@@ -1774,12 +1774,20 @@ fn infer_realm(
         return *hints.iter().next().expect("len checked");
     }
 
-    if hints.contains(&GmodRealm::Shared) && hints.len() == 2 {
-        if hints.contains(&GmodRealm::Client) {
-            return GmodRealm::Client;
+    if hints.len() == 2 {
+        // Shared + Client/Server → resolve to the specific realm
+        if hints.contains(&GmodRealm::Shared) {
+            if hints.contains(&GmodRealm::Client) {
+                return GmodRealm::Client;
+            }
+            if hints.contains(&GmodRealm::Server) {
+                return GmodRealm::Server;
+            }
         }
-        if hints.contains(&GmodRealm::Server) {
-            return GmodRealm::Server;
+
+        // Client + Server → the file runs on both realms, so it's Shared
+        if hints.contains(&GmodRealm::Client) && hints.contains(&GmodRealm::Server) {
+            return GmodRealm::Shared;
         }
     }
 
