@@ -687,4 +687,31 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[gtest]
+    fn test_inherited_method_docs_on_override() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---Called when touched by another entity.
+                ---@param other Entity The touching entity.
+                function Entity:Touch(other)
+                end
+
+                ---@class MyEntity: Entity
+                local ENT = {}
+
+                function ENT:To<??>uch(other)
+                end
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(method) MyEntity:Touch(other: Entity)\n```\n\n---\n\nCalled when touched by another entity.\n\n@*param* `other` — The touching entity.\n\n\n\n---\n\n```lua\n(method) Entity:Touch(other: Entity)\n```"
+                    .to_string(),
+            },
+        ));
+        Ok(())
+    }
 }

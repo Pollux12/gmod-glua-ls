@@ -5,7 +5,9 @@ use emmylua_parser::{LuaAstNode, LuaCallExpr, LuaExpr};
 use lsp_types::{Documentation, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel};
 use rowan::NodeOrToken;
 
-use crate::handlers::hover::{find_member_origin_owner, infer_prefix_global_name};
+use crate::handlers::hover::{
+    find_all_same_named_members, find_member_origin_owner, infer_prefix_global_name,
+};
 
 use super::build_signature_helper::{build_function_label, generate_param_label};
 
@@ -90,6 +92,31 @@ impl<'a> SignatureHelperBuilder<'a> {
             && let Some(description) = property.description()
         {
             self.set_description(description.to_string());
+        }
+
+        if self.description.is_none()
+            && let Some(same_named_members) =
+                find_all_same_named_members(semantic_model, &Some(semantic_decl.clone()))
+        {
+            for candidate_decl in same_named_members {
+                if candidate_decl == semantic_decl {
+                    continue;
+                }
+
+                let Some(property) = self
+                    .semantic_model
+                    .get_db()
+                    .get_property_index()
+                    .get_property(&candidate_decl)
+                else {
+                    continue;
+                };
+
+                if let Some(description) = property.description() {
+                    self.set_description(description.to_string());
+                    break;
+                }
+            }
         }
 
         match &semantic_decl {

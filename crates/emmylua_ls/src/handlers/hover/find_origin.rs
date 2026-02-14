@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use emmylua_code_analysis::{
-    LuaCompilation, LuaDeclExtra, LuaDeclId, LuaMemberId, LuaSemanticDeclId, LuaType, LuaUnionType,
+    LuaCompilation, LuaDeclExtra, LuaDeclId, LuaMemberId, LuaMemberOwner, LuaSemanticDeclId,
+    LuaType, LuaUnionType,
     SemanticDeclLevel, SemanticModel,
 };
 use emmylua_parser::{LuaAssignStat, LuaAstNode, LuaSyntaxKind, LuaTableExpr, LuaTableField};
@@ -163,21 +164,46 @@ pub fn find_all_same_named_members(
         .get_member_index()
         .get_member(member_id)?;
 
-    let target_key = original_member.get_key();
+    let target_key = original_member.get_key().clone();
     let current_owner = semantic_model
         .get_db()
         .get_member_index()
         .get_current_owner(member_id)?;
 
-    let all_members = semantic_model
-        .get_db()
-        .get_member_index()
-        .get_members(current_owner)?;
-    let same_named: Vec<LuaSemanticDeclId> = all_members
-        .iter()
-        .filter(|member| member.get_key() == target_key)
-        .map(|member| LuaSemanticDeclId::Member(member.get_id()))
-        .collect();
+    let mut seen_member_ids = HashSet::new();
+    let mut same_named: Vec<LuaSemanticDeclId> = Vec::new();
+    let mut push_member = |member_id: LuaMemberId| {
+        if seen_member_ids.insert(member_id) {
+            same_named.push(LuaSemanticDeclId::Member(member_id));
+        }
+    };
+
+    match current_owner {
+        LuaMemberOwner::Type(type_decl_id) => {
+            let members = semantic_model.get_member_info_with_key(
+                &LuaType::Def(type_decl_id.clone()),
+                target_key,
+                true,
+            )?;
+
+            for member_info in members {
+                if let Some(LuaSemanticDeclId::Member(member_id)) = member_info.property_owner_id {
+                    push_member(member_id);
+                }
+            }
+        }
+        _ => {
+            let all_members = semantic_model
+                .get_db()
+                .get_member_index()
+                .get_members(current_owner)?;
+            for member in all_members {
+                if member.get_key() == &target_key {
+                    push_member(member.get_id());
+                }
+            }
+        }
+    }
 
     if same_named.is_empty() {
         None

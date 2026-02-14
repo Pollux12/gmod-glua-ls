@@ -250,9 +250,23 @@ fn build_member_hover(
         builder.set_location_path(Some(member));
 
         // `typ`此时可能是泛型实例化后的类型, 所以我们需要从member获取原始类型
-        builder.add_signature_params_rets_description(
-            builder.semantic_model.get_type(member.get_id().into()),
-        );
+        let mut has_signature_docs = false;
+        let current_signature_type = builder.semantic_model.get_type(member.get_id().into());
+        let before_len = builder.annotation_description.len();
+        builder.add_signature_params_rets_description(current_signature_type);
+        if builder.annotation_description.len() > before_len {
+            has_signature_docs = true;
+        }
+
+        if !has_signature_docs {
+            for (_, signature_type) in &semantic_decls {
+                let before_len = builder.annotation_description.len();
+                builder.add_signature_params_rets_description(signature_type.clone());
+                if builder.annotation_description.len() > before_len {
+                    break;
+                }
+            }
+        }
     } else {
         if typ.is_const() {
             let const_value = hover_const_type(db, &typ);
