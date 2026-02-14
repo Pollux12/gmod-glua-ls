@@ -54,6 +54,10 @@ fn register_files_watch_use_lsp_client(client: &ClientProxy) {
                 glob_pattern: GlobPattern::String("**/.emmyrc.json".into()),
                 kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
             },
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/.emmyrc.lua".into()),
+                kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+            },
         ],
     };
 
@@ -67,7 +71,13 @@ fn register_files_watch_use_lsp_client(client: &ClientProxy) {
     });
 }
 
-const WATCH_FILE_EXTENSIONS: [&str; 4] = [".lua", ".editorconfig", ".luarc.json", ".emmyrc.json"];
+const WATCH_FILE_EXTENSIONS: [&str; 5] = [
+    ".lua",
+    ".editorconfig",
+    ".luarc.json",
+    ".emmyrc.json",
+    ".emmyrc.lua",
+];
 
 async fn register_files_watch_use_fsnotify(context: ServerContextSnapshot) -> Option<()> {
     let (tx, rx) = channel();
