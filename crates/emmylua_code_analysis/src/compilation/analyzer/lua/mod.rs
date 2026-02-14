@@ -1,4 +1,4 @@
-mod call;
+pub(in crate::compilation::analyzer) mod call;
 mod closure;
 mod for_range_stat;
 mod func_body;
@@ -7,6 +7,7 @@ mod module;
 mod stats;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use closure::analyze_closure;
 pub use closure::analyze_return_point;
@@ -42,11 +43,22 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
             .iter()
             .map(|x| (x.file_id, x.value.clone()))
             .collect::<HashMap<_, _>>();
+
+        // Pre-compute scripted class scope for all files (compile glob patterns once)
+        let gmod_enabled = db.get_emmyrc().gmod.enabled;
+        let scripted_scope_files = if gmod_enabled {
+            context.get_or_compute_scripted_scope_files(db).clone()
+        } else {
+            HashSet::new()
+        };
+
         let file_dependency = db.get_file_dependencies_index().get_file_dependencies();
         let order = file_dependency.get_best_analysis_order(&file_ids, &context.metas);
         for file_id in order {
             if let Some(root) = tree_map.get(&file_id) {
-                let mut analyzer = LuaAnalyzer::new(db, file_id, context);
+                let is_scripted = scripted_scope_files.contains(&file_id);
+                let mut analyzer =
+                    LuaAnalyzer::new(db, file_id, context, gmod_enabled, is_scripted);
                 for node in root.descendants::<LuaAst>() {
                     analyze_node(&mut analyzer, node);
                 }
@@ -95,6 +107,8 @@ struct LuaAnalyzer<'a> {
     file_id: FileId,
     db: &'a mut DbIndex,
     context: &'a mut AnalyzeContext,
+    gmod_enabled: bool,
+    is_scripted_class_scope: bool,
 }
 
 impl LuaAnalyzer<'_> {
@@ -102,11 +116,15 @@ impl LuaAnalyzer<'_> {
         db: &'a mut DbIndex,
         file_id: FileId,
         context: &'a mut AnalyzeContext,
+        gmod_enabled: bool,
+        is_scripted_class_scope: bool,
     ) -> LuaAnalyzer<'a> {
         LuaAnalyzer {
             file_id,
             db,
             context,
+            gmod_enabled,
+            is_scripted_class_scope,
         }
     }
 
