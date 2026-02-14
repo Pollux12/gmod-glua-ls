@@ -284,6 +284,14 @@ impl LuaTypeIndex {
             .insert(owner);
     }
 
+    pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
+        self.types.insert(owner.clone(), cache);
+        self.in_filed_type_owner
+            .entry(owner.get_file_id())
+            .or_default()
+            .insert(owner);
+    }
+
     pub fn get_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
         self.types.get(owner)
     }
