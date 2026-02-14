@@ -238,6 +238,12 @@ impl LuaModuleIndex {
         None
     }
 
+    pub fn find_module_by_path(&self, path: &Path) -> Option<&ModuleInfo> {
+        let path = path.to_str()?;
+        let (module_path, _) = self.extract_module_path(path)?;
+        self.find_module(&module_path)
+    }
+
     fn exact_find_module(&self, module_parts: &Vec<&str>) -> Option<&ModuleInfo> {
         let mut parent_node_id = self.module_root_id;
         for part in module_parts {

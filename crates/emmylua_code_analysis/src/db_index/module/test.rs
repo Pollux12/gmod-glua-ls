@@ -108,6 +108,27 @@ mod tests {
     }
 
     #[test]
+    fn test_find_module_by_path() {
+        let mut m = create_module();
+        m.add_workspace_root(
+            Path::new("C:/Users/username/Documents").into(),
+            WorkspaceId::MAIN,
+        );
+        let file_id = FileId { id: 1 };
+        m.add_module_by_path(
+            file_id,
+            "C:/Users/username/Documents/entities/test/shared.lua",
+        );
+        let module_info = m
+            .find_module_by_path(Path::new(
+                "C:/Users/username/Documents/entities/test/shared.lua",
+            ))
+            .unwrap();
+        assert_eq!(module_info.name, "shared");
+        assert_eq!(module_info.full_module_name, "entities.test.shared");
+    }
+
+    #[test]
     fn test_find_module_node() {
         let mut m = create_module();
         m.add_workspace_root(
