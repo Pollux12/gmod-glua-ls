@@ -68,6 +68,27 @@
         "useDiff": false
       }
     },
+    "gmod": {
+      "$ref": "#/$defs/EmmyrcGmod",
+      "default": {
+        "defaultRealm": "shared",
+        "enabled": true,
+        "hookMappings": {
+          "emitterToHook": {},
+          "methodPrefixes": [],
+          "methodToHook": {}
+        },
+        "scriptedClassScopes": {
+          "exclude": [],
+          "include": [
+            "entities/**",
+            "weapons/**",
+            "effects/**",
+            "weapons/gmod_tool/stools/**"
+          ]
+        }
+      }
+    },
     "hint": {
       "$ref": "#/$defs/EmmyrcInlayHint",
       "default": {
@@ -437,6 +458,26 @@
           "description": "Call to a non-callable value",
           "type": "string",
           "const": "call-non-callable"
+        },
+        {
+          "description": "gmod-invalid-hook-name",
+          "type": "string",
+          "const": "gmod-invalid-hook-name"
+        },
+        {
+          "description": "gmod-realm-misuse",
+          "type": "string",
+          "const": "gmod-realm-misuse"
+        },
+        {
+          "description": "gmod-unknown-net-message",
+          "type": "string",
+          "const": "gmod-unknown-net-message"
+        },
+        {
+          "description": "gmod-duplicate-system-registration",
+          "type": "string",
+          "const": "gmod-duplicate-system-registration"
         }
       ]
     },
@@ -768,6 +809,110 @@
           "const": "keep-class"
         }
       ]
+    },
+    "EmmyrcGmod": {
+      "type": "object",
+      "properties": {
+        "defaultRealm": {
+          "$ref": "#/$defs/EmmyrcGmodRealm",
+          "default": "shared"
+        },
+        "detectRealmFromCalls": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "detectRealmFromFilename": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "hookMappings": {
+          "$ref": "#/$defs/EmmyrcGmodHookMappings",
+          "default": {
+            "emitterToHook": {},
+            "methodPrefixes": [],
+            "methodToHook": {}
+          }
+        },
+        "scriptedClassScopes": {
+          "$ref": "#/$defs/EmmyrcGmodScriptedClassScopes",
+          "default": {
+            "exclude": [],
+            "include": [
+              "entities/**",
+              "weapons/**",
+              "effects/**",
+              "weapons/gmod_tool/stools/**"
+            ]
+          }
+        }
+      }
+    },
+    "EmmyrcGmodHookMappings": {
+      "type": "object",
+      "properties": {
+        "emitterToHook": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "methodPrefixes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "methodToHook": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      }
+    },
+    "EmmyrcGmodRealm": {
+      "type": "string",
+      "enum": [
+        "client",
+        "server",
+        "shared",
+        "menu"
+      ]
+    },
+    "EmmyrcGmodScriptedClassScopes": {
+      "type": "object",
+      "properties": {
+        "exclude": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "include": {
+          "type": "array",
+          "default": [
+            "entities/**",
+            "weapons/**",
+            "effects/**",
+            "weapons/gmod_tool/stools/**"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      }
     },
     "EmmyrcHover": {
       "type": "object",
