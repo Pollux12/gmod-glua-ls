@@ -132,6 +132,23 @@ Below is a complete configuration file example containing all configuration opti
         "nonstandardSymbol": [],
         "special": {}
     },
+    "gmod": {
+        "enabled": true,
+        "defaultRealm": "shared",
+        "scriptedClassScopes": {
+            "include": [
+                "entities/**",
+                "weapons/**",
+                "effects/**",
+                "weapons/gmod_tool/stools/**"
+            ],
+            "exclude": []
+        },
+        "hookMappings": {
+            "methodToHook": {},
+            "emitterToHook": {}
+        }
+    },
     "semanticTokens": {
         "enable": true
     },
@@ -502,6 +519,102 @@ Latest feature set
   }
 }
 ```
+
+---
+
+### 🎮 gmod - Garry's Mod Options
+
+<div align="center">
+
+#### Garry's Mod settings for realm, hooks, and scripted-class analysis
+
+</div>
+
+Defaults are aligned with the LuaLS addon where supported, especially scripted class scope paths.
+
+| Configuration | Type | Default | Description |
+|--------|------|--------|------|
+| **`enabled`** | `boolean` | `true` | 🔧 Enable/disable GMod-specific analysis features |
+| **`defaultRealm`** | `string` | `"shared"` | 🌐 Fallback realm when no explicit realm signal is found |
+| **`scriptedClassScopes.include`** | `string[]` | `["entities/**","weapons/**","effects/**","weapons/gmod_tool/stools/**"]` | 📦 Glob patterns where scripted-class call extraction is allowed |
+| **`scriptedClassScopes.exclude`** | `string[]` | `[]` | 🚫 Glob patterns to skip scripted-class extraction |
+| **`hookMappings.methodToHook`** | `object` | `{}` | 🪝 Map custom methods (for example `PLUGIN:PlayerSpawn`) to hook names |
+| **`hookMappings.emitterToHook`** | `object` | `{}` | 📣 Map custom emitters (for example `MyHooks.Emit`) to hook names |
+| **`hookMappings.methodPrefixes`** | `string[]` | `[]` | 🧭 Prefixes that should auto-map `Prefix:Method` as hook `Method` (for example `PLUGIN`) |
+| **`detectRealmFromFilename`** | `boolean \| null` | `null` | 🧭 Optional toggle for filename-based realm detection |
+| **`detectRealmFromCalls`** | `boolean \| null` | `null` | 🧠 Optional toggle for call-site-based realm detection |
+
+#### 📋 GMod Configuration Example
+
+```json
+{
+  "gmod": {
+    "enabled": true,
+    "defaultRealm": "shared",
+    "scriptedClassScopes": {
+      "include": [
+        "entities/**",
+        "weapons/**",
+        "effects/**",
+        "weapons/gmod_tool/stools/**"
+      ],
+      "exclude": []
+    },
+    "hookMappings": {
+      "methodToHook": {},
+      "emitterToHook": {},
+      "methodPrefixes": []
+    },
+    "detectRealmFromFilename": true
+  }
+}
+```
+
+#### 🪝 Automatic Hook Detection Rules
+
+- `hook.Add("Name", ...)`, `hook.Run("Name")`, and `hook.Call("Name", ...)` are detected automatically when names are static strings.
+- `GM:MethodName` and `GAMEMODE:MethodName` are automatically treated as hooks.
+- `---@hook` on method functions enables automatic hook registration from annotations:
+  - `---@hook` + `function PLUGIN:PlayerSpawn()` -> hook name `PlayerSpawn`
+  - `---@hook CustomName` + `function PLUGIN:OnX()` -> hook name `CustomName`
+- Hook names discovered from `hook.Add`, method hooks, and `---@hook` are available in autocomplete for `hook.Run`, `hook.Call`, and `hook.Add` first-string arguments.
+- Hook completion details include inferred callback arg names when available.
+- `hookMappings` is optional for overrides and framework-specific conventions:
+  - `methodToHook` for explicit remaps
+  - `methodPrefixes` for prefix-wide auto behavior (Helix-style `PLUGIN:*`, etc.)
+  - `emitterToHook` for custom emitter APIs
+
+#### 🧩 Plugin Folder Detection (Entity-like Scope Behavior)
+
+If your framework has plugin folders (for example `plugins` or `gamemode/plugins`) and you want scripted-class extraction (`DEFINE_BASECLASS`, `AccessorFunc`, `NetworkVar`) there too, include those folders in `scriptedClassScopes.include`.
+
+```json
+{
+  "gmod": {
+    "scriptedClassScopes": {
+      "include": [
+        "entities/**",
+        "weapons/**",
+        "effects/**",
+        "plugins/**",
+        "gamemode/plugins/**",
+        "gamemode/modules/**"
+      ],
+      "exclude": [
+        "**/tests/**",
+        "**/test/**"
+      ]
+    }
+  }
+}
+```
+
+> Matching accepts normalized full paths, `lua/...` relative paths, and path suffixes (for example `entities/**` matches `addons/x/gamemode/entities/...`), so these patterns work in nested addon/gamemode layouts.
+
+#### 📚 Full Guide
+
+For end-to-end setup (server launch, recommended `.emmyrc.json`, plugin-folder recipes, and troubleshooting), see:  
+[`docs/config/gmod_setup_EN.md`](./gmod_setup_EN.md)
 
 ---
 
