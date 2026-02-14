@@ -90,4 +90,32 @@ m.foo()
 
         Ok(())
     }
+
+    #[gtest]
+    fn test_doc_tag_realm_is_documentation_keyword() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"---@realm server
+local x = 1
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
+        let keyword_idx = token_type_index(SemanticTokenType::KEYWORD);
+        let doc_modifier = modifier_bitset(&[SemanticTokenModifier::DOCUMENTATION]);
+
+        verify_that!(
+            tokens
+                .iter()
+                .any(|(_, _, len, token_type, modifiers)| {
+                    *token_type == keyword_idx && (*modifiers & doc_modifier) == doc_modifier && *len >= 5
+                }),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
 }
