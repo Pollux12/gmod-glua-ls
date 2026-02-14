@@ -31,4 +31,19 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn test_unused_self_is_separate_code() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            local PLUGIN = {}
+
+            function PLUGIN:PlayerLeaveVehicle(client, veh)
+                return client, veh
+            end
+        "#;
+
+        assert!(!ws.check_code_for(DiagnosticCode::UnusedSelf, code));
+        assert!(ws.check_code_for(DiagnosticCode::Unused, code));
+    }
 }

@@ -217,7 +217,9 @@ impl<'a> DiagnosticContext<'a> {
 
     fn get_tags(&self, code: DiagnosticCode) -> Option<Vec<DiagnosticTag>> {
         match code {
-            DiagnosticCode::Unused | DiagnosticCode::UnreachableCode => {
+            DiagnosticCode::Unused
+            | DiagnosticCode::UnusedSelf
+            | DiagnosticCode::UnreachableCode => {
                 Some(vec![DiagnosticTag::UNNECESSARY])
             }
             DiagnosticCode::Deprecated => Some(vec![DiagnosticTag::DEPRECATED]),

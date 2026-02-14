@@ -8,7 +8,7 @@ use super::{Checker, DiagnosticContext};
 pub struct UnusedChecker;
 
 impl Checker for UnusedChecker {
-    const CODES: &[DiagnosticCode] = &[DiagnosticCode::Unused];
+    const CODES: &[DiagnosticCode] = &[DiagnosticCode::Unused, DiagnosticCode::UnusedSelf];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let file_id = semantic_model.get_file_id();
@@ -55,7 +55,7 @@ impl Checker for UnusedChecker {
                     // }
                     UnusedCheckResult::UnusedSelf(range) => {
                         context.add_diagnostic(
-                            DiagnosticCode::Unused,
+                            DiagnosticCode::UnusedSelf,
                             range,
                             t!(
                                 "Implicit self is never used, if this is intentional, please use '.' instead of ':' to define the method",

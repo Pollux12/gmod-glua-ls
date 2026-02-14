@@ -27,6 +27,8 @@ pub enum DiagnosticCode {
     UnreachableCode,
     /// Unused
     Unused,
+    /// Unused implicit self parameter
+    UnusedSelf,
     /// Undefined global
     UndefinedGlobal,
     /// Deprecated
@@ -140,6 +142,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::MissingParameter => DiagnosticSeverity::WARNING,
         DiagnosticCode::UnreachableCode => DiagnosticSeverity::HINT,
         DiagnosticCode::Unused => DiagnosticSeverity::HINT,
+        DiagnosticCode::UnusedSelf => DiagnosticSeverity::HINT,
         DiagnosticCode::UndefinedGlobal => DiagnosticSeverity::ERROR,
         DiagnosticCode::Deprecated => DiagnosticSeverity::HINT,
         DiagnosticCode::AccessInvisible => DiagnosticSeverity::WARNING,
