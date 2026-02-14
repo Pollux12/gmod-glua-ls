@@ -1,11 +1,22 @@
-use emmylua_parser::LuaCallExpr;
+use std::collections::HashSet;
+use std::path::Path;
+
+use emmylua_parser::{
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaLiteralToken, NumberResult, PathTrait,
+};
+use wax::Pattern;
 
 use crate::{
-    InferFailReason, LuaType,
+    FileId, GmodClassCallArg, GmodClassCallLiteral, GmodScriptedClassCallKind,
+    GmodScriptedClassCallMetadata, InferFailReason, LuaType,
     compilation::analyzer::{lua::LuaAnalyzer, unresolve::UnResolveConstructor},
+    db_index::DbIndex,
 };
 
-pub fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -> Option<()> {
+pub(super) fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -> Option<()> {
+    collect_gmod_scripted_class_call(analyzer, &call_expr);
+    collect_gmod_vgui_call(analyzer, &call_expr);
+
     let prefix_expr = call_expr.clone().get_prefix_expr()?;
     if let Ok(expr_type) = analyzer.infer_expr(&prefix_expr) {
         let LuaType::Signature(signature_id) = expr_type else {
@@ -28,4 +39,280 @@ pub fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -> Optio
         }
     }
     Some(())
+}
+
+fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaCallExpr) {
+    if !analyzer.is_scripted_class_scope {
+        return;
+    }
+
+    // Inline name check to avoid String allocation per call expression
+    let prefix_expr = call_expr.get_prefix_expr();
+    let kind = match prefix_expr.as_ref() {
+        Some(LuaExpr::NameExpr(name_expr)) => name_expr
+            .get_name_token()
+            .and_then(|t| GmodScriptedClassCallKind::from_call_name(t.get_name_text())),
+        Some(LuaExpr::IndexExpr(index_expr)) => {
+            index_expr.get_index_key().and_then(|key| match &key {
+                LuaIndexKey::Name(name_token) => {
+                    GmodScriptedClassCallKind::from_call_name(name_token.get_name_text())
+                }
+                LuaIndexKey::String(string_token) => {
+                    GmodScriptedClassCallKind::from_call_name(&string_token.get_value())
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    };
+
+    let Some(kind) = kind else {
+        return;
+    };
+
+    let (literal_args, args) = extract_call_args(call_expr);
+
+    analyzer.db.get_gmod_class_metadata_index_mut().add_call(
+        analyzer.file_id,
+        kind,
+        GmodScriptedClassCallMetadata {
+            syntax_id: call_expr.get_syntax_id(),
+            literal_args,
+            args,
+        },
+    );
+}
+
+fn collect_gmod_vgui_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaCallExpr) {
+    if !analyzer.gmod_enabled {
+        return;
+    }
+
+    // Fast path: vgui.Register / derma.DefineControl are always dotted accesses.
+    // Skip the expensive get_access_path() for the 99.9% of calls that can't match.
+    let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr() else {
+        return;
+    };
+
+    let Some(LuaIndexKey::Name(key_token)) = index_expr.get_index_key() else {
+        return;
+    };
+    let key_name = key_token.get_name_text();
+    if key_name != "Register" && key_name != "DefineControl" {
+        return;
+    }
+
+    // Check the base object: handle both direct (vgui.Register) and nested paths
+    let kind = match index_expr.get_prefix_expr() {
+        Some(LuaExpr::NameExpr(base)) => {
+            let base_name = base
+                .get_name_token()
+                .map(|t| t.get_name_text().to_string());
+            match base_name.as_deref() {
+                Some("vgui") if key_name == "Register" => {
+                    GmodScriptedClassCallKind::VguiRegister
+                }
+                Some("derma") if key_name == "DefineControl" => {
+                    GmodScriptedClassCallKind::DermaDefineControl
+                }
+                _ => return,
+            }
+        }
+        Some(_) => {
+            // Nested path like something.vgui.Register - fall back to full path
+            let Some(call_path) = call_expr.get_access_path() else {
+                return;
+            };
+            let Some(kind) = GmodScriptedClassCallKind::from_call_path(&call_path) else {
+                return;
+            };
+            kind
+        }
+        None => return,
+    };
+
+    let (literal_args, args) = extract_call_args(call_expr);
+
+    analyzer.db.get_gmod_class_metadata_index_mut().add_call(
+        analyzer.file_id,
+        kind,
+        GmodScriptedClassCallMetadata {
+            syntax_id: call_expr.get_syntax_id(),
+            literal_args,
+            args,
+        },
+    );
+}
+
+/// Pre-compute which files are in the scripted class scope.
+/// Compiles glob patterns once and checks all files, avoiding per-file compilation.
+pub(in crate::compilation::analyzer) fn compute_scripted_class_files(
+    db: &DbIndex,
+    file_ids: &[FileId],
+) -> HashSet<FileId> {
+    let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+    if scopes.include.is_empty() && scopes.exclude.is_empty() {
+        return file_ids.iter().copied().collect();
+    }
+
+    // Compile glob patterns once for all files
+    let include_patterns: Vec<&str> =
+        scopes.include.iter().map(String::as_str).collect();
+    let exclude_patterns: Vec<&str> =
+        scopes.exclude.iter().map(String::as_str).collect();
+
+    let include_glob = if !include_patterns.is_empty() {
+        match wax::any(include_patterns) {
+            Ok(g) => Some(g),
+            Err(err) => {
+                log::warn!(
+                    "Invalid gmod.scriptedClassScopes.include pattern: {err}"
+                );
+                return file_ids.iter().copied().collect();
+            }
+        }
+    } else {
+        None
+    };
+
+    let exclude_glob = if !exclude_patterns.is_empty() {
+        match wax::any(exclude_patterns) {
+            Ok(g) => Some(g),
+            Err(err) => {
+                log::warn!(
+                    "Invalid gmod.scriptedClassScopes.exclude pattern: {err}"
+                );
+                return HashSet::new();
+            }
+        }
+    } else {
+        None
+    };
+
+    file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| {
+            check_file_in_scope(
+                db,
+                *file_id,
+                &include_glob,
+                &exclude_glob,
+            )
+        })
+        .collect()
+}
+
+fn check_file_in_scope(
+    db: &DbIndex,
+    file_id: FileId,
+    include_glob: &Option<wax::Any>,
+    exclude_glob: &Option<wax::Any>,
+) -> bool {
+    let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
+        return include_glob.is_none();
+    };
+
+    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
+    let mut candidate_paths = Vec::new();
+    push_path_candidates(&mut candidate_paths, &normalized_path);
+    let normalized_lower = normalized_path.to_ascii_lowercase();
+    if let Some(lua_idx) = normalized_lower.find("/lua/") {
+        let lua_relative_path = normalized_path[lua_idx + 1..].to_string();
+        push_path_candidates(&mut candidate_paths, &lua_relative_path);
+        if let Some(stripped) = lua_relative_path.strip_prefix("lua/") {
+            push_path_candidates(&mut candidate_paths, stripped);
+        }
+    }
+    if let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) {
+        push_candidate_path(&mut candidate_paths, file_name);
+    }
+
+    if let Some(include) = include_glob {
+        if !candidate_paths
+            .iter()
+            .any(|path| include.is_match(Path::new(path)))
+        {
+            return false;
+        }
+    }
+
+    if let Some(exclude) = exclude_glob {
+        if candidate_paths
+            .iter()
+            .any(|path| exclude.is_match(Path::new(path)))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn push_path_candidates(candidate_paths: &mut Vec<String>, path: &str) {
+    push_candidate_path(candidate_paths, path);
+
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    for idx in 0..segments.len() {
+        push_candidate_path(candidate_paths, &segments[idx..].join("/"));
+    }
+}
+
+fn push_candidate_path(candidate_paths: &mut Vec<String>, candidate: &str) {
+    if candidate.is_empty() {
+        return;
+    }
+
+    if candidate_paths.iter().any(|existing| existing == candidate) {
+        return;
+    }
+
+    candidate_paths.push(candidate.to_string());
+}
+
+fn extract_call_args(
+    call_expr: &LuaCallExpr,
+) -> (Vec<Option<GmodClassCallLiteral>>, Vec<GmodClassCallArg>) {
+    let Some(args_list) = call_expr.get_args_list() else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut literal_args = Vec::new();
+    let mut args = Vec::new();
+
+    for arg_expr in args_list.get_args() {
+        let syntax_id = arg_expr.get_syntax_id();
+        let value = extract_literal_or_name(&arg_expr);
+        literal_args.push(value.clone());
+        args.push(GmodClassCallArg { syntax_id, value });
+    }
+
+    (literal_args, args)
+}
+
+fn extract_literal_or_name(expr: &LuaExpr) -> Option<GmodClassCallLiteral> {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(string_token) => Some(GmodClassCallLiteral::String(
+                string_token.get_value().to_string(),
+            )),
+            LuaLiteralToken::Number(number_token) => match number_token.get_number_value() {
+                NumberResult::Int(value) => Some(GmodClassCallLiteral::Integer(value)),
+                NumberResult::Uint(value) => Some(GmodClassCallLiteral::Unsigned(value)),
+                NumberResult::Float(value) => Some(GmodClassCallLiteral::Float(value)),
+            },
+            LuaLiteralToken::Bool(bool_token) => {
+                Some(GmodClassCallLiteral::Boolean(bool_token.is_true()))
+            }
+            LuaLiteralToken::Nil(_) => Some(GmodClassCallLiteral::Nil),
+            _ => None,
+        },
+        LuaExpr::NameExpr(name_expr) => {
+            name_expr.get_name_text().map(GmodClassCallLiteral::NameRef)
+        }
+        _ => None,
+    }
 }

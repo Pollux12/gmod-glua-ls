@@ -2,6 +2,7 @@ mod common;
 mod decl;
 mod doc;
 mod flow;
+mod gmod;
 mod infer_cache_manager;
 mod lua;
 mod unresolve;
@@ -33,6 +34,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
         run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
         run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
+        if db.get_emmyrc().gmod.enabled {
+            run_analysis::<gmod::GmodAnalysisPipeline>(db, &mut context);
+        }
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
     }
 }

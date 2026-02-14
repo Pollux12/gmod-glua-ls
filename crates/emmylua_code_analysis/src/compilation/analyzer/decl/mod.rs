@@ -9,7 +9,7 @@ use crate::{
     profile::Profile,
 };
 
-use super::AnalyzeContext;
+use super::{AnalyzeContext, gmod::ensure_scoped_class_type_decl_for_file};
 use emmylua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaSyntaxKind, LuaVarExpr};
 use rowan::{TextRange, TextSize, WalkEvent};
 
@@ -24,6 +24,11 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         let _p = Profile::cond_new("decl analyze", context.tree_list.len() > 1);
         let tree_list = context.tree_list.clone();
+        let scripted_scope_files = if db.get_emmyrc().gmod.enabled {
+            Some(context.get_or_compute_scripted_scope_files(db).clone())
+        } else {
+            None
+        };
         for in_filed_tree in tree_list.iter() {
             db.get_reference_index_mut()
                 .create_local_reference(in_filed_tree.file_id);
@@ -35,6 +40,15 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
             );
             analyzer.analyze();
             let decl_tree = analyzer.get_decl_tree();
+            if let Some(scripted_scope_files) = scripted_scope_files.as_ref()
+                && scripted_scope_files.contains(&in_filed_tree.file_id)
+            {
+                ensure_scoped_class_type_decl_for_file(
+                    db,
+                    in_filed_tree.file_id,
+                    in_filed_tree.value.syntax().text_range(),
+                );
+            }
             db.get_decl_index_mut().add_decl_tree(decl_tree);
         }
     }
