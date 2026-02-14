@@ -110,6 +110,20 @@ impl EmmyLuaAnalysis {
     }
 
     pub fn update_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> Option<FileId> {
+        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(uri);
+        if let Some(file_id) = existing_file_id {
+            if let (Some(new_text), Some(old_text)) = (
+                text.as_deref(),
+                self.compilation.get_db().get_vfs().get_file_content(&file_id).map(String::as_str),
+            )
+                && old_text == new_text
+            {
+                return Some(file_id);
+            }
+        } else if text.is_none() {
+            return None;
+        }
+
         let is_removed = text.is_none();
         let file_id = self
             .compilation
@@ -151,6 +165,20 @@ impl EmmyLuaAnalysis {
         {
             let _p = Profile::new("update files");
             for (uri, text) in files {
+                let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
+                if let Some(file_id) = existing_file_id {
+                    if let (Some(new_text), Some(old_text)) = (
+                        text.as_deref(),
+                        self.compilation.get_db().get_vfs().get_file_content(&file_id).map(String::as_str),
+                    )
+                        && old_text == new_text
+                    {
+                        continue;
+                    }
+                } else if text.is_none() {
+                    continue;
+                }
+
                 let is_new_text = text.is_some();
                 let file_id = self
                     .compilation
@@ -163,6 +191,10 @@ impl EmmyLuaAnalysis {
                 }
             }
         }
+        if removed_files.is_empty() {
+            return Vec::new();
+        }
+
         self.compilation
             .remove_index(removed_files.into_iter().collect());
         let updated_files: Vec<FileId> = updated_files.into_iter().collect();
@@ -180,6 +212,20 @@ impl EmmyLuaAnalysis {
         {
             let _p = Profile::new("update files");
             for (uri, text) in files {
+                let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
+                if let Some(file_id) = existing_file_id {
+                    if let (Some(new_text), Some(old_text)) = (
+                        text.as_deref(),
+                        self.compilation.get_db().get_vfs().get_file_content(&file_id).map(String::as_str),
+                    )
+                        && old_text == new_text
+                    {
+                        continue;
+                    }
+                } else if text.is_none() {
+                    continue;
+                }
+
                 let is_new_text = text.is_some();
                 let file_id = self
                     .compilation
@@ -192,6 +238,10 @@ impl EmmyLuaAnalysis {
                 }
             }
         }
+        if removed_files.is_empty() {
+            return Vec::new();
+        }
+
         self.compilation
             .remove_index(removed_files.into_iter().collect());
         let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
