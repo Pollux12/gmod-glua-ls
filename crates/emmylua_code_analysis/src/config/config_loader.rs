@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -48,37 +48,30 @@ pub fn load_configs_raw(config_files: Vec<PathBuf>, partial_emmyrcs: Option<Vec<
             }
         };
 
-        config_jsons.push(config_value);
+        config_jsons.push(normalize_to_emmyrc_json(config_value));
     }
 
     if let Some(partial_emmyrcs) = partial_emmyrcs {
         for partial_emmyrc in partial_emmyrcs {
-            config_jsons.push(partial_emmyrc);
+            config_jsons.push(normalize_to_emmyrc_json(partial_emmyrc));
         }
     }
 
     if config_jsons.is_empty() {
         log::info!("No valid config file found.");
         Value::Object(Default::default())
-    } else if config_jsons.len() == 1 {
-        let first_config = config_jsons.into_iter().next().unwrap_or_else(|| {
-            log::error!("No valid config file found.");
-            Value::Object(Default::default())
-        });
-
-        let flatten_config = FlattenConfigObject::parse(first_config);
-        flatten_config.to_emmyrc()
     } else {
-        let merge_config =
-            config_jsons
-                .into_iter()
-                .fold(Value::Object(Default::default()), |mut acc, item| {
-                    merge_values(&mut acc, item);
-                    acc
-                });
-        let flatten_config = FlattenConfigObject::parse(merge_config.clone());
-        flatten_config.to_emmyrc()
+        config_jsons
+            .into_iter()
+            .fold(Value::Object(Default::default()), |mut acc, item| {
+                merge_values(&mut acc, item);
+                acc
+            })
     }
+}
+
+fn normalize_to_emmyrc_json(config: Value) -> Value {
+    FlattenConfigObject::parse(config).to_emmyrc()
 }
 
 pub fn load_configs(config_files: Vec<PathBuf>, partial_emmyrcs: Option<Vec<Value>>) -> Emmyrc {
@@ -104,15 +97,116 @@ fn merge_values(base: &mut Value, overlay: Value) {
             }
         }
         (Value::Array(base_array), Value::Array(overlay_array)) => {
-            let mut seen = HashSet::new();
-            base_array.extend(
-                overlay_array
-                    .into_iter()
-                    .filter(|item| seen.insert(item.clone())),
-            );
+            *base_array = overlay_array;
         }
         (base_slot, overlay_value) => {
             *base_slot = overlay_value;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::merge_values;
+    use crate::config::flatten_config::FlattenConfigObject;
+
+    #[test]
+    fn test_merge_values_array_overlay_replaces_base() {
+        let mut base = json!({
+            "diagnostics": {
+                "disable": ["inject-field", "duplicate-set-field"]
+            }
+        });
+        let overlay = json!({
+            "diagnostics": {
+                "disable": ["call-non-callable"]
+            }
+        });
+
+        merge_values(&mut base, overlay);
+
+        assert_eq!(
+            base["diagnostics"]["disable"],
+            json!(["call-non-callable"])
+        );
+    }
+
+    #[test]
+    fn test_luarc_then_emmyrc_diagnostics_disable_prefers_emmyrc() {
+        let luarc = json!({
+            "diagnostics": {
+                "disable": ["inject-field", "duplicate-set-field"]
+            }
+        });
+        let emmyrc = json!({
+            "diagnostics": {
+                "disable": ["call-non-callable", "unnecessary-if"]
+            }
+        });
+
+        let mut merged = json!({});
+        merge_values(&mut merged, luarc);
+        merge_values(&mut merged, emmyrc);
+
+        let emmyrc_json = FlattenConfigObject::parse(merged).to_emmyrc();
+        assert_eq!(
+            emmyrc_json["diagnostics"]["disable"],
+            json!(["call-non-callable", "unnecessary-if"])
+        );
+    }
+
+    #[test]
+    fn test_dotted_luarc_key_then_nested_emmyrc_prefers_emmyrc() {
+        let luarc = json!({
+            "diagnostics.disable": ["inject-field"]
+        });
+        let emmyrc = json!({
+            "diagnostics": {
+                "disable": ["call-non-callable"]
+            }
+        });
+
+        let mut merged = json!({});
+        merge_values(
+            &mut merged,
+            super::normalize_to_emmyrc_json(luarc),
+        );
+        merge_values(
+            &mut merged,
+            super::normalize_to_emmyrc_json(emmyrc),
+        );
+
+        assert_eq!(
+            merged["diagnostics"]["disable"],
+            json!(["call-non-callable"])
+        );
+    }
+
+    #[test]
+    fn test_load_configs_raw_with_dotted_and_nested_disable_prefers_later_config() {
+        let configs = vec![
+            super::normalize_to_emmyrc_json(json!({
+                "diagnostics.disable": ["inject-field"]
+            })),
+            super::normalize_to_emmyrc_json(json!({
+                "diagnostics": {
+                    "disable": ["call-non-callable"]
+                }
+            })),
+        ];
+
+        let merged = configs
+            .into_iter()
+            .fold(json!({}), |mut acc, item| {
+                merge_values(&mut acc, item);
+                acc
+            });
+
+        assert_eq!(
+            merged["diagnostics"]["disable"],
+            json!(["call-non-callable"])
+        );
     }
 }
