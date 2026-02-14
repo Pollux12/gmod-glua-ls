@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use emmylua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaDocTagCast, LuaExpr,
     LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLiteralExpr, LuaLiteralToken, LuaNameExpr,
@@ -8,7 +10,7 @@ use crate::{
     FileId, InFiled, InferFailReason, LuaDeclExtra, LuaDeclId, LuaMemberFeature, LuaMemberId,
     LuaSignatureId,
     compilation::analyzer::unresolve::UnResolveTableField,
-    db_index::{LuaDecl, LuaMember, LuaMemberKey, LuaMemberOwner},
+    db_index::{LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey, LuaMemberOwner},
 };
 
 use super::DeclAnalyzer;
@@ -337,21 +339,110 @@ pub fn analyze_literal_expr(analyzer: &mut DeclAnalyzer, expr: LuaLiteralExpr) -
 }
 
 pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Option<()> {
-    if expr.is_require() {
-        let args = expr.get_args_list()?;
-        if let Some(LuaExpr::LiteralExpr(literal_expr)) = args.get_args().next()
-            && let Some(LuaLiteralToken::String(string_token)) = literal_expr.get_literal()
-        {
-            let module_path = string_token.get_value();
-            let file_id = analyzer.get_file_id();
-            let module_info = analyzer.db.get_module_index().find_module(&module_path)?;
-            let module_file_id = module_info.file_id;
-            analyzer
-                .db
-                .get_file_dependencies_index_mut()
-                .add_required_file(file_id, module_file_id);
-        }
+    let Some((dependency_kind, dependency_path)) = get_dependency_call_info(&expr) else {
+        return Some(());
+    };
+
+    let file_id = analyzer.get_file_id();
+    let dependency_file_id =
+        resolve_dependency_file_id(analyzer, file_id, dependency_kind, &dependency_path);
+    if let Some(dependency_file_id) = dependency_file_id {
+        analyzer
+            .db
+            .get_file_dependencies_index_mut()
+            .add_dependency_file(file_id, dependency_file_id, dependency_kind);
     }
 
     Some(())
+}
+
+fn get_dependency_call_info(expr: &LuaCallExpr) -> Option<(LuaDependencyKind, String)> {
+    let dependency_kind = if expr.is_require() {
+        LuaDependencyKind::Require
+    } else {
+        match get_call_name(expr).as_deref()? {
+            "include" => LuaDependencyKind::Include,
+            "AddCSLuaFile" => LuaDependencyKind::AddCSLuaFile,
+            _ => return None,
+        }
+    };
+    let dependency_path = get_static_string_arg(expr)?;
+    Some((dependency_kind, dependency_path))
+}
+
+fn get_call_name(expr: &LuaCallExpr) -> Option<String> {
+    match expr.get_prefix_expr()? {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+        LuaExpr::IndexExpr(index_expr) => match index_expr.get_index_key()? {
+            LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
+            LuaIndexKey::String(string) => Some(string.get_value()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn get_static_string_arg(expr: &LuaCallExpr) -> Option<String> {
+    let args = expr.get_args_list()?;
+    let first_arg = args.get_args().next()?;
+    let LuaExpr::LiteralExpr(literal_expr) = first_arg else {
+        return None;
+    };
+    let LuaLiteralToken::String(string_token) = literal_expr.get_literal()? else {
+        return None;
+    };
+    Some(string_token.get_value())
+}
+
+fn resolve_dependency_file_id(
+    analyzer: &DeclAnalyzer,
+    file_id: FileId,
+    dependency_kind: LuaDependencyKind,
+    dependency_path: &str,
+) -> Option<FileId> {
+    let module_index = analyzer.db.get_module_index();
+    match dependency_kind {
+        LuaDependencyKind::Require => module_index
+            .find_module(dependency_path)
+            .map(|it| it.file_id),
+        LuaDependencyKind::Include | LuaDependencyKind::AddCSLuaFile => {
+            resolve_gmod_include_file_id(analyzer, file_id, dependency_path).or_else(|| {
+                module_index
+                    .find_module(dependency_path)
+                    .map(|it| it.file_id)
+            })
+        }
+    }
+}
+
+fn resolve_gmod_include_file_id(
+    analyzer: &DeclAnalyzer,
+    file_id: FileId,
+    dependency_path: &str,
+) -> Option<FileId> {
+    let normalized_path = dependency_path.replace('\\', "/");
+    let normalized_path = normalized_path.trim_start_matches("./");
+    let normalized_no_ext = normalized_path
+        .strip_suffix(".lua")
+        .unwrap_or(normalized_path);
+
+    let module_index = analyzer.db.get_module_index();
+    let root_module_path = normalized_no_ext.replace('/', ".");
+    if let Some(module_info) = module_index.find_module(&root_module_path) {
+        return Some(module_info.file_id);
+    }
+
+    if let Some(path_without_lua_prefix) = normalized_no_ext.strip_prefix("lua/") {
+        let module_path = path_without_lua_prefix.replace('/', ".");
+        if let Some(module_info) = module_index.find_module(&module_path) {
+            return Some(module_info.file_id);
+        }
+    }
+
+    let current_file_path = analyzer.db.get_vfs().get_file_path(&file_id)?;
+    let parent_dir = current_file_path.parent()?;
+    let include_file_path = parent_dir.join(Path::new(normalized_path));
+    module_index
+        .find_module_by_path(&include_file_path)
+        .map(|it| it.file_id)
 }
