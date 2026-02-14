@@ -1,6 +1,6 @@
 use emmylua_code_analysis::{
-    DbIndex, InFiled, LuaMember, LuaMultiLineUnion, LuaSemanticDeclId, LuaType, LuaUnionType,
-    RenderLevel, SemanticDeclLevel, SemanticModel, format_union_type,
+    DbIndex, GmodRealm, InFiled, LuaMember, LuaMultiLineUnion, LuaSemanticDeclId, LuaType,
+    LuaUnionType, RenderLevel, SemanticDeclLevel, SemanticModel, format_union_type,
 };
 
 use emmylua_code_analysis::humanize_type;
@@ -165,9 +165,9 @@ pub fn extract_description_from_property_owner(
 
     let mut result = DescriptionInfo::new();
 
-    if let Some(detail) = property.description() {
-        result.description = Some(detail.to_string());
-    }
+    let mut description = property.description().map(|detail| detail.to_string());
+    inject_or_create_realm_badge(semantic_model, property_owner, &mut description);
+    result.description = description;
 
     if let Some(tag_content) = property.tag_content() {
         for (tag_name, description) in tag_content.get_all_tags() {
@@ -184,6 +184,90 @@ pub fn extract_description_from_property_owner(
         None
     } else {
         Some(result)
+    }
+}
+
+fn inject_or_create_realm_badge(
+    semantic_model: &SemanticModel,
+    property_owner: &LuaSemanticDeclId,
+    description: &mut Option<String>,
+) {
+    let Some(badge_markdown) = infer_realm_badge_markdown(semantic_model, property_owner) else {
+        return;
+    };
+
+    match description {
+        Some(existing_description) => {
+            if has_realm_badge(existing_description) {
+                return;
+            }
+            *existing_description = format!("{}\n\n{}", badge_markdown, existing_description.trim_start());
+        }
+        None => {
+            *description = Some(badge_markdown.to_string());
+        }
+    }
+}
+
+fn infer_realm_badge_markdown(
+    semantic_model: &SemanticModel,
+    property_owner: &LuaSemanticDeclId,
+) -> Option<&'static str> {
+    if !semantic_model.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let realm = infer_property_owner_realm(semantic_model, property_owner)?;
+    realm_badge_markdown(realm)
+}
+
+fn infer_property_owner_realm(
+    semantic_model: &SemanticModel,
+    property_owner: &LuaSemanticDeclId,
+) -> Option<GmodRealm> {
+    let db = semantic_model.get_db();
+    let (file_id, offset) = match property_owner {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(decl_id)?;
+            (decl.get_file_id(), decl.get_range().start())
+        }
+        LuaSemanticDeclId::Member(member_id) => {
+            let member = db.get_member_index().get_member(member_id)?;
+            (member.get_file_id(), member.get_range().start())
+        }
+        _ => return None,
+    };
+
+    Some(db.get_gmod_infer_index().get_realm_at_offset(&file_id, offset))
+}
+
+fn has_realm_badge(description: &str) -> bool {
+    description.contains("---![(Shared)](")
+        || description.contains("---![(Server)](")
+        || description.contains("---![(Client)](")
+        || description.contains("![(Shared)](")
+        || description.contains("![(Server)](")
+        || description.contains("![(Client)](")
+        || description.contains("[(Shared)](")
+        || description.contains("[(Server)](")
+        || description.contains("[(Client)](")
+        || description.contains("a356f942-57d7-4915-a8cc-559870a980fc")
+        || description.contains("d8fbe13a-6305-4e16-8698-5be874721ca1")
+        || description.contains("a5f6ba64-374d-42f0-b2f4-50e5c964e808")
+}
+
+fn realm_badge_markdown(realm: GmodRealm) -> Option<&'static str> {
+    match realm {
+        GmodRealm::Shared => Some(
+            "![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)",
+        ),
+        GmodRealm::Server => Some(
+            "![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)",
+        ),
+        GmodRealm::Client => Some(
+            "![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)",
+        ),
+        GmodRealm::Unknown => None,
     }
 }
 

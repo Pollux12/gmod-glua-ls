@@ -146,6 +146,19 @@ impl<'a> HoverBuilder<'a> {
         if annotation_description.is_empty() {
             return;
         }
+
+        if is_realm_badge_only_markdown(&annotation_description)
+            && self.annotation_description.iter().any(|existing| {
+                if let MarkedString::String(existing_markdown) = existing {
+                    contains_any_realm_badge(existing_markdown)
+                } else {
+                    false
+                }
+            })
+        {
+            return;
+        }
+
         self.annotation_description
             .push(MarkedString::from_markdown(annotation_description));
     }
@@ -291,6 +304,31 @@ impl<'a> HoverBuilder<'a> {
         }
         None
     }
+}
+
+fn contains_any_realm_badge(markdown: &str) -> bool {
+    markdown.contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)")
+        || markdown.contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)")
+        || markdown.contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)")
+        || markdown.contains("---![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)")
+        || markdown.contains("---![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)")
+        || markdown.contains("---![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)")
+}
+
+fn is_realm_badge_only_markdown(markdown: &str) -> bool {
+    let trimmed = markdown.trim();
+    trimmed
+        == "![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"
+        || trimmed
+            == "![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"
+        || trimmed
+            == "![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"
+        || trimmed
+            == "---![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"
+        || trimmed
+            == "---![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"
+        || trimmed
+            == "---![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"
 }
 
 // 推断基础泛型替换器

@@ -752,8 +752,60 @@ mod tests {
             markup.value
         );
         assert!(
+            markup
+                .value
+                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+            "expected hover to include shared realm badge, got: {}",
+            markup.value
+        );
+        assert!(
             markup.value.contains("PlayerSpawnSENT"),
             "expected hover to include hook function signature, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_gm_hook_method_shows_realm_badge_without_description() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "library/lua/includes/extensions/sandbox_hooks.lua",
+            r#"
+                ---@class SANDBOX
+                ---@type SANDBOX
+                SANDBOX = SANDBOX or {}
+
+                function SANDBOX:PlayerSpawnSENT(ply, class)
+                end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                function SANDBOX:PlayerSpawnSE<??>NT(ply, class)
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+            "expected hover to include shared realm badge without text description, got: {}",
             markup.value
         );
 

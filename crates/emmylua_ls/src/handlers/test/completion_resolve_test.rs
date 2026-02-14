@@ -158,7 +158,46 @@ mod tests {
             "#,
             VirtualCompletionResolveItem {
                 detail: "(method) SANDBOX:PlayerSpawnSENT(ply, class)".to_string(),
-                documentation: Some("\nCalled when a player attempts to spawn a SENT.".to_string()),
+                documentation: Some(
+                    "\n![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)\n\nCalled when a player attempts to spawn a SENT."
+                        .to_string(),
+                ),
+            },
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_completion_shows_realm_badge_without_description() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "library/lua/includes/extensions/sandbox_hooks.lua",
+            r#"
+                ---@class SANDBOX
+                ---@type SANDBOX
+                SANDBOX = SANDBOX or {}
+
+                function SANDBOX:PlayerSpawnSENT(ply, class)
+                end
+            "#,
+        );
+
+        check!(ws.check_completion_resolve(
+            r#"
+                function SANDBOX:<??>
+                end
+            "#,
+            VirtualCompletionResolveItem {
+                detail: "(method) SANDBOX:PlayerSpawnSENT(ply, class)".to_string(),
+                documentation: Some(
+                    "\n![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"
+                        .to_string(),
+                ),
             },
         ));
 
