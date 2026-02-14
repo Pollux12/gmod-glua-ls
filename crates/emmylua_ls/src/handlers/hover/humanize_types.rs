@@ -238,6 +238,12 @@ fn infer_property_owner_realm(
         _ => return None,
     };
 
+    if let Some(metadata) = db.get_gmod_infer_index().get_realm_file_metadata(&file_id)
+        && let Some(annotation_realm) = metadata.annotation_realm
+    {
+        return Some(annotation_realm);
+    }
+
     Some(db.get_gmod_infer_index().get_realm_at_offset(&file_id, offset))
 }
 

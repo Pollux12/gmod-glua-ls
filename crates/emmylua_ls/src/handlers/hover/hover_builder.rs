@@ -147,7 +147,25 @@ impl<'a> HoverBuilder<'a> {
             return;
         }
 
-        if is_realm_badge_only_markdown(&annotation_description)
+        let mut normalized_annotation_description = annotation_description;
+        if contains_any_realm_badge(&normalized_annotation_description)
+            && self.annotation_description.iter().any(|existing| {
+                if let MarkedString::String(existing_markdown) = existing {
+                    contains_any_realm_badge(existing_markdown)
+                } else {
+                    false
+                }
+            })
+        {
+            normalized_annotation_description = strip_realm_badges(&normalized_annotation_description)
+                .trim()
+                .to_string();
+            if normalized_annotation_description.is_empty() {
+                return;
+            }
+        }
+
+        if is_realm_badge_only_markdown(&normalized_annotation_description)
             && self.annotation_description.iter().any(|existing| {
                 if let MarkedString::String(existing_markdown) = existing {
                     contains_any_realm_badge(existing_markdown)
@@ -160,7 +178,7 @@ impl<'a> HoverBuilder<'a> {
         }
 
         self.annotation_description
-            .push(MarkedString::from_markdown(annotation_description));
+            .push(MarkedString::from_markdown(normalized_annotation_description));
     }
 
     pub fn add_description(&mut self, property_owner: &LuaSemanticDeclId) -> Option<()> {
@@ -202,6 +220,14 @@ impl<'a> HoverBuilder<'a> {
     }
 
     pub fn build_hover_result(&self, range: Option<lsp_types::Range>) -> Option<Hover> {
+        let realm_badge = self.annotation_description.iter().find_map(|marked_string| {
+            if let MarkedString::String(s) = marked_string {
+                find_realm_badge_markdown(s)
+            } else {
+                None
+            }
+        });
+
         let header = {
             let mut header = String::new();
             match &self.primary {
@@ -212,21 +238,32 @@ impl<'a> HoverBuilder<'a> {
                     header.push_str(&format!("\n```{}\n{}\n```\n", s.language, s.value));
                 }
             }
+
             if let Some(location_path) = &self.location_path
                 && let MarkedString::String(s) = location_path
             {
                 header.push_str(&format!("\n{}\n", s));
             }
+
             header
         };
 
         let description_content = {
             let mut content = String::new();
 
+            if let Some(realm_badge) = realm_badge {
+                let realm_label = realm_badge_label(realm_badge);
+                content.push_str(&format!("\n{} **{}**\n", realm_badge, realm_label));
+            }
+
             for marked_string in &self.annotation_description {
                 match marked_string {
                     MarkedString::String(s) => {
-                        content.push_str(&format!("\n{}\n", s));
+                        let sanitized_description = strip_realm_badges(s).trim().to_string();
+                        if sanitized_description.is_empty() {
+                            continue;
+                        }
+                        content.push_str(&format!("\n{}\n", sanitized_description));
                     }
                     MarkedString::LanguageString(s) => {
                         content.push_str(&format!("\n```{}\n{}\n```\n", s.language, s.value));
@@ -307,12 +344,35 @@ impl<'a> HoverBuilder<'a> {
 }
 
 fn contains_any_realm_badge(markdown: &str) -> bool {
-    markdown.contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)")
-        || markdown.contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)")
-        || markdown.contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)")
-        || markdown.contains("---![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)")
-        || markdown.contains("---![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)")
-        || markdown.contains("---![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)")
+    markdown.contains(GMOD_REALM_BADGE_SHARED_URL)
+        || markdown.contains(GMOD_REALM_BADGE_SERVER_URL)
+        || markdown.contains(GMOD_REALM_BADGE_CLIENT_URL)
+}
+
+fn find_realm_badge_markdown(markdown: &str) -> Option<&'static str> {
+    if markdown.contains(GMOD_REALM_BADGE_SHARED_URL) {
+        return Some(GMOD_REALM_BADGE_SHARED_MARKDOWN);
+    }
+    if markdown.contains(GMOD_REALM_BADGE_SERVER_URL) {
+        return Some(GMOD_REALM_BADGE_SERVER_MARKDOWN);
+    }
+    if markdown.contains(GMOD_REALM_BADGE_CLIENT_URL) {
+        return Some(GMOD_REALM_BADGE_CLIENT_MARKDOWN);
+    }
+    None
+}
+
+fn strip_realm_badges(markdown: &str) -> String {
+    markdown
+        .replace(GMOD_REALM_BADGE_SHARED_MARKDOWN, "")
+        .replace(GMOD_REALM_BADGE_SERVER_MARKDOWN, "")
+        .replace(GMOD_REALM_BADGE_CLIENT_MARKDOWN, "")
+        .replace(GMOD_REALM_BADGE_SHARED_MARKDOWN_LEGACY, "")
+        .replace(GMOD_REALM_BADGE_SERVER_MARKDOWN_LEGACY, "")
+        .replace(GMOD_REALM_BADGE_CLIENT_MARKDOWN_LEGACY, "")
+        .replace(GMOD_REALM_BADGE_SHARED_MARKDOWN_PLAIN, "")
+        .replace(GMOD_REALM_BADGE_SERVER_MARKDOWN_PLAIN, "")
+        .replace(GMOD_REALM_BADGE_CLIENT_MARKDOWN_PLAIN, "")
 }
 
 fn is_realm_badge_only_markdown(markdown: &str) -> bool {
@@ -329,7 +389,50 @@ fn is_realm_badge_only_markdown(markdown: &str) -> bool {
             == "---![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"
         || trimmed
             == "---![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"
+        || trimmed == "[(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"
+        || trimmed == "[(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"
+        || trimmed == "[(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"
 }
+
+fn realm_badge_label(realm_badge: &str) -> &'static str {
+    if realm_badge.contains(GMOD_REALM_BADGE_SHARED_URL) {
+        "SHARED"
+    } else if realm_badge.contains(GMOD_REALM_BADGE_SERVER_URL) {
+        "SERVER"
+    } else if realm_badge.contains(GMOD_REALM_BADGE_CLIENT_URL) {
+        "CLIENT"
+    } else {
+        "REALM"
+    }
+}
+
+const GMOD_REALM_BADGE_SHARED_URL: &str =
+    "https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc";
+const GMOD_REALM_BADGE_SERVER_URL: &str =
+    "https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1";
+const GMOD_REALM_BADGE_CLIENT_URL: &str =
+    "https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808";
+
+const GMOD_REALM_BADGE_SHARED_MARKDOWN: &str =
+    "![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)";
+const GMOD_REALM_BADGE_SERVER_MARKDOWN: &str =
+    "![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)";
+const GMOD_REALM_BADGE_CLIENT_MARKDOWN: &str =
+    "![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)";
+
+const GMOD_REALM_BADGE_SHARED_MARKDOWN_LEGACY: &str =
+    "---![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)";
+const GMOD_REALM_BADGE_SERVER_MARKDOWN_LEGACY: &str =
+    "---![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)";
+const GMOD_REALM_BADGE_CLIENT_MARKDOWN_LEGACY: &str =
+    "---![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)";
+
+const GMOD_REALM_BADGE_SHARED_MARKDOWN_PLAIN: &str =
+    "[(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)";
+const GMOD_REALM_BADGE_SERVER_MARKDOWN_PLAIN: &str =
+    "[(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)";
+const GMOD_REALM_BADGE_CLIENT_MARKDOWN_PLAIN: &str =
+    "[(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)";
 
 // 推断基础泛型替换器
 fn infer_substitutor_base_type(

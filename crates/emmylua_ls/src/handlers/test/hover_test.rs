@@ -751,11 +751,28 @@ mod tests {
             "expected hover to include SANDBOX hook docs, got: {}",
             markup.value
         );
+        let has_inline_realm_badge = markup.value.contains(
+            "![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)",
+        ) || markup.value.contains(
+            "![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)",
+        ) || markup.value.contains(
+            "![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)",
+        );
         assert!(
-            markup
-                .value
-                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
-            "expected hover to include shared realm badge, got: {}",
+            has_inline_realm_badge,
+            "expected hover to include a realm badge, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("**SHARED**")
+                || markup.value.contains("**SERVER**")
+                || markup.value.contains("**CLIENT**"),
+            "expected hover to include explicit realm label text, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("```lua\n(method)"),
+            "expected hover to keep syntax-highlighted lua signature, got: {}",
             markup.value
         );
         assert!(
@@ -806,6 +823,70 @@ mod tests {
                 .value
                 .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
             "expected hover to include shared realm badge without text description, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("**SHARED**"),
+            "expected hover to include SHARED label text with realm badge, got: {}",
+            markup.value
+        );
+        assert!(
+            markup
+                .value
+                .contains("```lua\n(method)"),
+            "expected hover to keep syntax-highlighted lua signature, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_badge_prefers_annotation_realm_over_inferred_realm() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@realm client
+
+                ---@class SANDBOX
+                ---@type SANDBOX
+                SANDBOX = SANDBOX or {}
+
+                ---Annotation should win for badge realm.
+                if SERVER then
+                    function SANDBOX:PlayerSpawnSE<??>NT(ply, class)
+                    end
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("sv_badge_priority.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+            "expected client badge from annotation realm precedence, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("**CLIENT**"),
+            "expected hover to include CLIENT label text with realm badge, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("```lua\n(method)"),
+            "expected hover to keep syntax-highlighted lua signature, got: {}",
             markup.value
         );
 
