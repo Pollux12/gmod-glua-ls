@@ -60,6 +60,7 @@
 - Format: `cargo fmt --all`
 - Pre-commit checks: `pre-commit run --all --hook-stage manual`
 - Spell check in CI: `typos`
+- Cargo is installed in local system but may show as unknown due to terminal restrictions - use directly path workaround e.g: `& "$env:USERPROFILE\.cargo\bin\cargo.exe"`
 
 ## Code Style and Conventions
 - Rust edition is `2024`; `rustfmt.toml` uses `max_width = 100`, 4 spaces.

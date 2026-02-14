@@ -133,7 +133,15 @@
       "default": {
         "extensions": [],
         "frameworkVersions": [],
-        "nonstandardSymbol": [],
+        "nonstandardSymbol": [
+          "//",
+          "/**/",
+          "continue",
+          "!=",
+          "||",
+          "&&",
+          "!"
+        ],
         "requireLikeFunction": [],
         "requirePattern": [],
         "special": {},
@@ -233,6 +241,11 @@
           "description": "Unused",
           "type": "string",
           "const": "unused"
+        },
+        {
+          "description": "Unused implicit self parameter",
+          "type": "string",
+          "const": "unused-self"
         },
         {
           "description": "Undefined global",
@@ -845,6 +858,13 @@
             "methodPrefixes": [],
             "methodToHook": {}
           }
+        },
+        "inferDynamicFields": {
+          "description": "Allow dynamic field inference on typed objects (Player, Entity, etc.).\nWhen enabled, reduces \"undefined field\" and \"inject field\" warnings for GMod's\ncommon pattern of adding custom fields to entities, players, and weapons at runtime.\nDefault: true (GMod-friendly ergonomics).",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "scriptedClassScopes": {
           "$ref": "#/$defs/EmmyrcGmodScriptedClassScopes",
