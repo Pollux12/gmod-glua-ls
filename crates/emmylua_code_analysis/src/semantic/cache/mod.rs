@@ -26,6 +26,7 @@ pub struct LuaInferCache {
     pub index_ref_origin_type_cache: HashMap<VarRefId, CacheEntry<LuaType>>,
     pub expr_var_ref_id_cache: HashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
+    pub scoped_scripted_global_cache: Option<Option<(String, String)>>,
 }
 
 impl LuaInferCache {
@@ -39,6 +40,7 @@ impl LuaInferCache {
             index_ref_origin_type_cache: HashMap::new(),
             expr_var_ref_id_cache: HashMap::new(),
             narrow_by_literal_stop_position_cache: HashSet::new(),
+            scoped_scripted_global_cache: None,
         }
     }
 
@@ -60,5 +62,6 @@ impl LuaInferCache {
         self.flow_node_cache.clear();
         self.index_ref_origin_type_cache.clear();
         self.expr_var_ref_id_cache.clear();
+        self.scoped_scripted_global_cache = None;
     }
 }
