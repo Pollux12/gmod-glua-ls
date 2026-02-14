@@ -3,6 +3,8 @@ mod dependency;
 mod diagnostic;
 mod flow;
 mod global;
+mod gmod_class;
+mod gmod_infer;
 mod member;
 mod metatable;
 mod module;
@@ -19,10 +21,12 @@ use std::sync::Arc;
 
 use crate::{Emmyrc, FileId, Vfs};
 pub use declaration::*;
-pub use dependency::LuaDependencyIndex;
+pub use dependency::{LuaDependencyIndex, LuaDependencyKind};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
 pub use flow::*;
 pub use global::{GlobalId, LuaGlobalIndex};
+pub use gmod_class::*;
+pub use gmod_infer::*;
 pub use member::*;
 pub use metatable::LuaMetatableIndex;
 pub use module::*;
@@ -47,6 +51,8 @@ pub struct DbIndex {
     diagnostic_index: DiagnosticIndex,
     operator_index: LuaOperatorIndex,
     flow_index: LuaFlowIndex,
+    gmod_class_index: GmodClassMetadataIndex,
+    gmod_infer_index: GmodInferIndex,
     vfs: Vfs,
     file_dependencies_index: LuaDependencyIndex,
     metatable_index: LuaMetatableIndex,
@@ -75,6 +81,8 @@ impl DbIndex {
             diagnostic_index: DiagnosticIndex::new(),
             operator_index: LuaOperatorIndex::new(),
             flow_index: LuaFlowIndex::new(),
+            gmod_class_index: GmodClassMetadataIndex::new(),
+            gmod_infer_index: GmodInferIndex::new(),
             vfs: Vfs::new(),
             file_dependencies_index: LuaDependencyIndex::new(),
             metatable_index: LuaMetatableIndex::new(),
@@ -178,6 +186,22 @@ impl DbIndex {
         &self.flow_index
     }
 
+    pub fn get_gmod_class_metadata_index(&self) -> &GmodClassMetadataIndex {
+        &self.gmod_class_index
+    }
+
+    pub fn get_gmod_class_metadata_index_mut(&mut self) -> &mut GmodClassMetadataIndex {
+        &mut self.gmod_class_index
+    }
+
+    pub fn get_gmod_infer_index(&self) -> &GmodInferIndex {
+        &self.gmod_infer_index
+    }
+
+    pub fn get_gmod_infer_index_mut(&mut self) -> &mut GmodInferIndex {
+        &mut self.gmod_infer_index
+    }
+
     pub fn get_vfs(&self) -> &Vfs {
         &self.vfs
     }
@@ -233,6 +257,8 @@ impl LuaIndex for DbIndex {
         self.diagnostic_index.remove(file_id);
         self.operator_index.remove(file_id);
         self.flow_index.remove(file_id);
+        self.gmod_class_index.remove(file_id);
+        self.gmod_infer_index.remove(file_id);
         self.file_dependencies_index.remove(file_id);
         self.metatable_index.remove(file_id);
         self.global_index.remove(file_id);
@@ -250,6 +276,8 @@ impl LuaIndex for DbIndex {
         self.diagnostic_index.clear();
         self.operator_index.clear();
         self.flow_index.clear();
+        self.gmod_class_index.clear();
+        self.gmod_infer_index.clear();
         self.file_dependencies_index.clear();
         self.metatable_index.clear();
         self.global_index.clear();
