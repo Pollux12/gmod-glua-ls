@@ -1,7 +1,8 @@
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 use emmylua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaCommentOwner,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaComment,
+    LuaCommentOwner,
     LuaDocDescriptionOwner,
     LuaDocTag, LuaDocTagRealm, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
     LuaVarExpr, PathTrait,
@@ -217,18 +218,28 @@ fn ensure_scoped_class_type_decl(
         );
     }
 
-    let super_type = LuaType::Ref(LuaTypeDeclId::global(global_name));
-    let has_super = db
-        .get_type_index()
-        .get_super_types_iter(&class_decl_id)
-        .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-        .unwrap_or(false);
-    if !has_super {
-        db.get_type_index_mut()
-            .add_super_type(class_decl_id.clone(), file_id, super_type);
+    for super_type in scoped_class_super_types(global_name) {
+        let has_super = db
+            .get_type_index()
+            .get_super_types_iter(&class_decl_id)
+            .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
+            .unwrap_or(false);
+        if !has_super {
+            db.get_type_index_mut()
+                .add_super_type(class_decl_id.clone(), file_id, super_type);
+        }
     }
 
     class_decl_id
+}
+
+fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
+    let mut super_types = vec![LuaType::Ref(LuaTypeDeclId::global(global_name))];
+    if global_name == "PLUGIN" {
+        super_types.push(LuaType::Ref(LuaTypeDeclId::global("GM")));
+    }
+
+    super_types
 }
 
 pub(crate) fn ensure_scoped_class_type_decl_for_file(
@@ -1173,7 +1184,7 @@ fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<Gmod
         .as_ref()
         .map(|name| name.trim().to_string())
         .unwrap_or_default();
-    let (hook_name, name_issue) = if let Some((hook_name, name_issue)) = mapped_method_hook {
+    let (hook_name, mut name_issue) = if let Some((hook_name, name_issue)) = mapped_method_hook {
         (hook_name, name_issue)
     } else if let Some(annotation_hook) = annotation {
         let hook_name = annotation_hook.hook_name.or_else(|| {
@@ -1198,6 +1209,11 @@ fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<Gmod
         let hook_name = (!trimmed_method_name.is_empty()).then_some(trimmed_method_name);
         (hook_name, name_issue)
     };
+
+    let hook_name = normalize_gamemode_hook_name(hook_name);
+    if hook_name.is_none() && name_issue.is_none() {
+        name_issue = Some(GmodHookNameIssue::Empty);
+    }
 
     Some(GmodHookSiteMetadata {
         syntax_id: index_expr.get_syntax_id(),
@@ -1250,7 +1266,7 @@ fn extract_param_names_from_closure(closure_expr: emmylua_parser::LuaClosureExpr
 }
 
 fn is_builtin_method_hook_prefix(prefix_name: &str) -> bool {
-    matches!(prefix_name, "GM" | "GAMEMODE")
+    matches!(prefix_name, "GM" | "GAMEMODE" | "PLUGIN" | "SANDBOX")
 }
 
 fn is_configured_method_hook_prefix(db: &DbIndex, prefix_name: &str) -> bool {
@@ -1341,6 +1357,35 @@ fn method_mapped_hook_name(
     None
 }
 
+fn normalize_gamemode_hook_name(hook_name: Option<String>) -> Option<String> {
+    let hook_name = hook_name?;
+    let trimmed = hook_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = strip_builtin_method_hook_prefix(trimmed)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(trimmed);
+
+    Some(normalized.to_string())
+}
+
+fn strip_builtin_method_hook_prefix(name: &str) -> Option<&str> {
+    for separator in [':', '.'] {
+        let Some((prefix, remainder)) = name.split_once(separator) else {
+            continue;
+        };
+
+        if is_builtin_method_hook_prefix(prefix.trim()) {
+            return Some(remainder);
+        }
+    }
+
+    None
+}
+
 fn extract_static_hook_name(
     first_arg: Option<LuaExpr>,
 ) -> (
@@ -1384,12 +1429,31 @@ fn collect_branch_realm_ranges(root: &LuaChunk) -> Vec<GmodRealmRange> {
     for if_stat in root.descendants::<LuaIfStat>() {
         collect_if_realm_ranges(&if_stat, &mut ranges);
     }
+    ranges.sort_by_key(|range| (range.range.len(), range.range.start()));
     ranges
 }
 
 /// Collect the first `---@realm client|server|shared` annotation from a file.
 fn collect_realm_annotation(root: &LuaChunk) -> Option<GmodRealm> {
-    let tag = root.descendants::<LuaDocTagRealm>().next()?;
+    for comment in root.descendants::<LuaComment>() {
+        let is_file_level = matches!(comment.get_owner(), None | Some(LuaAst::LuaChunk(_)));
+        if !is_file_level {
+            continue;
+        }
+
+        for tag in comment.get_doc_tags() {
+            if let LuaDocTag::Realm(realm_tag) = tag
+                && let Some(realm) = realm_from_doc_tag(&realm_tag)
+            {
+                return Some(realm);
+            }
+        }
+    }
+
+    None
+}
+
+fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
     let name = tag.get_name_token()?;
     match name.get_name_text() {
         "client" => Some(GmodRealm::Client),

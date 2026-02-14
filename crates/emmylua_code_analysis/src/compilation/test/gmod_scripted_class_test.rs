@@ -211,6 +211,11 @@ mod test {
                     .iter()
                     .any(|ty| ty == &LuaType::Ref(LuaTypeDeclId::global("PLUGIN")))
             );
+            assert!(
+                super_types
+                    .iter()
+                    .any(|ty| ty == &LuaType::Ref(LuaTypeDeclId::global("GM")))
+            );
         }
     }
 
