@@ -470,6 +470,11 @@
           "const": "gmod-realm-misuse"
         },
         {
+          "description": "gmod-realm-misuse-risky",
+          "type": "string",
+          "const": "gmod-realm-misuse-risky"
+        },
+        {
           "description": "gmod-unknown-net-message",
           "type": "string",
           "const": "gmod-unknown-net-message"
