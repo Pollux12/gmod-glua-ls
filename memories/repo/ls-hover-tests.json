@@ -1,0 +1,9 @@
+{
+  "subject": "LS hover regression test command",
+  "fact": "Targeted hover behavior tests for the language server live in crates/emmylua_ls/src/handlers/test/hover_function_test.rs and can be run with `cargo test -p emmylua_ls hover_function_test -- --nocapture`.",
+  "citations": [
+    "crates/emmylua_ls/src/handlers/test/hover_function_test.rs"
+  ],
+  "reason": "Having a focused test command speeds up validation for future hover/signature behavior changes without running the full workspace suite.",
+  "category": "testing"
+}
