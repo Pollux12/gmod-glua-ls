@@ -21,6 +21,11 @@ impl Checker for UnknownDocTag {
             .iter()
             .map(|tag| tag.as_str())
             .collect();
+        let mut known_tags = known_tags;
+        if semantic_model.get_emmyrc().gmod.enabled {
+            known_tags.insert("hook");
+            known_tags.insert("realm");
+        }
 
         let root = semantic_model.get_root().clone();
         for tag_other in root.descendants::<LuaDocTagOther>() {

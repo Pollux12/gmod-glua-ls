@@ -38,4 +38,25 @@ mod tests {
         "#
         ));
     }
+
+    #[test]
+    fn test_hook_doc_tag_is_known_when_gmod_enabled() {
+        let mut ws = VirtualWorkspace::new();
+
+        let mut emmyrc = ws.analysis.emmyrc.deref().clone();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .diagnostics
+            .enables
+            .push(DiagnosticCode::UnknownDocTag);
+        ws.analysis.update_config(Arc::new(emmyrc));
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UnknownDocTag,
+            r#"
+            ---@hook
+            function PLUGIN:PlayerSpawn() end
+        "#
+        ));
+    }
 }
