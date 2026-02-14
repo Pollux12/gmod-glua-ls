@@ -292,41 +292,25 @@ pub fn load_emmy_config(config_root: Option<PathBuf>, client_config: ClientConfi
 
     let home_dir = dirs::home_dir();
     if let Some(home_dir) = home_dir {
-        let global_luarc_path = home_dir.join(luarc_file);
-        if global_luarc_path.exists() {
-            info!("load config from: {:?}", global_luarc_path);
-            config_files.push(global_luarc_path);
-        }
-        let global_emmyrc_path = home_dir.join(emmyrc_file);
-        if global_emmyrc_path.exists() {
-            info!("load config from: {:?}", global_emmyrc_path);
-            config_files.push(global_emmyrc_path);
-        }
-        let global_emmyrc_lua_path = home_dir.join(emmyrc_lua_file);
-        if global_emmyrc_lua_path.exists() {
-            info!("load config from: {:?}", global_emmyrc_lua_path);
-            config_files.push(global_emmyrc_lua_path);
-        }
+        push_configs_from_dir(
+            &mut config_files,
+            &home_dir,
+            luarc_file,
+            emmyrc_file,
+            emmyrc_lua_file,
+        );
     };
 
     let emmylua_config_dir = "emmylua_ls";
     let config_dir = dirs::config_dir().map(|path| path.join(emmylua_config_dir));
     if let Some(config_dir) = config_dir {
-        let global_luarc_path = config_dir.join(luarc_file);
-        if global_luarc_path.exists() {
-            info!("load config from: {:?}", global_luarc_path);
-            config_files.push(global_luarc_path);
-        }
-        let global_emmyrc_path = config_dir.join(emmyrc_file);
-        if global_emmyrc_path.exists() {
-            info!("load config from: {:?}", global_emmyrc_path);
-            config_files.push(global_emmyrc_path);
-        }
-        let global_emmyrc_lua_path = config_dir.join(emmyrc_lua_file);
-        if global_emmyrc_lua_path.exists() {
-            info!("load config from: {:?}", global_emmyrc_lua_path);
-            config_files.push(global_emmyrc_lua_path);
-        }
+        push_configs_from_dir(
+            &mut config_files,
+            &config_dir,
+            luarc_file,
+            emmyrc_file,
+            emmyrc_lua_file,
+        );
     };
 
     std::env::var("EMMYLUALS_CONFIG")
@@ -340,21 +324,13 @@ pub fn load_emmy_config(config_root: Option<PathBuf>, client_config: ClientConfi
         .ok();
 
     if let Some(config_root) = &config_root {
-        let luarc_path = config_root.join(luarc_file);
-        if luarc_path.exists() {
-            info!("load config from: {:?}", luarc_path);
-            config_files.push(luarc_path);
-        }
-        let emmyrc_path = config_root.join(emmyrc_file);
-        if emmyrc_path.exists() {
-            info!("load config from: {:?}", emmyrc_path);
-            config_files.push(emmyrc_path);
-        }
-        let emmyrc_lua_path = config_root.join(emmyrc_lua_file);
-        if emmyrc_lua_path.exists() {
-            info!("load config from: {:?}", emmyrc_lua_path);
-            config_files.push(emmyrc_lua_path);
-        }
+        push_configs_from_dir(
+            &mut config_files,
+            config_root,
+            luarc_file,
+            emmyrc_file,
+            emmyrc_lua_file,
+        );
     }
 
     let mut emmyrc = load_configs(config_files, client_config.partial_emmyrcs.clone());
@@ -365,6 +341,36 @@ pub fn load_emmy_config(config_root: Option<PathBuf>, client_config: ClientConfi
 
     log::info!("loaded emmyrc complete");
     emmyrc.into()
+}
+
+fn push_configs_from_dir(
+    config_files: &mut Vec<PathBuf>,
+    dir: &Path,
+    luarc_file: &str,
+    emmyrc_file: &str,
+    emmyrc_lua_file: &str,
+) {
+    let dir_configs = collect_config_files_from_dir(dir, luarc_file, emmyrc_file, emmyrc_lua_file);
+    for config_file in dir_configs {
+        info!("load config from: {:?}", config_file);
+        config_files.push(config_file);
+    }
+}
+
+fn collect_config_files_from_dir(
+    dir: &Path,
+    luarc_file: &str,
+    emmyrc_file: &str,
+    emmyrc_lua_file: &str,
+) -> Vec<PathBuf> {
+    [
+        dir.join(luarc_file),
+        dir.join(emmyrc_file),
+        dir.join(emmyrc_lua_file),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .collect()
 }
 
 fn merge_client_config(client_config: ClientConfig, emmyrc: &mut Emmyrc) -> Option<()> {
@@ -494,5 +500,60 @@ impl WorkspaceDiagnosticLevel {
 
     pub fn to_u8(self) -> u8 {
         self as u8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::collect_config_files_from_dir;
+
+    fn create_temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("emmylua_ls_config_test_{unique}"));
+        fs::create_dir_all(&dir).expect("failed to create temp test dir");
+        dir
+    }
+
+    fn touch(path: &Path) {
+        fs::write(path, "{}").expect("failed to create temp config file");
+    }
+
+    #[test]
+    fn test_collect_config_files_from_dir_orders_luarc_then_emmyrc_json() {
+        let dir = create_temp_dir();
+        let emmyrc_json = dir.join(".emmyrc.json");
+        let luarc_json = dir.join(".luarc.json");
+        touch(&emmyrc_json);
+        touch(&luarc_json);
+
+        let files = collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
+
+        assert_eq!(files, vec![luarc_json, emmyrc_json]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_collect_config_files_from_dir_orders_emmyrc_lua_last() {
+        let dir = create_temp_dir();
+        let emmyrc_lua = dir.join(".emmyrc.lua");
+        let emmyrc_json = dir.join(".emmyrc.json");
+        let luarc_json = dir.join(".luarc.json");
+        touch(&emmyrc_lua);
+        touch(&emmyrc_json);
+        touch(&luarc_json);
+
+        let files = collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
+
+        assert_eq!(files, vec![luarc_json, emmyrc_json, emmyrc_lua]);
+        let _ = fs::remove_dir_all(dir);
     }
 }
