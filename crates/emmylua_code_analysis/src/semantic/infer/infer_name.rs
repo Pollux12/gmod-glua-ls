@@ -1,8 +1,12 @@
-use emmylua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaNameExpr};
+use std::path::Path;
+
+use emmylua_parser::{LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr, LuaVarExpr};
+use wax::Pattern;
 
 use super::{InferFailReason, InferResult};
 use crate::{
-    LuaDecl, LuaDeclExtra, LuaInferCache, LuaMemberId, LuaSemanticDeclId, LuaType,
+    FileId, LuaDecl, LuaDeclExtra, LuaInferCache, LuaMemberId, LuaSemanticDeclId, LuaType,
+    LuaTypeDeclId,
     SemanticDeclLevel, TypeOps,
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
@@ -40,11 +44,261 @@ pub fn infer_name_expr(
             VarRefId::VarRef(decl_id),
         )
     } else {
+        if let Some(scoped_type) = infer_scoped_scripted_global_type(db, cache, name)
+        {
+            return Ok(scoped_type);
+        }
+
         infer_global_type(db, name)
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScopedGlobalRule {
+    global_name: &'static str,
+    folder_segments: &'static [&'static str],
+}
+
+const SCOPED_GLOBAL_RULES: &[ScopedGlobalRule] = &[
+    ScopedGlobalRule {
+        global_name: "TOOL",
+        folder_segments: &["weapons", "gmod_tool", "stools"],
+    },
+    ScopedGlobalRule {
+        global_name: "ENT",
+        folder_segments: &["entities"],
+    },
+    ScopedGlobalRule {
+        global_name: "SWEP",
+        folder_segments: &["weapons"],
+    },
+    ScopedGlobalRule {
+        global_name: "EFFECT",
+        folder_segments: &["effects"],
+    },
+    ScopedGlobalRule {
+        global_name: "PLUGIN",
+        folder_segments: &["plugins"],
+    },
+];
+
+fn infer_scoped_scripted_global_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name: &str,
+) -> Option<LuaType> {
+    let class_decl_id = resolve_scoped_scripted_global_type_decl_id(db, cache, name)?;
+    Some(LuaType::Def(class_decl_id))
+}
+
+pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name: &str,
+) -> Option<LuaTypeDeclId> {
+    if !db.get_emmyrc().gmod.enabled || !is_scoped_scripted_global_name(name) {
+        return None;
+    }
+
+    let (global_name, class_name) = detect_scoped_global_from_path_cached(db, cache)?;
+    if global_name != name {
+        return None;
+    }
+
+    Some(LuaTypeDeclId::global(&class_name))
+}
+
+fn is_scoped_scripted_global_name(name: &str) -> bool {
+    matches!(name, "TOOL" | "ENT" | "SWEP" | "EFFECT" | "PLUGIN")
+}
+
+fn detect_scoped_global_from_path_cached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+) -> Option<(String, String)> {
+    if let Some(cached) = cache.scoped_scripted_global_cache.as_ref() {
+        return cached.clone();
+    }
+
+    let detected = detect_scoped_global_from_path(db, cache.get_file_id())
+        .map(|(global_name, class_name)| (global_name.to_string(), class_name));
+    cache.scoped_scripted_global_cache = Some(detected.clone());
+    detected
+}
+
+fn detect_scoped_global_from_path(db: &DbIndex, file_id: FileId) -> Option<(&'static str, String)> {
+    if !is_in_scripted_class_scope(db, file_id) {
+        return None;
+    }
+
+    let file_path = db.get_vfs().get_file_path(&file_id)?;
+    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
+    let lower_segments = normalized_path
+        .to_ascii_lowercase()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lower_segments.is_empty() {
+        return None;
+    }
+
+    let mut best_match: Option<(&ScopedGlobalRule, usize, usize)> = None;
+    for rule in SCOPED_GLOBAL_RULES {
+        let rule_len = rule.folder_segments.len();
+        if rule_len == 0 || lower_segments.len() < rule_len {
+            continue;
+        }
+
+        for start_idx in (0..=lower_segments.len() - rule_len).rev() {
+            let mut matched = true;
+            for (offset, rule_segment) in rule.folder_segments.iter().enumerate() {
+                if lower_segments[start_idx + offset] != *rule_segment {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if !matched {
+                continue;
+            }
+
+            let end_idx = start_idx + rule_len - 1;
+            let replace_best = match best_match {
+                None => true,
+                Some((_, best_end_idx, best_rule_len)) => {
+                    end_idx > best_end_idx || (end_idx == best_end_idx && rule_len > best_rule_len)
+                }
+            };
+
+            if replace_best {
+                best_match = Some((rule, end_idx, rule_len));
+            }
+            break;
+        }
+    }
+
+    let (rule, best_end_idx, _) = best_match?;
+    let class_idx = best_end_idx + 1;
+    if class_idx >= lower_segments.len() {
+        return None;
+    }
+
+    let class_name = if class_idx == lower_segments.len() - 1 {
+        lower_segments[class_idx]
+            .strip_suffix(".lua")
+            .unwrap_or(lower_segments[class_idx].as_str())
+            .to_string()
+    } else {
+        lower_segments[class_idx].clone()
+    };
+
+    if class_name.is_empty() {
+        return None;
+    }
+
+    Some((rule.global_name, class_name))
+}
+
+fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
+    let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+    if scopes.include.is_empty() && scopes.exclude.is_empty() {
+        return true;
+    }
+
+    let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
+        return scopes.include.is_empty();
+    };
+
+    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
+    let mut candidate_paths = Vec::new();
+    push_path_candidates(&mut candidate_paths, &normalized_path);
+    let normalized_lower = normalized_path.to_ascii_lowercase();
+    if let Some(lua_idx) = normalized_lower.find("/lua/") {
+        let lua_relative_path = normalized_path[lua_idx + 1..].to_string();
+        push_path_candidates(&mut candidate_paths, &lua_relative_path);
+        if let Some(stripped) = lua_relative_path.strip_prefix("lua/") {
+            push_path_candidates(&mut candidate_paths, stripped);
+        }
+    }
+    if let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) {
+        push_candidate_path(&mut candidate_paths, file_name);
+    }
+
+    if !scopes.include.is_empty() {
+        let include_pattern = scopes
+            .include
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let include_set = match wax::any(include_pattern) {
+            Ok(glob) => glob,
+            Err(err) => {
+                log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
+                return true;
+            }
+        };
+        if !candidate_paths
+            .iter()
+            .any(|path| include_set.is_match(Path::new(path)))
+        {
+            return false;
+        }
+    }
+
+    if !scopes.exclude.is_empty() {
+        let exclude_pattern = scopes
+            .exclude
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let exclude_set = match wax::any(exclude_pattern) {
+            Ok(glob) => glob,
+            Err(err) => {
+                log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");
+                return false;
+            }
+        };
+        if candidate_paths
+            .iter()
+            .any(|path| exclude_set.is_match(Path::new(path)))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn push_path_candidates(candidate_paths: &mut Vec<String>, path: &str) {
+    push_candidate_path(candidate_paths, path);
+
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    for idx in 0..segments.len() {
+        push_candidate_path(candidate_paths, &segments[idx..].join("/"));
+    }
+}
+
+fn push_candidate_path(candidate_paths: &mut Vec<String>, candidate: &str) {
+    if candidate.is_empty() {
+        return;
+    }
+
+    if candidate_paths.iter().any(|existing| existing == candidate) {
+        return;
+    }
+
+    candidate_paths.push(candidate.to_string());
+}
+
 fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -> InferResult {
+    if let Some(scoped_self_type) = infer_scoped_implicit_self_type(db, cache, &name_expr) {
+        return Ok(scoped_self_type);
+    }
+
     let decl_or_member_id =
         find_self_decl_or_member_id(db, cache, &name_expr).ok_or(InferFailReason::None)?;
     // LuaDeclOrMemberId::Member(member_id) => find_decl_member_type(db, member_id),
