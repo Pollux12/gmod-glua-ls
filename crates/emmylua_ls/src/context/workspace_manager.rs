@@ -184,7 +184,7 @@ impl WorkspaceManager {
     }
 
     pub async fn reindex_workspace(&self, delay: Duration) -> Option<()> {
-        log::info!("reindex workspace with delay: {:?}", delay);
+        log::info!("refresh workspace with delay: {:?}", delay);
         let mut update_token = self.update_token.lock().await;
         if let Some(token) = update_token.as_ref() {
             token.cancel();
@@ -210,8 +210,7 @@ impl WorkspaceManager {
                 let mut analysis = analysis.write().await;
                 // 在重新索引之前清理不存在的文件
                 analysis.cleanup_nonexistent_files();
-                analysis.reindex();
-                // Release lock immediately after reindex
+                // Release lock immediately after cleanup
             }
 
             // Cancel diagnostics and update status without holding analysis lock
