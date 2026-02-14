@@ -778,6 +778,25 @@ impl LuaDocTagModule {
     pub fn get_string_token(&self) -> Option<LuaStringToken> {
         self.token()
     }
+
+    pub fn get_module_path(&self) -> Option<String> {
+        if let Some(string_token) = self.get_string_token() {
+            return Some(string_token.get_value());
+        }
+        let mut path = String::new();
+        for token in self.syntax.children_with_tokens() {
+            if let Some(token) = token.as_token() {
+                let kind: LuaTokenKind = token.kind().into();
+                match kind {
+                    LuaTokenKind::TkName | LuaTokenKind::TkDot => {
+                        path.push_str(token.text());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if path.is_empty() { None } else { Some(path) }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

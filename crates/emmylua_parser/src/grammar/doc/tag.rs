@@ -242,12 +242,36 @@ fn parse_tag_alias(p: &mut LuaDocParser) -> DocParseResult {
 }
 
 // ---@module "aaa.bbb.ccc" force variable be "aaa.bbb.ccc"
+// ---@module aaa.bbb.ccc    also accepted (unquoted dotted name)
 fn parse_tag_module(p: &mut LuaDocParser) -> DocParseResult {
     p.set_lexer_state(LuaDocLexerState::Normal);
     let m = p.mark(LuaSyntaxKind::DocTagModule);
     p.bump();
 
-    expect_token(p, LuaTokenKind::TkString)?;
+    match p.current_token() {
+        LuaTokenKind::TkString => {
+            p.bump();
+        }
+        LuaTokenKind::TkName => {
+            p.bump();
+            while p.current_token() == LuaTokenKind::TkDot {
+                p.bump();
+                if p.current_token() == LuaTokenKind::TkName {
+                    p.bump();
+                }
+            }
+        }
+        _ => {
+            return Err(LuaParseError::syntax_error_from(
+                &t!(
+                    "expected %{token}, but get %{current}",
+                    token = LuaTokenKind::TkString,
+                    current = p.current_token()
+                ),
+                p.current_token_range(),
+            ));
+        }
+    }
 
     p.set_lexer_state(LuaDocLexerState::Description);
     parse_description(p);
