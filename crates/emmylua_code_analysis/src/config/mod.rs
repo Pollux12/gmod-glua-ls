@@ -10,9 +10,11 @@ pub use config_loader::{load_configs, load_configs_raw};
 pub use configs::{
     DiagnosticSeveritySetting, DocSyntax, EmmyLibraryConfig, EmmyLibraryItem, EmmyrcCodeAction,
     EmmyrcCodeLens, EmmyrcCompletion, EmmyrcDiagnostic, EmmyrcDoc, EmmyrcDocumentColor,
-    EmmyrcExternalTool, EmmyrcFilenameConvention, EmmyrcHover, EmmyrcInlayHint, EmmyrcInlineValues,
-    EmmyrcLuaVersion, EmmyrcReference, EmmyrcReformat, EmmyrcResource, EmmyrcRuntime,
-    EmmyrcSemanticToken, EmmyrcSignature, EmmyrcStrict, EmmyrcWorkspace, EmmyrcWorkspaceModuleMap,
+    EmmyrcExternalTool, EmmyrcFilenameConvention, EmmyrcGmod, EmmyrcGmodHookMappings,
+    EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes, EmmyrcHover, EmmyrcInlayHint,
+    EmmyrcInlineValues, EmmyrcLuaVersion, EmmyrcReference, EmmyrcReformat, EmmyrcResource,
+    EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcSignature, EmmyrcStrict, EmmyrcWorkspace,
+    EmmyrcWorkspaceModuleMap,
 };
 use emmylua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig, SpecialFunction};
 use rowan::NodeCache;
@@ -37,6 +39,8 @@ pub struct Emmyrc {
     pub hint: EmmyrcInlayHint,
     #[serde(default)]
     pub runtime: EmmyrcRuntime,
+    #[serde(default)]
+    pub gmod: EmmyrcGmod,
     #[serde(default)]
     pub workspace: EmmyrcWorkspace,
     #[serde(default)]

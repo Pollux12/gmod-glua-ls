@@ -4,6 +4,7 @@ mod completion;
 mod diagnostics;
 mod doc;
 mod document_color;
+mod gmod;
 mod hover;
 mod inlayhint;
 mod inline_values;
@@ -22,6 +23,9 @@ pub use completion::{EmmyrcCompletion, EmmyrcFilenameConvention};
 pub use diagnostics::{DiagnosticSeveritySetting, EmmyrcDiagnostic};
 pub use doc::{DocSyntax, EmmyrcDoc};
 pub use document_color::EmmyrcDocumentColor;
+pub use gmod::{
+    EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes,
+};
 pub use hover::EmmyrcHover;
 pub use inlayhint::EmmyrcInlayHint;
 pub use inline_values::EmmyrcInlineValues;
