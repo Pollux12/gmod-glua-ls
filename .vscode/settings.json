@@ -5,4 +5,13 @@
     "files.trimTrailingWhitespace": true,
     "files.trimTrailingWhitespaceInRegexAndStrings": true,
     "rust-analyzer.check.command": "clippy",
+    "github.copilot.chat.additionalReadAccessPaths": [
+        "C:\\Users\\Pollux\\Documents\\glualangserver\\emmylua-rust\\glua-api-snippets",
+        "A:\\Misc\\FearlessSRCDS\\steamapps\\common\\GarrysModDS\\garrysmod\\gamemodes\\cityrp"
+    ],
+    "github.copilot.chat.anthropic.contextEditing.enabled": true,
+    "github.copilot.chat.tools.memory.enabled": false,
+    "chat.tools.terminal.autoApprove": {
+        "cargo test": true
+    },
 }
