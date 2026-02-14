@@ -310,6 +310,35 @@ fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -
     )
 }
 
+fn infer_scoped_implicit_self_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaType> {
+    let file_id = cache.get_file_id();
+    let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
+    let self_decl = decl_tree.find_local_decl("self", name_expr.get_position())?;
+    if !self_decl.is_implicit_self() {
+        return None;
+    }
+
+    let func_stat = name_expr.ancestors::<LuaFuncStat>().next()?;
+    let func_name = func_stat.get_func_name()?;
+    let LuaVarExpr::IndexExpr(index_expr) = func_name else {
+        return None;
+    };
+    if !index_expr.get_index_token()?.is_colon() {
+        return None;
+    }
+
+    let LuaExpr::NameExpr(prefix_name_expr) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let prefix_name = prefix_name_expr.get_name_text()?;
+    let class_decl_id = resolve_scoped_scripted_global_type_decl_id(db, cache, &prefix_name)?;
+    Some(LuaType::Def(class_decl_id))
+}
+
 pub fn get_name_expr_var_ref_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
