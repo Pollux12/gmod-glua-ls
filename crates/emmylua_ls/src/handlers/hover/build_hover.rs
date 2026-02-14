@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use emmylua_code_analysis::humanize_type;
 use emmylua_code_analysis::{
     DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaMemberId, LuaMemberKey,
-    LuaSemanticDeclId, LuaSignatureId, LuaType, RenderLevel, SemanticInfo, SemanticModel,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
+    SemanticInfo, SemanticModel,
 };
 use emmylua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaSyntaxKind, LuaSyntaxToken,
@@ -238,6 +239,8 @@ fn build_member_hover(
     };
 
     if is_function(&typ) {
+        extend_gmod_hook_semantic_decls(builder, db, member, &mut semantic_decls);
+
         adjust_semantic_decls(
             builder,
             &mut semantic_decls,
@@ -299,6 +302,79 @@ fn build_member_hover(
     }
 
     Some(())
+}
+
+fn extend_gmod_hook_semantic_decls(
+    builder: &HoverBuilder,
+    db: &DbIndex,
+    member: &emmylua_code_analysis::LuaMember,
+    semantic_decls: &mut Vec<(LuaSemanticDeclId, LuaType)>,
+) {
+    if !builder.semantic_model.get_emmyrc().gmod.enabled {
+        return;
+    }
+
+    let Some(LuaMemberOwner::Type(owner_type_decl_id)) =
+        db.get_member_index().get_current_owner(&member.get_id())
+    else {
+        return;
+    };
+
+    let fallback_owner_names = gmod_hook_owner_fallbacks(owner_type_decl_id.get_simple_name());
+    if fallback_owner_names.is_empty() {
+        return;
+    }
+
+    let member_key = member.get_key().clone();
+    for fallback_owner_name in fallback_owner_names {
+        let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
+        let Some(member_infos) =
+            builder
+                .semantic_model
+                .get_member_info_with_key(&fallback_type, member_key.clone(), true)
+        else {
+            continue;
+        };
+
+        for member_info in member_infos {
+            let Some(property_owner_id) = member_info.property_owner_id else {
+                continue;
+            };
+
+            if semantic_decls
+                .iter()
+                .any(|(decl_id, _)| decl_id == &property_owner_id)
+            {
+                continue;
+            }
+
+            let owner_type = match property_owner_id {
+                LuaSemanticDeclId::LuaDecl(decl_id) => builder.semantic_model.get_type(decl_id.into()),
+                LuaSemanticDeclId::Member(member_id) => {
+                    builder.semantic_model.get_type(member_id.into())
+                }
+                _ => continue,
+            };
+
+            if !is_function(&owner_type) {
+                continue;
+            }
+
+            semantic_decls.push((property_owner_id, owner_type));
+        }
+    }
+}
+
+fn gmod_hook_owner_fallbacks(owner_name: &str) -> &'static [&'static str] {
+    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
+        &["SANDBOX"]
+    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
+        &["GM", "GAMEMODE", "SANDBOX"]
+    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
+        &["GM", "GAMEMODE"]
+    } else {
+        &[]
+    }
 }
 
 pub fn add_signature_param_description(

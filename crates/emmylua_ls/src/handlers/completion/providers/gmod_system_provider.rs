@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use emmylua_code_analysis::GmodRealm;
 use emmylua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken, PathTrait,
 };
@@ -100,8 +101,30 @@ fn add_hook_completion_items(
     let before_count = builder.get_completion_items_mut().len();
     let infer_index = builder.semantic_model.get_db().get_gmod_infer_index();
     let mut hook_stats: HashMap<String, HookStats> = HashMap::new();
+    let call_realm = infer_index.get_realm_at_offset(
+        &builder.semantic_model.get_file_id(),
+        builder.position_offset,
+    );
+    let mut allowed_file_ids: Option<HashSet<_>> = None;
+    if matches!(call_realm, GmodRealm::Client | GmodRealm::Server) {
+        let mut ids = HashSet::new();
+        for (file_id, _) in infer_index.iter_hook_file_metadata() {
+            let file_realm = infer_index
+                .get_realm_file_metadata(file_id)
+                .map(|metadata| metadata.inferred_realm)
+                .unwrap_or(GmodRealm::Unknown);
+            if is_realm_compatible(call_realm, file_realm) {
+                ids.insert(*file_id);
+            }
+        }
+        allowed_file_ids = Some(ids);
+    }
 
-    for (_, metadata) in infer_index.iter_hook_file_metadata() {
+    for (file_id, metadata) in infer_index.iter_hook_file_metadata() {
+        if let Some(allowed) = &allowed_file_ids && !allowed.contains(file_id) {
+            continue;
+        }
+
         for hook_site in &metadata.sites {
             let Some(name) = normalize_name(hook_site.hook_name.as_deref()) else {
                 continue;
@@ -221,4 +244,11 @@ fn normalize_name(name: Option<&str>) -> Option<&str> {
     } else {
         Some(trimmed)
     }
+}
+
+fn is_realm_compatible(call_realm: GmodRealm, item_realm: GmodRealm) -> bool {
+    !matches!(
+        (call_realm, item_realm),
+        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
+    )
 }

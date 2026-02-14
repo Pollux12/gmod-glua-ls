@@ -700,4 +700,63 @@ mod tests {
 
         Ok(())
     }
+
+    #[gtest]
+    fn test_hover_gm_hook_method_uses_sandbox_docs() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "library/lua/includes/extensions/sandbox_hooks.lua",
+            r#"
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@class SANDBOX
+                ---@type SANDBOX
+                SANDBOX = SANDBOX or {}
+
+                ---Called when a player attempts to spawn a SENT.
+                ---@param ply Player
+                ---@param class string
+                ---@return boolean
+                function SANDBOX:PlayerSpawnSENT(ply, class)
+                end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                function GM:PlayerSpawnSE<??>NT(ply, class)
+                    return true
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("Called when a player attempts to spawn a SENT"),
+            "expected hover to include SANDBOX hook docs, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("PlayerSpawnSENT"),
+            "expected hover to include hook function signature, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
 }

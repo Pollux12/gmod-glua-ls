@@ -2469,16 +2469,13 @@ mod tests {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc
-            .gmod
-            .hook_mappings
-            .method_prefixes
-            .push("PLUGIN".to_string());
         ws.analysis.update_config(emmyrc.into());
         ws.def(
             r#"
             hook.Add("Think", "id", function() end)
             function GM:PlayerSpawn(ply) end
+            function GM:PlayerSpawnSENT(ply, class_name) end
+            function SANDBOX:PlayerSpawnSENT(ply, class_name) end
             function PLUGIN:OnPluginLoaded(client, character) end
             ---@hook CustomEvent
             function PLUGIN:IgnoredName(x, y) end
@@ -2508,12 +2505,85 @@ mod tests {
                     label_detail: Some("(0 add, 1 methods, 0 emits) args: ply".to_string()),
                 },
                 VirtualCompletionItem {
+                    label: "PlayerSpawnSENT".to_string(),
+                    kind: CompletionItemKind::CONSTANT,
+                    label_detail: Some(
+                        "(0 add, 2 methods, 0 emits) args: ply, class_name".to_string(),
+                    ),
+                },
+                VirtualCompletionItem {
                     label: "Think".to_string(),
                     kind: CompletionItemKind::CONSTANT,
                     label_detail: Some("(1 add, 0 methods, 0 emits)".to_string()),
                 },
             ],
         ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_hook_completion_filters_realm_in_client_context() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_file(
+            "sv_hook.lua",
+            r#"
+            function GM:ServerOnlyHook(ply) end
+            "#,
+        );
+        ws.def_file(
+            "cl_hook.lua",
+            r#"
+            function GM:ClientOnlyHook(ply) end
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            if CLIENT then
+                hook.Run("<??>")
+            end
+            "#,
+            vec![VirtualCompletionItem {
+                label: "ClientOnlyHook".to_string(),
+                kind: CompletionItemKind::CONSTANT,
+                label_detail: Some("(0 add, 1 methods, 0 emits) args: ply".to_string()),
+            }],
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_member_completion_filters_realm_in_client_context() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_completion(
+            r#"
+            ---@class GM
+            ---@type GM
+            GM = GM or {}
+
+            if SERVER then
+                function GM:ServerOnlyMethod() end
+            end
+
+            if CLIENT then
+                function GM:ClientOnlyMethod() end
+                GM:<??>
+            end
+            "#,
+            vec![VirtualCompletionItem {
+                label: "ClientOnlyMethod".to_string(),
+                kind: CompletionItemKind::FUNCTION,
+                label_detail: Some("()".to_string()),
+            }],
+        ));
+
         Ok(())
     }
 }

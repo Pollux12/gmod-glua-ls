@@ -1,9 +1,11 @@
 use emmylua_code_analysis::{
-    DbIndex, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticModel,
+    DbIndex, FileId, GmodRealm, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId, LuaType,
+    LuaTypeDeclId, SemanticModel,
     enum_variable_is_param, get_tpl_ref_extend_type,
 };
 use emmylua_parser::{LuaAstNode, LuaAstToken, LuaIndexExpr, LuaStringToken};
-use std::collections::HashMap;
+use rowan::TextSize;
+use std::collections::{HashMap, HashSet};
 
 use crate::handlers::completion::{
     add_completions::{CompletionTriggerStatus, add_member_completion},
@@ -54,9 +56,65 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         return None;
     }
 
-    let member_info_map = builder.semantic_model.get_member_info_map(&prefix_type)?;
+    let mut member_info_map = builder.semantic_model.get_member_info_map(&prefix_type)?;
+    extend_gmod_hook_fallback_members(builder, &prefix_type, &mut member_info_map);
 
     add_completions_for_members(builder, &member_info_map, completion_status)
+}
+
+fn extend_gmod_hook_fallback_members(
+    builder: &CompletionBuilder,
+    prefix_type: &LuaType,
+    members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+) {
+    if !builder.semantic_model.get_emmyrc().gmod.enabled {
+        return;
+    }
+
+    let LuaType::Ref(owner_type_decl_id) = prefix_type else {
+        return;
+    };
+    let fallback_owner_names = gmod_hook_owner_fallbacks(owner_type_decl_id.get_simple_name());
+    if fallback_owner_names.is_empty() {
+        return;
+    }
+
+    let mut existing: HashMap<LuaMemberKey, HashSet<Option<LuaSemanticDeclId>>> = HashMap::new();
+    for (key, infos) in members.iter() {
+        let entry = existing.entry(key.clone()).or_default();
+        for info in infos {
+            entry.insert(info.property_owner_id.clone());
+        }
+    }
+
+    for fallback_owner_name in fallback_owner_names {
+        let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
+        let Some(fallback_map) = builder.semantic_model.get_member_info_map(&fallback_type) else {
+            continue;
+        };
+
+        for (key, fallback_infos) in fallback_map {
+            let owners = existing.entry(key.clone()).or_default();
+            let target = members.entry(key).or_default();
+            for info in fallback_infos {
+                if owners.insert(info.property_owner_id.clone()) {
+                    target.push(info);
+                }
+            }
+        }
+    }
+}
+
+fn gmod_hook_owner_fallbacks(owner_name: &str) -> &'static [&'static str] {
+    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
+        &["SANDBOX"]
+    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
+        &["GM", "GAMEMODE", "SANDBOX"]
+    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
+        &["GM", "GAMEMODE"]
+    } else {
+        &[]
+    }
 }
 
 pub fn add_completions_for_members(
@@ -82,6 +140,9 @@ fn add_resolve_member_infos(
 ) -> Option<()> {
     if member_infos.len() == 1 {
         let member_info = &member_infos[0];
+        if !is_member_realm_compatible(builder, member_info) {
+            return Some(());
+        }
         let overload_count = match &member_info.typ {
             LuaType::DocFunction(_) => None,
             LuaType::Signature(id) => {
@@ -114,6 +175,10 @@ fn add_resolve_member_infos(
     let resolve_state = get_resolve_state(builder.semantic_model.get_db(), &filtered_member_infos);
 
     for member_info in filtered_member_infos {
+        if !is_member_realm_compatible(builder, member_info) {
+            continue;
+        }
+
         match resolve_state {
             MemberResolveState::All => {
                 add_member_completion(
@@ -163,6 +228,7 @@ fn filter_member_infos<'a>(
     }
 
     let mut file_decl_member: Option<&LuaMemberInfo> = None;
+    let mut gmod_meta_member: Option<&LuaMemberInfo> = None;
     let mut member_with_owners: Vec<(&LuaMemberInfo, Option<LuaTypeDeclId>)> =
         Vec::with_capacity(member_infos.len());
     let mut all_doc_function = true;
@@ -179,6 +245,14 @@ fn filter_member_infos<'a>(
             && feature.is_file_decl()
         {
             file_decl_member = Some(member_info);
+        }
+
+        if gmod_meta_member.is_none()
+            && let Some(feature) = member_info.feature
+            && feature.is_meta_decl()
+            && is_gmod_hook_member_info(semantic_model.get_db(), member_info)
+        {
+            gmod_meta_member = Some(member_info);
         }
 
         // 检查是否全为 DocFunction，同时计算重载数量
@@ -200,7 +274,9 @@ fn filter_member_infos<'a>(
     }
 
     // 确定最终使用的参考 owner
-    let final_reference_owner = if let Some(file_decl_member_info) = file_decl_member {
+    let final_reference_owner = if let Some(meta_member_info) = gmod_meta_member {
+        get_owner_type_id(semantic_model.get_db(), meta_member_info)
+    } else if let Some(file_decl_member_info) = file_decl_member {
         // 与第一个成员进行类型检查, 确保子类成员的类型与父类成员的类型一致
         if let Some((first_member, first_owner)) = member_with_owners.first() {
             let type_check_result =
@@ -281,4 +357,56 @@ fn get_resolve_state(db: &DbIndex, member_infos: &Vec<&LuaMemberInfo>) -> Member
         }
     }
     resolve_state
+}
+
+fn is_gmod_hook_member_info(db: &DbIndex, info: &LuaMemberInfo) -> bool {
+    let Some(owner_type_id) = get_owner_type_id(db, info) else {
+        return false;
+    };
+
+    let owner_name = owner_type_id.get_simple_name();
+    owner_name.eq_ignore_ascii_case("GM")
+        || owner_name.eq_ignore_ascii_case("GAMEMODE")
+        || owner_name.eq_ignore_ascii_case("SANDBOX")
+        || owner_name.eq_ignore_ascii_case("PLUGIN")
+}
+
+fn is_member_realm_compatible(builder: &CompletionBuilder, info: &LuaMemberInfo) -> bool {
+    if !builder.semantic_model.get_emmyrc().gmod.enabled {
+        return true;
+    }
+
+    let infer_index = builder.semantic_model.get_db().get_gmod_infer_index();
+    let call_realm = infer_index.get_realm_at_offset(
+        &builder.semantic_model.get_file_id(),
+        builder.position_offset,
+    );
+
+    if !matches!(call_realm, GmodRealm::Client | GmodRealm::Server) {
+        return true;
+    }
+
+    let Some(property_owner_id) = &info.property_owner_id else {
+        return true;
+    };
+    let Some((decl_file_id, decl_offset)) = semantic_decl_position(property_owner_id) else {
+        return true;
+    };
+
+    let decl_realm = infer_index.get_realm_at_offset(&decl_file_id, decl_offset);
+    !matches!(
+        (call_realm, decl_realm),
+        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
+    )
+}
+
+fn semantic_decl_position(property_owner_id: &LuaSemanticDeclId) -> Option<(FileId, TextSize)> {
+    match property_owner_id {
+        LuaSemanticDeclId::LuaDecl(decl_id) => Some((decl_id.file_id, decl_id.position)),
+        LuaSemanticDeclId::Member(member_id) => Some((member_id.file_id, member_id.get_position())),
+        LuaSemanticDeclId::Signature(signature_id) => {
+            Some((signature_id.get_file_id(), signature_id.get_position()))
+        }
+        LuaSemanticDeclId::TypeDecl(_) => None,
+    }
 }

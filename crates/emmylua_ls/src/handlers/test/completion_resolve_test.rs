@@ -123,4 +123,45 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[gtest]
+    fn test_gmod_sandbox_completion_prefers_annotation_docs() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "library/lua/includes/extensions/sandbox_hooks.lua",
+            r#"
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@class SANDBOX
+                ---@type SANDBOX
+                SANDBOX = SANDBOX or {}
+
+                ---Called when a player attempts to spawn a SENT.
+                function SANDBOX:PlayerSpawnSENT(ply, class)
+                end
+            "#,
+        );
+
+        check!(ws.check_completion_resolve(
+            r#"
+                function GM:PlayerSpawnSENT(ply, class_name)
+                end
+
+                function SANDBOX:<??>
+                end
+            "#,
+            VirtualCompletionResolveItem {
+                detail: "(method) SANDBOX:PlayerSpawnSENT(ply, class)".to_string(),
+                documentation: Some("\nCalled when a player attempts to spawn a SENT.".to_string()),
+            },
+        ));
+
+        Ok(())
+    }
 }
