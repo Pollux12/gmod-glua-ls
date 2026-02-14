@@ -115,11 +115,14 @@ mod test {
         let file_id = ws.def(
             r#"
             hook.Add("Think", "id", function() end)
+            hook.Add("PlayerUse", "CityRP.VehicleTrunkAccess", function(client, entity) end)
             hook.Add("", "id", function() end)
             hook.Run("CustomEmit")
             hook.Call(123, GAMEMODE)
             function GM:PlayerSpawn(ply) end
             function GAMEMODE:EntityTakeDamage(ent, dmg) end
+            function PLUGIN:PlayerDisconnected(client) end
+            function SANDBOX:PlayerSpawnSENT(ply, class_name) end
             "#,
         );
 
@@ -137,6 +140,11 @@ mod test {
                 && site.callback_params.is_empty()
         }));
         assert!(metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Add
+                && site.hook_name.as_deref() == Some("PlayerUse")
+                && site.callback_params == vec!["client".to_string(), "entity".to_string()]
+        }));
+        assert!(metadata.sites.iter().any(|site| {
             site.kind == GmodHookKind::GamemodeMethod
                 && site.hook_name.as_deref() == Some("PlayerSpawn")
                 && site.callback_params == vec!["ply".to_string()]
@@ -145,6 +153,16 @@ mod test {
             site.kind == GmodHookKind::GamemodeMethod
                 && site.hook_name.as_deref() == Some("EntityTakeDamage")
                 && site.callback_params == vec!["ent".to_string(), "dmg".to_string()]
+        }));
+        assert!(metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::GamemodeMethod
+                && site.hook_name.as_deref() == Some("PlayerDisconnected")
+                && site.callback_params == vec!["client".to_string()]
+        }));
+        assert!(metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::GamemodeMethod
+                && site.hook_name.as_deref() == Some("PlayerSpawnSENT")
+                && site.callback_params == vec!["ply".to_string(), "class_name".to_string()]
         }));
         assert!(metadata.sites.iter().any(|site| {
             site.kind == GmodHookKind::Emit && site.hook_name.as_deref() == Some("CustomEmit")
@@ -340,6 +358,41 @@ mod test {
             site.kind == GmodHookKind::GamemodeMethod
                 && site.hook_name.as_deref() == Some("CustomPluginEvent")
         }));
+    }
+
+    #[test]
+    fn test_hook_detection_normalizes_builtin_owner_prefixed_names() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def(
+            r#"
+            ---@hook SANDBOX:PlayerSpawnSENT
+            function GM:PlayerSpawnSENT(ply, class_name) end
+
+            ---@hook GM:PlayerSpawnSENT
+            function SANDBOX:PlayerSpawnSENT(ply, class_name) end
+            "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_hook_file_metadata(&file_id)
+            .cloned()
+            .expect("expected hook metadata");
+
+        let spawn_sent_sites = metadata
+            .sites
+            .iter()
+            .filter(|site| {
+                site.kind == GmodHookKind::GamemodeMethod
+                    && site.hook_name.as_deref() == Some("PlayerSpawnSENT")
+            })
+            .count();
+
+        assert_eq!(spawn_sent_sites, 2);
     }
 
     #[test]

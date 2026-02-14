@@ -200,6 +200,7 @@ fn build_tokens_semantic_token(
         | LuaTokenKind::TkTagNamespace
         | LuaTokenKind::TkTagUsing
         | LuaTokenKind::TkTagSource
+        | LuaTokenKind::TkTagRealm
         | LuaTokenKind::TkTagReturnCast
         | LuaTokenKind::TkTagExport
         | LuaTokenKind::TkLanguage
