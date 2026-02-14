@@ -75,17 +75,7 @@ pub fn load_workspace(
                 root_from_configs(&config_paths, &main_path),
             )
         } else {
-            (
-                vec![
-                    main_path.join(".luarc.json"),
-                    main_path.join(".emmyrc.json"),
-                    main_path.join(".emmyrc.lua"),
-                ]
-                .into_iter()
-                .filter(|path| path.exists())
-                .collect(),
-                main_path.clone(),
-            )
+            (discover_config_files_in_order(&main_path), main_path.clone())
         };
 
     let mut emmyrc = load_configs(config_files, None);
@@ -146,4 +136,15 @@ pub fn load_workspace(
     analysis.update_files_by_path(files);
 
     Some(analysis)
+}
+
+fn discover_config_files_in_order(root: &Path) -> Vec<PathBuf> {
+    [
+        root.join(".luarc.json"),
+        root.join(".emmyrc.json"),
+        root.join(".emmyrc.lua"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .collect()
 }
