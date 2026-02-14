@@ -137,6 +137,7 @@ pub enum LuaTokenKind {
     TkLanguage,      // language
     TKTagSchema,     // schema
     TkTagAttribute,  // attribute
+    TkTagRealm,      // realm
     TkCallGeneric,   // call generic. function_name--[[@<type>]](...)
 
     TkDocOr,              // |

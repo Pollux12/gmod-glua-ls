@@ -55,6 +55,7 @@ fn parse_tag_detail(p: &mut LuaDocParser) -> DocParseResult {
         LuaTokenKind::TkTagNamespace => parse_tag_namespace(p),
         LuaTokenKind::TkTagUsing => parse_tag_using(p),
         LuaTokenKind::TkTagMeta => parse_tag_meta(p),
+        LuaTokenKind::TkTagRealm => parse_tag_realm(p),
         LuaTokenKind::TkTagExport => parse_tag_export(p),
         LuaTokenKind::TkLanguage => parse_tag_language(p),
         LuaTokenKind::TkTagAttribute => parse_tag_attribute(p),
@@ -642,6 +643,15 @@ fn parse_tag_using(p: &mut LuaDocParser) -> DocParseResult {
 fn parse_tag_meta(p: &mut LuaDocParser) -> DocParseResult {
     p.set_lexer_state(LuaDocLexerState::Normal);
     let m = p.mark(LuaSyntaxKind::DocTagMeta);
+    p.bump();
+    if_token_bump(p, LuaTokenKind::TkName);
+    Ok(m.complete(p))
+}
+
+// ---@realm client|server|shared
+fn parse_tag_realm(p: &mut LuaDocParser) -> DocParseResult {
+    p.set_lexer_state(LuaDocLexerState::Normal);
+    let m = p.mark(LuaSyntaxKind::DocTagRealm);
     p.bump();
     if_token_bump(p, LuaTokenKind::TkName);
     Ok(m.complete(p))

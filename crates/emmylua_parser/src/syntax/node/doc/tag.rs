@@ -46,6 +46,7 @@ pub enum LuaDocTag {
     ReturnCast(LuaDocTagReturnCast),
     Export(LuaDocTagExport),
     Language(LuaDocTagLanguage),
+    Realm(LuaDocTagRealm),
 }
 
 impl LuaAstNode for LuaDocTag {
@@ -83,6 +84,7 @@ impl LuaAstNode for LuaDocTag {
             LuaDocTag::Export(it) => it.syntax(),
             LuaDocTag::Language(it) => it.syntax(),
             LuaDocTag::AttributeUse(it) => it.syntax(),
+            LuaDocTag::Realm(it) => it.syntax(),
         }
     }
 
@@ -122,6 +124,7 @@ impl LuaAstNode for LuaDocTag {
             || kind == LuaSyntaxKind::DocTagLanguage
             || kind == LuaSyntaxKind::DocTagAttributeUse
             || kind == LuaSyntaxKind::DocTagSchema
+            || kind == LuaSyntaxKind::DocTagRealm
     }
 
     fn cast(syntax: LuaSyntaxNode) -> Option<Self>
@@ -220,6 +223,9 @@ impl LuaAstNode for LuaDocTag {
             }
             LuaSyntaxKind::DocTagLanguage => Some(LuaDocTag::Language(
                 LuaDocTagLanguage::cast(syntax).unwrap(),
+            )),
+            LuaSyntaxKind::DocTagRealm => Some(LuaDocTag::Realm(
+                LuaDocTagRealm::cast(syntax).unwrap(),
             )),
             _ => None,
         }
@@ -1270,6 +1276,41 @@ impl LuaAstNode for LuaDocTagMeta {
 }
 
 impl LuaDocTagMeta {
+    pub fn get_name_token(&self) -> Option<LuaNameToken> {
+        self.token()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaDocTagRealm {
+    syntax: LuaSyntaxNode,
+}
+
+impl LuaAstNode for LuaDocTagRealm {
+    fn syntax(&self) -> &LuaSyntaxNode {
+        &self.syntax
+    }
+
+    fn can_cast(kind: LuaSyntaxKind) -> bool
+    where
+        Self: Sized,
+    {
+        kind == LuaSyntaxKind::DocTagRealm
+    }
+
+    fn cast(syntax: LuaSyntaxNode) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        if Self::can_cast(syntax.kind().into()) {
+            Some(Self { syntax })
+        } else {
+            None
+        }
+    }
+}
+
+impl LuaDocTagRealm {
     pub fn get_name_token(&self) -> Option<LuaNameToken> {
         self.token()
     }

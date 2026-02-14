@@ -81,6 +81,7 @@ pub enum LuaAst {
     LuaDocTagNamespace(LuaDocTagNamespace),
     LuaDocTagUsing(LuaDocTagUsing),
     LuaDocTagMeta(LuaDocTagMeta),
+    LuaDocTagRealm(LuaDocTagRealm),
     LuaDocTagNodiscard(LuaDocTagNodiscard),
     LuaDocTagReadonly(LuaDocTagReadonly),
     LuaDocTagOperator(LuaDocTagOperator),
@@ -173,6 +174,7 @@ impl LuaAstNode for LuaAst {
             LuaAst::LuaDocTagNamespace(node) => node.syntax(),
             LuaAst::LuaDocTagUsing(node) => node.syntax(),
             LuaAst::LuaDocTagMeta(node) => node.syntax(),
+            LuaAst::LuaDocTagRealm(node) => node.syntax(),
             LuaAst::LuaDocTagNodiscard(node) => node.syntax(),
             LuaAst::LuaDocTagReadonly(node) => node.syntax(),
             LuaAst::LuaDocTagOperator(node) => node.syntax(),
@@ -273,6 +275,7 @@ impl LuaAstNode for LuaAst {
                 | LuaSyntaxKind::DocTagNamespace
                 | LuaSyntaxKind::DocTagUsing
                 | LuaSyntaxKind::DocTagMeta
+                | LuaSyntaxKind::DocTagRealm
                 | LuaSyntaxKind::DocTagNodiscard
                 | LuaSyntaxKind::DocTagReadonly
                 | LuaSyntaxKind::DocTagOperator
@@ -408,6 +411,9 @@ impl LuaAstNode for LuaAst {
             }
             LuaSyntaxKind::DocTagUsing => LuaDocTagUsing::cast(syntax).map(LuaAst::LuaDocTagUsing),
             LuaSyntaxKind::DocTagMeta => LuaDocTagMeta::cast(syntax).map(LuaAst::LuaDocTagMeta),
+            LuaSyntaxKind::DocTagRealm => {
+                LuaDocTagRealm::cast(syntax).map(LuaAst::LuaDocTagRealm)
+            }
             LuaSyntaxKind::DocTagNodiscard => {
                 LuaDocTagNodiscard::cast(syntax).map(LuaAst::LuaDocTagNodiscard)
             }
