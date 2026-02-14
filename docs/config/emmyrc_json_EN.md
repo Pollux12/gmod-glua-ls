@@ -540,7 +540,7 @@ Defaults are aligned with the LuaLS addon where supported, especially scripted c
 | **`scriptedClassScopes.exclude`** | `string[]` | `[]` | 🚫 Glob patterns to skip scripted-class extraction |
 | **`hookMappings.methodToHook`** | `object` | `{}` | 🪝 Map custom methods (for example `PLUGIN:PlayerSpawn`) to hook names |
 | **`hookMappings.emitterToHook`** | `object` | `{}` | 📣 Map custom emitters (for example `MyHooks.Emit`) to hook names |
-| **`hookMappings.methodPrefixes`** | `string[]` | `[]` | 🧭 Prefixes that should auto-map `Prefix:Method` as hook `Method` (for example `PLUGIN`) |
+| **`hookMappings.methodPrefixes`** | `string[]` | `[]` | 🧭 Additional prefixes (beyond built-ins) that should auto-map `Prefix:Method` as hook `Method` |
 | **`detectRealmFromFilename`** | `boolean \| null` | `null` | 🧭 Optional toggle for filename-based realm detection |
 | **`detectRealmFromCalls`** | `boolean \| null` | `null` | 🧠 Optional toggle for call-site-based realm detection |
 
@@ -573,7 +573,7 @@ Defaults are aligned with the LuaLS addon where supported, especially scripted c
 #### 🪝 Automatic Hook Detection Rules
 
 - `hook.Add("Name", ...)`, `hook.Run("Name")`, and `hook.Call("Name", ...)` are detected automatically when names are static strings.
-- `GM:MethodName` and `GAMEMODE:MethodName` are automatically treated as hooks.
+- `GM:MethodName`, `GAMEMODE:MethodName`, `PLUGIN:MethodName`, and `SANDBOX:MethodName` are automatically treated as hooks.
 - `---@hook` on method functions enables automatic hook registration from annotations:
   - `---@hook` + `function PLUGIN:PlayerSpawn()` -> hook name `PlayerSpawn`
   - `---@hook CustomName` + `function PLUGIN:OnX()` -> hook name `CustomName`
@@ -581,7 +581,7 @@ Defaults are aligned with the LuaLS addon where supported, especially scripted c
 - Hook completion details include inferred callback arg names when available.
 - `hookMappings` is optional for overrides and framework-specific conventions:
   - `methodToHook` for explicit remaps
-  - `methodPrefixes` for prefix-wide auto behavior (Helix-style `PLUGIN:*`, etc.)
+  - `methodPrefixes` for additional prefix-wide auto behavior beyond built-ins
   - `emitterToHook` for custom emitter APIs
 
 #### 🧩 Plugin Folder Detection (Entity-like Scope Behavior)
@@ -613,7 +613,7 @@ If your framework has plugin folders (for example `plugins` or `gamemode/plugins
 
 #### 📚 Full Guide
 
-For end-to-end setup (server launch, recommended `.emmyrc.json`, plugin-folder recipes, and troubleshooting), see:  
+For end-to-end setup (server launch, recommended `.emmyrc.json`, plugin-folder recipes, and troubleshooting), see:
 [`docs/config/gmod_setup_EN.md`](./gmod_setup_EN.md)
 
 ---
