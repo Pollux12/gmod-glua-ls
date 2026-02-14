@@ -141,6 +141,7 @@ pub struct AnalyzeContext {
     #[allow(unused)]
     config: Arc<Emmyrc>,
     metas: HashSet<FileId>,
+    scripted_scope_files: Option<HashSet<FileId>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
     infer_manager: InferCacheManager,
     pub workspace_id: Option<WorkspaceId>,
@@ -152,6 +153,7 @@ impl AnalyzeContext {
             tree_list: Vec::new(),
             config: emmyrc,
             metas: HashSet::new(),
+            scripted_scope_files: None,
             unresolves: Vec::new(),
             infer_manager: InferCacheManager::new(),
             workspace_id: None,
@@ -168,5 +170,19 @@ impl AnalyzeContext {
 
     pub fn add_unresolve(&mut self, un_resolve: UnResolve, reason: InferFailReason) {
         self.unresolves.push((un_resolve, reason));
+    }
+
+    pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> &HashSet<FileId> {
+        if self.scripted_scope_files.is_none() {
+            let file_ids = self
+                .tree_list
+                .iter()
+                .map(|in_filed_tree| in_filed_tree.file_id)
+                .collect::<Vec<_>>();
+            self.scripted_scope_files =
+                Some(lua::call::compute_scripted_class_files(db, &file_ids));
+        }
+
+        self.scripted_scope_files.as_ref().expect("set above")
     }
 }
