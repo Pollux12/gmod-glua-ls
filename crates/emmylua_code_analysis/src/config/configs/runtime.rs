@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
-#[derive(Default)]
 pub struct EmmyrcRuntime {
     /// Lua version.
     #[serde(default)]
@@ -30,6 +29,32 @@ pub struct EmmyrcRuntime {
     /// Special symbols.
     #[serde(default)]
     pub special: HashMap<String, EmmyrcSpecialSymbol>,
+}
+
+impl Default for EmmyrcRuntime {
+    fn default() -> Self {
+        Self {
+            version: EmmyrcLuaVersion::default(),
+            require_like_function: Vec::new(),
+            framework_versions: Vec::new(),
+            extensions: Vec::new(),
+            require_pattern: Vec::new(),
+            nonstandard_symbol: default_nonstandard_symbols(),
+            special: HashMap::new(),
+        }
+    }
+}
+
+fn default_nonstandard_symbols() -> Vec<EmmyrcNonStdSymbol> {
+    vec![
+        EmmyrcNonStdSymbol::DoubleSlash,
+        EmmyrcNonStdSymbol::SlashStar,
+        EmmyrcNonStdSymbol::Continue,
+        EmmyrcNonStdSymbol::NotEqual,
+        EmmyrcNonStdSymbol::DoublePipe,
+        EmmyrcNonStdSymbol::DoubleAmp,
+        EmmyrcNonStdSymbol::Exclamation,
+    ]
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
@@ -208,5 +233,45 @@ mod tests {
 
         let runtime: EmmyrcRuntime = serde_json::from_str(json2).unwrap();
         assert_eq!(runtime.version, EmmyrcLuaVersion::Lua51);
+    }
+
+    #[test]
+    fn test_runtime_default_has_glua_nonstandard_symbols() {
+        let runtime = EmmyrcRuntime::default();
+        assert!(
+            runtime
+                .nonstandard_symbol
+                .contains(&EmmyrcNonStdSymbol::DoubleSlash)
+        );
+        assert!(
+            runtime
+                .nonstandard_symbol
+                .contains(&EmmyrcNonStdSymbol::SlashStar)
+        );
+        assert!(
+            runtime
+                .nonstandard_symbol
+                .contains(&EmmyrcNonStdSymbol::Continue)
+        );
+        assert!(
+            runtime
+                .nonstandard_symbol
+                .contains(&EmmyrcNonStdSymbol::NotEqual)
+        );
+        assert!(
+            runtime
+                .nonstandard_symbol
+                .contains(&EmmyrcNonStdSymbol::DoublePipe)
+        );
+        assert!(
+            runtime
+                .nonstandard_symbol
+                .contains(&EmmyrcNonStdSymbol::DoubleAmp)
+        );
+        assert!(
+            runtime
+                .nonstandard_symbol
+                .contains(&EmmyrcNonStdSymbol::Exclamation)
+        );
     }
 }
