@@ -560,10 +560,12 @@ fn synthesize_network_var(
     };
 
     // Try 3rd arg first (standard NetworkVar), then 4th (NetworkVarElement)
-    let prop_name = match call.literal_args.get(2) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name.clone(),
+    let (prop_name, prop_name_arg_idx) = match call.literal_args.get(2) {
+        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => (name.clone(), 2usize),
         _ => match call.literal_args.get(3) {
-            Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name.clone(),
+            Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                (name.clone(), 3usize)
+            }
             _ => return,
         },
     };
@@ -573,7 +575,7 @@ fn synthesize_network_var(
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
 
     // Synthesize getter: GetPropName(self: Class): valueType
-    if let Some(getter_syntax_id) = call.args.get(2).map(|a| a.syntax_id) {
+    if let Some(getter_syntax_id) = call.args.get(prop_name_arg_idx).map(|a| a.syntax_id) {
         let getter_name = format!("Get{prop_name}");
         let getter_func = LuaFunctionType::new(
             AsyncState::None,
