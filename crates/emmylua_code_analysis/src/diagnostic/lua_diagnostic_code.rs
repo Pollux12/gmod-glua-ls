@@ -123,6 +123,8 @@ pub enum DiagnosticCode {
     GmodInvalidHookName,
     /// gmod-realm-misuse
     GmodRealmMisuse,
+    /// gmod-realm-misuse-risky
+    GmodRealmMisuseRisky,
     /// gmod-unknown-net-message
     GmodUnknownNetMessage,
     /// gmod-duplicate-system-registration
@@ -157,6 +159,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::PreferredLocalAlias => DiagnosticSeverity::HINT,
         DiagnosticCode::CallNonCallable => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodDuplicateSystemRegistration => DiagnosticSeverity::HINT,
+        DiagnosticCode::GmodRealmMisuseRisky => DiagnosticSeverity::HINT,
         _ => DiagnosticSeverity::WARNING,
     }
 }
@@ -168,7 +171,8 @@ pub fn is_code_default_enable(code: &DiagnosticCode, level: LuaLanguageLevel) ->
         DiagnosticCode::IncompleteSignatureDoc => false,
         DiagnosticCode::MissingGlobalDoc => false,
         DiagnosticCode::UnknownDocTag => false,
-        DiagnosticCode::GmodRealmMisuse => false,
+        DiagnosticCode::GmodRealmMisuse => true,
+        DiagnosticCode::GmodRealmMisuseRisky => false,
         DiagnosticCode::GmodDuplicateSystemRegistration => false,
         // ... handle other variants
 
