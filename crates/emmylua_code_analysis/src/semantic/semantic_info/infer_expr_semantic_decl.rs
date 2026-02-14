@@ -8,7 +8,8 @@ use crate::{
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeCache,
     LuaTypeDeclId, LuaUnionType, TypeOps,
     semantic::{
-        infer::find_self_decl_or_member_id, member::get_buildin_type_map_type_id,
+        infer::{find_self_decl_or_member_id, resolve_scoped_scripted_global_type_decl_id},
+        member::get_buildin_type_map_type_id,
         semantic_info::resolve_global_decl_id,
     },
 };
@@ -66,6 +67,10 @@ fn infer_name_expr_semantic_decl(
     let name = name_token.get_name_text().to_string();
     if name == "self" {
         return infer_self_semantic_decl(db, cache, name_expr);
+    }
+
+    if let Some(type_decl_id) = resolve_scoped_scripted_global_type_decl_id(db, cache, &name) {
+        return Some(LuaSemanticDeclId::TypeDecl(type_decl_id));
     }
 
     let decl_id = get_name_decl_id(db, cache, &name, name_expr.clone())?;
