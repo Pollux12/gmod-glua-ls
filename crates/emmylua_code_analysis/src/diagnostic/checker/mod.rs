@@ -21,6 +21,9 @@ mod duplicate_type;
 mod enum_value_mismatch;
 mod generic;
 mod global_non_module;
+mod gmod_hook_name;
+mod gmod_realm_misuse;
+mod gmod_systems;
 mod incomplete_signature_doc;
 mod local_const_reassign;
 mod missing_fields;
@@ -127,6 +130,11 @@ pub fn check_file(context: &mut DiagnosticContext, semantic_model: &SemanticMode
     run_check::<code_style::invert_if::InvertIfChecker>(context, semantic_model);
     run_check::<readonly_check::ReadOnlyChecker>(context, semantic_model);
     run_check::<global_non_module::GlobalInNonModuleChecker>(context, semantic_model);
+    if semantic_model.get_emmyrc().gmod.enabled {
+        run_check::<gmod_hook_name::GmodHookNameChecker>(context, semantic_model);
+        run_check::<gmod_realm_misuse::GmodRealmMisuseChecker>(context, semantic_model);
+        run_check::<gmod_systems::GmodSystemsChecker>(context, semantic_model);
+    }
     Some(())
 }
 

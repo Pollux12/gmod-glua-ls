@@ -117,6 +117,14 @@ pub enum DiagnosticCode {
     InvertIf,
     /// Call to a non-callable value
     CallNonCallable,
+    /// gmod-invalid-hook-name
+    GmodInvalidHookName,
+    /// gmod-realm-misuse
+    GmodRealmMisuse,
+    /// gmod-unknown-net-message
+    GmodUnknownNetMessage,
+    /// gmod-duplicate-system-registration
+    GmodDuplicateSystemRegistration,
     #[serde(other)]
     None,
 }
@@ -145,6 +153,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::IterVariableReassign => DiagnosticSeverity::ERROR,
         DiagnosticCode::PreferredLocalAlias => DiagnosticSeverity::HINT,
         DiagnosticCode::CallNonCallable => DiagnosticSeverity::WARNING,
+        DiagnosticCode::GmodDuplicateSystemRegistration => DiagnosticSeverity::HINT,
         _ => DiagnosticSeverity::WARNING,
     }
 }
@@ -156,6 +165,8 @@ pub fn is_code_default_enable(code: &DiagnosticCode, level: LuaLanguageLevel) ->
         DiagnosticCode::IncompleteSignatureDoc => false,
         DiagnosticCode::MissingGlobalDoc => false,
         DiagnosticCode::UnknownDocTag => false,
+        DiagnosticCode::GmodRealmMisuse => false,
+        DiagnosticCode::GmodDuplicateSystemRegistration => false,
         // ... handle other variants
 
         // neovim-code-style
