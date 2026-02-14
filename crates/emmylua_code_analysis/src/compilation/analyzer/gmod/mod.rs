@@ -804,12 +804,20 @@ fn resolve_networkvar_type(type_name: &str) -> LuaType {
     match type_name {
         "String" => LuaType::String,
         "Bool" => LuaType::Boolean,
-        "Float" => LuaType::Number,
-        "Int" => LuaType::Integer,
+        "Float" | "Double" => LuaType::Number,
+        "Int" | "UInt" => LuaType::Integer,
         "Vector" => LuaType::Ref(LuaTypeDeclId::global("Vector")),
         "Angle" => LuaType::Ref(LuaTypeDeclId::global("Angle")),
         "Entity" => LuaType::Ref(LuaTypeDeclId::global("Entity")),
-        _ => LuaType::Any,
+        "Color" => LuaType::Ref(LuaTypeDeclId::global("Color")),
+        _ => {
+            log::warn!(
+                "Unknown NetworkVar type '{}', defaulting to Any. Valid types are: \
+                String, Bool, Float, Double, Int, UInt, Vector, Angle, Entity, Color",
+                type_name
+            );
+            LuaType::Any
+        }
     }
 }
 
