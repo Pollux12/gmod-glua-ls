@@ -277,13 +277,14 @@ impl WorkspaceManager {
 
 pub fn load_emmy_config(config_root: Option<PathBuf>, client_config: ClientConfig) -> Arc<Emmyrc> {
     // Config load priority.
-    // * Global `<os-specific home-dir>/.luarc.json`.
-    // * Global `<os-specific home-dir>/.emmyrc.json`.
-    // * Global `<os-specific config-dir>/emmylua_ls/.luarc.json`.
-    // * Global `<os-specific config-dir>/emmylua_ls/.emmyrc.json`.
+    // * Global `<os-specific home-dir>` config files.
+    // * Global `<os-specific config-dir>/emmylua_ls` config files.
     // * Environment-specified config at the $EMMYLUALS_CONFIG path.
-    // * Local `.luarc.json`.
-    // * Local `.emmyrc.json`.
+    // * Local workspace config files.
+    //
+    // Merge order in one directory (low → high priority):
+    // `.luarc.json` → `.emmyrc.json` → `.emmyrc.lua`.
+    // This preserves LuaLS compatibility defaults while allowing Emmy configs to override.
     let luarc_file = ".luarc.json";
     let emmyrc_file = ".emmyrc.json";
     let emmyrc_lua_file = ".emmyrc.lua";
