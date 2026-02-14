@@ -2417,4 +2417,103 @@ mod tests {
 
         Ok(())
     }
+
+    #[gtest]
+    fn test_gmod_net_message_completion_disabled_when_gmod_off() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = false;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            util.AddNetworkString("known_message")
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            net.Start("<??>")
+            "#,
+            vec![],
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_message_completion_from_registry() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            util.AddNetworkString("known_message")
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            net.Start("<??>")
+            "#,
+            vec![VirtualCompletionItem {
+                label: "known_message".to_string(),
+                kind: CompletionItemKind::CONSTANT,
+                label_detail: Some("(1 registrations, 0 receivers)".to_string()),
+            }],
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_hook_completion_from_registry() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .hook_mappings
+            .method_prefixes
+            .push("PLUGIN".to_string());
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            hook.Add("Think", "id", function() end)
+            function GM:PlayerSpawn(ply) end
+            function PLUGIN:OnPluginLoaded(client, character) end
+            ---@hook CustomEvent
+            function PLUGIN:IgnoredName(x, y) end
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            hook.Run("<??>")
+            "#,
+            vec![
+                VirtualCompletionItem {
+                    label: "CustomEvent".to_string(),
+                    kind: CompletionItemKind::CONSTANT,
+                    label_detail: Some("(0 add, 1 methods, 0 emits) args: x, y".to_string()),
+                },
+                VirtualCompletionItem {
+                    label: "OnPluginLoaded".to_string(),
+                    kind: CompletionItemKind::CONSTANT,
+                    label_detail: Some(
+                        "(0 add, 1 methods, 0 emits) args: client, character".to_string(),
+                    ),
+                },
+                VirtualCompletionItem {
+                    label: "PlayerSpawn".to_string(),
+                    kind: CompletionItemKind::CONSTANT,
+                    label_detail: Some("(0 add, 1 methods, 0 emits) args: ply".to_string()),
+                },
+                VirtualCompletionItem {
+                    label: "Think".to_string(),
+                    kind: CompletionItemKind::CONSTANT,
+                    label_detail: Some("(1 add, 0 methods, 0 emits)".to_string()),
+                },
+            ],
+        ));
+        Ok(())
+    }
 }

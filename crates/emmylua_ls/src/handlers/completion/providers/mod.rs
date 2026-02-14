@@ -7,6 +7,7 @@ mod env_provider;
 mod equality_provider;
 mod file_path_provider;
 mod function_provider;
+mod gmod_system_provider;
 mod keywords_provider;
 mod member_provider;
 mod module_path_provider;
@@ -29,6 +30,7 @@ pub fn add_completions(builder: &mut CompletionBuilder) -> Option<()> {
     env_provider::add_completion(builder);
     keywords_provider::add_completion(builder);
     member_provider::add_completion(builder);
+    gmod_system_provider::add_completion(builder);
 
     module_path_provider::add_completion(builder);
     file_path_provider::add_completion(builder);
