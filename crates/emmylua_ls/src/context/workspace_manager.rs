@@ -94,6 +94,7 @@ impl WorkspaceManager {
         let status_bar = self.status_bar.clone();
         let file_diagnostic = self.file_diagnostic.clone();
         let lsp_features = self.lsp_features.clone();
+        let client = self.client.clone();
         tokio::spawn(async move {
             cancel_token.wait_for_reindex().await;
             if cancel_token.is_cancelled() {
@@ -110,6 +111,9 @@ impl WorkspaceManager {
                 emmyrc,
             )
             .await;
+            if lsp_features.supports_workspace_diagnostic() {
+                client.refresh_workspace_diagnostics();
+            }
             // After completion, remove from HashMap
             let mut tokens = config_update_token.lock().await;
             tokens.take();
