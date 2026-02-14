@@ -2,6 +2,7 @@
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualHoverResult, check};
     use googletest::prelude::*;
+    use lsp_types::HoverContents;
 
     fn dedent(input: &str) -> String {
         let lines: Vec<&str> = input.lines().collect();
@@ -548,6 +549,154 @@ mod tests {
                     "```lua\n(field) aAnnotation: string = \"a\"\n```\n\n---\n\na标签".to_string(),
             },
         ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_plugin_local_decl_uses_scoped_class_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["plugins/**".to_string()];
+        emmyrc.gmod.hook_mappings.method_prefixes = vec!["PLUGIN".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local <??>PLUGIN = PLUGIN ---@diagnostic disable-line: undefined-global
+
+                function PLUGIN:PlayerSpawn(client)
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("addons/cityrp/gamemode/plugins/vehicles/sh_plugin.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("vehicles"),
+            "expected hover to include inferred plugin class 'vehicles', got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("unknown"),
+            "expected hover to avoid unknown type, got: {}",
+            markup.value
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local PLUGIN = <??>PLUGIN ---@diagnostic disable-line: undefined-global
+
+                function PLUGIN:PlayerSpawn(client)
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("addons/cityrp/gamemode/plugins/vehicles/sh_plugin.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("vehicles"),
+            "expected RHS PLUGIN hover to include inferred plugin class 'vehicles', got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("unknown"),
+            "expected RHS PLUGIN hover to avoid unknown type, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_entity_ent_uses_scoped_class_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                <??>ENT.Type = "anim"
+                ENT.Base = "base_gmodentity"
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/cityrp/gamemode/entities/entities/cityrp_money/sh_init.lua",
+            &content,
+        );
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("cityrp_money"),
+            "expected ENT hover to include scoped class 'cityrp_money', got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("ENT: ENT"),
+            "expected ENT hover to avoid base global type ENT, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_entity_ent_without_base_assignment_uses_scoped_class_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                function <??>ENT:Initialize()
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/cityrp/gamemode/entities/entities/cityrp_inventory/init.lua",
+            &content,
+        );
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("cityrp_inventory"),
+            "expected ENT hover to include scoped class 'cityrp_inventory', got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("(global) ENT"),
+            "expected ENT hover to avoid plain global ENT declaration, got: {}",
+            markup.value
+        );
 
         Ok(())
     }
