@@ -14,7 +14,7 @@ Built for developers who want accurate autocomplete, go-to-definition, and type 
 
 - **Hook Autocomplete** — `hook.Add`, `hook.Run`, and `hook.Call` suggest available hooks. Add `---@hook` to your gamemode/plugin methods to register them as hook sources.
 
-- **Scripted Class Support** — Full support for `ENT`, `SWEP`, `TOOL`, and custom scripted entities. Understands `DEFINE_BASECLASS`, `AccessorFunc`, and `NetworkVar` with synthesized getter/setter autocomplete.
+- **Scripted Class Support** — Full support for `ENT`, `SWEP`, `TOOL`, and custom scripted entities. Understands `DEFINE_BASECLASS`, `AccessorFunc`, and `NetworkVar` with synthesized getter/setter autocomplete. Supports wrapper functions (including local helpers) that call `NetworkVar` internally. Add `---@accessorfunc` to custom accessor generators for the same synthesis behavior.
 
 - **Dynamic Field Inference** — Tracks fields dynamically set on Player, Entity, and other GMod objects to suppress false-positive "undefined field" warnings.
 

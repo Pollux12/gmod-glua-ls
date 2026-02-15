@@ -65,7 +65,7 @@ Configuration is done via `.emmyrc.json` (or `.luarc.json` for compatibility) in
 ### Severity Levels
 
 - `"error"` - Red error indicator
-- `"warning"` - Yellow warning indicator  
+- `"warning"` - Yellow warning indicator
 - `"information"` - Blue information indicator
 - `"hint"` - Subtle hint indicator
 
@@ -191,6 +191,44 @@ Configuration is done via `.emmyrc.json` (or `.luarc.json` for compatibility) in
 | `hookMappings.methodToHook` | `object` | `{}` | Map methods to hook names |
 | `hookMappings.emitterToHook` | `object` | `{}` | Map custom emitters to hook names |
 | `hookMappings.methodPrefixes` | `string[]` | `[]` | Additional prefixes for hook auto-detection |
+
+### Scripted Class Analysis
+
+Scripted class analysis runs on files matched by `gmod.scriptedClassScopes` and synthesizes members for common Garry's Mod patterns:
+
+- `AccessorFunc(target, "m_Field", "Name", ...)` synthesizes `GetName()` and `SetName(value)`
+- `NetworkVar(...)` / `NetworkVarElement(...)` synthesize getter/setter pairs for declared data table vars
+- Wrapper functions that call `NetworkVar` are detected, including local helper functions declared inside `SetupDataTables`
+- `---@accessorfunc` extends accessor synthesis to custom generator functions (works on any class)
+
+```lua
+function ENT:RegisterVar(varType, slot, name)
+  -- Method wrapper
+  self:NetworkVar(varType, slot, name)
+end
+
+---@accessorfunc 2
+function ENT:MakeAccessor(prefix, name)
+  -- Custom accessor generator (name is arg #2)
+end
+
+function ENT:SetupDataTables()
+  -- Direct NetworkVar call
+  self:NetworkVar("Float", 0, "Speed")
+
+  -- Method wrapper call
+  self:RegisterVar("Int", 1, "Ammo")
+
+  -- Local function wrapper call
+  local function addBool(slot, name)
+    self:NetworkVar("Bool", slot, name)
+  end
+  addBool(2, "IsReady")
+
+  -- Custom accessor synthesis via @accessorfunc
+  self:MakeAccessor("Net", "OwnerName")
+end
+```
 
 ---
 
