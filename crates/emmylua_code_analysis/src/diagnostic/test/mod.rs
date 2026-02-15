@@ -12,6 +12,7 @@ mod duplicate_require_test;
 mod enum_value_mismatch_test;
 mod generic_constraint_mismatch_test;
 mod global_in_non_module_test;
+mod gmod_dynamic_field_test;
 mod gmod_hook_name_test;
 mod gmod_realm_misuse_test;
 mod gmod_systems_test;

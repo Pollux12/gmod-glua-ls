@@ -7,8 +7,9 @@ use emmylua_parser::{
 use wax::Pattern;
 
 use crate::{
-    FileId, GmodClassCallArg, GmodClassCallLiteral, GmodScriptedClassCallKind,
-    GmodScriptedClassCallMetadata, InferFailReason, LuaType,
+    AccessorFuncCallMetadata, FileId, GmodClassCallArg, GmodClassCallLiteral,
+    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, InferFailReason, LuaType,
+    LuaTypeDeclId,
     compilation::analyzer::{lua::LuaAnalyzer, unresolve::UnResolveConstructor},
     db_index::DbIndex,
 };
@@ -16,6 +17,7 @@ use crate::{
 pub(super) fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -> Option<()> {
     collect_gmod_scripted_class_call(analyzer, &call_expr);
     collect_gmod_vgui_call(analyzer, &call_expr);
+    collect_accessorfunc_annotated_call(analyzer, &call_expr);
 
     let prefix_expr = call_expr.clone().get_prefix_expr()?;
     if let Ok(expr_type) = analyzer.infer_expr(&prefix_expr) {
@@ -39,6 +41,110 @@ pub(super) fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -
         }
     }
     Some(())
+}
+
+fn collect_accessorfunc_annotated_call(
+    analyzer: &mut LuaAnalyzer,
+    call_expr: &LuaCallExpr,
+) -> Option<()> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    let LuaExpr::IndexExpr(index_expr) = prefix_expr else {
+        return None;
+    };
+
+    let method_name = match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name_token) => name_token.get_name_text().to_string(),
+        LuaIndexKey::String(string_token) => string_token.get_value().to_string(),
+        _ => return None,
+    };
+
+    if !analyzer
+        .db
+        .get_accessor_func_index()
+        .contains_name(&method_name)
+    {
+        return None;
+    }
+
+    let name_param_index = analyzer
+        .db
+        .get_accessor_func_index()
+        .get_annotations(&method_name)
+        .and_then(|annotations| {
+            annotations
+                .first()
+                .map(|annotation| annotation.name_param_index)
+        })
+        .unwrap_or(0);
+
+    let args_list = call_expr.get_args_list()?;
+    let args = args_list.get_args().collect::<Vec<_>>();
+    let name_arg = args.get(name_param_index)?;
+    let accessor_name = extract_string_literal(name_arg)?;
+    if accessor_name.is_empty() {
+        return None;
+    }
+
+    let call_syntax_id = call_expr.get_syntax_id();
+    let name_arg_syntax_id = Some(name_arg.get_syntax_id());
+    let owner_type_id = find_owner_type_for_prefix(analyzer, &index_expr.get_prefix_expr()?)?;
+
+    analyzer.db.get_accessor_func_call_index_mut().add_call(
+        analyzer.file_id,
+        AccessorFuncCallMetadata {
+            syntax_id: call_syntax_id,
+            owner_type_id,
+            accessor_name,
+            name_arg_syntax_id,
+        },
+    );
+
+    Some(())
+}
+
+fn extract_string_literal(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(string_token) => Some(string_token.get_value().to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn find_owner_type_for_prefix(
+    analyzer: &mut LuaAnalyzer,
+    prefix: &LuaExpr,
+) -> Option<LuaTypeDeclId> {
+    if let Ok(prefix_type) = analyzer.infer_expr(prefix)
+        && let Some(type_decl_id) = find_decl_id_from_type(&prefix_type)
+    {
+        return Some(type_decl_id);
+    }
+
+    if let LuaExpr::NameExpr(name_expr) = prefix {
+        let name = name_expr.get_name_text()?;
+        let type_decl_id = LuaTypeDeclId::global(&name);
+        if analyzer
+            .db
+            .get_type_index()
+            .get_type_decl(&type_decl_id)
+            .is_some()
+        {
+            return Some(type_decl_id);
+        }
+    }
+
+    None
+}
+
+fn find_decl_id_from_type(typ: &LuaType) -> Option<LuaTypeDeclId> {
+    match typ {
+        LuaType::Def(type_decl_id) | LuaType::Ref(type_decl_id) => Some(type_decl_id.clone()),
+        LuaType::Instance(instance) => find_decl_id_from_type(instance.get_base()),
+        LuaType::TypeGuard(inner) => find_decl_id_from_type(inner),
+        _ => None,
+    }
 }
 
 fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaCallExpr) {
@@ -105,13 +211,9 @@ fn collect_gmod_vgui_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaCallExpr) {
     // Check the base object: handle both direct (vgui.Register) and nested paths
     let kind = match index_expr.get_prefix_expr() {
         Some(LuaExpr::NameExpr(base)) => {
-            let base_name = base
-                .get_name_token()
-                .map(|t| t.get_name_text().to_string());
+            let base_name = base.get_name_token().map(|t| t.get_name_text().to_string());
             match base_name.as_deref() {
-                Some("vgui") if key_name == "Register" => {
-                    GmodScriptedClassCallKind::VguiRegister
-                }
+                Some("vgui") if key_name == "Register" => GmodScriptedClassCallKind::VguiRegister,
                 Some("derma") if key_name == "DefineControl" => {
                     GmodScriptedClassCallKind::DermaDefineControl
                 }
@@ -156,18 +258,14 @@ pub(in crate::compilation::analyzer) fn compute_scripted_class_files(
     }
 
     // Compile glob patterns once for all files
-    let include_patterns: Vec<&str> =
-        scopes.include.iter().map(String::as_str).collect();
-    let exclude_patterns: Vec<&str> =
-        scopes.exclude.iter().map(String::as_str).collect();
+    let include_patterns: Vec<&str> = scopes.include.iter().map(String::as_str).collect();
+    let exclude_patterns: Vec<&str> = scopes.exclude.iter().map(String::as_str).collect();
 
     let include_glob = if !include_patterns.is_empty() {
         match wax::any(include_patterns) {
             Ok(g) => Some(g),
             Err(err) => {
-                log::warn!(
-                    "Invalid gmod.scriptedClassScopes.include pattern: {err}"
-                );
+                log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
                 return file_ids.iter().copied().collect();
             }
         }
@@ -179,9 +277,7 @@ pub(in crate::compilation::analyzer) fn compute_scripted_class_files(
         match wax::any(exclude_patterns) {
             Ok(g) => Some(g),
             Err(err) => {
-                log::warn!(
-                    "Invalid gmod.scriptedClassScopes.exclude pattern: {err}"
-                );
+                log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");
                 return HashSet::new();
             }
         }
@@ -192,14 +288,7 @@ pub(in crate::compilation::analyzer) fn compute_scripted_class_files(
     file_ids
         .iter()
         .copied()
-        .filter(|file_id| {
-            check_file_in_scope(
-                db,
-                *file_id,
-                &include_glob,
-                &exclude_glob,
-            )
-        })
+        .filter(|file_id| check_file_in_scope(db, *file_id, &include_glob, &exclude_glob))
         .collect()
 }
 

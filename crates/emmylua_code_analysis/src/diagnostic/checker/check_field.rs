@@ -74,6 +74,10 @@ fn check_index_expr(
         return Some(());
     }
 
+    if is_dynamic_field(db, &prefix_typ, &index_key) {
+        return Some(());
+    }
+
     let index_name = index_key.get_path_part();
     match code {
         DiagnosticCode::InjectField => {
@@ -477,4 +481,34 @@ fn get_keyof_keys(db: &DbIndex, alias_call: &LuaAliasCallType) -> Option<Vec<Lua
         })
         .collect::<Vec<_>>();
     Some(key_types)
+}
+
+fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, index_key: &LuaIndexKey) -> bool {
+    let emmyrc = db.get_emmyrc();
+    if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
+        return false;
+    }
+
+    let field_name = index_key.get_path_part();
+    let index = db.get_dynamic_field_index();
+
+    has_dynamic_field_for_type(index, prefix_typ, &field_name)
+}
+
+fn has_dynamic_field_for_type(
+    index: &crate::DynamicFieldIndex,
+    typ: &LuaType,
+    field_name: &str,
+) -> bool {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => index.has_field(id, field_name),
+        LuaType::Instance(instance) => {
+            has_dynamic_field_for_type(index, instance.get_base(), field_name)
+        }
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(|t| has_dynamic_field_for_type(index, t, field_name)),
+        _ => false,
+    }
 }

@@ -1,6 +1,8 @@
+mod accessor_func;
 mod declaration;
 mod dependency;
 mod diagnostic;
+mod dynamic_field;
 mod flow;
 mod global;
 mod gmod_class;
@@ -20,9 +22,11 @@ mod r#type;
 use std::sync::Arc;
 
 use crate::{Emmyrc, FileId, Vfs};
+pub use accessor_func::*;
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
+pub use dynamic_field::DynamicFieldIndex;
 pub use flow::*;
 pub use global::{GlobalId, LuaGlobalIndex};
 pub use gmod_class::*;
@@ -51,8 +55,11 @@ pub struct DbIndex {
     diagnostic_index: DiagnosticIndex,
     operator_index: LuaOperatorIndex,
     flow_index: LuaFlowIndex,
+    accessor_func_index: AccessorFuncAnnotationIndex,
+    accessor_func_call_index: AccessorFuncCallIndex,
     gmod_class_index: GmodClassMetadataIndex,
     gmod_infer_index: GmodInferIndex,
+    dynamic_field_index: DynamicFieldIndex,
     vfs: Vfs,
     file_dependencies_index: LuaDependencyIndex,
     metatable_index: LuaMetatableIndex,
@@ -81,8 +88,11 @@ impl DbIndex {
             diagnostic_index: DiagnosticIndex::new(),
             operator_index: LuaOperatorIndex::new(),
             flow_index: LuaFlowIndex::new(),
+            accessor_func_index: AccessorFuncAnnotationIndex::new(),
+            accessor_func_call_index: AccessorFuncCallIndex::new(),
             gmod_class_index: GmodClassMetadataIndex::new(),
             gmod_infer_index: GmodInferIndex::new(),
+            dynamic_field_index: DynamicFieldIndex::new(),
             vfs: Vfs::new(),
             file_dependencies_index: LuaDependencyIndex::new(),
             metatable_index: LuaMetatableIndex::new(),
@@ -186,6 +196,22 @@ impl DbIndex {
         &self.flow_index
     }
 
+    pub fn get_accessor_func_index(&self) -> &AccessorFuncAnnotationIndex {
+        &self.accessor_func_index
+    }
+
+    pub fn get_accessor_func_index_mut(&mut self) -> &mut AccessorFuncAnnotationIndex {
+        &mut self.accessor_func_index
+    }
+
+    pub fn get_accessor_func_call_index(&self) -> &AccessorFuncCallIndex {
+        &self.accessor_func_call_index
+    }
+
+    pub fn get_accessor_func_call_index_mut(&mut self) -> &mut AccessorFuncCallIndex {
+        &mut self.accessor_func_call_index
+    }
+
     pub fn get_gmod_class_metadata_index(&self) -> &GmodClassMetadataIndex {
         &self.gmod_class_index
     }
@@ -200,6 +226,14 @@ impl DbIndex {
 
     pub fn get_gmod_infer_index_mut(&mut self) -> &mut GmodInferIndex {
         &mut self.gmod_infer_index
+    }
+
+    pub fn get_dynamic_field_index(&self) -> &DynamicFieldIndex {
+        &self.dynamic_field_index
+    }
+
+    pub fn get_dynamic_field_index_mut(&mut self) -> &mut DynamicFieldIndex {
+        &mut self.dynamic_field_index
     }
 
     pub fn get_vfs(&self) -> &Vfs {
@@ -257,8 +291,11 @@ impl LuaIndex for DbIndex {
         self.diagnostic_index.remove(file_id);
         self.operator_index.remove(file_id);
         self.flow_index.remove(file_id);
+        self.accessor_func_index.remove(file_id);
+        self.accessor_func_call_index.remove(file_id);
         self.gmod_class_index.remove(file_id);
         self.gmod_infer_index.remove(file_id);
+        self.dynamic_field_index.remove(file_id);
         self.file_dependencies_index.remove(file_id);
         self.metatable_index.remove(file_id);
         self.global_index.remove(file_id);
@@ -276,8 +313,11 @@ impl LuaIndex for DbIndex {
         self.diagnostic_index.clear();
         self.operator_index.clear();
         self.flow_index.clear();
+        self.accessor_func_index.clear();
+        self.accessor_func_call_index.clear();
         self.gmod_class_index.clear();
         self.gmod_infer_index.clear();
+        self.dynamic_field_index.clear();
         self.file_dependencies_index.clear();
         self.metatable_index.clear();
         self.global_index.clear();

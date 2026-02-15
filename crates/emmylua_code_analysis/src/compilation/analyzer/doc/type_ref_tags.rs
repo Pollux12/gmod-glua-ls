@@ -1,8 +1,8 @@
 use emmylua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaDocDescriptionOwner, LuaDocTagAs, LuaDocTagCast,
     LuaDocTagModule, LuaDocTagOther, LuaDocTagOverload, LuaDocTagParam, LuaDocTagReturn,
-    LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaExpr, LuaLocalName,
-    LuaTokenKind, LuaVarExpr,
+    LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaExpr, LuaIndexKey,
+    LuaLocalName, LuaTokenKind, LuaVarExpr,
 };
 
 use super::{
@@ -16,8 +16,8 @@ use crate::{
     SignatureReturnStatus, TypeOps,
     compilation::analyzer::common::bind_type,
     db_index::{
-        LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaMemberId, LuaOperator, LuaSemanticDeclId,
-        LuaSignatureId, LuaType,
+        AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaMemberId,
+        LuaOperator, LuaSemanticDeclId, LuaSignatureId, LuaType,
     },
 };
 use crate::{
@@ -440,12 +440,60 @@ pub fn analyze_other(analyzer: &mut DocAnalyzer, other: LuaDocTagOther) -> Optio
         "".to_string()
     };
 
+    if tag_name == "accessorfunc"
+        && let Some(owner_ast) = analyzer.comment.get_owner()
+        && let Some(name) = extract_func_name_from_ast(&owner_ast)
+    {
+        let name_param_index = parse_accessorfunc_param_index(&description);
+        analyzer.db.get_accessor_func_index_mut().register(
+            name.into(),
+            AccessorFuncAnnotation {
+                name_param_index,
+                file_id: analyzer.file_id,
+            },
+        );
+    }
+
     analyzer
         .db
         .get_property_index_mut()
         .add_other(analyzer.file_id, owner, tag_name, description);
 
     Some(())
+}
+
+fn extract_func_name_from_ast(ast: &LuaAst) -> Option<String> {
+    match ast {
+        LuaAst::LuaFuncStat(func) => {
+            let var_expr = func.get_func_name()?;
+            match var_expr {
+                LuaVarExpr::IndexExpr(index_expr) => match index_expr.get_index_key()? {
+                    LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
+                    LuaIndexKey::String(string_token) => Some(string_token.get_value()),
+                    _ => None,
+                },
+                LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+            }
+        }
+        LuaAst::LuaLocalFuncStat(local_func) => local_func
+            .get_local_name()?
+            .get_name_token()
+            .map(|token| token.get_name_text().to_string()),
+        _ => None,
+    }
+}
+
+fn parse_accessorfunc_param_index(description: &str) -> usize {
+    let trimmed = description.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    trimmed
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .unwrap_or(0)
 }
 
 pub fn analyze_doc_tag_schema(analyzer: &mut DocAnalyzer, tag: LuaDocTagSchema) -> Option<()> {

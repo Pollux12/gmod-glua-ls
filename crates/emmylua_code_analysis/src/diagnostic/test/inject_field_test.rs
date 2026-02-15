@@ -19,6 +19,10 @@ mod test {
     #[test]
     fn test_inject_field() {
         let mut ws = VirtualWorkspace::new();
+        // Disable dynamic field inference so InjectField fires normally
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
         assert!(!ws.check_code_for(
             DiagnosticCode::InjectField,
             r#"

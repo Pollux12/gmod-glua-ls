@@ -22,6 +22,7 @@ impl Checker for UnknownDocTag {
             .map(|tag| tag.as_str())
             .collect();
         let mut known_tags = known_tags;
+        known_tags.insert("accessorfunc");
         if semantic_model.get_emmyrc().gmod.enabled {
             known_tags.insert("hook");
             known_tags.insert("realm");

@@ -145,7 +145,7 @@
         "requireLikeFunction": [],
         "requirePattern": [],
         "special": {},
-        "version": "LuaLatest"
+        "version": "LuaJIT"
       }
     },
     "semanticTokens": {
@@ -860,11 +860,9 @@
           }
         },
         "inferDynamicFields": {
-          "description": "Allow dynamic field inference on typed objects (Player, Entity, etc.).\nWhen enabled, reduces \"undefined field\" and \"inject field\" warnings for GMod's\ncommon pattern of adding custom fields to entities, players, and weapons at runtime.\nDefault: true (GMod-friendly ergonomics).",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "description": "When enabled, fields dynamically set on typed objects (e.g., Player, Entity) are tracked and won't trigger 'undefined field' warnings. Standard practice in Garry's Mod.",
+          "type": "boolean",
+          "default": true
         },
         "scriptedClassScopes": {
           "$ref": "#/$defs/EmmyrcGmodScriptedClassScopes",
@@ -1020,6 +1018,7 @@
       }
     },
     "EmmyrcLuaVersion": {
+      "description": "Deprecated: This GMod language server always uses LuaJIT. All values are accepted for compatibility but have no effect.",
       "oneOf": [
         {
           "description": "Lua 5.1",
@@ -1203,9 +1202,9 @@
           "default": {}
         },
         "version": {
-          "description": "Lua version.",
+          "description": "Deprecated: This GMod language server always uses LuaJIT. This option is accepted for compatibility but has no effect.",
           "$ref": "#/$defs/EmmyrcLuaVersion",
-          "default": "LuaLatest"
+          "default": "LuaJIT"
         }
       }
     },

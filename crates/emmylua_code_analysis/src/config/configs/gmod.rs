@@ -18,9 +18,15 @@ pub struct EmmyrcGmod {
     pub detect_realm_from_filename: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_realm_from_calls: Option<bool>,
+    #[serde(default = "infer_dynamic_fields_default")]
+    pub infer_dynamic_fields: bool,
 }
 
 fn enabled_default() -> bool {
+    true
+}
+
+fn infer_dynamic_fields_default() -> bool {
     true
 }
 
@@ -33,6 +39,7 @@ impl Default for EmmyrcGmod {
             hook_mappings: EmmyrcGmodHookMappings::default(),
             detect_realm_from_filename: None,
             detect_realm_from_calls: None,
+            infer_dynamic_fields: infer_dynamic_fields_default(),
         }
     }
 }
@@ -109,5 +116,6 @@ mod tests {
         assert!(gmod.hook_mappings.method_prefixes.is_empty());
         assert_eq!(gmod.detect_realm_from_filename, None);
         assert_eq!(gmod.detect_realm_from_calls, None);
+        assert!(gmod.infer_dynamic_fields);
     }
 }
