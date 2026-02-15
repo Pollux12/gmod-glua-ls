@@ -60,7 +60,7 @@
 - Format: `cargo fmt --all`
 - Pre-commit checks: `pre-commit run --all --hook-stage manual`
 - Spell check in CI: `typos`
-- Cargo is installed in local system but may show as unknown due to terminal restrictions - use directly path workaround e.g: `& "$env:USERPROFILE\.cargo\bin\cargo.exe"`
+- Cargo is installed in local system and is within path. If you get an error stating it is missing, try use direct path workaround e.g: `& "$env:USERPROFILE\.cargo\bin\cargo.exe"` but ONLY if cargo does not work by itself.
 
 ## Code Style and Conventions
 - Rust edition is `2024`; `rustfmt.toml` uses `max_width = 100`, 4 spaces.
@@ -88,9 +88,13 @@
 - `update_schema` fetches remote schema URLs via `reqwest`; treat network/file schema sources as untrusted input.
 
 ## Testing Patterns (How This Repo Verifies Behavior)
+- We use the standard Rust testing harness with [googletest-rust](https://github.com/google/googletest-rust/). Prefer `#[gtest]` over `#[test]` in repository test modules.
+- In test modules, import `googletest::prelude::*` and prefer matcher-style assertions (`assert_that!`, `expect_that!`, `verify_that!`) instead of introducing new `assert_eq!`/`assert!` where practical.
+- Use the `check!` helper where available to convert `Result`/`Option` into `googletest::Result` with useful location context.
 - Many semantic/diagnostic tests use `VirtualWorkspace` from `crates/emmylua_code_analysis/src/test_lib/mod.rs`.
 - When changing analysis behavior, add/adjust tests near the affected subsystem in:
   - `crates/emmylua_code_analysis/src/compilation/test/`
   - `crates/emmylua_code_analysis/src/diagnostic/test/`
   - `crates/emmylua_code_analysis/src/semantic/**/test.rs`
 - For GMod-specific changes, prioritize extending existing `gmod_*` tests rather than adding isolated ad-hoc coverage.
+- For GMod realm/path-sensitive tests, use realistic addon or gamemode style paths.
