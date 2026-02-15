@@ -5,6 +5,13 @@ members = [
     "tools/*",
 ]
 
+[workspace.package]
+description = "gmod-glua-ls — Garry's Mod Lua Language Server, a fork of EmmyLua Analyzer Rust optimized for GLua development"
+license = "MIT"
+repository = "https://github.com/Pollux-Dev/gmod-glua-ls"
+keywords = ["gmod", "glua", "lua", "language-server", "garrysmod"]
+categories = ["development-tools"]
+
 [workspace.dependencies]
 # local
 emmylua_code_analysis = { path = "crates/emmylua_code_analysis", version = "0.20.0" }

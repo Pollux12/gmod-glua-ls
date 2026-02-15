@@ -56,8 +56,8 @@ impl SarifOutputWriter {
             let tool = json!({
                 "name": CRATE_NAME,
                 "version": CRATE_VERSION,
-                "informationUri": "https://github.com/EmmyLuaLs/emmylua-analyzer-rust",
-                "organization": "EmmyLuaLs"
+                "informationUri": "https://github.com/Pollux-Dev/gmod-glua-ls",
+                "organization": "Pollux-Dev"
             });
             self.tools.insert(tool_name.clone(), tool);
         }

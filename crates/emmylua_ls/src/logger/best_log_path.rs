@@ -11,7 +11,7 @@ pub fn get_best_log_dir() -> PathBuf {
         // On Windows, try LOCALAPPDATA first
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
             PathBuf::from(local_app_data)
-                .join("emmylua_ls")
+                .join("gmod_glua_ls")
                 .join("logs")
         } else {
             // Fall back to the directory next to the executable
@@ -22,14 +22,16 @@ pub fn get_best_log_dir() -> PathBuf {
     } else {
         // On non-Windows platforms, try XDG_DATA_HOME first
         if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
-            PathBuf::from(xdg_data_home).join("emmylua_ls").join("logs")
+            PathBuf::from(xdg_data_home)
+                .join("gmod_glua_ls")
+                .join("logs")
         } else {
             // If XDG_DATA_HOME is not set, use default XDG path
             if let Ok(home) = std::env::var("HOME") {
                 PathBuf::from(home)
                     .join(".local")
                     .join("share")
-                    .join("emmylua_ls")
+                    .join("gmod_glua_ls")
                     .join("logs")
             } else {
                 // Fall back to the directory next to the executable
