@@ -105,6 +105,11 @@ impl ProviderVirtualWorkspace {
     pub fn new() -> Self {
         let generator = VirtualUrlGenerator::new();
         let mut analysis = EmmyLuaAnalysis::new();
+        // Disable GMod features by default in tests; GMod-specific tests
+        // explicitly enable this via update_emmyrc.
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = false;
+        analysis.update_config(Arc::new(emmyrc));
         let base = &generator.base;
         analysis.add_main_workspace(base.clone());
         ProviderVirtualWorkspace {
@@ -117,6 +122,9 @@ impl ProviderVirtualWorkspace {
     pub fn new_with_init_std_lib() -> Self {
         let generator = VirtualUrlGenerator::new();
         let mut analysis = EmmyLuaAnalysis::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = false;
+        analysis.update_config(Arc::new(emmyrc));
         analysis.init_std_lib(None);
         let base = &generator.base;
         analysis.add_main_workspace(base.clone());

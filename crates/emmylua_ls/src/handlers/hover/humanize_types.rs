@@ -201,7 +201,11 @@ fn inject_or_create_realm_badge(
             if has_realm_badge(existing_description) {
                 return;
             }
-            *existing_description = format!("{}\n\n{}", badge_markdown, existing_description.trim_start());
+            *existing_description = format!(
+                "{}\n\n{}",
+                badge_markdown,
+                existing_description.trim_start()
+            );
         }
         None => {
             *description = Some(badge_markdown.to_string());
@@ -244,7 +248,10 @@ fn infer_property_owner_realm(
         return Some(annotation_realm);
     }
 
-    Some(db.get_gmod_infer_index().get_realm_at_offset(&file_id, offset))
+    Some(
+        db.get_gmod_infer_index()
+            .get_realm_at_offset(&file_id, offset),
+    )
 }
 
 fn has_realm_badge(description: &str) -> bool {

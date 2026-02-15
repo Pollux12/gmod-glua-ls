@@ -570,7 +570,7 @@ mod tests {
                 end
             "#,
         )?;
-        let file_id = ws.def_file("addons/cityrp/gamemode/plugins/vehicles/sh_plugin.lua", &content);
+        let file_id = ws.def_file("cityrp/plugins/vehicles/sh_plugin.lua", &content);
         let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
             .ok_or("expected hover")
             .or_fail()?;
@@ -598,7 +598,7 @@ mod tests {
                 end
             "#,
         )?;
-        let file_id = ws.def_file("addons/cityrp/gamemode/plugins/vehicles/sh_plugin.lua", &content);
+        let file_id = ws.def_file("cityrp/plugins/vehicles/sh_plugin.lua", &content);
         let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
             .ok_or("expected hover")
             .or_fail()?;
@@ -636,7 +636,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file(
-            "addons/cityrp/gamemode/entities/entities/cityrp_money/sh_init.lua",
+            "cityrp/entities/entities/cityrp_money/sh_init.lua",
             &content,
         );
         let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
@@ -676,7 +676,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file(
-            "addons/cityrp/gamemode/entities/entities/cityrp_inventory/init.lua",
+            "cityrp/entities/entities/cityrp_inventory/init.lua",
             &content,
         );
         let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
@@ -831,9 +831,7 @@ mod tests {
             markup.value
         );
         assert!(
-            markup
-                .value
-                .contains("```lua\n(method)"),
+            markup.value.contains("```lua\n(method)"),
             "expected hover to keep syntax-highlighted lua signature, got: {}",
             markup.value
         );

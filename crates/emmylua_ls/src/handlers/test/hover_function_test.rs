@@ -18,7 +18,7 @@ mod tests {
                 local <??>delete4 = delete3
             "#,
             VirtualHoverResult {
-                value: "```lua\nlocal function delete(a: number)\n  -> a: number\n\n```\n\n---\n\n@*param* `a` — 参数a\n\n\n\n@*return* `a`  — 返回值a".to_string(),
+                value: "```lua\nlocal function delete(a: number)\n  -> a: number\n\n```\n\n---\n\n@*param* `a` — 参数a\n\n@*return* `a`  — 返回值a".to_string(),
             },
         ));
 
@@ -38,7 +38,7 @@ mod tests {
                 }
             "#,
             VirtualHoverResult {
-                value: "```lua\nlocal function delete(a: number)\n  -> a: number\n\n```\n\n---\n\n删除\n\n@*param* `a` — 参数a\n\n\n\n@*return* `a`  — 返回值a".to_string(),
+                value: "```lua\nlocal function delete(a: number)\n  -> a: number\n\n```\n\n---\n\n删除\n\n@*param* `a` — 参数a\n\n@*return* `a`  — 返回值a".to_string(),
             },
         ));
 
@@ -61,7 +61,7 @@ mod tests {
                 }
             "#,
             VirtualHoverResult {
-                value: "```lua\nlocal function delete(a: number)\n  -> a: number\n\n```\n\n---\n\n@*param* `a` — 参数a\n\n\n\n@*return* `a`  — 返回值a".to_string(),
+                value: "```lua\nlocal function delete(a: number)\n  -> a: number\n\n```\n\n---\n\n@*param* `a` — 参数a\n\n@*return* `a`  — 返回值a".to_string(),
             },
         ));
         Ok(())
@@ -96,7 +96,7 @@ mod tests {
                 local <??>local_b = local_a
             "#,
             VirtualHoverResult {
-                value: "```lua\n(method) Game:add(key: string, value: string)\n  -> ret: number\n\n```\n\n---\n\n说明\n\n@*param* `key` — 参数key\n\n@*param* `value` — 参数value\n\n\n\n@*return* `ret`  — 返回值".to_string(),
+                value: "```lua\n(method) Game:add(key: string, value: string)\n  -> ret: number\n\n```\n\n---\n\n说明\n\n@*param* `key` — 参数key\n\n@*param* `value` — 参数value\n\n@*return* `ret`  — 返回值".to_string(),
             },
         ));
         Ok(())
@@ -708,7 +708,7 @@ mod tests {
                 end
             "#,
             VirtualHoverResult {
-                value: "```lua\n(method) MyEntity:Touch(other: Entity)\n```\n\n---\n\nCalled when touched by another entity.\n\n@*param* `other` — The touching entity.\n\n\n\n---\n\n```lua\n(method) Entity:Touch(other: Entity)\n```"
+                value: "```lua\n(method) MyEntity:Touch(other: Entity)\n```\n\n---\n\nCalled when touched by another entity.\n\n@*param* `other` — The touching entity.\n\n---\n\n```lua\n(method) Entity:Touch(other: Entity)\n```"
                     .to_string(),
             },
         ));

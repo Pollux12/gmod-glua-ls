@@ -157,9 +157,10 @@ impl<'a> HoverBuilder<'a> {
                 }
             })
         {
-            normalized_annotation_description = strip_realm_badges(&normalized_annotation_description)
-                .trim()
-                .to_string();
+            normalized_annotation_description =
+                strip_realm_badges(&normalized_annotation_description)
+                    .trim()
+                    .to_string();
             if normalized_annotation_description.is_empty() {
                 return;
             }
@@ -178,7 +179,9 @@ impl<'a> HoverBuilder<'a> {
         }
 
         self.annotation_description
-            .push(MarkedString::from_markdown(normalized_annotation_description));
+            .push(MarkedString::from_markdown(
+                normalized_annotation_description,
+            ));
     }
 
     pub fn add_description(&mut self, property_owner: &LuaSemanticDeclId) -> Option<()> {
@@ -220,13 +223,16 @@ impl<'a> HoverBuilder<'a> {
     }
 
     pub fn build_hover_result(&self, range: Option<lsp_types::Range>) -> Option<Hover> {
-        let realm_badge = self.annotation_description.iter().find_map(|marked_string| {
-            if let MarkedString::String(s) = marked_string {
-                find_realm_badge_markdown(s)
-            } else {
-                None
-            }
-        });
+        let realm_badge = self
+            .annotation_description
+            .iter()
+            .find_map(|marked_string| {
+                if let MarkedString::String(s) = marked_string {
+                    find_realm_badge_markdown(s)
+                } else {
+                    None
+                }
+            });
 
         let header = {
             let mut header = String::new();
@@ -389,9 +395,12 @@ fn is_realm_badge_only_markdown(markdown: &str) -> bool {
             == "---![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"
         || trimmed
             == "---![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"
-        || trimmed == "[(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"
-        || trimmed == "[(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"
-        || trimmed == "[(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"
+        || trimmed
+            == "[(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"
+        || trimmed
+            == "[(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"
+        || trimmed
+            == "[(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"
 }
 
 fn realm_badge_label(realm_badge: &str) -> &'static str {
@@ -420,12 +429,9 @@ const GMOD_REALM_BADGE_SERVER_MARKDOWN: &str =
 const GMOD_REALM_BADGE_CLIENT_MARKDOWN: &str =
     "![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)";
 
-const GMOD_REALM_BADGE_SHARED_MARKDOWN_LEGACY: &str =
-    "---![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)";
-const GMOD_REALM_BADGE_SERVER_MARKDOWN_LEGACY: &str =
-    "---![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)";
-const GMOD_REALM_BADGE_CLIENT_MARKDOWN_LEGACY: &str =
-    "---![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)";
+const GMOD_REALM_BADGE_SHARED_MARKDOWN_LEGACY: &str = "---![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)";
+const GMOD_REALM_BADGE_SERVER_MARKDOWN_LEGACY: &str = "---![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)";
+const GMOD_REALM_BADGE_CLIENT_MARKDOWN_LEGACY: &str = "---![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)";
 
 const GMOD_REALM_BADGE_SHARED_MARKDOWN_PLAIN: &str =
     "[(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)";

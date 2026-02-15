@@ -328,11 +328,11 @@ fn extend_gmod_hook_semantic_decls(
     let member_key = member.get_key().clone();
     for fallback_owner_name in fallback_owner_names {
         let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
-        let Some(member_infos) =
-            builder
-                .semantic_model
-                .get_member_info_with_key(&fallback_type, member_key.clone(), true)
-        else {
+        let Some(member_infos) = builder.semantic_model.get_member_info_with_key(
+            &fallback_type,
+            member_key.clone(),
+            true,
+        ) else {
             continue;
         };
 
@@ -349,7 +349,9 @@ fn extend_gmod_hook_semantic_decls(
             }
 
             let owner_type = match property_owner_id {
-                LuaSemanticDeclId::LuaDecl(decl_id) => builder.semantic_model.get_type(decl_id.into()),
+                LuaSemanticDeclId::LuaDecl(decl_id) => {
+                    builder.semantic_model.get_type(decl_id.into())
+                }
                 LuaSemanticDeclId::Member(member_id) => {
                     builder.semantic_model.get_type(member_id.into())
                 }
