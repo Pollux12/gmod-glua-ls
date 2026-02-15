@@ -1,0 +1,20 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "cargo",
+			"command": "build",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"env": {
+				"PATH": "C:\\Users\\Pollux\\.cargo\\bin"
+			},
+			"label": "rust: cargo build"
+		}
+	]
+}
