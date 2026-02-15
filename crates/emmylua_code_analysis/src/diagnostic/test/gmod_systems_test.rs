@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
@@ -10,7 +11,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
     }
 
-    #[test]
+    #[gtest]
     fn test_reports_unknown_static_net_start_message() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -22,7 +23,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[gtest]
     fn test_ignores_known_or_dynamic_net_start_message() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -37,7 +38,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[gtest]
     fn test_duplicate_system_registration_disabled_by_default() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -59,7 +60,7 @@ mod tests {
         assert!(!diagnostics.iter().any(|diagnostic| diagnostic.code == code));
     }
 
-    #[test]
+    #[gtest]
     fn test_reports_duplicate_system_registration_when_enabled() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -76,7 +77,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[gtest]
     fn test_gmod_systems_checker_is_disabled_with_gmod_off() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

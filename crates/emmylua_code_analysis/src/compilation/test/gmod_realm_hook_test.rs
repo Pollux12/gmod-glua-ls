@@ -4,6 +4,7 @@ mod test {
         Emmyrc, GmodConVarKind, GmodHookKind, GmodHookNameIssue, GmodRealm, GmodTimerKind,
         VirtualWorkspace,
     };
+    use googletest::prelude::*;
 
     fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
@@ -11,7 +12,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
     }
 
-    #[test]
+    #[gtest]
     fn test_realm_inference_with_filename_and_dependency_hints() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -60,7 +61,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_realm_metadata_updates_after_dependency_removed() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -86,7 +87,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_require_dependency_marks_module_shared_not_caller() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -108,7 +109,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_hook_detection_for_add_emit_and_gamemode_methods() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -179,7 +180,7 @@ mod test {
         }));
     }
 
-    #[test]
+    #[gtest]
     fn test_system_metadata_detection_for_network_concommand_convar_and_timer() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -241,7 +242,7 @@ mod test {
         }));
     }
 
-    #[test]
+    #[gtest]
     fn test_realm_inference_respects_default_realm_config() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -259,7 +260,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_hook_detection_respects_hook_mappings() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -297,7 +298,7 @@ mod test {
         }));
     }
 
-    #[test]
+    #[gtest]
     fn test_hook_detection_respects_method_prefixes() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -327,7 +328,7 @@ mod test {
         }));
     }
 
-    #[test]
+    #[gtest]
     fn test_hook_detection_from_hook_annotation() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -360,7 +361,7 @@ mod test {
         }));
     }
 
-    #[test]
+    #[gtest]
     fn test_hook_detection_normalizes_builtin_owner_prefixed_names() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -395,7 +396,7 @@ mod test {
         assert_eq!(spawn_sent_sites, 2);
     }
 
-    #[test]
+    #[gtest]
     fn test_hook_metadata_not_collected_when_gmod_disabled() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -410,7 +411,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_branch_realm_narrowing_if_client() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -443,7 +444,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_branch_realm_narrowing_if_server_else_client() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -481,7 +482,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_branch_realm_narrowing_not_client_is_server() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -510,7 +511,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_branch_realm_get_realm_at_offset() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

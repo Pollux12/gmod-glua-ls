@@ -2,8 +2,8 @@ use emmylua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, PathTrait};
 use rowan::{NodeOrToken, TextSize};
 
 use crate::{
-    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaSemanticDeclId,
-    SemanticDeclLevel, SemanticModel,
+    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaSemanticDeclId, SemanticDeclLevel,
+    SemanticModel,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -20,8 +20,7 @@ impl Checker for GmodRealmMisuseChecker {
         let file_id = semantic_model.get_file_id();
         let db = semantic_model.get_db();
         let infer_index = db.get_gmod_infer_index();
-        let Some(file_realm_metadata) = infer_index.get_realm_file_metadata(&file_id)
-        else {
+        let Some(file_realm_metadata) = infer_index.get_realm_file_metadata(&file_id) else {
             return;
         };
 
@@ -54,7 +53,8 @@ impl Checker for GmodRealmMisuseChecker {
 
             let callee_realm = pick_best_mismatch_candidate(&callee_realms);
 
-            let Some(code) = diagnostic_code_for_mismatch(call_realm.evidence, callee_realm.evidence)
+            let Some(code) =
+                diagnostic_code_for_mismatch(call_realm.evidence, callee_realm.evidence)
             else {
                 continue;
             };
@@ -88,7 +88,10 @@ struct ResolvedRealm {
     evidence: RealmEvidence,
 }
 
-fn resolve_callee_realms(semantic_model: &SemanticModel, call_expr: &LuaCallExpr) -> Vec<ResolvedRealm> {
+fn resolve_callee_realms(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+) -> Vec<ResolvedRealm> {
     if let Some(realms) = resolve_member_candidate_realms(semantic_model, call_expr)
         && !realms.is_empty()
     {

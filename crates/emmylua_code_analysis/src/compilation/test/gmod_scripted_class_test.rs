@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test {
     use emmylua_parser::{LuaAstNode, LuaAstToken, LuaLocalName, LuaNameExpr};
+    use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
@@ -9,7 +10,7 @@ mod test {
         VirtualWorkspace,
     };
 
-    #[test]
+    #[gtest]
     fn test_extracts_scripted_class_call_literals() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -60,7 +61,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_scripted_class_index_clears_on_reparse_without_patterns() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -85,7 +86,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_scripted_class_metadata_disabled_when_gmod_disabled() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -100,7 +101,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_scripted_class_scope_filters_metadata_collection() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -131,7 +132,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_scripted_class_scope_matches_nested_entities_folder_anywhere() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -152,7 +153,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_plugin_scope_binds_plugin_decl_to_scoped_class() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -161,7 +162,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
-            "addons/cityrp/gamemode/plugins/vehicles/sh_plugin.lua",
+            "plugins/vehicles/sh_plugin.lua",
             r#"
             local PLUGIN = {}
 
@@ -219,7 +220,7 @@ mod test {
         }
     }
 
-    #[test]
+    #[gtest]
     fn test_plugin_scope_binds_plugin_decl_with_self_reference_initializer() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -228,7 +229,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
-            "addons/cityrp/gamemode/plugins/vehicles/sh_plugin.lua",
+            "plugins/vehicles/sh_plugin.lua",
             r#"
             local PLUGIN = PLUGIN ---@diagnostic disable-line: undefined-global
 
@@ -279,7 +280,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_plugin_scope_binding_respects_scope_filters() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -288,7 +289,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
-            "addons/cityrp/gamemode/plugins/vehicles/sh_plugin.lua",
+            "plugins/vehicles/sh_plugin.lua",
             r#"
             local PLUGIN = {}
         "#,
@@ -319,7 +320,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_entity_scope_infers_ent_reference_to_scoped_class_without_local_decl() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -328,7 +329,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
-            "addons/cityrp/gamemode/entities/entities/cityrp_money/sh_init.lua",
+            "plugins/vehicles/entities/entities/vehicles_money/sh_init.lua",
             r#"
             ENT.Type = "anim"
             ENT.Base = "base_gmodentity"
@@ -336,9 +337,7 @@ mod test {
         );
 
         let name_expr = ws.get_node::<LuaNameExpr>(file_id);
-        let token = name_expr
-            .get_name_token()
-            .expect("expected ENT name token");
+        let token = name_expr.get_name_token().expect("expected ENT name token");
         let semantic_model = ws
             .analysis
             .compilation
@@ -350,11 +349,11 @@ mod test {
 
         assert_eq!(
             semantic_info.typ,
-            LuaType::Def(LuaTypeDeclId::global("cityrp_money"))
+            LuaType::Def(LuaTypeDeclId::global("vehicles_money"))
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_entity_scope_creates_class_decl_without_ent_base_assignment() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -363,7 +362,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
-            "addons/cityrp/gamemode/entities/entities/cityrp_inventory/init.lua",
+            "entities/entities/cityrp_inventory/init.lua",
             r#"
             function ENT:Initialize()
             end
@@ -386,9 +385,7 @@ mod test {
         );
 
         let name_expr = ws.get_node::<LuaNameExpr>(file_id);
-        let token = name_expr
-            .get_name_token()
-            .expect("expected ENT name token");
+        let token = name_expr.get_name_token().expect("expected ENT name token");
         let semantic_model = ws
             .analysis
             .compilation
@@ -404,7 +401,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_entity_method_self_infers_scoped_class_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -413,7 +410,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
-            "addons/cityrp/gamemode/entities/entities/cityrp_inventory/init.lua",
+            "entities/entities/cityrp_inventory/init.lua",
             r#"
             function ENT:Initialize()
                 local self_copy = self
@@ -448,7 +445,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_accessor_func_synthesizes_get_set_members() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -508,7 +505,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_accessor_func_force_type_resolves_correctly() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -536,13 +533,14 @@ mod test {
             .find(|m| m.get_key().get_name() == Some("GetPosition"))
             .expect("expected GetPosition member");
 
-        let getter_type = db
-            .get_type_index()
-            .get_type_cache(&getter.get_id().into());
-        assert!(getter_type.is_some(), "GetPosition should have a type bound");
+        let getter_type = db.get_type_index().get_type_cache(&getter.get_id().into());
+        assert!(
+            getter_type.is_some(),
+            "GetPosition should have a type bound"
+        );
     }
 
-    #[test]
+    #[gtest]
     fn test_network_var_synthesizes_get_set_members() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -599,7 +597,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_define_baseclass_sets_super_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -629,7 +627,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_ent_base_from_shared_file_sets_folder_class_super_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -638,14 +636,14 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/cityrp/gamemode/entities/entities/cityrp_money/sh_init.lua",
+            "entities/entities/cityrp_money/sh_init.lua",
             r#"
             ENT.Base = "cityrp_base"
         "#,
         );
 
         let file_id = ws.def_file(
-            "addons/cityrp/gamemode/entities/entities/cityrp_money/init.lua",
+            "entities/entities/cityrp_money/init.lua",
             r#"
             function ENT:Initialize()
             end
@@ -668,9 +666,7 @@ mod test {
         }
 
         let name_expr = ws.get_node::<LuaNameExpr>(file_id);
-        let token = name_expr
-            .get_name_token()
-            .expect("expected ENT name token");
+        let token = name_expr.get_name_token().expect("expected ENT name token");
         let semantic_model = ws
             .analysis
             .compilation
@@ -686,7 +682,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_ent_base_known_gmod_base_maps_to_ent_super_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -719,7 +715,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_doc_param_resolves_scoped_entity_type_without_type_not_found() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -762,12 +758,14 @@ mod test {
             DiagnosticCode::TypeNotFound.get_name().to_string(),
         ));
         assert!(
-            diagnostics.iter().all(|diag| diag.code != type_not_found_code),
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != type_not_found_code),
             "unexpected type-not-found diagnostics: {diagnostics:?}"
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_vgui_register_creates_panel_class() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -809,7 +807,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[gtest]
     fn test_vgui_register_not_captured_when_gmod_disabled() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -827,6 +825,1455 @@ mod test {
         let db = ws.get_db_mut();
         let class_id = LuaTypeDeclId::global("DisabledPanel");
         let decl = db.get_type_index().get_type_decl(&class_id);
-        assert!(decl.is_none(), "Panel class should not be created when gmod disabled");
+        assert!(
+            decl.is_none(),
+            "Panel class should not be created when gmod disabled"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_two_arg_form_synthesizes_get_set() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/entities/two_arg_nw/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:NetworkVar("String", "Label")
+                self:NetworkVar("Bool", "Active")
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("two_arg_nw");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on two_arg_nw class");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetLabel".to_string()),
+            "missing GetLabel in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetLabel".to_string()),
+            "missing SetLabel in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetActive".to_string()),
+            "missing GetActive in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetActive".to_string()),
+            "missing SetActive in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_element_collected_and_synthesized() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/entities/nve_entity/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:NetworkVarElement("Float", 0, "x", "VehiclePos")
+                self:NetworkVarElement("Float", 1, "y", "VehicleAng")
+            end
+        "#,
+        );
+
+        // Verify collection
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+            .cloned()
+            .expect("expected scripted class metadata");
+        assert_eq!(
+            metadata.network_var_element_calls.len(),
+            2,
+            "expected 2 NetworkVarElement calls, got {}",
+            metadata.network_var_element_calls.len()
+        );
+
+        // Verify synthesis
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("nve_entity");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on nve_entity class");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetVehiclePos".to_string()),
+            "missing GetVehiclePos in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetVehiclePos".to_string()),
+            "missing SetVehiclePos in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetVehicleAng".to_string()),
+            "missing GetVehicleAng in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetVehicleAng".to_string()),
+            "missing SetVehicleAng in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_element_three_arg_form() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/entities/nve_short/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:NetworkVarElement("Float", 0, "Offset")
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("nve_short");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on nve_short class");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetOffset".to_string()),
+            "missing GetOffset in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetOffset".to_string()),
+            "missing SetOffset in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_inherited_network_vars_accessible_on_derived_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "addons/test/lua/entities/base_glide_car/shared.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Vector", 0, "HeadlightColor")
+                    self:NetworkVar("Float", 0, "SteerConeChangeRate")
+                end
+            "#,
+            ),
+            (
+                "addons/test/lua/entities/fl_dodge_charger/shared.lua",
+                r#"
+                ENT.Base = "base_glide_car"
+            "#,
+            ),
+        ]);
+
+        // Verify base entity has the NetworkVar members
+        {
+            let db = ws.get_db_mut();
+            let base_class_id = LuaTypeDeclId::global("base_glide_car");
+            let base_owner = LuaMemberOwner::Type(base_class_id);
+            let base_members = db
+                .get_member_index()
+                .get_members(&base_owner)
+                .expect("expected members on base_glide_car");
+            let base_member_names: Vec<_> = base_members
+                .iter()
+                .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                .collect();
+            assert!(
+                base_member_names.contains(&"GetHeadlightColor".to_string()),
+                "missing GetHeadlightColor on base: {base_member_names:?}"
+            );
+            assert!(
+                base_member_names.contains(&"SetSteerConeChangeRate".to_string()),
+                "missing SetSteerConeChangeRate on base: {base_member_names:?}"
+            );
+        }
+
+        // Verify derived entity inherits from base
+        {
+            let db = ws.get_db_mut();
+            let derived_class_id = LuaTypeDeclId::global("fl_dodge_charger");
+            let super_types: Vec<_> = db
+                .get_type_index()
+                .get_super_types_iter(&derived_class_id)
+                .map(|iter| iter.cloned().collect())
+                .unwrap_or_default();
+            assert!(
+                super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("base_glide_car"))),
+                "expected base_glide_car super type on derived, \
+                 got {super_types:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_network_var_mixed_forms_in_same_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/entities/mixed_nw/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Float", 0, "Speed")
+                self:NetworkVar("String", "Label")
+                self:NetworkVarElement("Float", 0, "x", "Position")
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("mixed_nw");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on mixed_nw class");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        // 3-arg NetworkVar
+        assert!(
+            member_names.contains(&"GetSpeed".to_string()),
+            "missing GetSpeed in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetSpeed".to_string()),
+            "missing SetSpeed in {member_names:?}"
+        );
+        // 2-arg NetworkVar
+        assert!(
+            member_names.contains(&"GetLabel".to_string()),
+            "missing GetLabel in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetLabel".to_string()),
+            "missing SetLabel in {member_names:?}"
+        );
+        // NetworkVarElement
+        assert!(
+            member_names.contains(&"GetPosition".to_string()),
+            "missing GetPosition in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetPosition".to_string()),
+            "missing SetPosition in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_element_metadata_collection() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/entities/nve_meta_test.lua",
+            r#"
+            self:NetworkVarElement("Float", 0, "x", "Position")
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+            .cloned()
+            .expect("expected metadata for NetworkVarElement");
+
+        assert_eq!(metadata.network_var_element_calls.len(), 1);
+        assert_eq!(
+            metadata.network_var_element_calls[0].literal_args,
+            vec![
+                Some(GmodClassCallLiteral::String("Float".to_string())),
+                Some(GmodClassCallLiteral::Integer(0)),
+                Some(GmodClassCallLiteral::String("x".to_string())),
+                Some(GmodClassCallLiteral::String("Position".to_string())),
+            ]
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_wrapper_function_synthesizes_get_set() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/entities/wrapper_ent/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:RegisterNW("String", "Label")
+                self:RegisterNW("Float", "Health")
+            end
+
+            function ENT:RegisterNW(type, name)
+                self:NetworkVar(type, 0, name)
+            end
+        "#,
+        );
+
+        let class_id = LuaTypeDeclId::global("wrapper_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let member_names: Vec<String> = ws
+            .get_db_mut()
+            .get_member_index()
+            .get_members(&owner)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            member_names.contains(&"GetLabel".to_string()),
+            "missing GetLabel in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetLabel".to_string()),
+            "missing SetLabel in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetHealth".to_string()),
+            "missing GetHealth in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetHealth".to_string()),
+            "missing SetHealth in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_wrapper_with_fixed_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/entities/wrapper_fixed/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:AddBoolNW("Active")
+                self:AddBoolNW("Visible")
+            end
+
+            function ENT:AddBoolNW(name)
+                self:NetworkVar("Bool", 0, name)
+            end
+        "#,
+        );
+
+        let class_id = LuaTypeDeclId::global("wrapper_fixed");
+        let owner = LuaMemberOwner::Type(class_id);
+        let member_names: Vec<String> = ws
+            .get_db_mut()
+            .get_member_index()
+            .get_members(&owner)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            member_names.contains(&"GetActive".to_string()),
+            "missing GetActive in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetActive".to_string()),
+            "missing SetActive in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetVisible".to_string()),
+            "missing GetVisible in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetVisible".to_string()),
+            "missing SetVisible in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_element_wrapper_synthesizes_number_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/entities/elem_wrap/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:AddPosElement("PosX")
+            end
+
+            function ENT:AddPosElement(name)
+                self:NetworkVarElement("Float", 0, "x", name)
+            end
+        "#,
+        );
+
+        let class_id = LuaTypeDeclId::global("elem_wrap");
+        let owner = LuaMemberOwner::Type(class_id);
+        let member_names: Vec<String> = ws
+            .get_db_mut()
+            .get_member_index()
+            .get_members(&owner)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            member_names.contains(&"GetPosX".to_string()),
+            "missing GetPosX in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetPosX".to_string()),
+            "missing SetPosX in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_no_undefined_field_across_entity_files() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_files(vec![
+            (
+                "addons/test/lua/entities/base_glide_car/shared.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Bool", "IsRedlining")
+                    self:NetworkVar("Float", 0, "Speed")
+                end
+            "#,
+            ),
+            (
+                "addons/test/lua/entities/base_glide_car/cl_init.lua",
+                r#"
+                function ENT:Think()
+                    local x = self:GetIsRedlining()
+                    local y = self:GetSpeed()
+                end
+            "#,
+            ),
+        ]);
+
+        let target_uri = ws
+            .virtual_url_generator
+            .new_uri("addons/test/lua/entities/base_glide_car/cl_init.lua");
+        let target_file_id = ws
+            .analysis
+            .get_file_id(&target_uri)
+            .expect("expected file id");
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(target_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_self_resolves_to_scoped_class_in_secondary_entity_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "addons/test/lua/entities/multi_file_ent/shared.lua",
+                r#"
+                ENT.Type = "anim"
+            "#,
+            ),
+            (
+                "addons/test/lua/entities/multi_file_ent/cl_init.lua",
+                r#"
+                function ENT:Draw()
+                    local self_copy = self
+                end
+            "#,
+            ),
+        ]);
+
+        let target_uri = ws
+            .virtual_url_generator
+            .new_uri("addons/test/lua/entities/multi_file_ent/cl_init.lua");
+        let file_id = ws
+            .analysis
+            .get_file_id(&target_uri)
+            .expect("expected file id");
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let self_name_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "self")
+            })
+            .expect("expected self name expr");
+        let self_token = self_name_expr
+            .get_name_token()
+            .expect("expected self token");
+        let semantic_info = semantic_model
+            .get_semantic_info(self_token.syntax().clone().into())
+            .expect("expected semantic info for self");
+
+        assert_eq!(
+            semantic_info.typ,
+            LuaType::Def(LuaTypeDeclId::global("multi_file_ent"))
+        );
+    }
+
+    #[gtest]
+    fn test_inherited_network_var_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_files(vec![
+            (
+                "addons/test/lua/entities/base_vehicle/shared.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Vector", 0, "HeadlightColor")
+                    self:NetworkVar("Float", 0, "SteerRate")
+                end
+            "#,
+            ),
+            (
+                "addons/test/lua/entities/derived_vehicle/shared.lua",
+                r#"
+                ENT.Base = "base_vehicle"
+            "#,
+            ),
+            (
+                "addons/test/lua/entities/derived_vehicle/cl_init.lua",
+                r#"
+                function ENT:Think()
+                    self:SetHeadlightColor(Vector(0, 0, 0))
+                    local rate = self:GetSteerRate()
+                end
+            "#,
+            ),
+        ]);
+
+        let target_uri = ws
+            .virtual_url_generator
+            .new_uri("addons/test/lua/entities/derived_vehicle/cl_init.lua");
+        let target_file_id = ws
+            .analysis
+            .get_file_id(&target_uri)
+            .expect("expected file id");
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(target_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_local_function_wrapper_inside_setup_data_tables() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/entities/local_wrap_ent/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                local function AddFloatVar(key, min, max)
+                    self:NetworkVar("Float", key)
+                end
+
+                AddFloatVar("Speed", 0, 100)
+                AddFloatVar("Health", 0, 500)
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("local_wrap_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetSpeed".to_string()),
+            "missing GetSpeed in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetSpeed".to_string()),
+            "missing SetSpeed in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetHealth".to_string()),
+            "missing GetHealth in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetHealth".to_string()),
+            "missing SetHealth in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_two_arg_network_var_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_files(vec![
+            (
+                "addons/test/lua/entities/two_arg_diag/shared.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Bool", "IsRedlining")
+                    self:NetworkVar("String", "Label")
+                end
+            "#,
+            ),
+            (
+                "addons/test/lua/entities/two_arg_diag/cl_init.lua",
+                r#"
+                function ENT:Think()
+                    local x = self:GetIsRedlining()
+                    local y = self:GetLabel()
+                end
+            "#,
+            ),
+        ]);
+
+        let target_uri = ws
+            .virtual_url_generator
+            .new_uri("addons/test/lua/entities/two_arg_diag/cl_init.lua");
+        let target_file_id = ws
+            .analysis
+            .get_file_id(&target_uri)
+            .expect("expected file id");
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(target_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_realistic_mixed_networkvar_and_wrapper_calls_in_same_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_files(vec![
+            (
+                "addons/test/lua/entities/base_glide_car_realistic/shared.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Bool", "IsRedlining")
+                    self:NetworkVar("Int", "Gear")
+                    self:NetworkVar("Float", "Steering")
+
+                    self:NetworkVar("Vector", "TireSmokeColor",
+                        { KeyName = "TireSmokeColor" })
+                    self:NetworkVar("Vector", "HeadlightColor",
+                        { KeyName = "HeadlightColor" })
+
+                    local order = 0
+                    local function AddFloatVar(key, min, max, category)
+                        order = order + 1
+                        self:NetworkVar("Float", key)
+                    end
+
+                    local function AddIntVar(key, min, max, category)
+                        order = order + 1
+                        self:NetworkVar("Int", key)
+                    end
+
+                    local function AddBoolVar(key, category)
+                        order = order + 1
+                        self:NetworkVar("Bool", key)
+                    end
+
+                    AddFloatVar("MaxSteerAngle", 10, 80, "steering")
+                    AddFloatVar("SteerConeChangeRate", 0.1, 10, "steering")
+                    AddBoolVar("HasHeadlights", "lights")
+                    AddIntVar("MaxHealth", 100, 10000, "health")
+                end
+            "#,
+            ),
+            (
+                "addons/test/lua/entities/base_glide_car_realistic/cl_init.lua",
+                r#"
+                function ENT:OnUpdateSounds()
+                    local redlining = self:GetIsRedlining()
+                    local gear = self:GetGear()
+                    local steer = self:GetSteering()
+                end
+            "#,
+            ),
+        ]);
+
+        {
+            let db = ws.get_db_mut();
+            let class_id = LuaTypeDeclId::global("base_glide_car_realistic");
+            let owner = LuaMemberOwner::Type(class_id);
+            let members = db
+                .get_member_index()
+                .get_members(&owner)
+                .expect("expected members on base_glide_car_realistic");
+            let member_names: Vec<_> = members
+                .iter()
+                .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                .collect();
+
+            assert!(
+                member_names.contains(&"GetIsRedlining".to_string()),
+                "missing GetIsRedlining in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"SetIsRedlining".to_string()),
+                "missing SetIsRedlining in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"GetGear".to_string()),
+                "missing GetGear in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"SetGear".to_string()),
+                "missing SetGear in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"GetSteering".to_string()),
+                "missing GetSteering in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"SetSteering".to_string()),
+                "missing SetSteering in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"GetTireSmokeColor".to_string()),
+                "missing GetTireSmokeColor in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"SetTireSmokeColor".to_string()),
+                "missing SetTireSmokeColor in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"GetHeadlightColor".to_string()),
+                "missing GetHeadlightColor in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"SetHeadlightColor".to_string()),
+                "missing SetHeadlightColor in {member_names:?}"
+            );
+        }
+
+        let cl_uri = ws
+            .virtual_url_generator
+            .new_uri("addons/test/lua/entities/base_glide_car_realistic/cl_init.lua");
+        let cl_file_id = ws
+            .analysis
+            .get_file_id(&cl_uri)
+            .expect("expected cl_init file id");
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(cl_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics on cl_init.lua accessing direct NetworkVar getters: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_sequential_file_analysis() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        // First batch: shared.lua analyzed alone
+        ws.def_file(
+            "addons/test/lua/entities/seq_entity/shared.lua",
+            r#"
+        function ENT:SetupDataTables()
+            self:NetworkVar("Bool", "IsRedlining")
+            self:NetworkVar("Float", 0, "Speed")
+        end
+    "#,
+        );
+
+        // Second batch: cl_init.lua analyzed separately (incremental)
+        let cl_file_id = ws.def_file(
+            "addons/test/lua/entities/seq_entity/cl_init.lua",
+            r#"
+        function ENT:Think()
+            local x = self:GetIsRedlining()
+            local y = self:GetSpeed()
+        end
+    "#,
+        );
+
+        // Check: cl_init.lua should have no UndefinedField diagnostics
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(cl_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics when files analyzed sequentially: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_with_std_lib_initialized() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_files(vec![
+            (
+                "addons/test/lua/entities/stdlib_ent/shared.lua",
+                r#"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Bool", "IsRedlining")
+                self:NetworkVar("Float", 0, "Speed")
+            end
+        "#,
+            ),
+            (
+                "addons/test/lua/entities/stdlib_ent/cl_init.lua",
+                r#"
+            function ENT:Think()
+                local x = self:GetIsRedlining()
+                local y = self:GetSpeed()
+            end
+        "#,
+            ),
+        ]);
+
+        let cl_uri = ws
+            .virtual_url_generator
+            .new_uri("addons/test/lua/entities/stdlib_ent/cl_init.lua");
+        let cl_file_id = ws
+            .analysis
+            .get_file_id(&cl_uri)
+            .expect("expected cl_init file id");
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(cl_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics with std lib loaded: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_same_function_usage_with_real_config() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![
+            "entities/**".to_string(),
+            "weapons/**".to_string(),
+            "effects/**".to_string(),
+            "weapons/gmod_tool/stools/**".to_string(),
+            "plugins/**".to_string(),
+        ];
+        emmyrc.gmod.scripted_class_scopes.exclude = vec![
+            "**/tests/**".to_string(),
+            "**/test/**".to_string(),
+            "**/docs/**".to_string(),
+        ];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        // This exactly mirrors the real base_glide/shared.lua:
+        // - ENT.Type and ENT.Base at top level
+        // - Many ENT field assignments
+        // - SetupDataTables with NetworkVar calls followed by setter usage
+        // - CLIENT/SERVER conditional blocks
+        // - NetworkVarNotify calls
+        let file_id = ws.def_file(
+            "addons/cityrp-vehicle-base/lua/entities/base_glide/shared.lua",
+            r##"
+        ENT.Type = "anim"
+        ENT.Base = "base_anim"
+
+        ENT.PrintName = "Glide Base Vehicle"
+        ENT.IsGlideVehicle = true
+        ENT.MaxChassisHealth = 1000
+        ENT.CanSwitchHeadlights = false
+
+        function ENT:SetupDataTables()
+            self:NetworkVar("Entity", "Driver")
+            self:NetworkVar("Int", "EngineState")
+            self:NetworkVar("Bool", "IsEngineOnFire")
+            self:NetworkVar("Bool", "IsLocked")
+            self:NetworkVar("Int", "LockOnState")
+            self:NetworkVar("Entity", "LockOnTarget")
+            self:NetworkVar("Float", "ChassisHealth")
+            self:NetworkVar("Float", "EngineHealth")
+            self:NetworkVar("Float", "BrakeValue")
+            self:NetworkVar("Bool", "HandbrakeActive")
+            self:NetworkVar("Int", "HeadlightState")
+            self:NetworkVar("Int", "TurnSignalState")
+            self:NetworkVar("Int", "ConnectedReceptacleCount")
+            self:NetworkVar("Bool", "ReducedThrottle")
+            self:NetworkVar("Int", "WaterState")
+
+            if CLIENT then
+                self:NetworkVarNotify("WaterState", self.OnWaterStateChange)
+            end
+
+            local editData = nil
+            if self.CanSwitchHeadlights then
+                editData = {
+                    KeyName = "HeadlightColor",
+                    Edit = { type = "VectorColor", order = 0, category = "#glide.settings" },
+                }
+            end
+            self:NetworkVar("Vector", "HeadlightColor", editData)
+
+            self:SetDriver(NULL)
+            self:SetEngineState(0)
+            self:SetIsEngineOnFire(false)
+            self:SetLockOnState(0)
+            self:SetLockOnTarget(NULL)
+            self:SetBrakeValue(0)
+            self:SetHandbrakeActive(false)
+            self:SetHeadlightState(0)
+            self:SetTurnSignalState(0)
+
+            local maxChassis = self.MaxChassisHealth or 1000
+            if maxChassis < 1 then maxChassis = 1 end
+            self:SetChassisHealth(maxChassis)
+            self:SetEngineHealth(1.0)
+
+            self:NetworkVarNotify("EngineState", self.OnEngineStateChange)
+
+            if SERVER then
+                self:NetworkVarNotify("EngineState", self.OnEngineStateChangePhoton)
+                self:NetworkVarNotify("HeadlightState", self.OnHeadlightStateChangePhoton)
+                self:NetworkVarNotify("TurnSignalState", self.OnTurnSignalStateChangePhoton)
+            end
+        end
+
+        function ENT:IsEngineOn(selfTbl)
+            selfTbl = selfTbl or self:GetTable()
+            local cached = selfTbl._cachedEngineState
+            if cached ~= nil then
+                return cached > 1
+            end
+            return self:GetEngineState() > 1
+        end
+
+        function ENT:IsBraking(selfTbl)
+            selfTbl = selfTbl or self:GetTable()
+            local cached = selfTbl._cachedBrakeValue
+            if cached ~= nil then
+                return cached > 0.1
+            end
+            return self:GetBrakeValue() > 0.1
+        end
+
+        function ENT:OnPostInitialize() end
+        function ENT:OnTurnOn() end
+        function ENT:OnTurnOff() end
+
+        if CLIENT then
+            ENT.Spawnable = false
+            ENT.CameraOffset = Vector(-200, 0, 50)
+
+            function ENT:OnActivateSounds() end
+            function ENT:OnDeactivateSounds() end
+            function ENT:OnUpdateSounds() end
+        end
+
+        if SERVER then
+            ENT.Spawnable = true
+            ENT.ChassisMass = 700
+
+            function ENT:CreateFeatures() end
+            function ENT:OnDriverEnter() end
+            function ENT:OnDriverExit() end
+        end
+    "##,
+        );
+
+        // First check: members should exist on base_glide class
+        let member_names: Vec<String> = {
+            let db = ws.get_db_mut();
+            let class_id = LuaTypeDeclId::global("base_glide");
+            let owner = LuaMemberOwner::Type(class_id);
+            let members = db
+                .get_member_index()
+                .get_members(&owner)
+                .expect("expected members on base_glide class");
+            let member_names: Vec<String> = members
+                .iter()
+                .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                .collect();
+
+            assert!(
+                member_names.contains(&"GetDriver".to_string()),
+                "missing GetDriver in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"SetDriver".to_string()),
+                "missing SetDriver in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"GetEngineState".to_string()),
+                "missing GetEngineState in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"SetEngineState".to_string()),
+                "missing SetEngineState in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"GetIsEngineOnFire".to_string()),
+                "missing GetIsEngineOnFire in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"GetHeadlightColor".to_string()),
+                "missing GetHeadlightColor in {member_names:?}"
+            );
+
+            member_names
+        };
+
+        // Second check: no UndefinedField diagnostics within the same file
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let param_type_mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let missing_parameter_code = Some(NumberOrString::String(
+            DiagnosticCode::MissingParameter.get_name().to_string(),
+        ));
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        let param_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| {
+                diag.code == param_type_mismatch_code || diag.code == missing_parameter_code
+            })
+            .collect();
+
+        assert!(
+            param_diagnostics.is_empty(),
+            "unexpected param diagnostics for synthesized NetworkVar accessors: {param_diagnostics:?}"
+        );
+
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
+
+        let extract_undefined_field_name = |message: &str| {
+            let prefix = "Undefined field `";
+            message
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.split_once('`'))
+                .map(|(name, _)| name.to_string())
+        };
+
+        let mut undefined_field_names: Vec<String> = undefined_field_diags
+            .iter()
+            .filter_map(|diag| extract_undefined_field_name(&diag.message))
+            .collect();
+        undefined_field_names.sort();
+
+        let allowed_undefined_field_names = [
+            "NetworkVar",
+            "NetworkVarNotify",
+            "OnWaterStateChange",
+            "OnEngineStateChange",
+            "OnEngineStateChangePhoton",
+            "OnHeadlightStateChangePhoton",
+            "OnTurnSignalStateChangePhoton",
+            "GetTable",
+        ];
+
+        assert!(
+            undefined_field_names
+                .iter()
+                .all(|name| allowed_undefined_field_names.contains(&name.as_str())),
+            "unexpected undefined-field diagnostics in same file: {undefined_field_diags:?}; undefined_field_names={undefined_field_names:?}; member_names={member_names:?}"
+        );
+
+        assert_eq!(
+            undefined_field_names
+                .iter()
+                .filter(|name| name.as_str() == "NetworkVar")
+                .count(),
+            16,
+            "expected 16 undefined NetworkVar members"
+        );
+        assert_eq!(
+            undefined_field_names
+                .iter()
+                .filter(|name| name.as_str() == "NetworkVarNotify")
+                .count(),
+            5,
+            "expected 5 undefined NetworkVarNotify members"
+        );
+        assert_eq!(
+            undefined_field_names
+                .iter()
+                .filter(|name| name.as_str() == "GetTable")
+                .count(),
+            2,
+            "expected 2 undefined GetTable members"
+        );
+        assert_eq!(
+            undefined_field_names
+                .iter()
+                .filter(|name| name.as_str() == "OnWaterStateChange")
+                .count(),
+            1,
+            "expected one undefined callback member for OnWaterStateChange"
+        );
+        assert_eq!(
+            undefined_field_names
+                .iter()
+                .filter(|name| name.as_str() == "OnEngineStateChange")
+                .count(),
+            1,
+            "expected one undefined callback member for OnEngineStateChange"
+        );
+        assert_eq!(
+            undefined_field_names
+                .iter()
+                .filter(|name| name.as_str() == "OnEngineStateChangePhoton")
+                .count(),
+            1,
+            "expected one undefined callback member for OnEngineStateChangePhoton"
+        );
+        assert_eq!(
+            undefined_field_names
+                .iter()
+                .filter(|name| name.as_str() == "OnHeadlightStateChangePhoton")
+                .count(),
+            1,
+            "expected one undefined callback member for OnHeadlightStateChangePhoton"
+        );
+        assert_eq!(
+            undefined_field_names
+                .iter()
+                .filter(|name| name.as_str() == "OnTurnSignalStateChangePhoton")
+                .count(),
+            1,
+            "expected one undefined callback member for OnTurnSignalStateChangePhoton"
+        );
+    }
+
+    #[gtest]
+    fn test_network_var_with_entity_type_definitions() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_files(vec![
+            (
+                "addons/test/lua/includes/entity_defs.lua",
+                r#"
+            ---@class Entity
+            ---@field NetworkVar fun(self: Entity, type: string, name: string)
+            ---@field NetworkVarNotify fun(self: Entity, name: string, callback: function)
+            ---@field GetTable fun(self: Entity): table
+            local Entity = {}
+
+            ---@class ENT : Entity
+            local ENT = {}
+        "#,
+            ),
+            (
+                "addons/test/lua/entities/base_glide/shared.lua",
+                r#"
+            ENT.Type = "anim"
+            ENT.Base = "base_anim"
+            ENT.PrintName = "Glide Base Vehicle"
+            ENT.MaxChassisHealth = 1000
+
+            function ENT:SetupDataTables()
+                self:NetworkVar("Entity", "Driver")
+                self:NetworkVar("Int", "EngineState")
+                self:NetworkVar("Bool", "IsEngineOnFire")
+                self:NetworkVar("Bool", "IsLocked")
+                self:NetworkVar("Float", "ChassisHealth")
+                self:NetworkVar("Float", "EngineHealth")
+                self:NetworkVar("Float", "BrakeValue")
+                self:NetworkVar("Bool", "HandbrakeActive")
+                self:NetworkVar("Int", "HeadlightState")
+
+                if CLIENT then
+                    self:NetworkVarNotify("HeadlightState", self.OnHeadlightStateChange)
+                end
+
+                self:SetDriver(NULL)
+                self:SetEngineState(0)
+                self:SetIsEngineOnFire(false)
+                self:SetBrakeValue(0)
+                self:SetHandbrakeActive(false)
+                self:SetHeadlightState(0)
+
+                local maxChassis = self.MaxChassisHealth or 1000
+                self:SetChassisHealth(maxChassis)
+                self:SetEngineHealth(1.0)
+
+                self:NetworkVarNotify("EngineState", self.OnEngineStateChange)
+            end
+
+            function ENT:IsEngineOn()
+                return self:GetEngineState() > 1
+            end
+
+            function ENT:IsBraking()
+                return self:GetBrakeValue() > 0.1
+            end
+        "#,
+            ),
+        ]);
+
+        let member_names: Vec<String> = {
+            let db = ws.get_db_mut();
+            let class_id = LuaTypeDeclId::global("base_glide");
+            let owner = LuaMemberOwner::Type(class_id);
+            let members = db
+                .get_member_index()
+                .get_members(&owner)
+                .expect("expected members on base_glide");
+            let member_names: Vec<_> = members
+                .iter()
+                .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                .collect();
+
+            assert!(
+                member_names.contains(&"SetDriver".to_string()),
+                "missing SetDriver in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"GetDriver".to_string()),
+                "missing GetDriver in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"GetEngineState".to_string()),
+                "missing GetEngineState in {member_names:?}"
+            );
+
+            member_names
+        };
+
+        let shared_uri = ws
+            .virtual_url_generator
+            .new_uri("addons/test/lua/entities/base_glide/shared.lua");
+        let shared_file_id = ws
+            .analysis
+            .get_file_id(&shared_uri)
+            .expect("expected shared file id");
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(shared_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let param_type_mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let missing_parameter_code = Some(NumberOrString::String(
+            DiagnosticCode::MissingParameter.get_name().to_string(),
+        ));
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        let param_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| {
+                diag.code == param_type_mismatch_code || diag.code == missing_parameter_code
+            })
+            .collect();
+
+        assert!(
+            param_diagnostics.is_empty(),
+            "unexpected param diagnostics for synthesized NetworkVar accessors: {param_diagnostics:?}"
+        );
+
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
+
+        let extract_undefined_field_name = |message: &str| {
+            let prefix = "Undefined field `";
+            message
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.split_once('`'))
+                .map(|(name, _)| name.to_string())
+        };
+
+        let mut undefined_field_names: Vec<String> = undefined_field_diags
+            .iter()
+            .filter_map(|diag| extract_undefined_field_name(&diag.message))
+            .collect();
+        undefined_field_names.sort();
+
+        let mut expected_undefined_field_names = vec![
+            "OnEngineStateChange".to_string(),
+            "OnHeadlightStateChange".to_string(),
+        ];
+        expected_undefined_field_names.sort();
+
+        assert!(
+            undefined_field_names == expected_undefined_field_names,
+            "unexpected undefined-field diagnostics with Entity type defined: {undefined_field_diags:?}; undefined_field_names={undefined_field_names:?}; member_names={member_names:?}"
+        );
     }
 }

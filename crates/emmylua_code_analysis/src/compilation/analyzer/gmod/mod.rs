@@ -1,20 +1,19 @@
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use emmylua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaComment,
-    LuaCommentOwner,
-    LuaDocDescriptionOwner,
-    LuaDocTag, LuaDocTagRealm, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
-    LuaVarExpr, PathTrait,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr,
+    LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
+    LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaVarExpr, PathTrait,
 };
 
 use crate::{
-    EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodScriptedClassCallMetadata,
-    LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
-    LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
-    compilation::analyzer::{
-        AnalysisPipeline, AnalyzeContext, common::add_member,
-    },
+    EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodScriptedClassCallKind,
+    GmodScriptedClassCallMetadata, LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature,
+    LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
+    compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
         GmodConcommandSiteMetadata, GmodHookKind, GmodHookNameIssue, GmodHookSiteMetadata,
@@ -45,7 +44,8 @@ impl AnalysisPipeline for GmodAnalysisPipeline {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
             collect_hook_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone());
             if is_in_scope {
-                if let Some(scope_match) = detect_scoped_class_from_path(db, in_filed_tree.file_id) {
+                if let Some(scope_match) = detect_scoped_class_from_path(db, in_filed_tree.file_id)
+                {
                     ensure_scoped_class_type_decl(
                         db,
                         in_filed_tree.file_id,
@@ -55,20 +55,31 @@ impl AnalysisPipeline for GmodAnalysisPipeline {
                     );
                 }
                 collect_scripted_scope_type_bindings(db, in_filed_tree.file_id);
-                synthesize_scoped_base_assignments(db, in_filed_tree.file_id, in_filed_tree.value.clone());
+                synthesize_scoped_base_assignments(
+                    db,
+                    in_filed_tree.file_id,
+                    in_filed_tree.value.clone(),
+                );
             }
             let ranges = collect_branch_realm_ranges(&in_filed_tree.value);
             if !ranges.is_empty() {
                 branch_realm_ranges.insert(in_filed_tree.file_id, ranges);
             }
-            if let Some(realm) =
-                collect_realm_annotation(&in_filed_tree.value)
-            {
+            if let Some(realm) = collect_realm_annotation(&in_filed_tree.value) {
                 annotation_realms.insert(in_filed_tree.file_id, realm);
             }
         }
 
         synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
+
+        // Detect wrapper functions that internally call NetworkVar/NetworkVarElement
+        // and synthesize members from their call sites.
+        let tree_map: HashMap<FileId, LuaChunk> = tree_list
+            .iter()
+            .map(|x| (x.file_id, x.value.clone()))
+            .collect();
+        synthesize_network_var_wrappers(db, &scripted_scope_files, &tree_map);
+
         synthesize_vgui_registrations(db, &file_ids);
 
         rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms);
@@ -187,7 +198,12 @@ fn collect_scripted_scope_type_bindings(db: &mut DbIndex, file_id: FileId) {
             let table_member_ids = db
                 .get_member_index()
                 .get_members(&table_member_owner)
-                .map(|members| members.iter().map(|member| member.get_id()).collect::<Vec<_>>())
+                .map(|members| {
+                    members
+                        .iter()
+                        .map(|member| member.get_id())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             for member_id in table_member_ids {
                 add_member(db, class_member_owner.clone(), member_id);
@@ -302,6 +318,14 @@ fn synthesize_scripted_class_members(
                 synthesize_network_var(db, file_id, &class_decl_id, call);
             }
         }
+
+        // NetworkVarElement: synthesize Get/Set members (always number type)
+        if let Some(ref scope_match) = scope_match {
+            let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+            for call in &metadata.network_var_element_calls {
+                synthesize_network_var_element(db, file_id, &class_decl_id, call);
+            }
+        }
     }
 }
 
@@ -410,6 +434,396 @@ fn remap_scoped_base_name(scope_match: &GmodScopedClassMatch, base_name: &str) -
     base_name.to_string()
 }
 
+/// A wrapper function that internally calls NetworkVar or NetworkVarElement.
+/// For example:
+/// ```lua
+/// function ENT:SetupNW(type, name)
+///     self:NetworkVar(type, 0, name)
+/// end
+/// ```
+#[derive(Debug, Clone)]
+struct NetworkVarWrapper {
+    /// The method name of the wrapper (e.g. "SetupNW")
+    method_name: String,
+    /// Fixed type name if the type arg is a string literal in the wrapper body
+    fixed_type: Option<String>,
+    /// Index of the wrapper parameter that provides the type arg (if not fixed)
+    type_param_index: Option<usize>,
+    /// Index of the wrapper parameter that provides the name arg
+    name_param_index: Option<usize>,
+    /// Fixed name if the name arg is a string literal in the wrapper body
+    fixed_name: Option<String>,
+    /// Whether this wraps NetworkVarElement (always number return type)
+    is_element: bool,
+    /// Whether the wrapper is a local function (`local function Foo(...)`)
+    is_local: bool,
+}
+
+/// Detect wrapper functions that internally call NetworkVar/NetworkVarElement
+/// and synthesize Get/Set members from their call sites.
+fn synthesize_network_var_wrappers(
+    db: &mut DbIndex,
+    scripted_scope_files: &HashSet<FileId>,
+    tree_map: &HashMap<FileId, LuaChunk>,
+) {
+    for (file_id, root) in tree_map {
+        if !scripted_scope_files.contains(file_id) {
+            continue;
+        }
+
+        let Some(scope_match) = detect_scoped_class_from_path(db, *file_id) else {
+            continue;
+        };
+
+        let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+
+        // Step 1: Collect wrapper definitions from method definitions
+        let wrappers = collect_network_var_wrappers(root, scope_match.global_name);
+        if wrappers.is_empty() {
+            continue;
+        }
+
+        // Step 2: Find calls to these wrappers and synthesize members
+        for call_expr in root.descendants::<LuaCallExpr>() {
+            let (method_name, is_local_call) = match call_expr.get_prefix_expr() {
+                Some(LuaExpr::IndexExpr(index_expr)) => {
+                    let Some(LuaIndexKey::Name(name_token)) = index_expr.get_index_key() else {
+                        continue;
+                    };
+                    (name_token.get_name_text().to_string(), false)
+                }
+                Some(LuaExpr::NameExpr(name_expr)) => {
+                    let Some(name_text) = name_expr.get_name_text() else {
+                        continue;
+                    };
+                    (name_text.to_string(), true)
+                }
+                _ => continue,
+            };
+
+            let Some(wrapper) = wrappers
+                .iter()
+                .find(|w| w.method_name == method_name && w.is_local == is_local_call)
+            else {
+                continue;
+            };
+
+            synthesize_from_wrapper_call(db, *file_id, &class_decl_id, wrapper, &call_expr);
+        }
+    }
+}
+
+/// Scan function definitions in a file for methods that internally call
+/// NetworkVar or NetworkVarElement, and map their parameters.
+fn collect_network_var_wrappers(root: &LuaChunk, global_name: &str) -> Vec<NetworkVarWrapper> {
+    let mut wrappers = Vec::new();
+
+    for func_stat in root.descendants::<LuaFuncStat>() {
+        // Only methods on the entity global: function ENT:MethodName(...)
+        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
+            continue;
+        };
+
+        // Check the prefix is the entity global name
+        let Some(LuaExpr::NameExpr(prefix_name)) = index_expr.get_prefix_expr() else {
+            continue;
+        };
+        let Some(prefix_text) = prefix_name.get_name_text() else {
+            continue;
+        };
+        if prefix_text != global_name {
+            continue;
+        }
+
+        let Some(LuaIndexKey::Name(method_name_token)) = index_expr.get_index_key() else {
+            continue;
+        };
+        let method_name = method_name_token.get_name_text().to_string();
+
+        // Skip known call kinds that are already handled directly
+        if GmodScriptedClassCallKind::from_call_name(&method_name).is_some() {
+            continue;
+        }
+
+        let Some(closure) = func_stat.get_closure() else {
+            continue;
+        };
+
+        // Collect parameter names for mapping
+        let param_names: Vec<String> = get_closure_param_names(&closure);
+
+        // Walk the closure body looking for NetworkVar/NetworkVarElement calls
+        if let Some(wrapper) = find_networkvar_in_closure(&closure, &method_name, &param_names) {
+            wrappers.push(wrapper);
+        }
+    }
+
+    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
+        let Some(local_name) = local_func_stat.get_local_name() else {
+            continue;
+        };
+        let Some(name_token) = local_name.get_name_token() else {
+            continue;
+        };
+        let method_name = name_token.get_name_text().to_string();
+
+        if GmodScriptedClassCallKind::from_call_name(&method_name).is_some() {
+            continue;
+        }
+
+        let Some(closure) = local_func_stat.get_closure() else {
+            continue;
+        };
+
+        let param_names: Vec<String> = get_closure_param_names(&closure);
+
+        if let Some(mut wrapper) = find_networkvar_in_closure(&closure, &method_name, &param_names)
+        {
+            wrapper.is_local = true;
+            wrappers.push(wrapper);
+        }
+    }
+
+    wrappers
+}
+
+/// Get the parameter names of a closure (excluding `self` for methods).
+fn get_closure_param_names(closure: &LuaClosureExpr) -> Vec<String> {
+    let Some(params_list) = closure.get_params_list() else {
+        return Vec::new();
+    };
+
+    params_list
+        .get_params()
+        .filter_map(|param| {
+            if param.is_dots() {
+                return None;
+            }
+            Some(param.get_name_token()?.get_name_text().to_string())
+        })
+        .collect()
+}
+
+/// Look inside a closure body for NetworkVar/NetworkVarElement calls and map
+/// their arguments back to the closure's parameter list.
+fn find_networkvar_in_closure(
+    closure: &LuaClosureExpr,
+    wrapper_method_name: &str,
+    param_names: &[String],
+) -> Option<NetworkVarWrapper> {
+    let block = closure.get_block()?;
+
+    for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        let Some(LuaExpr::IndexExpr(inner_index)) = call_expr.get_prefix_expr() else {
+            continue;
+        };
+
+        let Some(LuaIndexKey::Name(inner_name_token)) = inner_index.get_index_key() else {
+            continue;
+        };
+
+        let inner_method = inner_name_token.get_name_text();
+        let is_element = match inner_method {
+            "NetworkVar" => false,
+            "NetworkVarElement" => true,
+            _ => continue,
+        };
+
+        // Found a NetworkVar/NetworkVarElement call inside the wrapper.
+        // Collect the arguments and map them.
+        let Some(args_list) = call_expr.get_args_list() else {
+            continue;
+        };
+        let inner_args: Vec<LuaExpr> = args_list.get_args().collect();
+
+        // Determine the type argument (first arg to NetworkVar)
+        let (fixed_type, type_param_index) =
+            resolve_wrapper_arg_mapping(&inner_args, 0, param_names);
+
+        // Determine the name argument — find the last string-like argument
+        // For 3-arg NetworkVar: name is at index 2
+        // For 2-arg NetworkVar: name is at index 1
+        // For 4-arg NetworkVarElement: name is at index 3
+        // Try from the end to find the name position
+        let name_indices: &[usize] = if is_element { &[3, 2, 1] } else { &[2, 1] };
+
+        let mut fixed_name = None;
+        let mut name_param_index = None;
+
+        for &idx in name_indices {
+            if idx >= inner_args.len() {
+                continue;
+            }
+            let (fixed, param_idx) = resolve_wrapper_arg_mapping(&inner_args, idx, param_names);
+            if fixed.is_some() || param_idx.is_some() {
+                fixed_name = fixed;
+                name_param_index = param_idx;
+                break;
+            }
+        }
+
+        // Must have either a fixed name or a parameter mapping for the name
+        if fixed_name.is_none() && name_param_index.is_none() {
+            continue;
+        }
+
+        return Some(NetworkVarWrapper {
+            method_name: wrapper_method_name.to_string(),
+            fixed_type,
+            type_param_index,
+            name_param_index,
+            fixed_name,
+            is_element,
+            is_local: false,
+        });
+    }
+
+    None
+}
+
+/// Given a call argument expression and the wrapper's parameter names,
+/// determine if the argument is a fixed string literal or a reference to
+/// one of the wrapper's parameters.
+fn resolve_wrapper_arg_mapping(
+    inner_args: &[LuaExpr],
+    arg_index: usize,
+    param_names: &[String],
+) -> (Option<String>, Option<usize>) {
+    let Some(arg) = inner_args.get(arg_index) else {
+        return (None, None);
+    };
+
+    match arg {
+        LuaExpr::LiteralExpr(literal) => {
+            if let Some(LuaLiteralToken::String(s)) = literal.get_literal() {
+                let value = s.get_value();
+                if !value.is_empty() {
+                    return (Some(value), None);
+                }
+            }
+            (None, None)
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            if let Some(name) = name_expr.get_name_text() {
+                if let Some(idx) = param_names.iter().position(|p| p == &name) {
+                    return (None, Some(idx));
+                }
+            }
+            (None, None)
+        }
+        _ => (None, None),
+    }
+}
+
+/// Given a call to a known wrapper method and the wrapper's parameter mapping,
+/// resolve the concrete type and name from the call arguments and synthesize
+/// Get/Set members.
+fn synthesize_from_wrapper_call(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    wrapper: &NetworkVarWrapper,
+    call_expr: &LuaCallExpr,
+) {
+    let Some(args_list) = call_expr.get_args_list() else {
+        return;
+    };
+    let call_args: Vec<LuaExpr> = args_list.get_args().collect();
+
+    // Resolve the type name
+    let type_name = if let Some(ref fixed) = wrapper.fixed_type {
+        fixed.clone()
+    } else if let Some(idx) = wrapper.type_param_index {
+        match call_args.get(idx) {
+            Some(LuaExpr::LiteralExpr(lit)) => {
+                if let Some(LuaLiteralToken::String(s)) = lit.get_literal() {
+                    s.get_value()
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    } else {
+        return;
+    };
+
+    // Resolve the property name
+    let (prop_name, prop_name_expr) = if let Some(ref fixed) = wrapper.fixed_name {
+        (fixed.clone(), None)
+    } else if let Some(idx) = wrapper.name_param_index {
+        match call_args.get(idx) {
+            Some(LuaExpr::LiteralExpr(lit)) => {
+                if let Some(LuaLiteralToken::String(s)) = lit.get_literal() {
+                    let value = s.get_value();
+                    if value.is_empty() {
+                        return;
+                    }
+                    (value, Some(call_args[idx].clone()))
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    } else {
+        return;
+    };
+
+    let value_type = if wrapper.is_element {
+        LuaType::Number
+    } else {
+        resolve_networkvar_type(&type_name)
+    };
+    let owner = LuaMemberOwner::Type(class_decl_id.clone());
+
+    // Use the name expression's syntax id for the getter if available,
+    // otherwise use the call expression's syntax id.
+    let getter_syntax_id = prop_name_expr
+        .as_ref()
+        .map(|e| e.get_syntax_id())
+        .unwrap_or_else(|| call_expr.get_syntax_id());
+
+    let getter_name = format!("Get{prop_name}");
+    let getter_func =
+        LuaFunctionType::new(AsyncState::None, true, false, vec![], value_type.clone());
+    let member_id = LuaMemberId::new(getter_syntax_id, file_id);
+    let member = LuaMember::new(
+        member_id,
+        LuaMemberKey::Name(getter_name.as_str().into()),
+        LuaMemberFeature::FileMethodDecl,
+        None,
+    );
+    db.get_member_index_mut().add_member(owner.clone(), member);
+    db.get_type_index_mut().bind_type(
+        member_id.into(),
+        LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
+    );
+
+    // Setter
+    let setter_syntax_id = call_expr.get_syntax_id();
+    let setter_name = format!("Set{prop_name}");
+    let setter_func = LuaFunctionType::new(
+        AsyncState::None,
+        true,
+        false,
+        vec![("value".to_string(), Some(value_type))],
+        LuaType::Nil,
+    );
+    let member_id = LuaMemberId::new(setter_syntax_id, file_id);
+    let member = LuaMember::new(
+        member_id,
+        LuaMemberKey::Name(setter_name.as_str().into()),
+        LuaMemberFeature::FileMethodDecl,
+        None,
+    );
+    db.get_member_index_mut().add_member(owner.clone(), member);
+    db.get_type_index_mut().bind_type(
+        member_id.into(),
+        LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
+    );
+}
+
 fn synthesize_define_baseclass(
     db: &mut DbIndex,
     file_id: FileId,
@@ -466,7 +880,6 @@ fn synthesize_accessor_func(
 
     let force_type = call.literal_args.get(3).and_then(|arg| arg.as_ref());
     let value_type = resolve_accessor_force_type(force_type);
-    let self_type = LuaType::Ref(class_decl_id.clone());
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
 
     // Synthesize the backing field if var_key is present
@@ -479,25 +892,17 @@ fn synthesize_accessor_func(
                 LuaMemberFeature::FileFieldDecl,
                 None,
             );
-            db.get_member_index_mut()
-                .add_member(owner.clone(), member);
-            db.get_type_index_mut().bind_type(
-                member_id.into(),
-                LuaTypeCache::DocType(value_type.clone()),
-            );
+            db.get_member_index_mut().add_member(owner.clone(), member);
+            db.get_type_index_mut()
+                .bind_type(member_id.into(), LuaTypeCache::DocType(value_type.clone()));
         }
     }
 
     // Synthesize the getter: GetName(self: Class): valueType
     if let Some(getter_syntax_id) = call.args.get(2).map(|a| a.syntax_id) {
         let getter_name = format!("Get{accessor_name}");
-        let getter_func = LuaFunctionType::new(
-            AsyncState::None,
-            true,
-            false,
-            vec![("self".to_string(), Some(self_type.clone()))],
-            value_type.clone(),
-        );
+        let getter_func =
+            LuaFunctionType::new(AsyncState::None, true, false, vec![], value_type.clone());
         let member_id = LuaMemberId::new(getter_syntax_id, file_id);
         let member = LuaMember::new(
             member_id,
@@ -505,8 +910,7 @@ fn synthesize_accessor_func(
             LuaMemberFeature::FileMethodDecl,
             None,
         );
-        db.get_member_index_mut()
-            .add_member(owner.clone(), member);
+        db.get_member_index_mut().add_member(owner.clone(), member);
         db.get_type_index_mut().bind_type(
             member_id.into(),
             LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
@@ -520,10 +924,7 @@ fn synthesize_accessor_func(
         AsyncState::None,
         true,
         false,
-        vec![
-            ("self".to_string(), Some(self_type)),
-            ("value".to_string(), Some(value_type)),
-        ],
+        vec![("value".to_string(), Some(value_type))],
         LuaType::Nil,
     );
     let member_id = LuaMemberId::new(setter_syntax_id, file_id);
@@ -533,8 +934,7 @@ fn synthesize_accessor_func(
         LuaMemberFeature::FileMethodDecl,
         None,
     );
-    db.get_member_index_mut()
-        .add_member(owner.clone(), member);
+    db.get_member_index_mut().add_member(owner.clone(), member);
     db.get_type_index_mut().bind_type(
         member_id.into(),
         LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
@@ -547,43 +947,38 @@ fn synthesize_network_var(
     class_decl_id: &LuaTypeDeclId,
     call: &GmodScriptedClassCallMetadata,
 ) {
-    // ENT:NetworkVar("Type", slot, "Name") or
-    // ENT:NetworkVarElement("Type", slot, element, "Name")
-    // args[0] = type name (string like "Float", "String", "Bool", etc)
-    // args[1] = slot (integer)
-    // args[2] = property name (string)
-    // For NetworkVarElement: args[2] = element, args[3] = name
+    // ENT:NetworkVar("Type", slot, "Name") — 3-arg form
+    // ENT:NetworkVar("Type", "Name")       — 2-arg form (slot omitted)
+    // args[0] = type name (string)
+    // args[1] = slot (integer) OR name (string, if 2-arg form)
+    // args[2] = name (string, if 3-arg form)
 
     let type_name = match call.literal_args.first() {
         Some(Some(GmodClassCallLiteral::String(name))) => name.clone(),
         _ => return,
     };
 
-    // Try 3rd arg first (standard NetworkVar), then 4th (NetworkVarElement)
+    // Try index 2 first (3-arg form), then index 1 (2-arg form)
     let (prop_name, prop_name_arg_idx) = match call.literal_args.get(2) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => (name.clone(), 2usize),
-        _ => match call.literal_args.get(3) {
+        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+            (name.clone(), 2usize)
+        }
+        _ => match call.literal_args.get(1) {
             Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-                (name.clone(), 3usize)
+                (name.clone(), 1usize)
             }
             _ => return,
         },
     };
 
     let value_type = resolve_networkvar_type(&type_name);
-    let self_type = LuaType::Ref(class_decl_id.clone());
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
 
     // Synthesize getter: GetPropName(self: Class): valueType
     if let Some(getter_syntax_id) = call.args.get(prop_name_arg_idx).map(|a| a.syntax_id) {
         let getter_name = format!("Get{prop_name}");
-        let getter_func = LuaFunctionType::new(
-            AsyncState::None,
-            true,
-            false,
-            vec![("self".to_string(), Some(self_type.clone()))],
-            value_type.clone(),
-        );
+        let getter_func =
+            LuaFunctionType::new(AsyncState::None, true, false, vec![], value_type.clone());
         let member_id = LuaMemberId::new(getter_syntax_id, file_id);
         let member = LuaMember::new(
             member_id,
@@ -591,8 +986,7 @@ fn synthesize_network_var(
             LuaMemberFeature::FileMethodDecl,
             None,
         );
-        db.get_member_index_mut()
-            .add_member(owner.clone(), member);
+        db.get_member_index_mut().add_member(owner.clone(), member);
         db.get_type_index_mut().bind_type(
             member_id.into(),
             LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
@@ -606,10 +1000,7 @@ fn synthesize_network_var(
         AsyncState::None,
         true,
         false,
-        vec![
-            ("self".to_string(), Some(self_type)),
-            ("value".to_string(), Some(value_type)),
-        ],
+        vec![("value".to_string(), Some(value_type))],
         LuaType::Nil,
     );
     let member_id = LuaMemberId::new(setter_syntax_id, file_id);
@@ -619,8 +1010,92 @@ fn synthesize_network_var(
         LuaMemberFeature::FileMethodDecl,
         None,
     );
-    db.get_member_index_mut()
-        .add_member(owner.clone(), member);
+    db.get_member_index_mut().add_member(owner.clone(), member);
+    db.get_type_index_mut().bind_type(
+        member_id.into(),
+        LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
+    );
+}
+
+fn synthesize_network_var_element(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    call: &GmodScriptedClassCallMetadata,
+) {
+    // ENT:NetworkVarElement("Type", slot, element, "Name") — 4-arg form
+    // ENT:NetworkVarElement("Type", slot, "Name")          — 3-arg form
+    // ENT:NetworkVarElement("Type", "Name")                — 2-arg form
+    // The value type is always `number` for element access.
+    // args[0] = type name (string) — used only for validation, not for type
+    // args[1] = slot or name
+    // args[2] = element or name
+    // args[3] = name (if 4-arg form)
+
+    // Type name must be present (first arg is always the type)
+    if call.literal_args.first().and_then(|a| a.as_ref()).is_none() {
+        return;
+    }
+
+    // Find the property name: try index 3, then 2, then 1
+    let (prop_name, prop_name_arg_idx) = match call.literal_args.get(3) {
+        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+            (name.clone(), 3usize)
+        }
+        _ => match call.literal_args.get(2) {
+            Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                (name.clone(), 2usize)
+            }
+            _ => match call.literal_args.get(1) {
+                Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                    (name.clone(), 1usize)
+                }
+                _ => return,
+            },
+        },
+    };
+
+    // NetworkVarElement always produces number accessors
+    let value_type = LuaType::Number;
+    let owner = LuaMemberOwner::Type(class_decl_id.clone());
+
+    // Synthesize getter: GetPropName(self: Class): number
+    if let Some(getter_syntax_id) = call.args.get(prop_name_arg_idx).map(|a| a.syntax_id) {
+        let getter_name = format!("Get{prop_name}");
+        let getter_func =
+            LuaFunctionType::new(AsyncState::None, true, false, vec![], value_type.clone());
+        let member_id = LuaMemberId::new(getter_syntax_id, file_id);
+        let member = LuaMember::new(
+            member_id,
+            LuaMemberKey::Name(getter_name.as_str().into()),
+            LuaMemberFeature::FileMethodDecl,
+            None,
+        );
+        db.get_member_index_mut().add_member(owner.clone(), member);
+        db.get_type_index_mut().bind_type(
+            member_id.into(),
+            LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
+        );
+    }
+
+    // Synthesize setter: SetPropName(self: Class, value: number)
+    let setter_syntax_id = call.syntax_id;
+    let setter_name = format!("Set{prop_name}");
+    let setter_func = LuaFunctionType::new(
+        AsyncState::None,
+        true,
+        false,
+        vec![("value".to_string(), Some(value_type))],
+        LuaType::Nil,
+    );
+    let member_id = LuaMemberId::new(setter_syntax_id, file_id);
+    let member = LuaMember::new(
+        member_id,
+        LuaMemberKey::Name(setter_name.as_str().into()),
+        LuaMemberFeature::FileMethodDecl,
+        None,
+    );
+    db.get_member_index_mut().add_member(owner.clone(), member);
     db.get_type_index_mut().bind_type(
         member_id.into(),
         LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
@@ -651,7 +1126,14 @@ fn synthesize_vgui_register(
         _ => None,
     };
 
-    synthesize_panel_class(db, file_id, &panel_name, table_var_name.as_deref(), base_panel.as_deref(), call);
+    synthesize_panel_class(
+        db,
+        file_id,
+        &panel_name,
+        table_var_name.as_deref(),
+        base_panel.as_deref(),
+        call,
+    );
 }
 
 fn synthesize_derma_define_control(
@@ -679,7 +1161,14 @@ fn synthesize_derma_define_control(
         _ => None,
     };
 
-    synthesize_panel_class(db, file_id, &control_name, table_var_name.as_deref(), base_panel.as_deref(), call);
+    synthesize_panel_class(
+        db,
+        file_id,
+        &control_name,
+        table_var_name.as_deref(),
+        base_panel.as_deref(),
+        call,
+    );
 }
 
 fn synthesize_panel_class(
@@ -753,7 +1242,10 @@ fn synthesize_panel_class(
                     .get_member_index()
                     .get_members(&table_member_owner)
                     .map(|members| {
-                        members.iter().map(|member| member.get_id()).collect::<Vec<_>>()
+                        members
+                            .iter()
+                            .map(|member| member.get_id())
+                            .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
                 for member_id in table_member_ids {
@@ -1499,8 +1991,10 @@ fn collect_if_realm_ranges(if_stat: &LuaIfStat, ranges: &mut Vec<GmodRealmRange>
             match &clause {
                 emmylua_parser::LuaIfClauseStat::ElseIf(elseif) => {
                     has_elseif = true;
-                    if let Some(elseif_realm) =
-                        elseif.get_condition_expr().as_ref().and_then(realm_from_condition)
+                    if let Some(elseif_realm) = elseif
+                        .get_condition_expr()
+                        .as_ref()
+                        .and_then(realm_from_condition)
                     {
                         if let Some(block) = elseif.get_block() {
                             ranges.push(GmodRealmRange {

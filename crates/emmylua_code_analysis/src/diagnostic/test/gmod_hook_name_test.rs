@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use googletest::prelude::*;
 
     fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
@@ -8,7 +9,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
     }
 
-    #[test]
+    #[gtest]
     fn test_reports_invalid_static_hook_names() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -26,7 +27,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[gtest]
     fn test_ignores_valid_or_dynamic_hook_names() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -40,7 +41,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[gtest]
     fn test_gmod_hook_name_checker_is_disabled_with_gmod_off() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

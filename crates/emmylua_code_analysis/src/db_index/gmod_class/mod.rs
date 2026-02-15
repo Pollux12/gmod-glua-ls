@@ -10,6 +10,7 @@ pub enum GmodScriptedClassCallKind {
     DefineBaseClass,
     AccessorFunc,
     NetworkVar,
+    NetworkVarElement,
     VguiRegister,
     DermaDefineControl,
 }
@@ -20,6 +21,7 @@ impl GmodScriptedClassCallKind {
             "DEFINE_BASECLASS" => Some(Self::DefineBaseClass),
             "AccessorFunc" => Some(Self::AccessorFunc),
             "NetworkVar" => Some(Self::NetworkVar),
+            "NetworkVarElement" => Some(Self::NetworkVarElement),
             _ => None,
         }
     }
@@ -64,6 +66,7 @@ pub struct GmodScriptedClassFileMetadata {
     pub define_baseclass_calls: Vec<GmodScriptedClassCallMetadata>,
     pub accessor_func_calls: Vec<GmodScriptedClassCallMetadata>,
     pub network_var_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub network_var_element_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_calls: Vec<GmodScriptedClassCallMetadata>,
     pub derma_define_control_calls: Vec<GmodScriptedClassCallMetadata>,
 }
@@ -77,6 +80,7 @@ impl GmodScriptedClassFileMetadata {
             GmodScriptedClassCallKind::DefineBaseClass => &mut self.define_baseclass_calls,
             GmodScriptedClassCallKind::AccessorFunc => &mut self.accessor_func_calls,
             GmodScriptedClassCallKind::NetworkVar => &mut self.network_var_calls,
+            GmodScriptedClassCallKind::NetworkVarElement => &mut self.network_var_element_calls,
             GmodScriptedClassCallKind::VguiRegister => &mut self.vgui_register_calls,
             GmodScriptedClassCallKind::DermaDefineControl => &mut self.derma_define_control_calls,
         }
