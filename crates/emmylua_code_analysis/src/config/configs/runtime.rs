@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcRuntime {
-    /// Lua version.
+    /// Deprecated: GMod-only server always uses LuaJIT. Kept for config compatibility.
     #[serde(default)]
     pub version: EmmyrcLuaVersion,
     #[serde(default)]
@@ -57,6 +57,8 @@ fn default_nonstandard_symbols() -> Vec<EmmyrcNonStdSymbol> {
     ]
 }
 
+// Deprecated: GMod-only server always uses LuaJIT. Kept for config compatibility.
+// All variants are retained so old .emmyrc.json files deserialize without errors.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmmyrcLuaVersion {
     /// Lua 5.1
@@ -64,6 +66,7 @@ pub enum EmmyrcLuaVersion {
     Lua51,
     /// LuaJIT
     #[serde(rename = "LuaJIT")]
+    #[default]
     LuaJIT,
     /// Lua 5.2
     #[serde(rename = "Lua5.2", alias = "Lua 5.2")]
@@ -79,7 +82,6 @@ pub enum EmmyrcLuaVersion {
     Lua55,
     /// Lua Latest
     #[serde(rename = "LuaLatest", alias = "Lua Latest")]
-    #[default]
     LuaLatest,
 }
 

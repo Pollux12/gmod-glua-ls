@@ -97,15 +97,9 @@ impl Emmyrc {
     }
 
     pub fn get_language_level(&self) -> LuaLanguageLevel {
-        match self.runtime.version {
-            EmmyrcLuaVersion::Lua51 => LuaLanguageLevel::Lua51,
-            EmmyrcLuaVersion::Lua52 => LuaLanguageLevel::Lua52,
-            EmmyrcLuaVersion::Lua53 => LuaLanguageLevel::Lua53,
-            EmmyrcLuaVersion::Lua54 => LuaLanguageLevel::Lua54,
-            EmmyrcLuaVersion::LuaJIT => LuaLanguageLevel::LuaJIT,
-            EmmyrcLuaVersion::Lua55 => LuaLanguageLevel::Lua55,
-            EmmyrcLuaVersion::LuaLatest => LuaLanguageLevel::Lua55,
-        }
+        // GMod uses LuaJIT — always force LuaJIT regardless of config.
+        // Higher Lua versions (5.2–5.5) introduce features not available in GMod.
+        LuaLanguageLevel::LuaJIT
     }
 
     pub fn pre_process_emmyrc(&mut self, workspace_root: &Path) {
