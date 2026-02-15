@@ -127,10 +127,7 @@ mod tests {
 
         merge_values(&mut base, overlay);
 
-        assert_eq!(
-            base["diagnostics"]["disable"],
-            json!(["call-non-callable"])
-        );
+        assert_eq!(base["diagnostics"]["disable"], json!(["call-non-callable"]));
     }
 
     #[test]
@@ -169,14 +166,8 @@ mod tests {
         });
 
         let mut merged = json!({});
-        merge_values(
-            &mut merged,
-            super::normalize_to_emmyrc_json(luarc),
-        );
-        merge_values(
-            &mut merged,
-            super::normalize_to_emmyrc_json(emmyrc),
-        );
+        merge_values(&mut merged, super::normalize_to_emmyrc_json(luarc));
+        merge_values(&mut merged, super::normalize_to_emmyrc_json(emmyrc));
 
         assert_eq!(
             merged["diagnostics"]["disable"],
@@ -197,12 +188,10 @@ mod tests {
             })),
         ];
 
-        let merged = configs
-            .into_iter()
-            .fold(json!({}), |mut acc, item| {
-                merge_values(&mut acc, item);
-                acc
-            });
+        let merged = configs.into_iter().fold(json!({}), |mut acc, item| {
+            merge_values(&mut acc, item);
+            acc
+        });
 
         assert_eq!(
             merged["diagnostics"]["disable"],

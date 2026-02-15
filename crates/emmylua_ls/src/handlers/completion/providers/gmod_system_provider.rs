@@ -121,7 +121,9 @@ fn add_hook_completion_items(
     }
 
     for (file_id, metadata) in infer_index.iter_hook_file_metadata() {
-        if let Some(allowed) = &allowed_file_ids && !allowed.contains(file_id) {
+        if let Some(allowed) = &allowed_file_ids
+            && !allowed.contains(file_id)
+        {
             continue;
         }
 

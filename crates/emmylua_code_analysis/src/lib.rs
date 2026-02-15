@@ -114,9 +114,12 @@ impl EmmyLuaAnalysis {
         if let Some(file_id) = existing_file_id {
             if let (Some(new_text), Some(old_text)) = (
                 text.as_deref(),
-                self.compilation.get_db().get_vfs().get_file_content(&file_id).map(String::as_str),
-            )
-                && old_text == new_text
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_content(&file_id)
+                    .map(String::as_str),
+            ) && old_text == new_text
             {
                 return Some(file_id);
             }
@@ -169,9 +172,12 @@ impl EmmyLuaAnalysis {
                 if let Some(file_id) = existing_file_id {
                     if let (Some(new_text), Some(old_text)) = (
                         text.as_deref(),
-                        self.compilation.get_db().get_vfs().get_file_content(&file_id).map(String::as_str),
-                    )
-                        && old_text == new_text
+                        self.compilation
+                            .get_db()
+                            .get_vfs()
+                            .get_file_content(&file_id)
+                            .map(String::as_str),
+                    ) && old_text == new_text
                     {
                         continue;
                     }
@@ -216,9 +222,12 @@ impl EmmyLuaAnalysis {
                 if let Some(file_id) = existing_file_id {
                     if let (Some(new_text), Some(old_text)) = (
                         text.as_deref(),
-                        self.compilation.get_db().get_vfs().get_file_content(&file_id).map(String::as_str),
-                    )
-                        && old_text == new_text
+                        self.compilation
+                            .get_db()
+                            .get_vfs()
+                            .get_file_content(&file_id)
+                            .map(String::as_str),
+                    ) && old_text == new_text
                     {
                         continue;
                     }

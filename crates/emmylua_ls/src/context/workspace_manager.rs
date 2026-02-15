@@ -535,7 +535,8 @@ mod tests {
         touch(&emmyrc_json);
         touch(&luarc_json);
 
-        let files = collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
+        let files =
+            collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
 
         assert_eq!(files, vec![luarc_json, emmyrc_json]);
         let _ = fs::remove_dir_all(dir);
@@ -551,7 +552,8 @@ mod tests {
         touch(&emmyrc_json);
         touch(&luarc_json);
 
-        let files = collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
+        let files =
+            collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
 
         assert_eq!(files, vec![luarc_json, emmyrc_json, emmyrc_lua]);
         let _ = fs::remove_dir_all(dir);

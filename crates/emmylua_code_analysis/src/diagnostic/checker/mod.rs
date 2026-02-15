@@ -219,9 +219,7 @@ impl<'a> DiagnosticContext<'a> {
         match code {
             DiagnosticCode::Unused
             | DiagnosticCode::UnusedSelf
-            | DiagnosticCode::UnreachableCode => {
-                Some(vec![DiagnosticTag::UNNECESSARY])
-            }
+            | DiagnosticCode::UnreachableCode => Some(vec![DiagnosticTag::UNNECESSARY]),
             DiagnosticCode::Deprecated => Some(vec![DiagnosticTag::DEPRECATED]),
             _ => None,
         }

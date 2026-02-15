@@ -2,8 +2,7 @@ use std::collections::HashSet;
 
 use emmylua_code_analysis::{
     LuaCompilation, LuaDeclExtra, LuaDeclId, LuaMemberId, LuaMemberOwner, LuaSemanticDeclId,
-    LuaType, LuaUnionType,
-    SemanticDeclLevel, SemanticModel,
+    LuaType, LuaUnionType, SemanticDeclLevel, SemanticModel,
 };
 use emmylua_parser::{LuaAssignStat, LuaAstNode, LuaSyntaxKind, LuaTableExpr, LuaTableField};
 

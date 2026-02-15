@@ -89,7 +89,9 @@ impl LuaDecl {
     pub fn is_local(&self) -> bool {
         matches!(
             &self.extra,
-            LuaDeclExtra::Local { .. } | LuaDeclExtra::Param { .. } | LuaDeclExtra::ImplicitSelf { .. }
+            LuaDeclExtra::Local { .. }
+                | LuaDeclExtra::Param { .. }
+                | LuaDeclExtra::ImplicitSelf { .. }
         )
     }
 

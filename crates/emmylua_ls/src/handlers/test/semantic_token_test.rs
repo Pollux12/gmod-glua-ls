@@ -108,11 +108,11 @@ local x = 1
         let doc_modifier = modifier_bitset(&[SemanticTokenModifier::DOCUMENTATION]);
 
         verify_that!(
-            tokens
-                .iter()
-                .any(|(_, _, len, token_type, modifiers)| {
-                    *token_type == keyword_idx && (*modifiers & doc_modifier) == doc_modifier && *len >= 5
-                }),
+            tokens.iter().any(|(_, _, len, token_type, modifiers)| {
+                *token_type == keyword_idx
+                    && (*modifiers & doc_modifier) == doc_modifier
+                    && *len >= 5
+            }),
             eq(true)
         )?;
 

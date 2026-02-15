@@ -6,8 +6,7 @@ use wax::Pattern;
 use super::{InferFailReason, InferResult};
 use crate::{
     FileId, LuaDecl, LuaDeclExtra, LuaInferCache, LuaMemberId, LuaSemanticDeclId, LuaType,
-    LuaTypeDeclId,
-    SemanticDeclLevel, TypeOps,
+    LuaTypeDeclId, SemanticDeclLevel, TypeOps,
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
     semantic::{
@@ -44,8 +43,7 @@ pub fn infer_name_expr(
             VarRefId::VarRef(decl_id),
         )
     } else {
-        if let Some(scoped_type) = infer_scoped_scripted_global_type(db, cache, name)
-        {
+        if let Some(scoped_type) = infer_scoped_scripted_global_type(db, cache, name) {
             return Ok(scoped_type);
         }
 

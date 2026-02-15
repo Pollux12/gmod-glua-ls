@@ -71,7 +71,10 @@ pub async fn load_workspace(
                 root_from_configs(&config_paths, &main_path),
             )
         } else {
-            (discover_config_files_in_order(&main_path), main_path.clone())
+            (
+                discover_config_files_in_order(&main_path),
+                main_path.clone(),
+            )
         };
 
     let mut emmyrc = load_configs(config_files, None);

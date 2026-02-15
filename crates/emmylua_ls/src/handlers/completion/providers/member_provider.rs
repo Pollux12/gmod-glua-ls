@@ -1,7 +1,6 @@
 use emmylua_code_analysis::{
     DbIndex, FileId, GmodRealm, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId, LuaType,
-    LuaTypeDeclId, SemanticModel,
-    enum_variable_is_param, get_tpl_ref_extend_type,
+    LuaTypeDeclId, SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
 };
 use emmylua_parser::{LuaAstNode, LuaAstToken, LuaIndexExpr, LuaStringToken};
 use rowan::TextSize;
