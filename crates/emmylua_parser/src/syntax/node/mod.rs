@@ -411,9 +411,7 @@ impl LuaAstNode for LuaAst {
             }
             LuaSyntaxKind::DocTagUsing => LuaDocTagUsing::cast(syntax).map(LuaAst::LuaDocTagUsing),
             LuaSyntaxKind::DocTagMeta => LuaDocTagMeta::cast(syntax).map(LuaAst::LuaDocTagMeta),
-            LuaSyntaxKind::DocTagRealm => {
-                LuaDocTagRealm::cast(syntax).map(LuaAst::LuaDocTagRealm)
-            }
+            LuaSyntaxKind::DocTagRealm => LuaDocTagRealm::cast(syntax).map(LuaAst::LuaDocTagRealm),
             LuaSyntaxKind::DocTagNodiscard => {
                 LuaDocTagNodiscard::cast(syntax).map(LuaAst::LuaDocTagNodiscard)
             }

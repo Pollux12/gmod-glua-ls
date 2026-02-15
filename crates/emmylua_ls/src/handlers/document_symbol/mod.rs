@@ -213,6 +213,7 @@ fn process_stat(
         LuaStat::ReturnStat(return_stat) => {
             process_exprs(builder, return_stat.syntax(), parent_id)?;
         }
+        // GMod: dead path — Lua 5.5 `global` statement disabled
         LuaStat::GlobalStat(global_stat) => {
             process_exprs(builder, global_stat.syntax(), parent_id)?;
         }

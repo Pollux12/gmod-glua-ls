@@ -59,6 +59,7 @@ impl StyleRuler for BasicSpaceRuler {
                         f.add_token_right_expected(syntax_id, TokenExpected::Space(1));
                     }
                     LuaTokenKind::TkLt => {
+                        // GMod: dead path — Lua 5.4 <const>/<close> attributes disabled
                         if is_parent_syntax(&token, LuaSyntaxKind::Attribute) {
                             f.add_token_left_expected(syntax_id, TokenExpected::Space(1));
                             f.add_token_right_expected(syntax_id, TokenExpected::Space(0));
@@ -69,6 +70,7 @@ impl StyleRuler for BasicSpaceRuler {
                         f.add_token_right_expected(syntax_id, TokenExpected::Space(1));
                     }
                     LuaTokenKind::TkGt => {
+                        // GMod: dead path — Lua 5.4 <const>/<close> attributes disabled
                         if is_parent_syntax(&token, LuaSyntaxKind::Attribute) {
                             f.add_token_left_expected(syntax_id, TokenExpected::Space(0));
                             f.add_token_right_expected(syntax_id, TokenExpected::Space(1));
@@ -80,22 +82,24 @@ impl StyleRuler for BasicSpaceRuler {
                     }
                     LuaTokenKind::TkMul
                     | LuaTokenKind::TkDiv
+                    // GMod: dead paths below — Lua 5.3+ operators disabled
                     | LuaTokenKind::TkIDiv
+                    | LuaTokenKind::TkBitAnd
+                    | LuaTokenKind::TkBitOr
+                    | LuaTokenKind::TkBitXor
+                    | LuaTokenKind::TkShl
+                    | LuaTokenKind::TkShr
+                    // end dead paths
                     | LuaTokenKind::TkMod
                     | LuaTokenKind::TkPow
                     | LuaTokenKind::TkConcat
                     | LuaTokenKind::TkAssign
-                    | LuaTokenKind::TkBitAnd
-                    | LuaTokenKind::TkBitOr
-                    | LuaTokenKind::TkBitXor
                     | LuaTokenKind::TkEq
                     | LuaTokenKind::TkGe
                     | LuaTokenKind::TkLe
                     | LuaTokenKind::TkNe
                     | LuaTokenKind::TkAnd
-                    | LuaTokenKind::TkOr
-                    | LuaTokenKind::TkShl
-                    | LuaTokenKind::TkShr => {
+                    | LuaTokenKind::TkOr => {
                         f.add_token_left_expected(syntax_id, TokenExpected::Space(1));
                         f.add_token_right_expected(syntax_id, TokenExpected::Space(1));
                     }

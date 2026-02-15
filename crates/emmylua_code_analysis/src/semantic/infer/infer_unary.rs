@@ -22,6 +22,7 @@ pub fn infer_unary_expr(
         UnaryOperator::OpNot => infer_unary_expr_not(inner_type),
         UnaryOperator::OpLen => Ok(LuaType::Integer),
         UnaryOperator::OpUnm => infer_unary_expr_unm(db, inner_type),
+        // GMod: unreachable — Lua 5.3+ operator disabled in parser
         UnaryOperator::OpBNot => infer_unary_expr_bnot(db, inner_type),
         UnaryOperator::OpNop => Ok(inner_type),
     }
@@ -43,6 +44,7 @@ fn infer_unary_custom_operator(
 
     match op {
         LuaOperatorMetaMethod::Unm => Ok(LuaType::Number),
+        // GMod: unreachable — Lua 5.3+ operator disabled in parser
         LuaOperatorMetaMethod::BNot => Ok(LuaType::Integer),
         _ => Ok(LuaType::Nil),
     }

@@ -49,14 +49,12 @@ mod tests {
 
     #[test]
     fn test_name_token() {
-        let code = "local a<const> = 123";
+        let code = "local a = 123";
         let local_stat = get_ast_node::<LuaLocalStat>(code);
         let mut name_list = local_stat.get_local_name_list();
         let local_name1 = name_list.next().unwrap();
         let name = local_name1.get_name_token().unwrap();
         assert_eq!(name.get_name_text(), "a");
-        let attrib = local_name1.get_attrib().unwrap();
-        assert!(attrib.is_const());
     }
 
     #[test]

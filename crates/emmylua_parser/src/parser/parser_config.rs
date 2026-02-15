@@ -37,7 +37,8 @@ impl<'cache> ParserConfig<'cache> {
     }
 
     pub fn support_local_attrib(&self) -> bool {
-        self.level >= LuaLanguageLevel::Lua54
+        // Disabled: GMod uses Lua 5.1/LuaJIT which has no <const>/<close> attributes
+        false
     }
 
     pub fn support_emmylua_doc(&self) -> bool {
@@ -45,7 +46,8 @@ impl<'cache> ParserConfig<'cache> {
     }
 
     pub fn support_named_var_args(&self) -> bool {
-        self.level >= LuaLanguageLevel::Lua55
+        // Disabled: GMod uses Lua 5.1/LuaJIT which has no named varargs
+        false
     }
 
     pub fn node_cache(&mut self) -> Option<&mut NodeCache> {
@@ -83,9 +85,9 @@ impl<'cache> ParserConfig<'cache> {
 impl Default for ParserConfig<'_> {
     fn default() -> Self {
         Self {
-            level: LuaLanguageLevel::Lua55,
+            level: LuaLanguageLevel::LuaJIT,
             lexer_config: LexerConfig {
-                language_level: LuaLanguageLevel::Lua55,
+                language_level: LuaLanguageLevel::LuaJIT,
                 non_std_symbols: LuaNonStdSymbolSet::new(),
             },
             node_cache: None,

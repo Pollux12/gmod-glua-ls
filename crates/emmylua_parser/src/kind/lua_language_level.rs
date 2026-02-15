@@ -3,11 +3,11 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum LuaLanguageLevel {
     Lua51,
+    #[default]
     LuaJIT,
     Lua52,
     Lua53,
     Lua54,
-    #[default]
     Lua55,
 }
 

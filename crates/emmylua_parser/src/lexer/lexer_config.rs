@@ -25,18 +25,20 @@ impl LexerConfig {
     }
 
     pub fn support_integer_operation(&self) -> bool {
-        self.language_level >= LuaLanguageLevel::Lua53
+        // Disabled: GMod uses Lua 5.1/LuaJIT which has no native bitwise/integer-division operators
+        false
     }
 
     pub fn support_global_decl(&self) -> bool {
-        self.language_level >= LuaLanguageLevel::Lua55
+        // Disabled: GMod uses Lua 5.1/LuaJIT which has no global statement syntax
+        false
     }
 }
 
 impl Default for LexerConfig {
     fn default() -> Self {
         LexerConfig {
-            language_level: LuaLanguageLevel::Lua54,
+            language_level: LuaLanguageLevel::LuaJIT,
             non_std_symbols: LuaNonStdSymbolSet::new(),
         }
     }

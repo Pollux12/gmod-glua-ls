@@ -941,43 +941,35 @@ Syntax(Chunk)@0..146
     #[test]
     fn test_local_stat() {
         let code = r#"
-        local a<const>, b<close> = 123, {}
+        local a, b = 123, {}
         "#;
 
         let result = r#"
-Syntax(Chunk)@0..52
-  Syntax(Block)@0..52
+Syntax(Chunk)@0..38
+  Syntax(Block)@0..38
     Token(TkEndOfLine)@0..1 "\n"
     Token(TkWhitespace)@1..9 "        "
-    Syntax(LocalStat)@9..43
+    Syntax(LocalStat)@9..29
       Token(TkLocal)@9..14 "local"
       Token(TkWhitespace)@14..15 " "
-      Syntax(LocalName)@15..23
+      Syntax(LocalName)@15..16
         Token(TkName)@15..16 "a"
-        Syntax(Attribute)@16..23
-          Token(TkLt)@16..17 "<"
-          Token(TkName)@17..22 "const"
-          Token(TkGt)@22..23 ">"
-      Token(TkComma)@23..24 ","
-      Token(TkWhitespace)@24..25 " "
-      Syntax(LocalName)@25..33
-        Token(TkName)@25..26 "b"
-        Syntax(Attribute)@26..33
-          Token(TkLt)@26..27 "<"
-          Token(TkName)@27..32 "close"
-          Token(TkGt)@32..33 ">"
-      Token(TkWhitespace)@33..34 " "
-      Token(TkAssign)@34..35 "="
-      Token(TkWhitespace)@35..36 " "
-      Syntax(LiteralExpr)@36..39
-        Token(TkInt)@36..39 "123"
-      Token(TkComma)@39..40 ","
-      Token(TkWhitespace)@40..41 " "
-      Syntax(TableEmptyExpr)@41..43
-        Token(TkLeftBrace)@41..42 "{"
-        Token(TkRightBrace)@42..43 "}"
-    Token(TkEndOfLine)@43..44 "\n"
-    Token(TkWhitespace)@44..52 "        "
+      Token(TkComma)@16..17 ","
+      Token(TkWhitespace)@17..18 " "
+      Syntax(LocalName)@18..19
+        Token(TkName)@18..19 "b"
+      Token(TkWhitespace)@19..20 " "
+      Token(TkAssign)@20..21 "="
+      Token(TkWhitespace)@21..22 " "
+      Syntax(LiteralExpr)@22..25
+        Token(TkInt)@22..25 "123"
+      Token(TkComma)@25..26 ","
+      Token(TkWhitespace)@26..27 " "
+      Syntax(TableEmptyExpr)@27..29
+        Token(TkLeftBrace)@27..28 "{"
+        Token(TkRightBrace)@28..29 "}"
+    Token(TkEndOfLine)@29..30 "\n"
+    Token(TkWhitespace)@30..38 "        "
         "#;
 
         assert_ast_eq!(code, result);
@@ -1136,61 +1128,6 @@ Syntax(Chunk)@0..4
     }
 
     #[test]
-    fn test_lua55_global_grammar() {
-        let code = "global a, b;";
-        let result = r#"
-Syntax(Chunk)@0..12
-  Syntax(Block)@0..12
-    Syntax(GlobalStat)@0..12
-      Token(TkGlobal)@0..6 "global"
-      Token(TkWhitespace)@6..7 " "
-      Syntax(LocalName)@7..8
-        Token(TkName)@7..8 "a"
-      Token(TkComma)@8..9 ","
-      Token(TkWhitespace)@9..10 " "
-      Syntax(LocalName)@10..11
-        Token(TkName)@10..11 "b"
-      Token(TkSemicolon)@11..12 ";"
-        "#;
-
-        assert_ast_eq!(
-            code,
-            result,
-            ParserConfig::with_level(LuaLanguageLevel::Lua55)
-        );
-
-        let code2 = "global <const> a, b<const>";
-        let result2 = r#"
-Syntax(Chunk)@0..26
-  Syntax(Block)@0..26
-    Syntax(GlobalStat)@0..26
-      Token(TkGlobal)@0..6 "global"
-      Token(TkWhitespace)@6..7 " "
-      Syntax(Attribute)@7..14
-        Token(TkLt)@7..8 "<"
-        Token(TkName)@8..13 "const"
-        Token(TkGt)@13..14 ">"
-      Token(TkWhitespace)@14..15 " "
-      Syntax(LocalName)@15..16
-        Token(TkName)@15..16 "a"
-      Token(TkComma)@16..17 ","
-      Token(TkWhitespace)@17..18 " "
-      Syntax(LocalName)@18..26
-        Token(TkName)@18..19 "b"
-        Syntax(Attribute)@19..26
-          Token(TkLt)@19..20 "<"
-          Token(TkName)@20..25 "const"
-          Token(TkGt)@25..26 ">"
-        "#;
-
-        assert_ast_eq!(
-            code2,
-            result2,
-            ParserConfig::with_level(LuaLanguageLevel::Lua55)
-        );
-    }
-
-    #[test]
     fn test_wrong_table_expr() {
         let code = r#"
         local _A = {
@@ -1246,118 +1183,5 @@ Syntax(Chunk)@0..94
         "#;
 
         assert_ast_eq!(code, result);
-    }
-
-    #[test]
-    fn test_lua55_local_grammar() {
-        let code = "local <const> a, b<const> = 1, 2";
-        let result = r#"
-Syntax(Chunk)@0..32
-  Syntax(Block)@0..32
-    Syntax(LocalStat)@0..32
-      Token(TkLocal)@0..5 "local"
-      Token(TkWhitespace)@5..6 " "
-      Syntax(Attribute)@6..13
-        Token(TkLt)@6..7 "<"
-        Token(TkName)@7..12 "const"
-        Token(TkGt)@12..13 ">"
-      Token(TkWhitespace)@13..14 " "
-      Syntax(LocalName)@14..15
-        Token(TkName)@14..15 "a"
-      Token(TkComma)@15..16 ","
-      Token(TkWhitespace)@16..17 " "
-      Syntax(LocalName)@17..25
-        Token(TkName)@17..18 "b"
-        Syntax(Attribute)@18..25
-          Token(TkLt)@18..19 "<"
-          Token(TkName)@19..24 "const"
-          Token(TkGt)@24..25 ">"
-      Token(TkWhitespace)@25..26 " "
-      Token(TkAssign)@26..27 "="
-      Token(TkWhitespace)@27..28 " "
-      Syntax(LiteralExpr)@28..29
-        Token(TkInt)@28..29 "1"
-      Token(TkComma)@29..30 ","
-      Token(TkWhitespace)@30..31 " "
-      Syntax(LiteralExpr)@31..32
-        Token(TkInt)@31..32 "2"
-        "#;
-
-        assert_ast_eq!(
-            code,
-            result,
-            ParserConfig::with_level(LuaLanguageLevel::Lua55)
-        );
-    }
-
-    #[test]
-    fn test_lua55_named_var_args_grammar() {
-        let code = r#"
-        local function foo(a, b, ...c)
-        end
-        "#;
-        let result = r#"
-Syntax(Chunk)@0..60
-  Syntax(Block)@0..60
-    Token(TkEndOfLine)@0..1 "\n"
-    Token(TkWhitespace)@1..9 "        "
-    Syntax(LocalFuncStat)@9..51
-      Token(TkLocal)@9..14 "local"
-      Token(TkWhitespace)@14..15 " "
-      Token(TkFunction)@15..23 "function"
-      Token(TkWhitespace)@23..24 " "
-      Syntax(LocalName)@24..27
-        Token(TkName)@24..27 "foo"
-      Syntax(ClosureExpr)@27..51
-        Syntax(ParamList)@27..39
-          Token(TkLeftParen)@27..28 "("
-          Syntax(ParamName)@28..29
-            Token(TkName)@28..29 "a"
-          Token(TkComma)@29..30 ","
-          Token(TkWhitespace)@30..31 " "
-          Syntax(ParamName)@31..32
-            Token(TkName)@31..32 "b"
-          Token(TkComma)@32..33 ","
-          Token(TkWhitespace)@33..34 " "
-          Syntax(ParamName)@34..38
-            Token(TkDots)@34..37 "..."
-            Token(TkName)@37..38 "c"
-          Token(TkRightParen)@38..39 ")"
-        Token(TkEndOfLine)@39..40 "\n"
-        Token(TkWhitespace)@40..48 "        "
-        Token(TkEnd)@48..51 "end"
-    Token(TkEndOfLine)@51..52 "\n"
-    Token(TkWhitespace)@52..60 "        "
-        "#;
-
-        assert_ast_eq!(
-            code,
-            result,
-            ParserConfig::with_level(LuaLanguageLevel::Lua55)
-        );
-    }
-
-    #[test]
-    fn test_global_const_mul() {
-        let code = "global <const> *";
-        let result = r#"
-Syntax(Chunk)@0..16
-  Syntax(Block)@0..16
-    Syntax(GlobalStat)@0..16
-      Token(TkGlobal)@0..6 "global"
-      Token(TkWhitespace)@6..7 " "
-      Syntax(Attribute)@7..14
-        Token(TkLt)@7..8 "<"
-        Token(TkName)@8..13 "const"
-        Token(TkGt)@13..14 ">"
-      Token(TkWhitespace)@14..15 " "
-      Token(TkMul)@15..16 "*"
-        "#;
-
-        assert_ast_eq!(
-            code,
-            result,
-            ParserConfig::with_level(LuaLanguageLevel::Lua55)
-        );
     }
 }

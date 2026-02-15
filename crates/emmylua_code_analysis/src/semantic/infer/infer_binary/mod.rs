@@ -99,14 +99,8 @@ fn infer_binary_expr_type(
         BinaryOperator::OpSub => infer_binary_expr_sub(db, left_type, right_type),
         BinaryOperator::OpMul => infer_binary_expr_mul(db, left_type, right_type),
         BinaryOperator::OpDiv => infer_binary_expr_div(db, left_type, right_type),
-        BinaryOperator::OpIDiv => infer_binary_expr_idiv(db, left_type, right_type),
         BinaryOperator::OpMod => infer_binary_expr_mod(db, left_type, right_type),
         BinaryOperator::OpPow => infer_binary_expr_pow(db, left_type, right_type),
-        BinaryOperator::OpBAnd => infer_binary_expr_band(db, left_type, right_type),
-        BinaryOperator::OpBOr => infer_binary_expr_bor(db, left_type, right_type),
-        BinaryOperator::OpBXor => infer_binary_expr_bxor(db, left_type, right_type),
-        BinaryOperator::OpShl => infer_binary_expr_shl(db, left_type, right_type),
-        BinaryOperator::OpShr => infer_binary_expr_shr(db, left_type, right_type),
         BinaryOperator::OpConcat => infer_binary_expr_concat(db, left_type, right_type),
         BinaryOperator::OpOr => infer_binary_expr_or(db, left_type, right_type),
         BinaryOperator::OpAnd => infer_binary_expr_and(db, left_type, right_type),
@@ -157,6 +151,7 @@ fn infer_binary_custom_operator(
         | LuaOperatorMetaMethod::Div
         | LuaOperatorMetaMethod::Mod
         | LuaOperatorMetaMethod::Pow => Ok(LuaType::Number),
+        // GMod: unreachable — Lua 5.3+ operators disabled in parser
         LuaOperatorMetaMethod::IDiv
         | LuaOperatorMetaMethod::BAnd
         | LuaOperatorMetaMethod::BOr
@@ -300,22 +295,6 @@ fn infer_binary_expr_div(db: &DbIndex, left: LuaType, right: LuaType) -> InferRe
     infer_binary_custom_operator(db, &left, &right, LuaOperatorMetaMethod::Div)
 }
 
-fn infer_binary_expr_idiv(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {
-    if left.is_integer() && right.is_integer() {
-        return match (&left, &right) {
-            (LuaType::IntegerConst(int1), LuaType::IntegerConst(int2)) => {
-                if *int2 != 0 {
-                    return Ok(LuaType::IntegerConst(int1 / int2));
-                }
-                Ok(LuaType::Integer)
-            }
-            _ => Ok(LuaType::Integer),
-        };
-    }
-
-    infer_binary_custom_operator(db, &left, &right, LuaOperatorMetaMethod::IDiv)
-}
-
 fn infer_binary_expr_mod(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {
     if left.is_integer() && right.is_integer() {
         return match (&left, &right) {
@@ -350,71 +329,6 @@ fn infer_binary_expr_pow(db: &DbIndex, left: LuaType, right: LuaType) -> InferRe
     }
 
     infer_binary_custom_operator(db, &left, &right, LuaOperatorMetaMethod::Pow)
-}
-
-fn infer_binary_expr_band(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {
-    if left.is_integer() && right.is_integer() {
-        return match (&left, &right) {
-            (LuaType::IntegerConst(int1), LuaType::IntegerConst(int2)) => {
-                Ok(LuaType::IntegerConst(int1 & int2))
-            }
-            _ => Ok(LuaType::Integer),
-        };
-    }
-
-    infer_binary_custom_operator(db, &left, &right, LuaOperatorMetaMethod::BAnd)
-}
-
-fn infer_binary_expr_bor(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {
-    if left.is_integer() && right.is_integer() {
-        return match (&left, &right) {
-            (LuaType::IntegerConst(int1), LuaType::IntegerConst(int2)) => {
-                Ok(LuaType::IntegerConst(int1 | int2))
-            }
-            _ => Ok(LuaType::Integer),
-        };
-    }
-
-    infer_binary_custom_operator(db, &left, &right, LuaOperatorMetaMethod::BOr)
-}
-
-fn infer_binary_expr_bxor(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {
-    if left.is_integer() && right.is_integer() {
-        return match (&left, &right) {
-            (LuaType::IntegerConst(int1), LuaType::IntegerConst(int2)) => {
-                Ok(LuaType::IntegerConst(int1 ^ int2))
-            }
-            _ => Ok(LuaType::Integer),
-        };
-    }
-
-    infer_binary_custom_operator(db, &left, &right, LuaOperatorMetaMethod::BXor)
-}
-
-fn infer_binary_expr_shl(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {
-    if left.is_integer() && right.is_integer() {
-        return match (&left, &right) {
-            (LuaType::IntegerConst(int1), LuaType::IntegerConst(int2)) => {
-                Ok(LuaType::IntegerConst(int1 << int2))
-            }
-            _ => Ok(LuaType::Integer),
-        };
-    }
-
-    infer_binary_custom_operator(db, &left, &right, LuaOperatorMetaMethod::Shl)
-}
-
-fn infer_binary_expr_shr(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {
-    if left.is_integer() && right.is_integer() {
-        return match (&left, &right) {
-            (LuaType::IntegerConst(int1), LuaType::IntegerConst(int2)) => {
-                Ok(LuaType::IntegerConst(int1 >> int2))
-            }
-            _ => Ok(LuaType::Integer),
-        };
-    }
-
-    infer_binary_custom_operator(db, &left, &right, LuaOperatorMetaMethod::Shr)
 }
 
 fn infer_binary_expr_concat(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {

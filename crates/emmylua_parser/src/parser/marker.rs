@@ -128,6 +128,7 @@ impl CompleteMarker {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_invalid(&self) -> bool {
         self.kind == LuaSyntaxKind::None
     }

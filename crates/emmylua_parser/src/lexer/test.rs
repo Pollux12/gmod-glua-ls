@@ -2,7 +2,7 @@
 mod tests {
     use crate::text::Reader;
     use crate::{
-        LuaNonStdSymbol,
+        LuaLanguageLevel, LuaNonStdSymbol,
         lexer::{LexerConfig, LuaLexer},
         parser_error::LuaParseError,
     };
@@ -82,7 +82,10 @@ mod tests {
         function a.b.c() end
 
         "#;
-        let config = LexerConfig::default();
+        let config = LexerConfig {
+            language_level: LuaLanguageLevel::Lua54,
+            ..Default::default()
+        };
         let mut errors: Vec<LuaParseError> = Vec::new();
         let mut lexer = LuaLexer::new(Reader::new(text), config, Some(&mut errors));
         let tokens = lexer.tokenize();

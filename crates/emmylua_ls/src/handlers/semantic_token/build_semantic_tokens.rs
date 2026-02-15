@@ -85,6 +85,7 @@ fn build_tokens_semantic_token(
         | LuaTokenKind::TkThen
         | LuaTokenKind::TkUntil
         | LuaTokenKind::TkWhile
+        // GMod: dead path — Lua 5.5 `global` keyword disabled
         | LuaTokenKind::TkGlobal => {
             builder.push(token, SemanticTokenType::KEYWORD);
         }
@@ -97,23 +98,25 @@ fn build_tokens_semantic_token(
         | LuaTokenKind::TkMinus
         | LuaTokenKind::TkMul
         | LuaTokenKind::TkDiv
+        // GMod: dead paths below — Lua 5.3+ operators disabled
         | LuaTokenKind::TkIDiv
+        | LuaTokenKind::TkShl
+        | LuaTokenKind::TkShr
+        | LuaTokenKind::TkBitAnd
+        | LuaTokenKind::TkBitOr
+        | LuaTokenKind::TkBitXor
+        // end dead paths
         | LuaTokenKind::TkDot
         | LuaTokenKind::TkConcat
         | LuaTokenKind::TkEq
         | LuaTokenKind::TkGe
         | LuaTokenKind::TkLe
         | LuaTokenKind::TkNe
-        | LuaTokenKind::TkShl
-        | LuaTokenKind::TkShr
         | LuaTokenKind::TkLt
         | LuaTokenKind::TkGt
         | LuaTokenKind::TkMod
         | LuaTokenKind::TkPow
         | LuaTokenKind::TkLen
-        | LuaTokenKind::TkBitAnd
-        | LuaTokenKind::TkBitOr
-        | LuaTokenKind::TkBitXor
         | LuaTokenKind::TkAssign => {
             builder.push(token, SemanticTokenType::OPERATOR);
         }
@@ -511,6 +514,7 @@ fn build_node_semantic_token(
                 }
             }
         }
+        // GMod: dead path — Lua 5.4 <const>/<close> attributes disabled
         LuaAst::LuaLocalAttribute(local_attribute) => {
             let name = local_attribute.get_name_token()?;
             builder.push(name.syntax(), SemanticTokenType::KEYWORD);

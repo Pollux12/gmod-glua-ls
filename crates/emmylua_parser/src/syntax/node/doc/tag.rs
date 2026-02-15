@@ -224,9 +224,9 @@ impl LuaAstNode for LuaDocTag {
             LuaSyntaxKind::DocTagLanguage => Some(LuaDocTag::Language(
                 LuaDocTagLanguage::cast(syntax).unwrap(),
             )),
-            LuaSyntaxKind::DocTagRealm => Some(LuaDocTag::Realm(
-                LuaDocTagRealm::cast(syntax).unwrap(),
-            )),
+            LuaSyntaxKind::DocTagRealm => {
+                Some(LuaDocTag::Realm(LuaDocTagRealm::cast(syntax).unwrap()))
+            }
             _ => None,
         }
     }

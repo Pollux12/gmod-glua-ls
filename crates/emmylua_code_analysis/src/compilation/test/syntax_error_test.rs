@@ -5,7 +5,8 @@ mod tests {
     #[test]
     fn test_if_number_then() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        // LuaJIT: `0then` tokenizes cleanly as `0` + `then` (no error)
+        assert!(ws.check_code_for(
             DiagnosticCode::SyntaxError,
             r#"
             if 0then

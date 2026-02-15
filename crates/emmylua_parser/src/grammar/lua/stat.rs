@@ -1,5 +1,4 @@
 use crate::{
-    LuaLanguageLevel,
     grammar::{ParseFailReason, ParseResult, lua::is_statement_start_token},
     kind::{LuaSyntaxKind, LuaTokenKind},
     parser::{CompleteMarker, LuaParser, MarkerEventContainer},
@@ -152,35 +151,6 @@ fn parse_variable_name_list(p: &mut LuaParser, support_attrib: bool) -> ParseRes
                     &t!("expected variable name after ','"),
                     p.current_token_range(),
                 ));
-            }
-        }
-    }
-
-    Ok(CompleteMarker::empty())
-}
-
-fn parse_global_name_list(p: &mut LuaParser) -> ParseResult {
-    parse_local_name(p, true)?;
-
-    while p.current_token() == LuaTokenKind::TkComma {
-        p.bump();
-        match parse_local_name(p, true) {
-            Ok(_) => {}
-            Err(_) => {
-                p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected variable name after ','"),
-                    p.current_token_range(),
-                ));
-            }
-        }
-    }
-
-    if p.current_token() == LuaTokenKind::TkAssign {
-        p.bump();
-        match parse_expr_list_impl(p) {
-            Ok(_) => {}
-            Err(_) => {
-                push_expr_error_lazy(p, || t!("expected expression after '='"));
             }
         }
     }
@@ -585,7 +555,7 @@ fn parse_local(p: &mut LuaParser) -> ParseResult {
             }
         }
         LuaTokenKind::TkName => {
-            parse_variable_name_list(p, true)?;
+            parse_variable_name_list(p, false)?;
 
             // 可选的初始化表达式
             if p.current_token().is_assign_op() {
@@ -595,43 +565,9 @@ fn parse_local(p: &mut LuaParser) -> ParseResult {
                 }
             }
         }
-        LuaTokenKind::TkLt => {
-            if p.parse_config.level >= LuaLanguageLevel::Lua55 {
-                match parse_attrib(p) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        p.push_error(LuaParseError::syntax_error_from(
-                            &t!("invalid attribute syntax"),
-                            p.current_token_range(),
-                        ));
-                    }
-                }
-
-                parse_variable_name_list(p, true)?;
-
-                if p.current_token().is_assign_op() {
-                    p.bump();
-                    if parse_expr_list_impl(p).is_err() {
-                        push_expr_error_lazy(p, || {
-                            t!("expected initialization expression after '='")
-                        });
-                    }
-                }
-            } else {
-                p.push_error(LuaParseError::syntax_error_from(
-                    &t!(
-                        "local attributes are not supported in Lua version %{level}",
-                        level = p.parse_config.level
-                    ),
-                    p.current_token_range(),
-                ));
-
-                return Err(ParseFailReason::UnexpectedToken);
-            }
-        }
         _ => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected 'function', variable name, or attribute after 'local'"),
+                &t!("expected 'function' or variable name after 'local'"),
                 p.current_token_range(),
             ));
 
@@ -759,76 +695,7 @@ fn parse_empty_stat(p: &mut LuaParser) -> ParseResult {
     Ok(m.complete(p))
 }
 
-fn try_parse_global_stat(p: &mut LuaParser) -> ParseResult {
-    let mut m = p.mark(LuaSyntaxKind::GlobalStat);
-    match p.peek_next_token() {
-        LuaTokenKind::TkName => {
-            p.set_current_token_kind(LuaTokenKind::TkGlobal);
-            p.bump();
-            parse_global_name_list(p)?;
-        }
-        LuaTokenKind::TkLt => {
-            p.set_current_token_kind(LuaTokenKind::TkGlobal);
-            p.bump();
-            parse_attrib(p)?;
-            if p.current_token() == LuaTokenKind::TkName {
-                parse_global_name_list(p)?;
-            } else if p.current_token() == LuaTokenKind::TkMul {
-                p.bump();
-            } else {
-                p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected variable name after global attribute"),
-                    p.current_token_range(),
-                ));
-            }
-        }
-        // global function
-        LuaTokenKind::TkFunction => {
-            p.set_current_token_kind(LuaTokenKind::TkGlobal);
-            p.bump(); // consume 'global'
-            m.set_kind(p, LuaSyntaxKind::FuncStat);
-            p.bump(); // consume 'function'
-            let m2 = p.mark(LuaSyntaxKind::NameExpr);
-            match expect_token(p, LuaTokenKind::TkName) {
-                Ok(_) => {}
-                Err(_) => {
-                    p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected function name after 'global function'"),
-                        p.current_token_range(),
-                    ));
-                    return Err(ParseFailReason::UnexpectedToken);
-                }
-            }
-            m2.complete(p);
-            parse_closure_expr(p)?;
-        }
-        // global *
-        LuaTokenKind::TkMul => {
-            p.set_current_token_kind(LuaTokenKind::TkGlobal);
-            p.bump(); // consume 'global'
-            p.bump(); // consume '*'
-        }
-        _ => {
-            return Ok(m.undo(p));
-        }
-    }
-
-    if_token_bump(p, LuaTokenKind::TkSemicolon);
-    Ok(m.complete(p))
-}
-
 fn parse_assign_or_expr_or_global_stat(p: &mut LuaParser) -> ParseResult {
-    if p.parse_config.level >= LuaLanguageLevel::Lua55 && p.current_token() == LuaTokenKind::TkName
-    {
-        let token_text = p.current_token_text();
-        if token_text == "global" {
-            let cm = try_parse_global_stat(p)?;
-            if !cm.is_invalid() {
-                return Ok(cm);
-            }
-        }
-    }
-
     let mut m = p.mark(LuaSyntaxKind::AssignStat);
     let range = p.current_token_range();
 

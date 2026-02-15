@@ -49,29 +49,32 @@ fn to_highlight_kind(
         | LuaTokenKind::TkThen
         | LuaTokenKind::TkUntil
         | LuaTokenKind::TkWhile
+        // GMod: dead path — Lua 5.5 `global` keyword disabled
         | LuaTokenKind::TkGlobal
         | LuaTokenKind::TkLocal => CodeBlockHighlightKind::Keyword,
         LuaTokenKind::TkPlus
         | LuaTokenKind::TkMinus
         | LuaTokenKind::TkMul
         | LuaTokenKind::TkDiv
+        // GMod: dead paths below — Lua 5.3+ operators disabled
         | LuaTokenKind::TkIDiv
+        | LuaTokenKind::TkShl
+        | LuaTokenKind::TkShr
+        | LuaTokenKind::TkBitAnd
+        | LuaTokenKind::TkBitOr
+        | LuaTokenKind::TkBitXor
+        // end dead paths
         | LuaTokenKind::TkDot
         | LuaTokenKind::TkConcat
         | LuaTokenKind::TkEq
         | LuaTokenKind::TkGe
         | LuaTokenKind::TkLe
         | LuaTokenKind::TkNe
-        | LuaTokenKind::TkShl
-        | LuaTokenKind::TkShr
         | LuaTokenKind::TkLt
         | LuaTokenKind::TkGt
         | LuaTokenKind::TkMod
         | LuaTokenKind::TkPow
         | LuaTokenKind::TkLen
-        | LuaTokenKind::TkBitAnd
-        | LuaTokenKind::TkBitOr
-        | LuaTokenKind::TkBitXor
         | LuaTokenKind::TkLeftBrace
         | LuaTokenKind::TkRightBrace
         | LuaTokenKind::TkLeftBracket
