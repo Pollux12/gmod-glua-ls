@@ -10,6 +10,8 @@ Explicitly declares which realm (client, server, or shared) code belongs to. Use
 
 ## File-Level Realm
 
+Note: This is optional, by default we detect file realm by checking file prefix, and if that is inconclusive, infer based on loading and function usage.
+
 Place at the top of a file to declare the entire file's realm:
 
 ```lua
@@ -22,6 +24,8 @@ end
 ```
 
 ## Function-Level Realm
+
+Note: This is optional, by default we assign the realm based on the file realm, but also account for `if SERVER` or `if CLIENT` blocks within shared files.
 
 Use above a function to override the file's default realm:
 
@@ -77,4 +81,4 @@ end
 
 ## See Also
 
-- [Configuration](../../config.md) — `gmod.detectRealmFromFilename` and `gmod.detectRealmFromCalls`
+- [Configuration](../config.md) — `gmod.detectRealmFromFilename` and `gmod.detectRealmFromCalls`
