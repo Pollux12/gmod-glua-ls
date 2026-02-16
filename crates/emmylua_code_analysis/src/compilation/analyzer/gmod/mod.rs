@@ -2276,12 +2276,13 @@ fn infer_realm(
     dependency_hints: Option<&HashSet<GmodRealm>>,
     default_realm: GmodRealm,
 ) -> GmodRealm {
-    let mut hints = HashSet::new();
     if let Some(filename_hint) = filename_hint
         && filename_hint != GmodRealm::Unknown
     {
-        hints.insert(filename_hint);
+        return filename_hint;
     }
+
+    let mut hints = HashSet::new();
 
     if let Some(dependency_hints) = dependency_hints {
         hints.extend(

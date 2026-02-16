@@ -88,6 +88,28 @@ mod test {
     }
 
     #[gtest]
+    fn test_shared_filename_hint_wins_over_addcsluafile_client_hint() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let shared_file_id = ws.def_file("lua/autorun/sh_utf8.lua", "return {}");
+        ws.def_file(
+            "lua/autorun/sv_boot.lua",
+            r#"
+            AddCSLuaFile("sh_utf8.lua")
+            "#,
+        );
+
+        assert_eq!(
+            ws.get_db_mut()
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&shared_file_id)
+                .map(|metadata| metadata.inferred_realm),
+            Some(GmodRealm::Shared)
+        );
+    }
+
+    #[gtest]
     fn test_require_dependency_marks_module_shared_not_caller() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

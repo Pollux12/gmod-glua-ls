@@ -3,7 +3,8 @@ use std::sync::Arc;
 use emmylua_parser::{LuaAstNode, LuaCallExpr, LuaNameExpr};
 
 use crate::{
-    DbIndex, LuaDeclId, LuaInferCache, LuaType, semantic::overload_resolve::resolve_signature,
+    DbIndex, GmodRealm, LuaDeclId, LuaInferCache, LuaType,
+    semantic::overload_resolve::resolve_signature,
 };
 
 pub fn resolve_global_decl_id(
@@ -13,18 +14,23 @@ pub fn resolve_global_decl_id(
     name_expr: Option<&LuaNameExpr>,
 ) -> Option<LuaDeclId> {
     let decl_ids = db.get_global_index().get_global_decl_ids(name)?;
-    if decl_ids.len() == 1 {
-        return Some(decl_ids[0]);
+    let mut candidate_decl_ids = select_realm_compatible_decl_ids(db, cache, decl_ids, name_expr);
+    if candidate_decl_ids.is_empty() {
+        candidate_decl_ids = decl_ids.clone();
+    }
+
+    if candidate_decl_ids.len() == 1 {
+        return candidate_decl_ids.first().copied();
     }
 
     if let Some(name_expr) = name_expr
         && let Some(call_expr) = name_expr.get_parent::<LuaCallExpr>()
     {
-        return resolve_global_func_decl_id(db, cache, name, call_expr);
+        return resolve_global_func_decl_id(db, cache, &candidate_decl_ids, call_expr);
     }
 
     let mut last_valid_decl_id = None;
-    for decl_id in decl_ids {
+    for decl_id in &candidate_decl_ids {
         let decl_type_cache = db.get_type_index().get_type_cache(&(*decl_id).into());
         if let Some(type_cache) = decl_type_cache {
             let typ = type_cache.as_type();
@@ -37,8 +43,8 @@ pub fn resolve_global_decl_id(
             }
         }
     }
-    if last_valid_decl_id.is_none() && !decl_ids.is_empty() {
-        return Some(decl_ids[0]);
+    if last_valid_decl_id.is_none() && !candidate_decl_ids.is_empty() {
+        return candidate_decl_ids.first().copied();
     }
 
     last_valid_decl_id.cloned()
@@ -47,10 +53,9 @@ pub fn resolve_global_decl_id(
 fn resolve_global_func_decl_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    name: &str,
+    decl_ids: &[LuaDeclId],
     call_expr: LuaCallExpr,
 ) -> Option<LuaDeclId> {
-    let decl_ids = db.get_global_index().get_global_decl_ids(name)?;
     let mut overload_signature = vec![];
     for decl_id in decl_ids {
         let decl_type_cache = db.get_type_index().get_type_cache(&(*decl_id).into());
@@ -88,4 +93,41 @@ fn resolve_global_func_decl_id(
     }
 
     overload_signature.first().map(|(id, _)| id.clone())
+}
+
+fn select_realm_compatible_decl_ids(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    decl_ids: &[LuaDeclId],
+    name_expr: Option<&LuaNameExpr>,
+) -> Vec<LuaDeclId> {
+    if !db.get_emmyrc().gmod.enabled {
+        return decl_ids.to_vec();
+    }
+
+    let Some(name_expr) = name_expr else {
+        return decl_ids.to_vec();
+    };
+
+    let file_id = cache.get_file_id();
+    let call_offset = name_expr.get_position();
+    let infer_index = db.get_gmod_infer_index();
+    let call_realm = infer_index.get_realm_at_offset(&file_id, call_offset);
+
+    let mut compatible = Vec::new();
+    for decl_id in decl_ids {
+        let decl_realm = infer_index.get_realm_at_offset(&decl_id.file_id, decl_id.position);
+        if is_realm_compatible(call_realm, decl_realm) {
+            compatible.push(*decl_id);
+        }
+    }
+
+    compatible
+}
+
+fn is_realm_compatible(call_realm: GmodRealm, decl_realm: GmodRealm) -> bool {
+    !matches!(
+        (call_realm, decl_realm),
+        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
+    )
 }
