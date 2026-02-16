@@ -43,12 +43,27 @@ pub fn infer_name_expr(
             VarRefId::VarRef(decl_id),
         )
     } else {
+        if let Some(define_baseclass_type) = infer_define_baseclass_type(db, file_id, name) {
+            return Ok(define_baseclass_type);
+        }
+
         if let Some(scoped_type) = infer_scoped_scripted_global_type(db, cache, name) {
             return Ok(scoped_type);
         }
 
         infer_global_type(db, name)
     }
+}
+
+fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Option<LuaType> {
+    if !db.get_emmyrc().gmod.enabled || name != "BaseClass" {
+        return None;
+    }
+
+    let base_name = db
+        .get_gmod_class_metadata_index()
+        .get_define_baseclass_name(&file_id)?;
+    Some(LuaType::Ref(LuaTypeDeclId::global(base_name)))
 }
 
 #[derive(Clone, Copy)]

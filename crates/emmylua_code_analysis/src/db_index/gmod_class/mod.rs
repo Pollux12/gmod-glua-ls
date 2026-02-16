@@ -72,6 +72,18 @@ pub struct GmodScriptedClassFileMetadata {
 }
 
 impl GmodScriptedClassFileMetadata {
+    pub fn get_define_baseclass_name(&self) -> Option<&str> {
+        self.define_baseclass_calls
+            .iter()
+            .rev()
+            .find_map(|call| match call.literal_args.first() {
+                Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+    }
+
     fn calls_by_kind_mut(
         &mut self,
         kind: GmodScriptedClassCallKind,
@@ -114,6 +126,10 @@ impl GmodClassMetadataIndex {
 
     pub fn get_file_metadata(&self, file_id: &FileId) -> Option<&GmodScriptedClassFileMetadata> {
         self.file_metadata.get(file_id)
+    }
+
+    pub fn get_define_baseclass_name(&self, file_id: &FileId) -> Option<&str> {
+        self.get_file_metadata(file_id)?.get_define_baseclass_name()
     }
 
     pub fn iter_file_metadata(

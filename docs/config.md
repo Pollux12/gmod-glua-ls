@@ -4,15 +4,76 @@ Configuration is done via `.emmyrc.json` (or `.luarc.json` for compatibility) in
 
 ## Quick Start
 
+This config should be good for most, feel free to enable/disable diagnostics or change severity levels depending on how strict you want the checks to be.
+
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/Pollux-Dev/gmod-glua-ls/main/crates/emmylua_code_analysis/resources/schema.json",
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/refs/heads/main/crates/emmylua_code_analysis/resources/schema.json",
+  "diagnostics": {
+    "enable": true,
+    "diagnosticInterval": 500,
+    "disable": [
+      "inject-field",
+      "duplicate-set-field",
+      "unnecessary-if",
+      "unnecessary-assert",
+      "global-in-non-module",
+      "call-non-callable",
+      "unused-self",
+      "duplicate-type"
+    ],
+    "enables": [
+      "gmod-realm-misuse",
+      "gmod-realm-misuse-risky",
+      "gmod-unknown-net-message",
+      "gmod-duplicate-system-registration"
+    ],
+    "globals": [ ],
+    "severity": {
+      "need-check-nil": "hint",
+      "param-type-mismatch": "hint", // This one seems a bit bugged atm
+      "undefined-field": "information",
+      "undefined-global": "error",
+      "missing-parameter": "warning",
+      "assign-type-mismatch": "information",
+      "missing-return-value": "hint",
+      "missing-return": "hint",
+      "redundant-return": "hint",
+      "redundant-return-value": "hint",
+      "return-type-mismatch": "hint",
+      "redundant-parameter": "hint"
+    }
+  },
   "gmod": {
+    "defaultRealm": "shared",
+    "detectRealmFromCalls": true,
+    "detectRealmFromFilename": true,
     "enabled": true,
-    "defaultRealm": "shared"
+    "hookMappings": {
+      "methodPrefixes": [
+        "GM",
+        "PLUGIN"
+      ]
+    },
+    "scriptedClassScopes": {
+      "exclude": [
+        "**/tests/**",
+        "**/test/**",
+        "**/docs/**"
+      ],
+      "include": [
+        "entities/**",
+        "weapons/**",
+        "effects/**",
+        "weapons/gmod_tool/stools/**",
+        "plugins/**"
+      ]
+    }
   },
   "workspace": {
-    "library": ["./lua/glua-api"]
+    "library": [
+      "$GLUA_SNIPPETS_PATH",
+    ]
   }
 }
 ```

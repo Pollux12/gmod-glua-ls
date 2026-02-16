@@ -1,30 +1,42 @@
 # gmod-glua-ls
 
-A fast, feature-rich language server for Garry's Mod Lua (GLua), written in Rust.
+A fast, feature-rich language server for Garry's Mod Lua (GLua), written in Rust, based on [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust).
 
-Built for developers who want accurate autocomplete, go-to-definition, and type checking without the slowdowns.
+> [!IMPORTANT]
+> This is an early release, there may be some bugs or unexpected issues, such as some diagnostics being annoying with false positives or similar. You can turn any annoying diagnostics off or change their severity level in the config.
 
 <!-- TODO: Add GIF showing autocomplete for GMod functions -->
 
 ## Features
 
-### Made for Garry's Mod
+**Realm Detection**
 
-- **Realm Inference** — Knows whether your code runs on client, server, or shared. Detects realm mismatches (like calling `ents.Create` in a `cl_` file) and shows inline realm hints.
+- Infers realm for all functions based on several patterns, with automatic realm tags and diagnostics on realm mismatch.
 
-- **Hook Autocomplete** — `hook.Add`, `hook.Run`, and `hook.Call` suggest available hooks. Add `---@hook` to your gamemode/plugin methods to register them as hook sources.
+**Hook Autocomplete**
 
-- **Scripted Class Support** — Full support for `ENT`, `SWEP`, `TOOL`, and custom scripted entities. Understands `DEFINE_BASECLASS`, `AccessorFunc`, and `NetworkVar` with synthesized getter/setter autocomplete. Supports wrapper functions (including local helpers) that call `NetworkVar` internally. Add `---@accessorfunc` to custom accessor generators for the same synthesis behavior.
+- Smart hook detection, autocomplete and annotations, including `GM:` or custom method hooks (use `---@hook` annotation).
 
-- **Dynamic Field Inference** — Tracks fields dynamically set on Player, Entity, and other GMod objects to suppress false-positive "undefined field" warnings.
+**Advanced Class & Entity Support**
 
-### Fast & Reliable
+- Full support for `ENT`, `SWEP`, `TOOL`, and custom objects such as `PLUGIN`.
+- Automatically adds getter/setter functions for `NetworkVar`, `AccessorFunc`, and more, with custom support via `---@accessorfunc` annotation
+- Automatically adds definitions for all detected objects, such as class definitions for all entities and more.
 
-- Incremental analysis — instant feedback as you type
-- Memory efficient — handles large codebases without issues
-- Built with Rust for consistent performance
+**Dynamic Field Inference**
 
-### LSP Features
+- Tracks fields dynamically set on various objects, such as Player, Entity, and more, to prevent you from having to annotation these built-in classes.
+- Provides autocomplete and definitions for these fields.
+
+**Speed**
+
+- Takes seconds on large codebases vs LuaLS taking minutes.
+- Uses significantly less memory vs LuaLS.
+- This project was born out of frustration for how slow LuaLS can be.
+
+## LSP Features (from EmmyLua)
+
+Includes everything you'd expect from a Language Server:
 
 - Autocomplete with snippets
 - Go to definition / Find references
@@ -34,6 +46,9 @@ Built for developers who want accurate autocomplete, go-to-definition, and type 
 - Diagnostics (errors, warnings, hints)
 - Inlay hints (parameter names, types)
 - Code actions and code lens
+- Code formatting
+
+See more at: [EmmyLua Feature List](https://github.com/EmmyLuaLs/emmylua-analyzer-rust/blob/main/docs/features/features_EN.md#-code-formatting)
 
 <!-- TODO: Add screenshot of inlay hints and diagnostics -->
 
@@ -41,50 +56,98 @@ Built for developers who want accurate autocomplete, go-to-definition, and type 
 
 ### VS Code
 
-The recommended way is to use the GLua extension (coming soon). You can also configure the [EmmyLua extension](https://marketplace.visualstudio.com/items?itemName=tangzx.emmylua) to use this language server binary.
-
-### Neovim
-
-Using **lspconfig**:
-
-```lua
-require('lspconfig').emmylua_ls.setup({
-    cmd = { 'emmylua_ls' },
-    settings = {
-        Lua = {
-            gmod = { enabled = true }
-        }
-    }
-})
-```
+The recommended way is to use the GLua extension (coming soon). You can also configure the [EmmyLua extension](https://marketplace.visualstudio.com/items?itemName=tangzx.emmylua) to use this language server binary - change the language server path in VSCode setting under the EmmyLua category.
 
 ### Other Editors
 
-Any LSP-compatible editor works. Point your LSP client to the `emmylua_ls` binary.
+Any LSP-compatible editor should work. Point your LSP client to the `emmylua_ls` binary.
 
 ### Build from Source
 
 ```bash
 git clone https://github.com/Pollux-Dev/gmod-glua-ls.git
 cd gmod-glua-ls
-cargo build --release -p emmylua_ls
+cargo build --release
 ```
 
 Binary location: `target/release/emmylua_ls` (or `emmylua_ls.exe` on Windows)
 
 ## Configuration
 
-Create `.emmyrc.json` in your project root:
+Create `.emmyrc.json` in your project root, configure as per [docs/config.md](./docs/config.md).
+
+Note: Any existing LuaLS (`.luarc.json`) configuration will be used as fallback.
+
+Here's a config that should be a good default for most:
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/Pollux-Dev/gmod-glua-ls/main/crates/emmylua_code_analysis/resources/schema.json",
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/refs/heads/main/crates/emmylua_code_analysis/resources/schema.json",
+  "diagnostics": {
+    "enable": true,
+    "diagnosticInterval": 500,
+    "disable": [
+      "inject-field",
+      "duplicate-set-field",
+      "unnecessary-if",
+      "unnecessary-assert",
+      "global-in-non-module",
+      "call-non-callable",
+      "unused-self",
+      "duplicate-type"
+    ],
+    "enables": [
+      "gmod-realm-misuse",
+      "gmod-realm-misuse-risky",
+      "gmod-unknown-net-message",
+      "gmod-duplicate-system-registration"
+    ],
+    "globals": [ ],
+    "severity": {
+      "need-check-nil": "hint",
+      "param-type-mismatch": "hint", // This one seems a bit bugged atm
+      "undefined-field": "information",
+      "undefined-global": "error",
+      "missing-parameter": "warning",
+      "assign-type-mismatch": "information",
+      "missing-return-value": "hint",
+      "missing-return": "hint",
+      "redundant-return": "hint",
+      "redundant-return-value": "hint",
+      "return-type-mismatch": "hint",
+      "redundant-parameter": "hint"
+    }
+  },
   "gmod": {
+    "defaultRealm": "shared",
+    "detectRealmFromCalls": true,
+    "detectRealmFromFilename": true,
     "enabled": true,
-    "defaultRealm": "shared"
+    "hookMappings": {
+      "methodPrefixes": [
+        "GM",
+        "PLUGIN"
+      ]
+    },
+    "scriptedClassScopes": {
+      "exclude": [
+        "**/tests/**",
+        "**/test/**",
+        "**/docs/**"
+      ],
+      "include": [
+        "entities/**",
+        "weapons/**",
+        "effects/**",
+        "weapons/gmod_tool/stools/**",
+        "plugins/**"
+      ]
+    }
   },
   "workspace": {
-    "library": ["./lua/glua-api"]
+    "library": [
+      "$GLUA_SNIPPETS_PATH",
+    ]
   }
 }
 ```
@@ -93,22 +156,12 @@ See [docs/config.md](./docs/config.md) for all options.
 
 ## Annotations
 
-We support EmmyLua/LuaCATS annotations (`---@class`, `---@param`, etc.) plus GMod-specific additions:
-
-```lua
----@realm server|client|shared
----Mark which realm this file/function belongs to
-
----@hook [HookName]
----Register a method as a hook handler (for gamemodes/plugins)
-```
+Support for standard EmmyLua/LuaCATS annotations (`---@class`, `---@param`, etc.) plus GMod-specific additions such as `---@hook`.
 
 See [docs/annotations/](./docs/annotations/) for the full reference.
 
-## About This Fork
+## Credits
 
-This is a hard fork of [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust), maintained specifically for Garry's Mod development. While the original EmmyLua provides excellent Lua analysis, this fork adds GMod-specific features like realm detection, hook analysis, and scripted class support that generic Lua language servers cannot provide.
-
-## License
-
-MIT
+This is a hard fork of [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust), maintained specifically for Garry's Mod GLua.
+The original EmmyLua project does not support plugins, nor does it have any plan for any, making it difficult to fully adapt for Garry's Mod.
+While LuaLS has plugin support, it was annoyingly slow to use. Many features here are based on my [LuaLS plugin](https://github.com/Pollux12/gmod-luals-addon).

@@ -4,6 +4,7 @@
 - This repository is primarily a **Garry's Mod Language Server** fork of EmmyLua Analyzer Rust.
 - Default behavior should optimize for GLua/GMod workflows first, not generic Lua LS behavior.
 - When requirements are ambiguous, choose GMod-aware behavior and config defaults unless a task explicitly requests otherwise.
+- GitHub Repository: [@Pollux12/gmod-glua-ls](https://github.com/Pollux12/gmod-glua-ls)
 
 ## Architecture (Read This First)
 - Workspace layout by responsibility:

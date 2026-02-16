@@ -83,6 +83,16 @@ fn check_name_expr(
         return Some(());
     }
 
+    if name_text == "BaseClass"
+        && semantic_model
+            .get_db()
+            .get_gmod_class_metadata_index()
+            .get_define_baseclass_name(&semantic_model.get_file_id())
+            .is_some()
+    {
+        return Some(());
+    }
+
     context.add_diagnostic(
         DiagnosticCode::UndefinedGlobal,
         name_range,

@@ -628,6 +628,64 @@ mod test {
     }
 
     #[gtest]
+    fn test_define_baseclass_infers_baseclass_local_and_no_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedGlobal);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/entities/fl_dodge_charger/shared.lua",
+            r#"
+            DEFINE_BASECLASS("base_glide")
+            local _ = BaseClass
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let baseclass_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|name_expr| name_expr.get_name_text().as_deref() == Some("BaseClass"))
+            .expect("expected BaseClass name expression");
+        let baseclass_token = baseclass_expr
+            .get_name_token()
+            .expect("expected BaseClass token");
+        let semantic_info = semantic_model
+            .get_semantic_info(baseclass_token.syntax().clone().into())
+            .expect("expected semantic info for BaseClass");
+
+        assert_eq!(
+            semantic_info.typ,
+            LuaType::Ref(LuaTypeDeclId::global("base_glide")),
+            "expected BaseClass to resolve to base_glide"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_global_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedGlobal.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| {
+                    diag.code != undefined_global_code
+                        || !diag.message.contains("BaseClass")
+                }),
+            "unexpected undefined-global diagnostic for BaseClass: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
     fn test_ent_base_from_shared_file_sets_folder_class_super_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
