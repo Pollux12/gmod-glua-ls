@@ -445,6 +445,60 @@ mod test {
     }
 
     #[gtest]
+    fn test_branch_realm_ranges_persist_after_other_file_update() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let shared_file_id = ws.def_file(
+            "lua/autorun/sh_branch_scope.lua",
+            r#"
+            if SERVER then
+                function BranchServerOnly() return true end
+            end
+        "#,
+        );
+
+        let has_server_range_before = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&shared_file_id)
+            .map(|metadata| {
+                metadata
+                    .branch_realm_ranges
+                    .iter()
+                    .any(|r| r.realm == GmodRealm::Server)
+            })
+            .unwrap_or(false);
+        assert!(
+            has_server_range_before,
+            "Expected Server branch range before unrelated file updates"
+        );
+
+        ws.def_file(
+            "lua/autorun/client/cl_use_branch_scope.lua",
+            r#"
+            BranchServerOnly()
+        "#,
+        );
+
+        let has_server_range_after = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&shared_file_id)
+            .map(|metadata| {
+                metadata
+                    .branch_realm_ranges
+                    .iter()
+                    .any(|r| r.realm == GmodRealm::Server)
+            })
+            .unwrap_or(false);
+
+        assert!(
+            has_server_range_after,
+            "Expected Server branch range to persist after unrelated file updates"
+        );
+    }
+
+    #[gtest]
     fn test_branch_realm_narrowing_if_server_else_client() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

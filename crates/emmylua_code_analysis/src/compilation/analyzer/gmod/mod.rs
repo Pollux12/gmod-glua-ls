@@ -82,7 +82,7 @@ impl AnalysisPipeline for GmodAnalysisPipeline {
 
         synthesize_vgui_registrations(db, &file_ids);
 
-        rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms);
+        rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms, &file_ids);
     }
 }
 
@@ -2055,6 +2055,7 @@ fn rebuild_realm_metadata(
     db: &mut DbIndex,
     branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>>,
     annotation_realms: HashMap<FileId, GmodRealm>,
+    analyzed_file_ids: &[FileId],
 ) {
     let file_ids = db.get_vfs().get_all_local_file_ids();
     let default_realm = gmod_config_default_realm(db);
@@ -2064,15 +2065,49 @@ fn rebuild_realm_metadata(
         .detect_realm_from_filename
         .unwrap_or(true);
     let detect_calls = db.get_emmyrc().gmod.detect_realm_from_calls.unwrap_or(true);
+
+    let analyzed_file_ids: HashSet<FileId> = analyzed_file_ids.iter().copied().collect();
+    let previous_realm_metadata: HashMap<FileId, GmodRealmFileMetadata> = file_ids
+        .iter()
+        .filter_map(|file_id| {
+            db.get_gmod_infer_index()
+                .get_realm_file_metadata(file_id)
+                .cloned()
+                .map(|metadata| (*file_id, metadata))
+        })
+        .collect();
+
+    let resolve_branch_ranges = |file_id: &FileId| {
+        if let Some(ranges) = branch_realm_ranges.get(file_id) {
+            return ranges.clone();
+        }
+        if analyzed_file_ids.contains(file_id) {
+            return Vec::new();
+        }
+        previous_realm_metadata
+            .get(file_id)
+            .map(|metadata| metadata.branch_realm_ranges.clone())
+            .unwrap_or_default()
+    };
+
+    let resolve_annotation_realm = |file_id: &FileId| {
+        if let Some(realm) = annotation_realms.get(file_id) {
+            return Some(*realm);
+        }
+        if analyzed_file_ids.contains(file_id) {
+            return None;
+        }
+        previous_realm_metadata
+            .get(file_id)
+            .and_then(|metadata| metadata.annotation_realm)
+    };
+
     if !detect_filename && !detect_calls {
         let realm_metadata = file_ids
             .into_iter()
             .map(|file_id| {
-                let ranges = branch_realm_ranges
-                    .get(&file_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let annotation_realm = annotation_realms.get(&file_id).copied();
+                let ranges = resolve_branch_ranges(&file_id);
+                let annotation_realm = resolve_annotation_realm(&file_id);
                 let realm = annotation_realm.unwrap_or(default_realm);
                 (
                     file_id,
@@ -2210,12 +2245,9 @@ fn rebuild_realm_metadata(
             .collect::<Vec<_>>();
         hints.sort_by_key(|realm| realm_sort_key(*realm));
 
-        let ranges = branch_realm_ranges
-            .get(&file_id)
-            .cloned()
-            .unwrap_or_default();
+        let ranges = resolve_branch_ranges(&file_id);
 
-        let annotation_realm = annotation_realms.get(&file_id).copied();
+        let annotation_realm = resolve_annotation_realm(&file_id);
         let final_realm = annotation_realm.unwrap_or_else(|| {
             inferred_realms
                 .get(&file_id)
