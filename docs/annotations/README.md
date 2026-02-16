@@ -27,7 +27,7 @@ Type annotations for GLua development using EmmyLua/LuaCATS syntax.
 
 | Annotation | Description | Example |
 |------------|-------------|---------|
-| [@accessorfunc](./accessorfunc.md) | Accessor generator | `---@accessorfunc` |
+| [`@accessorfunc`](./accessorfunc.md) | Accessor generator | `---@accessorfunc` |
 | [`@realm`](./realm.md) | Declare realm | `---@realm server` |
 | [`@hook`](./hook.md) | Register hook | `---@hook PlayerSpawn` |
 

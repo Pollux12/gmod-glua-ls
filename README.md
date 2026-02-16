@@ -1,4 +1,4 @@
-# gmod-glua-ls
+# Garry's Mod GLua Language Server
 
 A fast, feature-rich language server for Garry's Mod Lua (GLua), written in Rust, based on [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust).
 
@@ -8,6 +8,8 @@ A fast, feature-rich language server for Garry's Mod Lua (GLua), written in Rust
 <!-- TODO: Add GIF showing autocomplete for GMod functions -->
 
 ## Features
+
+<!-- TODO: Add screenshots for each major feature -->
 
 **Realm Detection**
 
@@ -49,8 +51,6 @@ Includes everything you'd expect from a Language Server:
 - Code formatting
 
 See more at: [EmmyLua Feature List](https://github.com/EmmyLuaLs/emmylua-analyzer-rust/blob/main/docs/features/features_EN.md#-code-formatting)
-
-<!-- TODO: Add screenshot of inlay hints and diagnostics -->
 
 ## Installation
 

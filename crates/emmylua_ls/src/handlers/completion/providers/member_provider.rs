@@ -2,7 +2,7 @@ use emmylua_code_analysis::{
     DbIndex, FileId, GmodRealm, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId, LuaType,
     LuaTypeDeclId, SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
 };
-use emmylua_parser::{LuaAstNode, LuaAstToken, LuaIndexExpr, LuaStringToken};
+use emmylua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaStringToken};
 use rowan::TextSize;
 use std::collections::{HashMap, HashSet};
 
@@ -55,14 +55,18 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         return None;
     }
 
-    let mut member_info_map = builder.semantic_model.get_member_info_map(&prefix_type)?;
-    extend_gmod_hook_fallback_members(builder, &prefix_type, &mut member_info_map);
+    let mut member_info_map = builder
+        .semantic_model
+        .get_member_info_map(&prefix_type)
+        .unwrap_or_default();
+    extend_gmod_hook_fallback_members(builder, &prefix_expr, &prefix_type, &mut member_info_map);
 
     add_completions_for_members(builder, &member_info_map, completion_status)
 }
 
 fn extend_gmod_hook_fallback_members(
     builder: &CompletionBuilder,
+    prefix_expr: &LuaExpr,
     prefix_type: &LuaType,
     members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) {
@@ -70,11 +74,20 @@ fn extend_gmod_hook_fallback_members(
         return;
     }
 
-    let LuaType::Ref(owner_type_decl_id) = prefix_type else {
+    let owner_name = match prefix_type {
+        LuaType::Ref(owner_type_decl_id) => Some(owner_type_decl_id.get_simple_name().to_string()),
+        _ => match prefix_expr {
+            LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+            _ => None,
+        },
+    };
+
+    let Some(owner_name) = owner_name else {
         return;
     };
-    let fallback_owner_names = gmod_hook_owner_fallbacks(owner_type_decl_id.get_simple_name());
-    if fallback_owner_names.is_empty() {
+
+    let owner_candidates = gmod_hook_owner_candidates(owner_name.as_str());
+    if owner_candidates.is_empty() {
         return;
     }
 
@@ -86,9 +99,9 @@ fn extend_gmod_hook_fallback_members(
         }
     }
 
-    for fallback_owner_name in fallback_owner_names {
-        let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
-        let Some(fallback_map) = builder.semantic_model.get_member_info_map(&fallback_type) else {
+    for owner_candidate in owner_candidates {
+        let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_candidate));
+        let Some(fallback_map) = builder.semantic_model.get_member_info_map(&owner_type) else {
             continue;
         };
 
@@ -104,13 +117,13 @@ fn extend_gmod_hook_fallback_members(
     }
 }
 
-fn gmod_hook_owner_fallbacks(owner_name: &str) -> &'static [&'static str] {
+fn gmod_hook_owner_candidates(owner_name: &str) -> &'static [&'static str] {
     if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
-        &["SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
         &["GM", "GAMEMODE", "SANDBOX"]
+    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
+        &["PLUGIN", "GM", "GAMEMODE", "SANDBOX"]
     } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
-        &["GM", "GAMEMODE"]
+        &["SANDBOX", "GM", "GAMEMODE"]
     } else {
         &[]
     }

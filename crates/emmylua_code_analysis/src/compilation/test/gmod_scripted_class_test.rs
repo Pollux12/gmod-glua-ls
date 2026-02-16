@@ -675,12 +675,9 @@ mod test {
         ));
 
         assert!(
-            diagnostics
-                .iter()
-                .all(|diag| {
-                    diag.code != undefined_global_code
-                        || !diag.message.contains("BaseClass")
-                }),
+            diagnostics.iter().all(|diag| {
+                diag.code != undefined_global_code || !diag.message.contains("BaseClass")
+            }),
             "unexpected undefined-global diagnostic for BaseClass: {diagnostics:?}"
         );
     }

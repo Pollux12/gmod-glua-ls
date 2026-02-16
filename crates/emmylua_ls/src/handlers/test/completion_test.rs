@@ -2,8 +2,10 @@
 mod tests {
     use emmylua_code_analysis::{DocSyntax, Emmyrc, EmmyrcFilenameConvention};
     use googletest::prelude::*;
-    use lsp_types::{CompletionItemKind, CompletionTriggerKind};
+    use lsp_types::{CompletionItemKind, CompletionResponse, CompletionTriggerKind};
+    use tokio_util::sync::CancellationToken;
 
+    use crate::handlers::completion::completion;
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualCompletionItem, check};
 
     #[gtest]
@@ -2583,6 +2585,59 @@ mod tests {
                 label_detail: Some("()".to_string()),
             }],
         ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_plugin_function_decl_completion_uses_gm_fallback_with_param_detail() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            ---@class GM
+            ---@type GM
+            GM = GM or {}
+
+            function GM:ZzzPluginHook(player, entity) end
+
+            local PLUGIN = {}
+            function PLUGIN:<??>()
+            end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .into_iter()
+            .find(|it| it.label == "ZzzPluginHook")
+            .ok_or("missing ZzzPluginHook completion")
+            .or_fail()?;
+
+        verify_eq!(item.kind, Some(CompletionItemKind::FUNCTION))?;
+        let item_detail = item
+            .label_details
+            .as_ref()
+            .and_then(|details| details.detail.clone());
+        verify_eq!(item_detail, Some("(player, entity)".to_string()))?;
 
         Ok(())
     }

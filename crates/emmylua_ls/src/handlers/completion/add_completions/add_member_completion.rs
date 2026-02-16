@@ -281,8 +281,12 @@ fn resolve_function_params(
     if completion_item.insert_text.is_some() || completion_item.text_edit.is_some() {
         return None;
     }
-    let new_text = get_resolve_function_params_str(typ, call_display)?;
-    let index_expr = LuaIndexExpr::cast(builder.trigger_token.parent()?)?;
+    let new_text =
+        get_resolve_function_params_str(builder.semantic_model.get_db(), typ, call_display)?;
+    let index_expr = builder
+        .trigger_token
+        .parent_ancestors()
+        .find_map(LuaIndexExpr::cast)?;
     let func_stat = index_expr.get_parent::<LuaFuncStat>()?;
     // 从 ast 解析
     if func_stat.get_closure().is_some() {
@@ -318,30 +322,36 @@ fn resolve_function_params(
     Some(())
 }
 
-fn get_resolve_function_params_str(typ: &LuaType, display: CallDisplay) -> Option<String> {
-    match typ {
-        LuaType::DocFunction(f) => {
-            let mut params_str = f
-                .get_params()
-                .iter()
-                .map(|param| param.0.clone())
-                .collect::<Vec<_>>();
-
-            match display {
-                CallDisplay::AddSelf => {
-                    params_str.insert(0, "self".to_string());
-                }
-                CallDisplay::RemoveFirst => {
-                    if !params_str.is_empty() {
-                        params_str.remove(0);
-                    }
-                }
-                _ => {}
-            }
-            Some(params_str.join(", ").to_string())
+fn get_resolve_function_params_str(
+    db: &DbIndex,
+    typ: &LuaType,
+    display: CallDisplay,
+) -> Option<String> {
+    let mut params_str = match typ {
+        LuaType::DocFunction(f) => f
+            .get_params()
+            .iter()
+            .map(|param| param.0.clone())
+            .collect::<Vec<_>>(),
+        LuaType::Signature(signature_id) => {
+            db.get_signature_index().get(signature_id)?.params.clone()
         }
-        _ => None,
+        _ => return None,
+    };
+
+    match display {
+        CallDisplay::AddSelf => {
+            params_str.insert(0, "self".to_string());
+        }
+        CallDisplay::RemoveFirst => {
+            if !params_str.is_empty() {
+                params_str.remove(0);
+            }
+        }
+        _ => {}
     }
+
+    Some(params_str.join(", "))
 }
 
 fn try_add_alias_completion_item_new(
