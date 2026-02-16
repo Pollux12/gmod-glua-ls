@@ -122,7 +122,7 @@ mod tests {
                 local <??>event = test3.event
             "#,
             VirtualHoverResult {
-                value: "```lua\n(method) Test3:event(event: \"B\", key: string)\n```\n\n&nbsp;&nbsp;in class `Hover.Test3`\n\n---\n\n---\n\n```lua\n(method) Test3:event(event: \"A\", key: string)\n```".to_string(),
+                value: "```lua\n(method) Test3:event(event: \"B\", key: string)\n```\n\n```lua\n(method) Test3:event(event: \"A\", key: string)\n```\n\n&nbsp;&nbsp;in class `Hover.Test3`".to_string(),
             },
         ));
         Ok(())
@@ -152,7 +152,7 @@ mod tests {
                 ---@field event fun(self: self, event: "游戏-逻辑不同步"): Trigger
             "#,
             VirtualHoverResult {
-                value: "```lua\n(method) GameA:event(event_type: EventTypeA, ...: any) -> Trigger\n```\n\n---\n\n注册引擎事件\n\n---\n\n```lua\n(method) GameA:event(event: \"游戏-初始化\") -> Trigger\n```\n\n```lua\n(method) GameA:event(event: \"游戏-追帧完成\") -> Trigger\n```\n\n```lua\n(method) GameA:event(event: \"游戏-逻辑不同步\") -> Trigger\n```".to_string(),
+                value: "```lua\n(method) GameA:event(event_type: EventTypeA, ...: any) -> Trigger\n```\n\n```lua\n(method) GameA:event(event: \"游戏-初始化\") -> Trigger\n```\n\n```lua\n(method) GameA:event(event: \"游戏-追帧完成\") -> Trigger\n```\n\n```lua\n(method) GameA:event(event: \"游戏-逻辑不同步\") -> Trigger\n```\n\n---\n\n注册引擎事件".to_string(),
             },
         ));
         Ok(())
@@ -257,7 +257,7 @@ mod tests {
                 }
             "#,
             VirtualHoverResult {
-                value: "```lua\n(field) T.func(a: (string|number))\n```\n\n---\n\n注释1\n\n注释2\n\n---\n\n```lua\n(field) T.func(a: string)\n```\n\n```lua\n(field) T.func(a: number)\n```"
+                value: "```lua\n(field) T.func(a: (string|number))\n```\n\n```lua\n(field) T.func(a: string)\n```\n\n```lua\n(field) T.func(a: number)\n```\n\n---\n\n注释1\n\n注释2"
                     .to_string(),
             },
         ));
@@ -305,7 +305,7 @@ mod tests {
                 local ab<??>c = t.func
             "#,
             VirtualHoverResult {
-                value: "```lua\n(field) T.func(a: number)\n```\n\n---\n\n注释2\n\n注释1\n\n---\n\n```lua\n(field) T.func(a: string)\n```".to_string(),
+                value: "```lua\n(field) T.func(a: number)\n```\n\n```lua\n(field) T.func(a: string)\n```\n\n---\n\n注释2\n\n注释1".to_string(),
             },
         ));
         Ok(())
@@ -708,7 +708,7 @@ mod tests {
                 end
             "#,
             VirtualHoverResult {
-                value: "```lua\n(method) MyEntity:Touch(other: Entity)\n```\n\n---\n\nCalled when touched by another entity.\n\n@*param* `other` — The touching entity.\n\n---\n\n```lua\n(method) Entity:Touch(other: Entity)\n```"
+                value: "```lua\n(method) MyEntity:Touch(other: Entity)\n```\n\n```lua\n(method) Entity:Touch(other: Entity)\n```\n\n---\n\nCalled when touched by another entity.\n\n@*param* `other` — The touching entity."
                     .to_string(),
             },
         ));

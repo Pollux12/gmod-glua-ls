@@ -234,32 +234,37 @@ impl<'a> HoverBuilder<'a> {
                 }
             });
 
-        let header = {
-            let mut header = String::new();
-            match &self.primary {
-                MarkedString::String(s) => {
-                    header.push_str(&format!("\n{}\n", s));
-                }
-                MarkedString::LanguageString(s) => {
-                    header.push_str(&format!("\n```{}\n{}\n```\n", s.language, s.value));
+        let definitions_content = {
+            let mut content = vec![marked_string_to_markdown(&self.primary)];
+
+            if let Some(signature_overload) = &self.signature_overload {
+                for signature in signature_overload {
+                    content.push(marked_string_to_markdown(signature));
                 }
             }
 
             if let Some(location_path) = &self.location_path
                 && let MarkedString::String(s) = location_path
             {
-                header.push_str(&format!("\n{}\n", s));
+                let location = s.trim();
+                if !location.is_empty() {
+                    content.push(location.to_string());
+                }
             }
 
-            header
+            content
+                .into_iter()
+                .filter(|block| !block.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
         };
 
         let description_content = {
-            let mut content = String::new();
+            let mut content = Vec::new();
 
             if let Some(realm_badge) = realm_badge {
                 let realm_label = realm_badge_label(realm_badge);
-                content.push_str(&format!("\n{} **{}**\n", realm_badge, realm_label));
+                content.push(format!("{} **{}**", realm_badge, realm_label));
             }
 
             for marked_string in &self.annotation_description {
@@ -269,58 +274,59 @@ impl<'a> HoverBuilder<'a> {
                         if sanitized_description.is_empty() {
                             continue;
                         }
-                        content.push_str(&format!("\n{}\n", sanitized_description));
+                        content.push(sanitized_description);
                     }
                     MarkedString::LanguageString(s) => {
-                        content.push_str(&format!("\n```{}\n{}\n```\n", s.language, s.value));
+                        content.push(format!("```{}\n{}\n```", s.language, s.value));
                     }
                 }
             }
+
+            content.join("\n\n")
+        };
+
+        let tag_content = {
+            let mut tags = Vec::new();
 
             if let Some(tag_content) = &self.tag_content {
-                if !tag_content.is_empty() {
-                    content.push_str("\n---\n");
-                }
                 for (tag_name, description) in tag_content {
-                    content.push_str(&format!("\n@*{}* {}\n", tag_name, description));
+                    tags.push(format!("@*{}* {}", tag_name, description));
                 }
             }
 
-            content
+            tags.join("\n\n")
         };
 
-        let expansion = {
-            let mut expansion = String::new();
-            if let Some(signature_overload) = &self.signature_overload {
-                expansion.push_str("\n---\n");
-                for signature in signature_overload {
-                    match signature {
-                        MarkedString::String(s) => {
-                            expansion.push_str(&format!("\n{}\n", s));
-                        }
-                        MarkedString::LanguageString(s) => {
-                            expansion.push_str(&format!("\n```{}\n{}\n```\n", s.language, s.value));
-                        }
-                    }
-                }
-            }
-
+        let expansion_content = {
+            let mut expansion = Vec::new();
             if let Some(type_expansion) = &self.type_expansion {
                 for type_expansion in type_expansion {
-                    expansion.push_str(&format!("\n```{}\n{}\n```\n", "lua", type_expansion));
+                    expansion.push(format!("```{}\n{}\n```", "lua", type_expansion));
                 }
             }
-            expansion
+
+            expansion.join("\n\n")
         };
 
-        let mut result = String::new();
-
-        result.push_str(&header);
-        if !description_content.is_empty() || !expansion.is_empty() {
-            result.push_str("\n---\n");
+        let mut sections = Vec::new();
+        if !definitions_content.is_empty() {
+            sections.push(definitions_content);
         }
-        result.push_str(&description_content);
-        result.push_str(&expansion);
+        if !description_content.is_empty() {
+            sections.push(description_content);
+        }
+        if !tag_content.is_empty() {
+            sections.push(tag_content);
+        }
+        if !expansion_content.is_empty() {
+            sections.push(expansion_content);
+        }
+
+        if sections.is_empty() {
+            return None;
+        }
+
+        let mut result = sections.join("\n\n---\n\n");
 
         // 清除空白字符
         result = result.trim().to_string();
@@ -346,6 +352,13 @@ impl<'a> HoverBuilder<'a> {
             return LuaCallExpr::cast(call_expr);
         }
         None
+    }
+}
+
+fn marked_string_to_markdown(marked_string: &MarkedString) -> String {
+    match marked_string {
+        MarkedString::String(s) => s.clone(),
+        MarkedString::LanguageString(s) => format!("```{}\n{}\n```", s.language, s.value),
     }
 }
 
