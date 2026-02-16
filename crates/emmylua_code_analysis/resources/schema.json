@@ -78,6 +78,7 @@
           "methodPrefixes": [],
           "methodToHook": {}
         },
+        "inferDynamicFields": true,
         "scriptedClassScopes": {
           "exclude": [],
           "include": [
@@ -860,7 +861,6 @@
           }
         },
         "inferDynamicFields": {
-          "description": "When enabled, fields dynamically set on typed objects (e.g., Player, Entity) are tracked and won't trigger 'undefined field' warnings. Standard practice in Garry's Mod.",
           "type": "boolean",
           "default": true
         },
@@ -1018,7 +1018,6 @@
       }
     },
     "EmmyrcLuaVersion": {
-      "description": "Deprecated: This GMod language server always uses LuaJIT. All values are accepted for compatibility but have no effect.",
       "oneOf": [
         {
           "description": "Lua 5.1",
@@ -1202,7 +1201,7 @@
           "default": {}
         },
         "version": {
-          "description": "Deprecated: This GMod language server always uses LuaJIT. This option is accepted for compatibility but has no effect.",
+          "description": "Deprecated: GMod-only server always uses LuaJIT. Kept for config compatibility.",
           "$ref": "#/$defs/EmmyrcLuaVersion",
           "default": "LuaJIT"
         }
