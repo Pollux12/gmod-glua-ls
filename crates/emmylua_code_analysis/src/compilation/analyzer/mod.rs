@@ -187,7 +187,9 @@ fn module_analyze(
     for (workspace_id, tree_list) in file_tree_map {
         let mut context = AnalyzeContext::new(config.clone());
         context.tree_list = tree_list;
-        if workspace_id.is_library() || workspace_id.is_remote() {
+        if db.get_module_index().is_library_workspace_id(workspace_id)
+            || db.get_module_index().is_remote_workspace_id(workspace_id)
+        {
             contexts.push((workspace_id, context));
         } else {
             main_vec.push((workspace_id, context));

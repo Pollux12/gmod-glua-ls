@@ -344,7 +344,10 @@ pub fn analyze_overload(analyzer: &mut DocAnalyzer, tag: LuaDocTagOverload) -> O
 
 pub fn analyze_module(analyzer: &mut DocAnalyzer, tag: LuaDocTagModule) -> Option<()> {
     let module_path = tag.get_module_path()?;
-    let module_info = analyzer.db.get_module_index().find_module(&module_path)?;
+    let module_info = analyzer
+        .db
+        .get_module_index()
+        .find_module_for_file(&module_path, analyzer.file_id)?;
     let module_file_id = module_info.file_id;
     let owner_id = get_owner_id_or_report(analyzer, &tag)?;
     let module_ref = LuaType::ModuleRef(module_file_id);
@@ -497,7 +500,12 @@ fn parse_accessorfunc_param_index(description: &str) -> usize {
 }
 
 pub fn analyze_doc_tag_schema(analyzer: &mut DocAnalyzer, tag: LuaDocTagSchema) -> Option<()> {
-    if analyzer.is_meta || !analyzer.workspace_id.is_main() {
+    if analyzer.is_meta
+        || !analyzer
+            .db
+            .get_module_index()
+            .is_main_workspace_id(analyzer.workspace_id)
+    {
         return Some(());
     }
 

@@ -115,7 +115,9 @@ fn infer_name_expr_semantic_decl(
                 let tree = db.get_vfs().get_syntax_tree(&file_id)?;
                 let call_expr = LuaCallExpr::cast(value_expr_id.to_node(tree)?)?;
                 if call_expr.is_require() {
-                    if let Some(semantic_id) = infer_require_module_semantic_decl(db, call_expr) {
+                    if let Some(semantic_id) =
+                        infer_require_module_semantic_decl(db, cache, call_expr)
+                    {
                         return Some(semantic_id);
                     }
                 }
@@ -129,6 +131,7 @@ fn infer_name_expr_semantic_decl(
 
 fn infer_require_module_semantic_decl(
     db: &DbIndex,
+    cache: &LuaInferCache,
     call_expr: LuaCallExpr,
 ) -> Option<LuaSemanticDeclId> {
     let first_arg = call_expr.get_args_list()?.get_args().next()?;
@@ -146,7 +149,9 @@ fn infer_require_module_semantic_decl(
         _ => return None,
     };
 
-    let module_info = db.get_module_index().find_module(&module_path)?;
+    let module_info = db
+        .get_module_index()
+        .find_module_for_file(&module_path, cache.get_file_id())?;
     module_info.semantic_id.clone()
 }
 

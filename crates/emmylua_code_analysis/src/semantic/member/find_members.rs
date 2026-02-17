@@ -5,7 +5,7 @@ use smol_str::SmolStr;
 use crate::{
     DbIndex, FileId, InferGuardRef, LuaGenericType, LuaInstanceType, LuaIntersectionType,
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
-    LuaTypeDeclId, LuaUnionType,
+    LuaTypeDeclId, LuaUnionType, WorkspaceId,
     semantic::{
         InferGuard,
         generic::{TypeSubstitutor, instantiate_type_generic},
@@ -34,6 +34,15 @@ pub fn find_members(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
     find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::All)
 }
 
+pub fn find_members_in_workspace(
+    db: &DbIndex,
+    prefix_type: &LuaType,
+    workspace_id: WorkspaceId,
+) -> FindMembersResult {
+    let ctx = FindMembersContext::new_with_workspace(InferGuard::new(), workspace_id);
+    find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::All)
+}
+
 pub fn find_members_with_key(
     db: &DbIndex,
     prefix_type: &LuaType,
@@ -52,10 +61,30 @@ pub fn find_members_with_key(
     )
 }
 
+pub fn find_members_with_key_in_workspace(
+    db: &DbIndex,
+    prefix_type: &LuaType,
+    member_key: LuaMemberKey,
+    find_all: bool,
+    workspace_id: WorkspaceId,
+) -> FindMembersResult {
+    let ctx = FindMembersContext::new_with_workspace(InferGuard::new(), workspace_id);
+    find_members_guard(
+        db,
+        prefix_type,
+        &ctx,
+        &FindMemberFilter::ByKey {
+            member_key,
+            find_all,
+        },
+    )
+}
+
 #[derive(Clone)]
 struct FindMembersContext {
     infer_guard: InferGuardRef,
     substitutor: Option<TypeSubstitutor>,
+    workspace_id: Option<WorkspaceId>,
 }
 
 impl FindMembersContext {
@@ -63,12 +92,23 @@ impl FindMembersContext {
         Self {
             infer_guard,
             substitutor: None,
+            workspace_id: None,
         }
     }
+
+    fn new_with_workspace(infer_guard: InferGuardRef, workspace_id: WorkspaceId) -> Self {
+        Self {
+            infer_guard,
+            substitutor: None,
+            workspace_id: Some(workspace_id),
+        }
+    }
+
     fn with_substitutor(&self, substitutor: TypeSubstitutor) -> Self {
         Self {
             infer_guard: self.infer_guard.clone(),
             substitutor: Some(substitutor),
+            workspace_id: self.workspace_id,
         }
     }
 
@@ -76,6 +116,7 @@ impl FindMembersContext {
         Self {
             infer_guard: self.infer_guard.fork(),
             substitutor: self.substitutor.clone(),
+            workspace_id: self.workspace_id,
         }
     }
 
@@ -482,6 +523,20 @@ fn find_global_members(
     let mut members = Vec::new();
     let global_decls = db.get_global_index().get_all_global_decl_ids();
     for decl_id in global_decls {
+        if let Some(current_workspace_id) = ctx.workspace_id {
+            let candidate_workspace_id = db
+                .get_module_index()
+                .get_workspace_id(decl_id.file_id)
+                .unwrap_or(WorkspaceId::MAIN);
+            if db
+                .get_module_index()
+                .workspace_resolution_priority(current_workspace_id, candidate_workspace_id)
+                .is_none()
+            {
+                continue;
+            }
+        }
+
         if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
             let member_key = LuaMemberKey::Name(decl.get_name().to_string().into());
 

@@ -13,10 +13,33 @@ pub fn resolve_global_decl_id(
     name: &str,
     name_expr: Option<&LuaNameExpr>,
 ) -> Option<LuaDeclId> {
-    let decl_ids = db.get_global_index().get_global_decl_ids(name)?;
-    let mut candidate_decl_ids = select_realm_compatible_decl_ids(db, cache, decl_ids, name_expr);
-    if candidate_decl_ids.is_empty() {
+    let module_index = db.get_module_index();
+    let global_index = db.get_global_index();
+    let priority_tiers = if let Some(current_workspace_id) =
+        module_index.get_workspace_id(cache.get_file_id())
+    {
+        global_index.get_global_decl_id_priority_tiers(name, module_index, current_workspace_id)?
+    } else {
+        vec![(0, global_index.get_global_decl_ids(name)?.clone())]
+    };
+
+    let mut candidate_decl_ids = Vec::new();
+    for (_, tier_decl_ids) in &priority_tiers {
+        let tier_candidates = select_realm_compatible_decl_ids(db, cache, tier_decl_ids, name_expr);
+        if !tier_candidates.is_empty() {
+            candidate_decl_ids = tier_candidates;
+            break;
+        }
+    }
+
+    if candidate_decl_ids.is_empty()
+        && let Some((_, decl_ids)) = priority_tiers.first()
+    {
         candidate_decl_ids = decl_ids.clone();
+    }
+
+    if candidate_decl_ids.is_empty() {
+        return None;
     }
 
     if candidate_decl_ids.len() == 1 {

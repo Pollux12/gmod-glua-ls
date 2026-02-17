@@ -33,6 +33,7 @@ use resources::load_resource_std;
 use schema_to_emmylua::SchemaConverter;
 pub use semantic::*;
 use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 pub use test_lib::VirtualWorkspace;
@@ -71,7 +72,7 @@ impl EmmyLuaAnalysis {
         self.compilation
             .get_db_mut()
             .get_module_index_mut()
-            .add_workspace_root(std_root, WorkspaceId::STD);
+            .add_workspace_root_with_kind(std_root, WorkspaceId::STD, WorkspaceKind::Std);
 
         let files = files
             .into_iter()
@@ -95,10 +96,11 @@ impl EmmyLuaAnalysis {
     }
 
     pub fn add_main_workspace(&mut self, root: PathBuf) {
-        self.compilation
-            .get_db_mut()
-            .get_module_index_mut()
-            .add_workspace_root(root, WorkspaceId::MAIN);
+        let module_index = self.compilation.get_db_mut().get_module_index_mut();
+        let id = WorkspaceId {
+            id: module_index.next_main_workspace_id(),
+        };
+        module_index.add_workspace_root_with_kind(root, id, WorkspaceKind::Main);
     }
 
     pub fn add_library_workspace(&mut self, root: PathBuf) {
@@ -106,7 +108,7 @@ impl EmmyLuaAnalysis {
         let id = WorkspaceId {
             id: module_index.next_library_workspace_id(),
         };
-        module_index.add_workspace_root(root, id);
+        module_index.add_workspace_root_with_kind(root, id, WorkspaceKind::Library);
     }
 
     pub fn update_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> Option<FileId> {
@@ -283,6 +285,20 @@ impl EmmyLuaAnalysis {
         self.emmyrc = config.clone();
         self.compilation.update_config(config.clone());
         self.diagnostic.update_config(config);
+    }
+
+    pub fn set_workspace_diagnostic_configs(
+        &mut self,
+        configs: HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
+    ) {
+        self.diagnostic.set_workspace_configs(configs);
+    }
+
+    pub fn get_workspace_id_for_root(&self, root: &Path) -> Option<WorkspaceId> {
+        self.compilation
+            .get_db()
+            .get_module_index()
+            .get_workspace_id_for_root(root)
     }
 
     pub fn get_emmyrc(&self) -> Arc<Emmyrc> {

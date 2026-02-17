@@ -1,14 +1,23 @@
 use std::{fmt, path::PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkspaceKind {
+    Std,
+    Main,
+    Remote,
+    Library,
+}
+
 #[derive(Debug)]
 pub struct Workspace {
     pub root: PathBuf,
     pub id: WorkspaceId,
+    pub kind: WorkspaceKind,
 }
 
 impl Workspace {
-    pub fn new(root: PathBuf, id: WorkspaceId) -> Self {
-        Self { root, id }
+    pub fn new(root: PathBuf, id: WorkspaceId, kind: WorkspaceKind) -> Self {
+        Self { root, id, kind }
     }
 }
 

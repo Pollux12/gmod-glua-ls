@@ -403,12 +403,12 @@ fn resolve_dependency_file_id(
     let module_index = analyzer.db.get_module_index();
     match dependency_kind {
         LuaDependencyKind::Require => module_index
-            .find_module(dependency_path)
+            .find_module_for_file(dependency_path, file_id)
             .map(|it| it.file_id),
         LuaDependencyKind::Include | LuaDependencyKind::AddCSLuaFile => {
             resolve_gmod_include_file_id(analyzer, file_id, dependency_path).or_else(|| {
                 module_index
-                    .find_module(dependency_path)
+                    .find_module_for_file(dependency_path, file_id)
                     .map(|it| it.file_id)
             })
         }
@@ -428,13 +428,13 @@ fn resolve_gmod_include_file_id(
 
     let module_index = analyzer.db.get_module_index();
     let root_module_path = normalized_no_ext.replace('/', ".");
-    if let Some(module_info) = module_index.find_module(&root_module_path) {
+    if let Some(module_info) = module_index.find_module_for_file(&root_module_path, file_id) {
         return Some(module_info.file_id);
     }
 
     if let Some(path_without_lua_prefix) = normalized_no_ext.strip_prefix("lua/") {
         let module_path = path_without_lua_prefix.replace('/', ".");
-        if let Some(module_info) = module_index.find_module(&module_path) {
+        if let Some(module_info) = module_index.find_module_for_file(&module_path, file_id) {
             return Some(module_info.file_id);
         }
     }
@@ -443,6 +443,6 @@ fn resolve_gmod_include_file_id(
     let parent_dir = current_file_path.parent()?;
     let include_file_path = parent_dir.join(Path::new(normalized_path));
     module_index
-        .find_module_by_path(&include_file_path)
+        .find_module_by_path_for_file(&include_file_path, file_id)
         .map(|it| it.file_id)
 }

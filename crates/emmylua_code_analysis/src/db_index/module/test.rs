@@ -4,7 +4,7 @@ mod tests {
 
     use crate::{
         FileId, WorkspaceId,
-        db_index::{module::LuaModuleIndex, traits::LuaIndex},
+        db_index::{WorkspaceKind, module::LuaModuleIndex, traits::LuaIndex},
     };
 
     fn create_module() -> LuaModuleIndex {
@@ -187,5 +187,69 @@ mod tests {
         assert!(module_info.is_none());
         let module_node = m.find_module_node("test2.aaa");
         assert!(module_node.is_none());
+    }
+
+    #[test]
+    fn test_find_module_in_workspace_isolates_main_roots() {
+        let mut m = create_module();
+        let workspace_a = WorkspaceId::MAIN;
+        let workspace_b = WorkspaceId { id: 3 };
+
+        m.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectA").into(),
+            workspace_a,
+            WorkspaceKind::Main,
+        );
+        m.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectB").into(),
+            workspace_b,
+            WorkspaceKind::Main,
+        );
+
+        let file_a = FileId { id: 10 };
+        m.add_module_by_path(file_a, "C:/Users/username/ProjectA/shared.lua");
+
+        let file_b = FileId { id: 11 };
+        m.add_module_by_path(file_b, "C:/Users/username/ProjectB/shared.lua");
+
+        let only_b = FileId { id: 12 };
+        m.add_module_by_path(only_b, "C:/Users/username/ProjectB/only_b.lua");
+
+        let shared_a = m.find_module_in_workspace("shared", workspace_a).unwrap();
+        assert_eq!(shared_a.file_id, file_a);
+
+        let shared_b = m.find_module_in_workspace("shared", workspace_b).unwrap();
+        assert_eq!(shared_b.file_id, file_b);
+
+        let hidden_from_a = m.find_module_in_workspace("only_b", workspace_a);
+        assert!(hidden_from_a.is_none());
+
+        let visible_from_b = m.find_module_in_workspace("only_b", workspace_b).unwrap();
+        assert_eq!(visible_from_b.file_id, only_b);
+    }
+
+    #[test]
+    fn test_extract_module_path_with_mixed_separators_prefers_library_workspace() {
+        let mut m = create_module();
+        let workspace_main = WorkspaceId::MAIN;
+        let workspace_lib = WorkspaceId { id: 3 };
+
+        m.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/Project").into(),
+            workspace_main,
+            WorkspaceKind::Main,
+        );
+        m.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/Project/lua/lib").into(),
+            workspace_lib,
+            WorkspaceKind::Library,
+        );
+
+        let file_id = FileId { id: 50 };
+        m.add_module_by_path(file_id, "C:\\Users\\username\\Project\\lua\\lib\\globals.lua");
+
+        let module_info = m.get_module(file_id).unwrap();
+        assert_eq!(module_info.workspace_id, workspace_lib);
+        assert_eq!(module_info.name, "globals");
     }
 }

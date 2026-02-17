@@ -40,7 +40,7 @@ fn check_require_call_expr(
     let module_info = semantic_model
         .get_db()
         .get_module_index()
-        .find_module(&module_path)?;
+        .find_module_for_file(&module_path, semantic_model.get_file_id())?;
 
     // 检查可见性
     if !check_export_visibility(semantic_model, module_info).unwrap_or(false) {

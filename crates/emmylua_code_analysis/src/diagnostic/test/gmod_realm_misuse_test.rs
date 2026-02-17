@@ -383,6 +383,65 @@ mod tests {
     }
 
     #[gtest]
+    fn test_client_global_call_falls_back_to_library_shared_decl_when_main_is_server_only() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMisuse);
+
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+
+        ws.def_file(
+            "library/sh_shared_color.lua",
+            r#"
+                function Color(r, g, b, a)
+                    return r
+                end
+            "#,
+        );
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_override.lua",
+            r#"
+                if SERVER then
+                    function Color(r, g, b, a)
+                        if not r or not g or not b then
+                            return nil
+                        end
+
+                        return r
+                    end
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/cl_use_color.lua",
+            r#"
+                local c = Color(255, 255, 255, 255)
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let strict_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == strict_code)
+        );
+    }
+
+    #[gtest]
     fn test_disabled_when_gmod_off_even_if_diagnostic_enabled() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

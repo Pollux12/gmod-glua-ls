@@ -132,6 +132,11 @@ impl<'a> SemanticModel<'a> {
     }
 
     pub fn get_member_infos(&self, prefix_type: &LuaType) -> Option<Vec<LuaMemberInfo>> {
+        let module_index = self.db.get_module_index();
+        if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
+            return member::find_members_in_workspace(self.db, prefix_type, workspace_id);
+        }
+
         find_members(self.db, prefix_type)
     }
 
@@ -141,6 +146,17 @@ impl<'a> SemanticModel<'a> {
         member_key: LuaMemberKey,
         find_all: bool,
     ) -> Option<Vec<LuaMemberInfo>> {
+        let module_index = self.db.get_module_index();
+        if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
+            return member::find_members_with_key_in_workspace(
+                self.db,
+                prefix_type,
+                member_key,
+                find_all,
+                workspace_id,
+            );
+        }
+
         find_members_with_key(self.db, prefix_type, member_key, find_all)
     }
 
@@ -148,6 +164,11 @@ impl<'a> SemanticModel<'a> {
         &self,
         prefix_type: &LuaType,
     ) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+        let module_index = self.db.get_module_index();
+        if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
+            return member::get_member_map_in_workspace(self.db, prefix_type, workspace_id);
+        }
+
         get_member_map(self.db, prefix_type)
     }
 

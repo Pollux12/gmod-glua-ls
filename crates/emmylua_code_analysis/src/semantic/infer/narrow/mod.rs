@@ -45,7 +45,7 @@ fn get_var_ref_type(db: &DbIndex, cache: &mut LuaInferCache, var_ref_id: &VarRef
 
         if decl.is_global() {
             let name = decl.get_name();
-            return infer_global_type(db, name);
+            return infer_global_type(db, Some(cache.get_file_id()), None, name);
         }
 
         if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {

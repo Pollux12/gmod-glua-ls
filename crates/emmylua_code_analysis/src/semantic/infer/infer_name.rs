@@ -1,12 +1,13 @@
 use std::path::Path;
 
 use emmylua_parser::{LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr, LuaVarExpr};
+use rowan::TextSize;
 use wax::Pattern;
 
 use super::{InferFailReason, InferResult};
 use crate::{
-    FileId, LuaDecl, LuaDeclExtra, LuaInferCache, LuaMemberId, LuaSemanticDeclId, LuaType,
-    LuaTypeDeclId, SemanticDeclLevel, TypeOps,
+    FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId,
+    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, TypeOps,
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
     semantic::{
@@ -51,7 +52,7 @@ pub fn infer_name_expr(
             return Ok(scoped_type);
         }
 
-        infer_global_type(db, name)
+        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
     }
 }
 
@@ -628,11 +629,36 @@ fn find_param_type_from_union(
     }
 }
 
-pub fn infer_global_type(db: &DbIndex, name: &str) -> InferResult {
-    let decl_ids = db
-        .get_global_index()
-        .get_global_decl_ids(name)
-        .ok_or(InferFailReason::None)?;
+pub fn infer_global_type(
+    db: &DbIndex,
+    current_file_id: Option<FileId>,
+    call_offset: Option<TextSize>,
+    name: &str,
+) -> InferResult {
+    let module_index = db.get_module_index();
+    let global_index = db.get_global_index();
+    let priority_tiers = if let Some(current_workspace_id) =
+        current_file_id.and_then(|file_id| module_index.get_workspace_id(file_id))
+    {
+        global_index
+            .get_global_decl_id_priority_tiers(name, module_index, current_workspace_id)
+            .ok_or(InferFailReason::None)?
+    } else {
+        vec![(
+            0,
+            global_index
+                .get_global_decl_ids(name)
+                .cloned()
+                .ok_or(InferFailReason::None)?,
+        )]
+    };
+
+    let decl_ids =
+        select_decl_ids_for_global_infer(db, current_file_id, call_offset, &priority_tiers);
+    if decl_ids.is_empty() {
+        return Err(InferFailReason::None);
+    }
+
     if decl_ids.len() == 1 {
         let id = decl_ids[0];
         let typ = match db.get_type_index().get_type_cache(&id.into()) {
@@ -649,7 +675,7 @@ pub fn infer_global_type(db: &DbIndex, name: &str) -> InferResult {
         };
     }
 
-    let mut sorted_decl_ids = decl_ids.to_vec();
+    let mut sorted_decl_ids = decl_ids;
     sorted_decl_ids.sort_by(|a, b| {
         let a_is_std = db.get_module_index().is_std(&a.file_id);
         let b_is_std = db.get_module_index().is_std(&b.file_id);
@@ -695,6 +721,50 @@ pub fn infer_global_type(db: &DbIndex, name: &str) -> InferResult {
     }
 
     Err(last_resolve_reason)
+}
+
+fn select_decl_ids_for_global_infer(
+    db: &DbIndex,
+    current_file_id: Option<FileId>,
+    call_offset: Option<TextSize>,
+    priority_tiers: &[(u8, Vec<LuaDeclId>)],
+) -> Vec<LuaDeclId> {
+    let Some((_, best_tier_decl_ids)) = priority_tiers.first() else {
+        return Vec::new();
+    };
+
+    if !db.get_emmyrc().gmod.enabled {
+        return best_tier_decl_ids.clone();
+    }
+
+    let (Some(file_id), Some(call_offset)) = (current_file_id, call_offset) else {
+        return best_tier_decl_ids.clone();
+    };
+
+    let infer_index = db.get_gmod_infer_index();
+    let call_realm = infer_index.get_realm_at_offset(&file_id, call_offset);
+    for (_, decl_ids) in priority_tiers {
+        let mut compatible_decl_ids = Vec::new();
+        for decl_id in decl_ids {
+            let decl_realm = infer_index.get_realm_at_offset(&decl_id.file_id, decl_id.position);
+            if is_realm_compatible(call_realm, decl_realm) {
+                compatible_decl_ids.push(*decl_id);
+            }
+        }
+
+        if !compatible_decl_ids.is_empty() {
+            return compatible_decl_ids;
+        }
+    }
+
+    best_tier_decl_ids.clone()
+}
+
+fn is_realm_compatible(call_realm: GmodRealm, decl_realm: GmodRealm) -> bool {
+    !matches!(
+        (call_realm, decl_realm),
+        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
+    )
 }
 
 pub fn find_self_decl_or_member_id(

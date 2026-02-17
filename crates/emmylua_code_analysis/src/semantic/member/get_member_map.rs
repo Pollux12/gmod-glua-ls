@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{DbIndex, LuaMemberKey, LuaType};
+use crate::{DbIndex, LuaMemberKey, LuaType, WorkspaceId};
 
 use super::{
     LuaMemberInfo,
@@ -12,7 +12,21 @@ pub fn get_member_map(
     prefix_type: &LuaType,
 ) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
     let members = find_members::find_members(db, prefix_type)?;
+    build_member_map(members)
+}
 
+pub fn get_member_map_in_workspace(
+    db: &DbIndex,
+    prefix_type: &LuaType,
+    workspace_id: WorkspaceId,
+) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+    let members = find_members::find_members_in_workspace(db, prefix_type, workspace_id)?;
+    build_member_map(members)
+}
+
+fn build_member_map(
+    members: Vec<LuaMemberInfo>,
+) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
     let mut member_map = HashMap::new();
     for member in members {
         let key = member.key.clone();

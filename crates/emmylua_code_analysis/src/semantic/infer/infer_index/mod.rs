@@ -3,7 +3,7 @@ mod infer_array;
 use std::collections::HashSet;
 
 use emmylua_parser::{
-    LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, NumberResult, PathTrait,
+    LuaAstNode, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, NumberResult, PathTrait,
 };
 use internment::ArcIntern;
 use rowan::TextRange;
@@ -1104,7 +1104,7 @@ fn infer_member_by_index_table_generic(
 
 fn infer_global_field_member(
     db: &DbIndex,
-    _: &LuaInferCache,
+    cache: &LuaInferCache,
     index_expr: LuaIndexMemberExpr,
 ) -> InferResult {
     let member_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
@@ -1112,7 +1112,12 @@ fn infer_global_field_member(
         .get_name()
         .ok_or(InferFailReason::None)?
         .get_name_text();
-    infer_global_type(db, name)
+    infer_global_type(
+        db,
+        Some(cache.get_file_id()),
+        Some(index_expr.get_position()),
+        name,
+    )
 }
 
 fn infer_namespace_member(

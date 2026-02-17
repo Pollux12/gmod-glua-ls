@@ -8,7 +8,7 @@ use log::{error, info};
 pub use module_info::ModuleInfo;
 pub use module_node::{ModuleNode, ModuleNodeId};
 use regex::Regex;
-pub use workspace::{Workspace, WorkspaceId};
+pub use workspace::{Workspace, WorkspaceId, WorkspaceKind};
 
 use super::traits::LuaIndex;
 use crate::{Emmyrc, FileId};
@@ -26,6 +26,7 @@ pub struct LuaModuleIndex {
     file_module_map: HashMap<FileId, ModuleInfo>,
     module_name_to_file_ids: HashMap<String, Vec<FileId>>,
     workspaces: Vec<Workspace>,
+    workspace_kind_map: HashMap<WorkspaceId, WorkspaceKind>,
     id_counter: u32,
     fuzzy_search: bool,
     module_replace_vec: Vec<(Regex, String)>,
@@ -46,6 +47,7 @@ impl LuaModuleIndex {
             file_module_map: HashMap::new(),
             module_name_to_file_ids: HashMap::new(),
             workspaces: Vec::new(),
+            workspace_kind_map: HashMap::new(),
             id_counter: 1,
             fuzzy_search: false,
             module_replace_vec: Vec::new(),
@@ -238,10 +240,64 @@ impl LuaModuleIndex {
         None
     }
 
+    pub fn find_module_in_workspace(
+        &self,
+        module_path: &str,
+        workspace_id: WorkspaceId,
+    ) -> Option<&ModuleInfo> {
+        let module_path = module_path.replace(['\\', '/'], ".");
+        let module_parts: Vec<&str> = module_path.split('.').collect();
+        if module_parts.is_empty() {
+            return None;
+        }
+
+        let result = self.exact_find_module_in_workspace(&module_parts, workspace_id);
+        if result.is_some() {
+            return result;
+        }
+
+        if self.fuzzy_search {
+            let last_name = module_parts.last()?;
+            return self.fuzzy_find_module_in_workspace(&module_path, last_name, workspace_id);
+        }
+
+        None
+    }
+
     pub fn find_module_by_path(&self, path: &Path) -> Option<&ModuleInfo> {
         let path = path.to_str()?;
         let (module_path, _) = self.extract_module_path(path)?;
         self.find_module(&module_path)
+    }
+
+    pub fn find_module_for_file(&self, module_path: &str, file_id: FileId) -> Option<&ModuleInfo> {
+        if let Some(workspace_id) = self.get_workspace_id(file_id) {
+            return self.find_module_in_workspace(module_path, workspace_id);
+        }
+
+        self.find_module(module_path)
+    }
+
+    pub fn find_module_by_path_in_workspace(
+        &self,
+        path: &Path,
+        workspace_id: WorkspaceId,
+    ) -> Option<&ModuleInfo> {
+        let path = path.to_str()?;
+        let (module_path, _) = self.extract_module_path(path)?;
+        self.find_module_in_workspace(&module_path, workspace_id)
+    }
+
+    pub fn find_module_by_path_for_file(
+        &self,
+        path: &Path,
+        file_id: FileId,
+    ) -> Option<&ModuleInfo> {
+        if let Some(workspace_id) = self.get_workspace_id(file_id) {
+            return self.find_module_by_path_in_workspace(path, workspace_id);
+        }
+
+        self.find_module_by_path(path)
     }
 
     fn exact_find_module(&self, module_parts: &Vec<&str>) -> Option<&ModuleInfo> {
@@ -260,6 +316,25 @@ impl LuaModuleIndex {
         self.file_module_map.get(file_id)
     }
 
+    fn exact_find_module_in_workspace(
+        &self,
+        module_parts: &Vec<&str>,
+        workspace_id: WorkspaceId,
+    ) -> Option<&ModuleInfo> {
+        let mut parent_node_id = self.module_root_id;
+        for part in module_parts {
+            let parent_node = self.module_nodes.get(&parent_node_id)?;
+            let child_id = match parent_node.children.get(*part) {
+                Some(id) => *id,
+                None => return None,
+            };
+            parent_node_id = child_id;
+        }
+
+        let node = self.module_nodes.get(&parent_node_id)?;
+        self.select_module_for_workspace(&node.file_ids, workspace_id)
+    }
+
     fn fuzzy_find_module(&self, module_path: &str, last_name: &str) -> Option<&ModuleInfo> {
         let file_ids = self.module_name_to_file_ids.get(last_name)?;
         if file_ids.len() == 1 {
@@ -275,6 +350,59 @@ impl LuaModuleIndex {
         }
 
         None
+    }
+
+    fn fuzzy_find_module_in_workspace(
+        &self,
+        module_path: &str,
+        last_name: &str,
+        workspace_id: WorkspaceId,
+    ) -> Option<&ModuleInfo> {
+        let file_ids = self.module_name_to_file_ids.get(last_name)?;
+        let mut best: Option<(&ModuleInfo, u8)> = None;
+
+        for file_id in file_ids {
+            let module_info = self.file_module_map.get(file_id)?;
+            if !module_info.full_module_name.ends_with(module_path) {
+                continue;
+            }
+
+            let Some(priority) =
+                self.workspace_resolution_priority(workspace_id, module_info.workspace_id)
+            else {
+                continue;
+            };
+
+            match best {
+                Some((_, best_priority)) if priority >= best_priority => {}
+                _ => best = Some((module_info, priority)),
+            }
+        }
+
+        best.map(|(module_info, _)| module_info)
+    }
+
+    fn select_module_for_workspace(
+        &self,
+        file_ids: &[FileId],
+        workspace_id: WorkspaceId,
+    ) -> Option<&ModuleInfo> {
+        let mut best: Option<(&ModuleInfo, u8)> = None;
+        for file_id in file_ids {
+            let module_info = self.file_module_map.get(file_id)?;
+            let Some(priority) =
+                self.workspace_resolution_priority(workspace_id, module_info.workspace_id)
+            else {
+                continue;
+            };
+
+            match best {
+                Some((_, best_priority)) if priority >= best_priority => {}
+                _ => best = Some((module_info, priority)),
+            }
+        }
+
+        best.map(|(module_info, _)| module_info)
     }
 
     /// Find a module node by module path.
@@ -309,6 +437,76 @@ impl LuaModuleIndex {
         self.file_module_map.values().collect()
     }
 
+    pub fn get_workspace_kind(&self, workspace_id: WorkspaceId) -> WorkspaceKind {
+        if let Some(kind) = self.workspace_kind_map.get(&workspace_id) {
+            return *kind;
+        }
+
+        if workspace_id == WorkspaceId::STD {
+            WorkspaceKind::Std
+        } else if workspace_id == WorkspaceId::MAIN {
+            WorkspaceKind::Main
+        } else if workspace_id == WorkspaceId::REMOTE {
+            WorkspaceKind::Remote
+        } else {
+            WorkspaceKind::Library
+        }
+    }
+
+    pub fn is_main_workspace_id(&self, workspace_id: WorkspaceId) -> bool {
+        self.get_workspace_kind(workspace_id) == WorkspaceKind::Main
+    }
+
+    pub fn is_std_workspace_id(&self, workspace_id: WorkspaceId) -> bool {
+        self.get_workspace_kind(workspace_id) == WorkspaceKind::Std
+    }
+
+    pub fn is_library_workspace_id(&self, workspace_id: WorkspaceId) -> bool {
+        self.get_workspace_kind(workspace_id) == WorkspaceKind::Library
+    }
+
+    pub fn is_remote_workspace_id(&self, workspace_id: WorkspaceId) -> bool {
+        self.get_workspace_kind(workspace_id) == WorkspaceKind::Remote
+    }
+
+    pub fn workspace_resolution_priority(
+        &self,
+        current_workspace_id: WorkspaceId,
+        candidate_workspace_id: WorkspaceId,
+    ) -> Option<u8> {
+        if current_workspace_id == candidate_workspace_id {
+            return Some(0);
+        }
+
+        let current_kind = self.get_workspace_kind(current_workspace_id);
+        let candidate_kind = self.get_workspace_kind(candidate_workspace_id);
+        match current_kind {
+            WorkspaceKind::Std => {
+                if candidate_kind == WorkspaceKind::Std {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
+            WorkspaceKind::Main => match candidate_kind {
+                WorkspaceKind::Std => Some(1),
+                WorkspaceKind::Library => Some(2),
+                WorkspaceKind::Main | WorkspaceKind::Remote => None,
+            },
+            WorkspaceKind::Library => match candidate_kind {
+                WorkspaceKind::Std => Some(1),
+                WorkspaceKind::Library => Some(2),
+                WorkspaceKind::Main | WorkspaceKind::Remote => None,
+            },
+            WorkspaceKind::Remote => match candidate_kind {
+                WorkspaceKind::Std => Some(1),
+                WorkspaceKind::Library => Some(2),
+                WorkspaceKind::Remote => Some(3),
+                WorkspaceKind::Main => None,
+            },
+        }
+    }
+
     pub fn extract_module_path(&self, path: &str) -> Option<(String, WorkspaceId)> {
         let path = Path::new(path);
         let mut matched_module_path: Option<(String, WorkspaceId)> = None;
@@ -334,7 +532,7 @@ impl LuaModuleIndex {
                         if module_path.len() < matched.len() {
                             // Libraries could be in a subdirectory of the main workspace
                             // In case of a conflict, we prioritise the non-main workspace ID
-                            let workspace_id = if workspace.id.is_main() {
+                            let workspace_id = if workspace.kind == WorkspaceKind::Main {
                                 *matched_workspace_id
                             } else {
                                 workspace.id
@@ -373,14 +571,39 @@ impl LuaModuleIndex {
     }
 
     pub fn add_workspace_root(&mut self, root: PathBuf, workspace_id: WorkspaceId) {
-        if !self.workspaces.iter().any(|w| w.root == root) {
-            self.workspaces.push(Workspace::new(root, workspace_id));
+        let workspace_kind = self.get_workspace_kind(workspace_id);
+        self.add_workspace_root_with_kind(root, workspace_id, workspace_kind);
+    }
+
+    pub fn add_workspace_root_with_kind(
+        &mut self,
+        root: PathBuf,
+        workspace_id: WorkspaceId,
+        workspace_kind: WorkspaceKind,
+    ) {
+        if let Some(existing_workspace) = self.workspaces.iter().find(|w| w.root == root) {
+            self.workspace_kind_map
+                .insert(existing_workspace.id, existing_workspace.kind);
+            return;
         }
+
+        self.workspaces
+            .push(Workspace::new(root, workspace_id, workspace_kind));
+        self.workspace_kind_map.insert(workspace_id, workspace_kind);
+    }
+
+    pub fn next_main_workspace_id(&self) -> u32 {
+        let used: HashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
+        let mut candidate = WorkspaceId::MAIN.id;
+        while candidate == WorkspaceId::REMOTE.id || used.contains(&candidate) {
+            candidate += 1;
+        }
+        candidate
     }
 
     pub fn next_library_workspace_id(&self) -> u32 {
         let used: HashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
-        let mut candidate = 2;
+        let mut candidate = WorkspaceId::REMOTE.id + 1;
         while used.contains(&candidate) {
             candidate += 1;
         }
@@ -441,7 +664,7 @@ impl LuaModuleIndex {
     pub fn get_std_file_ids(&self) -> Vec<FileId> {
         let mut file_ids = Vec::new();
         for module_info in self.file_module_map.values() {
-            if module_info.workspace_id == WorkspaceId::STD {
+            if self.is_std_workspace_id(module_info.workspace_id) {
                 file_ids.push(module_info.file_id);
             }
         }
@@ -451,7 +674,7 @@ impl LuaModuleIndex {
 
     pub fn is_main(&self, file_id: &FileId) -> bool {
         if let Some(module_info) = self.file_module_map.get(file_id) {
-            return module_info.workspace_id == WorkspaceId::MAIN;
+            return self.is_main_workspace_id(module_info.workspace_id);
         }
 
         false
@@ -459,7 +682,7 @@ impl LuaModuleIndex {
 
     pub fn is_std(&self, file_id: &FileId) -> bool {
         if let Some(module_info) = self.file_module_map.get(file_id) {
-            return module_info.workspace_id == WorkspaceId::STD;
+            return self.is_std_workspace_id(module_info.workspace_id);
         }
 
         false
@@ -467,7 +690,7 @@ impl LuaModuleIndex {
 
     pub fn is_library(&self, file_id: &FileId) -> bool {
         if let Some(module_info) = self.file_module_map.get(file_id) {
-            return module_info.workspace_id.is_library();
+            return self.is_library_workspace_id(module_info.workspace_id);
         }
 
         false
@@ -476,7 +699,7 @@ impl LuaModuleIndex {
     pub fn get_main_workspace_file_ids(&self) -> Vec<FileId> {
         let mut file_ids = Vec::new();
         for module_info in self.file_module_map.values() {
-            if module_info.workspace_id == WorkspaceId::MAIN {
+            if self.is_main_workspace_id(module_info.workspace_id) {
                 file_ids.push(module_info.file_id);
             }
         }
@@ -487,7 +710,7 @@ impl LuaModuleIndex {
     pub fn get_lib_file_ids(&self) -> Vec<FileId> {
         let mut file_ids = Vec::new();
         for module_info in self.file_module_map.values() {
-            if module_info.workspace_id.is_library() {
+            if self.is_library_workspace_id(module_info.workspace_id) {
                 file_ids.push(module_info.file_id);
             }
         }
@@ -515,6 +738,10 @@ impl LuaModuleIndex {
         }
 
         None
+    }
+
+    pub fn get_workspace_id_for_root(&self, root: &Path) -> Option<WorkspaceId> {
+        self.workspaces.iter().find(|w| w.root == root).map(|w| w.id)
     }
 }
 
