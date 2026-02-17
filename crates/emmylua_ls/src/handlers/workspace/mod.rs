@@ -1,10 +1,13 @@
+mod did_change_workspace_folders;
 mod did_rename_files;
 
+pub use did_change_workspace_folders::on_did_change_workspace_folders;
 pub use did_rename_files::on_did_rename_files_handler;
 use lsp_types::{
     ClientCapabilities, FileOperationFilter, FileOperationPattern, FileOperationPatternOptions,
-    FileOperationRegistrationOptions, ServerCapabilities,
-    WorkspaceFileOperationsServerCapabilities, WorkspaceServerCapabilities,
+    FileOperationRegistrationOptions, OneOf, ServerCapabilities,
+    WorkspaceFileOperationsServerCapabilities, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities,
 };
 
 use crate::handlers::RegisterCapabilities;
@@ -29,7 +32,10 @@ impl RegisterCapabilities for WorkspaceCapabilities {
                 }),
                 ..Default::default()
             }),
-            ..Default::default()
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
         });
     }
 }

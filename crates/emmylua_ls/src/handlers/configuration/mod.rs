@@ -19,10 +19,6 @@ pub async fn on_did_change_configuration(
         (client_id, supports_config_request)
     };
 
-    if client_id.is_vscode() {
-        return Some(());
-    }
-
     log::info!("change config client_id: {:?}", client_id);
 
     // Get new config without holding any locks

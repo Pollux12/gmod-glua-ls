@@ -18,6 +18,7 @@
   - GMod analysis is conditionally inserted via `gmod::GmodAnalysisPipeline` when `emmyrc.gmod.enabled` is true.
 - GMod inference implementation lives in `crates/emmylua_code_analysis/src/compilation/analyzer/gmod/mod.rs`.
 - GMod metadata persistence is in `crates/emmylua_code_analysis/src/db_index/` (`gmod_*` indexes).
+- Note that we've added multi-workspace support for our language server. You need to make sure that any changes you make will support workspaces with different configurations, with each being isolated.
 
 ## Work Routing (Where To Implement Changes)
 - Parser/grammar/AST/CST: `crates/emmylua_parser/src/`.

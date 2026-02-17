@@ -157,7 +157,7 @@ mod tests {
                 end
             "#,
             VirtualCompletionResolveItem {
-                detail: "(method) SANDBOX:PlayerSpawnSENT(ply, class)".to_string(),
+                detail: "(method) SANDBOX:PlayerSpawnSENT(ply, class) (+1 overloads)".to_string(),
                 documentation: Some(
                     "\n![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)\n\nCalled when a player attempts to spawn a SENT."
                         .to_string(),

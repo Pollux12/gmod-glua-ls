@@ -19,18 +19,26 @@ pub async fn get_client_config_default(
         .await
         .workspace_folders
         .clone();
-    let main_workspace_folder = workspace_folders.first();
     let client = context.client();
-    let scope_uri = main_workspace_folder.and_then(|p| file_path_to_uri(&p.root));
+    let mut scope_uris = workspace_folders
+        .iter()
+        .filter_map(|workspace| file_path_to_uri(&workspace.root).map(Some))
+        .collect::<Vec<_>>();
+    if scope_uris.is_empty() {
+        scope_uris.push(None);
+    }
 
     let mut configs = Vec::new();
     let mut used_scope = None;
     for scope in scopes.unwrap_or(&["emmylua"]) {
         let params = lsp_types::ConfigurationParams {
-            items: vec![lsp_types::ConfigurationItem {
-                scope_uri: scope_uri.clone(),
-                section: Some(scope.to_string()),
-            }],
+            items: scope_uris
+                .iter()
+                .map(|scope_uri| lsp_types::ConfigurationItem {
+                    scope_uri: scope_uri.clone(),
+                    section: Some(scope.to_string()),
+                })
+                .collect(),
         };
         log::info!("fetching client config for scope {scope:?}");
         let cancel_token = time_cancel_token(Duration::from_secs(5));

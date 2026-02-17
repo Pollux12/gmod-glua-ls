@@ -3,7 +3,7 @@ mod codestyle;
 mod locale;
 mod std_i18n;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc};
 
 use crate::{
     cmd_args::CmdArgs,
@@ -19,7 +19,7 @@ use crate::{
 pub use client_config::{ClientConfig, get_client_config};
 use codestyle::load_editorconfig;
 use emmylua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, WorkspaceFolder, calculate_include_and_exclude,
+    EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, calculate_include_and_exclude,
     collect_workspace_files, uri_to_file_path,
 };
 use lsp_types::InitializeParams;
@@ -69,10 +69,14 @@ pub async fn initialized_handler(
     log::info!("initialization_params: {}", params_json);
 
     // init config
-    // todo! support multi config
-    let config_root: Option<PathBuf> = main_root.map(PathBuf::from);
-
-    let emmyrc = load_emmy_config(config_root, client_config.clone());
+    let config_roots = workspace_folders
+        .iter()
+        .map(|workspace| workspace.root.clone())
+        .collect();
+    let loaded = load_emmy_config(config_roots, client_config.clone());
+    let emmyrc = loaded.emmyrc;
+    let workspace_diagnostic_configs = loaded.workspace_diagnostic_configs;
+    let workspace_emmyrcs = loaded.workspace_emmyrcs;
     load_editorconfig(workspace_folders.clone());
 
     // init std lib
@@ -94,6 +98,8 @@ pub async fn initialized_handler(
         context.lsp_features(),
         workspace_folders,
         emmyrc.clone(),
+        workspace_diagnostic_configs,
+        workspace_emmyrcs,
     )
     .await;
 
@@ -108,6 +114,8 @@ pub async fn init_analysis(
     lsp_features: &LspFeatures,
     workspace_folders: Vec<WorkspaceFolder>,
     emmyrc: Arc<Emmyrc>,
+    workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
+    workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
 ) {
     let mut mut_analysis = analysis.write().await;
 
@@ -127,46 +135,61 @@ pub async fn init_analysis(
         Some("Loading workspace files".to_string()),
     );
 
-    let mut workspace_folders = workspace_folders;
-    for workspace_root in &workspace_folders {
-        log::info!("add workspace root: {:?}", workspace_root.root);
-        mut_analysis.add_main_workspace(workspace_root.root.clone());
+    let workspace_roots = workspace_folders
+        .into_iter()
+        .map(|workspace| workspace.root)
+        .collect::<Vec<_>>();
+
+    let mut workspace_collection_groups: Vec<(Arc<Emmyrc>, Vec<WorkspaceFolder>)> = Vec::new();
+    if workspace_roots.is_empty() {
+        workspace_collection_groups.push((
+            emmyrc.clone(),
+            build_workspace_collection_folders(None, emmyrc.as_ref()),
+        ));
+    } else {
+        for workspace_root in workspace_roots {
+            let workspace_config = workspace_emmyrcs
+                .get(&workspace_root)
+                .cloned()
+                .unwrap_or_else(|| emmyrc.clone());
+            workspace_collection_groups.push((
+                workspace_config.clone(),
+                build_workspace_collection_folders(Some(workspace_root), workspace_config.as_ref()),
+            ));
+        }
     }
 
-    for workspace_root in &emmyrc.workspace.workspace_roots {
-        log::info!("add workspace root: {:?}", workspace_root);
-        let root_path = PathBuf::from(workspace_root);
-        mut_analysis.add_main_workspace(root_path.clone());
-    }
-
-    for lib in &emmyrc.workspace.library {
-        log::info!("add library: {:?}", lib);
-        let lib_path = PathBuf::from(lib.get_path().clone());
-        mut_analysis.add_library_workspace(lib_path.clone());
-        workspace_folders.push(WorkspaceFolder::new(lib_path, true));
-    }
-
-    for package_dir in &emmyrc.workspace.package_dirs {
-        let package_path = PathBuf::from(package_dir);
-        if let Some(parent) = package_path.parent() {
-            if let Some(name) = package_path.file_name() {
-                let parent_path = parent.to_path_buf();
-                log::info!(
-                    "add package dir {:?} with parent workspace {:?}",
-                    package_path,
-                    parent_path
-                );
-                mut_analysis.add_library_workspace(parent_path.clone());
-                workspace_folders.push(WorkspaceFolder::with_sub_paths(
-                    parent_path,
-                    vec![PathBuf::from(name)],
-                    true,
-                ));
-            } else {
-                log::warn!("package dir {:?} has no file name", package_path);
+    let mut added_main_roots = HashSet::new();
+    let mut added_library_roots = HashSet::new();
+    for (_, workspace_group) in &workspace_collection_groups {
+        for workspace in workspace_group {
+            if workspace.is_library {
+                if added_library_roots.insert(workspace.root.clone()) {
+                    log::info!("add library: {:?}", workspace.root);
+                    mut_analysis.add_library_workspace(workspace.root.clone());
+                }
+            } else if added_main_roots.insert(workspace.root.clone()) {
+                log::info!("add workspace root: {:?}", workspace.root);
+                mut_analysis.add_main_workspace(workspace.root.clone());
             }
-        } else {
-            log::warn!("package dir {:?} has no parent", package_path);
+        }
+    }
+
+    // Map workspace root paths to WorkspaceIds for per-workspace diagnostic configs
+    if !workspace_diagnostic_configs.is_empty() {
+        let mut ws_diag_configs = HashMap::new();
+        for (root, diag_config) in workspace_diagnostic_configs {
+            if let Some(workspace_id) = mut_analysis.get_workspace_id_for_root(&root) {
+                log::info!(
+                    "setting per-workspace diagnostic config for {:?} (workspace_id: {:?})",
+                    root,
+                    workspace_id
+                );
+                ws_diag_configs.insert(workspace_id, Arc::new(diag_config));
+            }
+        }
+        if !ws_diag_configs.is_empty() {
+            mut_analysis.set_workspace_diagnostic_configs(ws_diag_configs);
         }
     }
 
@@ -176,10 +199,20 @@ pub async fn init_analysis(
         Some(String::from("Collecting files")),
     );
 
-    // load files
-    let files = collect_workspace_files(&workspace_folders, &emmyrc, None, None);
-    let files: Vec<(PathBuf, Option<String>)> =
-        files.into_iter().map(|file| file.into_tuple()).collect();
+    // load files with per-workspace configs
+    let mut files = Vec::new();
+    let mut loaded_paths = HashSet::new();
+    for (workspace_config, workspace_group) in &workspace_collection_groups {
+        for file in collect_workspace_files(workspace_group, workspace_config.as_ref(), None, None) {
+            let normalized_path = PathBuf::from(&file.path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&file.path));
+            if loaded_paths.insert(normalized_path) {
+                files.push(file.into_tuple());
+            }
+        }
+    }
+
     let file_count = files.len();
     if file_count != 0 {
         status_bar.update_progress_task(
@@ -212,6 +245,44 @@ pub async fn init_analysis(
             .add_workspace_diagnostic_task(0, false)
             .await;
     }
+}
+
+fn build_workspace_collection_folders(
+    workspace_root: Option<PathBuf>,
+    emmyrc: &Emmyrc,
+) -> Vec<WorkspaceFolder> {
+    let mut workspaces = Vec::new();
+
+    if let Some(workspace_root) = workspace_root {
+        workspaces.push(WorkspaceFolder::new(workspace_root, false));
+    }
+
+    for extra_root in &emmyrc.workspace.workspace_roots {
+        workspaces.push(WorkspaceFolder::new(PathBuf::from(extra_root), false));
+    }
+
+    for lib in &emmyrc.workspace.library {
+        workspaces.push(WorkspaceFolder::new(PathBuf::from(lib.get_path()), true));
+    }
+
+    for package_dir in &emmyrc.workspace.package_dirs {
+        let package_path = PathBuf::from(package_dir);
+        if let Some(parent) = package_path.parent() {
+            if let Some(name) = package_path.file_name() {
+                workspaces.push(WorkspaceFolder::with_sub_paths(
+                    parent.to_path_buf(),
+                    vec![PathBuf::from(name)],
+                    true,
+                ));
+            } else {
+                log::warn!("package dir {:?} has no file name", package_path);
+            }
+        } else {
+            log::warn!("package dir {:?} has no parent", package_path);
+        }
+    }
+
+    workspaces
 }
 
 pub fn get_workspace_folders(params: &InitializeParams) -> Vec<WorkspaceFolder> {

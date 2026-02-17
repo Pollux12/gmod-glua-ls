@@ -5,8 +5,7 @@ use std::{
 
 use emmylua_code_analysis::{LuaType, file_path_to_uri};
 use emmylua_parser::{
-    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken,
-    PathTrait,
+    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken, PathTrait,
 };
 use lsp_types::{CompletionItem, TextEdit};
 
@@ -153,14 +152,22 @@ fn infer_path_kind_from_call_type(
 ) -> Option<PathCompletionKind> {
     match call_type {
         LuaType::DocFunction(func) => {
-            let param_idx = map_call_param_to_decl_param_idx(arg_idx, func.is_colon_define(), call_is_colon)?;
+            let param_idx =
+                map_call_param_to_decl_param_idx(arg_idx, func.is_colon_define(), call_is_colon)?;
             let (_, param_type) = func.get_params().get(param_idx)?;
             classify_path_type(param_type.as_ref()?)
         }
         LuaType::Signature(signature_id) => {
-            let signature = builder.semantic_model.get_db().get_signature_index().get(signature_id)?;
-            let param_idx =
-                map_call_param_to_decl_param_idx(arg_idx, signature.is_colon_define, call_is_colon)?;
+            let signature = builder
+                .semantic_model
+                .get_db()
+                .get_signature_index()
+                .get(signature_id)?;
+            let param_idx = map_call_param_to_decl_param_idx(
+                arg_idx,
+                signature.is_colon_define,
+                call_is_colon,
+            )?;
             let param_type = &signature.get_param_info_by_id(param_idx)?.type_ref;
             classify_path_type(param_type)
         }
@@ -355,12 +362,18 @@ mod tests {
 
     #[test]
     fn test_classify_path_type_name_file_folder_and_path() {
-        assert_eq!(classify_path_type_name("file"), Some(PathCompletionKind::File));
+        assert_eq!(
+            classify_path_type_name("file"),
+            Some(PathCompletionKind::File)
+        );
         assert_eq!(
             classify_path_type_name("directory"),
             Some(PathCompletionKind::Folder)
         );
-        assert_eq!(classify_path_type_name("path"), Some(PathCompletionKind::Any));
+        assert_eq!(
+            classify_path_type_name("path"),
+            Some(PathCompletionKind::Any)
+        );
         assert_eq!(classify_path_type_name("string"), None);
     }
 

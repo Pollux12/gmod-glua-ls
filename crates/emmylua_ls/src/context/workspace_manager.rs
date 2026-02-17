@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -7,7 +8,7 @@ use super::{ClientProxy, FileDiagnostic, StatusBar};
 use crate::context::lsp_features::LspFeatures;
 use crate::handlers::{ClientConfig, init_analysis};
 use emmylua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, WorkspaceFolder, WorkspaceImport, load_configs,
+    EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, WorkspaceImport, load_configs,
 };
 use emmylua_code_analysis::{update_code_style, uri_to_file_path};
 use log::{debug, info};
@@ -101,14 +102,17 @@ impl WorkspaceManager {
                 return;
             }
 
-            let emmyrc = load_emmy_config(Some(file_dir.clone()), client_config);
+            let config_roots = collect_config_roots(&workspace_folders, Some(file_dir.clone()));
+            let loaded = load_emmy_config(config_roots, client_config);
             init_analysis(
                 &analysis,
                 &status_bar,
                 &file_diagnostic,
                 &lsp_features,
                 workspace_folders,
-                emmyrc,
+                loaded.emmyrc,
+                loaded.workspace_diagnostic_configs,
+                loaded.workspace_emmyrcs,
             )
             .await;
             if lsp_features.supports_workspace_diagnostic() {
@@ -134,9 +138,8 @@ impl WorkspaceManager {
     }
 
     pub fn add_reload_workspace_task(&self) -> Option<()> {
-        let config_root: Option<PathBuf> = self.workspace_folders.first().map(|wf| wf.root.clone());
-
-        let emmyrc = load_emmy_config(config_root, self.client_config.clone());
+        let config_roots = collect_config_roots(&self.workspace_folders, None);
+        let loaded = load_emmy_config(config_roots, self.client_config.clone());
         let analysis = self.analysis.clone();
         let workspace_folders = self.workspace_folders.clone();
         let status_bar = self.status_bar.clone();
@@ -152,7 +155,9 @@ impl WorkspaceManager {
                 &file_diagnostic,
                 &lsp_features,
                 workspace_folders,
-                emmyrc,
+                loaded.emmyrc,
+                loaded.workspace_diagnostic_configs,
+                loaded.workspace_emmyrcs,
             )
             .await;
 
@@ -275,7 +280,42 @@ impl WorkspaceManager {
     }
 }
 
-pub fn load_emmy_config(config_root: Option<PathBuf>, client_config: ClientConfig) -> Arc<Emmyrc> {
+fn collect_config_roots(
+    workspace_folders: &[WorkspaceFolder],
+    preferred_root: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut config_roots = Vec::new();
+    if let Some(preferred_root) = preferred_root {
+        config_roots.push(preferred_root);
+    }
+
+    config_roots.extend(
+        workspace_folders
+            .iter()
+            .map(|workspace| workspace.root.clone()),
+    );
+    dedup_paths(config_roots)
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            deduped.push(path);
+        }
+    }
+
+    deduped
+}
+
+pub struct LoadedConfig {
+    pub emmyrc: Arc<Emmyrc>,
+    pub workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
+    pub workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
+}
+
+pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig) -> LoadedConfig {
     // Config load priority.
     // * Global `<os-specific home-dir>` config files.
     // * Global `<os-specific config-dir>/emmylua_ls` config files.
@@ -288,12 +328,12 @@ pub fn load_emmy_config(config_root: Option<PathBuf>, client_config: ClientConfi
     let luarc_file = ".luarc.json";
     let emmyrc_file = ".emmyrc.json";
     let emmyrc_lua_file = ".emmyrc.lua";
-    let mut config_files = Vec::new();
+    let mut global_config_files = Vec::new();
 
     let home_dir = dirs::home_dir();
     if let Some(home_dir) = home_dir {
         push_configs_from_dir(
-            &mut config_files,
+            &mut global_config_files,
             &home_dir,
             luarc_file,
             emmyrc_file,
@@ -305,7 +345,7 @@ pub fn load_emmy_config(config_root: Option<PathBuf>, client_config: ClientConfi
     let config_dir = dirs::config_dir().map(|path| path.join(emmylua_config_dir));
     if let Some(config_dir) = config_dir {
         push_configs_from_dir(
-            &mut config_files,
+            &mut global_config_files,
             &config_dir,
             luarc_file,
             emmyrc_file,
@@ -318,29 +358,136 @@ pub fn load_emmy_config(config_root: Option<PathBuf>, client_config: ClientConfi
             let config_path = std::path::PathBuf::from(path);
             if config_path.exists() {
                 info!("load config from: {:?}", config_path);
-                config_files.push(config_path);
+                global_config_files.push(config_path);
             }
         })
         .ok();
 
-    if let Some(config_root) = &config_root {
-        push_configs_from_dir(
-            &mut config_files,
-            config_root,
+    let config_roots = dedup_paths(config_roots);
+    let mut config_files = global_config_files.clone();
+    push_configs_from_preferred_workspace_root(
+        &mut config_files,
+        &config_roots,
+        luarc_file,
+        emmyrc_file,
+        emmyrc_lua_file,
+    );
+
+    let mut emmyrc = load_configs(config_files, client_config.partial_emmyrcs.clone());
+    merge_client_config(&client_config, &mut emmyrc);
+    let (workspace_diagnostic_configs, workspace_emmyrcs) = pre_process_emmyrc_for_all_roots(
+        &mut emmyrc,
+        &config_roots,
+        &global_config_files,
+        &client_config,
+        luarc_file,
+        emmyrc_file,
+        emmyrc_lua_file,
+    );
+
+    log::info!("loaded emmyrc complete");
+    LoadedConfig {
+        emmyrc: emmyrc.into(),
+        workspace_diagnostic_configs,
+        workspace_emmyrcs,
+    }
+}
+
+fn pre_process_emmyrc_for_all_roots(
+    emmyrc: &mut Emmyrc,
+    config_roots: &[PathBuf],
+    global_config_files: &[PathBuf],
+    client_config: &ClientConfig,
+    luarc_file: &str,
+    emmyrc_file: &str,
+    emmyrc_lua_file: &str,
+) -> (
+    HashMap<PathBuf, LuaDiagnosticConfig>,
+    HashMap<PathBuf, Arc<Emmyrc>>,
+) {
+    let mut workspace_diagnostic_configs = HashMap::new();
+    let mut workspace_emmyrcs = HashMap::new();
+
+    if config_roots.is_empty() {
+        return (workspace_diagnostic_configs, workspace_emmyrcs);
+    }
+
+    let mut merged_emmyrc: Option<Emmyrc> = None;
+    for workspace_root in config_roots {
+        let mut workspace_config_files = global_config_files.to_vec();
+        workspace_config_files.extend(collect_config_files_from_dir(
+            workspace_root,
             luarc_file,
             emmyrc_file,
             emmyrc_lua_file,
+        ));
+
+        let mut workspace_emmyrc = load_configs(
+            workspace_config_files,
+            client_config.partial_emmyrcs.clone(),
         );
+        merge_client_config(client_config, &mut workspace_emmyrc);
+        workspace_emmyrc.pre_process_emmyrc(workspace_root);
+
+        // Store per-workspace diagnostic config before merging
+        workspace_diagnostic_configs.insert(
+            workspace_root.clone(),
+            LuaDiagnosticConfig::new(&workspace_emmyrc),
+        );
+        workspace_emmyrcs.insert(workspace_root.clone(), Arc::new(workspace_emmyrc.clone()));
+
+        if let Some(merged) = merged_emmyrc.as_mut() {
+            extend_unique(
+                &mut merged.workspace.workspace_roots,
+                workspace_emmyrc.workspace.workspace_roots,
+            );
+            extend_unique(
+                &mut merged.workspace.library,
+                workspace_emmyrc.workspace.library,
+            );
+            extend_unique(
+                &mut merged.workspace.package_dirs,
+                workspace_emmyrc.workspace.package_dirs,
+            );
+            extend_unique(
+                &mut merged.workspace.ignore_dir,
+                workspace_emmyrc.workspace.ignore_dir,
+            );
+            extend_unique(
+                &mut merged.workspace.ignore_globs,
+                workspace_emmyrc.workspace.ignore_globs,
+            );
+            extend_unique(
+                &mut merged.runtime.extensions,
+                workspace_emmyrc.runtime.extensions,
+            );
+            extend_unique(
+                &mut merged.runtime.require_pattern,
+                workspace_emmyrc.runtime.require_pattern,
+            );
+            extend_unique(&mut merged.resource.paths, workspace_emmyrc.resource.paths);
+        } else {
+            merged_emmyrc = Some(workspace_emmyrc);
+        }
     }
 
-    let mut emmyrc = load_configs(config_files, client_config.partial_emmyrcs.clone());
-    merge_client_config(client_config, &mut emmyrc);
-    if let Some(workspace_root) = &config_root {
-        emmyrc.pre_process_emmyrc(workspace_root);
+    if let Some(merged_emmyrc) = merged_emmyrc {
+        *emmyrc = merged_emmyrc;
     }
 
-    log::info!("loaded emmyrc complete");
-    emmyrc.into()
+    (workspace_diagnostic_configs, workspace_emmyrcs)
+}
+
+fn extend_unique<T>(target: &mut Vec<T>, incoming: Vec<T>)
+where
+    T: Eq + Hash + Clone,
+{
+    let mut seen: HashSet<T> = target.iter().cloned().collect();
+    for item in incoming {
+        if seen.insert(item.clone()) {
+            target.push(item);
+        }
+    }
 }
 
 fn push_configs_from_dir(
@@ -354,6 +501,30 @@ fn push_configs_from_dir(
     for config_file in dir_configs {
         info!("load config from: {:?}", config_file);
         config_files.push(config_file);
+    }
+}
+
+fn push_configs_from_preferred_workspace_root(
+    config_files: &mut Vec<PathBuf>,
+    config_roots: &[PathBuf],
+    luarc_file: &str,
+    emmyrc_file: &str,
+    emmyrc_lua_file: &str,
+) {
+    for config_root in config_roots {
+        let dir_configs =
+            collect_config_files_from_dir(config_root, luarc_file, emmyrc_file, emmyrc_lua_file);
+
+        if dir_configs.is_empty() {
+            continue;
+        }
+
+        info!("using preferred workspace config root: {:?}", config_root);
+        for config_file in dir_configs {
+            info!("load config from: {:?}", config_file);
+            config_files.push(config_file);
+        }
+        break;
     }
 }
 
@@ -373,11 +544,17 @@ fn collect_config_files_from_dir(
     .collect()
 }
 
-fn merge_client_config(client_config: ClientConfig, emmyrc: &mut Emmyrc) -> Option<()> {
-    emmyrc.runtime.extensions.extend(client_config.extensions);
-    emmyrc.workspace.ignore_globs.extend(client_config.exclude);
+fn merge_client_config(client_config: &ClientConfig, emmyrc: &mut Emmyrc) -> Option<()> {
+    emmyrc
+        .runtime
+        .extensions
+        .extend(client_config.extensions.clone());
+    emmyrc
+        .workspace
+        .ignore_globs
+        .extend(client_config.exclude.clone());
     if client_config.encoding != "utf-8" {
-        emmyrc.workspace.encoding = client_config.encoding;
+        emmyrc.workspace.encoding = client_config.encoding.clone();
     }
 
     Some(())
@@ -511,7 +688,14 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::collect_config_files_from_dir;
+    use emmylua_code_analysis::{DiagnosticCode, WorkspaceFolder, collect_workspace_files};
+
+    use crate::handlers::ClientConfig;
+
+    use super::{
+        collect_config_files_from_dir, collect_config_roots, dedup_paths, load_emmy_config,
+        push_configs_from_preferred_workspace_root,
+    };
 
     fn create_temp_dir() -> PathBuf {
         let unique = SystemTime::now()
@@ -557,5 +741,372 @@ mod tests {
 
         assert_eq!(files, vec![luarc_json, emmyrc_json, emmyrc_lua]);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_dedup_paths_preserves_order() {
+        let path_a = PathBuf::from("/workspace/a");
+        let path_b = PathBuf::from("/workspace/b");
+        let paths = vec![path_a.clone(), path_b.clone(), path_a.clone()];
+
+        let deduped = dedup_paths(paths);
+
+        assert_eq!(deduped, vec![path_a, path_b]);
+    }
+
+    #[test]
+    fn test_collect_config_roots_prefers_changed_dir_and_dedups() {
+        let workspace_a = WorkspaceFolder::new(PathBuf::from("/workspace/a"), false);
+        let workspace_b = WorkspaceFolder::new(PathBuf::from("/workspace/b"), false);
+        let preferred = PathBuf::from("/workspace/b");
+
+        let roots = collect_config_roots(&[workspace_a, workspace_b], Some(preferred.clone()));
+
+        assert_eq!(roots, vec![preferred, PathBuf::from("/workspace/a")]);
+    }
+
+    #[test]
+    fn test_push_configs_from_preferred_workspace_root_uses_first_root_with_config() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "diagnostics": { "globals": ["A_ONLY"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "diagnostics": { "globals": ["B_ONLY"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let mut config_files = Vec::new();
+        push_configs_from_preferred_workspace_root(
+            &mut config_files,
+            &[workspace_a.clone(), workspace_b.clone()],
+            ".luarc.json",
+            ".emmyrc.json",
+            ".emmyrc.lua",
+        );
+
+        assert_eq!(config_files, vec![workspace_a.join(".emmyrc.json")]);
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_load_emmy_config_does_not_overlay_with_secondary_workspace_local_config() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "diagnostics": { "globals": ["A_ONLY"], "disable": ["inject-field"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "diagnostics": { "globals": ["B_ONLY"], "disable": ["undefined-global"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        assert_eq!(loaded.emmyrc.diagnostics.globals, vec!["A_ONLY".to_string()]);
+        assert_eq!(
+            loaded.emmyrc.diagnostics.disable,
+            vec![DiagnosticCode::InjectField]
+        );
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_load_emmy_config_preprocesses_relative_paths_for_each_workspace_root() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+        touch(&workspace_a.join(".emmyrc.json"));
+        touch(&workspace_b.join(".emmyrc.json"));
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "resource": { "paths": ["./lua"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "resource": { "paths": ["./lua"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        let workspace_a_lua = workspace_a.join("lua").to_string_lossy().to_string();
+        let workspace_b_lua = workspace_b.join("lua").to_string_lossy().to_string();
+        assert!(loaded.emmyrc.resource.paths.contains(&workspace_a_lua));
+        assert!(loaded.emmyrc.resource.paths.contains(&workspace_b_lua));
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_load_emmy_config_uses_each_workspace_local_relative_paths() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "resource": { "paths": ["./lua_a"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "resource": { "paths": ["./lua_b"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        let workspace_a_lua = workspace_a.join("lua_a").to_string_lossy().to_string();
+        let workspace_b_lua = workspace_b.join("lua_b").to_string_lossy().to_string();
+        assert!(loaded.emmyrc.resource.paths.contains(&workspace_a_lua));
+        assert!(loaded.emmyrc.resource.paths.contains(&workspace_b_lua));
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_load_emmy_config_merges_runtime_extensions_for_each_workspace() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "runtime": { "extensions": [".luaa"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "runtime": { "extensions": [".luab"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        assert!(loaded.emmyrc.runtime.extensions.contains(&".luaa".to_string()));
+        assert!(loaded.emmyrc.runtime.extensions.contains(&".luab".to_string()));
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_load_emmy_config_merges_ignore_globs_for_each_workspace() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "workspace": { "ignoreGlobs": ["**/a/**"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "workspace": { "ignoreGlobs": ["**/b/**"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        assert!(
+            loaded
+                .emmyrc
+                .workspace
+                .ignore_globs
+                .contains(&"**/a/**".to_string())
+        );
+        assert!(
+            loaded
+                .emmyrc
+                .workspace
+                .ignore_globs
+                .contains(&"**/b/**".to_string())
+        );
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_load_emmy_config_uses_each_workspace_local_library_paths() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "workspace": { "library": ["./lua/lib_a"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "workspace": { "library": ["./lua/lib_b"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        let workspace_a_lib = workspace_a.join("lua").join("lib_a");
+        let workspace_b_lib = workspace_b.join("lua").join("lib_b");
+        let library_paths = loaded
+            .emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|item| PathBuf::from(item.get_path()))
+            .collect::<Vec<_>>();
+
+        assert!(
+            library_paths.iter().any(|path| path == &workspace_a_lib),
+            "libraries: {:?}",
+            loaded.emmyrc.workspace.library
+        );
+        assert!(
+            library_paths.iter().any(|path| path == &workspace_b_lib),
+            "libraries: {:?}",
+            loaded.emmyrc.workspace.library
+        );
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_collect_workspace_files_loads_libraries_from_each_workspace_config() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+        let library_a = workspace_a.join("lib_a");
+        let library_b = workspace_b.join("lib_b");
+        fs::create_dir_all(&library_a).expect("failed to create workspace a library");
+        fs::create_dir_all(&library_b).expect("failed to create workspace b library");
+
+        fs::write(library_a.join("globals_a.lua"), "LibGlobalA = true")
+            .expect("failed to write workspace a library file");
+        fs::write(library_b.join("globals_b.lua"), "LibGlobalB = true")
+            .expect("failed to write workspace b library file");
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "workspace": { "library": ["./lib_a"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "workspace": { "library": ["./lib_b"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        let mut workspaces = vec![
+            WorkspaceFolder::new(workspace_a.clone(), false),
+            WorkspaceFolder::new(workspace_b.clone(), false),
+        ];
+        for lib in &loaded.emmyrc.workspace.library {
+            workspaces.push(WorkspaceFolder::new(PathBuf::from(lib.get_path()), true));
+        }
+
+        let files = collect_workspace_files(&workspaces, &loaded.emmyrc, None, None);
+        let loaded_paths = files.into_iter().map(|f| f.path).collect::<Vec<_>>();
+
+        let globals_a_path = library_a.join("globals_a.lua").to_string_lossy().to_string();
+        let globals_b_path = library_b.join("globals_b.lua").to_string_lossy().to_string();
+        assert!(
+            loaded_paths.iter().any(|path| path == &globals_a_path),
+            "loaded paths: {:?}",
+            loaded_paths
+        );
+        assert!(
+            loaded_paths.iter().any(|path| path == &globals_b_path),
+            "loaded paths: {:?}",
+            loaded_paths
+        );
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_load_emmy_config_returns_per_workspace_diagnostic_configs() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "diagnostics": { "severity": { "undefined-global": "warning" } } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "diagnostics": { "severity": { "undefined-global": "error" } } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        let config_a = loaded
+            .workspace_diagnostic_configs
+            .get(&workspace_a)
+            .expect("workspace_a config should be present");
+        let config_b = loaded
+            .workspace_diagnostic_configs
+            .get(&workspace_b)
+            .expect("workspace_b config should be present");
+
+        assert_eq!(
+            config_a
+                .severity
+                .get(&DiagnosticCode::UndefinedGlobal)
+                .copied(),
+            Some(lsp_types::DiagnosticSeverity::WARNING)
+        );
+        assert_eq!(
+            config_b
+                .severity
+                .get(&DiagnosticCode::UndefinedGlobal)
+                .copied(),
+            Some(lsp_types::DiagnosticSeverity::ERROR)
+        );
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
     }
 }
