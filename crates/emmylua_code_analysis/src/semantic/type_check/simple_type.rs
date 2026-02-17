@@ -125,6 +125,13 @@ pub fn check_simple_type_compact(
             LuaType::Integer | LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) => {
                 return Ok(());
             }
+            // In LuaJIT/GLua, integer and number are interchangeable — no integer type exists
+            // at the runtime level. Allow number/float values to satisfy integer-typed slots.
+            LuaType::Number | LuaType::FloatConst(_) => {
+                if context.db.get_emmyrc().gmod.enabled {
+                    return Ok(());
+                }
+            }
             LuaType::Ref(_) => {
                 match check_base_type_for_ref_compact(context, source, compact_type, check_guard) {
                     Ok(_) => return Ok(()),
