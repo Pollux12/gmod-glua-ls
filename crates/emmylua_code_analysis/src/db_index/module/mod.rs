@@ -489,18 +489,20 @@ impl LuaModuleIndex {
                 }
             }
             WorkspaceKind::Main => match candidate_kind {
-                WorkspaceKind::Std => Some(1),
-                WorkspaceKind::Library => Some(2),
+                // Library (e.g. GMod annotations) takes priority over std so user-provided
+                // type definitions override the built-in Lua stdlib definitions.
+                WorkspaceKind::Library => Some(1),
+                WorkspaceKind::Std => Some(2),
                 WorkspaceKind::Main | WorkspaceKind::Remote => None,
             },
             WorkspaceKind::Library => match candidate_kind {
-                WorkspaceKind::Std => Some(1),
-                WorkspaceKind::Library => Some(2),
+                WorkspaceKind::Library => Some(1),
+                WorkspaceKind::Std => Some(2),
                 WorkspaceKind::Main | WorkspaceKind::Remote => None,
             },
             WorkspaceKind::Remote => match candidate_kind {
-                WorkspaceKind::Std => Some(1),
-                WorkspaceKind::Library => Some(2),
+                WorkspaceKind::Library => Some(1),
+                WorkspaceKind::Std => Some(2),
                 WorkspaceKind::Remote => Some(3),
                 WorkspaceKind::Main => None,
             },
