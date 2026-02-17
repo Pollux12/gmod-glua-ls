@@ -1,10 +1,15 @@
 use emmylua_code_analysis::LuaDocument;
-use emmylua_parser::{LuaSyntaxNode, LuaSyntaxToken, LuaTokenKind};
+use emmylua_parser::{
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaLiteralToken, LuaSyntaxNode,
+    LuaSyntaxToken, LuaTokenKind, NumberResult,
+};
 use lsp_types::{Color, ColorInformation};
 use rowan::{TextRange, TextSize};
 
 pub fn build_colors(root: LuaSyntaxNode, document: &LuaDocument) -> Vec<ColorInformation> {
     let mut result = vec![];
+
+    // Scan for hex colors embedded in string literals.
     let string_tokens = root
         .descendants_with_tokens()
         .filter_map(|it| it.into_token())
@@ -17,7 +22,71 @@ pub fn build_colors(root: LuaSyntaxNode, document: &LuaDocument) -> Vec<ColorInf
         try_build_color_information(token, document, &mut result);
     }
 
+    // Scan for GMod Color(r, g, b[, a]) constructor calls.
+    for call_expr in root.descendants().filter_map(LuaCallExpr::cast) {
+        try_build_gmod_color_call(call_expr, document, &mut result);
+    }
+
     result
+}
+
+/// Detects `Color(r, g, b)` or `Color(r, g, b, a)` calls where every argument is a
+/// numeric integer literal in the 0–255 range and registers a color swatch for them.
+fn try_build_gmod_color_call(
+    call_expr: LuaCallExpr,
+    document: &LuaDocument,
+    result: &mut Vec<ColorInformation>,
+) -> Option<()> {
+    // Prefix must be a bare name expression "Color".
+    let prefix = call_expr.get_prefix_expr()?;
+    let LuaExpr::NameExpr(name_expr) = &prefix else {
+        return None;
+    };
+    let name_token = name_expr.get_name_token()?;
+    if name_token.get_name_text() != "Color" {
+        return None;
+    }
+
+    let args_list = call_expr.get_args_list()?;
+    let args: Vec<_> = args_list.get_args().collect();
+
+    if args.len() < 3 || args.len() > 4 {
+        return None;
+    }
+
+    let mut components = [0.0f32; 4];
+    components[3] = 1.0; // default alpha = 255
+
+    for (i, arg) in args.iter().enumerate() {
+        let LuaExpr::LiteralExpr(lit_expr) = arg else {
+            return None;
+        };
+        let LuaLiteralToken::Number(num_token) = lit_expr.get_literal()? else {
+            return None;
+        };
+        let value: f64 = match num_token.get_number_value() {
+            NumberResult::Int(n) => n as f64,
+            NumberResult::Uint(n) => n as f64,
+            NumberResult::Float(n) => n,
+        };
+        if !(0.0..=255.0).contains(&value) {
+            return None;
+        }
+        components[i] = (value / 255.0) as f32;
+    }
+
+    let range = document.to_lsp_range(call_expr.syntax().text_range())?;
+    result.push(ColorInformation {
+        range,
+        color: Color {
+            red: components[0],
+            green: components[1],
+            blue: components[2],
+            alpha: components[3],
+        },
+    });
+
+    Some(())
 }
 
 fn try_build_color_information(

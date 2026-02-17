@@ -3,7 +3,7 @@ mod build_color;
 use build_color::{build_colors, convert_color_to_hex};
 use emmylua_parser::LuaAstNode;
 use lsp_types::{
-    ClientCapabilities, ColorInformation, ColorPresentation, ColorPresentationParams,
+    ClientCapabilities, Color, ColorInformation, ColorPresentation, ColorPresentationParams,
     ColorProviderCapability, DocumentColorParams, ServerCapabilities, TextEdit,
 };
 use tokio_util::sync::CancellationToken;
@@ -11,6 +11,21 @@ use tokio_util::sync::CancellationToken;
 use crate::context::ServerContextSnapshot;
 
 use super::RegisterCapabilities;
+
+/// Converts a color picker result back to a GMod `Color(r, g, b[, a])` constructor string.
+/// Preserves the original 3-arg vs 4-arg form based on the source text.
+fn convert_color_to_gmod(color: Color, original_text: &str) -> String {
+    let r = (color.red * 255.0).round() as u8;
+    let g = (color.green * 255.0).round() as u8;
+    let b = (color.blue * 255.0).round() as u8;
+    let comma_count = original_text.chars().filter(|&c| c == ',').count();
+    if comma_count >= 3 {
+        let a = (color.alpha * 255.0).round() as u8;
+        format!("Color({r}, {g}, {b}, {a})")
+    } else {
+        format!("Color({r}, {g}, {b})")
+    }
+}
 
 pub async fn on_document_color(
     context: ServerContextSnapshot,
@@ -69,7 +84,11 @@ pub async fn on_document_color_presentation(
     };
     let color = params.color;
     let text = document.get_text_slice(range);
-    let color_text = convert_color_to_hex(color, text.len());
+    let color_text = if text.starts_with("Color(") {
+        convert_color_to_gmod(color, text)
+    } else {
+        convert_color_to_hex(color, text.len())
+    };
     let color_presentations = vec![ColorPresentation {
         label: text.to_string(),
         text_edit: Some(TextEdit {
