@@ -71,6 +71,7 @@
     "gmod": {
       "$ref": "#/$defs/EmmyrcGmod",
       "default": {
+        "autoLoadAnnotations": null,
         "defaultRealm": "shared",
         "enabled": true,
         "hookMappings": {
@@ -832,6 +833,21 @@
     "EmmyrcGmod": {
       "type": "object",
       "properties": {
+        "annotationsPath": {
+          "description": "Path to GMod annotations to load as core library.\nWhen set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).\nSet to explicit path to override, or use `autoLoadAnnotations: false` in .emmyrc to disable entirely.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "autoLoadAnnotations": {
+          "description": "Disable auto-loading of annotations (from VSCode or default path).\nThis takes precedence over extension settings.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "defaultRealm": {
           "$ref": "#/$defs/EmmyrcGmodRealm",
           "default": "shared"

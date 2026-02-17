@@ -63,6 +63,18 @@ pub async fn initialized_handler(
     }
 
     let client_config = get_client_config(&context, client_id, supports_config_request).await;
+    
+    // Extract gmodAnnotationsPath from initialization options if provided
+    let mut client_config = client_config;
+    if let Some(ref init_options) = params.initialization_options {
+        if let Some(gmod_path) = init_options.get("gmodAnnotationsPath") {
+            if let Some(path_str) = gmod_path.as_str() {
+                log::info!("Received gmodAnnotationsPath from VSCode: {}", path_str);
+                client_config.gmod_annotations_path = Some(path_str.to_string());
+            }
+        }
+    }
+    
     log::info!("client_config: {:?}", client_config);
 
     let params_json = serde_json::to_string_pretty(&params).unwrap();

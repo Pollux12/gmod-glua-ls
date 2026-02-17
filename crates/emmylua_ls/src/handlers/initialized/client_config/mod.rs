@@ -15,6 +15,7 @@ pub struct ClientConfig {
     pub extensions: Vec<String>,
     pub encoding: String,
     pub partial_emmyrcs: Option<Vec<Value>>,
+    pub gmod_annotations_path: Option<String>,
 }
 
 pub async fn get_client_config(
@@ -28,6 +29,7 @@ pub async fn get_client_config(
         extensions: Vec::new(),
         encoding: "utf-8".to_string(),
         partial_emmyrcs: None,
+        gmod_annotations_path: None,
     };
     match client_id {
         ClientId::VSCode => {

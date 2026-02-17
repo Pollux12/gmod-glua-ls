@@ -20,6 +20,15 @@ pub struct EmmyrcGmod {
     pub detect_realm_from_calls: Option<bool>,
     #[serde(default = "infer_dynamic_fields_default")]
     pub infer_dynamic_fields: bool,
+    /// Path to GMod annotations to load as core library.
+    /// When set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).
+    /// Set to explicit path to override, or use `autoLoadAnnotations: false` in .emmyrc to disable entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations_path: Option<String>,
+    /// Disable auto-loading of annotations (from VSCode or default path).
+    /// This takes precedence over extension settings.
+    #[serde(default)]
+    pub auto_load_annotations: Option<bool>,
 }
 
 fn enabled_default() -> bool {
@@ -40,6 +49,8 @@ impl Default for EmmyrcGmod {
             detect_realm_from_filename: None,
             detect_realm_from_calls: None,
             infer_dynamic_fields: infer_dynamic_fields_default(),
+            annotations_path: None,
+            auto_load_annotations: None,
         }
     }
 }

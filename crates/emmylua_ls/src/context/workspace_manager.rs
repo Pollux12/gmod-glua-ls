@@ -375,6 +375,10 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
 
     let mut emmyrc = load_configs(config_files, client_config.partial_emmyrcs.clone());
     merge_client_config(&client_config, &mut emmyrc);
+    
+    // Inject GMod annotations path if provided and not explicitly disabled
+    inject_gmod_annotations(&client_config, &mut emmyrc);
+    
     let (workspace_diagnostic_configs, workspace_emmyrcs) = pre_process_emmyrc_for_all_roots(
         &mut emmyrc,
         &config_roots,
@@ -427,6 +431,7 @@ fn pre_process_emmyrc_for_all_roots(
             client_config.partial_emmyrcs.clone(),
         );
         merge_client_config(client_config, &mut workspace_emmyrc);
+        inject_gmod_annotations(client_config, &mut workspace_emmyrc);
         workspace_emmyrc.pre_process_emmyrc(workspace_root);
 
         // Store per-workspace diagnostic config before merging
@@ -558,6 +563,52 @@ fn merge_client_config(client_config: &ClientConfig, emmyrc: &mut Emmyrc) -> Opt
     }
 
     Some(())
+}
+
+/// Inject GMod annotations path into workspace library if appropriate
+fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
+    // Check if explicitly disabled in .emmyrc
+    if let Some(false) = emmyrc.gmod.auto_load_annotations {
+        log::info!("GMod annotations auto-load explicitly disabled in .emmyrc");
+        return;
+    }
+
+    // Determine which path to use
+    let annotations_path = if let Some(explicit_path) = &emmyrc.gmod.annotations_path {
+        // User specified explicit path in .emmyrc - use that
+        if explicit_path.is_empty() {
+            log::info!("GMod annotations_path is explicitly set to empty string - skipping");
+            return;
+        }
+        log::info!("Using GMod annotations from .emmyrc: {}", explicit_path);
+        explicit_path.clone()
+    } else if let Some(vscode_path) = &client_config.gmod_annotations_path {
+        // VSCode extension provided path
+        log::info!("Using GMod annotations from VSCode extension: {}", vscode_path);
+        vscode_path.clone()
+    } else {
+        // No path available
+        log::info!("No GMod annotations path available");
+        return;
+    };
+
+    // Add to library paths
+    use emmylua_code_analysis::EmmyLibraryItem;
+    if emmyrc
+        .workspace
+        .library
+        .iter()
+        .any(|item| item.get_path() == &annotations_path)
+    {
+        log::info!("GMod annotations path already exists in workspace library");
+        return;
+    }
+
+    emmyrc
+        .workspace
+        .library
+        .push(EmmyLibraryItem::Path(annotations_path));
+    log::info!("GMod annotations added to workspace library");
 }
 
 #[derive(Debug)]
