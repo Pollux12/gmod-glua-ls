@@ -10,7 +10,7 @@ use super::CodeLensData;
 
 // VSCode does not support calling editor.action.showReferences directly through LSP,
 // it can only be converted through the VSCode plugin
-const VSCODE_COMMAND_NAME: &str = "emmy.showReferences";
+const VSCODE_COMMAND_NAME: &str = "gluals.showReferences";
 // In fact, VSCode ultimately uses this command
 const OTHER_COMMAND_NAME: &str = "editor.action.showReferences";
 

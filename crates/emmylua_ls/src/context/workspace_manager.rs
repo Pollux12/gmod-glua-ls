@@ -341,7 +341,7 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
         );
     };
 
-    let emmylua_config_dir = "emmylua_ls";
+    let emmylua_config_dir = "gluals";
     let config_dir = dirs::config_dir().map(|path| path.join(emmylua_config_dir));
     if let Some(config_dir) = config_dir {
         push_configs_from_dir(
@@ -353,7 +353,7 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
         );
     };
 
-    std::env::var("EMMYLUALS_CONFIG")
+    std::env::var("GLUALS_CONFIG")
         .inspect(|path| {
             let config_path = std::path::PathBuf::from(path);
             if config_path.exists() {
@@ -375,10 +375,10 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
 
     let mut emmyrc = load_configs(config_files, client_config.partial_emmyrcs.clone());
     merge_client_config(&client_config, &mut emmyrc);
-    
+
     // Inject GMod annotations path if provided and not explicitly disabled
     inject_gmod_annotations(&client_config, &mut emmyrc);
-    
+
     let (workspace_diagnostic_configs, workspace_emmyrcs) = pre_process_emmyrc_for_all_roots(
         &mut emmyrc,
         &config_roots,

@@ -12,7 +12,7 @@ use super::CommandSpec;
 pub struct AutoRequireCommand;
 
 impl CommandSpec for AutoRequireCommand {
-    const COMMAND: &str = "emmy.auto.require";
+    const COMMAND: &str = "gluals.auto.require";
 
     async fn handle(context: ServerContextSnapshot, args: Vec<Value>) -> Option<()> {
         let add_to: FileId = serde_json::from_value(args.first()?.clone()).ok()?;

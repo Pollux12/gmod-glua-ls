@@ -7,7 +7,7 @@ pub enum EmmySyntaxTreeRequest {}
 impl Request for EmmySyntaxTreeRequest {
     type Params = EmmySyntaxTreeParams;
     type Result = Option<SyntaxTreeResponse>;
-    const METHOD: &'static str = "emmy/syntaxTree";
+    const METHOD: &'static str = "gluals/syntaxTree";
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]

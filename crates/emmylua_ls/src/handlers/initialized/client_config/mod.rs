@@ -36,7 +36,7 @@ pub async fn get_client_config(
             get_client_config_vscode(context, &mut config).await;
         }
         ClientId::Neovim => {
-            get_client_config_default(context, &mut config, Some(&["Lua", "emmylua"])).await;
+            get_client_config_default(context, &mut config, Some(&["Lua", "gluals"])).await;
         }
         _ if supports_config_request => {
             get_client_config_default(context, &mut config, None).await;

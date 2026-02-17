@@ -7,7 +7,7 @@ pub enum EmmyAnnotatorRequest {}
 impl Request for EmmyAnnotatorRequest {
     type Params = EmmyAnnotatorParams;
     type Result = Option<Vec<EmmyAnnotator>>;
-    const METHOD: &'static str = "emmy/annotator";
+    const METHOD: &'static str = "gluals/annotator";
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]

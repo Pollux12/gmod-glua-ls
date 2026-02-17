@@ -354,7 +354,7 @@ pub struct DocumentSymbolCapabilities;
 impl RegisterCapabilities for DocumentSymbolCapabilities {
     fn register_capabilities(server_capabilities: &mut ServerCapabilities, _: &ClientCapabilities) {
         server_capabilities.document_symbol_provider = Some(OneOf::Right(DocumentSymbolOptions {
-            label: Some("EmmyLua".into()),
+            label: Some("GLuaLS".into()),
             work_done_progress_options: Default::default(),
         }));
     }

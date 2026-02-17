@@ -21,7 +21,7 @@ pub enum DisableAction {
 pub struct DisableCodeCommand;
 
 impl CommandSpec for DisableCodeCommand {
-    const COMMAND: &str = "emmy.disable.code";
+    const COMMAND: &str = "gluals.disable.code";
 
     async fn handle(context: ServerContextSnapshot, args: Vec<Value>) -> Option<()> {
         let action: DisableAction = serde_json::from_value(args.first()?.clone()).ok()?;

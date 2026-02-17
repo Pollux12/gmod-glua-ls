@@ -62,7 +62,7 @@ fn register_files_watch_use_lsp_client(client: &ClientProxy) {
     };
 
     let registration = Registration {
-        id: "emmylua_watch_files".to_string(),
+        id: "gluals_watch_files".to_string(),
         method: "workspace/didChangeWatchedFiles".to_string(),
         register_options: Some(serde_json::to_value(options).unwrap()),
     };

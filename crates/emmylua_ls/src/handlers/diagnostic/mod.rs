@@ -14,7 +14,7 @@ impl RegisterCapabilities for DiagnosticCapabilities {
     fn register_capabilities(server_capabilities: &mut ServerCapabilities, _: &ClientCapabilities) {
         server_capabilities.diagnostic_provider =
             Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
-                identifier: Some("EmmyLua".to_string()),
+                identifier: Some("GLuaLS".to_string()),
                 inter_file_dependencies: false,
                 workspace_diagnostics: true,
                 ..Default::default()

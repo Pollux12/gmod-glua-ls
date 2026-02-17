@@ -24,7 +24,7 @@ pub fn build_actions(
         }
 
         let source = diagnostic.source.unwrap();
-        if source != "EmmyLua" {
+        if source != "GLuaLS" {
             continue;
         }
 

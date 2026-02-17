@@ -9,7 +9,7 @@ pub enum EmmyGutterDetailRequest {}
 impl Request for EmmyGutterDetailRequest {
     type Params = EmmyGutterDetailParams;
     type Result = Option<GutterDetailResponse>;
-    const METHOD: &'static str = "emmy/gutter/detail";
+    const METHOD: &'static str = "gluals/gutter/detail";
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]

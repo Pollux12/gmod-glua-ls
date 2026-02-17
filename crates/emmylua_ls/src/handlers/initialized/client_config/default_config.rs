@@ -30,7 +30,7 @@ pub async fn get_client_config_default(
 
     let mut configs = Vec::new();
     let mut used_scope = None;
-    for scope in scopes.unwrap_or(&["emmylua"]) {
+    for scope in scopes.unwrap_or(&["gluals"]) {
         let params = lsp_types::ConfigurationParams {
             items: scope_uris
                 .iter()

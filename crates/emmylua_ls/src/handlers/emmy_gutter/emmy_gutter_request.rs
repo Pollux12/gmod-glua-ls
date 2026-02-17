@@ -7,7 +7,7 @@ pub enum EmmyGutterRequest {}
 impl Request for EmmyGutterRequest {
     type Params = EmmyGutterParams;
     type Result = Option<Vec<GutterInfo>>;
-    const METHOD: &'static str = "emmy/gutter";
+    const METHOD: &'static str = "gluals/gutter";
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
