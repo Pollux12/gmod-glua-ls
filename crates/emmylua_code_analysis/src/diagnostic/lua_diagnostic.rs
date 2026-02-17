@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use super::checker::DiagnosticContext;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
-use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation};
+use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
 use lsp_types::Diagnostic;
 use tokio_util::sync::CancellationToken;
 
@@ -10,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 pub struct LuaDiagnostic {
     enable: bool,
     config: Arc<LuaDiagnosticConfig>,
+    workspace_configs: HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
 }
 
 impl Default for LuaDiagnostic {
@@ -23,12 +25,21 @@ impl LuaDiagnostic {
         Self {
             enable: true,
             config: Arc::new(LuaDiagnosticConfig::default()),
+            workspace_configs: HashMap::new(),
         }
     }
 
     pub fn update_config(&mut self, emmyrc: Arc<Emmyrc>) {
         self.enable = emmyrc.diagnostics.enable;
         self.config = LuaDiagnosticConfig::new(&emmyrc).into();
+        self.workspace_configs.clear();
+    }
+
+    pub fn set_workspace_configs(
+        &mut self,
+        configs: HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
+    ) {
+        self.workspace_configs = configs;
     }
 
     // 只开启指定的诊断
@@ -41,6 +52,22 @@ impl LuaDiagnostic {
             }
         }
         self.config = LuaDiagnosticConfig::new(&emmyrc).into();
+    }
+
+    fn get_config_for_file(
+        &self,
+        compilation: &LuaCompilation,
+        file_id: FileId,
+    ) -> Arc<LuaDiagnosticConfig> {
+        if !self.workspace_configs.is_empty() {
+            let db = compilation.get_db();
+            if let Some(workspace_id) = db.get_module_index().get_workspace_id(file_id) {
+                if let Some(config) = self.workspace_configs.get(&workspace_id) {
+                    return config.clone();
+                }
+            }
+        }
+        self.config.clone()
     }
 
     pub fn diagnose_file(
@@ -58,14 +85,15 @@ impl LuaDiagnostic {
         }
 
         let db = compilation.get_db();
-        if let Some(module_info) = db.get_module_index().get_workspace_id(file_id)
-            && !module_info.is_main()
+        if let Some(workspace_id) = db.get_module_index().get_workspace_id(file_id)
+            && !db.get_module_index().is_main_workspace_id(workspace_id)
         {
             return None;
         }
 
+        let config = self.get_config_for_file(compilation, file_id);
         let semantic_model = compilation.get_semantic_model(file_id)?;
-        let mut context = DiagnosticContext::new(file_id, db, self.config.clone());
+        let mut context = DiagnosticContext::new(file_id, db, config);
 
         check_file(&mut context, &semantic_model);
 

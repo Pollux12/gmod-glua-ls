@@ -54,11 +54,18 @@ fn check_name_expr(
         return Some(());
     }
 
-    if semantic_model
-        .get_db()
-        .get_global_index()
-        .is_exist_global_decl(&name_text)
+    let db = semantic_model.get_db();
+    let module_index = db.get_module_index();
+    if let Some(current_workspace_id) = module_index.get_workspace_id(semantic_model.get_file_id())
     {
+        if db.get_global_index().is_exist_global_decl_in_workspace(
+            &name_text,
+            module_index,
+            current_workspace_id,
+        ) {
+            return Some(());
+        }
+    } else if db.get_global_index().is_exist_global_decl(&name_text) {
         return Some(());
     }
 

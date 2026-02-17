@@ -6,3 +6,4 @@ mod test;
 
 pub use lua_diagnostic::LuaDiagnostic;
 pub use lua_diagnostic_code::DiagnosticCode;
+pub use lua_diagnostic_config::LuaDiagnosticConfig;
