@@ -32,13 +32,6 @@ impl Checker for GmodRealmMisuseChecker {
                 call_expr.get_range().start(),
             );
 
-            if is_add_cslua_file_call(&call_expr)
-                && call_realm.realm == GmodRealm::Client
-                && let Some(code) = diagnostic_code_for_single_realm(call_realm.evidence)
-            {
-                context.add_diagnostic(code, call_expr.get_range(), add_cslua_message(code), None);
-            }
-
             let callee_realms = resolve_callee_realms(semantic_model, &call_expr);
             if callee_realms.is_empty() {
                 continue;
@@ -244,16 +237,6 @@ fn realm_evidence_at_offset(metadata: &GmodRealmFileMetadata, offset: TextSize) 
     RealmEvidence::Unknown
 }
 
-fn diagnostic_code_for_single_realm(evidence: RealmEvidence) -> Option<DiagnosticCode> {
-    if is_strict_evidence(evidence) {
-        Some(DiagnosticCode::GmodRealmMisuse)
-    } else if is_inferred_evidence(evidence) {
-        Some(DiagnosticCode::GmodRealmMisuseRisky)
-    } else {
-        None
-    }
-}
-
 fn diagnostic_code_for_mismatch(
     call_evidence: RealmEvidence,
     callee_evidence: RealmEvidence,
@@ -280,34 +263,11 @@ fn is_strict_evidence(evidence: RealmEvidence) -> bool {
     )
 }
 
-fn is_inferred_evidence(evidence: RealmEvidence) -> bool {
-    matches!(
-        evidence,
-        RealmEvidence::InferredFilename
-            | RealmEvidence::InferredDependency
-            | RealmEvidence::InferredDefault
-    )
-}
-
 fn is_cross_realm_misuse(call_realm: GmodRealm, callee_realm: GmodRealm) -> bool {
     matches!(
         (call_realm, callee_realm),
         (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
     )
-}
-
-fn add_cslua_message(code: DiagnosticCode) -> String {
-    match code {
-        DiagnosticCode::GmodRealmMisuse => t!(
-            "AddCSLuaFile is server-only and is invalid in explicit client-only code paths."
-        )
-        .to_string(),
-        DiagnosticCode::GmodRealmMisuseRisky => t!(
-            "AddCSLuaFile is server-only; current code path is inferred as client and may be invalid."
-        )
-        .to_string(),
-        _ => t!("AddCSLuaFile is server-only.").to_string(),
-    }
 }
 
 fn mismatch_message(
@@ -345,14 +305,4 @@ fn realm_label(realm: GmodRealm) -> &'static str {
         GmodRealm::Shared => "shared",
         GmodRealm::Unknown => "unknown",
     }
-}
-
-fn is_add_cslua_file_call(call_expr: &LuaCallExpr) -> bool {
-    let Some(call_path) = call_expr.get_access_path() else {
-        return false;
-    };
-
-    call_path == "AddCSLuaFile"
-        || call_path.ends_with(".AddCSLuaFile")
-        || call_path.ends_with(":AddCSLuaFile")
 }

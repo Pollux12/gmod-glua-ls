@@ -11,9 +11,13 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = false;
         ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "addons/test/lua/autorun/server/sv_api.lua",
+            r#"function ServerOnlyApi() return true end"#,
+        );
         let file_id = ws.def_file(
             "addons/test/lua/autorun/client/cl_test.lua",
-            r#"AddCSLuaFile("shared.lua")"#,
+            r#"ServerOnlyApi()"#,
         );
         let diagnostics = ws
             .analysis
@@ -34,9 +38,13 @@ mod tests {
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::GmodRealmMisuseRisky);
+        ws.def_file(
+            "addons/test/lua/autorun/server/sv_api.lua",
+            r#"function ServerOnlyApi() return true end"#,
+        );
         let file_id = ws.def_file(
             "addons/test/lua/autorun/client/cl_test.lua",
-            r#"AddCSLuaFile("shared.lua")"#,
+            r#"ServerOnlyApi()"#,
         );
         let diagnostics = ws
             .analysis
@@ -46,6 +54,69 @@ mod tests {
             DiagnosticCode::GmodRealmMisuseRisky.get_name().to_string(),
         ));
         assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == code));
+    }
+
+    /// AddCSLuaFile is a shared function: it can be called from any realm and simply
+    /// does nothing on the client. Calling it from a client file must not produce any
+    /// realm-misuse diagnostic.
+    #[gtest]
+    fn test_addcsluafile_no_realm_diagnostic_in_client_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/cl_test.lua",
+            r#"AddCSLuaFile("shared.lua")"#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let misuse_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+        ));
+        let risky_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMisuseRisky.get_name().to_string(),
+        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == misuse_code || d.code == risky_code)
+        );
+    }
+
+    /// AddCSLuaFile is a shared function: calling it inside an explicit `if CLIENT then`
+    /// block must not produce a realm-misuse diagnostic either.
+    #[gtest]
+    fn test_addcsluafile_no_realm_diagnostic_in_explicit_client_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/sh_test.lua",
+            r#"
+                if CLIENT then
+                    AddCSLuaFile("shared.lua")
+                end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let misuse_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+        ));
+        let risky_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMisuseRisky.get_name().to_string(),
+        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == misuse_code || d.code == risky_code)
+        );
     }
 
     #[gtest]
@@ -447,12 +518,16 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = false;
         ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "addons/test/lua/autorun/server/sv_api.lua",
+            r#"function ServerOnlyApi() return true end"#,
+        );
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::GmodRealmMisuse);
         let file_id = ws.def_file(
             "addons/test/lua/autorun/client/cl_test.lua",
-            r#"AddCSLuaFile("shared.lua")"#,
+            r#"ServerOnlyApi()"#,
         );
         let diagnostics = ws
             .analysis
