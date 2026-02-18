@@ -158,6 +158,8 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::IterVariableReassign => DiagnosticSeverity::ERROR,
         DiagnosticCode::PreferredLocalAlias => DiagnosticSeverity::HINT,
         DiagnosticCode::CallNonCallable => DiagnosticSeverity::WARNING,
+        DiagnosticCode::NeedCheckNil => DiagnosticSeverity::HINT,
+        DiagnosticCode::GenericConstraintMismatch => DiagnosticSeverity::INFORMATION,
         DiagnosticCode::GmodDuplicateSystemRegistration => DiagnosticSeverity::HINT,
         DiagnosticCode::GmodRealmMisuseRisky => DiagnosticSeverity::HINT,
         _ => DiagnosticSeverity::WARNING,
@@ -171,10 +173,25 @@ pub fn is_code_default_enable(code: &DiagnosticCode, level: LuaLanguageLevel) ->
         DiagnosticCode::IncompleteSignatureDoc => false,
         DiagnosticCode::MissingGlobalDoc => false,
         DiagnosticCode::UnknownDocTag => false,
+        DiagnosticCode::InjectField => false,
+        DiagnosticCode::UnnecessaryIf => false,
+        DiagnosticCode::RedundantReturnValue => false,
+        DiagnosticCode::UnnecessaryAssert => false,
+        DiagnosticCode::GlobalInNonModule => false,
+        DiagnosticCode::UnusedSelf => false,
+        DiagnosticCode::MissingReturn => false,
+        DiagnosticCode::DuplicateType => false,
+        DiagnosticCode::ReturnTypeMismatch => false,
+        DiagnosticCode::DuplicateSetField => false,
+        DiagnosticCode::CallNonCallable => false,
+        DiagnosticCode::InvertIf => false,
+
+        // gmod diagnostics
         DiagnosticCode::GmodRealmMisuse => true,
-        DiagnosticCode::GmodRealmMisuseRisky => false,
-        DiagnosticCode::GmodDuplicateSystemRegistration => false,
-        // ... handle other variants
+        DiagnosticCode::GmodRealmMisuseRisky => true,
+        DiagnosticCode::GmodDuplicateSystemRegistration => true,
+        DiagnosticCode::GmodUnknownNetMessage => true,
+        DiagnosticCode::GmodInvalidHookName => true,
 
         // neovim-code-style
         DiagnosticCode::NonLiteralExpressionsInAssert => false,
