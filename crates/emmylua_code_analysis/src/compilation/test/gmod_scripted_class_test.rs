@@ -354,6 +354,58 @@ mod test {
     }
 
     #[gtest]
+    fn test_entity_scope_ent_decl_is_local_and_not_indexed_globally() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "entities/entities/cityrp_money/sh_init.lua",
+            r#"
+            ENT = ENT or {}
+            ENT.Type = "anim"
+            ENT.Base = "base_gmodentity"
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let (ent_decl_id, ent_decl_is_local) = {
+            let decl_tree = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .expect("expected decl tree");
+            let ent_decl = decl_tree
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == "ENT")
+                .expect("expected ENT declaration");
+            (ent_decl.get_id(), ent_decl.is_local())
+        };
+
+        assert!(ent_decl_is_local, "expected ENT declaration to be local");
+
+        let has_ent_global_decl = db
+            .get_global_index()
+            .get_global_decl_ids("ENT")
+            .is_some_and(|decl_ids| decl_ids.contains(&ent_decl_id));
+        assert!(
+            !has_ent_global_decl,
+            "expected ENT declaration to be excluded from global index"
+        );
+
+        let has_ent_global_refs_in_file = db
+            .get_reference_index()
+            .get_global_file_references("ENT", file_id)
+            .is_some_and(|refs| !refs.is_empty());
+        assert!(
+            !has_ent_global_refs_in_file,
+            "expected no global ENT references for scripted-scope file"
+        );
+    }
+
+    #[gtest]
     fn test_entity_scope_creates_class_decl_without_ent_base_assignment() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

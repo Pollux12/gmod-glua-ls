@@ -9,13 +9,16 @@ use crate::{
     profile::Profile,
 };
 
-use super::{AnalyzeContext, gmod::ensure_scoped_class_type_decl_for_file};
+use super::{
+    AnalyzeContext,
+    gmod::{ensure_scoped_class_type_decl_for_file, scoped_class_global_name_for_file},
+};
 use emmylua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaSyntaxKind, LuaVarExpr};
 use rowan::{TextRange, TextSize, WalkEvent};
 
 use crate::{
     FileId,
-    db_index::{LuaDecl, LuaDeclId, LuaDeclarationTree, LuaScopeId},
+    db_index::{LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclarationTree, LuaScopeId},
 };
 
 pub struct DeclAnalysisPipeline;
@@ -30,6 +33,14 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
             None
         };
         for in_filed_tree in tree_list.iter() {
+            let scoped_class_global_name = if let Some(scripted_scope_files) =
+                scripted_scope_files.as_ref()
+                && scripted_scope_files.contains(&in_filed_tree.file_id)
+            {
+                scoped_class_global_name_for_file(db, in_filed_tree.file_id)
+            } else {
+                None
+            };
             db.get_reference_index_mut()
                 .create_local_reference(in_filed_tree.file_id);
             let mut analyzer = DeclAnalyzer::new(
@@ -37,6 +48,7 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
                 in_filed_tree.file_id,
                 in_filed_tree.value.clone(),
                 context,
+                scoped_class_global_name,
             );
             analyzer.analyze();
             let decl_tree = analyzer.get_decl_tree();
@@ -164,6 +176,7 @@ pub struct DeclAnalyzer<'a> {
     db: &'a mut DbIndex,
     root: LuaChunk,
     decl: LuaDeclarationTree,
+    scoped_class_global_name: Option<&'static str>,
     scopes: Vec<LuaScopeId>,
     is_meta: bool,
     context: &'a mut AnalyzeContext,
@@ -175,11 +188,13 @@ impl<'a> DeclAnalyzer<'a> {
         file_id: FileId,
         root: LuaChunk,
         context: &'a mut AnalyzeContext,
+        scoped_class_global_name: Option<&'static str>,
     ) -> DeclAnalyzer<'a> {
         DeclAnalyzer {
             db,
             root,
             decl: LuaDeclarationTree::new(file_id),
+            scoped_class_global_name,
             scopes: Vec::new(),
             is_meta: false,
             context,
@@ -223,7 +238,14 @@ impl<'a> DeclAnalyzer<'a> {
         }
     }
 
-    pub fn add_decl(&mut self, decl: LuaDecl) -> LuaDeclId {
+    pub fn add_decl(&mut self, mut decl: LuaDecl) -> LuaDeclId {
+        if let Some(scoped_class_global_name) = self.scoped_class_global_name
+            && decl.get_name() == scoped_class_global_name
+            && let LuaDeclExtra::Global { kind } = decl.extra.clone()
+        {
+            decl.extra = LuaDeclExtra::Local { kind, attrib: None };
+        }
+
         let is_global = decl.is_global();
         let file_id = decl.get_file_id();
         let name = decl.get_name().to_string();
@@ -244,6 +266,11 @@ impl<'a> DeclAnalyzer<'a> {
 
     pub fn find_decl(&self, name: &str, position: TextSize) -> Option<&LuaDecl> {
         self.decl.find_local_decl(name, position)
+    }
+
+    pub fn is_scoped_class_global_name(&self, name: &str) -> bool {
+        self.scoped_class_global_name
+            .is_some_and(|scoped_name| scoped_name == name)
     }
 }
 

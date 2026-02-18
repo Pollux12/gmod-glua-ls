@@ -22,8 +22,8 @@ pub fn analyze_name_expr(analyzer: &mut DeclAnalyzer, expr: LuaNameExpr) -> Opti
     let range = name_token.get_range();
     let file_id = analyzer.get_file_id();
     let decl_id = LuaDeclId::new(file_id, position);
-    let (decl_id, is_local) = if analyzer.decl.get_decl(&decl_id).is_some() {
-        (Some(decl_id), false)
+    let (decl_id, is_local) = if let Some(decl) = analyzer.decl.get_decl(&decl_id) {
+        (Some(decl_id), decl.is_local())
     } else if let Some(decl) = analyzer.find_decl(name, position) {
         if decl.is_local() {
             // reference local variable
@@ -39,13 +39,14 @@ pub fn analyze_name_expr(analyzer: &mut DeclAnalyzer, expr: LuaNameExpr) -> Opti
         (None, false)
     };
 
+    let is_scoped_class_global_name = analyzer.is_scoped_class_global_name(name);
     let reference_index = analyzer.db.get_reference_index_mut();
 
     if let Some(id) = decl_id {
         reference_index.add_decl_reference(id, file_id, range, false);
     }
 
-    if !is_local {
+    if !is_local && !is_scoped_class_global_name {
         reference_index.add_global_reference(name, file_id, expr.get_syntax_id());
     }
 
