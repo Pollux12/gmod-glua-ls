@@ -539,6 +539,12 @@ fn collect_config_files_from_dir(
     emmyrc_file: &str,
     emmyrc_lua_file: &str,
 ) -> Vec<PathBuf> {
+    // .gluarc.json is the GMod-specific config — if present, it takes exclusive priority
+    // and no other config files in this directory are considered.
+    let gluarc = dir.join(".gluarc.json");
+    if gluarc.exists() {
+        return vec![gluarc];
+    }
     [
         dir.join(luarc_file),
         dir.join(emmyrc_file),
@@ -760,6 +766,23 @@ mod tests {
 
     fn touch(path: &Path) {
         fs::write(path, "{}").expect("failed to create temp config file");
+    }
+
+    #[test]
+    fn test_collect_config_files_from_dir_gluarc_json_takes_exclusive_priority() {
+        let dir = create_temp_dir();
+        let gluarc_json = dir.join(".gluarc.json");
+        let emmyrc_json = dir.join(".emmyrc.json");
+        let luarc_json = dir.join(".luarc.json");
+        touch(&gluarc_json);
+        touch(&emmyrc_json);
+        touch(&luarc_json);
+
+        let files =
+            collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
+
+        assert_eq!(files, vec![gluarc_json]);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

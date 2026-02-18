@@ -142,6 +142,11 @@ pub fn load_workspace(
 }
 
 fn discover_config_files_in_order(root: &Path) -> Vec<PathBuf> {
+    // .gluarc.json is the GMod-specific config — if present, it takes exclusive priority.
+    let gluarc = root.join(".gluarc.json");
+    if gluarc.exists() {
+        return vec![gluarc];
+    }
     [
         root.join(".luarc.json"),
         root.join(".emmyrc.json"),
