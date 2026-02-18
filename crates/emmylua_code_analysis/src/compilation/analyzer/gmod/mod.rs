@@ -11,8 +11,9 @@ use emmylua_parser::{
 
 use crate::{
     EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodScriptedClassCallKind,
-    GmodScriptedClassCallMetadata, LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature,
-    LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
+    GmodScriptedClassCallMetadata, LuaDeclExtra, LuaDeclTypeKind, LuaFunctionType, LuaMember,
+    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl,
+    LuaTypeDeclId, LuaTypeFlag,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -191,6 +192,16 @@ fn collect_scripted_scope_type_bindings(db: &mut DbIndex, file_id: FileId) {
             decl_id.into(),
             LuaTypeCache::InferType(LuaType::Def(class_decl_id.clone())),
         );
+
+        // Mark the declaration as local so hover shows "local" instead of "(global)"
+        if let Some(decl) = db.get_decl_index_mut().get_decl_mut(&decl_id) {
+            if let LuaDeclExtra::Global { kind } = decl.extra {
+                decl.extra = LuaDeclExtra::Local {
+                    kind,
+                    attrib: None,
+                };
+            }
+        }
 
         if let Some(LuaType::TableConst(table_range)) = previous_decl_type {
             let table_member_owner = LuaMemberOwner::Element(table_range);
