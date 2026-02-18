@@ -32,9 +32,22 @@ impl Checker for GmodRealmMisuseChecker {
                 call_expr.get_range().start(),
             );
 
-            let callee_realms = resolve_callee_realms(semantic_model, &call_expr);
+            let mut callee_realms = resolve_callee_realms(semantic_model, &call_expr);
             if callee_realms.is_empty() {
                 continue;
+            }
+
+            // If a function is defined in both client and server realms, treat it as shared
+            let has_client = callee_realms.iter().any(|r| r.realm == GmodRealm::Client);
+            let has_server = callee_realms.iter().any(|r| r.realm == GmodRealm::Server);
+            if has_client && has_server {
+                push_unique_realm(
+                    &mut callee_realms,
+                    ResolvedRealm {
+                        realm: GmodRealm::Shared,
+                        evidence: RealmEvidence::InferredDependency,
+                    },
+                );
             }
 
             if callee_realms
