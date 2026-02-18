@@ -31,23 +31,12 @@ pub fn get_type_at_call_expr(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    // Check for IsValid pattern (Garry's Mod nil check)
-    if let Some(result) = try_narrow_isvalid(
-        db,
-        tree,
-        cache,
-        root,
-        var_ref_id,
-        flow_node,
-        &call_expr,
-        &prefix_expr,
-        condition_flow,
-    )? {
-        return Ok(ResultTypeOrContinue::Result(result));
-    }
+    // Keep references for potential IsValid fallback
+    let call_expr_ref = call_expr.clone();
+    let prefix_expr_ref = prefix_expr.clone();
 
     let maybe_func = infer_expr(db, cache, prefix_expr.clone())?;
-    match maybe_func {
+    let result = match maybe_func {
         LuaType::DocFunction(f) => {
             let return_type = f.get_ret();
             match return_type {
@@ -140,7 +129,27 @@ pub fn get_type_at_call_expr(
             // If the prefix expression is not a function, we cannot infer the type cast.
             Ok(ResultTypeOrContinue::Continue)
         }
+    };
+
+    // Fallback: check for IsValid pattern (Garry's Mod nil check) when normal
+    // type-based narrowing didn't produce a result
+    if let Ok(ResultTypeOrContinue::Continue) = result {
+        if let Some(isvalid_type) = try_narrow_isvalid(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            &call_expr_ref,
+            &prefix_expr_ref,
+            condition_flow,
+        )? {
+            return Ok(ResultTypeOrContinue::Result(isvalid_type));
+        }
     }
+
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -464,8 +473,11 @@ fn try_narrow_isvalid(
                 None => return Ok(None),
             }
         }
-        // Method call: x:IsValid()
+        // Method call: x:IsValid() (only colon syntax, not dot syntax)
         LuaExpr::IndexExpr(index_expr) => {
+            if !call_expr.is_colon_call() {
+                return Ok(None);
+            }
             let is_isvalid = match index_expr.get_index_key() {
                 Some(LuaIndexKey::Name(name_token)) => {
                     name_token.get_name_text() == "IsValid"
