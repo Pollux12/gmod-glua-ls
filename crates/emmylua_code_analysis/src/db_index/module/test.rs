@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use crate::{
         FileId, WorkspaceId,
@@ -251,5 +251,29 @@ mod tests {
         let module_info = m.get_module(file_id).unwrap();
         assert_eq!(module_info.workspace_id, workspace_lib);
         assert_eq!(module_info.name, "globals");
+    }
+
+    #[test]
+    fn test_get_main_workspace_roots_returns_only_main_workspaces() {
+        let mut m = create_module();
+        let main_a = PathBuf::from("C:/Users/username/ProjectA");
+        let main_b = PathBuf::from("C:/Users/username/ProjectB");
+        let library = PathBuf::from("C:/Users/username/Annotations");
+        let std_root = PathBuf::from("C:/Users/username/Std");
+
+        m.add_workspace_root_with_kind(main_a.clone(), WorkspaceId::MAIN, WorkspaceKind::Main);
+        m.add_workspace_root_with_kind(
+            main_b.clone(),
+            WorkspaceId { id: 7 },
+            WorkspaceKind::Main,
+        );
+        m.add_workspace_root_with_kind(
+            library,
+            WorkspaceId { id: 8 },
+            WorkspaceKind::Library,
+        );
+        m.add_workspace_root_with_kind(std_root, WorkspaceId::STD, WorkspaceKind::Std);
+
+        assert_eq!(m.get_main_workspace_roots(), vec![main_a, main_b]);
     }
 }

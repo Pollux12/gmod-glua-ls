@@ -19,7 +19,7 @@ mod signature;
 mod traits;
 mod r#type;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{Emmyrc, FileId, Vfs};
 pub use accessor_func::*;
@@ -276,6 +276,18 @@ impl DbIndex {
 
     pub fn get_emmyrc(&self) -> &Emmyrc {
         &self.emmyrc
+    }
+
+    pub fn get_effective_resource_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.modules_index.get_main_workspace_roots();
+
+        for configured_path in self.emmyrc.resource.paths.iter().map(PathBuf::from) {
+            if !paths.contains(&configured_path) {
+                paths.push(configured_path);
+            }
+        }
+
+        paths
     }
 }
 

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use emmylua_code_analysis::{DbIndex, Emmyrc, LuaDocument, file_path_to_uri};
+use emmylua_code_analysis::{DbIndex, LuaDocument, file_path_to_uri};
 use emmylua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken,
     LuaSyntaxNode,
@@ -11,7 +11,6 @@ pub fn build_links(
     db: &DbIndex,
     root: LuaSyntaxNode,
     document: &LuaDocument,
-    emmyrc: &Emmyrc,
 ) -> Option<Vec<DocumentLink>> {
     let string_tokens = root
         .descendants_with_tokens()
@@ -20,7 +19,7 @@ pub fn build_links(
 
     let mut result = vec![];
     for token in string_tokens {
-        try_build_file_link(db, token, document, &mut result, emmyrc);
+        try_build_file_link(db, token, document, &mut result);
     }
 
     Some(result)
@@ -31,7 +30,6 @@ fn try_build_file_link(
     token: LuaStringToken,
     document: &LuaDocument,
     result: &mut Vec<DocumentLink>,
-    emmyrc: &Emmyrc,
 ) -> Option<()> {
     if is_require_path(token.clone()).unwrap_or(false) {
         try_build_module_link(db, token, document, result);
@@ -55,9 +53,9 @@ fn try_build_file_link(
             return Some(());
         }
 
-        let resource_paths = emmyrc.resource.paths.clone();
+        let resource_paths = db.get_effective_resource_paths();
         for resource_path in resource_paths {
-            let full_path = PathBuf::from(resource_path).join(&suffix_path);
+            let full_path = resource_path.join(&suffix_path);
             if full_path.exists() {
                 if let Some(uri) = file_path_to_uri(&full_path) {
                     let document_link = DocumentLink {

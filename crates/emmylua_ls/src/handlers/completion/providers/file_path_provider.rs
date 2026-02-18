@@ -264,12 +264,8 @@ fn collect_contextual_roots(builder: &CompletionBuilder) -> Vec<PathBuf> {
 fn collect_resource_roots(builder: &CompletionBuilder) -> Vec<PathBuf> {
     let roots = builder
         .semantic_model
-        .get_emmyrc()
-        .resource
-        .paths
-        .iter()
-        .map(PathBuf::from)
-        .collect();
+        .get_db()
+        .get_effective_resource_paths();
 
     dedup_existing_dirs(roots)
 }
