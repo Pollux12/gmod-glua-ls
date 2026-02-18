@@ -94,7 +94,6 @@
     "hint": {
       "$ref": "#/$defs/EmmyrcInlayHint",
       "default": {
-        "enable": true,
         "enumParamHint": false,
         "indexHint": true,
         "localHint": true,
@@ -134,7 +133,6 @@
       "$ref": "#/$defs/EmmyrcRuntime",
       "default": {
         "extensions": [],
-        "frameworkVersions": [],
         "nonstandardSymbol": [
           "//",
           "/**/",
@@ -157,12 +155,6 @@
         "renderDocumentationMarkup": true
       }
     },
-    "signature": {
-      "$ref": "#/$defs/EmmyrcSignature",
-      "default": {
-        "detailSignatureHelper": true
-      }
-    },
     "strict": {
       "$ref": "#/$defs/EmmyrcStrict",
       "default": {
@@ -170,8 +162,7 @@
         "docBaseConstMatchBaseType": true,
         "metaOverrideFileDefine": true,
         "requireExportGlobal": false,
-        "requirePath": false,
-        "typeCall": false
+        "requirePath": false
       }
     },
     "workspace": {
@@ -184,7 +175,6 @@
         "library": [],
         "moduleMap": [],
         "packageDirs": [],
-        "preloadFileSize": 0,
         "reindexDuration": 5000,
         "workspaceRoots": []
       }
@@ -978,12 +968,6 @@
     "EmmyrcInlayHint": {
       "type": "object",
       "properties": {
-        "enable": {
-          "description": "Enable inlay hints.",
-          "type": "boolean",
-          "default": true,
-          "x-vscode-setting": true
-        },
         "enumParamHint": {
           "description": "Show name of enumerator when passing a literal value to a function\nthat expects an enum.\n\nExample:\n\n```lua\n--- @enum Level\nlocal Foo = {\n   Info = 1,\n   Error = 2,\n}\n\n--- @param l Level\nfunction print_level(l) end\n\nprint_level(1 --[[ Hint: Level.Info ]])\n```",
           "type": "boolean",
@@ -1176,14 +1160,6 @@
             "type": "string"
           }
         },
-        "frameworkVersions": {
-          "description": "Framework versions.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
         "nonstandardSymbol": {
           "description": "Non-standard symbols.",
           "type": "array",
@@ -1240,16 +1216,6 @@
         }
       }
     },
-    "EmmyrcSignature": {
-      "type": "object",
-      "properties": {
-        "detailSignatureHelper": {
-          "description": "Whether to enable signature help.",
-          "type": "boolean",
-          "default": true
-        }
-      }
-    },
     "EmmyrcSpecialSymbol": {
       "type": "string",
       "enum": [
@@ -1286,10 +1252,6 @@
         },
         "requirePath": {
           "description": "Whether to enable strict mode require path.",
-          "type": "boolean",
-          "default": false
-        },
-        "typeCall": {
           "type": "boolean",
           "default": false
         }
@@ -1348,11 +1310,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "preloadFileSize": {
-          "type": "integer",
-          "format": "int32",
-          "default": 0
         },
         "reindexDuration": {
           "description": "Delay between changing a file and full project reindex, in milliseconds.",

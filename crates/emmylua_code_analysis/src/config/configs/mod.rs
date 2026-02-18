@@ -13,7 +13,6 @@ mod reformat;
 mod resource;
 mod runtime;
 mod semantictoken;
-mod signature;
 mod strict;
 mod workspace;
 
@@ -34,7 +33,6 @@ pub use reformat::{EmmyrcExternalTool, EmmyrcReformat};
 pub use resource::EmmyrcResource;
 pub use runtime::{EmmyrcLuaVersion, EmmyrcRuntime};
 pub use semantictoken::EmmyrcSemanticToken;
-pub use signature::EmmyrcSignature;
 pub use strict::EmmyrcStrict;
 pub use workspace::{
     EmmyLibraryConfig, EmmyLibraryItem, EmmyrcWorkspace, EmmyrcWorkspaceModuleMap,

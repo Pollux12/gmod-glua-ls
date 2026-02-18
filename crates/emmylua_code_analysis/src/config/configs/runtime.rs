@@ -15,9 +15,6 @@ pub struct EmmyrcRuntime {
     /// Functions that like require.
     pub require_like_function: Vec<String>,
     #[serde(default)]
-    /// Framework versions.
-    pub framework_versions: Vec<String>,
-    #[serde(default)]
     /// file Extensions. eg: .lua, .lua.txt
     pub extensions: Vec<String>,
     #[serde(default)]
@@ -36,7 +33,6 @@ impl Default for EmmyrcRuntime {
         Self {
             version: EmmyrcLuaVersion::default(),
             require_like_function: Vec::new(),
-            framework_versions: Vec::new(),
             extensions: Vec::new(),
             require_pattern: Vec::new(),
             nonstandard_symbol: default_nonstandard_symbols(),

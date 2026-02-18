@@ -13,7 +13,7 @@ pub use configs::{
     EmmyrcExternalTool, EmmyrcFilenameConvention, EmmyrcGmod, EmmyrcGmodHookMappings,
     EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes, EmmyrcHover, EmmyrcInlayHint,
     EmmyrcInlineValues, EmmyrcLuaVersion, EmmyrcReference, EmmyrcReformat, EmmyrcResource,
-    EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcSignature, EmmyrcStrict, EmmyrcWorkspace,
+    EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcStrict, EmmyrcWorkspace,
     EmmyrcWorkspaceModuleMap,
 };
 use emmylua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig, SpecialFunction};
@@ -33,8 +33,6 @@ pub struct Emmyrc {
     pub completion: EmmyrcCompletion,
     #[serde(default)]
     pub diagnostics: EmmyrcDiagnostic,
-    #[serde(default)]
-    pub signature: EmmyrcSignature,
     #[serde(default)]
     pub hint: EmmyrcInlayHint,
     #[serde(default)]

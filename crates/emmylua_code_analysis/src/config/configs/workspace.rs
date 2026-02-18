@@ -21,9 +21,6 @@ pub struct EmmyrcWorkspace {
     #[serde(default)]
     /// Workspace roots. eg: ["src", "test"]
     pub workspace_roots: Vec<String>,
-    // unused
-    #[serde(default)]
-    pub preload_file_size: i32,
     /// Encoding. eg: "utf-8"
     #[serde(default = "encoding_default")]
     pub encoding: String,
@@ -52,7 +49,6 @@ impl Default for EmmyrcWorkspace {
             library: Vec::new(),
             package_dirs: Vec::new(),
             workspace_roots: Vec::new(),
-            preload_file_size: 0,
             encoding: encoding_default(),
             module_map: Vec::new(),
             reindex_duration: 5000,

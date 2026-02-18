@@ -4,10 +4,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcInlayHint {
-    /// Enable inlay hints.
-    #[serde(default = "default_true")]
-    #[schemars(extend("x-vscode-setting" = true))]
-    pub enable: bool,
     /// Show parameter names in function calls and parameter types in function definitions.
     #[serde(default = "default_true")]
     #[schemars(extend("x-vscode-setting" = true))]
@@ -64,7 +60,6 @@ pub struct EmmyrcInlayHint {
 impl Default for EmmyrcInlayHint {
     fn default() -> Self {
         Self {
-            enable: default_true(),
             param_hint: default_true(),
             index_hint: default_true(),
             local_hint: default_true(),
