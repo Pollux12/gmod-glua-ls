@@ -86,68 +86,19 @@ Here's a config that should be a good default for most:
   "diagnostics": {
     "enable": true,
     "diagnosticInterval": 500,
-    "disable": [
-      "inject-field",
-      "duplicate-set-field",
-      "unnecessary-if",
-      "unnecessary-assert",
-      "global-in-non-module",
-      "call-non-callable",
-      "unused-self",
-      "duplicate-type"
-    ],
-    "enables": [
-      "gmod-realm-misuse",
-      "gmod-realm-misuse-risky",
-      "gmod-unknown-net-message",
-      "gmod-duplicate-system-registration"
-    ],
-    "globals": [ ],
     "severity": {
-      "need-check-nil": "hint",
-      "param-type-mismatch": "hint", // This one seems a bit bugged atm
+      "unused": "hint",
       "undefined-field": "information",
-      "undefined-global": "error",
-      "missing-parameter": "warning",
-      "assign-type-mismatch": "information",
-      "missing-return-value": "hint",
-      "missing-return": "hint",
       "redundant-return": "hint",
       "redundant-return-value": "hint",
-      "return-type-mismatch": "hint",
-      "redundant-parameter": "hint"
+      "param-type-mismatch": "information",
+      "missing-fields": "information",
+      "assign-type-mismatch": "information",
+      "return-type-mismatch": "information",
+      "missing-parameter": "information",
+      "cast-type-mismatch": "information",
+      "need-check-nil": "hint"
     }
-  },
-  "gmod": {
-    "defaultRealm": "shared",
-    "detectRealmFromCalls": true,
-    "detectRealmFromFilename": true,
-    "enabled": true,
-    "hookMappings": {
-      "methodPrefixes": [
-        "GM",
-        "PLUGIN"
-      ]
-    },
-    "scriptedClassScopes": {
-      "exclude": [
-        "**/tests/**",
-        "**/test/**",
-        "**/docs/**"
-      ],
-      "include": [
-        "entities/**",
-        "weapons/**",
-        "effects/**",
-        "weapons/gmod_tool/stools/**",
-        "plugins/**"
-      ]
-    }
-  },
-  "workspace": {
-    "library": [
-      "$GLUA_SNIPPETS_PATH",
-    ]
   }
 }
 ```

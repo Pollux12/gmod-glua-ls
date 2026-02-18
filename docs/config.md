@@ -12,68 +12,19 @@ This config should be good for most, feel free to enable/disable diagnostics or 
   "diagnostics": {
     "enable": true,
     "diagnosticInterval": 500,
-    "disable": [
-      "inject-field",
-      "duplicate-set-field",
-      "unnecessary-if",
-      "unnecessary-assert",
-      "global-in-non-module",
-      "call-non-callable",
-      "unused-self",
-      "duplicate-type"
-    ],
-    "enables": [
-      "gmod-realm-misuse",
-      "gmod-realm-misuse-risky",
-      "gmod-unknown-net-message",
-      "gmod-duplicate-system-registration"
-    ],
-    "globals": [ ],
     "severity": {
-      "need-check-nil": "hint",
-      "param-type-mismatch": "hint", // This one seems a bit bugged atm
+      "unused": "hint",
       "undefined-field": "information",
-      "undefined-global": "error",
-      "missing-parameter": "warning",
-      "assign-type-mismatch": "information",
-      "missing-return-value": "hint",
-      "missing-return": "hint",
       "redundant-return": "hint",
       "redundant-return-value": "hint",
-      "return-type-mismatch": "hint",
-      "redundant-parameter": "hint"
+      "param-type-mismatch": "information",
+      "missing-fields": "information",
+      "assign-type-mismatch": "information",
+      "return-type-mismatch": "information",
+      "missing-parameter": "information",
+      "cast-type-mismatch": "information",
+      "need-check-nil": "hint"
     }
-  },
-  "gmod": {
-    "defaultRealm": "shared",
-    "detectRealmFromCalls": true,
-    "detectRealmFromFilename": true,
-    "enabled": true,
-    "hookMappings": {
-      "methodPrefixes": [
-        "GM",
-        "PLUGIN"
-      ]
-    },
-    "scriptedClassScopes": {
-      "exclude": [
-        "**/tests/**",
-        "**/test/**",
-        "**/docs/**"
-      ],
-      "include": [
-        "entities/**",
-        "weapons/**",
-        "effects/**",
-        "weapons/gmod_tool/stools/**",
-        "plugins/**"
-      ]
-    }
-  },
-  "workspace": {
-    "library": [
-      "$GLUA_SNIPPETS_PATH",
-    ]
   }
 }
 ```
@@ -137,34 +88,34 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `syntax-error` | On | Error | Syntax errors |
 | `doc-syntax-error` | On | Error | Documentation annotation syntax errors |
 | `type-not-found` | On | Warning | Referenced type not found |
-| `missing-return` | On | Warning | Function missing return statement |
+| `missing-return` | **Off** | Warning | Function missing return statement |
 | `param-type-mismatch` | On | Warning | Parameter type doesn't match |
 | `missing-parameter` | On | Warning | Missing required parameter |
 | `redundant-parameter` | On | Warning | Extra parameter passed |
 | `unreachable-code` | On | Hint | Code can never be executed |
 | `unused` | On | Hint | Unused variable/function |
-| `unused-self` | On | Hint | Unused implicit self parameter |
+| `unused-self` | **Off** | Hint | Unused implicit self parameter |
 | `undefined-global` | On | Error | Undefined global variable |
 | `deprecated` | On | Hint | Use of deprecated function/field |
 | `access-invisible` | On | Warning | Access to private/protected member |
 | `discard-returns` | On | Warning | Return value not used (for `@nodiscard` functions) |
 | `undefined-field` | On | Warning | Field doesn't exist on type |
 | `local-const-reassign` | On | Error | Reassigning a local const |
-| `duplicate-type` | On | Warning | Type defined multiple times |
+| `duplicate-type` | **Off** | Warning | Type defined multiple times |
 | `redefined-local` | On | Hint | Local variable redefined |
 | `redefined-label` | On | Warning | Label redefined |
 | `code-style-check` | **Off** | Warning | Code style violations |
-| `need-check-nil` | On | Warning | Potential nil dereference |
+| `need-check-nil` | On | Hint | Potential nil dereference |
 | `await-in-sync` | On | Warning | Using await in synchronous function |
 | `annotation-usage-error` | On | Error | Incorrect annotation usage |
-| `return-type-mismatch` | On | Warning | Return type doesn't match |
+| `return-type-mismatch` | **Off** | Warning | Return type doesn't match |
 | `missing-return-value` | On | Warning | Missing return value |
-| `redundant-return-value` | On | Warning | Extra return value |
+| `redundant-return-value` | **Off** | Warning | Extra return value |
 | `undefined-doc-param` | On | Warning | Documented parameter doesn't exist |
 | `duplicate-doc-field` | On | Warning | Documented field defined multiple times |
 | `unknown-doc-tag` | **Off** | Warning | Unknown documentation annotation |
 | `missing-fields` | On | Warning | Required fields not set |
-| `inject-field` | On | Warning | Field injected into type |
+| `inject-field` | **Off** | Warning | Field injected into type |
 | `circle-doc-class` | On | Warning | Circular class inheritance |
 | `incomplete-signature-doc` | **Off** | Warning | Missing documentation for parameters/returns |
 | `missing-global-doc` | **Off** | Warning | Global missing documentation |
@@ -172,27 +123,27 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `duplicate-require` | On | Hint | Module required multiple times |
 | `non-literal-expressions-in-assert` | **Off** | Warning | Non-literal in assert |
 | `unbalanced-assignments` | On | Warning | Unequal values in assignment |
-| `unnecessary-assert` | On | Warning | Assert that always passes |
-| `unnecessary-if` | On | Warning | If statement always true/false |
-| `duplicate-set-field` | On | Warning | Field set multiple times |
+| `unnecessary-assert` | **Off** | Warning | Assert that always passes |
+| `unnecessary-if` | **Off** | Warning | If statement always true/false |
+| `duplicate-set-field` | **Off** | Warning | Field set multiple times |
 | `duplicate-index` | On | Warning | Index used multiple times |
-| `generic-constraint-mismatch` | On | Warning | Generic constraint violation |
+| `generic-constraint-mismatch` | On | Information | Generic constraint violation |
 | `cast-type-mismatch` | On | Warning | Cast type incompatible |
 | `require-module-not-visible` | On | Warning | Required module not accessible |
 | `enum-value-mismatch` | On | Warning | Value doesn't match enum |
 | `preferred-local-alias` | On | Hint | Prefer local alias over global |
 | `read-only` | On | Warning | Writing to read-only value |
-| `global-in-non-module` | On | Warning | Global defined in non-module scope |
+| `global-in-non-module` | **Off** | Warning | Global defined in non-module scope |
 | `attribute-param-type-mismatch` | On | Warning | Attribute parameter type mismatch |
 | `attribute-missing-parameter` | On | Warning | Missing attribute parameter |
 | `attribute-redundant-parameter` | On | Warning | Extra attribute parameter |
-| `invert-if` | On | Warning | If can be inverted for clarity |
-| `call-non-callable` | On | Warning | Calling non-callable value |
+| `invert-if` | **Off** | Warning | If can be inverted for clarity |
+| `call-non-callable` | **Off** | Warning | Calling non-callable value |
 | `gmod-invalid-hook-name` | On | Warning | Invalid hook name |
 | `gmod-realm-misuse` | On | Warning | Client/server API used in wrong realm |
-| `gmod-realm-misuse-risky` | **Off** | Hint | Risky realm usage detected |
+| `gmod-realm-misuse-risky` | On | Hint | Risky realm usage detected |
 | `gmod-unknown-net-message` | On | Warning | Unknown net message identifier |
-| `gmod-duplicate-system-registration` | **Off** | Hint | Duplicate registration (concommand, net, timer, etc.) |
+| `gmod-duplicate-system-registration` | On | Hint | Duplicate registration (concommand, net, timer, etc.) |
 
 **Note:** Diagnostics marked **Off** are disabled by default and must be added to `enables` to activate.
 
