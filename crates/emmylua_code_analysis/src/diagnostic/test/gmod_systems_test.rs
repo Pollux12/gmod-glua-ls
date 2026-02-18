@@ -39,7 +39,7 @@ mod tests {
     }
 
     #[gtest]
-    fn test_duplicate_system_registration_disabled_by_default() {
+    fn test_duplicate_system_registration_enabled_by_default() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
         let file_id = ws.def(
@@ -57,7 +57,7 @@ mod tests {
                 .get_name()
                 .to_string(),
         ));
-        assert!(!diagnostics.iter().any(|diagnostic| diagnostic.code == code));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == code));
     }
 
     #[gtest]
