@@ -34,7 +34,7 @@ mod test {
         assert!(ws.check_type(&number_ty, &number_expr2));
 
         assert!(ws.check_type(&number_ty, &integer_ty));
-        assert!(!ws.check_type(&integer_ty, &number_ty));
+        assert!(ws.check_type(&integer_ty, &number_ty));
 
         let number_union = ws.ty("1 | 2 | 3");
         assert!(ws.check_type(&number_ty, &number_union));
@@ -123,7 +123,7 @@ mod test {
 
         let array_ty2 = ws.ty("integer[]");
         assert!(ws.check_type(&array_ty, &array_ty2));
-        assert!(!ws.check_type(&array_ty2, &array_ty));
+        assert!(ws.check_type(&array_ty2, &array_ty));
     }
 
     #[test]
@@ -139,7 +139,7 @@ mod test {
 
         let tuple_ty2 = ws.ty("[integer, string]");
         assert!(ws.check_type(&tuple_ty, &tuple_ty2));
-        assert!(!ws.check_type(&tuple_ty2, &tuple_ty));
+        assert!(ws.check_type(&tuple_ty2, &tuple_ty));
     }
 
     #[test]

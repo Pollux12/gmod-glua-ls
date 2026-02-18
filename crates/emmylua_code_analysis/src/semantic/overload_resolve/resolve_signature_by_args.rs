@@ -82,6 +82,8 @@ pub fn resolve_signature_by_args(
 
             let match_result = if param_type.is_any() {
                 ParamMatchResult::Any
+            } else if is_exact_param_match(&param_type, expr_type) {
+                ParamMatchResult::Exact
             } else if check_type_compact(db, &param_type, expr_type).is_ok() {
                 ParamMatchResult::Type
             } else {
@@ -98,7 +100,7 @@ pub fn resolve_signature_by_args(
                 continue;
             }
 
-            if match_result > ParamMatchResult::Any
+            if match_result >= ParamMatchResult::Exact
                 && arg_index + 1 == expr_len
                 && param_index + 1 == func.get_params().len()
             {
@@ -216,9 +218,22 @@ fn is_func_last_param_variadic(func: &LuaFunctionType) -> bool {
     }
 }
 
+fn is_exact_param_match(param_type: &LuaType, expr_type: &LuaType) -> bool {
+    if param_type == expr_type {
+        return true;
+    }
+
+    matches!(
+        (param_type, expr_type),
+        (LuaType::Number, LuaType::FloatConst(_))
+            | (LuaType::Integer, LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_))
+    )
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum ParamMatchResult {
     Not,
     Any,
     Type,
+    Exact,
 }
