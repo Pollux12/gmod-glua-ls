@@ -1,6 +1,6 @@
 use std::{ops::Deref, sync::Arc};
 
-use emmylua_parser::{LuaCallExpr, LuaChunk, LuaExpr};
+use emmylua_parser::{LuaCallExpr, LuaChunk, LuaExpr, LuaIndexKey};
 
 use crate::{
     DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaAliasCallKind, LuaAliasCallType,
@@ -30,6 +30,21 @@ pub fn get_type_at_call_expr(
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return Ok(ResultTypeOrContinue::Continue);
     };
+
+    // Check for IsValid pattern (Garry's Mod nil check)
+    if let Some(result) = try_narrow_isvalid(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        &call_expr,
+        &prefix_expr,
+        condition_flow,
+    )? {
+        return Ok(ResultTypeOrContinue::Result(result));
+    }
 
     let maybe_func = infer_expr(db, cache, prefix_expr.clone())?;
     match maybe_func {
@@ -416,4 +431,74 @@ fn get_type_at_call_expr_by_call(
     };
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+/// Detect `IsValid(x)` or `x:IsValid()` calls and narrow the argument/self type
+/// to remove nil/false in the true branch. This is essential for Garry's Mod where
+/// IsValid is the standard nil/validity check.
+#[allow(clippy::too_many_arguments)]
+fn try_narrow_isvalid(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    call_expr: &LuaCallExpr,
+    prefix_expr: &LuaExpr,
+    condition_flow: InferConditionFlow,
+) -> Result<Option<LuaType>, InferFailReason> {
+    // Determine if this is an IsValid call and get the target expression to narrow
+    let target_expr = match prefix_expr {
+        // Global call: IsValid(x)
+        LuaExpr::NameExpr(name_expr) => {
+            if name_expr.get_name_text().as_deref() != Some("IsValid") {
+                return Ok(None);
+            }
+            let arg_list = match call_expr.get_args_list() {
+                Some(list) => list,
+                None => return Ok(None),
+            };
+            match arg_list.get_args().next() {
+                Some(first_arg) => first_arg,
+                None => return Ok(None),
+            }
+        }
+        // Method call: x:IsValid()
+        LuaExpr::IndexExpr(index_expr) => {
+            let is_isvalid = match index_expr.get_index_key() {
+                Some(LuaIndexKey::Name(name_token)) => {
+                    name_token.get_name_text() == "IsValid"
+                }
+                _ => false,
+            };
+            if !is_isvalid {
+                return Ok(None);
+            }
+            match index_expr.get_prefix_expr() {
+                Some(self_expr) => self_expr,
+                None => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+
+    // Check if the target expression matches the variable we're narrowing
+    let Some(target_ref_id) = get_var_expr_var_ref_id(db, cache, target_expr) else {
+        return Ok(None);
+    };
+    if target_ref_id != *var_ref_id {
+        return Ok(None);
+    }
+
+    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+    let antecedent_type =
+        get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+
+    let result_type = match condition_flow {
+        InferConditionFlow::TrueCondition => remove_false_or_nil(antecedent_type),
+        InferConditionFlow::FalseCondition => narrow_false_or_nil(db, antecedent_type),
+    };
+
+    Ok(Some(result_type))
 }
