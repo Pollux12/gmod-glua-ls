@@ -88,7 +88,7 @@ fn infer_call_target_type(
     let typ = inferred.unwrap_or(LuaType::Unknown);
     if !matches!(
         typ,
-        LuaType::Any | LuaType::Unknown | LuaType::SelfInfer | LuaType::Global
+        LuaType::Any | LuaType::Unknown | LuaType::SelfInfer | LuaType::Global | LuaType::Never
     ) {
         return Some(typ);
     }
@@ -147,7 +147,7 @@ fn has_non_callable_member(db: &DbIndex, typ: &LuaType) -> bool {
     }
 
     match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::SelfInfer | LuaType::Global | LuaType::Nil => {
+        LuaType::Any | LuaType::Unknown | LuaType::SelfInfer | LuaType::Global | LuaType::Nil | LuaType::Never => {
             false
         }
         LuaType::Union(union) => union
