@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::VirtualWorkspace;
+    use crate::{DiagnosticCode, VirtualWorkspace};
 
     #[test]
     fn test_custom_binary() {
@@ -67,5 +67,57 @@ mod test {
         let ty = ws.expr_ty("c");
         let expected = ws.ty("number");
         assert_eq!(ty, expected);
+    }
+
+    #[test]
+    fn test_isvalid_shadowed_local_no_narrow() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field health integer
+
+            ---@return Entity?
+            local function get_ent() end
+
+            local IsValid = function(obj)
+                return obj ~= nil
+            end
+
+            local ent = get_ent()
+            if IsValid(ent) then
+                local _health = ent.health
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_isvalid_false_branch_not_narrowed_to_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+
+            ---@return Entity?
+            local function get_ent() end
+
+            function IsValid(obj)
+                return obj ~= nil
+            end
+
+            ---@param value nil
+            local function expects_nil(value) end
+
+            local ent = get_ent()
+            if not IsValid(ent) then
+                expects_nil(ent)
+            end
+            "#
+        ));
     }
 }

@@ -464,6 +464,18 @@ fn try_narrow_isvalid(
             if name_expr.get_name_text().as_deref() != Some("IsValid") {
                 return Ok(None);
             }
+            if let Some(isvalid_ref_id) =
+                get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr.clone()))
+            {
+                let VarRefId::VarRef(isvalid_decl_id) = isvalid_ref_id else {
+                    return Ok(None);
+                };
+                if let Some(isvalid_decl) = db.get_decl_index().get_decl(&isvalid_decl_id)
+                    && isvalid_decl.is_local()
+                {
+                    return Ok(None);
+                }
+            }
             let arg_list = match call_expr.get_args_list() {
                 Some(list) => list,
                 None => return Ok(None),
@@ -479,9 +491,7 @@ fn try_narrow_isvalid(
                 return Ok(None);
             }
             let is_isvalid = match index_expr.get_index_key() {
-                Some(LuaIndexKey::Name(name_token)) => {
-                    name_token.get_name_text() == "IsValid"
-                }
+                Some(LuaIndexKey::Name(name_token)) => name_token.get_name_text() == "IsValid",
                 _ => false,
             };
             if !is_isvalid {
@@ -504,12 +514,11 @@ fn try_narrow_isvalid(
     }
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type =
-        get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
 
     let result_type = match condition_flow {
         InferConditionFlow::TrueCondition => remove_false_or_nil(antecedent_type),
-        InferConditionFlow::FalseCondition => narrow_false_or_nil(db, antecedent_type),
+        InferConditionFlow::FalseCondition => antecedent_type,
     };
 
     Ok(Some(result_type))
