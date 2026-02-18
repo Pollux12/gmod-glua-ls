@@ -63,7 +63,7 @@ pub async fn initialized_handler(
     }
 
     let client_config = get_client_config(&context, client_id, supports_config_request).await;
-    
+
     // Extract gmodAnnotationsPath from initialization options if provided
     let mut client_config = client_config;
     if let Some(ref init_options) = params.initialization_options {
@@ -74,7 +74,7 @@ pub async fn initialized_handler(
             }
         }
     }
-    
+
     log::info!("client_config: {:?}", client_config);
 
     let params_json = serde_json::to_string_pretty(&params).unwrap();

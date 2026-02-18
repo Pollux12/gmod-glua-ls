@@ -24,6 +24,7 @@ pub struct GluaDocSearchResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GluaDocItem {
     pub name: String,
     pub full_name: String,
