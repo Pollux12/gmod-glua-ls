@@ -192,7 +192,7 @@ impl<'a> DiagnosticContext<'a> {
             }),
             severity: self.get_severity(code),
             code: Some(NumberOrString::String(code.get_name().to_string())),
-            source: Some("EmmyLua".into()),
+            source: Some("GLuaLS".into()),
             tags: self.get_tags(code),
             data,
             ..Default::default()
