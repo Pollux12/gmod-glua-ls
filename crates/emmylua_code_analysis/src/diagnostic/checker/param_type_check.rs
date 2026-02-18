@@ -79,11 +79,13 @@ fn check_call_expr(
             let arg_type = arg_types.get(idx).unwrap_or(&LuaType::Any);
             let mut check_type = param_type.clone();
             // 对于第一个参数, 他有可能是`:`调用, 所以需要特殊处理
-            if idx == 0
-                && param_type.is_self_infer()
-                && let Some(result) = get_call_source_type(semantic_model, &call_expr)
-            {
-                check_type = result;
+            if idx == 0 && param_type.is_self_infer() {
+                if let Some(result) = get_call_source_type(semantic_model, &call_expr) {
+                    check_type = result;
+                } else {
+                    // Can't resolve self type from call context, skip check
+                    continue;
+                }
             }
             let result = semantic_model.type_check_detail(&check_type, arg_type);
             if result.is_err() {

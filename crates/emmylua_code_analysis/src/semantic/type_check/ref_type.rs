@@ -46,6 +46,16 @@ pub fn check_ref_type_compact(
             if result.is_err() && origin_type.is_function() {
                 return check_ref_class(context, source_id, compact_type, check_guard);
             }
+            // When alias origin is a union of integer constants (enum-like),
+            // accept any integer value (may be a bitwise combination of flags)
+            if result.is_err() && is_all_integer_const_origin(&origin_type)
+                && matches!(
+                    compact_type,
+                    LuaType::Integer | LuaType::DocIntegerConst(_) | LuaType::IntegerConst(_)
+                )
+            {
+                return Ok(());
+            }
             return result;
         }
 
@@ -474,4 +484,23 @@ fn check_ref_type_compact_tuple(
     }
 
     Ok(())
+}
+
+/// Checks if a type is a union consisting entirely of integer constants.
+/// Used for enum-like aliases where integer values may be bitwise combinations.
+fn is_all_integer_const_origin(origin_type: &LuaType) -> bool {
+    match origin_type {
+        LuaType::Union(union_types) => union_types
+            .into_vec()
+            .iter()
+            .all(|t| matches!(t, LuaType::DocIntegerConst(_) | LuaType::IntegerConst(_))),
+        LuaType::MultiLineUnion(multi_union) => {
+            let unions = multi_union.get_unions();
+            !unions.is_empty()
+                && unions.iter().all(|(t, _)| {
+                    matches!(t, LuaType::DocIntegerConst(_) | LuaType::IntegerConst(_))
+                })
+        }
+        _ => false,
+    }
 }
