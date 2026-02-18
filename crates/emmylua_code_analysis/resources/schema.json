@@ -86,7 +86,8 @@
             "entities/**",
             "weapons/**",
             "effects/**",
-            "weapons/gmod_tool/stools/**"
+            "weapons/gmod_tool/stools/**",
+            "plugins/**"
           ]
         }
       }
@@ -878,7 +879,8 @@
               "entities/**",
               "weapons/**",
               "effects/**",
-              "weapons/gmod_tool/stools/**"
+              "weapons/gmod_tool/stools/**",
+              "plugins/**"
             ]
           }
         }
@@ -935,7 +937,8 @@
             "entities/**",
             "weapons/**",
             "effects/**",
-            "weapons/gmod_tool/stools/**"
+            "weapons/gmod_tool/stools/**",
+            "plugins/**"
           ],
           "items": {
             "type": "string"

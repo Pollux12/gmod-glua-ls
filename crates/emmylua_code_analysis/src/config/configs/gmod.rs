@@ -80,6 +80,7 @@ fn scripted_scope_include_default() -> Vec<String> {
         "weapons/**".to_string(),
         "effects/**".to_string(),
         "weapons/gmod_tool/stools/**".to_string(),
+        "plugins/**".to_string(),
     ]
 }
 
@@ -106,27 +107,29 @@ pub struct EmmyrcGmodHookMappings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use googletest::prelude::*;
 
-    #[test]
-    fn test_gmod_defaults() {
-        let gmod: EmmyrcGmod = serde_json::from_str("{}").unwrap();
-        assert!(gmod.enabled);
-        assert_eq!(gmod.default_realm, EmmyrcGmodRealm::Shared);
-        assert_eq!(
+    #[gtest]
+    fn test_gmod_defaults() -> Result<()> {
+        let gmod: EmmyrcGmod = serde_json::from_str("{}").or_fail()?;
+        verify_that!(gmod.enabled, eq(true))?;
+        verify_that!(gmod.default_realm, eq(EmmyrcGmodRealm::Shared))?;
+        verify_that!(
             gmod.scripted_class_scopes.include,
-            vec![
+            eq(&vec![
                 "entities/**".to_string(),
                 "weapons/**".to_string(),
                 "effects/**".to_string(),
                 "weapons/gmod_tool/stools/**".to_string(),
-            ]
-        );
-        assert!(gmod.scripted_class_scopes.exclude.is_empty());
-        assert!(gmod.hook_mappings.method_to_hook.is_empty());
-        assert!(gmod.hook_mappings.emitter_to_hook.is_empty());
-        assert!(gmod.hook_mappings.method_prefixes.is_empty());
-        assert_eq!(gmod.detect_realm_from_filename, None);
-        assert_eq!(gmod.detect_realm_from_calls, None);
-        assert!(gmod.infer_dynamic_fields);
+                "plugins/**".to_string(),
+            ])
+        )?;
+        verify_that!(gmod.scripted_class_scopes.exclude.is_empty(), eq(true))?;
+        verify_that!(gmod.hook_mappings.method_to_hook.is_empty(), eq(true))?;
+        verify_that!(gmod.hook_mappings.emitter_to_hook.is_empty(), eq(true))?;
+        verify_that!(gmod.hook_mappings.method_prefixes.is_empty(), eq(true))?;
+        verify_that!(gmod.detect_realm_from_filename, eq(None))?;
+        verify_that!(gmod.detect_realm_from_calls, eq(None))?;
+        verify_that!(gmod.infer_dynamic_fields, eq(true))
     }
 }
