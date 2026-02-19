@@ -993,6 +993,231 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_register_multiple_panels_bind_nearest_panel_decl() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/vgui/multi_panel.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+            end
+
+            vgui.Register("MyPanelOne", PANEL, "DFrame")
+
+            local PANEL = {}
+
+            function PANEL:Paint(w, h)
+            end
+
+            vgui.Register("MyPanelTwo", PANEL, "EditablePanel")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+
+        let first_class_id = LuaTypeDeclId::global("MyPanelOne");
+        let second_class_id = LuaTypeDeclId::global("MyPanelTwo");
+
+        assert!(
+            db.get_type_index().get_type_decl(&first_class_id).is_some(),
+            "MyPanelOne class should be created"
+        );
+        assert!(
+            db.get_type_index()
+                .get_type_decl(&second_class_id)
+                .is_some(),
+            "MyPanelTwo class should be created"
+        );
+
+        let first_supers: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&first_class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            first_supers.contains(&LuaType::Ref(LuaTypeDeclId::global("DFrame"))),
+            "expected DFrame super type for MyPanelOne, got {first_supers:?}"
+        );
+
+        let second_supers: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&second_class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            second_supers.contains(&LuaType::Ref(LuaTypeDeclId::global("EditablePanel"))),
+            "expected EditablePanel super type for MyPanelTwo, got {second_supers:?}"
+        );
+
+        let first_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(first_class_id.clone()))
+            .expect("expected members on MyPanelOne");
+        let first_member_names: Vec<_> = first_members
+            .iter()
+            .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+            .collect();
+
+        assert!(
+            first_member_names.contains(&"Init".to_string()),
+            "expected Init on MyPanelOne, got {first_member_names:?}"
+        );
+        assert!(
+            !first_member_names.contains(&"Paint".to_string()),
+            "MyPanelOne should not inherit PANEL:Paint from second panel, got {first_member_names:?}"
+        );
+
+        let second_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(second_class_id.clone()))
+            .expect("expected members on MyPanelTwo");
+        let second_member_names: Vec<_> = second_members
+            .iter()
+            .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+            .collect();
+
+        assert!(
+            second_member_names.contains(&"Paint".to_string()),
+            "expected Paint on MyPanelTwo, got {second_member_names:?}"
+        );
+        assert!(
+            !second_member_names.contains(&"Init".to_string()),
+            "MyPanelTwo should not inherit PANEL:Init from first panel, got {second_member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_panel_local_name_resolves_to_correct_panel_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/vgui/panel_hover_type.lua",
+            r#"
+            local PANEL = {}
+            vgui.Register("HoverPanelOne", PANEL, "DPanel")
+
+            local PANEL = {}
+            vgui.Register("HoverPanelTwo", PANEL, "EditablePanel")
+        "#,
+        );
+
+        let first_class_id = LuaTypeDeclId::global("HoverPanelOne");
+        let second_class_id = LuaTypeDeclId::global("HoverPanelTwo");
+
+        {
+            let db = ws.get_db_mut();
+            let decl_tree = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .expect("expected decl tree");
+            let mut panel_decl_ids = decl_tree
+                .get_decls()
+                .values()
+                .filter(|decl| decl.get_name() == "PANEL" && decl.is_local())
+                .map(|decl| (decl.get_position(), decl.get_id()))
+                .collect::<Vec<_>>();
+            panel_decl_ids.sort_by_key(|(position, _)| *position);
+
+            assert_eq!(
+                panel_decl_ids.len(),
+                2,
+                "expected two local PANEL declarations, got {panel_decl_ids:?}"
+            );
+
+            let first_panel_type = db
+                .get_type_index()
+                .get_type_cache(&panel_decl_ids[0].1.into())
+                .expect("expected first PANEL type cache")
+                .as_type()
+                .clone();
+            assert_eq!(first_panel_type, LuaType::Def(first_class_id.clone()));
+
+            let second_panel_type = db
+                .get_type_index()
+                .get_type_cache(&panel_decl_ids[1].1.into())
+                .expect("expected second PANEL type cache")
+                .as_type()
+                .clone();
+            assert_eq!(second_panel_type, LuaType::Def(second_class_id.clone()));
+        }
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let mut panel_local_types = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .filter_map(|local_name| {
+                let token = local_name.get_name_token()?;
+                if token.get_name_text() != "PANEL" {
+                    return None;
+                }
+
+                let semantic_info =
+                    semantic_model.get_semantic_info(token.syntax().clone().into())?;
+                Some((token.get_position(), semantic_info.typ))
+            })
+            .collect::<Vec<_>>();
+        panel_local_types.sort_by_key(|(position, _)| *position);
+
+        assert_eq!(
+            panel_local_types.len(),
+            2,
+            "expected semantic info for two local PANEL names, got {panel_local_types:?}"
+        );
+        assert_eq!(panel_local_types[0].1, LuaType::Def(first_class_id));
+        assert_eq!(panel_local_types[1].1, LuaType::Def(second_class_id));
+    }
+
+    #[gtest]
+    fn test_vgui_panel_self_dynamic_field_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/vgui/self_field_panel.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.buttons = {}
+                local _ = self.buttons
+            end
+
+            vgui.Register("SelfFieldPanel", PANEL, "EditablePanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vgui_register_not_captured_when_gmod_disabled() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

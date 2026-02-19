@@ -1223,41 +1223,46 @@ fn synthesize_panel_class(
             return;
         };
 
-        let matching_decls: Vec<_> = decl_tree
+        let register_position = call.syntax_id.get_range().start();
+        let selected_decl_id = decl_tree
             .get_decls()
             .values()
             .filter(|decl| decl.get_name() == var_name)
-            .map(|decl| (decl.get_id(), decl.get_range()))
-            .collect();
+            // Bind the nearest declaration that exists before this register call.
+            .filter(|decl| decl.get_range().start() < register_position)
+            .max_by_key(|decl| decl.get_range().start())
+            .map(|decl| decl.get_id());
 
-        for (decl_id, _) in &matching_decls {
-            let previous_decl_type = db
-                .get_type_index()
-                .get_type_cache(&(*decl_id).into())
-                .map(|type_cache| type_cache.as_type().clone());
+        let Some(decl_id) = selected_decl_id else {
+            return;
+        };
 
-            db.get_type_index_mut().force_bind_type(
-                (*decl_id).into(),
-                LuaTypeCache::InferType(LuaType::Def(class_decl_id.clone())),
-            );
+        let previous_decl_type = db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .map(|type_cache| type_cache.as_type().clone());
 
-            // Transfer table members to the class
-            if let Some(LuaType::TableConst(table_range)) = previous_decl_type {
-                let table_member_owner = LuaMemberOwner::Element(table_range);
-                let class_member_owner = LuaMemberOwner::Type(class_decl_id.clone());
-                let table_member_ids = db
-                    .get_member_index()
-                    .get_members(&table_member_owner)
-                    .map(|members| {
-                        members
-                            .iter()
-                            .map(|member| member.get_id())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                for member_id in table_member_ids {
-                    add_member(db, class_member_owner.clone(), member_id);
-                }
+        db.get_type_index_mut().force_bind_type(
+            decl_id.into(),
+            LuaTypeCache::InferType(LuaType::Def(class_decl_id.clone())),
+        );
+
+        // Transfer table members to the class
+        if let Some(LuaType::TableConst(table_range)) = previous_decl_type {
+            let table_member_owner = LuaMemberOwner::Element(table_range);
+            let class_member_owner = LuaMemberOwner::Type(class_decl_id.clone());
+            let table_member_ids = db
+                .get_member_index()
+                .get_members(&table_member_owner)
+                .map(|members| {
+                    members
+                        .iter()
+                        .map(|member| member.get_id())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for member_id in table_member_ids {
+                add_member(db, class_member_owner.clone(), member_id);
             }
         }
     }
