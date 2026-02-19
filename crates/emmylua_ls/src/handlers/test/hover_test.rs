@@ -931,4 +931,30 @@ mod tests {
 
         Ok(())
     }
+
+    #[gtest]
+    fn test_hover_dynamic_field_uses_field_style_output() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        check!(ws.check_hover(
+            r#"
+                ---@class HoverDyn.Entity
+
+                ---@type HoverDyn.Entity
+                local ent
+                ent.testVar = true
+
+                local x = ent.te<??>stVar
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) testVar: true\n```".to_string(),
+            },
+        ));
+
+        Ok(())
+    }
 }

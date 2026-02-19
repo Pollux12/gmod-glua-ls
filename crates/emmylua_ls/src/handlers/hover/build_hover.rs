@@ -8,7 +8,7 @@ use emmylua_code_analysis::{
 };
 use emmylua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaSyntaxKind, LuaSyntaxToken,
-    LuaTableExpr, LuaTableField,
+    LuaIndexExpr, LuaTableExpr, LuaTableField,
 };
 use lsp_types::{Hover, HoverContents, MarkedString, MarkupContent};
 use rowan::TextRange;
@@ -34,7 +34,7 @@ pub fn build_semantic_info_hover(
 ) -> Option<Hover> {
     let typ = semantic_info.clone().typ;
     if semantic_info.semantic_decl.is_none() {
-        return build_hover_without_property(db, document, token, typ);
+        return build_hover_without_property(db, semantic_model, document, token, typ);
     }
     let hover_builder = build_hover_content(
         compilation,
@@ -54,10 +54,22 @@ pub fn build_semantic_info_hover(
 
 fn build_hover_without_property(
     db: &DbIndex,
+    semantic_model: &SemanticModel,
     document: &LuaDocument,
     token: LuaSyntaxToken,
     typ: LuaType,
 ) -> Option<Hover> {
+    if let Some(hover) = build_dynamic_field_hover_without_property(db, semantic_model, &token, &typ)
+    {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: lsp_types::MarkupKind::Markdown,
+                value: hover,
+            }),
+            range: document.to_lsp_range(token.text_range()),
+        });
+    }
+
     let render_level = db
         .get_emmyrc()
         .hover
@@ -74,6 +86,72 @@ fn build_hover_without_property(
         }),
         range: document.to_lsp_range(token.text_range()),
     })
+}
+
+fn build_dynamic_field_hover_without_property(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    token: &LuaSyntaxToken,
+    typ: &LuaType,
+) -> Option<String> {
+    let index_expr = token
+        .parent()?
+        .ancestors()
+        .find_map(LuaIndexExpr::cast)?;
+    let index_key = index_expr.get_index_key()?;
+    let key_range = index_key.get_range()?;
+    if !key_range.contains_range(token.text_range()) {
+        return None;
+    }
+
+    let field_name = index_key.get_path_part();
+    if field_name.is_empty() {
+        return None;
+    }
+
+    let prefix_type = semantic_model.infer_expr(index_expr.get_prefix_expr()?).ok()?;
+    if !is_dynamic_field_for_type(db, &prefix_type, &field_name) {
+        return None;
+    }
+
+    let type_humanize_text = if typ.is_const() {
+        hover_const_type(db, typ)
+    } else {
+        humanize_type(db, typ, RenderLevel::Simple)
+    };
+
+    Some(format!(
+        "```lua\n(field) {}: {}\n```",
+        field_name, type_humanize_text
+    ))
+}
+
+fn is_dynamic_field_for_type(db: &DbIndex, typ: &LuaType, field_name: &str) -> bool {
+    let emmyrc = db.get_emmyrc();
+    if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
+        return false;
+    }
+
+    let index = db.get_dynamic_field_index();
+    has_dynamic_field_for_type(index, typ, field_name)
+}
+
+fn has_dynamic_field_for_type(
+    index: &emmylua_code_analysis::DynamicFieldIndex,
+    typ: &LuaType,
+    field_name: &str,
+) -> bool {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => index.has_field(id, field_name),
+        LuaType::Instance(instance) => {
+            has_dynamic_field_for_type(index, instance.get_base(), field_name)
+        }
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(|member_type| has_dynamic_field_for_type(index, member_type, field_name)),
+        _ => false,
+    }
 }
 
 pub fn build_hover_content_for_completion<'a>(
