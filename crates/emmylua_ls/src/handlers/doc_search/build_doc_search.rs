@@ -1,19 +1,13 @@
+use std::{cmp, collections::HashSet};
+
 use emmylua_code_analysis::{
     DbIndex, GlobalId, LuaDeclId, LuaDeclTypeKind, LuaMemberFeature, LuaMemberId, LuaMemberKey,
     LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
     humanize_type,
 };
-use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
 
 use super::doc_search_request::GluaDocItem;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MatchRank {
-    Exact,
-    Prefix,
-    Contains,
-}
 
 #[derive(Debug, Clone)]
 enum DocSymbol {
@@ -27,7 +21,7 @@ enum DocSymbol {
 struct DocCandidate {
     name: String,
     full_name: String,
-    rank: MatchRank,
+    rank: u32,
     symbol: DocSymbol,
 }
 
@@ -100,14 +94,13 @@ pub fn build_doc_search(
     candidates.sort_by(|left, right| {
         left.rank
             .cmp(&right.rank)
+            .reverse()
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.full_name.cmp(&right.full_name))
     });
 
     let mut seen_full_names = HashSet::new();
     candidates.retain(|candidate| seen_full_names.insert(candidate.full_name.clone()));
-
-    candidates.truncate(capped_limit);
 
     let mut items = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -119,6 +112,10 @@ pub fn build_doc_search(
             items.push(item);
         }
     }
+
+    let max_constants = cmp::min(5, capped_limit / 3);
+    apply_diversity_filter(&mut items, max_constants);
+    items.truncate(capped_limit);
 
     Some(items)
 }
@@ -232,7 +229,22 @@ fn collect_qualified_global_decl_member_candidates(
                 continue;
             };
 
-            let rank = owner_rank.max(member_rank);
+            let typ = db
+                .get_type_index()
+                .get_type_cache(&member.get_id().into())
+                .map(|cache| cache.as_type())
+                .unwrap_or(&LuaType::Unknown);
+            let kind = member_kind(typ, ".");
+            let semantic_id = LuaSemanticDeclId::Member(member.get_id());
+            let description = get_description_text(db, &semantic_id);
+            let rank = score_candidate(
+                owner_rank.max(member_rank),
+                kind,
+                description.as_deref(),
+                query.member_query,
+                case_sensitive,
+            );
+
             candidates.push(DocCandidate {
                 name: member_name.to_string(),
                 full_name: format!("{}{}{}", decl.get_name(), query.separator, member_name),
@@ -287,7 +299,23 @@ fn collect_qualified_type_member_candidates(
                 continue;
             };
 
-            let rank = owner_rank.max(member_rank);
+            let typ = db
+                .get_type_index()
+                .get_type_cache(&member.get_id().into())
+                .map(|cache| cache.as_type())
+                .unwrap_or(&LuaType::Unknown);
+            let separator = if query.separator == ':' { ":" } else { "." };
+            let kind = member_kind(typ, separator);
+            let semantic_id = LuaSemanticDeclId::Member(member.get_id());
+            let description = get_description_text(db, &semantic_id);
+            let rank = score_candidate(
+                owner_rank.max(member_rank),
+                kind,
+                description.as_deref(),
+                query.member_query,
+                case_sensitive,
+            );
+
             candidates.push(DocCandidate {
                 name: member_name.to_string(),
                 full_name: format!(
@@ -330,6 +358,22 @@ fn collect_qualified_global_path_member_candidates(
             continue;
         };
 
+        let typ = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())
+            .map(|cache| cache.as_type())
+            .unwrap_or(&LuaType::Unknown);
+        let kind = member_kind(typ, ".");
+        let semantic_id = LuaSemanticDeclId::Member(member.get_id());
+        let description = get_description_text(db, &semantic_id);
+        let rank = score_candidate(
+            rank,
+            kind,
+            description.as_deref(),
+            query.member_query,
+            case_sensitive,
+        );
+
         candidates.push(DocCandidate {
             name: member_name.to_string(),
             full_name: format!("{}{}{}", query.owner_query, query.separator, member_name),
@@ -361,6 +405,16 @@ fn collect_global_candidates(
             continue;
         };
 
+        let typ = db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .map(|cache| cache.as_type())
+            .unwrap_or(&LuaType::Unknown);
+        let kind = global_kind(typ);
+        let semantic_id = LuaSemanticDeclId::LuaDecl(decl_id);
+        let description = get_description_text(db, &semantic_id);
+        let rank = score_candidate(rank, kind, description.as_deref(), query, case_sensitive);
+
         candidates.push(DocCandidate {
             name: decl.get_name().to_string(),
             full_name: decl.get_name().to_string(),
@@ -388,6 +442,11 @@ fn collect_type_candidates(
         let Some(rank) = match_rank(full_name, query, case_sensitive) else {
             continue;
         };
+
+        let kind = type_decl_kind(type_decl_kind_value(type_decl));
+        let semantic_id = LuaSemanticDeclId::TypeDecl(type_decl.get_id());
+        let description = get_description_text(db, &semantic_id);
+        let rank = score_candidate(rank, kind, description.as_deref(), query, case_sensitive);
 
         candidates.push(DocCandidate {
             name: type_decl.get_id().get_simple_name().to_string(),
@@ -431,6 +490,16 @@ fn collect_unqualified_member_candidates(
             };
 
             let separator = member_separator(member.get_feature());
+            let typ = db
+                .get_type_index()
+                .get_type_cache(&member.get_id().into())
+                .map(|cache| cache.as_type())
+                .unwrap_or(&LuaType::Unknown);
+            let kind = member_kind(typ, separator);
+            let semantic_id = LuaSemanticDeclId::Member(member.get_id());
+            let description = get_description_text(db, &semantic_id);
+            let rank = score_candidate(rank, kind, description.as_deref(), query, case_sensitive);
+
             candidates.push(DocCandidate {
                 name: member_name.to_string(),
                 full_name: format!("{}{}{}", type_decl.get_full_name(), separator, member_name),
@@ -447,11 +516,11 @@ fn match_type_decl_rank(
     type_decl: &emmylua_code_analysis::LuaTypeDecl,
     query: &str,
     case_sensitive: bool,
-) -> Option<MatchRank> {
+) -> Option<u32> {
     let full_rank = match_rank(type_decl.get_full_name(), query, case_sensitive);
     let simple_rank = match_rank(type_decl.get_id().get_simple_name(), query, case_sensitive);
     match (full_rank, simple_rank) {
-        (Some(full_rank), Some(simple_rank)) => Some(full_rank.min(simple_rank)),
+        (Some(full_rank), Some(simple_rank)) => Some(full_rank.max(simple_rank)),
         (Some(rank), None) | (None, Some(rank)) => Some(rank),
         (None, None) => None,
     }
@@ -732,29 +801,157 @@ fn collect_signature_ids(typ: &LuaType, signature_ids: &mut Vec<LuaSignatureId>)
     }
 }
 
-fn match_rank(text: &str, query: &str, case_sensitive: bool) -> Option<MatchRank> {
+const MATCH_SCORE_EXACT: u32 = 1000;
+const MATCH_SCORE_PREFIX: u32 = 600;
+const MATCH_SCORE_WORD_BOUNDARY: u32 = 400;
+const MATCH_SCORE_CONTAINS: u32 = 200;
+
+const DESCRIPTION_BONUS_CONTAINS: u32 = 150;
+const DESCRIPTION_BONUS_FIRST_SENTENCE_START: u32 = 250;
+
+fn score_candidate(
+    base_name_score: u32,
+    kind: &str,
+    description: Option<&str>,
+    query: &str,
+    case_sensitive: bool,
+) -> u32 {
+    let name_score = (base_name_score as f32 * kind_score_multiplier(kind)) as u32;
+    name_score + description_bonus(description, query, case_sensitive)
+}
+
+fn kind_score_multiplier(kind: &str) -> f32 {
+    match kind {
+        "function" | "method" => 1.0,
+        "class" => 0.95,
+        "alias" => 0.85,
+        "constant" | "field" => 0.65,
+        "variable" => 0.80,
+        _ => 0.75,
+    }
+}
+
+fn description_bonus(description: Option<&str>, query: &str, case_sensitive: bool) -> u32 {
+    let Some(description) = description else {
+        return 0;
+    };
+
+    let trimmed = description.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    if case_sensitive {
+        if first_sentence(trimmed).trim_start().starts_with(query) {
+            DESCRIPTION_BONUS_FIRST_SENTENCE_START
+        } else if trimmed.contains(query) {
+            DESCRIPTION_BONUS_CONTAINS
+        } else {
+            0
+        }
+    } else {
+        let lower_description = trimmed.to_ascii_lowercase();
+        let lower_query = query.to_ascii_lowercase();
+        if first_sentence(&lower_description)
+            .trim_start()
+            .starts_with(&lower_query)
+        {
+            DESCRIPTION_BONUS_FIRST_SENTENCE_START
+        } else if lower_description.contains(&lower_query) {
+            DESCRIPTION_BONUS_CONTAINS
+        } else {
+            0
+        }
+    }
+}
+
+fn first_sentence(text: &str) -> &str {
+    text.split_terminator(['.', '!', '?', '\n'])
+        .next()
+        .unwrap_or(text)
+}
+
+fn get_description_text(db: &DbIndex, semantic_id: &LuaSemanticDeclId) -> Option<String> {
+    db.get_property_index()
+        .get_property(semantic_id)
+        .and_then(|property| property.description())
+        .map(|description| description.trim().to_string())
+        .filter(|description| !description.is_empty())
+}
+
+fn apply_diversity_filter(items: &mut Vec<GluaDocItem>, max_constants: usize) {
+    let mut constant_count = 0usize;
+    items.retain(|item| {
+        if item.kind == "constant" || item.kind == "field" {
+            constant_count += 1;
+            constant_count <= max_constants
+        } else {
+            true
+        }
+    });
+}
+
+fn match_rank(text: &str, query: &str, case_sensitive: bool) -> Option<u32> {
     if case_sensitive {
         if text == query {
-            Some(MatchRank::Exact)
-        } else if text.starts_with(query) {
-            Some(MatchRank::Prefix)
-        } else if text.contains(query) {
-            Some(MatchRank::Contains)
-        } else {
-            None
+            return Some(MATCH_SCORE_EXACT);
         }
+
+        if text.starts_with(query) {
+            return Some(MATCH_SCORE_PREFIX);
+        }
+
+        if has_word_boundary_match(text, text, query) {
+            return Some(MATCH_SCORE_WORD_BOUNDARY);
+        }
+
+        if text.contains(query) {
+            return Some(MATCH_SCORE_CONTAINS);
+        }
+
+        None
     } else {
         let lower_text = text.to_ascii_lowercase();
         let lower_query = query.to_ascii_lowercase();
+
         if lower_text == lower_query {
-            Some(MatchRank::Exact)
-        } else if lower_text.starts_with(&lower_query) {
-            Some(MatchRank::Prefix)
-        } else if lower_text.contains(&lower_query) {
-            Some(MatchRank::Contains)
-        } else {
-            None
+            return Some(MATCH_SCORE_EXACT);
         }
+
+        if lower_text.starts_with(&lower_query) {
+            return Some(MATCH_SCORE_PREFIX);
+        }
+
+        if has_word_boundary_match(text, &lower_text, &lower_query) {
+            return Some(MATCH_SCORE_WORD_BOUNDARY);
+        }
+
+        if lower_text.contains(&lower_query) {
+            return Some(MATCH_SCORE_CONTAINS);
+        }
+
+        None
+    }
+}
+
+fn has_word_boundary_match(original_text: &str, search_text: &str, query: &str) -> bool {
+    search_text
+        .match_indices(query)
+        .any(|(idx, _)| idx > 0 && is_word_boundary(original_text, idx))
+}
+
+fn is_word_boundary(text: &str, idx: usize) -> bool {
+    if idx == 0 || !text.is_char_boundary(idx) {
+        return idx == 0;
+    }
+
+    let prev_char = text[..idx].chars().next_back();
+    let current_char = text[idx..].chars().next();
+
+    match (prev_char, current_char) {
+        (Some('_' | ':' | '.'), _) => true,
+        (Some(prev), Some(current)) => prev.is_ascii_lowercase() && current.is_ascii_uppercase(),
+        _ => false,
     }
 }
 
@@ -902,5 +1099,108 @@ mod tests {
         )
         .or_fail()?;
         verify_that!(items, is_empty())
+    }
+
+    #[gtest]
+    fn build_doc_search_ranks_exact_prefix_boundary_and_contains() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/doc_search_rank.lua",
+            r#"
+            physics = 1
+            physicsEngine = 1
+            entity_physics = 1
+            myphysicsvalue = 1
+        "#,
+        );
+
+        let items =
+            build_doc_search(ws.get_db_mut(), "physics", 20, &CancellationToken::new()).or_fail()?;
+
+        let exact_idx = items.iter().position(|item| item.name == "physics").or_fail()?;
+        let prefix_idx = items
+            .iter()
+            .position(|item| item.name == "physicsEngine")
+            .or_fail()?;
+        let boundary_idx = items
+            .iter()
+            .position(|item| item.name == "entity_physics")
+            .or_fail()?;
+        let contains_idx = items
+            .iter()
+            .position(|item| item.name == "myphysicsvalue")
+            .or_fail()?;
+
+        verify_that!(exact_idx < prefix_idx, eq(true))?;
+        verify_that!(prefix_idx < boundary_idx, eq(true))?;
+        verify_that!(boundary_idx < contains_idx, eq(true))
+    }
+
+    #[gtest]
+    fn build_doc_search_prioritizes_description_bonus_for_matching_names() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/doc_search_description_bonus.lua",
+            r#"
+            function physicsAlpha()
+            end
+
+            ---physics helpers for simulation.
+            function physicsBeta()
+            end
+        "#,
+        );
+
+        let items =
+            build_doc_search(ws.get_db_mut(), "physics", 20, &CancellationToken::new()).or_fail()?;
+
+        let alpha_idx = items
+            .iter()
+            .position(|item| item.name == "physicsAlpha")
+            .or_fail()?;
+        let beta_idx = items
+            .iter()
+            .position(|item| item.name == "physicsBeta")
+            .or_fail()?;
+
+        verify_that!(beta_idx < alpha_idx, eq(true))
+    }
+
+    #[gtest]
+    fn build_doc_search_limits_constant_and_field_results_for_diversity() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/doc_search_diversity.lua",
+            r#"
+            ---@class PhysicsContainer
+            local PhysicsContainer = {}
+
+            PhysicsContainer.physicsField01 = UNKNOWN_ONE
+            PhysicsContainer.physicsField02 = UNKNOWN_TWO
+            PhysicsContainer.physicsField03 = UNKNOWN_THREE
+            PhysicsContainer.physicsField04 = UNKNOWN_FOUR
+            PhysicsContainer.physicsField05 = UNKNOWN_FIVE
+            PhysicsContainer.physicsField06 = UNKNOWN_SIX
+            PhysicsContainer.physicsField07 = UNKNOWN_SEVEN
+            PhysicsContainer.physicsField08 = UNKNOWN_EIGHT
+
+            function PhysicsContainer:physicsRun()
+            end
+
+            function physicsGlobal()
+            end
+        "#,
+        );
+
+        let items =
+            build_doc_search(ws.get_db_mut(), "physics", 20, &CancellationToken::new()).or_fail()?;
+
+        let constant_or_field_count = items
+            .iter()
+            .filter(|item| item.kind == "constant" || item.kind == "field")
+            .count();
+        verify_that!(constant_or_field_count <= 5, eq(true))?;
+        verify_that!(items.iter().any(|item| item.kind == "method"), eq(true))?;
+        verify_that!(items.iter().any(|item| item.kind == "class"), eq(true))
     }
 }
