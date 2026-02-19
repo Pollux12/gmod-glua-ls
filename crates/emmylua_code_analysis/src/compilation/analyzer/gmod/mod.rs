@@ -12,7 +12,8 @@ use emmylua_parser::{
 use crate::{
     EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodScriptedClassCallKind,
     GmodScriptedClassCallMetadata, LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature,
-    LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
+    LuaDeclId, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId,
+    LuaTypeFlag,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -22,6 +23,7 @@ use crate::{
     },
     profile::Profile,
 };
+use rowan::TextSize;
 
 pub struct GmodAnalysisPipeline;
 
@@ -338,6 +340,8 @@ fn synthesize_scripted_class_members(
 
 /// Synthesize vgui.Register / derma.DefineControl class types.
 fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
+    let mut original_decl_table_types: HashMap<LuaDeclId, Option<LuaType>> = HashMap::new();
+
     for file_id in file_ids.iter().copied() {
         let metadata = match db
             .get_gmod_class_metadata_index()
@@ -348,11 +352,11 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
         };
 
         for call in &metadata.vgui_register_calls {
-            synthesize_vgui_register(db, file_id, call);
+            synthesize_vgui_register(db, file_id, call, &mut original_decl_table_types);
         }
 
         for call in &metadata.derma_define_control_calls {
-            synthesize_derma_define_control(db, file_id, call);
+            synthesize_derma_define_control(db, file_id, call, &mut original_decl_table_types);
         }
     }
 }
@@ -1113,6 +1117,7 @@ fn synthesize_vgui_register(
     db: &mut DbIndex,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
+    original_decl_table_types: &mut HashMap<LuaDeclId, Option<LuaType>>,
 ) {
     // vgui.Register("PanelName", TABLE, "BasePanel")
     // args[0] = panel name (string)
@@ -1140,6 +1145,7 @@ fn synthesize_vgui_register(
         table_var_name.as_deref(),
         base_panel.as_deref(),
         call,
+        original_decl_table_types,
     );
 }
 
@@ -1147,6 +1153,7 @@ fn synthesize_derma_define_control(
     db: &mut DbIndex,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
+    original_decl_table_types: &mut HashMap<LuaDeclId, Option<LuaType>>,
 ) {
     // derma.DefineControl("ControlName", "description", TABLE, "BasePanel")
     // args[0] = control name (string)
@@ -1175,7 +1182,51 @@ fn synthesize_derma_define_control(
         table_var_name.as_deref(),
         base_panel.as_deref(),
         call,
+        original_decl_table_types,
     );
+}
+
+fn find_table_type_for_register(
+    db: &DbIndex,
+    file_id: FileId,
+    decl_id: LuaDeclId,
+    register_position: TextSize,
+) -> Option<LuaType> {
+    let latest_write_decl_id = find_latest_decl_write_before_position(
+        db,
+        file_id,
+        decl_id,
+        register_position,
+    )
+    .map(|position| LuaDeclId::new(file_id, position));
+
+    if let Some(write_decl_id) = latest_write_decl_id
+        && let Some(type_cache) = db.get_type_index().get_type_cache(&write_decl_id.into())
+    {
+        return Some(type_cache.as_type().clone());
+    }
+
+    db.get_type_index()
+        .get_type_cache(&decl_id.into())
+        .map(|type_cache| type_cache.as_type().clone())
+}
+
+fn find_latest_decl_write_before_position(
+    db: &DbIndex,
+    file_id: FileId,
+    decl_id: LuaDeclId,
+    position: TextSize,
+) -> Option<TextSize> {
+    db.get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .and_then(|decl_references| {
+            decl_references
+                .cells
+                .iter()
+                .filter(|cell| cell.is_write && cell.range.start() < position)
+                .max_by_key(|cell| cell.range.start())
+                .map(|cell| cell.range.start())
+        })
 }
 
 fn synthesize_panel_class(
@@ -1185,6 +1236,7 @@ fn synthesize_panel_class(
     table_var_name: Option<&str>,
     base_panel: Option<&str>,
     call: &GmodScriptedClassCallMetadata,
+    original_decl_table_types: &mut HashMap<LuaDeclId, Option<LuaType>>,
 ) {
     let class_decl_id = LuaTypeDeclId::global(panel_name);
 
@@ -1232,10 +1284,18 @@ fn synthesize_panel_class(
             return;
         };
 
-        let previous_decl_type = db
-            .get_type_index()
-            .get_type_cache(&decl_id.into())
-            .map(|type_cache| type_cache.as_type().clone());
+        let previous_decl_type =
+            find_table_type_for_register(db, file_id, decl_id, register_position);
+        let decl_table_type = original_decl_table_types
+            .entry(decl_id)
+            .or_insert_with(|| {
+                db.get_type_index()
+                    .get_type_cache(&decl_id.into())
+                    .map(|type_cache| type_cache.as_type().clone())
+            })
+            .clone();
+        let latest_write_position =
+            find_latest_decl_write_before_position(db, file_id, decl_id, register_position);
 
         db.get_type_index_mut().force_bind_type(
             decl_id.into(),
@@ -1243,19 +1303,36 @@ fn synthesize_panel_class(
         );
 
         // Transfer table members to the class
+        let mut table_ranges = Vec::new();
         if let Some(LuaType::TableConst(table_range)) = previous_decl_type {
-            let table_member_owner = LuaMemberOwner::Element(table_range);
+            table_ranges.push(table_range);
+        }
+        if let Some(LuaType::TableConst(table_range)) = decl_table_type
+            && !table_ranges.iter().any(|existing| existing == &table_range)
+        {
+            table_ranges.push(table_range);
+        }
+
+        if !table_ranges.is_empty() {
             let class_member_owner = LuaMemberOwner::Type(class_decl_id.clone());
-            let table_member_ids = db
-                .get_member_index()
-                .get_members(&table_member_owner)
-                .map(|members| {
-                    members
-                        .iter()
-                        .map(|member| member.get_id())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let mut table_member_ids = HashSet::new();
+
+            for table_range in table_ranges {
+                let table_member_owner = LuaMemberOwner::Element(table_range);
+                if let Some(members) = db.get_member_index().get_members(&table_member_owner) {
+                    for member in members {
+                        let member_position = member.get_id().get_position();
+                        if member_position < register_position
+                            && latest_write_position
+                                .map(|write_position| member_position >= write_position)
+                                .unwrap_or(true)
+                        {
+                            table_member_ids.insert(member.get_id());
+                        }
+                    }
+                }
+            }
+
             for member_id in table_member_ids {
                 add_member(db, class_member_owner.clone(), member_id);
             }

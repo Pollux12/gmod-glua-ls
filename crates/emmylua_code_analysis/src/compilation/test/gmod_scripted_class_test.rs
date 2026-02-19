@@ -1092,6 +1092,156 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_register_reassigned_local_panel_transfers_members_per_register() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/vgui/reassigned_panel.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("PanelA", PANEL, "DFrame")
+
+            PANEL = {}
+            function PANEL:Paint(w, h) end
+            vgui.Register("PanelB", PANEL, "EditablePanel")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let panel_a_id = LuaTypeDeclId::global("PanelA");
+        let panel_b_id = LuaTypeDeclId::global("PanelB");
+
+        let panel_a_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(panel_a_id.clone()))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            panel_a_members.contains(&"Init".to_string()),
+            "expected Init on PanelA, got {panel_a_members:?}"
+        );
+        assert!(
+            !panel_a_members.contains(&"Paint".to_string()),
+            "PanelA should not inherit Paint from reassigned PANEL, got {panel_a_members:?}"
+        );
+
+        let panel_b_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(panel_b_id.clone()))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            panel_b_members.contains(&"Paint".to_string()),
+            "expected Paint on PanelB, got {panel_b_members:?}"
+        );
+        assert!(
+            !panel_b_members.contains(&"Init".to_string()),
+            "PanelB should not inherit Init from first PANEL table, got {panel_b_members:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_reassigned_local_panel_stress_three_panels() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/vgui/reassigned_panel_stress.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Alpha() end
+            vgui.Register("PA", PANEL, "Panel")
+
+            PANEL = {}
+            function PANEL:Beta() end
+            vgui.Register("PB", PANEL, "DFrame")
+
+            PANEL = {}
+            function PANEL:Gamma() end
+            vgui.Register("PC", PANEL, "EditablePanel")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let pa_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("PA")))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let pb_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("PB")))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let pc_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("PC")))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            pa_members.contains(&"Alpha".to_string()),
+            "expected Alpha on PA, got {pa_members:?}"
+        );
+        assert!(
+            !pa_members.contains(&"Beta".to_string()) && !pa_members.contains(&"Gamma".to_string()),
+            "PA should only contain Alpha, got {pa_members:?}"
+        );
+
+        assert!(
+            pb_members.contains(&"Beta".to_string()),
+            "expected Beta on PB, got {pb_members:?}"
+        );
+        assert!(
+            !pb_members.contains(&"Alpha".to_string())
+                && !pb_members.contains(&"Gamma".to_string()),
+            "PB should only contain Beta, got {pb_members:?}"
+        );
+
+        assert!(
+            pc_members.contains(&"Gamma".to_string()),
+            "expected Gamma on PC, got {pc_members:?}"
+        );
+        assert!(
+            !pc_members.contains(&"Alpha".to_string()) && !pc_members.contains(&"Beta".to_string()),
+            "PC should only contain Gamma, got {pc_members:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vgui_register_panel_decl_inside_closed_do_block_does_not_leak_to_outer_register() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
