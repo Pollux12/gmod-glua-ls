@@ -231,6 +231,25 @@ fn validate_str_tpl_ref(
                 .get_db()
                 .get_type_index()
                 .find_type_decl(semantic_model.get_file_id(), &full_type_name);
+            let is_auto_generated_decl = founded_type_decl
+                .as_ref()
+                .is_some_and(|type_decl| type_decl.is_auto_generated());
+            if is_auto_generated_decl
+                && let Some(extend_type) = extend_type.as_ref()
+            {
+                context.add_diagnostic_with_severity(
+                    DiagnosticCode::GenericConstraintMismatch,
+                    range,
+                    format!(
+                        "Type `{}` is not explicitly defined; auto-created inheriting `{}`",
+                        full_type_name,
+                        humanize_type(semantic_model.get_db(), extend_type, RenderLevel::Simple)
+                    ),
+                    Some(DiagnosticSeverity::HINT),
+                    None,
+                );
+            }
+
             if founded_type_decl.is_none() {
                 if let Some(extend_type) = extend_type.as_ref() {
                     context.add_diagnostic_with_severity(

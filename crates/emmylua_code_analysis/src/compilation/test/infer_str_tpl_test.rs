@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod test {
     use googletest::prelude::*;
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
 
-    use crate::{LuaType, LuaTypeDeclId, VirtualWorkspace};
+    use crate::{DiagnosticCode, LuaType, LuaTypeDeclId, VirtualWorkspace};
 
     #[test]
     fn test_str_tpl_type() {
@@ -139,5 +141,112 @@ mod test {
             super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
             "expected `prop_physics` to inherit `Entity`, got {super_types:?}"
         );
+    }
+
+    #[gtest]
+    fn test_user_full_scenario_type_and_field_resolution() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def_file(
+            "annotations.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@class Player : Entity
+                local Player = {}
+
+                ---@class Panel
+                local Panel = {}
+
+                ---@class DPanel : Panel
+                local DPanel = {}
+
+                ---@generic T : Entity
+                ---@param class `T`
+                ---@return T
+                function ents_Create(class) end
+
+                ---@generic T : Panel
+                ---@param classname `T`
+                ---@return T
+                function vgui_Create(classname) end
+
+                ---@param playerIndex number
+                ---@return Player
+                function Player_func(playerIndex) end
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        let scenario_file_id = ws.def_file(
+            "scenario.lua",
+            r#"
+                local tbl = {}
+                tbl.testVar = true
+
+                local ent = ents_Create("prop_physics")
+                ent.testVar = true
+
+                local row = vgui_Create("DPanel")
+                row.testVar = true
+
+                local ply = Player_func(1)
+                ply.testVar = true
+
+                scenario_tbl = tbl
+                scenario_ent = ent
+                scenario_row = row
+                scenario_ply = ply
+
+                scenario_tbl_test_var = tbl.testVar
+                scenario_ent_test_var = ent.testVar
+                scenario_row_test_var = row.testVar
+                scenario_ply_test_var = ply.testVar
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(scenario_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_field_code),
+            "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+
+        let tbl_type = ws.expr_ty("scenario_tbl");
+        let table_type = ws.ty("table");
+        assert!(ws.check_type(&tbl_type, &table_type));
+
+        let ent_expected = ws.ty("prop_physics");
+        let ent_type = ws.expr_ty("scenario_ent");
+        assert_eq!(ent_type, ent_expected);
+
+        let row_expected = ws.ty("DPanel");
+        let row_type = ws.expr_ty("scenario_row");
+        assert_eq!(row_type, row_expected);
+
+        let ply_expected = ws.ty("Player");
+        let ply_type = ws.expr_ty("scenario_ply");
+        assert_eq!(ply_type, ply_expected);
+
+        let bool_type = ws.ty("boolean");
+        let tbl_field_type = ws.expr_ty("scenario_tbl_test_var");
+        assert!(ws.check_type(&tbl_field_type, &bool_type));
+
+        let ent_field_type = ws.expr_ty("scenario_ent_test_var");
+        assert!(ws.check_type(&ent_field_type, &bool_type));
+
+        let row_field_type = ws.expr_ty("scenario_row_test_var");
+        assert!(ws.check_type(&row_field_type, &bool_type));
+
+        let ply_field_type = ws.expr_ty("scenario_ply_test_var");
+        assert!(ws.check_type(&ply_field_type, &bool_type));
     }
 }

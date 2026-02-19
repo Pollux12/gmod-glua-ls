@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod test {
     use googletest::prelude::*;
+    use lsp_types::{DiagnosticSeverity, NumberOrString};
+    use tokio_util::sync::CancellationToken;
 
     use crate::{DiagnosticCode, VirtualWorkspace};
 
@@ -210,9 +212,12 @@ mod test {
     }
 
     #[gtest]
-    fn test_str_tpl_ref_missing_type_with_constraint_auto_creates_no_diagnostic() {
+    fn test_str_tpl_ref_missing_type_with_constraint_reports_hint_for_auto_created_type() {
         let mut ws = VirtualWorkspace::new();
-        let code = r#"
+        ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+
+        let file_id = ws.def(
+            r#"
                     ---@class Entity
 
                     ents = {}
@@ -224,10 +229,31 @@ mod test {
                     end
 
                     ents.Create("sent_custom")
-                "#;
+                "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::GenericConstraintMismatch
+                .get_name()
+                .to_string(),
+        ));
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diag| diag.code == code)
+            .expect("expected generic-constraint-mismatch diagnostic");
 
         expect_that!(
-            ws.check_code_for(DiagnosticCode::GenericConstraintMismatch, code),
+            diagnostic.severity,
+            eq(Some(DiagnosticSeverity::HINT))
+        );
+        expect_that!(
+            diagnostic.message.contains(
+                "Type `sent_custom` is not explicitly defined; auto-created inheriting `Entity`"
+            ),
             eq(true)
         );
     }
