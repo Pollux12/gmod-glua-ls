@@ -1225,12 +1225,7 @@ fn synthesize_panel_class(
 
         let register_position = call.syntax_id.get_range().start();
         let selected_decl_id = decl_tree
-            .get_decls()
-            .values()
-            .filter(|decl| decl.get_name() == var_name)
-            // Bind the nearest declaration that exists before this register call.
-            .filter(|decl| decl.get_range().start() < register_position)
-            .max_by_key(|decl| decl.get_range().start())
+            .find_local_decl(var_name, register_position)
             .map(|decl| decl.get_id());
 
         let Some(decl_id) = selected_decl_id else {

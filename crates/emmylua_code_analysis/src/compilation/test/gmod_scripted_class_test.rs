@@ -1092,6 +1092,122 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_register_panel_decl_inside_closed_do_block_does_not_leak_to_outer_register() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/vgui/panel_do_scope.lua",
+            r#"
+            do
+                local PANEL = {}
+                function PANEL:Init() end
+                vgui.Register("InnerPanel", PANEL, "DFrame")
+            end
+
+            local PANEL = {}
+            function PANEL:Paint(w, h) end
+            vgui.Register("OuterPanel", PANEL, "EditablePanel")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let inner_class_id = LuaTypeDeclId::global("InnerPanel");
+        let outer_class_id = LuaTypeDeclId::global("OuterPanel");
+
+        assert!(
+            db.get_type_index().get_type_decl(&inner_class_id).is_some(),
+            "InnerPanel class should be created"
+        );
+        assert!(
+            db.get_type_index().get_type_decl(&outer_class_id).is_some(),
+            "OuterPanel class should be created"
+        );
+
+        let inner_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(inner_class_id.clone()))
+            .expect("expected members on InnerPanel");
+        let inner_member_names: Vec<_> = inner_members
+            .iter()
+            .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+            .collect();
+
+        assert!(
+            inner_member_names.contains(&"Init".to_string()),
+            "expected Init on InnerPanel, got {inner_member_names:?}"
+        );
+        assert!(
+            !inner_member_names.contains(&"Paint".to_string()),
+            "InnerPanel should not inherit outer PANEL:Paint, got {inner_member_names:?}"
+        );
+
+        let outer_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(outer_class_id.clone()))
+            .expect("expected members on OuterPanel");
+        let outer_member_names: Vec<_> = outer_members
+            .iter()
+            .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+            .collect();
+
+        assert!(
+            outer_member_names.contains(&"Paint".to_string()),
+            "expected Paint on OuterPanel, got {outer_member_names:?}"
+        );
+        assert!(
+            !outer_member_names.contains(&"Init".to_string()),
+            "OuterPanel should not inherit inner PANEL:Init, got {outer_member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_outside_closed_do_block_ignores_inner_panel_decl() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/vgui/panel_orphan_scope.lua",
+            r#"
+            do
+                local PANEL = {}
+                function PANEL:Init() end
+            end
+
+            vgui.Register("OrphanPanel", PANEL, "DFrame")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("OrphanPanel");
+
+        assert!(
+            db.get_type_index().get_type_decl(&class_id).is_some(),
+            "OrphanPanel class should be created"
+        );
+
+        let member_names: Vec<_> = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(class_id))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            !member_names.contains(&"Init".to_string()),
+            "OrphanPanel should not inherit members from out-of-scope PANEL, got {member_names:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vgui_register_panel_local_name_resolves_to_correct_panel_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
