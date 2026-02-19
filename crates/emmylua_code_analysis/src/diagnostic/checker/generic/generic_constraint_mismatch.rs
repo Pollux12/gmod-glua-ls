@@ -239,7 +239,11 @@ fn validate_str_tpl_ref(
                         format!(
                             "type `{}` is not defined in the codebase, using constraint type `{}`",
                             full_type_name,
-                            humanize_type(semantic_model.get_db(), extend_type, RenderLevel::Simple)
+                            humanize_type(
+                                semantic_model.get_db(),
+                                extend_type,
+                                RenderLevel::Simple
+                            )
                         ),
                         Some(DiagnosticSeverity::HINT),
                         None,

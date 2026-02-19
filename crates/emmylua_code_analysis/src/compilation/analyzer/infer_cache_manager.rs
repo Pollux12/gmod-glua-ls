@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::{FileId, LuaAnalysisPhase, semantic::LuaInferCache};
+use crate::{
+    FileId, LuaAnalysisPhase,
+    semantic::{LuaInferCache, PendingStrTplTypeDecl},
+};
 
 #[derive(Debug, Default)]
 pub struct InferCacheManager {
@@ -35,5 +38,15 @@ impl InferCacheManager {
         for (_, infer_cache) in self.infer_map.iter_mut() {
             infer_cache.clear();
         }
+    }
+
+    pub fn drain_pending_str_tpl_type_decls(&mut self) -> Vec<PendingStrTplTypeDecl> {
+        let mut pending = Vec::new();
+
+        for infer_cache in self.infer_map.values_mut() {
+            pending.extend(infer_cache.take_pending_str_tpl_type_decls());
+        }
+
+        pending
     }
 }

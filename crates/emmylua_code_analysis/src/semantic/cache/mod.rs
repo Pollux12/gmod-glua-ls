@@ -7,12 +7,23 @@ use std::{
     sync::Arc,
 };
 
-use crate::{FileId, FlowId, LuaFunctionType, db_index::LuaType, semantic::infer::VarRefId};
+use crate::{
+    FileId, FlowId, LuaFunctionType,
+    db_index::{LuaType, LuaTypeDeclId},
+    semantic::infer::VarRefId,
+};
 
 #[derive(Debug)]
 pub enum CacheEntry<T> {
     Ready,
     Cache(T),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingStrTplTypeDecl {
+    pub file_id: FileId,
+    pub type_decl_id: LuaTypeDeclId,
+    pub super_type: LuaType,
 }
 
 #[derive(Debug)]
@@ -27,6 +38,7 @@ pub struct LuaInferCache {
     pub expr_var_ref_id_cache: HashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
     pub scoped_scripted_global_cache: Option<Option<(String, String)>>,
+    pub pending_str_tpl_type_decls: Vec<PendingStrTplTypeDecl>,
 }
 
 impl LuaInferCache {
@@ -41,6 +53,7 @@ impl LuaInferCache {
             expr_var_ref_id_cache: HashMap::new(),
             narrow_by_literal_stop_position_cache: HashSet::new(),
             scoped_scripted_global_cache: None,
+            pending_str_tpl_type_decls: Vec::new(),
         }
     }
 
@@ -56,6 +69,30 @@ impl LuaInferCache {
         self.config.analysis_phase = phase;
     }
 
+    pub fn add_pending_str_tpl_type_decl(
+        &mut self,
+        type_decl_id: LuaTypeDeclId,
+        super_type: LuaType,
+    ) {
+        let pending = PendingStrTplTypeDecl {
+            file_id: self.file_id,
+            type_decl_id,
+            super_type,
+        };
+
+        if !self
+            .pending_str_tpl_type_decls
+            .iter()
+            .any(|exist| exist == &pending)
+        {
+            self.pending_str_tpl_type_decls.push(pending);
+        }
+    }
+
+    pub fn take_pending_str_tpl_type_decls(&mut self) -> Vec<PendingStrTplTypeDecl> {
+        std::mem::take(&mut self.pending_str_tpl_type_decls)
+    }
+
     pub fn clear(&mut self) {
         self.expr_cache.clear();
         self.call_cache.clear();
@@ -63,5 +100,6 @@ impl LuaInferCache {
         self.index_ref_origin_type_cache.clear();
         self.expr_var_ref_id_cache.clear();
         self.scoped_scripted_global_cache = None;
+        self.pending_str_tpl_type_decls.clear();
     }
 }

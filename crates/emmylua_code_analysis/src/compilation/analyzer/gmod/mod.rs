@@ -11,8 +11,8 @@ use emmylua_parser::{
 
 use crate::{
     EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodScriptedClassCallKind,
-    GmodScriptedClassCallMetadata, LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature,
-    LuaDeclId, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId,
+    GmodScriptedClassCallMetadata, LuaDeclId, LuaDeclTypeKind, LuaFunctionType, LuaMember,
+    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId,
     LuaTypeFlag,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
@@ -1192,13 +1192,9 @@ fn find_table_type_for_register(
     decl_id: LuaDeclId,
     register_position: TextSize,
 ) -> Option<LuaType> {
-    let latest_write_decl_id = find_latest_decl_write_before_position(
-        db,
-        file_id,
-        decl_id,
-        register_position,
-    )
-    .map(|position| LuaDeclId::new(file_id, position));
+    let latest_write_decl_id =
+        find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
+            .map(|position| LuaDeclId::new(file_id, position));
 
     if let Some(write_decl_id) = latest_write_decl_id
         && let Some(type_cache) = db.get_type_index().get_type_cache(&write_decl_id.into())

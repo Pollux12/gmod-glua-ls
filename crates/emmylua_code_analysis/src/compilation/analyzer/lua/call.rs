@@ -8,8 +8,8 @@ use wax::Pattern;
 
 use crate::{
     AccessorFuncCallMetadata, FileId, GmodClassCallArg, GmodClassCallLiteral,
-    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, InferFailReason, LuaType,
-    LuaTypeDeclId,
+    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, InferFailReason, LuaDeclTypeKind,
+    LuaType, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
     compilation::analyzer::{lua::LuaAnalyzer, unresolve::UnResolveConstructor},
     db_index::DbIndex,
 };
@@ -25,13 +25,36 @@ pub(super) fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -
             return Some(());
         };
         let signature = analyzer.db.get_signature_index().get(&signature_id)?;
-        for (idx, param_info) in signature.param_docs.iter() {
-            if param_info.get_attribute_by_name("constructor").is_some() {
+        let is_colon_define = signature.is_colon_define;
+        let is_colon_call = call_expr.is_colon_call();
+        let param_infos = signature
+            .param_docs
+            .iter()
+            .map(|(idx, param_info)| {
+                (
+                    *idx,
+                    param_info.type_ref.clone(),
+                    param_info.get_attribute_by_name("constructor").is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (idx, param_type, is_constructor) in param_infos {
+            materialize_str_tpl_class_from_call(
+                analyzer,
+                &call_expr,
+                idx,
+                &param_type,
+                is_colon_define,
+                is_colon_call,
+            );
+
+            if is_constructor {
                 let unresolve = UnResolveConstructor {
                     file_id: analyzer.file_id,
                     call_expr: call_expr.clone(),
                     signature_id,
-                    param_idx: *idx,
+                    param_idx: idx,
                 };
                 analyzer
                     .context
@@ -41,6 +64,100 @@ pub(super) fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -
         }
     }
     Some(())
+}
+
+fn materialize_str_tpl_class_from_call(
+    analyzer: &mut LuaAnalyzer,
+    call_expr: &LuaCallExpr,
+    param_idx: usize,
+    param_type: &LuaType,
+    is_colon_define: bool,
+    is_colon_call: bool,
+) {
+    let LuaType::StrTplRef(str_tpl) = param_type else {
+        return;
+    };
+
+    let constraint = match str_tpl.get_constraint() {
+        Some(LuaType::Ref(type_decl_id)) => type_decl_id.clone(),
+        _ => return,
+    };
+    let is_class_constraint = analyzer
+        .db
+        .get_type_index()
+        .get_type_decl(&constraint)
+        .map(|decl| decl.is_class())
+        .unwrap_or(false);
+    if !is_class_constraint {
+        return;
+    }
+
+    let arg_idx = match (is_colon_define, is_colon_call) {
+        (true, true) => {
+            if param_idx == 0 {
+                return;
+            }
+            param_idx - 1
+        }
+        _ => param_idx,
+    };
+
+    let Some(arg_expr) = call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().nth(arg_idx))
+    else {
+        return;
+    };
+    let Some(arg_name) = extract_string_literal(&arg_expr) else {
+        return;
+    };
+
+    let class_name = format!(
+        "{}{}{}",
+        str_tpl.get_prefix(),
+        arg_name,
+        str_tpl.get_suffix()
+    );
+    let class_decl_id = LuaTypeDeclId::global(&class_name);
+    let mut created_type_decl = false;
+    if analyzer
+        .db
+        .get_type_index()
+        .get_type_decl(&class_decl_id)
+        .is_none()
+    {
+        created_type_decl = true;
+        analyzer.db.get_type_index_mut().add_type_decl(
+            analyzer.file_id,
+            LuaTypeDecl::new(
+                analyzer.file_id,
+                arg_expr.get_range(),
+                class_decl_id.get_simple_name().to_string(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::None.into(),
+                class_decl_id.clone(),
+            ),
+        );
+    }
+
+    if !created_type_decl {
+        return;
+    }
+
+    let super_type = LuaType::Ref(constraint);
+    let has_super = analyzer
+        .db
+        .get_type_index()
+        .get_super_types_iter(&class_decl_id)
+        .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
+        .unwrap_or(false);
+    if !has_super {
+        analyzer.db.get_type_index_mut().add_super_type(
+            class_decl_id,
+            analyzer.file_id,
+            super_type,
+        );
+    }
 }
 
 fn collect_accessorfunc_annotated_call(

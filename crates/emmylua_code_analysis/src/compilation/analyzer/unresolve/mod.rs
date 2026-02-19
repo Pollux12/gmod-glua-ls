@@ -6,7 +6,8 @@ mod resolve_closure;
 use std::collections::HashMap;
 
 use crate::{
-    FileId, InferFailReason, LuaMemberFeature, LuaSemanticDeclId,
+    FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaSemanticDeclId, LuaTypeDecl,
+    LuaTypeFlag,
     compilation::analyzer::{AnalysisPipeline, unresolve::resolve::try_resolve_constructor},
     db_index::{DbIndex, LuaDeclId, LuaMemberId, LuaSignatureId},
     profile::Profile,
@@ -22,6 +23,7 @@ use resolve::{
 use resolve_closure::{
     try_resolve_call_closure_params, try_resolve_closure_parent_params, try_resolve_closure_return,
 };
+use rowan::TextRange;
 
 use super::{AnalyzeContext, infer_cache_manager::InferCacheManager, lua::LuaReturnPoint};
 
@@ -33,6 +35,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         let _p = Profile::cond_new("resolve analyze", context.tree_list.len() > 1);
         let mut infer_manager = std::mem::take(&mut context.infer_manager);
+        materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
         infer_manager.clear();
         let mut reason_resolve: HashMap<InferFailReason, Vec<UnResolve>> = HashMap::new();
         for (unresolve, reason) in context.unresolves.drain(..) {
@@ -45,6 +48,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         let mut loop_count = 0;
         while !reason_resolve.is_empty() {
             try_resolve(db, &mut infer_manager, &mut reason_resolve);
+            materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
 
             if reason_resolve.is_empty() {
                 break;
@@ -60,6 +64,43 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                 break;
             }
             loop_count += 1;
+        }
+    }
+}
+
+fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut InferCacheManager) {
+    let pending_type_decls = infer_manager.drain_pending_str_tpl_type_decls();
+
+    for pending in pending_type_decls {
+        if db
+            .get_type_index()
+            .get_type_decl(&pending.type_decl_id)
+            .is_none()
+        {
+            db.get_type_index_mut().add_type_decl(
+                pending.file_id,
+                LuaTypeDecl::new(
+                    pending.file_id,
+                    TextRange::default(),
+                    pending.type_decl_id.get_simple_name().to_string(),
+                    LuaDeclTypeKind::Class,
+                    LuaTypeFlag::None.into(),
+                    pending.type_decl_id.clone(),
+                ),
+            );
+        }
+
+        let has_super = db
+            .get_type_index()
+            .get_super_types_iter(&pending.type_decl_id)
+            .map(|mut supers| supers.any(|existing_super| existing_super == &pending.super_type))
+            .unwrap_or(false);
+        if !has_super {
+            db.get_type_index_mut().add_super_type(
+                pending.type_decl_id.clone(),
+                pending.file_id,
+                pending.super_type,
+            );
         }
     }
 }

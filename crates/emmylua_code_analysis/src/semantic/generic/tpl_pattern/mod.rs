@@ -107,7 +107,7 @@ pub fn multi_param_tpl_pattern_match_multi_return(
 }
 
 fn get_str_tpl_infer_type(
-    context: &TplContext,
+    context: &mut TplContext,
     name: &str,
     extend_type: Option<&LuaType>,
 ) -> LuaType {
@@ -127,20 +127,31 @@ fn get_str_tpl_infer_type(
         "global" => LuaType::Global,
         "function" => LuaType::Function,
         _ => {
-            let ref_type = LuaType::Ref(LuaTypeDeclId::global(&name));
-            let type_decl_exists = match &ref_type {
-                LuaType::Ref(type_decl_id) => context
-                    .db
-                    .get_type_index()
-                    .get_type_decl(type_decl_id)
-                    .is_some(),
-                _ => false,
-            };
+            let type_decl_id = LuaTypeDeclId::global(&name);
+            let ref_type = LuaType::Ref(type_decl_id.clone());
+            let type_decl_exists = context
+                .db
+                .get_type_index()
+                .get_type_decl(&type_decl_id)
+                .is_some();
 
             if type_decl_exists {
                 ref_type
             } else if let Some(extend_type) = extend_type {
-                extend_type.clone()
+                if let LuaType::Ref(extend_type_decl_id) = extend_type
+                    && let Some(extend_type_decl) = context
+                        .db
+                        .get_type_index()
+                        .get_type_decl(extend_type_decl_id)
+                    && extend_type_decl.is_class()
+                {
+                    context
+                        .cache
+                        .add_pending_str_tpl_type_decl(type_decl_id, extend_type.clone());
+                    ref_type
+                } else {
+                    extend_type.clone()
+                }
             } else {
                 ref_type
             }
@@ -178,11 +189,12 @@ pub fn tpl_pattern_match(
                 let prefix = str_tpl.get_prefix();
                 let suffix = str_tpl.get_suffix();
                 let type_name = SmolStr::new(format!("{}{}{}", prefix, s, suffix));
-                context.substitutor.insert_type(
-                    str_tpl.get_tpl_id(),
-                    get_str_tpl_infer_type(context, &type_name, str_tpl.get_constraint()),
-                    true,
-                );
+                let constraint = str_tpl.get_constraint().cloned();
+                let inferred_type =
+                    get_str_tpl_infer_type(context, &type_name, constraint.as_ref());
+                context
+                    .substitutor
+                    .insert_type(str_tpl.get_tpl_id(), inferred_type, true);
             }
         }
         LuaType::Array(array_type) => {
