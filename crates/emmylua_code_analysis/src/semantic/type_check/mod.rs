@@ -81,6 +81,22 @@ fn check_general_type_compact(
         );
     }
 
+    if context
+        .db
+        .get_emmyrc()
+        .strict
+        .allow_nullable_as_non_nullable
+        && let LuaType::Union(union_type) = compact_type
+        && let LuaUnionType::Nullable(non_nullable_type) = union_type.deref()
+    {
+        return check_general_type_compact(
+            context,
+            source,
+            non_nullable_type,
+            check_guard.next_level()?,
+        );
+    }
+
     match source {
         LuaType::Unknown | LuaType::Any => Ok(()),
         // simple type
@@ -240,4 +256,74 @@ fn escape_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod nullable_leniency_test {
+    use crate::{DiagnosticCode, VirtualWorkspace};
+
+    #[test]
+    fn allow_nullable_as_non_nullable_enabled_allows_nullable_argument() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@return Vector?
+            local function get_vec()
+            end
+
+            ---@param v Vector
+            local function takes_vec(v)
+            end
+
+            takes_vec(get_vec())
+            "#,
+        ));
+    }
+
+    #[test]
+    fn allow_nullable_as_non_nullable_disabled_reports_nullable_argument() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.strict.allow_nullable_as_non_nullable = false;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@return Vector?
+            local function get_vec()
+            end
+
+            ---@param v Vector
+            local function takes_vec(v)
+            end
+
+            takes_vec(get_vec())
+            "#,
+        ));
+    }
+
+    #[test]
+    fn allow_nullable_as_non_nullable_does_not_allow_bare_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@param v Vector
+            local function takes_vec(v)
+            end
+
+            takes_vec(nil)
+            "#,
+        ));
+    }
 }

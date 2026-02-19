@@ -159,6 +159,7 @@
     "strict": {
       "$ref": "#/$defs/EmmyrcStrict",
       "default": {
+        "allowNullableAsNonNullable": true,
         "arrayIndex": true,
         "docBaseConstMatchBaseType": true,
         "metaOverrideFileDefine": true,
@@ -1233,6 +1234,11 @@
     "EmmyrcStrict": {
       "type": "object",
       "properties": {
+        "allowNullableAsNonNullable": {
+          "description": "Allow nullable types (T?) to be passed where non-nullable (T) is expected.",
+          "type": "boolean",
+          "default": true
+        },
         "arrayIndex": {
           "description": "Whether to enable strict mode array indexing.",
           "type": "boolean",

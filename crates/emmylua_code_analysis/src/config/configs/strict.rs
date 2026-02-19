@@ -30,6 +30,9 @@ pub struct EmmyrcStrict {
     /// When enabled, third-party libraries must use `---@export global` annotation to be importable (i.e., no diagnostic errors and visible in auto-import).
     #[serde(default = "default_false")]
     pub require_export_global: bool,
+    /// Allow nullable types (T?) to be passed where non-nullable (T) is expected.
+    #[serde(default = "default_true")]
+    pub allow_nullable_as_non_nullable: bool,
 }
 
 impl Default for EmmyrcStrict {
@@ -40,6 +43,7 @@ impl Default for EmmyrcStrict {
             meta_override_file_define: true,
             doc_base_const_match_base_type: true,
             require_export_global: false,
+            allow_nullable_as_non_nullable: true,
         }
     }
 }
