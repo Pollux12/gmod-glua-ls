@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+use rowan::TextRange;
 use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
-use crate::{FileId, LuaTypeDeclId};
+use crate::{FileId, InFiled, LuaTypeDeclId};
 
 /// Index tracking dynamically-assigned fields on typed variables.
 ///
@@ -14,8 +15,10 @@ use crate::{FileId, LuaTypeDeclId};
 pub struct DynamicFieldIndex {
     /// type → (field_name → set of files that assign this field)
     type_fields: HashMap<LuaTypeDeclId, HashMap<SmolStr, HashSet<FileId>>>,
+    /// type → (field_name → assignment locations)
+    field_definitions: HashMap<LuaTypeDeclId, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     /// file → list of (type, field_name) pairs contributed by this file
-    file_contributions: HashMap<FileId, Vec<(LuaTypeDeclId, SmolStr)>>,
+    file_contributions: HashMap<FileId, Vec<(LuaTypeDeclId, SmolStr, TextRange)>>,
 }
 
 impl DynamicFieldIndex {
@@ -23,7 +26,13 @@ impl DynamicFieldIndex {
         Self::default()
     }
 
-    pub fn add_field(&mut self, type_id: LuaTypeDeclId, field_name: SmolStr, file_id: FileId) {
+    pub fn add_field(
+        &mut self,
+        type_id: LuaTypeDeclId,
+        field_name: SmolStr,
+        file_id: FileId,
+        range: TextRange,
+    ) {
         self.type_fields
             .entry(type_id.clone())
             .or_default()
@@ -31,10 +40,21 @@ impl DynamicFieldIndex {
             .or_default()
             .insert(file_id);
 
+        let field_definitions = self
+            .field_definitions
+            .entry(type_id.clone())
+            .or_default()
+            .entry(field_name.clone())
+            .or_default();
+        let definition = InFiled::new(file_id, range);
+        if !field_definitions.contains(&definition) {
+            field_definitions.push(definition);
+        }
+
         self.file_contributions
             .entry(file_id)
             .or_default()
-            .push((type_id, field_name));
+            .push((type_id, field_name, range));
     }
 
     pub fn has_field(&self, type_id: &LuaTypeDeclId, field_name: &str) -> bool {
@@ -61,12 +81,24 @@ impl DynamicFieldIndex {
             })
             .unwrap_or_default()
     }
+
+    pub fn get_field_definitions(
+        &self,
+        type_id: &LuaTypeDeclId,
+        field_name: &str,
+    ) -> Vec<InFiled<TextRange>> {
+        self.field_definitions
+            .get(type_id)
+            .and_then(|fields| fields.get(field_name))
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 impl LuaIndex for DynamicFieldIndex {
     fn remove(&mut self, file_id: FileId) {
         if let Some(contributions) = self.file_contributions.remove(&file_id) {
-            for (type_id, field_name) in contributions {
+            for (type_id, field_name, range) in contributions {
                 if let Some(fields) = self.type_fields.get_mut(&type_id) {
                     if let Some(files) = fields.get_mut(&field_name) {
                         files.remove(&file_id);
@@ -78,12 +110,25 @@ impl LuaIndex for DynamicFieldIndex {
                         self.type_fields.remove(&type_id);
                     }
                 }
+
+                if let Some(field_map) = self.field_definitions.get_mut(&type_id) {
+                    if let Some(definitions) = field_map.get_mut(&field_name) {
+                        definitions.retain(|def| !(def.file_id == file_id && def.value == range));
+                        if definitions.is_empty() {
+                            field_map.remove(&field_name);
+                        }
+                    }
+                    if field_map.is_empty() {
+                        self.field_definitions.remove(&type_id);
+                    }
+                }
             }
         }
     }
 
     fn clear(&mut self) {
         self.type_fields.clear();
+        self.field_definitions.clear();
         self.file_contributions.clear();
     }
 }

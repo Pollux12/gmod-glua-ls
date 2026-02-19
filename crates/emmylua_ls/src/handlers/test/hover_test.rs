@@ -951,7 +951,7 @@ mod tests {
                 local x = ent.te<??>stVar
             "#,
             VirtualHoverResult {
-                value: "```lua\n(field) testVar: true\n```".to_string(),
+                value: "```lua\n(infer) testVar: true\n```".to_string(),
             },
         ));
 

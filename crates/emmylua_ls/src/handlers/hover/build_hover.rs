@@ -121,7 +121,7 @@ fn build_dynamic_field_hover_without_property(
     };
 
     Some(format!(
-        "```lua\n(field) {}: {}\n```",
+        "```lua\n(infer) {}: {}\n```",
         field_name, type_humanize_text
     ))
 }

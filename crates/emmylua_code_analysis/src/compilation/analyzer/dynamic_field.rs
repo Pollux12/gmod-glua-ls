@@ -11,7 +11,8 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         let _p = Profile::cond_new("dynamic field analyze", context.tree_list.len() > 1);
         let tree_list = context.tree_list.clone();
-        let mut collected: Vec<(LuaTypeDeclId, SmolStr, crate::FileId)> = Vec::new();
+        let mut collected: Vec<(LuaTypeDeclId, SmolStr, crate::FileId, rowan::TextRange)> =
+            Vec::new();
 
         for in_filed_tree in &tree_list {
             let root = in_filed_tree.value.clone();
@@ -36,14 +37,20 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                     let Some(field_name) = get_field_name(&index_expr) else {
                         continue;
                     };
-                    collect_for_type(&prefix_type, &field_name, file_id, &mut collected);
+                    collect_for_type(
+                        &prefix_type,
+                        &field_name,
+                        file_id,
+                        index_expr.get_range(),
+                        &mut collected,
+                    );
                 }
             }
         }
 
         let index = db.get_dynamic_field_index_mut();
-        for (type_id, field_name, file_id) in collected {
-            index.add_field(type_id, field_name, file_id);
+        for (type_id, field_name, file_id, range) in collected {
+            index.add_field(type_id, field_name, file_id, range);
         }
     }
 }
@@ -61,18 +68,19 @@ fn collect_for_type(
     typ: &LuaType,
     field_name: &SmolStr,
     file_id: crate::FileId,
-    result: &mut Vec<(LuaTypeDeclId, SmolStr, crate::FileId)>,
+    range: rowan::TextRange,
+    result: &mut Vec<(LuaTypeDeclId, SmolStr, crate::FileId, rowan::TextRange)>,
 ) {
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
-            result.push((id.clone(), field_name.clone(), file_id));
+            result.push((id.clone(), field_name.clone(), file_id, range));
         }
         LuaType::Instance(instance) => {
-            collect_for_type(instance.get_base(), field_name, file_id, result);
+            collect_for_type(instance.get_base(), field_name, file_id, range, result);
         }
         LuaType::Union(union_type) => {
             for t in union_type.into_vec() {
-                collect_for_type(&t, field_name, file_id, result);
+                collect_for_type(&t, field_name, file_id, range, result);
             }
         }
         _ => {}

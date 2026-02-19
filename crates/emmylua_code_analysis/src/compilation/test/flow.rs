@@ -1756,6 +1756,39 @@ _2 = a[1]
     }
 
     #[test]
+    fn test_file_level_param_hint_overrides_inferred_defaults() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .param_type_hints
+            .insert("vehicle".to_string(), "Entity".to_string());
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Entity
+
+            ---@class base_glide: Entity
+            ---@field GetFreeSeat fun(self: base_glide): Entity
+
+            ---@paramhint vehicle base_glide
+            local function enter(vehicle)
+                local seat = vehicle:GetFreeSeat()
+                A = vehicle
+                B = seat
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "base_glide");
+        let b = ws.expr_ty("B");
+        assert_eq!(ws.humanize_type(b), "Entity");
+    }
+
+    #[test]
     fn test_gmod_field_guard_narrows_base_entity_to_subtype_members() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

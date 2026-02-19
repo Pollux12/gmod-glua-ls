@@ -418,6 +418,10 @@ pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
         }
     }
 
+    if let Some(file_hint_type) = infer_param_type_from_file_hint(db, decl) {
+        return Ok(file_hint_type);
+    }
+
     if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name()) {
         return Ok(param_hint_type);
     }
@@ -445,6 +449,44 @@ fn infer_param_type_from_gmod_name_hint(db: &DbIndex, param_name: &str) -> Optio
     }
 
     resolve_param_hint_type(db, hint)
+}
+
+fn infer_param_type_from_file_hint(db: &DbIndex, decl: &LuaDecl) -> Option<LuaType> {
+    if !db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let document = db.get_vfs().get_document(&decl.get_file_id())?;
+    let hint = find_file_level_param_hint(document.get_text(), decl.get_name())?;
+    resolve_param_hint_type(db, &hint)
+}
+
+fn find_file_level_param_hint(document_text: &str, param_name: &str) -> Option<String> {
+    let target_name = param_name.to_ascii_lowercase();
+    for line in document_text.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("---@paramhint") {
+            continue;
+        }
+
+        let rest = trimmed.trim_start_matches("---@paramhint").trim_start();
+        let mut segments = rest.splitn(2, char::is_whitespace);
+        let Some(name) = segments.next() else {
+            continue;
+        };
+        let Some(type_hint) = segments.next() else {
+            continue;
+        };
+
+        if name.to_ascii_lowercase() == target_name {
+            let normalized_hint = type_hint.trim();
+            if !normalized_hint.is_empty() {
+                return Some(normalized_hint.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 fn resolve_param_hint_type(db: &DbIndex, hint: &str) -> Option<LuaType> {

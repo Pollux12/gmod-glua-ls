@@ -4,10 +4,12 @@ mod goto_function;
 mod goto_module_file;
 mod goto_path;
 
-use emmylua_code_analysis::{EmmyLuaAnalysis, FileId, SemanticDeclLevel, WorkspaceId};
+use emmylua_code_analysis::{
+    EmmyLuaAnalysis, FileId, LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
+};
 use emmylua_parser::{
-    LuaAstNode, LuaAstToken, LuaDocDescription, LuaDocTagSee, LuaGeneralToken, LuaStringToken,
-    LuaTokenKind,
+    LuaAstNode, LuaAstToken, LuaDocDescription, LuaDocTagSee, LuaGeneralToken, LuaIndexExpr,
+    LuaStringToken, LuaTokenKind,
 };
 pub use goto_def_definition::goto_def_definition;
 use goto_def_definition::goto_str_tpl_ref_definition;
@@ -15,7 +17,7 @@ pub use goto_doc_see::goto_doc_see;
 pub use goto_function::compare_function_types;
 pub use goto_module_file::goto_module_file;
 use lsp_types::{
-    ClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse, OneOf, Position,
+    ClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse, Location, OneOf, Position,
     ServerCapabilities,
 };
 use rowan::TokenAtOffset;
@@ -81,6 +83,10 @@ pub fn definition(
             semantic_decl,
             &token,
         );
+    } else if let Some(dynamic_field_response) =
+        goto_inferred_dynamic_field_definition(&semantic_model, &token)
+    {
+        return Some(dynamic_field_response);
     } else if let Some(string_token) = LuaStringToken::cast(token.clone()) {
         if let Some(module_response) = goto_module_file(&semantic_model, string_token.clone()) {
             return Some(module_response);
@@ -122,6 +128,75 @@ pub fn definition(
     }
 
     None
+}
+
+fn goto_inferred_dynamic_field_definition(
+    semantic_model: &SemanticModel,
+    token: &emmylua_parser::LuaSyntaxToken,
+) -> Option<GotoDefinitionResponse> {
+    let emmyrc = semantic_model.get_emmyrc();
+    if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
+        return None;
+    }
+
+    let index_expr = token.parent()?.ancestors().find_map(LuaIndexExpr::cast)?;
+    let index_key = index_expr.get_index_key()?;
+    let key_range = index_key.get_range()?;
+    if !key_range.contains_range(token.text_range()) {
+        return None;
+    }
+
+    let field_name = index_key.get_path_part();
+    if field_name.is_empty() {
+        return None;
+    }
+
+    let prefix_type = semantic_model.infer_expr(index_expr.get_prefix_expr()?).ok()?;
+
+    let mut locations = Vec::new();
+    collect_dynamic_field_locations(semantic_model, &prefix_type, &field_name, &mut locations);
+    if locations.is_empty() {
+        return None;
+    }
+
+    Some(GotoDefinitionResponse::Array(locations))
+}
+
+fn collect_dynamic_field_locations(
+    semantic_model: &SemanticModel,
+    typ: &LuaType,
+    field_name: &str,
+    locations: &mut Vec<Location>,
+) {
+    match typ {
+        LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
+            let definitions = semantic_model
+                .get_db()
+                .get_dynamic_field_index()
+                .get_field_definitions(type_decl_id, field_name);
+            for definition in definitions {
+                if let Some(document) = semantic_model.get_document_by_file_id(definition.file_id)
+                    && let Some(location) = document.to_lsp_location(definition.value)
+                {
+                    locations.push(location);
+                }
+            }
+        }
+        LuaType::Instance(instance_type) => {
+            collect_dynamic_field_locations(
+                semantic_model,
+                instance_type.get_base(),
+                field_name,
+                locations,
+            );
+        }
+        LuaType::Union(union_type) => {
+            for union_member in union_type.into_vec() {
+                collect_dynamic_field_locations(semantic_model, &union_member, field_name, locations);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub struct DefinitionCapabilities;

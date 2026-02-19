@@ -206,6 +206,19 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `hookMappings.emitterToHook` | `object` | `{}` | Map custom emitters to hook names |
 | `hookMappings.methodPrefixes` | `string[]` | `[]` | Additional prefixes for hook auto-detection |
 
+File-level parameter hints can be added with `---@paramhint <paramName> <typeName>` comments in Lua files. These act as defaults for unannotated parameters in that file only.
+
+```lua
+---@paramhint vehicle base_glide
+---@paramhint ply Player
+```
+
+Hint precedence for parameters is:
+
+1. Explicit signature/doc annotations (`---@param`)
+2. File-level `---@paramhint`
+3. `gmod.paramTypeHints` config map
+
 ### Scripted Class Analysis
 
 Scripted class analysis runs on files matched by `gmod.scriptedClassScopes` and synthesizes members for common Garry's Mod patterns:

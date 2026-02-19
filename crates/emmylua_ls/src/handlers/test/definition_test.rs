@@ -609,4 +609,32 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[gtest]
+    fn test_goto_inferred_dynamic_field_definition() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "assign.lua",
+            "---@class DynGoto.Entity\n---@type DynGoto.Entity\nlocal ent\nent.testVar = true\n",
+        );
+
+        check!(ws.check_definition(
+            r#"
+                ---@type DynGoto.Entity
+                local ent2
+                ent2.te<??>stVar
+            "#,
+            vec![Expected {
+                file: "assign.lua".to_string(),
+                line: 3,
+            }],
+        ));
+
+        Ok(())
+    }
 }
