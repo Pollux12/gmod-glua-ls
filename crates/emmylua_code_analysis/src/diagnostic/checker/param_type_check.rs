@@ -2,8 +2,8 @@ use emmylua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaI
 use rowan::TextRange;
 
 use crate::{
-    DiagnosticCode, LuaSemanticDeclId, LuaType, RenderLevel, SemanticDeclLevel, SemanticModel,
-    TypeCheckFailReason, TypeCheckResult,
+    DiagnosticCode, LuaMemberId, LuaMemberOwner, LuaSemanticDeclId, LuaType, RenderLevel,
+    SemanticDeclLevel, SemanticModel, TypeCheckFailReason, TypeCheckResult,
     diagnostic::checker::assign_type_mismatch::check_table_expr, humanize_type,
 };
 
@@ -228,6 +228,12 @@ pub fn get_call_source_type(
                 && let Some(LuaSemanticDeclId::Member(member_id)) =
                     semantic_model.get_member_origin_owner(member_id)
             {
+                // First try to resolve the self type from the member owner stored in the index.
+                // This is reliable even when the member is defined in a different file.
+                if let Some(owner_type) = get_self_type_from_member(semantic_model, member_id) {
+                    return Some(owner_type);
+                }
+
                 let root = semantic_model
                     .get_db()
                     .get_vfs()
@@ -258,6 +264,14 @@ pub fn get_call_source_type(
                 SemanticDeclLevel::default(),
             )?;
             if let LuaSemanticDeclId::Member(member_id) = decl {
+                // First try to resolve the self type from the member owner stored in the index.
+                // This avoids cross-file inference failures when the member is defined in a
+                // different file (e.g. GLua API annotations), where inferring the prefix
+                // expression would fail and incorrectly fall back to SelfInfer.
+                if let Some(owner_type) = get_self_type_from_member(semantic_model, member_id) {
+                    return Some(owner_type);
+                }
+
                 let root = semantic_model
                     .get_db()
                     .get_vfs()
@@ -279,4 +293,21 @@ pub fn get_call_source_type(
     }
 
     None
+}
+
+/// Returns the owner type of a member as a `LuaType::Ref` if the member belongs to a named class.
+/// Returns `None` for table/element/global-scoped members where the owner type cannot be
+/// expressed as a simple class reference.
+fn get_self_type_from_member(
+    semantic_model: &SemanticModel,
+    member_id: LuaMemberId,
+) -> Option<LuaType> {
+    match semantic_model
+        .get_db()
+        .get_member_index()
+        .get_current_owner(&member_id)?
+    {
+        LuaMemberOwner::Type(type_id) => Some(LuaType::Ref(type_id.clone())),
+        _ => None,
+    }
 }

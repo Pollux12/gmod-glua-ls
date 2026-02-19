@@ -1532,4 +1532,94 @@ mod test {
         "#,
         ));
     }
+
+    /// Regression test: calling a base-class method stored in a local variable with a
+    /// subclass `self` should NOT produce a `param-type-mismatch` diagnostic.
+    ///
+    /// Pattern:
+    ///   local GetNWEntity = EntityMeta.GetNWEntity
+    ///   function PlayerMeta:Test()
+    ///     return GetNWEntity(self, "key", nil)  -- self is Player, method expects Entity
+    ///   end
+    ///
+    /// Player extends Entity, so this is valid. When the method is defined in a separate
+    /// file (e.g. API annotations), `get_call_source_type` used to infer the prefix
+    /// expression cross-file, which failed and fell back to `SelfInfer`. The resulting
+    /// `type_check(SelfInfer, Player)` always failed, producing a spurious diagnostic.
+    #[test]
+    fn test_no_false_positive_subclass_self_via_local_var() {
+        let mut ws = VirtualWorkspace::new();
+
+        // Set up Entity and Player in a separate file to simulate cross-file member lookup.
+        ws.def(
+            r#"
+            ---@class Entity
+            local EntityMeta = {}
+
+            ---@param key string
+            ---@param fallback any
+            ---@return any
+            function EntityMeta:GetNWEntity(key, fallback) end
+
+            ---@param key string
+            ---@param fallback integer
+            ---@return integer
+            function EntityMeta:GetNWInt(key, fallback) end
+
+            ---@class Player: Entity
+            "#,
+        );
+
+        // Player (subclass of Entity) self via local method variable — no diagnostic expected.
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local EntityMeta = {} ---@type Entity
+            local PlayerMeta = {} ---@type Player
+
+            local GetNWEntity = EntityMeta.GetNWEntity
+
+            do
+                local GetNWInt = EntityMeta.GetNWInt
+
+                function PlayerMeta:GlideGetVehicle()
+                    return GetNWEntity(self, "GlideVehicle", nil)
+                end
+
+                function PlayerMeta:GlideGetSeatIndex()
+                    return GetNWInt(self, "GlideSeatIndex", 0)
+                end
+            end
+            "#,
+        ));
+    }
+
+    /// Complementary test: passing a completely unrelated type should still raise the
+    /// diagnostic.
+    #[test]
+    fn test_wrong_type_for_self_still_errors() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            local EntityMeta = {}
+
+            ---@param key string
+            ---@param fallback any
+            ---@return any
+            function EntityMeta:GetNWEntity(key, fallback) end
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local EntityMeta = {} ---@type Entity
+            local GetNWEntity = EntityMeta.GetNWEntity
+
+            GetNWEntity("not_an_entity", "GlideVehicle", nil)
+            "#,
+        ));
+    }
 }
