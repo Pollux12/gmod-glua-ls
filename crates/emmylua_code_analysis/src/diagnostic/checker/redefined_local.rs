@@ -29,8 +29,15 @@ impl Checker for RedefinedLocalChecker {
         };
         let mut diagnostics = HashSet::new();
         let mut root_locals = HashMap::new();
+        let gmod_enabled = semantic_model.get_emmyrc().gmod.enabled;
 
-        check_scope_for_redefined_locals(decl_tree, root_scope, &mut root_locals, &mut diagnostics);
+        check_scope_for_redefined_locals(
+            decl_tree,
+            root_scope,
+            &mut root_locals,
+            &mut diagnostics,
+            gmod_enabled,
+        );
 
         // 添加诊断信息
         for decl_id in diagnostics {
@@ -51,6 +58,7 @@ fn check_scope_for_redefined_locals(
     scope: &LuaScope,
     parent_locals: &mut HashMap<String, LuaDeclId>,
     diagnostics: &mut HashSet<LuaDeclId>,
+    gmod_enabled: bool,
 ) {
     let should_add_to_parent = should_add_to_parent_scope(scope);
 
@@ -63,6 +71,9 @@ fn check_scope_for_redefined_locals(
         {
             let name = decl.get_name().to_string();
             if decl.is_local() && name != "..." && !name.starts_with("_") {
+                if gmod_enabled && name == "self" {
+                    continue;
+                }
                 if current_locals.contains_key(&name) {
                     let old_decl = current_locals
                         .get(&name)
@@ -90,6 +101,7 @@ fn check_scope_for_redefined_locals(
                 child_scope,
                 &mut current_locals,
                 diagnostics,
+                gmod_enabled,
             );
         }
     }

@@ -26,6 +26,9 @@ impl Checker for UnusedChecker {
             if decl.is_global() || decl.is_param() && decl.get_name() == "..." {
                 continue;
             }
+            if semantic_model.get_emmyrc().gmod.enabled && decl.is_param() {
+                continue;
+            }
 
             if let Err(result) = get_unused_check_result(ref_index, decl, root) {
                 let name = decl.get_name();

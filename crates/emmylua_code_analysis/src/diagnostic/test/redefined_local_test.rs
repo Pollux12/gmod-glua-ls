@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::{DiagnosticCode, VirtualWorkspace};
     #[test]
     fn test_issue_226() {
@@ -125,5 +127,28 @@ mod tests {
                 end
         "#
         ));
+    }
+
+    #[test]
+    fn test_gmod_self_param_shadow_is_ignored() {
+        let code = r#"
+            local ENT = {}
+            function ENT:Build()
+                local f = function(self)
+                    return self
+                end
+
+                return f(self)
+            end
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(DiagnosticCode::RedefinedLocal, code));
+
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = false;
+        ws.analysis.update_config(Arc::new(emmyrc));
+        assert!(!ws.check_code_for(DiagnosticCode::RedefinedLocal, code));
     }
 }

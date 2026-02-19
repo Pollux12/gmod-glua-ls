@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use crate::{DiagnosticCode, VirtualWorkspace};
 
     #[test]
@@ -45,5 +47,46 @@ mod test {
 
         assert!(!ws.check_code_for(DiagnosticCode::UnusedSelf, code));
         assert!(ws.check_code_for(DiagnosticCode::Unused, code));
+    }
+
+    #[test]
+    fn test_gmod_ignores_unused_params() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function consume(v)
+                    return v
+                end
+
+                local function foo(vehicle)
+                    return consume(1)
+                end
+
+                foo(1)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_non_gmod_reports_unused_params() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = false;
+        ws.analysis.update_config(Arc::new(emmyrc));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function consume(v)
+                    return v
+                end
+
+                local function foo(vehicle)
+                    return consume(1)
+                end
+
+                foo(1)
+            "#,
+        ));
     }
 }

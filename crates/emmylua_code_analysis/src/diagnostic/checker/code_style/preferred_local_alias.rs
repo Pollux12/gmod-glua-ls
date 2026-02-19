@@ -180,6 +180,7 @@ struct LocalAliasInfo {
     pub ref_field: LuaSemanticDeclId,
     pub preferred_name: String,
     pub invalid: bool,
+    pub reported: bool,
 }
 
 impl LocalAliasSet {
@@ -213,6 +214,7 @@ impl LocalAliasSet {
                     ref_field: decl_id,
                     preferred_name,
                     invalid: false,
+                    reported: false,
                 },
             );
         }
@@ -269,7 +271,7 @@ fn check_index_expr_preference(
     let access_path = index_expr.get_access_path()?;
 
     let alias_info = local_alias_set.get(&access_path)?;
-    if alias_info.invalid {
+    if alias_info.invalid || alias_info.reported {
         return Some(());
     }
 
@@ -307,6 +309,7 @@ fn check_index_expr_preference(
             "preferredAlias": alias_info.preferred_name.clone(),
         })),
     );
+    alias_info.reported = true;
 
     Some(())
 }
