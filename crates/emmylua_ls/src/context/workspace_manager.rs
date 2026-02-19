@@ -590,7 +590,10 @@ fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
         explicit_path.clone()
     } else if let Some(vscode_path) = &client_config.gmod_annotations_path {
         // VSCode extension provided path
-        log::info!("Using GMod annotations from VSCode extension: {}", vscode_path);
+        log::info!(
+            "Using GMod annotations from VSCode extension: {}",
+            vscode_path
+        );
         vscode_path.clone()
     } else {
         // No path available
@@ -891,7 +894,10 @@ mod tests {
             ClientConfig::default(),
         );
 
-        assert_eq!(loaded.emmyrc.diagnostics.globals, vec!["A_ONLY".to_string()]);
+        assert_eq!(
+            loaded.emmyrc.diagnostics.globals,
+            vec!["A_ONLY".to_string()]
+        );
         assert_eq!(
             loaded.emmyrc.diagnostics.disable,
             vec![DiagnosticCode::InjectField]
@@ -984,8 +990,20 @@ mod tests {
             ClientConfig::default(),
         );
 
-        assert!(loaded.emmyrc.runtime.extensions.contains(&".luaa".to_string()));
-        assert!(loaded.emmyrc.runtime.extensions.contains(&".luab".to_string()));
+        assert!(
+            loaded
+                .emmyrc
+                .runtime
+                .extensions
+                .contains(&".luaa".to_string())
+        );
+        assert!(
+            loaded
+                .emmyrc
+                .runtime
+                .extensions
+                .contains(&".luab".to_string())
+        );
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);
@@ -1118,8 +1136,14 @@ mod tests {
         let files = collect_workspace_files(&workspaces, &loaded.emmyrc, None, None);
         let loaded_paths = files.into_iter().map(|f| f.path).collect::<Vec<_>>();
 
-        let globals_a_path = library_a.join("globals_a.lua").to_string_lossy().to_string();
-        let globals_b_path = library_b.join("globals_b.lua").to_string_lossy().to_string();
+        let globals_a_path = library_a
+            .join("globals_a.lua")
+            .to_string_lossy()
+            .to_string();
+        let globals_b_path = library_b
+            .join("globals_b.lua")
+            .to_string_lossy()
+            .to_string();
         assert!(
             loaded_paths.iter().any(|path| path == &globals_a_path),
             "loaded paths: {:?}",

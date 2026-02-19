@@ -743,7 +743,10 @@ impl LuaModuleIndex {
     }
 
     pub fn get_workspace_id_for_root(&self, root: &Path) -> Option<WorkspaceId> {
-        self.workspaces.iter().find(|w| w.root == root).map(|w| w.id)
+        self.workspaces
+            .iter()
+            .find(|w| w.root == root)
+            .map(|w| w.id)
     }
 
     pub fn get_main_workspace_roots(&self) -> Vec<PathBuf> {

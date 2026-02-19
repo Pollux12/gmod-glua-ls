@@ -147,9 +147,12 @@ fn has_non_callable_member(db: &DbIndex, typ: &LuaType) -> bool {
     }
 
     match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::SelfInfer | LuaType::Global | LuaType::Nil | LuaType::Never => {
-            false
-        }
+        LuaType::Any
+        | LuaType::Unknown
+        | LuaType::SelfInfer
+        | LuaType::Global
+        | LuaType::Nil
+        | LuaType::Never => false,
         LuaType::Union(union) => union
             .into_vec()
             .iter()

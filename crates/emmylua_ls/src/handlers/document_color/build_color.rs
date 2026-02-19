@@ -1,7 +1,7 @@
 use emmylua_code_analysis::LuaDocument;
 use emmylua_parser::{
-    LuaAstNode, LuaCallExpr, LuaExpr, LuaLiteralToken, LuaSyntaxNode,
-    LuaSyntaxToken, LuaTokenKind, NumberResult,
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaLiteralToken, LuaSyntaxNode, LuaSyntaxToken, LuaTokenKind,
+    NumberResult,
 };
 use lsp_types::{Color, ColorInformation};
 use rowan::{TextRange, TextSize};

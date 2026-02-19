@@ -205,7 +205,10 @@ mod tests {
         );
 
         let lib_file = FileId { id: 30 };
-        module_index.add_module_by_path(lib_file, "C:/Users/username/ProjectB/lua/lib/shared_lib.lua");
+        module_index.add_module_by_path(
+            lib_file,
+            "C:/Users/username/ProjectB/lua/lib/shared_lib.lua",
+        );
         let lib_decl = LuaDeclId::new(lib_file, TextSize::new(0));
         global_index.add_global_decl("FromLibrary", lib_decl);
 

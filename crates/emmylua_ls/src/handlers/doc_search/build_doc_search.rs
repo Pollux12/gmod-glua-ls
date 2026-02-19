@@ -258,9 +258,14 @@ fn collect_qualified_global_decl_member_candidates(
 }
 
 fn resolve_decl_member_owner(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaMemberOwner> {
-    let typ = db.get_type_index().get_type_cache(&decl_id.into())?.as_type();
+    let typ = db
+        .get_type_index()
+        .get_type_cache(&decl_id.into())?
+        .as_type();
     match typ {
-        LuaType::Ref(type_id) | LuaType::Def(type_id) => Some(LuaMemberOwner::Type(type_id.clone())),
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            Some(LuaMemberOwner::Type(type_id.clone()))
+        }
         LuaType::TableConst(id) => Some(LuaMemberOwner::Element(id.clone())),
         LuaType::Instance(inst) => Some(LuaMemberOwner::Element(inst.get_range().clone())),
         _ => None,
@@ -585,7 +590,8 @@ fn build_doc_item(db: &DbIndex, candidate: DocCandidate) -> Option<GluaDocItem> 
             let owner = LuaSemanticDeclId::Member(member_id);
             let fallback = humanize_type(db, typ, RenderLevel::Detailed);
             let documentation = build_documentation_markdown(db, &owner, Some(typ), &fallback);
-            let separator = display_member_separator(&full_name, member_separator(member.get_feature()));
+            let separator =
+                display_member_separator(&full_name, member_separator(member.get_feature()));
 
             Some(GluaDocItem {
                 name,
@@ -604,12 +610,18 @@ fn build_doc_item(db: &DbIndex, candidate: DocCandidate) -> Option<GluaDocItem> 
                 .unwrap_or(&LuaType::Unknown);
             let owner = LuaSemanticDeclId::Member(member_id);
             let fallback = if full_name.is_empty() {
-                format!("{}{}{}", owner_path, member_separator(member.get_feature()), name)
+                format!(
+                    "{}{}{}",
+                    owner_path,
+                    member_separator(member.get_feature()),
+                    name
+                )
             } else {
                 humanize_type(db, typ, RenderLevel::Detailed)
             };
             let documentation = build_documentation_markdown(db, &owner, Some(typ), &fallback);
-            let separator = display_member_separator(&full_name, member_separator(member.get_feature()));
+            let separator =
+                display_member_separator(&full_name, member_separator(member.get_feature()));
 
             Some(GluaDocItem {
                 name,
@@ -1029,9 +1041,13 @@ mod tests {
     fn build_doc_search_supports_qualified_class_member_query() -> Result<()> {
         let mut ws = create_member_workspace();
 
-        let items =
-            build_doc_search(ws.get_db_mut(), "Entity:GetPos", 20, &CancellationToken::new())
-                .or_fail()?;
+        let items = build_doc_search(
+            ws.get_db_mut(),
+            "Entity:GetPos",
+            20,
+            &CancellationToken::new(),
+        )
+        .or_fail()?;
 
         let item = items
             .iter()
@@ -1044,8 +1060,8 @@ mod tests {
     fn build_doc_search_supports_unqualified_class_member_query() -> Result<()> {
         let mut ws = create_member_workspace();
 
-        let items = build_doc_search(ws.get_db_mut(), "GetPos", 20, &CancellationToken::new())
-            .or_fail()?;
+        let items =
+            build_doc_search(ws.get_db_mut(), "GetPos", 20, &CancellationToken::new()).or_fail()?;
 
         verify_that!(
             items.iter().any(|item| item.full_name == "Entity:GetPos"),
@@ -1081,10 +1097,12 @@ mod tests {
             eq(true)
         )?;
 
-        let left_only =
-            build_doc_search(ws.get_db_mut(), "Entity:", 20, &CancellationToken::new())
-                .or_fail()?;
-        verify_that!(left_only.iter().any(|item| item.full_name == "Entity"), eq(true))
+        let left_only = build_doc_search(ws.get_db_mut(), "Entity:", 20, &CancellationToken::new())
+            .or_fail()?;
+        verify_that!(
+            left_only.iter().any(|item| item.full_name == "Entity"),
+            eq(true)
+        )
     }
 
     #[gtest]
@@ -1114,10 +1132,13 @@ mod tests {
         "#,
         );
 
-        let items =
-            build_doc_search(ws.get_db_mut(), "physics", 20, &CancellationToken::new()).or_fail()?;
+        let items = build_doc_search(ws.get_db_mut(), "physics", 20, &CancellationToken::new())
+            .or_fail()?;
 
-        let exact_idx = items.iter().position(|item| item.name == "physics").or_fail()?;
+        let exact_idx = items
+            .iter()
+            .position(|item| item.name == "physics")
+            .or_fail()?;
         let prefix_idx = items
             .iter()
             .position(|item| item.name == "physicsEngine")
@@ -1151,8 +1172,8 @@ mod tests {
         "#,
         );
 
-        let items =
-            build_doc_search(ws.get_db_mut(), "physics", 20, &CancellationToken::new()).or_fail()?;
+        let items = build_doc_search(ws.get_db_mut(), "physics", 20, &CancellationToken::new())
+            .or_fail()?;
 
         let alpha_idx = items
             .iter()
@@ -1192,8 +1213,8 @@ mod tests {
         "#,
         );
 
-        let items =
-            build_doc_search(ws.get_db_mut(), "physics", 20, &CancellationToken::new()).or_fail()?;
+        let items = build_doc_search(ws.get_db_mut(), "physics", 20, &CancellationToken::new())
+            .or_fail()?;
 
         let constant_or_field_count = items
             .iter()

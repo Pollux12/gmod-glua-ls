@@ -48,7 +48,8 @@ pub fn check_ref_type_compact(
             }
             // When alias origin is a union of integer constants (enum-like),
             // accept any integer value (may be a bitwise combination of flags)
-            if result.is_err() && is_all_integer_const_origin(&origin_type)
+            if result.is_err()
+                && is_all_integer_const_origin(&origin_type)
                 && matches!(
                     compact_type,
                     LuaType::Integer | LuaType::DocIntegerConst(_) | LuaType::IntegerConst(_)

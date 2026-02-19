@@ -13,8 +13,7 @@ pub use configs::{
     EmmyrcExternalTool, EmmyrcFilenameConvention, EmmyrcGmod, EmmyrcGmodHookMappings,
     EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes, EmmyrcHover, EmmyrcInlayHint,
     EmmyrcInlineValues, EmmyrcLuaVersion, EmmyrcReference, EmmyrcReformat, EmmyrcResource,
-    EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcStrict, EmmyrcWorkspace,
-    EmmyrcWorkspaceModuleMap,
+    EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcStrict, EmmyrcWorkspace, EmmyrcWorkspaceModuleMap,
 };
 use emmylua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig, SpecialFunction};
 use rowan::NodeCache;

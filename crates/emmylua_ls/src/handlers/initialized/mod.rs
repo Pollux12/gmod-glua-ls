@@ -3,7 +3,11 @@ mod codestyle;
 mod locale;
 mod std_i18n;
 
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use crate::{
     cmd_args::CmdArgs,
@@ -215,7 +219,8 @@ pub async fn init_analysis(
     let mut files = Vec::new();
     let mut loaded_paths = HashSet::new();
     for (workspace_config, workspace_group) in &workspace_collection_groups {
-        for file in collect_workspace_files(workspace_group, workspace_config.as_ref(), None, None) {
+        for file in collect_workspace_files(workspace_group, workspace_config.as_ref(), None, None)
+        {
             let normalized_path = PathBuf::from(&file.path)
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&file.path));

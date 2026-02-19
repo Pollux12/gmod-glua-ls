@@ -226,7 +226,10 @@ fn is_exact_param_match(param_type: &LuaType, expr_type: &LuaType) -> bool {
     matches!(
         (param_type, expr_type),
         (LuaType::Number, LuaType::FloatConst(_))
-            | (LuaType::Integer, LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_))
+            | (
+                LuaType::Integer,
+                LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
+            )
     )
 }
 
