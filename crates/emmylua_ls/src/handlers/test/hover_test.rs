@@ -140,6 +140,47 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_decl_shows_inheritance_chain() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class BaseEntity
+                ---@class Entity: BaseEntity
+                ---@class Player: Entity
+
+                ---@type Player
+                local <??>ply
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal ply: Player : Entity : BaseEntity\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_decl_shows_full_deep_inheritance_chain() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class A
+                ---@class B: A
+                ---@class C: B
+                ---@class D: C
+                ---@class E: D
+                ---@class F: E
+
+                ---@type F
+                local <??>value
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal value: F : E : D : C : B : A\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_function_infer_return_val() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(

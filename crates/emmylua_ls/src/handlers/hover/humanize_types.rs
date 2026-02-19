@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use emmylua_code_analysis::{
     DbIndex, GmodRealm, InFiled, LuaMember, LuaMultiLineUnion, LuaSemanticDeclId, LuaType,
-    LuaUnionType, RenderLevel, SemanticDeclLevel, SemanticModel, format_union_type,
+    LuaTypeDeclId, LuaUnionType, RenderLevel, SemanticDeclLevel, SemanticModel, format_union_type,
 };
 
 use emmylua_code_analysis::humanize_type;
@@ -45,7 +47,12 @@ pub fn hover_humanize_type(
                 )
                 .unwrap_or_default();
             }
-            humanize_type(db, ty, fallback_level.unwrap_or(RenderLevel::Simple))
+            hover_ref_type_with_inheritance(
+                db,
+                ty,
+                type_decl_id,
+                fallback_level.unwrap_or(RenderLevel::Simple),
+            )
         }
         LuaType::MultiLineUnion(multi_union) => {
             hover_multi_line_union_type(builder, db, multi_union.as_ref(), None).unwrap_or_default()
@@ -53,6 +60,58 @@ pub fn hover_humanize_type(
         LuaType::Union(union) => hover_union_type(builder, union, RenderLevel::Detailed),
         _ => humanize_type(db, ty, fallback_level.unwrap_or(RenderLevel::Simple)),
     }
+}
+
+fn hover_ref_type_with_inheritance(
+    db: &DbIndex,
+    ty: &LuaType,
+    type_decl_id: &LuaTypeDeclId,
+    fallback_level: RenderLevel,
+) -> String {
+    let base_type = humanize_type(db, ty, fallback_level);
+    let inheritance_suffix = build_inheritance_suffix(db, type_decl_id);
+    if inheritance_suffix.is_empty() {
+        base_type
+    } else {
+        format!("{base_type}{inheritance_suffix}")
+    }
+}
+
+fn build_inheritance_suffix(db: &DbIndex, type_decl_id: &LuaTypeDeclId) -> String {
+    let mut current_type_id = type_decl_id.clone();
+    let mut visited = HashSet::from([current_type_id.clone()]);
+    let mut chain_parts = Vec::new();
+
+    while let Some(super_type) = first_super_type(db, &current_type_id) {
+        let next_type_id = if let LuaType::Ref(next_type_id) = &super_type {
+            Some(next_type_id.clone())
+        } else {
+            None
+        };
+
+        chain_parts.push(humanize_type(db, &super_type, RenderLevel::Simple));
+
+        let Some(next_type_id) = next_type_id else {
+            break;
+        };
+        if !visited.insert(next_type_id.clone()) {
+            break;
+        }
+        current_type_id = next_type_id;
+    }
+
+    if chain_parts.is_empty() {
+        return String::new();
+    }
+
+    format!(" : {}", chain_parts.join(" : "))
+}
+
+fn first_super_type(db: &DbIndex, type_decl_id: &LuaTypeDeclId) -> Option<LuaType> {
+    db.get_type_index()
+        .get_super_types_iter(type_decl_id)?
+        .next()
+        .cloned()
 }
 
 fn hover_union_type(
