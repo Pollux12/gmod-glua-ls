@@ -473,6 +473,8 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
             LuaSyntaxKind::BinaryExpr => {
                 return ancestor.children_with_tokens().any(|child| {
                     child.kind() == LuaTokenKind::TkAnd.into()
+                        || child.kind() == LuaTokenKind::TkEq.into()
+                        || child.kind() == LuaTokenKind::TkNe.into()
                         || child.kind() == LuaTokenKind::TkOr.into()
                 });
             }

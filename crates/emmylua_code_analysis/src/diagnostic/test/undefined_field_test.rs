@@ -793,6 +793,55 @@ mod test {
     }
 
     #[test]
+    fn test_nil_safe_equality_contexts_for_custom_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class VehicleEqLike
+                VehicleEqLike = {}
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type VehicleEqLike
+                local ent
+                local ok = ent.isGlideVehicle == nil
+            "#
+        ));
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type VehicleEqLike
+                local ent
+                local ok = ent.isGlideVehicle ~= nil
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_safe_equality_does_not_suppress_member_calls() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class VehicleCallLike
+                VehicleCallLike = {}
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type VehicleCallLike
+                local ent
+                local ok = ent.isGlideVehicle() ~= nil
+            "#
+        ));
+    }
+
+    #[test]
     fn test_nil_safe_or_regression_return_expression() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
