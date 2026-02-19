@@ -232,6 +232,19 @@ pub fn infer_bind_value_type(
         LuaAst::LuaAssignStat(assign) => {
             let (vars, exprs) = assign.get_var_and_expr_list();
             let mut typ = None;
+
+            for (idx, var) in vars.iter().enumerate() {
+                let var_expr: LuaExpr = var.clone().into();
+                if expr != var_expr {
+                    continue;
+                }
+
+                let Some(assign_expr) = exprs.get(idx) else {
+                    return Some(LuaType::Nil);
+                };
+                return infer_expr(db, cache, assign_expr.clone()).ok();
+            }
+
             for (idx, assign_expr) in exprs.iter().enumerate() {
                 if expr == *assign_expr {
                     let var = vars.get(idx);

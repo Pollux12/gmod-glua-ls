@@ -16,7 +16,7 @@ pub use resolve_global_decl::resolve_global_decl_id;
 pub use semantic_decl_level::SemanticDeclLevel;
 pub use semantic_guard::SemanticDeclGuard;
 
-use super::{LuaInferCache, infer_expr};
+use super::{LuaInferCache, infer_bind_value_type, infer_expr};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticInfo {
@@ -78,7 +78,12 @@ pub fn infer_node_semantic_info(
     match node {
         expr_node if LuaExpr::can_cast(expr_node.kind().into()) => {
             let expr = LuaExpr::cast(expr_node)?;
-            let typ = infer_expr(db, cache, expr.clone()).unwrap_or(LuaType::Unknown);
+            let mut typ = infer_expr(db, cache, expr.clone()).unwrap_or(LuaType::Unknown);
+            if typ.is_unknown()
+                && let Some(bind_typ) = infer_bind_value_type(db, cache, expr.clone())
+            {
+                typ = bind_typ;
+            }
             let property_owner = infer_expr_semantic_decl(
                 db,
                 cache,

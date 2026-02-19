@@ -1,9 +1,10 @@
 #[cfg(test)]
 mod test {
+    use emmylua_parser::{LuaAst, LuaAstNode, LuaIndexKey, LuaVarExpr};
     use googletest::prelude::*;
     use smol_str::SmolStr;
 
-    use crate::{LuaType, LuaUnionType, VirtualWorkspace};
+    use crate::{DiagnosticCode, LuaType, LuaUnionType, VirtualWorkspace};
 
     #[test]
     fn test_issue_318() {
@@ -189,5 +190,124 @@ mod test {
 
         let ty = ws.expr_ty("A");
         assert_that!(ws.check_type(&ty, &LuaType::Integer), eq(true));
+    }
+
+    #[gtest]
+    fn test_assignment_side_dynamic_field_type_for_class_typed_variables() {
+        let mut ws = VirtualWorkspace::new();
+
+        let source = r#"
+        ---@class Entity
+        ---@class prop_physics: Entity
+        ---@class Player
+        ---@class Panel
+        ---@class DPanel: Panel
+
+        ---@generic T: Entity
+        ---@param class `T`
+        ---@return T
+        local function ents_Create(class)
+        end
+
+        ---@generic T: Panel
+        ---@param class `T`
+        ---@return T
+        local function vgui_Create(class)
+        end
+
+        ---@param idx integer
+        ---@return Player
+        local function Player_func(idx)
+        end
+
+        ---@class TEST
+        local TEST = {}
+
+        function TEST:Function()
+            self.testVar = true
+
+            if self.testVar then
+                return
+            end
+
+            local tbl = {}
+            tbl.testVar = true
+
+            if tbl.testVar then
+                return
+            end
+
+            local ent = ents_Create("prop_physics")
+            ent.testVar = true
+
+            if ent.testVar then
+                return
+            end
+
+            local row = vgui_Create("DPanel")
+            row.testVar = true
+
+            if row.testVar then
+                return
+            end
+
+            local ply = Player_func(1)
+            ply.testVar = true
+
+            if ply.testVar then
+                return
+            end
+        end
+        "#;
+
+        assert_that!(ws.check_code_for(DiagnosticCode::UndefinedField, source), eq(true));
+        assert_that!(ws.check_code_for(DiagnosticCode::InjectField, source), eq(true));
+
+        let file_id = ws.def(source);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let mut assignment_types = Vec::new();
+        for node in semantic_model.get_root().clone().descendants::<LuaAst>() {
+            let LuaAst::LuaAssignStat(assign) = node else {
+                continue;
+            };
+
+            let (vars, _) = assign.get_var_and_expr_list();
+            for var in vars.iter() {
+                let LuaVarExpr::IndexExpr(index_expr) = var else {
+                    continue;
+                };
+
+                let Some(index_key) = index_expr.get_index_key() else {
+                    continue;
+                };
+                let is_test_var = match index_key {
+                    LuaIndexKey::Name(name) => name.get_name_text() == "testVar",
+                    LuaIndexKey::String(str_token) => str_token.get_value() == "testVar",
+                    _ => false,
+                };
+                if !is_test_var {
+                    continue;
+                }
+
+                let semantic_info = semantic_model
+                    .get_semantic_info(index_expr.syntax().clone().into())
+                    .expect("expected semantic info for assignment field");
+                assignment_types.push((index_expr.syntax().text().to_string(), semantic_info.typ));
+            }
+        }
+
+        assert_eq!(assignment_types.len(), 5);
+        for (assignment_expr, typ) in assignment_types {
+            assert!(
+                !typ.is_unknown(),
+                "assignment `{assignment_expr}` inferred as unknown"
+            );
+            assert_that!(ws.check_type(&typ, &LuaType::Boolean), eq(true));
+        }
     }
 }
