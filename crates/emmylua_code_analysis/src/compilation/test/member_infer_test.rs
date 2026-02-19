@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod test {
+    use googletest::prelude::*;
     use smol_str::SmolStr;
 
     use crate::{LuaType, LuaUnionType, VirtualWorkspace};
@@ -125,5 +126,68 @@ mod test {
 
         let ty = ws.expr_ty("A");
         assert_eq!(ws.humanize_type(ty), "(number|string)");
+    }
+
+    #[gtest]
+    fn test_flow_fallback_for_class_typed_dynamic_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@class TestEntity
+        local TestEntity = {}
+
+        ---@return TestEntity
+        local function create_entity()
+        end
+
+        local ent = create_entity()
+        ent.testVar = true
+        A = ent.testVar
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        assert_that!(ws.check_type(&ty, &LuaType::Boolean), eq(true));
+    }
+
+    #[gtest]
+    fn test_flow_fallback_table_literal_regression_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        local tbl = {}
+        tbl.testVar = true
+        A = tbl.testVar
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        assert_that!(ws.check_type(&ty, &LuaType::Boolean), eq(true));
+    }
+
+    #[gtest]
+    fn test_flow_fallback_prefers_latest_dynamic_field_assignment() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@class TestEntity
+        local TestEntity = {}
+
+        ---@return TestEntity
+        local function create_entity()
+        end
+
+        local ent = create_entity()
+        ent.testVar = true
+        ent.testVar = 42
+        A = ent.testVar
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        assert_that!(ws.check_type(&ty, &LuaType::Integer), eq(true));
     }
 }

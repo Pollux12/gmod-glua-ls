@@ -90,6 +90,14 @@ pub fn infer_index_expr(
         Err(err) => return Err(err),
     }
 
+    if pass_flow {
+        match infer_member_type_fallback_pass_flow(db, cache, index_expr) {
+            Ok(member_type) => return Ok(member_type),
+            Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
     Err(reason)
 }
 
@@ -111,6 +119,25 @@ fn infer_member_type_pass_flow(
     match &result {
         Err(InferFailReason::None) => Ok(member_type.clone()),
         _ => result,
+    }
+}
+
+fn infer_member_type_fallback_pass_flow(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: LuaIndexExpr,
+) -> InferResult {
+    let Some(var_ref_id) = get_index_expr_var_ref_id(db, cache, &index_expr) else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+
+    cache
+        .index_ref_origin_type_cache
+        .insert(var_ref_id.clone(), CacheEntry::Cache(LuaType::Nil));
+    match infer_expr_narrow_type(db, cache, LuaExpr::IndexExpr(index_expr), var_ref_id) {
+        Ok(member_type) if !member_type.is_nil() && !member_type.is_unknown() => Ok(member_type),
+        Ok(_) | Err(InferFailReason::None) => Err(InferFailReason::FieldNotFound),
+        Err(err) => Err(err),
     }
 }
 
