@@ -1184,4 +1184,36 @@ return t
             "#,
         ));
     }
+
+    #[test]
+    fn test_no_false_positive_dynamic_table_field_write() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local params = {}
+                params.buoyancy = 6
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_no_false_positive_tuple_literal_for_table_field_param() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@class SoundData
+                ---@field pitch (number|table<number>)?
+
+                ---@param data SoundData
+                local function add_sound(data)
+                end
+
+                add_sound({
+                    pitch = {95, 105}
+                })
+            "#,
+        ));
+    }
 }

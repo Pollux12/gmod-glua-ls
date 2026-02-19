@@ -296,7 +296,7 @@ fn check_table_expr_content(
             }
         };
 
-        if (source_type.is_table() || source_type.is_custom_type())
+        if should_check_nested_table_fields(&source_type)
             && let Some(table_expr) = LuaTableExpr::cast(value_expr.syntax().clone())
         {
             // 检查子表
@@ -323,6 +323,28 @@ fn check_table_expr_content(
     }
 
     Some(has_diagnostic)
+}
+
+fn should_check_nested_table_fields(source_type: &LuaType) -> bool {
+    if source_type.is_table() || source_type.is_custom_type() {
+        return true;
+    }
+
+    match source_type {
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(should_check_nested_table_fields),
+        LuaType::MultiLineUnion(multi_union) => multi_union
+            .get_unions()
+            .iter()
+            .any(|(typ, _)| should_check_nested_table_fields(typ)),
+        LuaType::Intersection(intersection_type) => intersection_type
+            .get_types()
+            .iter()
+            .any(should_check_nested_table_fields),
+        _ => false,
+    }
 }
 
 fn check_table_last_variadic_type(

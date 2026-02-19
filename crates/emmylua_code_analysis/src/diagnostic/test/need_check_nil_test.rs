@@ -120,4 +120,23 @@ mod test {
         "#,
         ));
     }
+
+    #[test]
+    fn test_no_false_positive_deferred_local_function_call() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local RefreshPanel
+            local button = {}
+
+            button.DoClick = function()
+                RefreshPanel()
+            end
+
+            RefreshPanel = function()
+            end
+            "#,
+        ));
+    }
 }

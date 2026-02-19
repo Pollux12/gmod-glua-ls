@@ -1,5 +1,5 @@
 use emmylua_parser::{
-    BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaExpr, LuaIndexExpr,
+    BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexExpr,
 };
 
 use crate::{DiagnosticCode, SemanticModel};
@@ -37,7 +37,7 @@ fn check_call_expr(
 ) -> Option<()> {
     let prefix = call_expr.get_prefix_expr()?;
     let func = semantic_model.infer_expr(prefix.clone()).ok()?;
-    if func.is_nullable() {
+    if func.is_nullable() && !should_skip_deferred_nullable_function_call(&call_expr, &prefix) {
         context.add_diagnostic(
             DiagnosticCode::NeedCheckNil,
             prefix.get_range(),
@@ -47,6 +47,19 @@ fn check_call_expr(
     }
 
     Some(())
+}
+
+fn should_skip_deferred_nullable_function_call(call_expr: &LuaCallExpr, prefix: &LuaExpr) -> bool {
+    let in_closure = call_expr
+        .syntax()
+        .ancestors()
+        .skip(1)
+        .any(|node| LuaClosureExpr::cast(node).is_some());
+    if !in_closure {
+        return false;
+    }
+
+    matches!(prefix, LuaExpr::NameExpr(_))
 }
 
 fn check_index_expr(

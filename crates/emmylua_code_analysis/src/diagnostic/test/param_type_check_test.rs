@@ -2,6 +2,9 @@
 mod test {
     use std::{ops::Deref, sync::Arc};
 
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
     use crate::{DiagnosticCode, VirtualWorkspace};
 
     #[test]
@@ -1621,5 +1624,57 @@ mod test {
             GetNWEntity("not_an_entity", "GlideVehicle", nil)
             "#,
         ));
+    }
+
+    #[test]
+    fn test_no_false_positive_realm_specific_member_overload() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "addons/test/lua/glide/client/network.lua",
+            r#"
+            Glide = Glide or {}
+
+            ---@param commandId number
+            ---@param handler fun(len: number)
+            function Glide.AddCommandHandler(commandId, handler)
+            end
+            "#,
+        );
+        ws.def_file(
+            "addons/test/lua/glide/server/network.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.Repair = Glide.Repair or {}
+
+            ---@class Player
+
+            ---@param ply Player
+            function Glide.Repair.StartSession(ply)
+            end
+
+            ---@param commandId number
+            ---@param handler fun(ply: Player)
+            function Glide.AddCommandHandler(commandId, handler)
+            end
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        let file_id = ws.def_file(
+            "addons/test/lua/glide/server/repair_network.lua",
+            r#"
+            Glide.AddCommandHandler(1, function(ply)
+                Glide.Repair.StartSession(ply)
+            end)
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        assert!(!diagnostics.iter().any(|diag| diag.code == code));
     }
 }
