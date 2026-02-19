@@ -1,4 +1,5 @@
 use emmylua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaDocTagType};
+use lsp_types::DiagnosticSeverity;
 use rowan::TextRange;
 
 use crate::diagnostic::{checker::Checker, lua_diagnostic::DiagnosticContext};
@@ -231,7 +232,19 @@ fn validate_str_tpl_ref(
                 .get_type_index()
                 .find_type_decl(semantic_model.get_file_id(), &full_type_name);
             if founded_type_decl.is_none() {
-                if extend_type.is_none() {
+                if let Some(extend_type) = extend_type.as_ref() {
+                    context.add_diagnostic_with_severity(
+                        DiagnosticCode::GenericConstraintMismatch,
+                        range,
+                        format!(
+                            "type `{}` is not defined in the codebase, using constraint type `{}`",
+                            full_type_name,
+                            humanize_type(semantic_model.get_db(), extend_type, RenderLevel::Simple)
+                        ),
+                        Some(DiagnosticSeverity::HINT),
+                        None,
+                    );
+                } else {
                     context.add_diagnostic(
                         DiagnosticCode::GenericConstraintMismatch,
                         range,

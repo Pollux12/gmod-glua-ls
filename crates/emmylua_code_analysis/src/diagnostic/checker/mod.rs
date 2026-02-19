@@ -170,6 +170,17 @@ impl<'a> DiagnosticContext<'a> {
         message: String,
         data: Option<serde_json::Value>,
     ) {
+        self.add_diagnostic_with_severity(code, range, message, None, data);
+    }
+
+    pub fn add_diagnostic_with_severity(
+        &mut self,
+        code: DiagnosticCode,
+        range: TextRange,
+        message: String,
+        severity: Option<DiagnosticSeverity>,
+        data: Option<serde_json::Value>,
+    ) {
         if !self.is_checker_enable_by_code(&code) {
             return;
         }
@@ -190,7 +201,7 @@ impl<'a> DiagnosticContext<'a> {
                     character: 0,
                 },
             }),
-            severity: self.get_severity(code),
+            severity: severity.or_else(|| self.get_severity(code)),
             code: Some(NumberOrString::String(code.get_name().to_string())),
             source: Some("GLuaLS".into()),
             tags: self.get_tags(code),

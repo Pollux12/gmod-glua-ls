@@ -1,8 +1,24 @@
 #[cfg(test)]
 mod test {
     use googletest::prelude::*;
+    use lsp_types::{DiagnosticSeverity, NumberOrString};
+    use tokio_util::sync::CancellationToken;
 
     use crate::{DiagnosticCode, VirtualWorkspace};
+
+    fn first_diagnostic_for_code(
+        ws: &mut VirtualWorkspace,
+        diagnostic_code: DiagnosticCode,
+        block_str: &str,
+    ) -> Option<lsp_types::Diagnostic> {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let file_id = ws.def(block_str);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())?;
+        let code_string = Some(NumberOrString::String(diagnostic_code.get_name().to_string()));
+        diagnostics.into_iter().find(|diagnostic| diagnostic.code == code_string)
+    }
 
     #[test]
     fn test_1() {
@@ -210,13 +226,9 @@ mod test {
     }
 
     #[gtest]
-    fn test_str_tpl_ref_missing_type_with_constraint_no_diagnostic() {
+    fn test_str_tpl_ref_missing_type_with_constraint_reports_hint_diagnostic() {
         let mut ws = VirtualWorkspace::new();
-
-        expect_that!(
-            ws.check_code_for(
-                DiagnosticCode::GenericConstraintMismatch,
-                r#"
+        let code = r#"
                     ---@class Entity
 
                     ents = {}
@@ -228,9 +240,22 @@ mod test {
                     end
 
                     ents.Create("sent_custom")
-                "#
-            ),
-            eq(true)
+                "#;
+
+        expect_that!(
+            ws.check_code_for(DiagnosticCode::GenericConstraintMismatch, code),
+            eq(false)
+        );
+
+        let diagnostic = first_diagnostic_for_code(
+            &mut ws,
+            DiagnosticCode::GenericConstraintMismatch,
+            code,
+        );
+        expect_that!(diagnostic.is_some(), eq(true));
+        expect_that!(
+            diagnostic.and_then(|diagnostic| diagnostic.severity),
+            eq(Some(DiagnosticSeverity::HINT))
         );
     }
 
