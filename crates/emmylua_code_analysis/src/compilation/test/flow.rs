@@ -1823,4 +1823,26 @@ _2 = a[1]
 
         assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
     }
+
+    #[test]
+    fn test_isfunction_member_guard_narrows_base_entity_to_callable_member_subtypes() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class Entity
+
+            ---@class base_glide: Entity
+            ---@field GetFreeSeat fun(self: base_glide): Entity?
+
+            ---@param vehicle Entity
+            local function enter(vehicle)
+                if isfunction(vehicle.GetFreeSeat) then
+                    local seat = vehicle:GetFreeSeat()
+                    A = seat
+                end
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
 }

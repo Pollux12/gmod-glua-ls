@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 
 use emmylua_parser::{
-    LuaAst, LuaAstNode, LuaElseIfClauseStat, LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr,
-    LuaIndexKey, LuaRepeatStat, LuaSyntaxKind, LuaTokenKind, LuaVarExpr, LuaWhileStat,
+    LuaAst, LuaAstNode, LuaCallExpr, LuaElseIfClauseStat, LuaExpr, LuaForRangeStat, LuaForStat,
+    LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaRepeatStat, LuaSyntaxKind, LuaTokenKind,
+    LuaVarExpr, LuaWhileStat,
 };
 
 use crate::{
@@ -461,8 +462,24 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
 
     for ancestor in node.syntax().ancestors().skip(1) {
         match ancestor.kind().into() {
-            LuaSyntaxKind::CallExpr
-            | LuaSyntaxKind::RequireCallExpr
+            LuaSyntaxKind::CallExpr => {
+                if let Some(call_expr) = LuaCallExpr::cast(ancestor.clone()) {
+                    let node_range = node.syntax().text_range();
+                    if is_known_member_guard_call_argument(&call_expr, node_range) {
+                        return true;
+                    }
+
+                    if call_expr
+                        .get_prefix_expr()
+                        .is_some_and(|prefix| prefix.get_range().contains_range(node_range))
+                    {
+                        return false;
+                    }
+                }
+
+                return false;
+            }
+            LuaSyntaxKind::RequireCallExpr
             | LuaSyntaxKind::ErrorCallExpr
             | LuaSyntaxKind::AssertCallExpr
             | LuaSyntaxKind::TypeCallExpr
@@ -489,6 +506,30 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
     }
 
     false
+}
+
+fn is_known_member_guard_call_argument(
+    call_expr: &LuaCallExpr,
+    node_range: rowan::TextRange,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return false;
+    };
+    if name_expr.get_name_text().as_deref() != Some("isfunction") {
+        return false;
+    }
+
+    let Some(args_list) = call_expr.get_args_list() else {
+        return false;
+    };
+
+    args_list
+        .get_args()
+        .any(|arg| arg.get_range().contains_range(node_range))
 }
 
 fn is_expression_boundary(kind: LuaSyntaxKind) -> bool {
