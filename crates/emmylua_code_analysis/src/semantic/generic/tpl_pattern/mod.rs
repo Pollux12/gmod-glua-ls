@@ -106,7 +106,11 @@ pub fn multi_param_tpl_pattern_match_multi_return(
     Ok(())
 }
 
-fn get_str_tpl_infer_type(name: &str) -> LuaType {
+fn get_str_tpl_infer_type(
+    context: &TplContext,
+    name: &str,
+    extend_type: Option<&LuaType>,
+) -> LuaType {
     match name {
         "unknown" => LuaType::Unknown,
         "never" => LuaType::Never,
@@ -122,7 +126,25 @@ fn get_str_tpl_infer_type(name: &str) -> LuaType {
         "self" => LuaType::SelfInfer,
         "global" => LuaType::Global,
         "function" => LuaType::Function,
-        _ => LuaType::Ref(LuaTypeDeclId::global(&name)),
+        _ => {
+            let ref_type = LuaType::Ref(LuaTypeDeclId::global(&name));
+            let type_decl_exists = match &ref_type {
+                LuaType::Ref(type_decl_id) => context
+                    .db
+                    .get_type_index()
+                    .get_type_decl(type_decl_id)
+                    .is_some(),
+                _ => false,
+            };
+
+            if type_decl_exists {
+                ref_type
+            } else if let Some(extend_type) = extend_type {
+                extend_type.clone()
+            } else {
+                ref_type
+            }
+        }
     }
 }
 
@@ -158,7 +180,7 @@ pub fn tpl_pattern_match(
                 let type_name = SmolStr::new(format!("{}{}{}", prefix, s, suffix));
                 context.substitutor.insert_type(
                     str_tpl.get_tpl_id(),
-                    get_str_tpl_infer_type(&type_name),
+                    get_str_tpl_infer_type(context, &type_name, str_tpl.get_constraint()),
                     true,
                 );
             }

@@ -5,7 +5,7 @@ mod tests {
     #[test]
     fn test_1() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for_namespace(
+        assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
             ---@generic T: string

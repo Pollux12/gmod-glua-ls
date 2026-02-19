@@ -231,12 +231,17 @@ fn validate_str_tpl_ref(
                 .get_type_index()
                 .find_type_decl(semantic_model.get_file_id(), &full_type_name);
             if founded_type_decl.is_none() {
-                context.add_diagnostic(
-                    DiagnosticCode::GenericConstraintMismatch,
-                    range,
-                    t!("the string template type does not match any type declaration").to_string(),
-                    None,
-                );
+                if extend_type.is_none() {
+                    context.add_diagnostic(
+                        DiagnosticCode::GenericConstraintMismatch,
+                        range,
+                        t!("the string template type does not match any type declaration")
+                            .to_string(),
+                        None,
+                    );
+                }
+
+                return Some(());
             }
 
             if let Some(extend_type) = extend_type

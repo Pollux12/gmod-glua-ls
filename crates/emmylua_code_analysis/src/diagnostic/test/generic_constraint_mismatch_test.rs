@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod test {
+    use googletest::prelude::*;
 
     use crate::{DiagnosticCode, VirtualWorkspace};
 
@@ -180,6 +181,80 @@ mod test {
                 end
         "#
         ));
+    }
+
+    #[gtest]
+    fn test_str_tpl_ref_declared_type_with_constraint_no_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::GenericConstraintMismatch,
+                r#"
+                    ---@class Entity
+                    ---@class sent_npc: Entity
+
+                    ents = {}
+
+                    ---@generic T: Entity
+                    ---@param class `T`
+                    ---@return T
+                    function ents.Create(class)
+                    end
+
+                    ents.Create("sent_npc")
+                "#
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_ref_missing_type_with_constraint_no_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::GenericConstraintMismatch,
+                r#"
+                    ---@class Entity
+
+                    ents = {}
+
+                    ---@generic T: Entity
+                    ---@param class `T`
+                    ---@return T
+                    function ents.Create(class)
+                    end
+
+                    ents.Create("sent_custom")
+                "#
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_ref_missing_type_without_constraint_reports_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::GenericConstraintMismatch,
+                r#"
+                    ents = {}
+
+                    ---@generic T
+                    ---@param class `T`
+                    ---@return T
+                    function ents.Create(class)
+                    end
+
+                    ents.Create("sent_custom")
+                "#
+            ),
+            eq(false)
+        );
     }
 
     #[test]
