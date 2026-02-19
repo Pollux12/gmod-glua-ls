@@ -111,25 +111,36 @@ mod test {
 
         let allowed_file_id = ws.def_file(
             "lua/entities/entities_test.lua",
-            r#"DEFINE_BASECLASS("base_anim")"#,
+            r#"
+            DEFINE_BASECLASS("base_anim")
+            AccessorFunc(ENT, "m_iHealth", "Health", true)
+        "#,
         );
         let denied_file_id = ws.def_file(
             "lua/autorun/ignored.lua",
-            r#"DEFINE_BASECLASS("base_anim")"#,
+            r#"
+            DEFINE_BASECLASS("base_anim")
+            AccessorFunc(ENT, "m_iHealth", "Health", true)
+        "#,
         );
 
-        assert!(
-            ws.get_db_mut()
-                .get_gmod_class_metadata_index()
-                .get_file_metadata(&allowed_file_id)
-                .is_some()
-        );
-        assert!(
-            ws.get_db_mut()
-                .get_gmod_class_metadata_index()
-                .get_file_metadata(&denied_file_id)
-                .is_none()
-        );
+        let allowed_metadata = ws
+            .get_db_mut()
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&allowed_file_id)
+            .cloned()
+            .expect("expected scoped metadata for allowed scripted-class file");
+        assert_eq!(allowed_metadata.define_baseclass_calls.len(), 1);
+        assert_eq!(allowed_metadata.accessor_func_calls.len(), 1);
+
+        let denied_metadata = ws
+            .get_db_mut()
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&denied_file_id)
+            .cloned()
+            .expect("expected DEFINE_BASECLASS metadata for out-of-scope file");
+        assert_eq!(denied_metadata.define_baseclass_calls.len(), 1);
+        assert_eq!(denied_metadata.accessor_func_calls.len(), 0);
     }
 
     #[gtest]
@@ -716,6 +727,73 @@ mod test {
             semantic_info.typ,
             LuaType::Ref(LuaTypeDeclId::global("base_glide")),
             "expected BaseClass to resolve to base_glide"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_global_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedGlobal.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics.iter().all(|diag| {
+                diag.code != undefined_global_code || !diag.message.contains("BaseClass")
+            }),
+            "unexpected undefined-global diagnostic for BaseClass: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_infers_baseclass_outside_scripted_scope_and_no_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedGlobal);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/vgui/test_panel.lua",
+            r#"
+            DEFINE_BASECLASS("base_panel")
+            local _ = BaseClass
+        "#,
+        );
+
+        {
+            let metadata = ws
+                .get_db_mut()
+                .get_gmod_class_metadata_index()
+                .get_file_metadata(&file_id)
+                .cloned()
+                .expect("expected scripted class metadata for out-of-scope DEFINE_BASECLASS");
+            assert_eq!(metadata.define_baseclass_calls.len(), 1);
+            assert_eq!(metadata.accessor_func_calls.len(), 0);
+        }
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let baseclass_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|name_expr| name_expr.get_name_text().as_deref() == Some("BaseClass"))
+            .expect("expected BaseClass name expression");
+        let baseclass_token = baseclass_expr
+            .get_name_token()
+            .expect("expected BaseClass token");
+        let semantic_info = semantic_model
+            .get_semantic_info(baseclass_token.syntax().clone().into())
+            .expect("expected semantic info for BaseClass");
+
+        assert_eq!(
+            semantic_info.typ,
+            LuaType::Ref(LuaTypeDeclId::global("base_panel")),
+            "expected BaseClass to resolve to base_panel"
         );
 
         let diagnostics = ws

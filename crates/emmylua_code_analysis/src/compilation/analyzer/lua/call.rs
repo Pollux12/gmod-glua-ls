@@ -148,7 +148,7 @@ fn find_decl_id_from_type(typ: &LuaType) -> Option<LuaTypeDeclId> {
 }
 
 fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaCallExpr) {
-    if !analyzer.is_scripted_class_scope {
+    if !analyzer.gmod_enabled {
         return;
     }
 
@@ -175,6 +175,10 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
     let Some(kind) = kind else {
         return;
     };
+
+    if kind != GmodScriptedClassCallKind::DefineBaseClass && !analyzer.is_scripted_class_scope {
+        return;
+    }
 
     let (literal_args, args) = extract_call_args(call_expr);
 
