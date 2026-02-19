@@ -3,7 +3,7 @@ use std::sync::Arc;
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, InferFailReason, InferGuard, InferGuardRef, LuaGenericType, LuaMemberKey,
+    DbIndex, GlobalId, InferFailReason, InferGuard, InferGuardRef, LuaGenericType, LuaMemberKey,
     LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, LuaTypeDeclId, TypeOps,
     check_type_compact,
     semantic::generic::{TypeSubstitutor, instantiate_type_generic},
@@ -97,6 +97,13 @@ fn infer_custom_type_raw_member_type(
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, member_key) {
         return member_item.resolve_type(db);
     }
+    let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(type_id.get_name()));
+    if let Some(member_item) = db
+        .get_member_index()
+        .get_member_item(&global_owner, member_key)
+    {
+        return member_item.resolve_type(db);
+    }
 
     if type_decl.is_class()
         && let Some(super_types) = type_index.get_super_types(type_id)
@@ -109,7 +116,7 @@ fn infer_custom_type_raw_member_type(
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
-                Err(InferFailReason::FieldNotFound) => {}
+                Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
                 Err(err) => return Err(err),
             }
         }

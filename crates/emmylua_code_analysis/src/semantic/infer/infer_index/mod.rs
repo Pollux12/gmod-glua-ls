@@ -10,7 +10,7 @@ use rowan::TextRange;
 use smol_str::SmolStr;
 
 use crate::{
-    CacheEntry, GenericTpl, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclOrMemberId,
+    CacheEntry, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclOrMemberId,
     LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaObjectType,
@@ -298,6 +298,10 @@ fn infer_custom_type_member(
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
         return member_item.resolve_type(db);
     }
+    let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
+    if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, &key) {
+        return member_item.resolve_type(db);
+    }
 
     // 解决`key`为表达式的情况
     if let LuaIndexKey::Expr(expr) = index_key
@@ -335,7 +339,7 @@ fn infer_custom_type_member(
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
-                Err(InferFailReason::FieldNotFound) => {}
+                Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
                 Err(err) => return Err(err),
             }
         }

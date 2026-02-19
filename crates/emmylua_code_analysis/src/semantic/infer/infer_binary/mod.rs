@@ -150,7 +150,19 @@ fn infer_binary_custom_operator(
         | LuaOperatorMetaMethod::Mul
         | LuaOperatorMetaMethod::Div
         | LuaOperatorMetaMethod::Mod
-        | LuaOperatorMetaMethod::Pow => Ok(LuaType::Number),
+        | LuaOperatorMetaMethod::Pow => {
+            let has_ambiguous_operand = left.is_nil()
+                || right.is_nil()
+                || left.is_any()
+                || right.is_any()
+                || left.is_unknown()
+                || right.is_unknown();
+            if has_ambiguous_operand || left.is_custom_type() || right.is_custom_type() {
+                Ok(LuaType::Unknown)
+            } else {
+                Ok(LuaType::Number)
+            }
+        }
         // GMod: unreachable — Lua 5.3+ operators disabled in parser
         LuaOperatorMetaMethod::IDiv
         | LuaOperatorMetaMethod::BAnd

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, FileId, InferGuardRef, LuaGenericType, LuaInstanceType, LuaIntersectionType,
+    DbIndex, FileId, GlobalId, InferGuardRef, LuaGenericType, LuaInstanceType, LuaIntersectionType,
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
     LuaTypeDeclId, LuaUnionType, WorkspaceId,
     semantic::{
@@ -308,6 +308,34 @@ fn find_custom_type_members(
         member_index.get_members(&LuaMemberOwner::Type(type_decl_id.clone()))
     {
         for member in type_members {
+            let member_key = member.get_key().clone();
+
+            if should_include_member(&member_key, filter) {
+                let raw_type = db
+                    .get_type_index()
+                    .get_type_cache(&member.get_id().into())
+                    .map(|t| t.as_type().clone())
+                    .unwrap_or(LuaType::Unknown);
+                members.push(LuaMemberInfo {
+                    property_owner_id: Some(LuaSemanticDeclId::Member(member.get_id())),
+                    key: member_key,
+                    typ: ctx.instantiate_type(db, &raw_type),
+                    feature: Some(member.get_feature()),
+                    overload_index: None,
+                });
+
+                if should_stop_collecting(members.len(), filter) {
+                    return Some(members);
+                }
+            }
+        }
+    }
+    if members.is_empty()
+        && let Some(global_members) = member_index.get_members(&LuaMemberOwner::GlobalPath(
+            GlobalId::new(type_decl_id.get_name()),
+        ))
+    {
+        for member in global_members {
             let member_key = member.get_key().clone();
 
             if should_include_member(&member_key, filter) {

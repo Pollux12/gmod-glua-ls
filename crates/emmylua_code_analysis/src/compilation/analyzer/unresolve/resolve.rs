@@ -64,9 +64,21 @@ pub fn try_resolve_member(
                 LuaMemberOwner::Type(def_id)
             }
             LuaType::Instance(instance) => LuaMemberOwner::Element(instance.get_range().clone()),
-            // is ref need extend field?
             _ => {
-                return Ok(()); // Changed from return None to return Ok(())
+                // Some annotation bundles define methods as `function TypeName:Method()`
+                // without binding a typed declaration for `TypeName` in scope.
+                // If a global type exists for that name, attach unresolved members there.
+                let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+                    return Ok(());
+                };
+                let Some(name_token) = name_expr.get_name_token() else {
+                    return Ok(());
+                };
+                let type_decl_id = LuaTypeDeclId::global(name_token.get_name_text());
+                if db.get_type_index().get_type_decl(&type_decl_id).is_none() {
+                    return Ok(());
+                }
+                LuaMemberOwner::Type(type_decl_id)
             }
         };
         let member_id = unresolve_member.member_id;

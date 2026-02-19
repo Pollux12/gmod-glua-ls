@@ -4,9 +4,9 @@ use emmylua_parser::{
 };
 
 use crate::{
-    DbIndex, LuaDeclId, LuaDeclOrMemberId, LuaInferCache, LuaInstanceType, LuaIntersectionType,
-    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeCache,
-    LuaTypeDeclId, LuaUnionType, TypeOps,
+    DbIndex, GlobalId, LuaDeclId, LuaDeclOrMemberId, LuaInferCache, LuaInstanceType,
+    LuaIntersectionType, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType,
+    LuaTypeCache, LuaTypeDeclId, LuaUnionType, TypeOps,
     semantic::{
         infer::{find_self_decl_or_member_id, resolve_scoped_scripted_global_type_decl_id},
         member::get_buildin_type_map_type_id,
@@ -359,6 +359,13 @@ fn infer_custom_type_member_semantic_decl(
 
     let owner = LuaMemberOwner::Type(prefix_type_id.clone());
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, member_key) {
+        return member_item.resolve_semantic_decl(db);
+    }
+    let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
+    if let Some(member_item) = db
+        .get_member_index()
+        .get_member_item(&global_owner, member_key)
+    {
         return member_item.resolve_semantic_decl(db);
     }
 

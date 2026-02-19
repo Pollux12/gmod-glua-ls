@@ -3058,4 +3058,178 @@ mod test {
             "unexpected undefined-field diagnostics with Entity type defined: {undefined_field_diags:?}; undefined_field_names={undefined_field_names:?}; member_names={member_names:?}"
         );
     }
+
+    #[gtest]
+    fn test_stool_methods_resolve_from_tool_super_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "addons/test/lua/includes/custom_classes.lua",
+            r#"
+                ---@class Tool
+                ---@class TOOL : Tool
+            "#,
+        );
+
+        ws.def_file(
+            "addons/test/lua/includes/tool_meta.lua",
+            r#"
+                ---@class Player
+                ---@param command string
+                function Player:ConCommand(command) end
+
+                ---@return Player
+                function Tool:GetOwner() end
+
+                ---@param name string
+                ---@return number
+                function Tool:GetClientNumber(name) end
+
+                ---@return table
+                function Tool:BuildConVarList() end
+
+                ---@class DNumSlider
+                ---@param value number
+                function DNumSlider:SetValue(value) end
+
+                ---@class ControlPanel
+                ---@param text string
+                function ControlPanel:Help(text) end
+
+                ---@param controlType string
+                ---@param info table
+                function ControlPanel:AddControl(controlType, info) end
+
+                ---@return DNumSlider
+                function ControlPanel:NumSlider(...) end
+
+                ---@param panel ControlPanel
+                function TOOL.BuildCPanel(panel) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/weapons/gmod_tool/stools/my_tool.lua",
+            r#"
+                TOOL.Category = "Test"
+                TOOL.Name = "My Tool"
+
+                function TOOL:LeftClick(trace)
+                    local owner = self:GetOwner()
+                    local speed = self:GetClientNumber("my_speed")
+                    local defaults = self:BuildConVarList()
+                    owner:ConCommand("say test")
+                    return IsValid(owner) and speed >= 0 and defaults ~= nil
+                end
+
+                function TOOL.BuildCPanel(panel)
+                    panel:Help("help")
+                    panel:AddControl("slider", {})
+                    local slider = panel:NumSlider("Label", "tool_speed", 0, 10, 0)
+                    slider:SetValue(5)
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
+
+        let extract_name = |message: &str| {
+            message
+                .strip_prefix("Undefined field `")
+                .and_then(|rest| rest.split_once('`'))
+                .map(|(name, _)| name.to_string())
+        };
+
+        let undefined_field_names: Vec<String> = undefined_field_diags
+            .iter()
+            .filter_map(|diag| extract_name(&diag.message))
+            .collect();
+
+        assert!(
+            !undefined_field_names.iter().any(|name| {
+                matches!(
+                    name.as_str(),
+                    "GetOwner"
+                        | "GetClientNumber"
+                        | "BuildConVarList"
+                        | "ConCommand"
+                        | "Help"
+                        | "AddControl"
+                        | "NumSlider"
+                        | "SetValue"
+                )
+            }),
+            "unexpected undefined-field diagnostics for TOOL base methods: {undefined_field_diags:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vector_member_access_after_arithmetic_chain() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/glide/server/vector_chain.lua",
+            r#"
+                local function compute(steerDir, fixedLen)
+                    local dirLen = steerDir:Length()
+                    local dirNorm = steerDir / dirLen
+                    local dirVec = dirNorm * fixedLen
+                    dirVec:Normalize()
+                    local len = dirVec:Length()
+                    local cross = dirVec:Cross(Vector(1, 0, 0))
+                    return len + cross.x + dirVec.y
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
+
+        let extract_name = |message: &str| {
+            message
+                .strip_prefix("Undefined field `")
+                .and_then(|rest| rest.split_once('`'))
+                .map(|(name, _)| name.to_string())
+        };
+        let undefined_field_names: Vec<String> = undefined_field_diags
+            .iter()
+            .filter_map(|diag| extract_name(&diag.message))
+            .collect();
+
+        assert!(
+            !undefined_field_names
+                .iter()
+                .any(|name| matches!(name.as_str(), "Normalize" | "Length" | "Cross" | "x" | "y")),
+            "unexpected vector undefined-field diagnostics after arithmetic chain: {undefined_field_diags:?}"
+        );
+    }
 }

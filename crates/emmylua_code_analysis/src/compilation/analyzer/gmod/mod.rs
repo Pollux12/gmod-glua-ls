@@ -247,14 +247,17 @@ fn ensure_scoped_class_type_decl(
                 .add_super_type(class_decl_id.clone(), file_id, super_type);
         }
     }
-
     class_decl_id
 }
 
 fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
     let mut super_types = vec![LuaType::Ref(LuaTypeDeclId::global(global_name))];
-    if global_name == "PLUGIN" {
-        super_types.push(LuaType::Ref(LuaTypeDeclId::global("GM")));
+    match global_name {
+        "TOOL" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Tool"))),
+        "SWEP" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Weapon"))),
+        "ENT" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+        "PLUGIN" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("GM"))),
+        _ => {}
     }
 
     super_types
