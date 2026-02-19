@@ -1722,4 +1722,72 @@ _2 = a[1]
         let type_str = ws.humanize_type_detailed(e_ty);
         assert_eq!(type_str, "(A|B|table)");
     }
+
+    #[test]
+    fn test_gmod_param_name_hint_infers_unannotated_param_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .param_type_hints
+            .insert("veh".to_string(), "HintVehicle".to_string());
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class HintVehicle
+            ---@field GetFreeSeat fun(self: HintVehicle): Entity
+
+            ---@class Entity
+
+            local function enter(veh)
+                local seat = veh:GetFreeSeat()
+                A = veh
+                B = seat
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "HintVehicle");
+        let b = ws.expr_ty("B");
+        assert_eq!(ws.humanize_type(b), "Entity");
+    }
+
+    #[test]
+    fn test_gmod_field_guard_narrows_base_entity_to_subtype_members() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class Entity
+
+            ---@class base_glide: Entity
+            ---@field IsGlideVehicle boolean
+            ---@field GetFreeSeat fun(self: base_glide): Entity?
+
+            local function EnterVehicle(ply, veh)
+                return true
+            end
+
+            ---@class PlayerMeta
+            local PlayerMeta = {}
+
+            ---@param vehicle Entity
+            function PlayerMeta:EnterVehicle(vehicle)
+                if vehicle.IsGlideVehicle and isfunction(vehicle.GetFreeSeat) then
+                    local seat = vehicle:GetFreeSeat()
+                    if not IsValid(seat) then
+                        return
+                    end
+
+                    return EnterVehicle(self, seat)
+                end
+
+                return EnterVehicle(self, vehicle)
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
 }

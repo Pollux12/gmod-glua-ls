@@ -81,6 +81,18 @@
           "methodToHook": {}
         },
         "inferDynamicFields": true,
+        "paramTypeHints": {
+          "ent": "Entity",
+          "entity": "Entity",
+          "panel": "Panel",
+          "player": "Player",
+          "ply": "Player",
+          "pnl": "Panel",
+          "veh": "Entity",
+          "vehicle": "Entity",
+          "weapon": "Weapon",
+          "wep": "Weapon"
+        },
         "scriptedClassScopes": {
           "exclude": [],
           "include": [
@@ -876,6 +888,24 @@
         "inferDynamicFields": {
           "type": "boolean",
           "default": true
+        },
+        "paramTypeHints": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {
+            "ent": "Entity",
+            "entity": "Entity",
+            "panel": "Panel",
+            "player": "Player",
+            "ply": "Player",
+            "pnl": "Panel",
+            "veh": "Entity",
+            "vehicle": "Entity",
+            "weapon": "Weapon",
+            "wep": "Weapon"
+          }
         },
         "scriptedClassScopes": {
           "$ref": "#/$defs/EmmyrcGmodScriptedClassScopes",

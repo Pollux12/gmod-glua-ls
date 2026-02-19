@@ -418,7 +418,73 @@ pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
         }
     }
 
+    if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name()) {
+        return Ok(param_hint_type);
+    }
+
     Err(InferFailReason::UnResolveDeclType(decl.get_id()))
+}
+
+fn infer_param_type_from_gmod_name_hint(db: &DbIndex, param_name: &str) -> Option<LuaType> {
+    if !db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let hints = &db.get_emmyrc().gmod.param_type_hints;
+    if hints.is_empty() {
+        return None;
+    }
+
+    let lowercase_name = param_name.to_ascii_lowercase();
+    let hint = hints
+        .get(param_name)
+        .or_else(|| hints.get(&lowercase_name))?
+        .trim();
+    if hint.is_empty() {
+        return None;
+    }
+
+    resolve_param_hint_type(db, hint)
+}
+
+fn resolve_param_hint_type(db: &DbIndex, hint: &str) -> Option<LuaType> {
+    let normalized_hint = hint.trim();
+    let (type_name, nullable) = if let Some(name) = normalized_hint.strip_suffix('?') {
+        (name.trim(), true)
+    } else {
+        (normalized_hint, false)
+    };
+
+    if type_name.is_empty() {
+        return None;
+    }
+
+    let mut resolved_type = match type_name {
+        "any" => LuaType::Any,
+        "unknown" => LuaType::Unknown,
+        "string" => LuaType::String,
+        "number" => LuaType::Number,
+        "integer" => LuaType::Integer,
+        "boolean" => LuaType::Boolean,
+        "table" => LuaType::Table,
+        "function" => LuaType::Function,
+        "thread" => LuaType::Thread,
+        "userdata" => LuaType::Userdata,
+        "nil" => LuaType::Nil,
+        _ => {
+            let type_decl_id = LuaTypeDeclId::global(type_name);
+            if db.get_type_index().get_type_decl(&type_decl_id).is_none() {
+                return None;
+            }
+            LuaType::Ref(type_decl_id)
+        }
+    };
+
+    if nullable && !resolved_type.is_nullable() {
+        resolved_type = TypeOps::Union.apply(db, &resolved_type, &LuaType::Nil);
+    }
+
+    Some(resolved_type)
 }
 
 pub fn find_decl_member_type(db: &DbIndex, member_id: LuaMemberId) -> InferResult {
