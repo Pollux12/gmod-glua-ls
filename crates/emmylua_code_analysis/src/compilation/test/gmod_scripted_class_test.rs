@@ -1334,6 +1334,112 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_panel_dynamic_field_method_call_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def(
+            r#"
+            ---@class Panel
+            local Panel = {}
+
+            ---@param name string
+            ---@return Panel
+            function Panel:Add(name)
+            end
+
+            ---@param dir number
+            function Panel:Dock(dir)
+            end
+
+            ---@class EditablePanel : Panel
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/vgui/test_dynamic_field_panel.lua",
+            r#"
+            local TOP = 1
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.buttons = self:Add("Panel")
+                self.buttons:Dock(TOP)
+            end
+
+            vgui.Register("TestDynamicFieldPanel", PANEL, "EditablePanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_cross_method_dynamic_field_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def(
+            r#"
+            ---@class EditablePanel
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/vgui/cross_method_panel.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.header = {}
+            end
+
+            function PANEL:PerformLayout()
+                local _ = self.header
+            end
+
+            vgui.Register("CrossMethodPanel", PANEL, "EditablePanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vgui_register_not_captured_when_gmod_disabled() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

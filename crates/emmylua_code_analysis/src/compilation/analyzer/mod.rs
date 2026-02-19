@@ -43,6 +43,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
             run_analysis::<gmod::GmodAnalysisPipeline>(db, &mut context);
         }
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
+            context.infer_manager.clear();
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
         }
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
