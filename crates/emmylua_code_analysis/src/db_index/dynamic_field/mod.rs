@@ -42,6 +42,25 @@ impl DynamicFieldIndex {
             .get(type_id)
             .is_some_and(|fields| fields.contains_key(field_name))
     }
+
+    pub fn get_fields(
+        &self,
+        type_id: &LuaTypeDeclId,
+    ) -> Option<&HashMap<SmolStr, HashSet<FileId>>> {
+        self.type_fields.get(type_id)
+    }
+
+    pub fn get_fields_in_file(&self, type_id: &LuaTypeDeclId, file_id: FileId) -> Vec<&SmolStr> {
+        self.type_fields
+            .get(type_id)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|(name, files)| files.contains(&file_id).then_some(name))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl LuaIndex for DynamicFieldIndex {

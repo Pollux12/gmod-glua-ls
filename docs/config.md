@@ -198,6 +198,7 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `detectRealmFromFilename` | `boolean \| null` | `true` | Detect realm from filename prefixes (`cl_`, `sv_`, `sh_`) |
 | `detectRealmFromCalls` | `boolean \| null` | `true` | Detect realm from API usage |
 | `inferDynamicFields` | `boolean` | `true` | Track dynamic fields on GMod objects |
+| `dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files (`false` keeps completion results file-scoped) |
 | `scriptedClassScopes.include` | `string[]` | `["entities/**", "weapons/**", "effects/**", "weapons/gmod_tool/stools/**"]` | Glob patterns for scripted class extraction |
 | `scriptedClassScopes.exclude` | `string[]` | `[]` | Patterns to exclude from scripted class extraction |
 | `hookMappings.methodToHook` | `object` | `{}` | Map methods to hook names |
@@ -416,6 +417,7 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
     "detectRealmFromFilename": true,
     "detectRealmFromCalls": true,
     "inferDynamicFields": true,
+    "dynamicFieldsGlobal": true,
     "scriptedClassScopes": {
       "include": [
         "entities/**",

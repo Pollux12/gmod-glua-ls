@@ -717,7 +717,7 @@ mod test {
             "#,
         );
 
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedField,
             r#"
                 if Flags.b then
@@ -751,6 +751,88 @@ mod test {
                 if Flags[c] then
                 end
         "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_safe_logical_contexts_for_custom_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class VehicleLike
+                VehicleLike = {}
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type VehicleLike
+                local ent
+                local ok = ent.isGlideVehicle or false
+            "#
+        ));
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type VehicleLike
+                local ent
+                local ok = ent.isGlideVehicle and true
+            "#
+        ));
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type VehicleLike
+                local ent
+                local ok = not ent.isGlideVehicle
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_safe_or_regression_return_expression() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class EntityMeta
+                EntityMeta = {}
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type EntityMeta
+                local self
+                local function IsVehicle(v) end
+
+                local function is_vehicle()
+                    return self.IsGlideVehicle or IsVehicle(self)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_safe_logical_context_keeps_enum_warning() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@enum FlagsEnum
+                FlagsEnum = {
+                    a = 1,
+                }
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local ok = FlagsEnum.b or false
+            "#
         ));
     }
 

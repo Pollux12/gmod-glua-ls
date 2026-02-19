@@ -12,10 +12,10 @@ use crate::{
 use emmylua_parser::{LuaAssignStat, LuaAstNode, LuaSyntaxKind, LuaTableExpr, LuaTableField};
 pub use find_index::find_index_operations;
 pub use find_members::{
-    find_members, find_members_in_workspace, find_members_with_key,
-    find_members_with_key_in_workspace,
+    find_members, find_members_in_workspace_for_file, find_members_with_key,
+    find_members_with_key_in_workspace_for_file,
 };
-pub use get_member_map::{get_member_map, get_member_map_in_workspace};
+pub use get_member_map::{get_member_map, get_member_map_in_workspace_for_file};
 pub use infer_raw_member::infer_raw_member_type;
 
 use super::{

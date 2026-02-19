@@ -20,6 +20,8 @@ pub struct EmmyrcGmod {
     pub detect_realm_from_calls: Option<bool>,
     #[serde(default = "infer_dynamic_fields_default")]
     pub infer_dynamic_fields: bool,
+    #[serde(default = "dynamic_fields_global_default")]
+    pub dynamic_fields_global: bool,
     /// Path to GMod annotations to load as core library.
     /// When set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).
     /// Set to explicit path to override, or use `autoLoadAnnotations: false` in .emmyrc to disable entirely.
@@ -39,6 +41,10 @@ fn infer_dynamic_fields_default() -> bool {
     true
 }
 
+fn dynamic_fields_global_default() -> bool {
+    true
+}
+
 impl Default for EmmyrcGmod {
     fn default() -> Self {
         Self {
@@ -49,6 +55,7 @@ impl Default for EmmyrcGmod {
             detect_realm_from_filename: None,
             detect_realm_from_calls: None,
             infer_dynamic_fields: infer_dynamic_fields_default(),
+            dynamic_fields_global: dynamic_fields_global_default(),
             annotations_path: None,
             auto_load_annotations: None,
         }
@@ -130,6 +137,7 @@ mod tests {
         verify_that!(gmod.hook_mappings.method_prefixes.is_empty(), eq(true))?;
         verify_that!(gmod.detect_realm_from_filename, eq(None))?;
         verify_that!(gmod.detect_realm_from_calls, eq(None))?;
-        verify_that!(gmod.infer_dynamic_fields, eq(true))
+        verify_that!(gmod.infer_dynamic_fields, eq(true))?;
+        verify_that!(gmod.dynamic_fields_global, eq(true))
     }
 }

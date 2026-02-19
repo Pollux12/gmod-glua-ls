@@ -73,6 +73,7 @@
       "default": {
         "autoLoadAnnotations": null,
         "defaultRealm": "shared",
+        "dynamicFieldsGlobal": true,
         "enabled": true,
         "hookMappings": {
           "emitterToHook": {},
@@ -855,6 +856,10 @@
             "boolean",
             "null"
           ]
+        },
+        "dynamicFieldsGlobal": {
+          "type": "boolean",
+          "default": true
         },
         "enabled": {
           "type": "boolean",

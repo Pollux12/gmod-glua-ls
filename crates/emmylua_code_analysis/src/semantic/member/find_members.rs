@@ -34,12 +34,14 @@ pub fn find_members(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
     find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::All)
 }
 
-pub fn find_members_in_workspace(
+pub fn find_members_in_workspace_for_file(
     db: &DbIndex,
     prefix_type: &LuaType,
     workspace_id: WorkspaceId,
+    file_id: FileId,
 ) -> FindMembersResult {
-    let ctx = FindMembersContext::new_with_workspace(InferGuard::new(), workspace_id);
+    let ctx =
+        FindMembersContext::new_with_workspace_and_file(InferGuard::new(), workspace_id, file_id);
     find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::All)
 }
 
@@ -61,14 +63,16 @@ pub fn find_members_with_key(
     )
 }
 
-pub fn find_members_with_key_in_workspace(
+pub fn find_members_with_key_in_workspace_for_file(
     db: &DbIndex,
     prefix_type: &LuaType,
     member_key: LuaMemberKey,
     find_all: bool,
     workspace_id: WorkspaceId,
+    file_id: FileId,
 ) -> FindMembersResult {
-    let ctx = FindMembersContext::new_with_workspace(InferGuard::new(), workspace_id);
+    let ctx =
+        FindMembersContext::new_with_workspace_and_file(InferGuard::new(), workspace_id, file_id);
     find_members_guard(
         db,
         prefix_type,
@@ -85,6 +89,7 @@ struct FindMembersContext {
     infer_guard: InferGuardRef,
     substitutor: Option<TypeSubstitutor>,
     workspace_id: Option<WorkspaceId>,
+    file_id: Option<FileId>,
 }
 
 impl FindMembersContext {
@@ -93,14 +98,20 @@ impl FindMembersContext {
             infer_guard,
             substitutor: None,
             workspace_id: None,
+            file_id: None,
         }
     }
 
-    fn new_with_workspace(infer_guard: InferGuardRef, workspace_id: WorkspaceId) -> Self {
+    fn new_with_workspace_and_file(
+        infer_guard: InferGuardRef,
+        workspace_id: WorkspaceId,
+        file_id: FileId,
+    ) -> Self {
         Self {
             infer_guard,
             substitutor: None,
             workspace_id: Some(workspace_id),
+            file_id: Some(file_id),
         }
     }
 
@@ -109,6 +120,7 @@ impl FindMembersContext {
             infer_guard: self.infer_guard.clone(),
             substitutor: Some(substitutor),
             workspace_id: self.workspace_id,
+            file_id: self.file_id,
         }
     }
 
@@ -117,6 +129,7 @@ impl FindMembersContext {
             infer_guard: self.infer_guard.fork(),
             substitutor: self.substitutor.clone(),
             workspace_id: self.workspace_id,
+            file_id: self.file_id,
         }
     }
 
@@ -130,6 +143,10 @@ impl FindMembersContext {
 
     fn infer_guard(&self) -> &InferGuardRef {
         &self.infer_guard
+    }
+
+    fn file_id(&self) -> Option<FileId> {
+        self.file_id
     }
 }
 
@@ -327,6 +344,10 @@ fn find_custom_type_members(
                 }
             }
         }
+    }
+
+    if append_dynamic_fields_for_type(db, ctx, type_decl_id, &mut members, filter) {
+        return Some(members);
     }
 
     Some(members)
@@ -633,4 +654,63 @@ fn find_namespace_members(
     }
 
     Some(members)
+}
+
+fn append_dynamic_fields_for_type(
+    db: &DbIndex,
+    ctx: &FindMembersContext,
+    type_decl_id: &LuaTypeDeclId,
+    members: &mut Vec<LuaMemberInfo>,
+    filter: &FindMemberFilter,
+) -> bool {
+    let emmyrc = db.get_emmyrc();
+    if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
+        return false;
+    }
+
+    let index = db.get_dynamic_field_index();
+    let mut field_names = if emmyrc.gmod.dynamic_fields_global {
+        index
+            .get_fields(type_decl_id)
+            .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    } else if let Some(file_id) = ctx.file_id() {
+        index
+            .get_fields_in_file(type_decl_id, file_id)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        index
+            .get_fields(type_decl_id)
+            .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+
+    field_names.sort_unstable();
+
+    for field_name in field_names {
+        let member_key = LuaMemberKey::Name(field_name);
+        if !should_include_member(&member_key, filter) {
+            continue;
+        }
+
+        if members.iter().any(|member| member.key == member_key) {
+            continue;
+        }
+
+        members.push(LuaMemberInfo {
+            property_owner_id: None,
+            key: member_key,
+            typ: LuaType::Any,
+            feature: None,
+            overload_index: None,
+        });
+
+        if should_stop_collecting(members.len(), filter) {
+            return true;
+        }
+    }
+
+    false
 }

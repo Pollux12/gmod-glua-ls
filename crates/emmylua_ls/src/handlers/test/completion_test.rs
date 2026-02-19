@@ -2590,6 +2590,74 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_dynamic_field_completion_global_per_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "assign.lua",
+            r#"
+            ---@class DynComp.Entity
+
+            ---@type DynComp.Entity
+            local ent
+            ent.testVar = true
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            ---@type DynComp.Entity
+            local ent2
+            ent2.<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "testVar".to_string(),
+                kind: CompletionItemKind::VARIABLE,
+                ..Default::default()
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_dynamic_field_completion_file_scoped_when_disabled() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = false;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "assign.lua",
+            r#"
+            ---@class DynCompScoped.Entity
+
+            ---@type DynCompScoped.Entity
+            local ent
+            ent.testVar = true
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            ---@type DynCompScoped.Entity
+            local ent2
+            ent2.<??>
+            "#,
+            vec![],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_plugin_function_decl_completion_uses_gm_fallback_with_param_detail() -> Result<()>
     {
         let mut ws = ProviderVirtualWorkspace::new();

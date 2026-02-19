@@ -148,8 +148,12 @@ pub(super) fn is_valid_member(
         _ => {}
     }
 
-    // 如果位于检查语句中, 则可以做一些宽泛的检查
-    if matches!(code, DiagnosticCode::UndefinedField) && in_conditional_statement(index_expr) {
+    // nil-safe 上下文(条件表达式、and/or/not)中, 允许宽泛检查
+    if matches!(code, DiagnosticCode::UndefinedField) && is_nil_safe_expr_context(index_expr) {
+        if is_non_enum_custom_type(semantic_model, prefix_typ) {
+            return Some(());
+        }
+
         for child in index_expr.syntax().children_with_tokens() {
             if child.kind() == LuaTokenKind::TkLeftBracket.into() {
                 // 此时为 [] 访问, 大部分类型都可以直接通行
@@ -448,6 +452,87 @@ fn in_conditional_statement<T: LuaAstNode>(node: &T) -> bool {
         }
     }
     false
+}
+
+fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
+    if in_conditional_statement(node) {
+        return true;
+    }
+
+    for ancestor in node.syntax().ancestors().skip(1) {
+        match ancestor.kind().into() {
+            LuaSyntaxKind::CallExpr
+            | LuaSyntaxKind::RequireCallExpr
+            | LuaSyntaxKind::ErrorCallExpr
+            | LuaSyntaxKind::AssertCallExpr
+            | LuaSyntaxKind::TypeCallExpr
+            | LuaSyntaxKind::SetmetatableCallExpr
+            | LuaSyntaxKind::IndexExpr => {
+                return false;
+            }
+            LuaSyntaxKind::BinaryExpr => {
+                return ancestor.children_with_tokens().any(|child| {
+                    child.kind() == LuaTokenKind::TkAnd.into()
+                        || child.kind() == LuaTokenKind::TkOr.into()
+                });
+            }
+            LuaSyntaxKind::UnaryExpr => {
+                return ancestor
+                    .children_with_tokens()
+                    .any(|child| child.kind() == LuaTokenKind::TkNot.into());
+            }
+            kind if is_expression_boundary(kind) => return false,
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn is_expression_boundary(kind: LuaSyntaxKind) -> bool {
+    matches!(
+        kind,
+        LuaSyntaxKind::Chunk
+            | LuaSyntaxKind::Block
+            | LuaSyntaxKind::EmptyStat
+            | LuaSyntaxKind::LocalStat
+            | LuaSyntaxKind::LocalFuncStat
+            | LuaSyntaxKind::IfStat
+            | LuaSyntaxKind::ElseIfClauseStat
+            | LuaSyntaxKind::ElseClauseStat
+            | LuaSyntaxKind::WhileStat
+            | LuaSyntaxKind::DoStat
+            | LuaSyntaxKind::ForStat
+            | LuaSyntaxKind::ForRangeStat
+            | LuaSyntaxKind::RepeatStat
+            | LuaSyntaxKind::FuncStat
+            | LuaSyntaxKind::LabelStat
+            | LuaSyntaxKind::BreakStat
+            | LuaSyntaxKind::ReturnStat
+            | LuaSyntaxKind::GotoStat
+            | LuaSyntaxKind::CallExprStat
+            | LuaSyntaxKind::AssignStat
+            | LuaSyntaxKind::GlobalStat
+            | LuaSyntaxKind::UnknownStat
+    )
+}
+
+fn is_non_enum_custom_type(semantic_model: &SemanticModel, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => semantic_model
+            .get_db()
+            .get_type_index()
+            .get_type_decl(id)
+            .is_some_and(|decl| !decl.is_enum()),
+        LuaType::Instance(instance_type) => {
+            is_non_enum_custom_type(semantic_model, instance_type.get_base())
+        }
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .all(|member_type| is_non_enum_custom_type(semantic_model, member_type)),
+        _ => false,
+    }
 }
 
 fn check_enum_is_param(
