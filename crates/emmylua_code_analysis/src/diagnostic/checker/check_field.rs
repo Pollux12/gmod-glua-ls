@@ -79,6 +79,10 @@ fn check_index_expr(
         return Some(());
     }
 
+    if matches!(code, DiagnosticCode::UndefinedField) && is_nil_guarded_in_scope(index_expr) {
+        return Some(());
+    }
+
     let index_name = index_key.get_path_part();
     match code {
         DiagnosticCode::InjectField => {
@@ -655,6 +659,103 @@ fn get_keyof_keys(db: &DbIndex, alias_call: &LuaAliasCallType) -> Option<Vec<Lua
         })
         .collect::<Vec<_>>();
     Some(key_types)
+}
+
+/// Check if this index expression is inside an if-body where the condition
+/// guards the same field against nil (e.g., `if x.field ~= nil then ... end`
+/// or `if x.field then ... end`).
+fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
+    let target_text = index_expr.syntax().text().to_string();
+    let node_range = index_expr.syntax().text_range();
+
+    for ancestor in index_expr.syntax().ancestors() {
+        match ancestor.kind().into() {
+            LuaSyntaxKind::IfStat => {
+                if let Some(if_stat) = LuaIfStat::cast(ancestor) {
+                    if let Some(condition_expr) = if_stat.get_condition_expr() {
+                        let cond_range = condition_expr.get_range();
+                        if !cond_range.contains_range(node_range) {
+                            if condition_nil_guards_field(&condition_expr, &target_text) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            LuaSyntaxKind::ElseIfClauseStat => {
+                if let Some(elseif_clause) = LuaElseIfClauseStat::cast(ancestor) {
+                    if let Some(condition_expr) = elseif_clause.get_condition_expr() {
+                        let cond_range = condition_expr.get_range();
+                        if !cond_range.contains_range(node_range) {
+                            if condition_nil_guards_field(&condition_expr, &target_text) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            LuaSyntaxKind::ClosureExpr | LuaSyntaxKind::FuncStat | LuaSyntaxKind::LocalFuncStat => {
+                break;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Check if a condition expression guards a field against nil.
+/// Handles: `field ~= nil`, `field` (truthy), and compound `and` conditions.
+fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
+    match condition {
+        LuaExpr::BinaryExpr(binary) => {
+            let has_ne_nil = binary.syntax().children_with_tokens().any(|child| {
+                child.kind() == LuaTokenKind::TkNe.into()
+            });
+            if has_ne_nil {
+                let exprs: Vec<LuaExpr> = binary
+                    .syntax()
+                    .children()
+                    .filter_map(LuaExpr::cast)
+                    .collect();
+                if exprs.len() == 2 {
+                    let lhs_text = exprs[0].syntax().text().to_string();
+                    let rhs_text = exprs[1].syntax().text().to_string();
+                    if (lhs_text == field_text && rhs_text.trim() == "nil")
+                        || (rhs_text == field_text && lhs_text.trim() == "nil")
+                    {
+                        return true;
+                    }
+                }
+            }
+            let has_and = binary.syntax().children_with_tokens().any(|child| {
+                child.kind() == LuaTokenKind::TkAnd.into()
+            });
+            if has_and {
+                let exprs: Vec<LuaExpr> = binary
+                    .syntax()
+                    .children()
+                    .filter_map(LuaExpr::cast)
+                    .collect();
+                for expr in &exprs {
+                    if condition_nil_guards_field(expr, field_text) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        LuaExpr::IndexExpr(idx) => idx.syntax().text().to_string() == field_text,
+        LuaExpr::ParenExpr(paren) => {
+            if let Some(inner) = paren.get_expr() {
+                condition_nil_guards_field(&inner, field_text)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, index_key: &LuaIndexKey) -> bool {

@@ -1056,4 +1056,61 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_nil_guarded_field_in_if_body() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestConfig
+                local Config = {}
+
+                ---@type TestConfig
+                local cfg = {}
+
+                if cfg.dynamicField ~= nil then
+                    local x = cfg.dynamicField
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_nil_guarded_field_truthy_check() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestConfig2
+                local Config = {}
+
+                ---@type TestConfig2
+                local cfg = {}
+
+                if cfg.dynamicField then
+                    local x = cfg.dynamicField
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_nil_guarded_field_compound_and() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestConfig3
+                local Config = {}
+
+                ---@type TestConfig3
+                local cfg = {}
+
+                if cfg.dynamicField ~= nil and cfg.dynamicField > 0 then
+                    local x = cfg.dynamicField
+                end
+            "#,
+        ));
+    }
 }
