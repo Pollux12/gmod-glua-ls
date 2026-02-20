@@ -3,7 +3,7 @@ use smol_str::SmolStr;
 
 use crate::{LuaType, LuaTypeDeclId, db_index::DbIndex, profile::Profile, semantic::infer_expr};
 
-use super::{AnalysisPipeline, AnalyzeContext};
+use super::{AnalysisPipeline, AnalyzeContext, gmod::get_gmod_class_name_for_file};
 
 pub struct DynamicFieldAnalysisPipeline;
 
@@ -18,6 +18,10 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
             let root = in_filed_tree.value.clone();
             let file_id = in_filed_tree.file_id;
             let cache = context.infer_manager.get_infer_cache(file_id);
+            // Pre-compute the gmod class for this file (if any) to avoid
+            // repeated path lookups inside the inner loop.
+            let file_class_type = get_gmod_class_name_for_file(&*db, file_id)
+                .map(|name| LuaType::Ref(LuaTypeDeclId::global(&name)));
 
             for node in root.descendants::<LuaAst>() {
                 let LuaAst::LuaAssignStat(assign) = node else {
@@ -37,8 +41,24 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                     let Some(field_name) = get_field_name(&index_expr) else {
                         continue;
                     };
+
+                    // When the prefix resolves to a generic table type (e.g.
+                    // from Entity:GetTable()) and the file belongs to a gmod
+                    // scripted class, index under the class type so that
+                    // `self.field` accesses find these dynamic fields.
+                    let effective_type =
+                        if is_unresolved_table_type(&prefix_type) {
+                            if let Some(class_type) = &file_class_type {
+                                class_type.clone()
+                            } else {
+                                prefix_type
+                            }
+                        } else {
+                            prefix_type
+                        };
+
                     collect_for_type(
-                        &prefix_type,
+                        &effective_type,
                         &field_name,
                         file_id,
                         index_expr.get_range(),
@@ -80,6 +100,26 @@ fn get_field_name(index_expr: &emmylua_parser::LuaIndexExpr) -> Option<SmolStr> 
         LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
         LuaIndexKey::String(s) => Some(s.get_value().into()),
         _ => None,
+    }
+}
+
+/// Returns true when the type is a generic/unresolved table type that
+/// does not carry useful class information.  Matches:
+/// - `table` (the bare Ref/Def type)
+/// - `table|nil`
+/// - `TableConst` (inferred from `return {}` or similar)
+fn is_unresolved_table_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => id.get_name() == "table",
+        LuaType::TableConst(_) => true,
+        LuaType::Union(union_type) => {
+            let types = union_type.into_vec();
+            types.iter().any(|t| is_unresolved_table_type(t))
+                && types
+                    .iter()
+                    .all(|t| is_unresolved_table_type(t) || matches!(t, LuaType::Nil))
+        }
+        _ => false,
     }
 }
 

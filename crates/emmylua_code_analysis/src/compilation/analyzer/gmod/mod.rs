@@ -1471,6 +1471,13 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
     })
 }
 
+/// Returns the gmod scripted-class name that the given file belongs to, if any.
+/// For example, a file at `lua/entities/base_glide_car/sv_braking.lua` returns
+/// `Some("base_glide_car")`.
+pub fn get_gmod_class_name_for_file(db: &DbIndex, file_id: FileId) -> Option<String> {
+    detect_scoped_class_from_path(db, file_id).map(|m| m.class_name)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GmodSystemCallKind {
     AddNetworkString,
