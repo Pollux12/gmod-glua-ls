@@ -48,8 +48,27 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
             }
         }
 
+        // Propagate dynamic fields to parent types so that e.g. a field assigned
+        // on `base_glide` (which extends `Entity`) is also visible when the variable
+        // is typed as `Entity`.  This avoids false-positive `undefined-field` when
+        // user code accesses entity fields through a base-class reference.
+        let mut propagated: Vec<(LuaTypeDeclId, SmolStr, crate::FileId, rowan::TextRange)> =
+            Vec::new();
+        for (type_id, field_name, file_id, range) in &collected {
+            let mut super_types = Vec::new();
+            type_id.collect_super_types(&*db, &mut super_types);
+            for super_type in super_types {
+                if let LuaType::Ref(super_id) = &super_type {
+                    propagated.push((super_id.clone(), field_name.clone(), *file_id, *range));
+                }
+            }
+        }
+
         let index = db.get_dynamic_field_index_mut();
         for (type_id, field_name, file_id, range) in collected {
+            index.add_field(type_id, field_name, file_id, range);
+        }
+        for (type_id, field_name, file_id, range) in propagated {
             index.add_field(type_id, field_name, file_id, range);
         }
     }
