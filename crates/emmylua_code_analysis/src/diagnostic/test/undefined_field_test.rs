@@ -2,7 +2,7 @@
 mod test {
     use std::{ops::Deref, sync::Arc};
 
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, LuaType, VirtualWorkspace};
 
     #[test]
     fn test_1() {
@@ -1301,6 +1301,84 @@ mod test {
                 local pos, ang = GetViewPos()
                 local dir = -ang:Forward()
                 local result = dir:Dot(pos)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_tableof_field_access_works() {
+        let mut ws = VirtualWorkspace::new();
+        // Simpler test: use explicit type instead of self
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class MyEntity
+                ---@field health number
+                ---@field name string
+                local MyEntity = {}
+
+                ---@type tableof<MyEntity>
+                local tbl
+                local h = tbl.health
+                local n = tbl.name
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_tableof_self_field_access_works() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class MyEntity
+                ---@field health number
+                ---@field name string
+                local MyEntity = {}
+
+                ---@return tableof<self>
+                function MyEntity:GetTable() end
+
+                function MyEntity:Test()
+                    local tbl = self:GetTable()
+                    local h = tbl.health
+                    local n = tbl.name
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_tableof_type_inference() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(r#"
+            ---@class MyEntity2
+            local MyEntity2 = {}
+        "#);
+
+        let tableof_ty = ws.ty("tableof<MyEntity2>");
+        assert!(matches!(tableof_ty, LuaType::TableOf(_)));
+    }
+
+    #[test]
+    fn test_tableof_colon_call_flags_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        // Colon calls on tableof should trigger undefined-field diagnostic
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class MyEntity
+                local MyEntity = {}
+
+                function MyEntity:DoSomething() end
+
+                ---@return tableof<self>
+                function MyEntity:GetTable() end
+
+                function MyEntity:Test()
+                    local tbl = self:GetTable()
+                    tbl:DoSomething()
+                end
             "#,
         ));
     }

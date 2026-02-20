@@ -562,6 +562,11 @@ pub(crate) fn unwrapp_return_type(
                 return Ok(self_type);
             }
         }
+        LuaType::TableOf(inner) if matches!(inner.as_ref(), LuaType::SelfInfer) => {
+            if let Some(self_type) = infer_self_type(db, cache, &call_expr) {
+                return Ok(LuaType::TableOf(self_type.into()));
+            }
+        }
         LuaType::TypeGuard(_) => return Ok(LuaType::Boolean),
         _ => {}
     }

@@ -57,6 +57,10 @@ pub fn instantiate_type_generic(
             let inner = instantiate_type_generic(db, guard.deref(), substitutor);
             LuaType::TypeGuard(inner.into())
         }
+        LuaType::TableOf(inner) => {
+            let inner = instantiate_type_generic(db, inner.deref(), substitutor);
+            LuaType::TableOf(inner.into())
+        }
         LuaType::Conditional(conditional) => instantiate_conditional(db, conditional, substitutor),
         LuaType::Mapped(mapped) => instantiate_mapped_type(db, mapped.deref(), substitutor),
         _ => ty.clone(),

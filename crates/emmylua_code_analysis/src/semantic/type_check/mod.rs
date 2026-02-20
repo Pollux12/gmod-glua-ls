@@ -188,6 +188,11 @@ fn check_general_type_compact(
         // SelfInfer represents `self` — it should accept any class/ref type
         // since `self` is always the owning class instance.
         LuaType::SelfInfer => Ok(()),
+        // TableOf(T) acts like T for assignment/parameter checking,
+        // since it has all the same fields (just no method calls).
+        LuaType::TableOf(inner) => {
+            check_general_type_compact(context, inner, &compact_type, check_guard.next_level()?)
+        }
         _ => Err(TypeCheckFailReason::TypeNotMatch),
     }
 }

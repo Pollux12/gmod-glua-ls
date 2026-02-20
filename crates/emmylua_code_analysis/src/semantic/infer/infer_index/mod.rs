@@ -238,6 +238,9 @@ pub fn infer_member_by_member_key(
 
             Err(InferFailReason::FieldNotFound)
         }
+        LuaType::TableOf(inner) => {
+            infer_member_by_member_key(db, cache, inner, index_expr, infer_guard)
+        }
         _ => Err(InferFailReason::FieldNotFound),
     }
 }

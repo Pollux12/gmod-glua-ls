@@ -68,6 +68,10 @@ pub enum LuaType {
     Conditional(Arc<LuaConditionalType>),
     ConditionalInfer(ArcIntern<SmolStr>),
     Mapped(Arc<LuaMappedType>),
+    /// A table projection of a type: has all members (fields AND methods as values)
+    /// but colon-call method invocations are disallowed.
+    /// Used for `Entity:GetTable()` which returns the entity's field table.
+    TableOf(Box<LuaType>),
 }
 
 impl PartialEq for LuaType {
@@ -122,6 +126,7 @@ impl PartialEq for LuaType {
             (LuaType::Conditional(a), LuaType::Conditional(b)) => a == b,
             (LuaType::ConditionalInfer(a), LuaType::ConditionalInfer(b)) => a == b,
             (LuaType::Mapped(a), LuaType::Mapped(b)) => a == b,
+            (LuaType::TableOf(a), LuaType::TableOf(b)) => a == b,
             _ => false, // 不同变体之间不相等
         }
     }
@@ -220,6 +225,7 @@ impl Hash for LuaType {
                 (51, ptr).hash(state)
             }
             LuaType::DocAttribute(a) => (52, a).hash(state),
+            LuaType::TableOf(a) => (53, a).hash(state),
         }
     }
 }
@@ -247,6 +253,7 @@ impl LuaType {
                 | LuaType::Global
                 | LuaType::Tuple(_)
                 | LuaType::Array(_)
+                | LuaType::TableOf(_)
         )
     }
 
@@ -531,6 +538,7 @@ impl TypeVisitTrait for LuaType {
             LuaType::MultiLineUnion(inner) => inner.visit_type(f),
             LuaType::TypeGuard(inner) => inner.visit_type(f),
             LuaType::Conditional(inner) => inner.visit_type(f),
+            LuaType::TableOf(inner) => inner.visit_type(f),
             _ => {}
         }
     }

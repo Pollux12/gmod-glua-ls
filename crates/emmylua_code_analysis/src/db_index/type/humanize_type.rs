@@ -130,6 +130,10 @@ pub fn humanize_type(db: &DbIndex, ty: &LuaType, level: RenderLevel) -> String {
             let type_str = humanize_type(db, inner, level.next_level());
             format!("TypeGuard<{}>", type_str)
         }
+        LuaType::TableOf(inner) => {
+            let type_str = humanize_type(db, inner, level.next_level());
+            format!("tableof<{}>", type_str)
+        }
         LuaType::ConstTplRef(const_tpl) => humanize_const_tpl_ref_type(const_tpl),
         LuaType::Language(s) => s.to_string(),
         LuaType::Conditional(c) => humanize_conditional_type(db, c, level),

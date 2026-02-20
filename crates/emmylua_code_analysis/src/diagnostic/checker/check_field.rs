@@ -72,6 +72,20 @@ fn check_index_expr(
     let index_key = index_expr.get_index_key()?;
 
     if is_valid_member(semantic_model, &prefix_typ, index_expr, &index_key, code).is_some() {
+        // TableOf types allow dot-access to all members but flag colon method calls.
+        // GetTable() returns a plain table with fields; colon calls pass the wrong self.
+        if is_tableof_colon_access(&prefix_typ, index_expr) {
+            context.add_diagnostic(
+                DiagnosticCode::UndefinedField,
+                index_key.get_range()?,
+                t!(
+                    "Cannot call methods via `:` on a table returned by GetTable(). Use dot-access `.%{field}` instead. ",
+                    field = index_key.get_path_part(),
+                )
+                .to_string(),
+                None,
+            );
+        }
         return Some(());
     }
 
@@ -160,6 +174,21 @@ fn is_invalid_prefix_type(typ: &LuaType) -> bool {
             _ => return false,
         }
     }
+}
+
+/// Check if this is a colon method call on a `tableof(T)` type.
+fn is_tableof_colon_access(prefix_typ: &LuaType, index_expr: &LuaIndexExpr) -> bool {
+    let is_tableof = match prefix_typ {
+        LuaType::TableOf(_) => true,
+        LuaType::Union(union) => union.into_vec().iter().any(|t| matches!(t, LuaType::TableOf(_))),
+        _ => false,
+    };
+    if !is_tableof {
+        return false;
+    }
+    index_expr
+        .get_index_token()
+        .is_some_and(|token| token.is_colon())
 }
 
 pub(super) fn is_valid_member(
@@ -871,6 +900,9 @@ fn has_dynamic_field_for_type(
         }
         LuaType::Instance(instance) => {
             has_dynamic_field_for_type(db, index, instance.get_base(), field_name)
+        }
+        LuaType::TableOf(inner) => {
+            has_dynamic_field_for_type(db, index, inner, field_name)
         }
         LuaType::Union(union_type) => union_type
             .into_vec()

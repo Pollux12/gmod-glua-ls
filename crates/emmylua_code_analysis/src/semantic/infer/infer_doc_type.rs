@@ -276,6 +276,12 @@ fn infer_special_generic_type(
 
             return Some(LuaType::TypeGuard(first_param.into()));
         }
+        "tableof" => {
+            let first_doc_param_type = generic_type.get_generic_types()?.get_types().next()?;
+            let first_param = infer_doc_type(ctx, &first_doc_param_type);
+
+            return Some(LuaType::TableOf(first_param.into()));
+        }
         "Merge" => {
             let mut params = Vec::new();
             for param in generic_type.get_generic_types()?.get_types() {

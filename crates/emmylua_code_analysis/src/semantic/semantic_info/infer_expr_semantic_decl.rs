@@ -315,6 +315,13 @@ fn infer_member_semantic_decl_by_member_key(
             member_key,
             semantic_guard.next_level()?,
         ),
+        LuaType::TableOf(inner) => infer_member_semantic_decl_by_member_key(
+            db,
+            cache,
+            inner,
+            member_key,
+            semantic_guard.next_level()?,
+        ),
         _ => None,
     }
 }

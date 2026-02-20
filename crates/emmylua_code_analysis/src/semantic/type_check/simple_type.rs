@@ -42,6 +42,7 @@ pub fn check_simple_type_compact(
                     | LuaType::Userdata
                     | LuaType::Instance(_)
                     | LuaType::Any
+                    | LuaType::TableOf(_)
             ) {
                 return Ok(());
             }
