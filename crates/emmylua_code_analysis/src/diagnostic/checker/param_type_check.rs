@@ -89,6 +89,10 @@ fn check_call_expr(
             }
             let result = semantic_model.type_check_detail(&check_type, arg_type);
             if result.is_err() {
+                // `never` indicates a type inference limitation, skip the diagnostic
+                if matches!(check_type, LuaType::Never) || matches!(arg_type, LuaType::Never) {
+                    continue;
+                }
                 // 这里执行了`AssignTypeMismatch`的检查
                 if arg_type.is_table() {
                     let arg_expr_idx = match (colon_call, colon_define) {

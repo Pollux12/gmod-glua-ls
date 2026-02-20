@@ -1323,13 +1323,14 @@ return t
         ));
     }
 
-    // Verify that assigning to a field of a nil-typed variable correctly produces a diagnostic.
-    // This is a sanity check to ensure the "cannot assign to never" detection works.
+    // Assigning to a field of a nil-typed variable used to produce an AssignTypeMismatch for
+    // `never` (the result of indexing nil). Now that `never` suppresses the diagnostic, no
+    // assign-type-mismatch is reported — the inject-field checker handles the nil case instead.
     #[test]
     fn test_nil_field_assign_produces_never_diagnostic() {
         let mut ws = VirtualWorkspace::new();
-        // ---@type nil variable's field assignment should produce assign-type-mismatch
-        assert!(!ws.check_code_for_namespace(
+        // `never` as the target type should suppress assign-type-mismatch (type inference limitation).
+        assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
             ---@type nil
@@ -1557,6 +1558,21 @@ return t
                 active = data
                 SetupNotification()
             end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_never_target_no_assign_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        // Assigning to a field whose type resolves to `never` should not produce a diagnostic.
+        // `never` indicates a type inference limitation rather than an actual type error.
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@type never
+                local x
+                x = 42
             "#
         ));
     }

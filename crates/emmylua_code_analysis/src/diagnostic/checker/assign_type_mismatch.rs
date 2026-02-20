@@ -400,6 +400,11 @@ fn check_assign_type_mismatch(
         return Some(false);
     }
 
+    // `never` indicates a type inference limitation, not an actual error
+    if matches!(source_type, LuaType::Never) || matches!(value_type, LuaType::Never) {
+        return Some(false);
+    }
+
     // 某些情况下我们应允许可空, 例如: boolean[]
     if allow_nil && value_type.is_nullable() {
         return Some(false);

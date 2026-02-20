@@ -115,6 +115,7 @@ fn is_invalid_prefix_type(typ: &LuaType) -> bool {
             LuaType::Any
             | LuaType::Unknown
             | LuaType::Table
+            | LuaType::Never
             | LuaType::TplRef(_)
             | LuaType::StrTplRef(_)
             | LuaType::TableConst(_) => return true,

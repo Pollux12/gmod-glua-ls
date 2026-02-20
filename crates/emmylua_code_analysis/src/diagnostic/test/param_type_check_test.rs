@@ -1677,4 +1677,22 @@ mod test {
         ));
         assert!(!diagnostics.iter().any(|diag| diag.code == code));
     }
+
+    #[test]
+    fn test_never_param_no_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        // Passing a `never` typed argument should not produce param-type-mismatch.
+        // `never` arises from type inference limitations, not real code errors.
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+                ---@param x integer
+                local function foo(x) end
+
+                ---@type never
+                local val
+                foo(val)
+            "#
+        ));
+    }
 }
