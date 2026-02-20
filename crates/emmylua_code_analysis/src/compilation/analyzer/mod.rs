@@ -38,10 +38,10 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
         run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
         run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
-        synthesize_accessorfunc_members(db);
         if db.get_emmyrc().gmod.enabled {
             run_analysis::<gmod::GmodAnalysisPipeline>(db, &mut context);
         }
+        synthesize_accessorfunc_members(db);
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
         // Dynamic field analysis runs AFTER unresolve so that all declaration types
         // (e.g. function parameters with @type annotations on reassignments) are

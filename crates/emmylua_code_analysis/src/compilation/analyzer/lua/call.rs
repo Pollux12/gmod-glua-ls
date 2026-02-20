@@ -165,20 +165,28 @@ fn collect_accessorfunc_annotated_call(
     call_expr: &LuaCallExpr,
 ) -> Option<()> {
     let prefix_expr = call_expr.get_prefix_expr()?;
-    let LuaExpr::IndexExpr(index_expr) = prefix_expr else {
-        return None;
-    };
 
-    let method_name = match index_expr.get_index_key()? {
-        LuaIndexKey::Name(name_token) => name_token.get_name_text().to_string(),
-        LuaIndexKey::String(string_token) => string_token.get_value().to_string(),
+    // Extract function name: handle both `obj.Method(...)` (IndexExpr) and `FuncName(...)` (NameExpr)
+    let (func_name, owner_arg_index) = match &prefix_expr {
+        LuaExpr::IndexExpr(index_expr) => {
+            let name = match index_expr.get_index_key()? {
+                LuaIndexKey::Name(name_token) => name_token.get_name_text().to_string(),
+                LuaIndexKey::String(string_token) => string_token.get_value().to_string(),
+                _ => return None,
+            };
+            (name, None) // owner comes from prefix
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let name = name_expr.get_name_text()?.to_string();
+            (name, Some(0usize)) // owner is the first argument
+        }
         _ => return None,
     };
 
     if !analyzer
         .db
         .get_accessor_func_index()
-        .contains_name(&method_name)
+        .contains_name(&func_name)
     {
         return None;
     }
@@ -186,7 +194,7 @@ fn collect_accessorfunc_annotated_call(
     let name_param_index = analyzer
         .db
         .get_accessor_func_index()
-        .get_annotations(&method_name)
+        .get_annotations(&func_name)
         .and_then(|annotations| {
             annotations
                 .first()
@@ -204,7 +212,16 @@ fn collect_accessorfunc_annotated_call(
 
     let call_syntax_id = call_expr.get_syntax_id();
     let name_arg_syntax_id = Some(name_arg.get_syntax_id());
-    let owner_type_id = find_owner_type_for_prefix(analyzer, &index_expr.get_prefix_expr()?)?;
+
+    // Find owner type: from first argument (global call) or from prefix expression (method call)
+    let owner_type_id = if let Some(arg_idx) = owner_arg_index {
+        let owner_arg = args.get(arg_idx)?;
+        find_owner_type_for_prefix(analyzer, owner_arg)?
+    } else if let LuaExpr::IndexExpr(index_expr) = &prefix_expr {
+        find_owner_type_for_prefix(analyzer, &index_expr.get_prefix_expr()?)?
+    } else {
+        return None;
+    };
 
     analyzer.db.get_accessor_func_call_index_mut().add_call(
         analyzer.file_id,
@@ -293,7 +310,13 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
         return;
     };
 
-    if kind != GmodScriptedClassCallKind::DefineBaseClass && !analyzer.is_scripted_class_scope {
+    // AccessorFunc can be used anywhere (VGUI panels, etc.), not just in scripted class scopes.
+    // DEFINE_BASECLASS also needs to work outside scripted scopes.
+    // Only NetworkVar/NetworkVarElement are entity-specific and require scripted scope.
+    if kind != GmodScriptedClassCallKind::DefineBaseClass
+        && kind != GmodScriptedClassCallKind::AccessorFunc
+        && !analyzer.is_scripted_class_scope
+    {
         return;
     }
 

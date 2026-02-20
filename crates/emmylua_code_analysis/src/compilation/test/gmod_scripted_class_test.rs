@@ -140,7 +140,9 @@ mod test {
             .cloned()
             .expect("expected DEFINE_BASECLASS metadata for out-of-scope file");
         assert_eq!(denied_metadata.define_baseclass_calls.len(), 1);
-        assert_eq!(denied_metadata.accessor_func_calls.len(), 0);
+        // AccessorFunc is always collected regardless of scripted class scope,
+        // since it's used by VGUI panels and other non-entity code.
+        assert_eq!(denied_metadata.accessor_func_calls.len(), 1);
     }
 
     #[gtest]

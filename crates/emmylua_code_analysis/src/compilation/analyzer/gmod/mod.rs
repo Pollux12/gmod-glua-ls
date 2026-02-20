@@ -344,6 +344,8 @@ fn synthesize_scripted_class_members(
 /// Synthesize vgui.Register / derma.DefineControl class types.
 fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
     let mut original_decl_table_types: HashMap<LuaDeclId, Option<LuaType>> = HashMap::new();
+    // Track (file_id, table_var_name, panel_name) for AccessorFunc synthesis
+    let mut vgui_table_vars: Vec<(FileId, String, String)> = Vec::new();
 
     for file_id in file_ids.iter().copied() {
         let metadata = match db
@@ -355,11 +357,45 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
         };
 
         for call in &metadata.vgui_register_calls {
+            // Extract table var name and panel name before synthesizing
+            if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first() {
+                if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) = call.literal_args.get(1) {
+                    vgui_table_vars.push((file_id, table_var.clone(), panel_name.clone()));
+                }
+            }
             synthesize_vgui_register(db, file_id, call, &mut original_decl_table_types);
         }
 
         for call in &metadata.derma_define_control_calls {
+            if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first() {
+                if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) = call.literal_args.get(2) {
+                    vgui_table_vars.push((file_id, table_var.clone(), panel_name.clone()));
+                }
+            }
             synthesize_derma_define_control(db, file_id, call, &mut original_decl_table_types);
+        }
+    }
+
+    // Synthesize AccessorFunc members for VGUI-registered classes
+    for (file_id, table_var_name, panel_name) in &vgui_table_vars {
+        let metadata = match db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(file_id)
+        {
+            Some(m) => m.clone(),
+            None => continue,
+        };
+
+        log::debug!("VGUI AccessorFunc: file {:?} has {} accessor_func_calls for table_var={} panel={}", file_id, metadata.accessor_func_calls.len(), table_var_name, panel_name);
+        let class_decl_id = LuaTypeDeclId::global(panel_name);
+        for call in &metadata.accessor_func_calls {
+            // Check if the AccessorFunc's first arg matches this table variable
+            if let Some(Some(GmodClassCallLiteral::NameRef(target_name))) = call.literal_args.first() {
+                if target_name == table_var_name {
+                    synthesize_accessor_func(db, *file_id, &class_decl_id, call);
+                    synthesize_accessor_func(db, *file_id, &class_decl_id, call);
+                }
+            }
         }
     }
 }
