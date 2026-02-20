@@ -205,7 +205,8 @@ impl EmmyLuaAnalysis {
 
         self.compilation
             .remove_index(removed_files.into_iter().collect());
-        let updated_files: Vec<FileId> = updated_files.into_iter().collect();
+        let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
+        updated_files.sort();
         self.compilation.update_index(updated_files.clone());
         updated_files
     }
