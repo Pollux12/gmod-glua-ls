@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use emmylua_parser::{
     LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr, LuaForRangeStat, LuaForStat,
-    LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaRepeatStat, LuaSyntaxKind, LuaTokenKind,
+    LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaRepeatStat, LuaSyntaxKind, LuaTokenKind,
     LuaVarExpr, LuaWhileStat,
 };
 
@@ -872,6 +872,19 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
             _ => {}
         }
     }
+
+    // Pattern: local assignment followed by nil-check of the assigned variable.
+    // e.g., `local x = obj.field; if x then ...`
+    if is_local_assign_with_nil_check(index_expr, &normalized_target) {
+        return true;
+    }
+
+    // Pattern: early return guard — a preceding `if not field then return end`
+    // e.g., `if not obj.field then return end; ... obj.field`
+    if is_guarded_by_early_return(index_expr, &normalized_target) {
+        return true;
+    }
+
     false
 }
 
@@ -912,6 +925,13 @@ fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
                         || (rhs.replacen(':', ".", 1) == field_text && lhs.trim() == "nil")
                     {
                         return true;
+                    }
+                    // Also check if the field is nested inside either side,
+                    // e.g., `type(obj.field) == "table"` — field is inside the call.
+                    for expr in &exprs {
+                        if is_truthy_check_in_condition(expr, field_text) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -1020,6 +1040,151 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Check if the field access is on the RHS of a local assignment, and the assigned
+/// variable is nil-checked in a following sibling statement.
+/// e.g., `local x = obj.field; if x then ...` or `local x = obj.field; if not x then return end`
+fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr, _field_text: &str) -> bool {
+    // Walk up to find the parent LocalStat
+    let local_stat = match index_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaLocalStat::cast)
+    {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // Get the variable name assigned in the local statement
+    let local_names: Vec<_> = local_stat.get_local_name_list().collect();
+    if local_names.is_empty() {
+        return false;
+    }
+    let var_name = local_names[0].syntax().text().to_string();
+    let var_name = var_name.trim();
+
+    // Look at following sibling statements (up to 5) for a nil-check of the variable
+    let local_stat_node = local_stat.syntax().clone();
+    let parent = match local_stat_node.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    let mut found_self = false;
+    let mut checked = 0;
+
+    for sibling in parent.children() {
+        if !found_self {
+            if sibling == local_stat_node {
+                found_self = true;
+            }
+            continue;
+        }
+        checked += 1;
+        if checked > 5 {
+            break;
+        }
+
+        let kind: LuaSyntaxKind = sibling.kind().into();
+        if kind == LuaSyntaxKind::IfStat {
+            // Check if the if-condition references the variable
+            if let Some(if_stat) = LuaIfStat::cast(sibling) {
+                if let Some(cond) = if_stat.get_condition_expr() {
+                    let cond_text = cond.syntax().text().to_string();
+                    if condition_references_var(&cond_text, var_name) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if there is a preceding if-statement with an early return that guards the field.
+/// e.g., `if not obj.field then return end; ... obj.field`
+fn is_guarded_by_early_return(index_expr: &LuaIndexExpr, field_text: &str) -> bool {
+    // Find the statement containing the field access
+    let containing_stat = match index_expr
+        .syntax()
+        .ancestors()
+        .find(|n| {
+            let k: LuaSyntaxKind = n.kind().into();
+            matches!(
+                k,
+                LuaSyntaxKind::LocalStat
+                    | LuaSyntaxKind::AssignStat
+                    | LuaSyntaxKind::CallExprStat
+                    | LuaSyntaxKind::IfStat
+                    | LuaSyntaxKind::ReturnStat
+            )
+        })
+    {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let parent = match containing_stat.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    let stat_range = containing_stat.text_range();
+
+    // Look at preceding siblings for early-return guards
+    for sibling in parent.children() {
+        // Only look at siblings BEFORE the containing statement
+        if sibling.text_range().start() >= stat_range.start() {
+            break;
+        }
+
+        let kind: LuaSyntaxKind = sibling.kind().into();
+        if kind != LuaSyntaxKind::IfStat {
+            continue;
+        }
+
+        if let Some(if_stat) = LuaIfStat::cast(sibling) {
+            // Check if the condition references our field
+            if let Some(cond) = if_stat.get_condition_expr() {
+                let cond_text = cond.syntax().text().to_string();
+                let cond_text_normalized = cond_text.replacen(':', ".", 1);
+                if !cond_text_normalized.contains(field_text) {
+                    continue;
+                }
+                // Check if the if-body contains a return statement (early return pattern)
+                if if_body_has_return(&if_stat) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if a condition text references a variable name.
+fn condition_references_var(cond_text: &str, var_name: &str) -> bool {
+    // Simple text search: the variable appears as a word boundary in the condition
+    // This handles: `if x then`, `if not x then`, `if x ~= nil then`, `IsValid(x)`, etc.
+    for part in cond_text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if part == var_name {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if the body of an if-statement contains a return statement.
+fn if_body_has_return(if_stat: &LuaIfStat) -> bool {
+    if let Some(block) = if_stat.get_block() {
+        for child in block.syntax().children() {
+            let kind: LuaSyntaxKind = child.kind().into();
+            if kind == LuaSyntaxKind::ReturnStat {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, index_key: &LuaIndexKey) -> bool {

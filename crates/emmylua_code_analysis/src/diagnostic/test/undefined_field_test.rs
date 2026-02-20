@@ -1550,4 +1550,76 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_unm_operator_preserves_type() {
+        let mut ws = VirtualWorkspace::new();
+        // Unary minus on a class with __unm operator should preserve the type
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestVec
+                ---@operator unm: TestVec
+                local TestVec = {}
+
+                function TestVec:SomeMethod()
+                    return 1
+                end
+
+                ---@type TestVec
+                local v = TestVec
+
+                local neg = -v
+                neg:SomeMethod()
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_guard_type_check_in_condition() {
+        let mut ws = VirtualWorkspace::new();
+        // type(obj.field) == "table" should suppress undefined-field
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TypeCheckTest
+                local obj = {}
+                if type(obj.unknownField) == "table" then
+                    print("yes")
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_guard_local_assign_then_nil_check() {
+        let mut ws = VirtualWorkspace::new();
+        // local x = obj.field; if x then ... should suppress undefined-field
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class LocalAssignTest
+                local obj = {}
+                local x = obj.unknownField
+                if x then
+                    print(x)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_guard_early_return() {
+        let mut ws = VirtualWorkspace::new();
+        // if not obj.field then return end; ... obj.field should suppress
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class EarlyReturnTest
+                local obj = {}
+                if not obj.unknownField then return end
+                local x = obj.unknownField .. "suffix"
+            "#
+        ));
+    }
 }
