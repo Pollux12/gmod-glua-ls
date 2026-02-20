@@ -107,7 +107,7 @@ fn check_general_type_compact(
                 let non_nil: Vec<LuaType> =
                     types.iter().filter(|t| !matches!(t, LuaType::Nil)).cloned().collect();
                 let stripped = if non_nil.len() == 1 {
-                    non_nil.into_iter().next().unwrap()
+                    non_nil.into_iter().next().expect("non_nil has exactly 1 element")
                 } else {
                     LuaType::Union(LuaUnionType::Multi(non_nil).into())
                 };

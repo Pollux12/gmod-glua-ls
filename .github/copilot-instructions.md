@@ -41,6 +41,7 @@
 - If changing GMod hook/realm logic, keep tests aligned:
   - `crates/emmylua_code_analysis/src/compilation/test/gmod_realm_hook_test.rs`
   - `crates/emmylua_code_analysis/src/compilation/test/gmod_scripted_class_test.rs`
+- All non-standard GMod operators should be treated as standard, with first-class support in completion/signature/diagnostics (C style operators)
 
 ## Config and Schema Rules
 - Configuration entry points are `.emmyrc.json` / `.luarc.json` (plus `.emmyrc.lua` in LS/CLI loaders).

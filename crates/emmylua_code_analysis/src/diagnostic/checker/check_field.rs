@@ -1006,6 +1006,39 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
                     }
                 }
             }
+            let has_or = binary.syntax().children_with_tokens().any(|child| {
+                child.kind() == LuaTokenKind::TkOr.into()
+            });
+            if has_or {
+                let exprs: Vec<LuaExpr> = binary
+                    .syntax()
+                    .children()
+                    .filter_map(LuaExpr::cast)
+                    .collect();
+                for expr in &exprs {
+                    if condition_nil_guards_field(expr, field_text) {
+                        return true;
+                    }
+                }
+            }
+            // For == or ~= comparisons, also check if the field is inside either side
+            // e.g., `string.sub(data.text, 1, 1) == "#"` guards data.text
+            let has_eq_ne = binary.syntax().children_with_tokens().any(|child| {
+                let k = child.kind();
+                k == LuaTokenKind::TkEq.into() || k == LuaTokenKind::TkNe.into()
+            });
+            if has_eq_ne {
+                let exprs: Vec<LuaExpr> = binary
+                    .syntax()
+                    .children()
+                    .filter_map(LuaExpr::cast)
+                    .collect();
+                for expr in &exprs {
+                    if condition_nil_guards_field(expr, field_text) {
+                        return true;
+                    }
+                }
+            }
             false
         }
         LuaExpr::IndexExpr(idx) => {
