@@ -1217,6 +1217,71 @@ return t
         ));
     }
 
+    // Entity:GetTable() should return `table`, and assigning to fields of the returned
+    // table should not produce assign-type-mismatch errors (no `never` type).
+    #[test]
+    fn test_entity_get_table_no_never() {
+        let mut ws = VirtualWorkspace::new();
+
+        // Case 1: direct local assignment from GetTable()
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class Entity
+            ---@return table
+            function Entity:GetTable() end
+
+            ---@class ENT : Entity
+            local ENT = {}
+
+            function ENT:Initialize()
+                local selfTbl = self:GetTable()
+                selfTbl.spin = 0
+                selfTbl.tilt = 0
+                selfTbl.isRunning = true
+            end
+            "#
+        ));
+
+        // Case 2: selfTbl = selfTbl or self:GetTable() pattern
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class Entity
+            ---@return table
+            function Entity:GetTable() end
+
+            ---@class ENT : Entity
+            local ENT = {}
+
+            function ENT:Think(selfTbl)
+                selfTbl = selfTbl or self:GetTable()
+                selfTbl.spin = 0
+                selfTbl.tilt = 0
+            end
+            "#
+        ));
+        // Case 3: GetTable NOT defined on Entity - should still not produce false positives
+        let mut ws3 = VirtualWorkspace::new();
+        assert!(ws3.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class ENT : Entity
+            local ENT = {}
+
+            function ENT:Initialize()
+                local selfTbl = self:GetTable()
+                selfTbl.spin = 0
+                selfTbl.tilt = 0
+                selfTbl.isRunning = true
+            end
+            "#
+        ));
+    }
+
     // When a colon-defined method annotation is assigned via dot syntax, the user's
     // closure with an explicit `self` as first parameter should not produce an
     // assign-type-mismatch error.

@@ -294,6 +294,11 @@ fn check_return_count(
         }
     }
 
+    // Bare `return` (no expressions) is always valid in Lua - it is an early exit returning nil.
+    if expr_list.is_empty() {
+        return Some(());
+    }
+
     // 检查缺失的返回值
     if total_return_count < min_expected_return_count {
         context.add_diagnostic(

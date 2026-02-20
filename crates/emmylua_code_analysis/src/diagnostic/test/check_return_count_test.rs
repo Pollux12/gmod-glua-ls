@@ -43,7 +43,8 @@ mod tests {
     fn test_missing_return_value() {
         let mut ws = VirtualWorkspace::new();
 
-        assert!(!ws.check_code_for(
+        // Bare `return` is a valid early exit in Lua and should never trigger MissingReturnValue
+        assert!(ws.check_code_for(
             DiagnosticCode::MissingReturnValue,
             r#"
             ---@return number
