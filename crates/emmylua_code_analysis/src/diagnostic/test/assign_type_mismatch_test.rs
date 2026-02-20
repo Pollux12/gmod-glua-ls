@@ -1518,4 +1518,46 @@ return t
             "#
         ));
     }
+
+    // RC-2 fix: local var (no init) used as upvalue in closure, assigned in different function.
+    // Before fix: active bound to Nil → active.fade = Never → "Cannot assign integer to never"
+    // After fix:  active (mutable) not bound to Nil → infer returns Err → no diagnostic
+    #[test]
+    fn test_rc2_upvalue_assigned_after_closure_decl() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local active
+            local function setup()
+                active.fade = 0
+                active.flash = 1
+            end
+            active = {}
+            setup()
+            "#
+        ));
+    }
+
+    // RC-2 fix: mutable local with nil used in closure hook pattern (mirrors notify.lua)
+    #[test]
+    fn test_rc2_mutable_upvalue_hook_pattern() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local active
+            local function SetupNotification()
+                active.fade = 0
+                active.flash = 1
+                active.x = 0
+                active.y = 0
+            end
+            local function OnAdd(data)
+                active = data
+                SetupNotification()
+            end
+            "#
+        ));
+    }
 }

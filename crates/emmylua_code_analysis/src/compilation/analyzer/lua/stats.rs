@@ -27,6 +27,12 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             if has_delayed_definition_attribute(analyzer, decl_id) {
                 return Some(());
             }
+            // Skip Nil binding for mutable locals (those with subsequent write-assignments).
+            // This prevents false "cannot assign X to never" diagnostics when a local is used
+            // as an upvalue inside a closure and assigned before the closure is first called.
+            if is_local_mutable(analyzer, decl_id) {
+                continue;
+            }
             analyzer
                 .db
                 .get_type_index_mut()
@@ -532,6 +538,15 @@ fn has_delayed_definition_attribute(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) 
         }
     }
     false
+}
+
+fn is_local_mutable(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bool {
+    analyzer
+        .db
+        .get_reference_index()
+        .get_decl_references(&analyzer.file_id, &decl_id)
+        .map(|decl_ref| decl_ref.mutable)
+        .unwrap_or(false)
 }
 
 // 获取延迟定义的声明id
