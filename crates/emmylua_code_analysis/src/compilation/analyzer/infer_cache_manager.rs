@@ -8,27 +8,31 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct InferCacheManager {
     infer_map: HashMap<FileId, LuaInferCache>,
+    current_phase: LuaAnalysisPhase,
 }
 
 impl InferCacheManager {
     pub fn new() -> Self {
         InferCacheManager {
             infer_map: HashMap::new(),
+            current_phase: LuaAnalysisPhase::Ordered,
         }
     }
 
     pub fn get_infer_cache(&mut self, file_id: FileId) -> &mut LuaInferCache {
+        let phase = self.current_phase;
         self.infer_map.entry(file_id).or_insert_with(|| {
             LuaInferCache::new(
                 file_id,
                 crate::CacheOptions {
-                    analysis_phase: LuaAnalysisPhase::Ordered,
+                    analysis_phase: phase,
                 },
             )
         })
     }
 
     pub fn set_force(&mut self) {
+        self.current_phase = LuaAnalysisPhase::Force;
         for (_, infer_cache) in self.infer_map.iter_mut() {
             infer_cache.set_phase(LuaAnalysisPhase::Force);
         }

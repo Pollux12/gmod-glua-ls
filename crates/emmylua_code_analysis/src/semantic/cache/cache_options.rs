@@ -11,9 +11,10 @@ impl Default for CacheOptions {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum LuaAnalysisPhase {
     // Ordered phase
+    #[default]
     Ordered,
     // Unordered phase
     Unordered,

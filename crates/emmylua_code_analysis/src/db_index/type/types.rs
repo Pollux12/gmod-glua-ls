@@ -4,7 +4,6 @@ use std::{
     ops::Deref,
     sync::Arc,
 };
-
 use internment::ArcIntern;
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -926,7 +925,9 @@ impl LuaUnionType {
             }
             Self::Nullable(LuaType::Unknown)
         } else {
-            Self::Multi(set.into_iter().collect())
+            let mut types: Vec<LuaType> = set.into_iter().collect();
+            types.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+            Self::Multi(types)
         }
     }
 

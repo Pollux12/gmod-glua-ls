@@ -14,7 +14,8 @@ use crate::{
 };
 use check_reason::{check_reach_reason, resolve_all_reason};
 use emmylua_parser::{
-    LuaAssignStat, LuaCallExpr, LuaExpr, LuaFuncStat, LuaNameToken, LuaTableExpr, LuaTableField,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat, LuaNameToken,
+    LuaTableExpr, LuaTableField,
 };
 use resolve::{
     try_resolve_decl, try_resolve_iter_var, try_resolve_member, try_resolve_module,
@@ -37,6 +38,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         let mut infer_manager = std::mem::take(&mut context.infer_manager);
         materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
         infer_manager.clear();
+
         let mut reason_resolve: Vec<(InferFailReason, Vec<UnResolve>)> = Vec::new();
         for (unresolve, reason) in context.unresolves.drain(..) {
             if let Some(entry) = reason_resolve.iter_mut().find(|(r, _)| r == &reason) {
@@ -44,6 +46,13 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             } else {
                 reason_resolve.push((reason, vec![unresolve]));
             }
+        }
+
+        // Sort unresolves within each reason group by (file_id, position) to ensure
+        // deterministic processing order regardless of HashMap iteration order during
+        // earlier analysis phases.
+        for (_, unresolves) in &mut reason_resolve {
+            unresolves.sort_by_key(|u| u.sort_key());
         }
 
         let mut loop_count = 0;
@@ -57,6 +66,12 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 
             if loop_count == 0 {
                 infer_manager.set_force();
+                // Clear expression caches when entering force mode so that all
+                // remaining unresolves are re-evaluated from a clean state.
+                // Without this, cache entries populated during normal-mode
+                // resolution can differ between runs (due to non-deterministic
+                // processing order), causing the force-mode results to vary.
+                infer_manager.clear();
             }
 
             resolve_all_reason(db, &mut reason_resolve, loop_count);
@@ -290,6 +305,11 @@ fn try_resolve(
             }
         }
 
+        // Re-sort after regrouping to maintain deterministic order
+        for (_, unresolves) in reason_reasolve.iter_mut() {
+            unresolves.sort_by_key(|u| u.sort_key());
+        }
+
         if !changed || reason_reasolve.is_empty() {
             break;
         }
@@ -332,6 +352,27 @@ impl UnResolve {
             UnResolve::TableField(un_resolve_table_field) => Some(un_resolve_table_field.file_id),
             UnResolve::ModuleRef(_) => None,
             UnResolve::ClassCtor(un_resolve_constructor) => Some(un_resolve_constructor.file_id),
+        }
+    }
+
+    /// Returns a deterministic sort key (file_id, text_position) for stable ordering.
+    /// This ensures unresolves are processed in a consistent order regardless of
+    /// HashMap iteration order or other non-deterministic sources during collection.
+    fn sort_key(&self) -> (u32, u32) {
+        match self {
+            UnResolve::Decl(d) => (d.file_id.id, u32::from(d.decl_id.position)),
+            UnResolve::IterDecl(d) => (d.file_id.id, d.iter_vars.first()
+                .map(|v| u32::from(v.syntax().text_range().start()))
+                .unwrap_or(0)),
+            UnResolve::Member(d) => (d.file_id.id, u32::from(d.member_id.get_position())),
+            UnResolve::Module(d) => (d.file_id.id, u32::from(d.expr.syntax().text_range().start())),
+            UnResolve::Return(d) => (d.file_id.id, u32::from(d.signature_id.get_position())),
+            UnResolve::ClosureParams(d) => (d.file_id.id, u32::from(d.call_expr.syntax().text_range().start())),
+            UnResolve::ClosureReturn(d) => (d.file_id.id, u32::from(d.call_expr.syntax().text_range().start())),
+            UnResolve::ClosureParentParams(d) => (d.file_id.id, u32::from(d.signature_id.get_position())),
+            UnResolve::ModuleRef(d) => (0, u32::from(d.module_file_id.id)),
+            UnResolve::TableField(d) => (d.file_id.id, u32::from(d.field.syntax().text_range().start())),
+            UnResolve::ClassCtor(d) => (d.file_id.id, u32::from(d.call_expr.syntax().text_range().start())),
         }
     }
 }

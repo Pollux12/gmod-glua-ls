@@ -516,7 +516,10 @@ fn synthesize_network_var_wrappers(
     scripted_scope_files: &HashSet<FileId>,
     tree_map: &HashMap<FileId, LuaChunk>,
 ) {
-    for (file_id, root) in tree_map {
+    // Sort by FileId for deterministic iteration order
+    let mut sorted_entries: Vec<_> = tree_map.iter().collect();
+    sorted_entries.sort_by_key(|(fid, _)| fid.id);
+    for (file_id, root) in sorted_entries {
         if !scripted_scope_files.contains(file_id) {
             continue;
         }
