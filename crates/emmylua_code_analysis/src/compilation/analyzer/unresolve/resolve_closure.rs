@@ -4,8 +4,8 @@ use emmylua_parser::{LuaAstNode, LuaIndexMemberExpr, LuaTableExpr, LuaVarExpr};
 
 use crate::{
     DbIndex, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo, LuaDocReturnInfo,
-    LuaFunctionType, LuaInferCache, LuaSignature, LuaType, SignatureReturnStatus, TypeOps,
-    get_real_type, infer_call_expr_func, infer_expr, infer_table_should_be,
+    LuaFunctionType, LuaInferCache, LuaSignature, LuaSignatureId, LuaType, SignatureReturnStatus,
+    TypeOps, get_real_type, infer_call_expr_func, infer_expr, infer_table_should_be,
 };
 
 use super::{
@@ -198,6 +198,7 @@ pub fn try_resolve_closure_parent_params(
     cache: &mut LuaInferCache,
     closure_params: &mut UnResolveParentClosureParams,
 ) -> ResolveResult {
+    let origin_sig_id = closure_params.signature_id;
     let signature = db
         .get_signature_index()
         .get(&closure_params.signature_id)
@@ -220,6 +221,7 @@ pub fn try_resolve_closure_parent_params(
                         &prefix_type,
                         LuaIndexMemberExpr::IndexExpr(index_expr),
                         signature,
+                        &origin_sig_id,
                     )
                     .ok_or(InferFailReason::None)?
                 }
@@ -238,6 +240,7 @@ pub fn try_resolve_closure_parent_params(
                 &parent_table_type,
                 LuaIndexMemberExpr::TableField(table_field.clone()),
                 signature,
+                &origin_sig_id,
             )
             .ok_or(InferFailReason::None)?
         }
@@ -260,6 +263,7 @@ pub fn try_resolve_closure_parent_params(
                         &prefix_expr_type,
                         LuaIndexMemberExpr::IndexExpr(index_expr.clone()),
                         signature,
+                        &origin_sig_id,
                     )
                     .ok_or(InferFailReason::None)?
                 }
@@ -491,7 +495,11 @@ fn resolve_doc_function(
     Ok(())
 }
 
-fn filter_signature_type(db: &DbIndex, typ: &LuaType) -> Option<Vec<Arc<LuaFunctionType>>> {
+fn filter_signature_type(
+    db: &DbIndex,
+    typ: &LuaType,
+    origin_signature_id: &LuaSignatureId,
+) -> Option<Vec<Arc<LuaFunctionType>>> {
     let mut result: Vec<Arc<LuaFunctionType>> = Vec::new();
     let mut stack = Vec::new();
     stack.push(typ.clone());
@@ -500,6 +508,27 @@ fn filter_signature_type(db: &DbIndex, typ: &LuaType) -> Option<Vec<Arc<LuaFunct
         match typ {
             LuaType::DocFunction(func) => {
                 result.push(func.clone());
+            }
+            LuaType::Signature(sig_id) => {
+                // Skip the current closure's own signature to avoid self-reference
+                if &sig_id != origin_signature_id {
+                    if let Some(sig) = db.get_signature_index().get(&sig_id) {
+                        // Convert annotated signature to DocFunction for param propagation only.
+                        // Use Nil return type so we don't force return constraints on closures
+                        // that monkey-patch existing functions (e.g. os.exit = function(...) end).
+                        if !sig.param_docs.is_empty() {
+                            let params = sig.get_type_params();
+                            let doc_func = LuaFunctionType::new(
+                                sig.async_state,
+                                sig.is_colon_define,
+                                sig.is_vararg,
+                                params,
+                                LuaType::Nil,
+                            );
+                            result.push(Arc::new(doc_func));
+                        }
+                    }
+                }
             }
             LuaType::Union(union) => {
                 let types = union.into_vec();
@@ -541,12 +570,15 @@ fn find_best_function_type(
     prefix_type: &LuaType,
     index_member_expr: LuaIndexMemberExpr,
     origin_signature: &LuaSignature,
+    origin_sig_id: &LuaSignatureId,
 ) -> Option<LuaType> {
     // 寻找非自身定义的签名
     if let Ok(result) = find_decl_function_type(db, cache, prefix_type, index_member_expr) {
         if result.is_current_owner {
             // 对应当前类型下的声明, 我们需要过滤掉所有`signature`类型
-            if let Some(filtered_types) = filter_signature_type(db, &result.typ) {
+            if let Some(filtered_types) =
+                filter_signature_type(db, &result.typ, origin_sig_id)
+            {
                 match filtered_types.len() {
                     0 => {}
                     1 => return Some(LuaType::DocFunction(filtered_types[0].clone())),

@@ -665,7 +665,17 @@ fn find_param_type_from_union(
         LuaType::Signature(signature_id) => {
             let signature = db.get_signature_index().get(&signature_id)?;
             if !signature.param_docs.is_empty() {
-                return None;
+                let adjusted_idx =
+                    adjust_param_idx(param_idx, origin_colon_define, signature.is_colon_define);
+                return if let Some(param_info) = signature.get_param_info_by_id(adjusted_idx) {
+                    let mut typ = param_info.type_ref.clone();
+                    if param_info.nullable && !typ.is_nullable() {
+                        typ = TypeOps::Union.apply(db, &typ, &LuaType::Nil);
+                    }
+                    Some(typ)
+                } else {
+                    None
+                };
             }
             let mut final_type = None;
             for overload in &signature.overloads {
