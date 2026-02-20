@@ -1622,4 +1622,21 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_nil_guard_reassignment_should_not_suppress() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class ReassignEntity
+                ---@field species string
+                local entity = { species = "Dog" }
+                if entity.nickname ~= nil then
+                    entity = { species = "Cat" }
+                    print(entity.nickname)
+                end
+            "#
+        ));
+    }
 }

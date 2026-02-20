@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use emmylua_parser::{
-    LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr, LuaForRangeStat, LuaForStat,
-    LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaRepeatStat, LuaSyntaxKind, LuaTokenKind,
-    LuaVarExpr, LuaWhileStat,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat,
+    LuaExpr, LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat,
+    LuaRepeatStat, LuaSyntaxKind, LuaTokenKind, LuaVarExpr, LuaWhileStat,
 };
 
 use crate::{
@@ -786,6 +786,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
     // Normalize colon-access to dot-access so that `obj:Method` matches `obj.Method`
     let normalized_target = target_text.replacen(':', ".", 1);
     let node_range = index_expr.syntax().text_range();
+    let target_root_name = extract_root_identifier(&normalized_target);
 
     for ancestor in index_expr.syntax().ancestors() {
         match ancestor.kind().into() {
@@ -802,6 +803,11 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                         } else {
                             // Field is in the body — check if the condition guards it.
                             if condition_nil_guards_field(&condition_expr, &normalized_target) {
+                                if let Some(root_name) = target_root_name
+                                    && has_root_reassignment_before_usage(index_expr, root_name)
+                                {
+                                    break;
+                                }
                                 return true;
                             }
                         }
@@ -819,6 +825,11 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                             }
                         } else {
                             if condition_nil_guards_field(&condition_expr, &normalized_target) {
+                                if let Some(root_name) = target_root_name
+                                    && has_root_reassignment_before_usage(index_expr, root_name)
+                                {
+                                    break;
+                                }
                                 return true;
                             }
                         }
@@ -883,6 +894,70 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
     // e.g., `if not obj.field then return end; ... obj.field`
     if is_guarded_by_early_return(index_expr, &normalized_target) {
         return true;
+    }
+
+    false
+}
+
+fn extract_root_identifier(field_text: &str) -> Option<&str> {
+    let root = field_text
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()?;
+    if root.is_empty() {
+        return None;
+    }
+
+    Some(root)
+}
+
+fn has_root_reassignment_before_usage(index_expr: &LuaIndexExpr, root_name: &str) -> bool {
+    let containing_stat = match index_expr
+        .syntax()
+        .ancestors()
+        .find(|n| {
+            let k: LuaSyntaxKind = n.kind().into();
+            matches!(
+                k,
+                LuaSyntaxKind::LocalStat
+                    | LuaSyntaxKind::AssignStat
+                    | LuaSyntaxKind::CallExprStat
+                    | LuaSyntaxKind::IfStat
+                    | LuaSyntaxKind::ReturnStat
+            )
+        })
+    {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let parent = match containing_stat.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    let stat_start = containing_stat.text_range().start();
+    for child in parent.children() {
+        if child.text_range().start() >= stat_start {
+            break;
+        }
+
+        if let Some(assign_stat) = LuaAssignStat::cast(child.clone()) {
+            let (vars, _) = assign_stat.get_var_and_expr_list();
+            for var in vars {
+                if let LuaVarExpr::NameExpr(name_expr) = var
+                    && name_expr.syntax().text().to_string().trim() == root_name
+                {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(local_stat) = LuaLocalStat::cast(child) {
+            for local_name in local_stat.get_local_name_list() {
+                if local_name.syntax().text().to_string().trim() == root_name {
+                    return true;
+                }
+            }
+        }
     }
 
     false
