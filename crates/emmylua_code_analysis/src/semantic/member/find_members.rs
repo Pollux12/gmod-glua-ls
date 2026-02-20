@@ -192,6 +192,7 @@ fn find_members_guard(
         LuaType::Global => find_global_members(db, ctx, filter),
         LuaType::Instance(inst) => find_instance_members(db, inst, ctx, filter),
         LuaType::Namespace(ns) => find_namespace_members(db, ctx, ns, filter),
+        LuaType::TableOf(inner) => find_members_guard(db, inner, ctx, filter),
         LuaType::ModuleRef(file_id) => {
             let module_info = db.get_module_index().get_module(*file_id);
             if let Some(module_info) = module_info

@@ -159,9 +159,14 @@ fn resolve_member_type_with_realm(
                 .copied()
                 .collect();
 
-            if compatible.is_empty() || compatible.len() == member_ids.len() {
-                // No filtering possible or nothing was filtered out
+            if compatible.len() == member_ids.len() {
+                // Nothing was filtered out — all members are realm-compatible
                 return resolve_member_type(db, member_item);
+            }
+            if compatible.is_empty() {
+                // All candidates are from incompatible realms; resolve only the filtered
+                // (empty) set, which yields Unknown rather than leaking cross-realm types.
+                return resolve_member_type(db, &LuaMemberIndexItem::Many(vec![]));
             }
 
             let filtered_item = if compatible.len() == 1 {

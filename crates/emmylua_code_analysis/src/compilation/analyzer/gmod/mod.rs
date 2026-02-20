@@ -393,7 +393,6 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
             if let Some(Some(GmodClassCallLiteral::NameRef(target_name))) = call.literal_args.first() {
                 if target_name == table_var_name {
                     synthesize_accessor_func(db, *file_id, &class_decl_id, call);
-                    synthesize_accessor_func(db, *file_id, &class_decl_id, call);
                 }
             }
         }
@@ -2478,13 +2477,20 @@ fn infer_realm_from_filename(db: &DbIndex, file_id: FileId) -> Option<GmodRealm>
         return Some(GmodRealm::Shared);
     }
 
-    // Check parent directory names for realm hints (e.g., lua/glide/server/network.lua)
+    // Check parent directory names for realm hints (e.g., lua/glide/server/network.lua).
+    // Only inspect the path segment after `lua/` to avoid false realm hints from
+    // unrelated parent directory names (e.g., a user's home directory named "server").
     let path_str = file_path.to_string_lossy().to_ascii_lowercase();
     let path_str = path_str.replace('\\', "/");
-    if path_str.contains("/server/") || path_str.contains("/sv/") {
+    let search_str = if let Some(idx) = path_str.rfind("/lua/") {
+        &path_str[idx..]
+    } else {
+        &path_str
+    };
+    if search_str.contains("/server/") || search_str.contains("/sv/") {
         return Some(GmodRealm::Server);
     }
-    if path_str.contains("/client/") || path_str.contains("/cl/") {
+    if search_str.contains("/client/") || search_str.contains("/cl/") {
         return Some(GmodRealm::Client);
     }
 

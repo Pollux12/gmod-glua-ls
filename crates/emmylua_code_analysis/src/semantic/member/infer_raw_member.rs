@@ -57,6 +57,9 @@ fn infer_raw_member_type_guard(
         LuaType::Generic(generic_type) => {
             infer_generic_raw_member_type(db, generic_type, member_key, infer_guard)
         }
+        LuaType::TableOf(inner) => {
+            infer_raw_member_type_guard(db, inner, member_key, infer_guard)
+        }
         // other do not support now
         _ => Err(InferFailReason::None),
     }
