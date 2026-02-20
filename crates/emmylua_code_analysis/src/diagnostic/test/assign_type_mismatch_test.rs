@@ -1280,6 +1280,20 @@ return t
             end
             "#
         ));
+
+        // Case 4: self typed as `any` - calling any method should not produce false positives
+        let mut ws4 = VirtualWorkspace::new();
+        assert!(ws4.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@type any
+            local self = nil
+
+            local selfTbl = self:GetTable()
+            selfTbl.spin = 0
+            selfTbl.tilt = 0
+            "#
+        ));
     }
 
     // When a colon-defined method annotation is assigned via dot syntax, the user's
@@ -1304,6 +1318,202 @@ return t
             local panel = {}
 
             panel.Paint = function(self, w, h)
+            end
+            "#
+        ));
+    }
+
+    // Verify that assigning to a field of a nil-typed variable correctly produces a diagnostic.
+    // This is a sanity check to ensure the "cannot assign to never" detection works.
+    #[test]
+    fn test_nil_field_assign_produces_never_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        // ---@type nil variable's field assignment should produce assign-type-mismatch
+        assert!(!ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@type nil
+            local x
+            x.spin = 0
+            "#
+        ));
+    }
+
+    // Reproduce: FindMetaTable("Entity").GetTable pattern - selfTbl should not be `never`
+    #[test]
+    fn test_rc2_find_meta_table_get_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        // Pattern: local getTable = FindMetaTable("Entity").GetTable; local selfTbl = getTable(self)
+        ws.def(
+            r#"
+            ---@class RC2Entity
+            ---@return table
+            function RC2Entity:GetTable() end
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return T|nil
+            function FindMetaTable2(metaName) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@param self RC2Entity
+            local function test(self)
+                local getTable = FindMetaTable2("RC2Entity").GetTable
+                local selfTbl = getTable(self)
+                selfTbl.spin = 0
+                selfTbl.tilt = 0
+            end
+            "#
+        ));
+    }
+
+    // Pattern 2: local var without initializer - assigning then accessing fields should not error
+    #[test]
+    fn test_rc2_local_no_init_then_assign_table() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local active
+            active = {}
+            active.running = true
+            active.spin = 0
+            "#
+        ));
+    }
+
+    // Pattern 2b: local var without initializer used inside function, assigned to {}
+    #[test]
+    fn test_rc2_local_no_init_inside_func() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local function test()
+                local dt
+                dt = {}
+                dt.x = 1
+                dt.y = 2
+            end
+            "#
+        ));
+    }
+
+    // Pattern 3: self.field = nil then self.field = {...} across functions
+    #[test]
+    fn test_rc2_self_field_nil_then_table() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class Ent3
+            local Ent3 = {}
+
+            function Ent3:Initialize()
+                self.data = nil
+            end
+
+            function Ent3:Think()
+                self.data = { running = true }
+                self.data.running = false
+            end
+            "#
+        ));
+    }
+
+    // Pattern 1b: module-level getTable variable then used inside function
+    #[test]
+    fn test_rc2_module_level_get_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class ModEnt
+            ---@return table
+            function ModEnt:GetTable() end
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return T|nil
+            function FindMetaTable3(metaName) end
+            "#,
+        );
+
+        // getTable declared at module level, used inside function
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local getTable = FindMetaTable3("ModEnt").GetTable
+
+            ---@param self ModEnt
+            local function test(self)
+                local selfTbl = getTable(self)
+                selfTbl.spin = 0
+                selfTbl.tilt = 0
+            end
+            "#
+        ));
+    }
+
+    // Pattern 1c: getTable in one def file, usage in check_code_for file (cross-file)
+    #[test]
+    fn test_rc2_cross_file_get_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class XEnt
+            ---@return table
+            function XEnt:GetTable() end
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return T|nil
+            function FindMetaTable4(metaName) end
+
+            local getTable = FindMetaTable4("XEnt").GetTable
+
+            ---@param self XEnt
+            local function doStuff(self)
+                local selfTbl = getTable(self)
+                selfTbl.spin = 0
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local getTable2 = FindMetaTable4("XEnt").GetTable
+
+            ---@param self XEnt
+            local function test2(self)
+                local selfTbl = getTable2(self)
+                selfTbl.tilt = 0
+            end
+            "#
+        ));
+    }
+
+    // Debug test: verify what type `result` gets when fn() is called with fn: any
+    // (This is a documentation test - confirms any() → Unknown, not Nil or Never)
+    #[test]
+    fn test_any_call_expr_type_is_unknown() {
+        // Calling a value typed as `any` returns Unknown (not Nil/Never).
+        // The top-level infer_expr converts Err(None) → Ok(Unknown) for call exprs.
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@param fn any
+            local function test(fn)
+                local result = fn()
+                result.field = 0
             end
             "#
         ));
