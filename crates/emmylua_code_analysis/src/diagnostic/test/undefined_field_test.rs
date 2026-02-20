@@ -1176,4 +1176,64 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_tool_getowner_concommand() {
+        // Tool:GetOwner() returns Player, Player:ConCommand should resolve
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Player
+            function Player:ConCommand(cmd) end
+
+            ---@class Tool
+            ---@return Player
+            function Tool:GetOwner() end
+
+            ---@class TOOL : Tool
+            TOOL = {}
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            function TOOL:RightClick(trace)
+                local ply = self:GetOwner()
+                ply:ConCommand("test")
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_buildcpanel_param_from_field_annotation() {
+        // BuildCPanel field annotation fun(panel: ControlPanel) should propagate
+        // the ControlPanel type to the panel parameter
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class DForm
+            function DForm:Help(text) end
+            function DForm:NumSlider(label, convar, min, max) end
+
+            ---@class ControlPanel : DForm
+            function ControlPanel:AddControl(type, controlinfo) end
+
+            ---@class Tool
+            ---@field BuildCPanel fun(panel: ControlPanel)
+
+            ---@class TOOL : Tool
+            TOOL = {}
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            function TOOL.BuildCPanel(panel)
+                panel:Help("test help")
+                panel:AddControl("slider", {})
+            end
+            "#,
+        ));
+    }
 }

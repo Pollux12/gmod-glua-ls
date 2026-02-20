@@ -3179,6 +3179,160 @@ mod test {
     }
 
     #[gtest]
+    fn test_stool_buildcpanel_from_field_annotation_only() {
+        // Reproduces the real scenario with exact annotation structure from glua-api-snippets.
+        // @field BuildCPanel fun(panel: ControlPanel) is on Tool class (not TOOL).
+        // ControlPanel : DForm, and DForm:Help is inherited.
+        // Methods are split across separate files.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        // class.TOOL.lua - exact real annotation structure
+        ws.def_file(
+            "addons/test/lua/annotations/class.TOOL.lua",
+            r#"
+                ---@class Tool
+                ---@field BuildCPanel fun(panel: ControlPanel) Called to populate the tool's control panel.
+                Tool = Tool or {}
+
+                ---@class TOOL : Tool
+                TOOL = {}
+            "#,
+        );
+
+        // tool.lua - Tool methods
+        ws.def_file(
+            "addons/test/lua/annotations/tool.lua",
+            r#"
+                ---@return Player
+                function Tool:GetOwner() end
+            "#,
+        );
+
+        // player.lua
+        ws.def_file(
+            "addons/test/lua/annotations/player.lua",
+            r#"
+                ---@class Player
+                ---@param command string
+                function Player:ConCommand(command) end
+            "#,
+        );
+
+        // class.ControlPanel.lua (separate from controlpanel.lua methods)
+        ws.def_file(
+            "addons/test/lua/annotations/class.ControlPanel.lua",
+            r#"
+                ---@class ControlPanel : DForm
+                local ControlPanel = {}
+            "#,
+        );
+
+        // controlpanel.lua (methods, separate from class declaration)
+        ws.def_file(
+            "addons/test/lua/annotations/controlpanel.lua",
+            r#"
+                ---@param type string
+                ---@param controlinfo table
+                ---@return Panel
+                function ControlPanel:AddControl(type, controlinfo) end
+
+                ---@return DNumSlider
+                function ControlPanel:NumSlider(...) end
+            "#,
+        );
+
+        // dform.lua (DForm methods, inherited by ControlPanel)
+        ws.def_file(
+            "addons/test/lua/annotations/dform.lua",
+            r#"
+                ---@class DForm : DCollapsibleCategory
+                local DForm = {}
+
+                ---@param help string
+                ---@return DLabel
+                function DForm:Help(help) end
+
+                ---@param label string
+                ---@param convar string
+                ---@param min number
+                ---@param max number
+                ---@param decimals? number
+                ---@return DNumSlider
+                function DForm:NumSlider(label, convar, min, max, decimals) end
+            "#,
+        );
+
+        // dcollapsiblecategory.lua
+        ws.def_file(
+            "addons/test/lua/annotations/dcollapsiblecategory.lua",
+            r#"
+                ---@class DCollapsibleCategory
+                ---@class DNumSlider
+                ---@class DLabel
+                ---@class Panel
+            "#,
+        );
+
+        // Stool file: NO @param annotations, types come from @field on Tool
+        let file_id = ws.def_file(
+            "addons/test/lua/weapons/gmod_tool/stools/glide_test.lua",
+            r#"
+                TOOL.Category = "Glide"
+                TOOL.Name = "Projectile Launcher"
+
+                function TOOL:RightClick(trace)
+                    local ply = self:GetOwner()
+                    ply:ConCommand("say test")
+                end
+
+                function TOOL.BuildCPanel(panel)
+                    panel:Help("help text")
+                    panel:AddControl("slider", {})
+                    panel:NumSlider("Speed", "tool_speed", 0, 100)
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
+
+        let extract_name = |message: &str| {
+            message
+                .strip_prefix("Undefined field `")
+                .and_then(|rest| rest.split_once('`'))
+                .map(|(name, _)| name.to_string())
+        };
+        let undefined_field_names: Vec<String> = undefined_field_diags
+            .iter()
+            .filter_map(|diag| extract_name(&diag.message))
+            .collect();
+
+        assert!(
+            !undefined_field_names
+                .iter()
+                .any(|name| matches!(
+                    name.as_str(),
+                    "Help" | "AddControl" | "NumSlider" | "ConCommand" | "GetOwner"
+                )),
+            "unexpected undefined-field diagnostics for TOOL methods (type from @field): {undefined_field_diags:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vector_member_access_after_arithmetic_chain() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
