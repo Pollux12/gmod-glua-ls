@@ -1236,4 +1236,72 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_unary_minus_preserves_type_methods() {
+        let mut ws = VirtualWorkspace::new();
+
+        // Unary minus on a type with @operator unm should preserve that type
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestVecUNM
+                ---@operator unm: TestVecUNM
+                local TestVecUNM = {}
+                function TestVecUNM:Dot(v) return 0 end
+                function TestVecUNM:Forward() return TestVecUNM end
+
+                ---@type TestVecUNM
+                local ang
+
+                local dir = -ang:Forward()
+                local result = dir:Dot(ang)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_global_table_cross_file_member_resolution() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def_file(
+            "defs.lua",
+            r#"
+                ---@class VecCross
+                ---@operator unm: VecCross
+                local VecCross = {}
+                function VecCross:Dot(v) return 0 end
+                function VecCross:Forward() return VecCross end
+
+                ---@return VecCross
+                function _G.MakeVecCross() end
+            "#,
+        );
+
+        // File A defines a global table and functions (NO return annotations - inferred)
+        ws.def_file(
+            "file_a.lua",
+            r#"
+                MyGlobal = MyGlobal or {}
+
+                local cachedPos = MakeVecCross()
+                local cachedAng = MakeVecCross()
+
+                function MyGlobal.GetViewPos()
+                    return cachedPos, cachedAng
+                end
+            "#,
+        );
+
+        // File B uses a localized reference (like the real addon)
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local GetViewPos = MyGlobal.GetViewPos
+                local pos, ang = GetViewPos()
+                local dir = -ang:Forward()
+                local result = dir:Dot(pos)
+            "#,
+        ));
+    }
 }

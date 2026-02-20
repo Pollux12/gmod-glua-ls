@@ -1695,4 +1695,60 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_closure_param_from_function_call() {
+        let mut ws = VirtualWorkspace::new();
+
+        // Closure param should be inferred from the function's param type
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Player
+            local Player = {}
+            function Player:Nick() return "" end
+
+            ---@param handler fun(ply: Player)
+            function RegisterHandler(handler) end
+
+            RegisterHandler(function(ply)
+                local name = ply:Nick()
+            end)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_closure_param_cross_file() {
+        let mut ws = VirtualWorkspace::new();
+
+        // Define the function with handler param in one file
+        ws.def_file("network.lua", r#"
+            ---@class Player
+            local Player = {}
+            function Player:Nick() return "" end
+
+            Glide = Glide or {}
+
+            ---@param commandId number
+            ---@param handler fun(ply: Player)
+            function Glide.AddCommandHandler(commandId, handler) end
+        "#);
+
+        // Use the closure in another file (mimicking addon pattern)
+        // Note: Glide = Glide or {} in BOTH files, just like the addon
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            Glide = Glide or {}
+
+            ---@param ply Player
+            local function Validate(ply) end
+
+            Glide.AddCommandHandler(1, function(ply)
+                Validate(ply)
+            end)
+        "#
+        ));
+    }
 }

@@ -3386,4 +3386,183 @@ mod test {
             "unexpected vector undefined-field diagnostics after arithmetic chain: {undefined_field_diags:?}"
         );
     }
+
+    #[test]
+    fn test_dynamic_field_from_typed_variable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        // Mimics the real pattern: function param with @type re-annotation
+        let file_id = ws.def(
+            r#"
+                ---@class base_glide_car
+                local ENT = {}
+
+                ---@return table
+                function ENT:GetTable() return {} end
+
+                function ENT:OnPostThink(dt, selfTbl)
+                    ---@type base_glide_car
+                    selfTbl = selfTbl or self:GetTable()
+
+                    selfTbl.throttleRamp = 0.5
+                    local x = selfTbl.throttleRamp * selfTbl.throttleRamp * selfTbl.throttleRamp
+                end
+            "#,
+        );
+
+        let result = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new());
+        let diags: Vec<_> = result
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "undefined-field".to_string(),
+                    ))
+            })
+            .collect();
+
+        let field_names: Vec<String> = diags
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+
+        assert!(
+            !field_names.iter().any(|m| m.contains("throttleRamp")),
+            "throttleRamp should not trigger undefined-field after dynamic assignment: {field_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_field_multifile() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        // Class defined in file A
+        ws.def_file(
+            "lua/entities/base_glide_car/shared.lua",
+            r#"
+                ---@class base_glide_car
+                local ENT = {}
+
+                ---@return table
+                function ENT:GetTable() return {} end
+            "#,
+        );
+
+        // Dynamic field used in file B
+        let file_id = ws.def_file(
+            "lua/entities/base_glide_car/init.lua",
+            r#"
+                ---@class base_glide_car
+                local ENT = {}
+
+                local getTable = FindMetaTable("Entity").GetTable
+
+                function ENT:OnPostThink(dt, selfTbl)
+                    ---@type base_glide_car
+                    selfTbl = selfTbl or getTable(self)
+
+                    selfTbl.throttleRamp = 0.5
+                    local x = selfTbl.throttleRamp * selfTbl.throttleRamp * selfTbl.throttleRamp
+                end
+            "#,
+        );
+
+        let result = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new());
+        let diags: Vec<_> = result
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "undefined-field".to_string(),
+                    ))
+            })
+            .collect();
+
+        let field_names: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            !field_names.iter().any(|m| m.contains("throttleRamp")),
+            "throttleRamp should not trigger undefined-field in multi-file setup: {field_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_field_table_typed_in_class_file() {
+        // When selfTbl is typed as `table` (e.g. from Entity:GetTable()),
+        // dynamic field assignments in gmod class files should still be indexed
+        // under the class type.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "lua/entities/base_glide_car/shared.lua",
+            r#"
+                ---@class base_glide_car : Entity
+                local ENT = {}
+            "#,
+        );
+
+        // selfTbl is typed as `table` (no @type annotation)
+        let file_id = ws.def_file(
+            "lua/entities/base_glide_car/sv_braking.lua",
+            r#"
+                ---@class base_glide_car
+                local ENT = {}
+
+                ---@return table
+                local function getTable(e) return {} end
+
+                function ENT:BrakeInit()
+                    local selfTbl = getTable(self)
+                    selfTbl.frontBrake = 0
+                    selfTbl.rearBrake = 0
+                end
+
+                function ENT:GetBrakes()
+                    return self.frontBrake + self.rearBrake
+                end
+            "#,
+        );
+
+        let result = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new());
+        let diags: Vec<_> = result
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "undefined-field".to_string(),
+                    ))
+            })
+            .collect();
+
+        let field_names: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            !field_names.iter().any(|m| m.contains("frontBrake") || m.contains("rearBrake")),
+            "frontBrake/rearBrake should not trigger undefined-field when assigned via table-typed selfTbl in class file: {field_names:?}"
+        );
+    }
 }
