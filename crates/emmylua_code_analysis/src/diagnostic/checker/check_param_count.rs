@@ -51,12 +51,15 @@ fn check_closure_expr(
     let source_params_len = match &source_typ {
         LuaType::DocFunction(func_type) => {
             let params = func_type.get_params();
-            get_params_len(params)
+            let base = get_params_len(params)?;
+            // colon-defined methods have an implicit `self` not listed in params
+            Some(if func_type.is_colon_define() { base + 1 } else { base })
         }
         LuaType::Signature(signature_id) => {
             let signature = context.db.get_signature_index().get(signature_id)?;
             let params = signature.get_type_params();
-            get_params_len(&params)
+            let base = get_params_len(&params)?;
+            Some(if signature.is_colon_define { base + 1 } else { base })
         }
         _ => return Some(()),
     }?;

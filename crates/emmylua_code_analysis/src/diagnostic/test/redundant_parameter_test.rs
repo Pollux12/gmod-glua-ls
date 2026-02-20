@@ -175,4 +175,50 @@ mod test {
         "#
         ));
     }
+
+    // When a colon-defined method annotation is assigned via dot syntax, the user's
+    // closure should be allowed to include an explicit `self` as the first parameter
+    // without being flagged as a redundant parameter.
+    #[test]
+    fn test_colon_method_dot_assign_with_explicit_self() {
+        let mut ws = VirtualWorkspace::new();
+
+        // panel.Paint = function(self, w, h) should NOT trigger redundant-parameter
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ---@class Panel
+            local Panel = {}
+
+            ---@param width number
+            ---@param height number
+            function Panel:Paint(width, height) end
+
+            ---@type Panel
+            local panel = {}
+
+            panel.Paint = function(self, w, h)
+            end
+            "#
+        ));
+
+        // With fewer params (no self) also OK
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ---@class Panel2
+            local Panel2 = {}
+
+            ---@param width number
+            ---@param height number
+            function Panel2:Paint(width, height) end
+
+            ---@type Panel2
+            local panel2 = {}
+
+            panel2.Paint = function(w, h)
+            end
+            "#
+        ));
+    }
 }

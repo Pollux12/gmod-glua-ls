@@ -75,8 +75,13 @@ fn check_doc_func_type_compact_for_params(
     compact_func: &LuaFunctionType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    let source_params = source_func.get_params();
+    let mut source_params: Vec<(String, Option<LuaType>)> = source_func.get_params().to_vec();
     let mut compact_params: Vec<(String, Option<LuaType>)> = compact_func.get_params().to_vec();
+
+    // colon-defined methods have an implicit `self` not stored in params; expand it for comparison
+    if source_func.is_colon_define() {
+        source_params.insert(0, ("self".to_string(), None));
+    }
 
     if compact_func.is_colon_define() {
         compact_params.insert(0, ("self".to_string(), None));

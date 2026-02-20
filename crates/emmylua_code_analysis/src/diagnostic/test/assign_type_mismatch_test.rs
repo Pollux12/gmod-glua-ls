@@ -1216,4 +1216,31 @@ return t
             "#,
         ));
     }
+
+    // When a colon-defined method annotation is assigned via dot syntax, the user's
+    // closure with an explicit `self` as first parameter should not produce an
+    // assign-type-mismatch error.
+    #[test]
+    fn test_colon_method_dot_assign_with_explicit_self() {
+        let mut ws = VirtualWorkspace::new();
+
+        // panel.Paint = function(self, w, h) should NOT trigger assign-type-mismatch
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class Panel
+            local Panel = {}
+
+            ---@param width number
+            ---@param height number
+            function Panel:Paint(width, height) end
+
+            ---@type Panel
+            local panel = {}
+
+            panel.Paint = function(self, w, h)
+            end
+            "#
+        ));
+    }
 }
