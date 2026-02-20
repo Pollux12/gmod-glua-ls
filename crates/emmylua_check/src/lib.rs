@@ -50,7 +50,18 @@ pub async fn run_check(cmd_args: CmdArgs) -> Result<(), Box<dyn Error + Sync + S
         .workspace
         .ignore_dir
         .iter()
-        .map(|d| PathBuf::from(d))
+        .map(|d| {
+            let p = PathBuf::from(d);
+            // Strip Windows verbatim prefix (\\?\) added by canonicalize()
+            #[cfg(windows)]
+            {
+                let s = p.to_string_lossy();
+                if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                    return PathBuf::from(stripped);
+                }
+            }
+            p
+        })
         .collect();
     let need_check_files: Vec<_> = db
         .get_module_index()
