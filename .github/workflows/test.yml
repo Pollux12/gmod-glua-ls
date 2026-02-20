@@ -47,6 +47,8 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
     - name: Run Clippy
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -57,6 +59,8 @@ jobs:
         uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
       - name: Run Tests
         run: cargo test
 
@@ -68,6 +72,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         id: toolchain
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
       - name: Check schema
         run: |
           # Generate schema
