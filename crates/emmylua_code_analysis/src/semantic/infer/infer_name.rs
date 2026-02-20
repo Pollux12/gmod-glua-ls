@@ -4,7 +4,7 @@ use emmylua_parser::{LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr
 use rowan::TextSize;
 use wax::Pattern;
 
-use super::{InferFailReason, InferResult};
+use super::{InferFailReason, InferResult, infer_expr};
 use crate::{
     FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId,
     LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, TypeOps,
@@ -36,11 +36,11 @@ pub fn infer_name_expr(
         .get_local_reference(&file_id)
         .ok_or(InferFailReason::None)?;
     let decl_id = file_ref.get_decl_id(&range);
-    if let Some(decl_id) = decl_id {
+    let result = if let Some(decl_id) = decl_id {
         infer_expr_narrow_type(
             db,
             cache,
-            LuaExpr::NameExpr(name_expr),
+            LuaExpr::NameExpr(name_expr.clone()),
             VarRefId::VarRef(decl_id),
         )
     } else {
@@ -53,7 +53,21 @@ pub fn infer_name_expr(
         }
 
         infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+    };
+
+    // When the inferred type contains unresolved SelfInfer (e.g. from
+    // `local selfTbl = GetTable(self)` where the call's SelfInfer wasn't
+    // resolved during compilation), resolve it using the enclosing method's
+    // self type.
+    if let Ok(ref typ) = result {
+        if contains_self_infer(typ) {
+            if let Some(self_type) = infer_enclosing_self_type(db, cache, &name_expr) {
+                return Ok(resolve_self_infer(typ, &self_type));
+            }
+        }
     }
+
+    result
 }
 
 fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Option<LuaType> {
@@ -931,4 +945,52 @@ pub fn find_self_decl_or_member_id(
         }
         _ => None,
     }
+}
+
+/// Returns true if the type contains an unresolved `SelfInfer`.
+fn contains_self_infer(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::SelfInfer => true,
+        LuaType::TableOf(inner) => contains_self_infer(inner),
+        LuaType::Union(u) => u.into_vec().iter().any(contains_self_infer),
+        _ => false,
+    }
+}
+
+/// Replaces `SelfInfer` with the given self type.
+fn resolve_self_infer(typ: &LuaType, self_type: &LuaType) -> LuaType {
+    match typ {
+        LuaType::SelfInfer => self_type.clone(),
+        LuaType::TableOf(inner) => {
+            LuaType::TableOf(Box::new(resolve_self_infer(inner, self_type)))
+        }
+        LuaType::Union(u) => {
+            let types: Vec<_> = u
+                .into_vec()
+                .iter()
+                .map(|t| resolve_self_infer(t, self_type))
+                .collect();
+            LuaType::Union(crate::LuaUnionType::from_vec(types).into())
+        }
+        _ => typ.clone(),
+    }
+}
+
+/// Infers the self type from the enclosing method (colon function).
+/// For `function ENT:Update() ... end`, this returns the type of `ENT`.
+fn infer_enclosing_self_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaType> {
+    for func_stat in name_expr.ancestors::<LuaFuncStat>() {
+        let func_name = func_stat.get_func_name()?;
+        if let LuaVarExpr::IndexExpr(index_expr) = func_name {
+            if index_expr.get_index_token()?.is_colon() {
+                let prefix_expr = index_expr.get_prefix_expr()?;
+                return infer_expr(db, cache, prefix_expr).ok();
+            }
+        }
+    }
+    None
 }

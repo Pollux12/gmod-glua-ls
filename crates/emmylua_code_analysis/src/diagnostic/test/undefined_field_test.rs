@@ -1406,4 +1406,88 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_tableof_dynamic_field_assignment() {
+        // Test: dynamically-assigned fields through tableof should be recognized
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def(
+            r#"
+                ---@class MyVehicle
+                local MyVehicle = {}
+
+                ---@return tableof<self>
+                function MyVehicle:GetTable() end
+
+                local getTable = MyVehicle.GetTable
+
+                function MyVehicle:Initialize()
+                    local selfTbl = getTable(self)
+                    selfTbl.wheels = {}
+                    selfTbl.wheelCount = 4
+                end
+
+                function MyVehicle:Update()
+                    local selfTbl = getTable(self)
+                    local w = selfTbl.wheels
+                    local c = selfTbl.wheelCount
+                end
+            "#,
+        );
+
+        // We need to check the second method's file for diagnostics
+        // Since both are in same def block, check the whole file
+        let file_id = ws.def(
+            r#"
+                ---@class MyVehicle2
+                local MyVehicle2 = {}
+
+                ---@return tableof<self>
+                function MyVehicle2:GetTable() end
+
+                local getTable2 = MyVehicle2.GetTable
+
+                function MyVehicle2:Initialize()
+                    local selfTbl = getTable2(self)
+                    selfTbl.wheels = {}
+                    selfTbl.wheelCount = 4
+                end
+
+                function MyVehicle2:Update()
+                    local selfTbl = getTable2(self)
+                    local w = selfTbl.wheels
+                    local c = selfTbl.wheelCount
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new());
+        if let Some(diagnostics) = diagnostics {
+            let undef_fields: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| {
+                    d.code
+                        == Some(lsp_types::NumberOrString::String(
+                            "undefined-field".to_string(),
+                        ))
+                })
+                .collect();
+            assert!(
+                undef_fields.is_empty(),
+                "Expected no undefined-field diagnostics but got: {:?}",
+                undef_fields
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

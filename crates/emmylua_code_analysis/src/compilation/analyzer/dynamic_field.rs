@@ -46,10 +46,20 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                     // from Entity:GetTable()) and the file belongs to a gmod
                     // scripted class, index under the class type so that
                     // `self.field` accesses find these dynamic fields.
+                    //
+                    // Also handles TableOf(SelfInfer) — when SelfInfer couldn't
+                    // be resolved during compilation (e.g. localized GetTable),
+                    // we fall back to the file's class type.
                     let effective_type =
                         if is_unresolved_table_type(&prefix_type) {
                             if let Some(class_type) = &file_class_type {
                                 class_type.clone()
+                            } else {
+                                prefix_type
+                            }
+                        } else if has_unresolved_self_infer(&prefix_type) {
+                            if let Some(class_type) = &file_class_type {
+                                replace_self_infer(&prefix_type, class_type)
                             } else {
                                 prefix_type
                             }
@@ -123,6 +133,26 @@ fn is_unresolved_table_type(typ: &LuaType) -> bool {
     }
 }
 
+/// Returns true when the type contains an unresolved SelfInfer,
+/// e.g. `TableOf(SelfInfer)` from an unresolved localized GetTable call.
+fn has_unresolved_self_infer(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::SelfInfer => true,
+        LuaType::TableOf(inner) => has_unresolved_self_infer(inner),
+        LuaType::Union(union_type) => union_type.into_vec().iter().any(has_unresolved_self_infer),
+        _ => false,
+    }
+}
+
+/// Replaces SelfInfer in a type with the given class type.
+fn replace_self_infer(typ: &LuaType, class_type: &LuaType) -> LuaType {
+    match typ {
+        LuaType::SelfInfer => class_type.clone(),
+        LuaType::TableOf(inner) => LuaType::TableOf(Box::new(replace_self_infer(inner, class_type))),
+        _ => typ.clone(),
+    }
+}
+
 fn collect_for_type(
     typ: &LuaType,
     field_name: &SmolStr,
@@ -136,6 +166,9 @@ fn collect_for_type(
         }
         LuaType::Instance(instance) => {
             collect_for_type(instance.get_base(), field_name, file_id, range, result);
+        }
+        LuaType::TableOf(inner) => {
+            collect_for_type(inner, field_name, file_id, range, result);
         }
         LuaType::Union(union_type) => {
             for t in union_type.into_vec() {
