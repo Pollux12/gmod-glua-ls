@@ -94,37 +94,39 @@ pub fn get_type_at_call_expr(
                 _ => {}
             }
 
-            let Some(signature_cast) = db.get_flow_index().get_signature_cast(&signature_id) else {
-                return Ok(ResultTypeOrContinue::Continue);
-            };
-
-            match signature_cast.name.as_str() {
-                "self" => get_type_at_call_expr_by_signature_self(
-                    db,
-                    tree,
-                    cache,
-                    root,
-                    var_ref_id,
-                    flow_node,
-                    prefix_expr,
-                    signature_cast,
-                    signature_id,
-                    condition_flow,
-                ),
-                name => get_type_at_call_expr_by_signature_param_name(
-                    db,
-                    tree,
-                    cache,
-                    root,
-                    var_ref_id,
-                    flow_node,
-                    call_expr,
-                    signature_cast,
-                    signature_id,
-                    name,
-                    condition_flow,
-                ),
+            if let Some(signature_cast) = db.get_flow_index().get_signature_cast(&signature_id) {
+                return match signature_cast.name.as_str() {
+                    "self" => get_type_at_call_expr_by_signature_self(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        prefix_expr,
+                        signature_cast,
+                        signature_id,
+                        condition_flow,
+                    ),
+                    name => get_type_at_call_expr_by_signature_param_name(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        call_expr,
+                        signature_cast,
+                        signature_id,
+                        name,
+                        condition_flow,
+                    ),
+                };
             }
+
+            // No @cast annotation found — fall through so IsValid/isfunction
+            // name-based narrowing can still run as a fallback.
+            Ok(ResultTypeOrContinue::Continue)
         }
         _ => {
             // If the prefix expression is not a function, we cannot infer the type cast.
