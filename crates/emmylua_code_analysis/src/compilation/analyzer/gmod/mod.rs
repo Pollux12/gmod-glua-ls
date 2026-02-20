@@ -2478,15 +2478,13 @@ fn infer_realm_from_filename(db: &DbIndex, file_id: FileId) -> Option<GmodRealm>
     }
 
     // Check parent directory names for realm hints (e.g., lua/glide/server/network.lua).
-    // Only inspect the path segment after `lua/` to avoid false realm hints from
-    // unrelated parent directory names (e.g., a user's home directory named "server").
+    // Only inspect the path segment after the last `/lua/` anchor to avoid false realm hints
+    // from unrelated parent directory names (e.g. a user home directory named "server").
+    // If there is no `/lua/` anchor the file is outside a GMod lua tree and we cannot
+    // reliably infer realm from directory structure alone.
     let path_str = file_path.to_string_lossy().to_ascii_lowercase();
     let path_str = path_str.replace('\\', "/");
-    let search_str = if let Some(idx) = path_str.rfind("/lua/") {
-        &path_str[idx..]
-    } else {
-        &path_str
-    };
+    let search_str = path_str.rfind("/lua/").map(|idx| &path_str[idx..])?;
     if search_str.contains("/server/") || search_str.contains("/sv/") {
         return Some(GmodRealm::Server);
     }

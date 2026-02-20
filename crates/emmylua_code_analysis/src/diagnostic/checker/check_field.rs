@@ -1094,8 +1094,11 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
                     }
                 }
             }
-            // For == or ~= comparisons, also check if the field is inside either side
-            // e.g., `string.sub(data.text, 1, 1) == "#"` guards data.text
+            // For == or ~= comparisons, check if the field is nested inside a function call
+            // on either side of the comparison, e.g. `string.sub(data.text, 1, 1) == "#"`
+            // guards data.text (the call would have errored if data.text was nil).
+            // Do NOT match direct field operands here — `field == "x"` does not guarantee
+            // the field is non-nil in the body (nil ~= "x" is true in Lua).
             let has_eq_ne = binary.syntax().children_with_tokens().any(|child| {
                 let k = child.kind();
                 k == LuaTokenKind::TkEq.into() || k == LuaTokenKind::TkNe.into()
@@ -1107,8 +1110,14 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
                     .filter_map(LuaExpr::cast)
                     .collect();
                 for expr in &exprs {
-                    if condition_nil_guards_field(expr, field_text) {
-                        return true;
+                    if let LuaExpr::CallExpr(call) = expr {
+                        if let Some(args) = call.get_args_list() {
+                            for arg in args.get_args() {
+                                if condition_nil_guards_field(&arg, field_text) {
+                                    return true;
+                                }
+                            }
+                        }
                     }
                 }
             }
