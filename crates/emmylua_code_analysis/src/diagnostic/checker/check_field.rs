@@ -93,7 +93,7 @@ fn check_index_expr(
         return Some(());
     }
 
-    if matches!(code, DiagnosticCode::UndefinedField) && is_nil_guarded_in_scope(index_expr) {
+    if matches!(code, DiagnosticCode::UndefinedField) && !is_enum_type(db, &prefix_typ) && is_nil_guarded_in_scope(index_expr) {
         return Some(());
     }
 
@@ -793,7 +793,14 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                 if let Some(if_stat) = LuaIfStat::cast(ancestor) {
                     if let Some(condition_expr) = if_stat.get_condition_expr() {
                         let cond_range = condition_expr.get_range();
-                        if !cond_range.contains_range(node_range) {
+                        if cond_range.contains_range(node_range) {
+                            // Field IS in the condition — it's a nil/truthy check itself.
+                            // Suppress if the field is used as a truthy check (direct, or, and, not).
+                            if is_truthy_check_in_condition(&condition_expr, &normalized_target) {
+                                return true;
+                            }
+                        } else {
+                            // Field is in the body — check if the condition guards it.
                             if condition_nil_guards_field(&condition_expr, &normalized_target) {
                                 return true;
                             }
@@ -806,7 +813,11 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                 if let Some(elseif_clause) = LuaElseIfClauseStat::cast(ancestor) {
                     if let Some(condition_expr) = elseif_clause.get_condition_expr() {
                         let cond_range = condition_expr.get_range();
-                        if !cond_range.contains_range(node_range) {
+                        if cond_range.contains_range(node_range) {
+                            if is_truthy_check_in_condition(&condition_expr, &normalized_target) {
+                                return true;
+                            }
+                        } else {
                             if condition_nil_guards_field(&condition_expr, &normalized_target) {
                                 return true;
                             }
@@ -815,6 +826,46 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                 }
                 break;
             }
+            // `or` default pattern: `field or DEFAULT` — field is nil-checked by the or.
+            LuaSyntaxKind::BinaryExpr => {
+                if let Some(binary) = LuaBinaryExpr::cast(ancestor.clone()) {
+                    let has_or = binary.syntax().children_with_tokens().any(|child| {
+                        child.kind() == LuaTokenKind::TkOr.into()
+                    });
+                    if has_or {
+                        // Check if the field is on the left side of `or`
+                        let exprs: Vec<LuaExpr> = binary
+                            .syntax()
+                            .children()
+                            .filter_map(LuaExpr::cast)
+                            .collect();
+                        if let Some(first) = exprs.first() {
+                            let first_range = first.get_range();
+                            if first_range.contains_range(node_range) {
+                                return true;
+                            }
+                        }
+                    }
+                    let has_and = binary.syntax().children_with_tokens().any(|child| {
+                        child.kind() == LuaTokenKind::TkAnd.into()
+                    });
+                    if has_and {
+                        // `field and expr` — field is being used as a guard
+                        let exprs: Vec<LuaExpr> = binary
+                            .syntax()
+                            .children()
+                            .filter_map(LuaExpr::cast)
+                            .collect();
+                        if let Some(first) = exprs.first() {
+                            let first_range = first.get_range();
+                            if first_range.contains_range(node_range) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             LuaSyntaxKind::ClosureExpr | LuaSyntaxKind::FuncStat | LuaSyntaxKind::LocalFuncStat => {
                 break;
             }
@@ -822,6 +873,78 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
         }
     }
     false
+}
+
+/// Check if a field is being used as a direct truthy/nil check in a condition.
+/// Handles: `field`, `not field`, `field or other`, `field and other`, `a or field`, etc.
+fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
+    match condition {
+        LuaExpr::IndexExpr(idx) => {
+            idx.syntax().text().to_string().replacen(':', ".", 1) == field_text
+        }
+        LuaExpr::BinaryExpr(binary) => {
+            let has_and_or = binary.syntax().children_with_tokens().any(|child| {
+                let kind = child.kind();
+                kind == LuaTokenKind::TkAnd.into() || kind == LuaTokenKind::TkOr.into()
+            });
+            if has_and_or {
+                for expr in binary.syntax().children().filter_map(LuaExpr::cast) {
+                    if is_truthy_check_in_condition(&expr, field_text) {
+                        return true;
+                    }
+                }
+            }
+            // Also handle comparison: field ~= nil, field == nil
+            let has_eq_ne = binary.syntax().children_with_tokens().any(|child| {
+                let kind = child.kind();
+                kind == LuaTokenKind::TkEq.into() || kind == LuaTokenKind::TkNe.into()
+            });
+            if has_eq_ne {
+                let exprs: Vec<LuaExpr> = binary
+                    .syntax()
+                    .children()
+                    .filter_map(LuaExpr::cast)
+                    .collect();
+                if exprs.len() == 2 {
+                    let lhs = exprs[0].syntax().text().to_string();
+                    let rhs = exprs[1].syntax().text().to_string();
+                    if (lhs.replacen(':', ".", 1) == field_text && rhs.trim() == "nil")
+                        || (rhs.replacen(':', ".", 1) == field_text && lhs.trim() == "nil")
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        LuaExpr::UnaryExpr(unary) => {
+            for child in unary.syntax().children().filter_map(LuaExpr::cast) {
+                if is_truthy_check_in_condition(&child, field_text) {
+                    return true;
+                }
+            }
+            false
+        }
+        LuaExpr::ParenExpr(paren) => {
+            if let Some(inner) = paren.get_expr() {
+                is_truthy_check_in_condition(&inner, field_text)
+            } else {
+                false
+            }
+        }
+        LuaExpr::CallExpr(call) => {
+            // Handle guard calls like IsValid(field), isfunction(field), etc.
+            if let Some(args) = call.get_args_list() {
+                for arg in args.get_args() {
+                    if is_truthy_check_in_condition(&arg, field_text) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 /// Check if a condition expression guards a field against nil.
@@ -909,6 +1032,18 @@ fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, index_key: &LuaIndexKey)
     let index = db.get_dynamic_field_index();
 
     has_dynamic_field_for_type(db, index, prefix_typ, &field_name)
+}
+
+/// Check if a type is an enum type. Enum members are finite and known,
+/// so nil-guard suppression should not apply to them.
+fn is_enum_type(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => db
+            .get_type_index()
+            .get_type_decl(id)
+            .is_some_and(|decl| decl.is_enum()),
+        _ => false,
+    }
 }
 
 fn has_dynamic_field_for_type(

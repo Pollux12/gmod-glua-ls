@@ -1490,4 +1490,64 @@ mod test {
             );
         }
     }
+
+    #[test]
+    fn test_nil_guard_in_condition_truthy_check() {
+        let mut ws = VirtualWorkspace::new();
+        // Field used as truthy check in if condition should be suppressed
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class NilGuardTest
+                local obj = {}
+                if obj.unknownField then
+                    print("exists")
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_guard_or_default_pattern() {
+        let mut ws = VirtualWorkspace::new();
+        // Field used in `or` default pattern should be suppressed
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class OrDefaultTest
+                local obj = {}
+                local val = obj.unknownField or 42
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_guard_not_condition() {
+        let mut ws = VirtualWorkspace::new();
+        // Field used in `not field` condition should be suppressed
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class NotCondTest
+                local obj = {}
+                if not obj.unknownField then
+                    return
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_guard_and_pattern() {
+        let mut ws = VirtualWorkspace::new();
+        // Field used as left side of `and` should be suppressed
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class AndPatternTest
+                local obj = {}
+                local val = obj.unknownField and obj.unknownField()
+            "#
+        ));
+    }
 }
