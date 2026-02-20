@@ -8,7 +8,7 @@ use emmylua_parser::{
 
 use crate::{
     DbIndex, DiagnosticCode, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaMemberKey,
-    LuaType, SemanticModel, enum_variable_is_param, get_keyof_members,
+    LuaMemberOwner, LuaType, SemanticModel, enum_variable_is_param, get_keyof_members,
 };
 
 use super::{Checker, DiagnosticContext, humanize_lint_type};
@@ -80,6 +80,12 @@ fn check_index_expr(
     }
 
     if matches!(code, DiagnosticCode::UndefinedField) && is_nil_guarded_in_scope(index_expr) {
+        return Some(());
+    }
+
+    if matches!(code, DiagnosticCode::UndefinedField)
+        && field_exists_on_subclass(db, &prefix_typ, &index_key.get_path_part())
+    {
         return Some(());
     }
 
@@ -786,4 +792,32 @@ fn has_dynamic_field_for_type(
             .any(|t| has_dynamic_field_for_type(index, t, field_name)),
         _ => false,
     }
+}
+
+/// Check if a field exists on any subclass of the given prefix type.
+/// In GMod, entities are commonly passed around as their base type (e.g. Entity)
+/// even though they are actually a specific subclass (e.g. Vehicle, Player).
+fn field_exists_on_subclass(db: &DbIndex, prefix_typ: &LuaType, field_name: &str) -> bool {
+    if !db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+
+    let type_id = match prefix_typ {
+        LuaType::Ref(id) | LuaType::Def(id) => id,
+        _ => return false,
+    };
+
+    let sub_types = db.get_type_index().get_all_sub_types(type_id);
+    for sub_decl in sub_types {
+        let owner = LuaMemberOwner::Type(sub_decl.get_id());
+        let key = LuaMemberKey::Name(field_name.into());
+        if db
+            .get_member_index()
+            .get_member_item(&owner, &key)
+            .is_some()
+        {
+            return true;
+        }
+    }
+    false
 }

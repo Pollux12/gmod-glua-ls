@@ -1113,4 +1113,67 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_field_on_subclass_suppressed() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class SubclassTest.BaseEntity
+                local BaseEntity = {}
+
+                ---@class SubclassTest.Vehicle : SubclassTest.BaseEntity
+                local Vehicle = {}
+                function Vehicle:GetDriver() end
+
+                ---@type SubclassTest.BaseEntity
+                local ent = nil
+                ent:GetDriver()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_field_on_deep_subclass_suppressed() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class DeepSubTest.Entity
+                local Entity = {}
+
+                ---@class DeepSubTest.Vehicle : DeepSubTest.Entity
+                local Vehicle = {}
+
+                ---@class DeepSubTest.Airboat : DeepSubTest.Vehicle
+                local Airboat = {}
+                function Airboat:GetSpecialField() end
+
+                ---@type DeepSubTest.Entity
+                local ent = nil
+                ent:GetSpecialField()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_field_not_on_any_subclass_still_reported() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class NoSubField.BaseEntity
+                local BaseEntity = {}
+
+                ---@class NoSubField.Vehicle : NoSubField.BaseEntity
+                local Vehicle = {}
+                function Vehicle:GetDriver() end
+
+                ---@type NoSubField.BaseEntity
+                local ent = nil
+                ent:CompletelyMadeUpMethod()
+            "#,
+        ));
+    }
 }
