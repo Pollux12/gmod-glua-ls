@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use emmylua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat,
     LuaExpr, LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat,
-    LuaRepeatStat, LuaSyntaxKind, LuaTokenKind, LuaVarExpr, LuaWhileStat,
+    LuaRepeatStat, LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat,
 };
 
 use crate::{
@@ -939,24 +939,37 @@ fn has_root_reassignment_before_usage(index_expr: &LuaIndexExpr, root_name: &str
         if child.text_range().start() >= stat_start {
             break;
         }
+        if node_reassigns_root_name(&child, root_name) {
+            return true;
+        }
+    }
 
-        if let Some(assign_stat) = LuaAssignStat::cast(child.clone()) {
-            let (vars, _) = assign_stat.get_var_and_expr_list();
-            for var in vars {
-                if let LuaVarExpr::NameExpr(name_expr) = var
-                    && name_expr.syntax().text().to_string().trim() == root_name
-                {
-                    return true;
-                }
+    false
+}
+
+fn node_reassigns_root_name(node: &LuaSyntaxNode, root_name: &str) -> bool {
+    if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        for var in vars {
+            if let LuaVarExpr::NameExpr(name_expr) = var
+                && name_expr.syntax().text().to_string().trim() == root_name
+            {
+                return true;
             }
         }
+    }
 
-        if let Some(local_stat) = LuaLocalStat::cast(child) {
-            for local_name in local_stat.get_local_name_list() {
-                if local_name.syntax().text().to_string().trim() == root_name {
-                    return true;
-                }
+    if let Some(local_stat) = LuaLocalStat::cast(node.clone()) {
+        for local_name in local_stat.get_local_name_list() {
+            if local_name.syntax().text().to_string().trim() == root_name {
+                return true;
             }
+        }
+    }
+
+    for child in node.children() {
+        if node_reassigns_root_name(&child, root_name) {
+            return true;
         }
     }
 

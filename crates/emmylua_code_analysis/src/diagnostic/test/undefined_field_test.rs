@@ -1639,4 +1639,42 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_nil_guard_reassignment_in_for_loop_should_not_suppress() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class ReassignLoopEntity
+                ---@field species string
+                local entity = { species = "Dog" }
+                if entity.nickname ~= nil then
+                    for i = 1, 1 do
+                        entity = { species = "Cat" }
+                    end
+                    print(entity.nickname)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_guard_reassignment_in_while_loop_should_not_suppress() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class ReassignWhileEntity
+                ---@field species string
+                local entity = { species = "Dog" }
+                if entity.nickname ~= nil then
+                    while false do
+                        entity = { species = "Cat" }
+                    end
+                    print(entity.nickname)
+                end
+            "#
+        ));
+    }
 }
