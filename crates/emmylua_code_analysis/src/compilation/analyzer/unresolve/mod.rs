@@ -37,12 +37,13 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         let mut infer_manager = std::mem::take(&mut context.infer_manager);
         materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
         infer_manager.clear();
-        let mut reason_resolve: HashMap<InferFailReason, Vec<UnResolve>> = HashMap::new();
+        let mut reason_resolve: Vec<(InferFailReason, Vec<UnResolve>)> = Vec::new();
         for (unresolve, reason) in context.unresolves.drain(..) {
-            reason_resolve
-                .entry(reason.clone())
-                .or_default()
-                .push(unresolve);
+            if let Some(entry) = reason_resolve.iter_mut().find(|(r, _)| r == &reason) {
+                entry.1.push(unresolve);
+            } else {
+                reason_resolve.push((reason, vec![unresolve]));
+            }
         }
 
         let mut loop_count = 0;
@@ -108,7 +109,7 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
 #[allow(unused)]
 fn record_unresolve_info(
     time_hash_map: HashMap<usize, (u128, usize)>,
-    reason_unresolves: &HashMap<InferFailReason, Vec<UnResolve>>,
+    reason_unresolves: &Vec<(InferFailReason, Vec<UnResolve>)>,
 ) {
     let mut unresolve_info: HashMap<String, usize> = HashMap::new();
     for (check_reason, unresolves) in reason_unresolves.iter() {
@@ -197,13 +198,14 @@ fn record_unresolve_info(
 fn try_resolve(
     db: &mut DbIndex,
     infer_manager: &mut InferCacheManager,
-    reason_reasolve: &mut HashMap<InferFailReason, Vec<UnResolve>>,
+    reason_reasolve: &mut Vec<(InferFailReason, Vec<UnResolve>)>,
 ) {
     loop {
         let mut changed = false;
-        let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
-        for (check_reason, unresolves) in reason_reasolve.iter_mut() {
+        let mut to_remove_indices = Vec::new();
+
+        for (idx, (check_reason, unresolves)) in reason_reasolve.iter_mut().enumerate() {
             if !check_reach_reason(db, infer_manager, check_reason).unwrap_or(false) {
                 continue;
             }
@@ -272,18 +274,20 @@ fn try_resolve(
                 }
             }
 
-            to_be_remove.push(check_reason.clone());
+            to_remove_indices.push(idx);
         }
 
-        for reason in to_be_remove {
-            reason_reasolve.remove(&reason);
+        // Remove in reverse order to preserve indices
+        for idx in to_remove_indices.into_iter().rev() {
+            reason_reasolve.remove(idx);
         }
 
         for (unresolve, reason) in retain_unresolve {
-            reason_reasolve
-                .entry(reason.clone())
-                .or_default()
-                .push(unresolve);
+            if let Some(entry) = reason_reasolve.iter_mut().find(|(r, _)| r == &reason) {
+                entry.1.push(unresolve);
+            } else {
+                reason_reasolve.push((reason, vec![unresolve]));
+            }
         }
 
         if !changed || reason_reasolve.is_empty() {
