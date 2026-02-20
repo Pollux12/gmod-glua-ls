@@ -1576,4 +1576,31 @@ return t
             "#
         ));
     }
+
+    #[test]
+    fn test_inferred_local_reassign_different_type() {
+        let mut ws = VirtualWorkspace::new();
+        // Inferred type from first assignment should not constrain reassignment
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local matchesFilter = true
+                matchesFilter = 42
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_annotated_local_reassign_still_errors() {
+        let mut ws = VirtualWorkspace::new();
+        // Explicitly annotated type SHOULD constrain reassignment
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@type boolean
+                local matchesFilter = true
+                matchesFilter = 42
+            "#
+        ));
+    }
 }

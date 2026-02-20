@@ -95,6 +95,18 @@ fn check_name_expr(
                     let param_type = signature.get_param_info_by_id(idx)?;
                     Some(param_type.type_ref.clone())
                 }
+                LuaDeclExtra::Local { .. } => {
+                    let type_cache = semantic_model
+                        .get_db()
+                        .get_type_index()
+                        .get_type_cache(&decl_id.into())?;
+                    // In Lua, local variables can be reassigned to any type.
+                    // Only enforce type checks when the type was explicitly annotated.
+                    if type_cache.is_infer() {
+                        return Some(());
+                    }
+                    Some(type_cache.as_type().clone())
+                }
                 _ => semantic_model
                     .get_db()
                     .get_type_index()
