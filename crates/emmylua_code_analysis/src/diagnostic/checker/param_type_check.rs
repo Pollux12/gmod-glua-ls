@@ -78,19 +78,39 @@ fn check_call_expr(
         if let Some(param_type) = param.1.clone() {
             let arg_type = arg_types.get(idx).unwrap_or(&LuaType::Any);
             let mut check_type = param_type.clone();
-            // 对于第一个参数, 他有可能是`:`调用, 所以需要特殊处理
-            if idx == 0 && param_type.is_self_infer() {
-                if let Some(result) = get_call_source_type(semantic_model, &call_expr) {
-                    check_type = result;
+            let was_self_infer = param_type.is_self_infer();
+            // SelfInfer parameters represent `self` — they accept any class type.
+            // At idx==0, try to resolve the actual self type from the call context.
+            // At any other index, just skip the check since SelfInfer is always compatible.
+            if was_self_infer {
+                if idx == 0 {
+                    if let Some(result) = get_call_source_type(semantic_model, &call_expr) {
+                        check_type = result;
+                    } else {
+                        continue;
+                    }
                 } else {
-                    // Can't resolve self type from call context, skip check
                     continue;
                 }
             }
             let result = semantic_model.type_check_detail(&check_type, arg_type);
             if result.is_err() {
-                // `never` indicates a type inference limitation, skip the diagnostic
-                if matches!(check_type, LuaType::Never) || matches!(arg_type, LuaType::Never) {
+                // `never` and `SelfInfer` indicate type inference limitations, skip the diagnostic.
+                // When the original param was SelfInfer and the arg is a class/ref/def type,
+                // skip the diagnostic — get_call_source_type may resolve to the storage owner
+                // instead of the method's original class when a method is captured and stored
+                // on a different object. We only skip for class types, not primitives like string,
+                // to preserve genuine error detection (e.g., passing a string where entity is expected).
+                if matches!(
+                    check_type,
+                    LuaType::Never | LuaType::SelfInfer
+                ) || matches!(arg_type, LuaType::Never | LuaType::SelfInfer)
+                    || (was_self_infer
+                        && matches!(
+                            arg_type,
+                            LuaType::Ref(_) | LuaType::Def(_) | LuaType::SelfInfer
+                        ))
+                {
                     continue;
                 }
                 // 这里执行了`AssignTypeMismatch`的检查

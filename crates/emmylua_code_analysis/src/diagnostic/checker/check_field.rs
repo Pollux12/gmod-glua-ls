@@ -251,17 +251,36 @@ pub(super) fn is_valid_member(
             }
         }
         LuaType::Union(union) => {
-            // For union types (e.g., Player|number from realm merge), if ANY non-nil
-            // member has the field, treat it as valid. This prevents false positives
-            // when runtime type checks guard the field access.
+            // For union types (e.g., Player|number from realm merge), check if the
+            // field exists as a member of ANY non-nil union member using the member index.
+            // This handles cases where runtime type checks guard the field access.
+            let db = semantic_model.get_db();
+            let field_name = index_key.get_path_part();
+            let key = LuaMemberKey::Name(field_name.into());
             for member in union.into_vec().iter() {
                 if member.is_nil() {
                     continue;
                 }
-                if is_valid_member(semantic_model, member, index_expr, index_key, code)
-                    .is_some()
-                {
-                    return Some(());
+                if let LuaType::Ref(id) | LuaType::Def(id) = member {
+                    let owner = LuaMemberOwner::Type(id.clone());
+                    if db.get_member_index().get_member_item(&owner, &key).is_some() {
+                        return Some(());
+                    }
+                    // Also check parent types (e.g. Player inherits from Entity)
+                    let mut supers = Vec::new();
+                    id.collect_super_types(db, &mut supers);
+                    for st in &supers {
+                        if let LuaType::Ref(sid) | LuaType::Def(sid) = st {
+                            let sowner = LuaMemberOwner::Type(sid.clone());
+                            if db
+                                .get_member_index()
+                                .get_member_item(&sowner, &key)
+                                .is_some()
+                            {
+                                return Some(());
+                            }
+                        }
+                    }
                 }
             }
         }

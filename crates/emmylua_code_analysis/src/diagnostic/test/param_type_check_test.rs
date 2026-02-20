@@ -1751,4 +1751,32 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn test_dot_call_self_infer_local_var() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Player
+            local PlayerMeta = {}
+
+            ---@param vehicle Entity
+            function PlayerMeta:EnterVehicle(vehicle)
+            end
+
+            ---@class GlideNS
+            Glide = Glide or {}
+
+            Glide._OriginalEnterVehicle = Glide._OriginalEnterVehicle or PlayerMeta.EnterVehicle
+            local EnterVehicle = Glide._OriginalEnterVehicle
+
+            function PlayerMeta:TestMethod(vehicle)
+                local seat = vehicle
+
+                return EnterVehicle(self, seat)
+            end
+        "#
+        ));
+    }
 }
