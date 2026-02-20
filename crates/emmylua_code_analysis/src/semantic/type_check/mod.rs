@@ -81,6 +81,12 @@ fn check_general_type_compact(
         );
     }
 
+    // When the actual value is tableof<T>, unwrap to T for compatibility checking.
+    // tableof<T> has the same fields as T, so it should be assignable where T is expected.
+    if let LuaType::TableOf(inner) = compact_type {
+        return check_general_type_compact(context, source, inner, check_guard.next_level()?);
+    }
+
     if context
         .db
         .get_emmyrc()
@@ -202,6 +208,7 @@ fn is_like_any(ty: &LuaType) -> bool {
         ty,
         LuaType::Any
             | LuaType::Unknown
+            | LuaType::SelfInfer
             | LuaType::TplRef(_)
             | LuaType::StrTplRef(_)
             | LuaType::ConstTplRef(_)

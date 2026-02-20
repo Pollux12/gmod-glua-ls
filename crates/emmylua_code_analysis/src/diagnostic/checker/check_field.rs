@@ -165,11 +165,15 @@ fn is_invalid_prefix_type(typ: &LuaType) -> bool {
             | LuaType::Unknown
             | LuaType::Table
             | LuaType::Never
+            | LuaType::SelfInfer
             | LuaType::TplRef(_)
             | LuaType::StrTplRef(_)
             | LuaType::TableConst(_) => return true,
             LuaType::Instance(instance_typ) => {
                 current_typ = instance_typ.get_base();
+            }
+            LuaType::TableOf(inner) => {
+                current_typ = inner;
             }
             _ => return false,
         }
