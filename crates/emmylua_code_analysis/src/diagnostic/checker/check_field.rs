@@ -250,6 +250,21 @@ pub(super) fn is_valid_member(
                 return None;
             }
         }
+        LuaType::Union(union) => {
+            // For union types (e.g., Player|number from realm merge), if ANY non-nil
+            // member has the field, treat it as valid. This prevents false positives
+            // when runtime type checks guard the field access.
+            for member in union.into_vec().iter() {
+                if member.is_nil() {
+                    continue;
+                }
+                if is_valid_member(semantic_model, member, index_expr, index_key, code)
+                    .is_some()
+                {
+                    return Some(());
+                }
+            }
+        }
         _ => {}
     }
 
@@ -926,6 +941,13 @@ fn field_exists_on_subclass(db: &DbIndex, prefix_typ: &LuaType, field_name: &str
 
     let type_id = match prefix_typ {
         LuaType::Ref(id) | LuaType::Def(id) => id,
+        LuaType::TableOf(inner) => return field_exists_on_subclass(db, inner, field_name),
+        LuaType::Union(union) => {
+            return union
+                .into_vec()
+                .iter()
+                .any(|t| field_exists_on_subclass(db, t, field_name));
+        }
         _ => return false,
     };
 
