@@ -926,7 +926,9 @@ impl LuaUnionType {
             Self::Nullable(LuaType::Unknown)
         } else {
             let mut types: Vec<LuaType> = set.into_iter().collect();
-            types.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+            // Keep deterministic ordering while avoiding repeated debug formatting
+            // allocations during sort comparisons.
+            types.sort_by_cached_key(|ty| format!("{ty:?}"));
             Self::Multi(types)
         }
     }
