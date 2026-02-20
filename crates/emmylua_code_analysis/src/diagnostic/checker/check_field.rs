@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use emmylua_parser::{
-    LuaAst, LuaAstNode, LuaCallExpr, LuaElseIfClauseStat, LuaExpr, LuaForRangeStat, LuaForStat,
+    LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr, LuaForRangeStat, LuaForStat,
     LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaRepeatStat, LuaSyntaxKind, LuaTokenKind,
     LuaVarExpr, LuaWhileStat,
 };
@@ -87,6 +87,31 @@ fn check_index_expr(
         && field_exists_on_subclass(db, &prefix_typ, &index_key.get_path_part())
     {
         return Some(());
+    }
+
+    // Bracket access with non-literal expression keys (e.g., `tbl[entity]`) is a dynamic
+    // table access pattern that cannot be statically validated. Suppress undefined-field
+    // unless the prefix is an enum or a typed table (where key validation is meaningful).
+    if matches!(code, DiagnosticCode::UndefinedField) {
+        if let LuaIndexKey::Expr(expr) = &index_key {
+            let key_type = semantic_model.infer_expr(expr.clone()).ok();
+            let is_literal_key = key_type.as_ref().is_some_and(|t| {
+                t.is_string() || t.is_integer() || matches!(t, LuaType::StringConst(_))
+            });
+            if !is_literal_key {
+                let has_strict_key_type = match &prefix_typ {
+                    LuaType::Ref(id) | LuaType::Def(id) => db
+                        .get_type_index()
+                        .get_type_decl(id)
+                        .is_some_and(|decl| decl.is_enum()),
+                    LuaType::TableGeneric(_) => true,
+                    _ => false,
+                };
+                if !has_strict_key_type {
+                    return Some(());
+                }
+            }
+        }
     }
 
     let index_name = index_key.get_path_part();
@@ -519,6 +544,25 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
                         .get_prefix_expr()
                         .is_some_and(|prefix| prefix.get_range().contains_range(node_range))
                     {
+                        // The field is being called (e.g. `x:method()`).
+                        // Only suppress if this call is on the right side of an `and`
+                        // expression (short-circuit guard: `x.method and x:method()`).
+                        if let Some(parent) = ancestor.parent() {
+                            if let Some(binary) = LuaBinaryExpr::cast(parent) {
+                                let has_and = binary.syntax().children_with_tokens().any(
+                                    |child| child.kind() == LuaTokenKind::TkAnd.into(),
+                                );
+                                if has_and {
+                                    // Check that the call is the right operand (guarded side)
+                                    if let Some((_, right)) = binary.get_exprs() {
+                                        let call_range = call_expr.syntax().text_range();
+                                        if right.syntax().text_range() == call_range {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         return false;
                     }
                 }
@@ -672,6 +716,8 @@ fn get_keyof_keys(db: &DbIndex, alias_call: &LuaAliasCallType) -> Option<Vec<Lua
 /// or `if x.field then ... end`).
 fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
     let target_text = index_expr.syntax().text().to_string();
+    // Normalize colon-access to dot-access so that `obj:Method` matches `obj.Method`
+    let normalized_target = target_text.replacen(':', ".", 1);
     let node_range = index_expr.syntax().text_range();
 
     for ancestor in index_expr.syntax().ancestors() {
@@ -681,7 +727,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                     if let Some(condition_expr) = if_stat.get_condition_expr() {
                         let cond_range = condition_expr.get_range();
                         if !cond_range.contains_range(node_range) {
-                            if condition_nil_guards_field(&condition_expr, &target_text) {
+                            if condition_nil_guards_field(&condition_expr, &normalized_target) {
                                 return true;
                             }
                         }
@@ -694,7 +740,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                     if let Some(condition_expr) = elseif_clause.get_condition_expr() {
                         let cond_range = condition_expr.get_range();
                         if !cond_range.contains_range(node_range) {
-                            if condition_nil_guards_field(&condition_expr, &target_text) {
+                            if condition_nil_guards_field(&condition_expr, &normalized_target) {
                                 return true;
                             }
                         }
@@ -712,7 +758,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
 }
 
 /// Check if a condition expression guards a field against nil.
-/// Handles: `field ~= nil`, `field` (truthy), and compound `and` conditions.
+/// Handles: `field ~= nil`, `field` (truthy), `isfunction(field)`, and compound `and` conditions.
 fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
     match condition {
         LuaExpr::BinaryExpr(binary) => {
@@ -752,13 +798,35 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
             }
             false
         }
-        LuaExpr::IndexExpr(idx) => idx.syntax().text().to_string() == field_text,
+        LuaExpr::IndexExpr(idx) => {
+            idx.syntax().text().to_string().replacen(':', ".", 1) == field_text
+        }
         LuaExpr::ParenExpr(paren) => {
             if let Some(inner) = paren.get_expr() {
                 condition_nil_guards_field(&inner, field_text)
             } else {
                 false
             }
+        }
+        LuaExpr::CallExpr(call) => {
+            // Handle guard calls like isfunction(obj.field), istable(obj.field), etc.
+            if let Some(args) = call.get_args_list() {
+                for arg in args.get_args() {
+                    if condition_nil_guards_field(&arg, field_text) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        LuaExpr::UnaryExpr(unary) => {
+            // Handle `not field` patterns
+            for child in unary.syntax().children().filter_map(LuaExpr::cast) {
+                if condition_nil_guards_field(&child, field_text) {
+                    return true;
+                }
+            }
+            false
         }
         _ => false,
     }
@@ -773,23 +841,41 @@ fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, index_key: &LuaIndexKey)
     let field_name = index_key.get_path_part();
     let index = db.get_dynamic_field_index();
 
-    has_dynamic_field_for_type(index, prefix_typ, &field_name)
+    has_dynamic_field_for_type(db, index, prefix_typ, &field_name)
 }
 
 fn has_dynamic_field_for_type(
+    db: &DbIndex,
     index: &crate::DynamicFieldIndex,
     typ: &LuaType,
     field_name: &str,
 ) -> bool {
     match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => index.has_field(id, field_name),
+        LuaType::Ref(id) | LuaType::Def(id) => {
+            if index.has_field(id, field_name) {
+                return true;
+            }
+            // Walk parent types: dynamic fields registered on a parent class
+            // (e.g. base_glide_car) should also be visible on child classes
+            // (e.g. base_glide_motorcycle).
+            let mut super_types = Vec::new();
+            id.collect_super_types(db, &mut super_types);
+            for super_type in &super_types {
+                if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
+                    if index.has_field(super_id, field_name) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
         LuaType::Instance(instance) => {
-            has_dynamic_field_for_type(index, instance.get_base(), field_name)
+            has_dynamic_field_for_type(db, index, instance.get_base(), field_name)
         }
         LuaType::Union(union_type) => union_type
             .into_vec()
             .iter()
-            .any(|t| has_dynamic_field_for_type(index, t, field_name)),
+            .any(|t| has_dynamic_field_for_type(db, index, t, field_name)),
         _ => false,
     }
 }
