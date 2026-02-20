@@ -53,7 +53,9 @@ pub fn infer_array_member(
         }
         LuaIndexKey::Expr(expr) => {
             let expr_type = infer_expr(db, cache, expr.clone())?;
-            if expr_type.is_integer() {
+            // In Lua 5.1 / GLua there is no distinct integer type at runtime —
+            // functions annotated as returning `number` are legitimate array indices.
+            if expr_type.is_integer() || matches!(expr_type, LuaType::Number) {
                 let base_type = array_type.get_base();
                 match (array_type.get_len(), expr_type) {
                     (

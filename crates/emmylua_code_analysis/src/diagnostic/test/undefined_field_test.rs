@@ -887,6 +887,37 @@ mod test {
     }
 
     #[test]
+    fn test_nil_safe_logical_contexts_for_nullable_custom_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class VehicleNullable
+                VehicleNullable = {}
+            "#,
+        );
+
+        // nullable type (Vehicle | nil) in or-context: field access should be suppressed
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type VehicleNullable?
+                local ent
+                local ok = ent.isGlideVehicle or false
+            "#
+        ));
+
+        // nullable type in and-context (IsValid-style guard pattern)
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type VehicleNullable?
+                local ent
+                local ok = ent and ent.isGlideVehicle
+            "#
+        ));
+    }
+
+    #[test]
     fn test_nil_safe_logical_context_keeps_enum_warning() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
@@ -902,6 +933,46 @@ mod test {
             DiagnosticCode::UndefinedField,
             r#"
                 local ok = FlagsEnum.b or false
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_array_computed_number_index() {
+        let mut ws = VirtualWorkspace::new();
+        // Array indexed with an expression whose return type is `number`
+        // (e.g. a GLua-style RandomInt or math.random) must not trigger
+        // undefined-field.
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local SMOKE_SPRITES = {
+                    "particle/smokesprites_0001",
+                    "particle/smokesprites_0002",
+                    "particle/smokesprites_0003",
+                }
+
+                ---@return number
+                local function RandomInt(m, n) end
+
+                local sprite = SMOKE_SPRITES[RandomInt(1, #SMOKE_SPRITES)]
+            "#
+        ));
+
+        // table[variable] where the variable is typed `number` must not trigger
+        // undefined-field either.
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local SPRITES = {
+                    "a",
+                    "b",
+                }
+
+                ---@type number
+                local idx
+
+                local sprite = SPRITES[idx]
             "#
         ));
     }

@@ -139,6 +139,41 @@ pub(super) fn is_valid_member(
             if typ.get_base().is_unknown() {
                 return Some(());
             }
+            // For arrays with a known element type, any numeric index is valid.
+            // Integer literals and Idx keys are always fine.
+            if matches!(index_key, LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_)) {
+                return Some(());
+            }
+            // Expression keys: accept integer/number types (Lua 5.1/GLua uses
+            // `number` for all numeric values, including integer indices).
+            if let LuaIndexKey::Expr(expr) = index_key {
+                match semantic_model.infer_expr(expr.clone()) {
+                    Ok(key_type)
+                        if key_type.is_integer() || matches!(key_type, LuaType::Number) =>
+                    {
+                        return Some(());
+                    }
+                    Err(_) => return Some(()),
+                    _ => {}
+                }
+            }
+        }
+        LuaType::Tuple(_) => {
+            // Tuple types are array-like; integer and number index access is always valid.
+            if matches!(index_key, LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_)) {
+                return Some(());
+            }
+            if let LuaIndexKey::Expr(expr) = index_key {
+                match semantic_model.infer_expr(expr.clone()) {
+                    Ok(key_type)
+                        if key_type.is_integer() || matches!(key_type, LuaType::Number) =>
+                    {
+                        return Some(());
+                    }
+                    Err(_) => return Some(()),
+                    _ => {}
+                }
+            }
         }
         LuaType::Ref(_) => {
             // 如果类型是 Ref 的 enum, 那么需要检查变量是否为参数, 因为作为参数的 enum 本质上是 value 而不是 enum
@@ -570,10 +605,20 @@ fn is_non_enum_custom_type(semantic_model: &SemanticModel, typ: &LuaType) -> boo
         LuaType::Instance(instance_type) => {
             is_non_enum_custom_type(semantic_model, instance_type.get_base())
         }
-        LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
-            .all(|member_type| is_non_enum_custom_type(semantic_model, member_type)),
+        LuaType::Union(union_type) => {
+            let members = union_type.into_vec();
+            // Treat `T | nil` as equivalent to `T` for nil-safe context checks:
+            // accessing a field on `T?` in an `and`/`or` expression is safe because
+            // the surrounding boolean expression guards against the nil case.
+            let non_nil: Vec<_> = members
+                .iter()
+                .filter(|t| !matches!(t, LuaType::Nil))
+                .collect();
+            !non_nil.is_empty()
+                && non_nil
+                    .iter()
+                    .all(|t| is_non_enum_custom_type(semantic_model, t))
+        }
         _ => false,
     }
 }

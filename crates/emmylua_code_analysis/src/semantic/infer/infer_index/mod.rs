@@ -476,7 +476,7 @@ fn infer_tuple_member(
                     None => Err(InferFailReason::FieldNotFound),
                 };
             }
-            LuaType::Integer => {
+            LuaType::Integer | LuaType::Number => {
                 let mut result = LuaType::Unknown;
                 for typ in tuple_type.get_types() {
                     result = TypeOps::Union.apply(db, &result, typ);
