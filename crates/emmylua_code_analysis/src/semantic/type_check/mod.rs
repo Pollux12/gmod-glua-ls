@@ -185,6 +185,9 @@ fn check_general_type_compact(
             Err(TypeCheckFailReason::TypeNotMatch)
         }
         LuaType::ModuleRef(_) => Ok(()),
+        // SelfInfer represents `self` — it should accept any class/ref type
+        // since `self` is always the owning class instance.
+        LuaType::SelfInfer => Ok(()),
         _ => Err(TypeCheckFailReason::TypeNotMatch),
     }
 }

@@ -514,4 +514,39 @@ mod test {
         let expected = ws.ty("integer");
         assert_eq!(ty, expected);
     }
+
+    #[test]
+    fn test_dot_function_param_inherit() {
+        // Tests that dot-style function definitions inherit param types from
+        // annotated Signatures (e.g. TOOL.BuildCPanel pattern in Garry's Mod)
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class ControlPanel
+            ---@field AddControl fun(self: ControlPanel, type: string, controlinfo: table): Panel
+
+            ---@class Tool
+            ---@field BuildCPanel fun(panel: ControlPanel)
+
+            ---@class TOOL : Tool
+            TOOL = {}
+
+            ---@param panel ControlPanel
+            function TOOL.BuildCPanel(panel) end
+            "#,
+        );
+
+        ws.def(
+            r#"
+            function TOOL.BuildCPanel(panel)
+                a = panel
+            end
+            "#,
+        );
+
+        let ty = ws.expr_ty("a");
+        let expected = ws.ty("ControlPanel");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
 }
