@@ -7,3 +7,6 @@ dhat-heap.json
 # MCP, 用于为AI提供lsp上下文
 .serena
 .agents/skills/
+
+# Diagnostic output files
+*.json
