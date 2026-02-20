@@ -1,4 +1,4 @@
-use crate::{DbIndex, InferFailReason, LuaSemanticDeclId, LuaType, TypeOps};
+use crate::{db_index::gmod_infer::GmodRealm, DbIndex, FileId, InferFailReason, LuaSemanticDeclId, LuaType, TypeOps};
 
 use super::LuaMemberId;
 
@@ -11,6 +11,14 @@ pub enum LuaMemberIndexItem {
 impl LuaMemberIndexItem {
     pub fn resolve_type(&self, db: &DbIndex) -> Result<LuaType, InferFailReason> {
         resolve_member_type(db, self)
+    }
+
+    pub fn resolve_type_with_realm(
+        &self,
+        db: &DbIndex,
+        caller_file_id: &FileId,
+    ) -> Result<LuaType, InferFailReason> {
+        resolve_member_type_with_realm(db, self, caller_file_id)
     }
 
     pub fn resolve_semantic_decl(&self, db: &DbIndex) -> Option<LuaSemanticDeclId> {
@@ -120,6 +128,57 @@ fn resolve_member_type(
             }
         }
     }
+}
+
+fn resolve_member_type_with_realm(
+    db: &DbIndex,
+    member_item: &LuaMemberIndexItem,
+    caller_file_id: &FileId,
+) -> Result<LuaType, InferFailReason> {
+    if !db.get_emmyrc().gmod.enabled {
+        return resolve_member_type(db, member_item);
+    }
+    match member_item {
+        LuaMemberIndexItem::One(_) => resolve_member_type(db, member_item),
+        LuaMemberIndexItem::Many(member_ids) => {
+            let infer_index = db.get_gmod_infer_index();
+            // Use file-level realm for the caller
+            let caller_realm = infer_index
+                .get_realm_file_metadata(caller_file_id)
+                .map(|m| m.inferred_realm)
+                .unwrap_or(GmodRealm::Unknown);
+
+            // Filter member_ids by realm compatibility
+            let compatible: Vec<LuaMemberId> = member_ids
+                .iter()
+                .filter(|mid| {
+                    let member_realm = infer_index
+                        .get_realm_at_offset(&mid.file_id, mid.get_position());
+                    is_realm_compatible(caller_realm, member_realm)
+                })
+                .copied()
+                .collect();
+
+            if compatible.is_empty() || compatible.len() == member_ids.len() {
+                // No filtering possible or nothing was filtered out
+                return resolve_member_type(db, member_item);
+            }
+
+            let filtered_item = if compatible.len() == 1 {
+                LuaMemberIndexItem::One(compatible[0])
+            } else {
+                LuaMemberIndexItem::Many(compatible)
+            };
+            resolve_member_type(db, &filtered_item)
+        }
+    }
+}
+
+fn is_realm_compatible(call_realm: GmodRealm, decl_realm: GmodRealm) -> bool {
+    !matches!(
+        (call_realm, decl_realm),
+        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
+    )
 }
 
 fn resolve_type_owner_member_id(

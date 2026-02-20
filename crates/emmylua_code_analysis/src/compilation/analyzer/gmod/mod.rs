@@ -2439,6 +2439,16 @@ fn infer_realm_from_filename(db: &DbIndex, file_id: FileId) -> Option<GmodRealm>
         return Some(GmodRealm::Shared);
     }
 
+    // Check parent directory names for realm hints (e.g., lua/glide/server/network.lua)
+    let path_str = file_path.to_string_lossy().to_ascii_lowercase();
+    let path_str = path_str.replace('\\', "/");
+    if path_str.contains("/server/") || path_str.contains("/sv/") {
+        return Some(GmodRealm::Server);
+    }
+    if path_str.contains("/client/") || path_str.contains("/cl/") {
+        return Some(GmodRealm::Client);
+    }
+
     None
 }
 

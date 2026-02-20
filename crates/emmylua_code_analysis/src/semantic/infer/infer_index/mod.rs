@@ -259,7 +259,7 @@ fn infer_table_member(
         None => return Err(InferFailReason::FieldNotFound),
     };
 
-    member_item.resolve_type(db)
+    member_item.resolve_type_with_realm(db, &cache.get_file_id())
 }
 
 fn infer_custom_type_member(
@@ -299,11 +299,11 @@ fn infer_custom_type_member(
     let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
 
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
-        return member_item.resolve_type(db);
+        return member_item.resolve_type_with_realm(db, &cache.get_file_id());
     }
     let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
     if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, &key) {
-        return member_item.resolve_type(db);
+        return member_item.resolve_type_with_realm(db, &cache.get_file_id());
     }
 
     // 解决`key`为表达式的情况
@@ -319,7 +319,7 @@ fn infer_custom_type_member(
             }
 
             if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key)
-                && let Ok(member_type) = member_item.resolve_type(db)
+                && let Ok(member_type) = member_item.resolve_type_with_realm(db, &cache.get_file_id())
             {
                 result_types.push(member_type);
             }
