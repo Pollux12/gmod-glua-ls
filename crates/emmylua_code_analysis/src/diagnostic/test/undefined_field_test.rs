@@ -1382,4 +1382,28 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_tableof_local_function_call() {
+        // Test: local getTable = Entity.GetTable; getTable(self)
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class MyEntity
+                ---@field health number
+                local MyEntity = {}
+
+                ---@return tableof<self>
+                function MyEntity:GetTable() end
+
+                local getTable = MyEntity.GetTable
+
+                function MyEntity:Test()
+                    local tbl = getTable(self)
+                    local h = tbl.health
+                end
+            "#,
+        ));
+    }
 }

@@ -721,6 +721,7 @@ impl LuaFunctionType {
                 .iter()
                 .any(|(name, t)| name == "self" || t.as_ref().is_some_and(|t| t.is_self_infer()))
             || self.ret.is_self_infer()
+            || matches!(&self.ret, LuaType::TableOf(inner) if inner.is_self_infer())
     }
 
     pub fn is_method(&self, semantic_model: &SemanticModel, owner_type: Option<&LuaType>) -> bool {

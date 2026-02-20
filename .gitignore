@@ -10,3 +10,4 @@ dhat-heap.json
 
 # Diagnostic output files
 *.json
+dynfield_stderr.txt
