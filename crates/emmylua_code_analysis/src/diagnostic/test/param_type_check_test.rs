@@ -1779,4 +1779,33 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn test_nullable_number_literal_union_accepted_as_number() {
+        let mut ws = VirtualWorkspace::new();
+        // Test 1: direct indexing works
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param delay number
+            local function takesNumber(delay) end
+
+            local delays = { 0.5, 1, 2, 3, 5 }
+            local delay = delays[1]
+            takesNumber(delay)
+            "#
+        ));
+        // Test 2: nullable number literal union via annotation
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param delay number
+            local function takesNumber(delay) end
+
+            ---@type (0.5|1|2|3|5)?
+            local delay
+            takesNumber(delay)
+            "#
+        ));
+    }
 }

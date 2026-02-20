@@ -93,14 +93,33 @@ fn check_general_type_compact(
         .strict
         .allow_nullable_as_non_nullable
         && let LuaType::Union(union_type) = compact_type
-        && let LuaUnionType::Nullable(non_nullable_type) = union_type.deref()
     {
-        return check_general_type_compact(
-            context,
-            source,
-            non_nullable_type,
-            check_guard.next_level()?,
-        );
+        match union_type.deref() {
+            LuaUnionType::Nullable(non_nullable_type) => {
+                return check_general_type_compact(
+                    context,
+                    source,
+                    non_nullable_type,
+                    check_guard.next_level()?,
+                );
+            }
+            LuaUnionType::Multi(types) if types.contains(&LuaType::Nil) => {
+                let non_nil: Vec<LuaType> =
+                    types.iter().filter(|t| !matches!(t, LuaType::Nil)).cloned().collect();
+                let stripped = if non_nil.len() == 1 {
+                    non_nil.into_iter().next().unwrap()
+                } else {
+                    LuaType::Union(LuaUnionType::Multi(non_nil).into())
+                };
+                return check_general_type_compact(
+                    context,
+                    source,
+                    &stripped,
+                    check_guard.next_level()?,
+                );
+            }
+            _ => {}
+        }
     }
 
     match source {
