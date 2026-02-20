@@ -49,8 +49,9 @@ fn get_var_ref_type(db: &DbIndex, cache: &mut LuaInferCache, var_ref_id: &VarRef
         }
 
         if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
+            let result = type_cache.as_type().clone();
             // 不要在此阶段展开泛型别名, 必须让后续的泛型匹配阶段基于声明形态完成推断
-            return Ok(type_cache.as_type().clone());
+            return Ok(result);
         }
 
         if decl.is_param() {

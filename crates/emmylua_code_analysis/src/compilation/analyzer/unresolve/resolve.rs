@@ -29,7 +29,7 @@ pub fn try_resolve_decl(
     decl: &mut UnResolveDecl,
 ) -> ResolveResult {
     let expr = decl.expr.clone();
-    let expr_type = infer_expr(db, cache, expr)?;
+    let expr_type = infer_expr(db, cache, expr.clone())?;
     let decl_id = decl.decl_id;
     let expr_type = match &expr_type {
         LuaType::Variadic(multi) => multi

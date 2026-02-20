@@ -95,11 +95,11 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
         }
 
         let index = db.get_dynamic_field_index_mut();
-        for (type_id, field_name, file_id, range) in collected {
-            index.add_field(type_id, field_name, file_id, range);
+        for (type_id, field_name, file_id, range) in &collected {
+            index.add_field(type_id.clone(), field_name.clone(), *file_id, *range);
         }
-        for (type_id, field_name, file_id, range) in propagated {
-            index.add_field(type_id, field_name, file_id, range);
+        for (type_id, field_name, file_id, range) in &propagated {
+            index.add_field(type_id.clone(), field_name.clone(), *file_id, *range);
         }
     }
 }

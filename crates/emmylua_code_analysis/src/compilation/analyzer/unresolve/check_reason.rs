@@ -39,7 +39,8 @@ pub fn check_reach_reason(
         }
         InferFailReason::UnResolveExpr(expr) => {
             let cache = infer_manager.get_infer_cache(expr.file_id);
-            Some(infer_expr(db, cache, expr.value.clone()).is_ok())
+            let result = infer_expr(db, cache, expr.value.clone());
+            Some(result.is_ok())
         }
         InferFailReason::UnResolveSignatureReturn(signature_id) => {
             let signature = db.get_signature_index().get(signature_id)?;

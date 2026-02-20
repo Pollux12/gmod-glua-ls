@@ -41,7 +41,7 @@ pub fn infer_index_expr(
     pass_flow: bool,
 ) -> InferResult {
     let prefix_expr = index_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
-    let prefix_type = infer_expr(db, cache, prefix_expr)?;
+    let prefix_type = infer_expr(db, cache, prefix_expr.clone())?;
     let index_member_expr = LuaIndexMemberExpr::IndexExpr(index_expr.clone());
 
     let reason = match infer_member_by_member_key(
