@@ -42,11 +42,14 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
         if db.get_emmyrc().gmod.enabled {
             run_analysis::<gmod::GmodAnalysisPipeline>(db, &mut context);
         }
+        run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
+        // Dynamic field analysis runs AFTER unresolve so that all declaration types
+        // (e.g. function parameters with @type annotations on reassignments) are
+        // fully resolved before we try to infer prefix types for field assignments.
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
             context.infer_manager.clear();
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
         }
-        run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
     }
 }
 
@@ -198,6 +201,7 @@ fn module_analyze(
     }
 
     contexts.sort_by(|a, b| a.0.cmp(&b.0));
+    main_vec.sort_by(|a, b| a.0.cmp(&b.0));
 
     contexts.extend(main_vec);
     contexts
