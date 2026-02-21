@@ -1094,23 +1094,11 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
                     }
                 }
             }
-            let has_or = binary.syntax().children_with_tokens().any(|child| {
-                child.kind() == LuaTokenKind::TkOr.into()
-            });
-            if has_or {
-                let exprs: Vec<LuaExpr> = binary
-                    .syntax()
-                    .children()
-                    .filter_map(LuaExpr::cast)
-                    .collect();
-                for expr in &exprs {
-                    if condition_nil_guards_field(expr, field_text) {
-                        return true;
-                    }
-                }
-            }
-            // For == or ~= comparisons, also check if the field is inside either side
-            // e.g., `string.sub(data.text, 1, 1) == "#"` guards data.text
+            // For == or ~= comparisons, check if the field is nested inside a function call
+            // on either side of the comparison, e.g. `string.sub(data.text, 1, 1) == "#"`
+            // guards data.text (the call would have errored if data.text was nil).
+            // Do NOT match direct field operands here — `field == "x"` does not guarantee
+            // the field is non-nil in the body (nil ~= "x" is true in Lua).
             let has_eq_ne = binary.syntax().children_with_tokens().any(|child| {
                 let k = child.kind();
                 k == LuaTokenKind::TkEq.into() || k == LuaTokenKind::TkNe.into()
@@ -1122,8 +1110,14 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
                     .filter_map(LuaExpr::cast)
                     .collect();
                 for expr in &exprs {
-                    if condition_nil_guards_field(expr, field_text) {
-                        return true;
+                    if let LuaExpr::CallExpr(call) = expr {
+                        if let Some(args) = call.get_args_list() {
+                            for arg in args.get_args() {
+                                if condition_nil_guards_field(&arg, field_text) {
+                                    return true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1269,7 +1263,7 @@ fn is_guarded_by_early_return(index_expr: &LuaIndexExpr, field_text: &str) -> bo
             if let Some(cond) = if_stat.get_condition_expr() {
                 let cond_text = cond.syntax().text().to_string();
                 let cond_text_normalized = cond_text.replacen(':', ".", 1);
-                if !cond_text_normalized.contains(field_text) {
+                if !cond_text_contains_field_exact(&cond_text_normalized, field_text) {
                     continue;
                 }
                 // Check if the if-body contains a return statement (early return pattern)
@@ -1280,6 +1274,35 @@ fn is_guarded_by_early_return(index_expr: &LuaIndexExpr, field_text: &str) -> bo
         }
     }
 
+    false
+}
+
+/// Check if a condition text contains a field access expression with proper word boundaries.
+/// Avoids false positives where `obj.a` would match inside `obj.aa`.
+fn cond_text_contains_field_exact(cond_text: &str, field_text: &str) -> bool {
+    let bytes = cond_text.as_bytes();
+    let field_len = field_text.len();
+    if field_len == 0 {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = cond_text[start..].find(field_text) {
+        let abs_pos = start + pos;
+        // Check boundary before the match
+        let before_ok = abs_pos == 0 || {
+            let c = bytes[abs_pos - 1] as char;
+            !c.is_alphanumeric() && c != '_'
+        };
+        // Check boundary after the match
+        let after_ok = abs_pos + field_len >= bytes.len() || {
+            let c = bytes[abs_pos + field_len] as char;
+            !c.is_alphanumeric() && c != '_'
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs_pos + 1;
+    }
     false
 }
 

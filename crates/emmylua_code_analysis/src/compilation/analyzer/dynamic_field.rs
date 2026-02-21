@@ -149,6 +149,14 @@ fn replace_self_infer(typ: &LuaType, class_type: &LuaType) -> LuaType {
     match typ {
         LuaType::SelfInfer => class_type.clone(),
         LuaType::TableOf(inner) => LuaType::TableOf(Box::new(replace_self_infer(inner, class_type))),
+        LuaType::Union(union_type) => {
+            let new_types: Vec<LuaType> = union_type
+                .into_vec()
+                .iter()
+                .map(|t| replace_self_infer(t, class_type))
+                .collect();
+            LuaType::from_vec(new_types)
+        }
         _ => typ.clone(),
     }
 }
