@@ -1,10 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use emmylua_code_analysis::GmodRealm;
+use emmylua_code_analysis::{FileId, GmodHookSiteMetadata, GmodRealm, SemanticModel};
 use emmylua_parser::{
-    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken, PathTrait,
+    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaComment, LuaCommentOwner, LuaDocTag,
+    LuaDocTagRealm, LuaFuncStat, LuaLiteralExpr, LuaLocalFuncStat, LuaStringToken, PathTrait,
 };
 use lsp_types::{CompletionItem, CompletionTextEdit, TextEdit};
+use rowan::TextSize;
 
 use crate::handlers::completion::completion_builder::CompletionBuilder;
 
@@ -105,29 +107,18 @@ fn add_hook_completion_items(
         &builder.semantic_model.get_file_id(),
         builder.position_offset,
     );
-    let mut allowed_file_ids: Option<HashSet<_>> = None;
-    if matches!(call_realm, GmodRealm::Client | GmodRealm::Server) {
-        let mut ids = HashSet::new();
-        for (file_id, _) in infer_index.iter_hook_file_metadata() {
-            let file_realm = infer_index
-                .get_realm_file_metadata(file_id)
-                .map(|metadata| metadata.inferred_realm)
-                .unwrap_or(GmodRealm::Unknown);
-            if is_realm_compatible(call_realm, file_realm) {
-                ids.insert(*file_id);
-            }
-        }
-        allowed_file_ids = Some(ids);
-    }
+    let should_filter_realm = matches!(call_realm, GmodRealm::Client | GmodRealm::Server);
 
     for (file_id, metadata) in infer_index.iter_hook_file_metadata() {
-        if let Some(allowed) = &allowed_file_ids
-            && !allowed.contains(file_id)
-        {
-            continue;
-        }
-
         for hook_site in &metadata.sites {
+            if should_filter_realm {
+                let hook_realm =
+                    resolve_hook_site_realm(&builder.semantic_model, file_id, hook_site);
+                if !is_realm_compatible(call_realm, hook_realm) {
+                    continue;
+                }
+            }
+
             let Some(name) = normalize_name(hook_site.hook_name.as_deref()) else {
                 continue;
             };
@@ -253,4 +244,71 @@ fn is_realm_compatible(call_realm: GmodRealm, item_realm: GmodRealm) -> bool {
         (call_realm, item_realm),
         (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
     )
+}
+
+fn resolve_hook_site_realm(
+    semantic_model: &SemanticModel,
+    file_id: &FileId,
+    hook_site: &GmodHookSiteMetadata,
+) -> GmodRealm {
+    let offset = hook_site.syntax_id.get_range().start();
+    if let Some(annotation_realm) =
+        resolve_decl_annotation_realm_at_offset(semantic_model, file_id, offset)
+    {
+        return annotation_realm;
+    }
+
+    semantic_model
+        .get_db()
+        .get_gmod_infer_index()
+        .get_realm_at_offset(file_id, offset)
+}
+
+fn resolve_decl_annotation_realm_at_offset(
+    semantic_model: &SemanticModel,
+    file_id: &FileId,
+    offset: TextSize,
+) -> Option<GmodRealm> {
+    let tree = semantic_model.get_db().get_vfs().get_syntax_tree(file_id)?;
+    for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
+        if func_stat.get_range().contains(offset)
+            && let Some(comment) = func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            return Some(realm);
+        }
+    }
+
+    for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
+        if local_func_stat.get_range().contains(offset)
+            && let Some(comment) = local_func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            return Some(realm);
+        }
+    }
+
+    None
+}
+
+fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {
+    for tag in comment.get_doc_tags() {
+        if let LuaDocTag::Realm(realm_tag) = tag
+            && let Some(realm) = realm_from_doc_tag(&realm_tag)
+        {
+            return Some(realm);
+        }
+    }
+
+    None
+}
+
+fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
+    let name = tag.get_name_token()?;
+    match name.get_name_text() {
+        "client" => Some(GmodRealm::Client),
+        "server" => Some(GmodRealm::Server),
+        "shared" => Some(GmodRealm::Shared),
+        _ => None,
+    }
 }

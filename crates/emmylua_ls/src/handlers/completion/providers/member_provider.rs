@@ -2,7 +2,10 @@ use emmylua_code_analysis::{
     DbIndex, FileId, GmodRealm, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId, LuaType,
     LuaTypeDeclId, SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
 };
-use emmylua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaStringToken};
+use emmylua_parser::{
+    LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
+    LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaStringToken,
+};
 use rowan::TextSize;
 use std::collections::{HashMap, HashSet};
 
@@ -405,7 +408,8 @@ fn is_member_realm_compatible(builder: &CompletionBuilder, info: &LuaMemberInfo)
         return true;
     };
 
-    let decl_realm = infer_index.get_realm_at_offset(&decl_file_id, decl_offset);
+    let decl_realm = resolve_decl_realm(&builder.semantic_model, property_owner_id)
+        .unwrap_or_else(|| infer_index.get_realm_at_offset(&decl_file_id, decl_offset));
     !matches!(
         (call_realm, decl_realm),
         (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
@@ -420,5 +424,73 @@ fn semantic_decl_position(property_owner_id: &LuaSemanticDeclId) -> Option<(File
             Some((signature_id.get_file_id(), signature_id.get_position()))
         }
         LuaSemanticDeclId::TypeDecl(_) => None,
+    }
+}
+
+fn resolve_decl_realm(
+    semantic_model: &SemanticModel,
+    property_owner_id: &LuaSemanticDeclId,
+) -> Option<GmodRealm> {
+    let (decl_file_id, decl_offset) = semantic_decl_position(property_owner_id)?;
+    if let Some(annotation_realm) =
+        resolve_decl_annotation_realm_at_offset(semantic_model, &decl_file_id, decl_offset)
+    {
+        return Some(annotation_realm);
+    }
+
+    Some(
+        semantic_model
+            .get_db()
+            .get_gmod_infer_index()
+            .get_realm_at_offset(&decl_file_id, decl_offset),
+    )
+}
+
+fn resolve_decl_annotation_realm_at_offset(
+    semantic_model: &SemanticModel,
+    file_id: &FileId,
+    offset: TextSize,
+) -> Option<GmodRealm> {
+    let tree = semantic_model.get_db().get_vfs().get_syntax_tree(file_id)?;
+    for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
+        if func_stat.get_range().contains(offset)
+            && let Some(comment) = func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            return Some(realm);
+        }
+    }
+
+    for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
+        if local_func_stat.get_range().contains(offset)
+            && let Some(comment) = local_func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            return Some(realm);
+        }
+    }
+
+    None
+}
+
+fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {
+    for tag in comment.get_doc_tags() {
+        if let LuaDocTag::Realm(realm_tag) = tag
+            && let Some(realm) = realm_from_doc_tag(&realm_tag)
+        {
+            return Some(realm);
+        }
+    }
+
+    None
+}
+
+fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
+    let name = tag.get_name_token()?;
+    match name.get_name_text() {
+        "client" => Some(GmodRealm::Client),
+        "server" => Some(GmodRealm::Server),
+        "shared" => Some(GmodRealm::Shared),
+        _ => None,
     }
 }

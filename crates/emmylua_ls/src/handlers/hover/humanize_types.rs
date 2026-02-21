@@ -1,16 +1,16 @@
 use std::collections::HashSet;
 
 use emmylua_code_analysis::{
-    DbIndex, GmodRealm, InFiled, LuaMember, LuaMultiLineUnion, LuaSemanticDeclId, LuaType,
+    DbIndex, FileId, GmodRealm, InFiled, LuaMember, LuaMultiLineUnion, LuaSemanticDeclId, LuaType,
     LuaTypeDeclId, LuaUnionType, RenderLevel, SemanticDeclLevel, SemanticModel, format_union_type,
 };
 
 use emmylua_code_analysis::humanize_type;
 use emmylua_parser::{
-    LuaAstNode, LuaExpr, LuaIndexExpr, LuaStat, LuaSyntaxId, LuaSyntaxKind, LuaTableExpr,
-    LuaVarExpr,
+    LuaAstNode, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr, LuaFuncStat,
+    LuaIndexExpr, LuaLocalFuncStat, LuaStat, LuaSyntaxId, LuaSyntaxKind, LuaTableExpr, LuaVarExpr,
 };
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 use super::hover_builder::HoverBuilder;
 
@@ -301,6 +301,12 @@ fn infer_property_owner_realm(
         _ => return None,
     };
 
+    if let Some(annotation_realm) =
+        resolve_decl_annotation_realm_at_offset(semantic_model, &file_id, offset)
+    {
+        return Some(annotation_realm);
+    }
+
     if let Some(metadata) = db.get_gmod_infer_index().get_realm_file_metadata(&file_id)
         && let Some(annotation_realm) = metadata.annotation_realm
     {
@@ -311,6 +317,55 @@ fn infer_property_owner_realm(
         db.get_gmod_infer_index()
             .get_realm_at_offset(&file_id, offset),
     )
+}
+
+fn resolve_decl_annotation_realm_at_offset(
+    semantic_model: &SemanticModel,
+    file_id: &FileId,
+    offset: TextSize,
+) -> Option<GmodRealm> {
+    let tree = semantic_model.get_db().get_vfs().get_syntax_tree(file_id)?;
+    for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
+        if func_stat.get_range().contains(offset)
+            && let Some(comment) = func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            return Some(realm);
+        }
+    }
+
+    for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
+        if local_func_stat.get_range().contains(offset)
+            && let Some(comment) = local_func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            return Some(realm);
+        }
+    }
+
+    None
+}
+
+fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {
+    for tag in comment.get_doc_tags() {
+        if let LuaDocTag::Realm(realm_tag) = tag
+            && let Some(realm) = realm_from_doc_tag(&realm_tag)
+        {
+            return Some(realm);
+        }
+    }
+
+    None
+}
+
+fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
+    let name = tag.get_name_token()?;
+    match name.get_name_text() {
+        "client" => Some(GmodRealm::Client),
+        "server" => Some(GmodRealm::Server),
+        "shared" => Some(GmodRealm::Shared),
+        _ => None,
+    }
 }
 
 fn has_realm_badge(description: &str) -> bool {

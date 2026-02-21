@@ -933,6 +933,168 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_gm_method_annotation_realm_overrides_shared_file_realm() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "library/lua/includes/extensions/sh_meta_hooks.lua",
+            r#"
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@realm client
+                function GM:AnnotatedMetaHook(ply)
+                end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                function GM:AnnotatedMetaHo<??>ok(ply)
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/shared.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+            "expected CLIENT badge from declaration annotation, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+            "did not expect SHARED badge when declaration has ---@realm client, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("**CLIENT**"),
+            "expected CLIENT label text with realm badge, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_table_method_annotation_realm_overrides_shared_file_realm() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class testTbl
+                ---@type testTbl
+                testTbl = testTbl or {}
+
+                if SERVER then
+                    ---@realm client
+                    function testTbl:TestMe<??>thod()
+                    end
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("sh_test_tbl.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+            "expected CLIENT badge for annotated table method, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+            "did not expect SHARED badge for annotated table method, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+            "did not expect SERVER badge for annotated table method, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_global_function_annotation_realm_overrides_shared_file_realm() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                if SERVER then
+                    ---@realm client
+                    function TestFun<??>ction()
+                    end
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("sh_global_function.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+            "expected CLIENT badge for annotated global function, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+            "did not expect SHARED badge for annotated global function, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+            "did not expect SERVER badge for annotated global function, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_dynamic_field_uses_field_style_output() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

@@ -2558,6 +2558,38 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_hook_completion_prefers_annotation_realm_over_branch_realm() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_file(
+            "sh_hook_annotated.lua",
+            r#"
+            if SERVER then
+                ---@realm client
+                function GM:AnnotatedClientHook(ply) end
+                function GM:ServerOnlyHook(ply) end
+            end
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            if CLIENT then
+                hook.Run("<??>")
+            end
+            "#,
+            vec![VirtualCompletionItem {
+                label: "AnnotatedClientHook".to_string(),
+                kind: CompletionItemKind::CONSTANT,
+                label_detail: Some("(0 add, 1 methods, 0 emits) args: ply".to_string()),
+            }],
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_member_completion_filters_realm_in_client_context() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -2581,6 +2613,39 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "ClientOnlyMethod".to_string(),
+                kind: CompletionItemKind::FUNCTION,
+                label_detail: Some("()".to_string()),
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_member_completion_prefers_annotation_realm_over_branch_realm() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_completion(
+            r#"
+            ---@class GM
+            ---@type GM
+            GM = GM or {}
+
+            if SERVER then
+                ---@realm client
+                function GM:AnnotatedClientMethod() end
+                function GM:ServerOnlyMethod() end
+            end
+
+            if CLIENT then
+                GM:<??>
+            end
+            "#,
+            vec![VirtualCompletionItem {
+                label: "AnnotatedClientMethod".to_string(),
                 kind: CompletionItemKind::FUNCTION,
                 label_detail: Some("()".to_string()),
             }],
