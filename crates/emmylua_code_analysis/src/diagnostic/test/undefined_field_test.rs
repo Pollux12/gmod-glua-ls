@@ -1351,10 +1351,12 @@ mod test {
     #[test]
     fn test_tableof_type_inference() {
         let mut ws = VirtualWorkspace::new();
-        ws.def(r#"
+        ws.def(
+            r#"
             ---@class MyEntity2
             local MyEntity2 = {}
-        "#);
+        "#,
+        );
 
         let tableof_ty = ws.ty("tableof<MyEntity2>");
         assert!(matches!(tableof_ty, LuaType::TableOf(_)));
@@ -1483,10 +1485,7 @@ mod test {
             assert!(
                 undef_fields.is_empty(),
                 "Expected no undefined-field diagnostics but got: {:?}",
-                undef_fields
-                    .iter()
-                    .map(|d| &d.message)
-                    .collect::<Vec<_>>()
+                undef_fields.iter().map(|d| &d.message).collect::<Vec<_>>()
             );
         }
     }

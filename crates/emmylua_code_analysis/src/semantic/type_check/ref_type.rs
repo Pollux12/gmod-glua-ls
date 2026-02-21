@@ -204,14 +204,12 @@ fn check_ref_class(
             }
         }
         LuaType::Table => Ok(()),
-        LuaType::TableOf(inner) => {
-            check_general_type_compact(
-                context,
-                &LuaType::Ref(source_id.clone()),
-                inner,
-                check_guard.next_level()?,
-            )
-        }
+        LuaType::TableOf(inner) => check_general_type_compact(
+            context,
+            &LuaType::Ref(source_id.clone()),
+            inner,
+            check_guard.next_level()?,
+        ),
         LuaType::Union(union_type) => {
             for typ in union_type.into_vec() {
                 check_general_type_compact(

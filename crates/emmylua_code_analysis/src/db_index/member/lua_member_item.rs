@@ -1,4 +1,7 @@
-use crate::{db_index::gmod_infer::GmodRealm, DbIndex, FileId, InferFailReason, LuaSemanticDeclId, LuaType, TypeOps};
+use crate::{
+    DbIndex, FileId, InferFailReason, LuaSemanticDeclId, LuaType, TypeOps,
+    db_index::gmod_infer::GmodRealm,
+};
 
 use super::LuaMemberId;
 
@@ -152,8 +155,8 @@ fn resolve_member_type_with_realm(
             let compatible: Vec<LuaMemberId> = member_ids
                 .iter()
                 .filter(|mid| {
-                    let member_realm = infer_index
-                        .get_realm_at_offset(&mid.file_id, mid.get_position());
+                    let member_realm =
+                        infer_index.get_realm_at_offset(&mid.file_id, mid.get_position());
                     is_realm_compatible(caller_realm, member_realm)
                 })
                 .copied()

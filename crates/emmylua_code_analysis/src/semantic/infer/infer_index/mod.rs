@@ -319,7 +319,8 @@ fn infer_custom_type_member(
             }
 
             if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key)
-                && let Ok(member_type) = member_item.resolve_type_with_realm(db, &cache.get_file_id())
+                && let Ok(member_type) =
+                    member_item.resolve_type_with_realm(db, &cache.get_file_id())
             {
                 result_types.push(member_type);
             }

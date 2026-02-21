@@ -260,8 +260,14 @@ mod test {
         end
         "#;
 
-        assert_that!(ws.check_code_for(DiagnosticCode::UndefinedField, source), eq(true));
-        assert_that!(ws.check_code_for(DiagnosticCode::InjectField, source), eq(true));
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UndefinedField, source),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::InjectField, source),
+            eq(true)
+        );
 
         let file_id = ws.def(source);
         let semantic_model = ws

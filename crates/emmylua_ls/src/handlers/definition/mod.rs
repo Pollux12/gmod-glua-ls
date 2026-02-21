@@ -151,7 +151,9 @@ fn goto_inferred_dynamic_field_definition(
         return None;
     }
 
-    let prefix_type = semantic_model.infer_expr(index_expr.get_prefix_expr()?).ok()?;
+    let prefix_type = semantic_model
+        .infer_expr(index_expr.get_prefix_expr()?)
+        .ok()?;
 
     let mut locations = Vec::new();
     collect_dynamic_field_locations(semantic_model, &prefix_type, &field_name, &mut locations);
@@ -192,7 +194,12 @@ fn collect_dynamic_field_locations(
         }
         LuaType::Union(union_type) => {
             for union_member in union_type.into_vec() {
-                collect_dynamic_field_locations(semantic_model, &union_member, field_name, locations);
+                collect_dynamic_field_locations(
+                    semantic_model,
+                    &union_member,
+                    field_name,
+                    locations,
+                );
             }
         }
         _ => {}

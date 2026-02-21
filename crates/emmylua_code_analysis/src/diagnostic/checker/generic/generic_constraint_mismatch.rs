@@ -234,9 +234,7 @@ fn validate_str_tpl_ref(
             let is_auto_generated_decl = founded_type_decl
                 .as_ref()
                 .is_some_and(|type_decl| type_decl.is_auto_generated());
-            if is_auto_generated_decl
-                && let Some(extend_type) = extend_type.as_ref()
-            {
+            if is_auto_generated_decl && let Some(extend_type) = extend_type.as_ref() {
                 context.add_diagnostic_with_severity(
                     DiagnosticCode::GenericConstraintMismatch,
                     range,

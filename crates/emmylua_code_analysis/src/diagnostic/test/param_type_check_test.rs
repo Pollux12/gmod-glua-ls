@@ -1723,7 +1723,9 @@ mod test {
         let mut ws = VirtualWorkspace::new();
 
         // Define the function with handler param in one file
-        ws.def_file("network.lua", r#"
+        ws.def_file(
+            "network.lua",
+            r#"
             ---@class Player
             local Player = {}
             function Player:Nick() return "" end
@@ -1733,7 +1735,8 @@ mod test {
             ---@param commandId number
             ---@param handler fun(ply: Player)
             function Glide.AddCommandHandler(commandId, handler) end
-        "#);
+        "#,
+        );
 
         // Use the closure in another file (mimicking addon pattern)
         // Note: Glide = Glide or {} in BOTH files, just like the addon

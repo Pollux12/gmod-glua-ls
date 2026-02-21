@@ -190,7 +190,8 @@ fn try_narrow_isfunction_member(
     }
 
     // Ignore shadowed local isfunction.
-    if let Some(isfunction_ref_id) = get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr.clone()))
+    if let Some(isfunction_ref_id) =
+        get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr.clone()))
         && let VarRefId::VarRef(isfunction_decl_id) = isfunction_ref_id
         && let Some(isfunction_decl) = db.get_decl_index().get_decl(&isfunction_decl_id)
         && isfunction_decl.is_local()
@@ -265,7 +266,10 @@ fn try_narrow_isfunction_member(
     Ok(Some(narrowed_type))
 }
 
-fn collect_isfunction_narrow_candidates(db: &DbIndex, antecedent_type: &LuaType) -> Option<Vec<LuaType>> {
+fn collect_isfunction_narrow_candidates(
+    db: &DbIndex,
+    antecedent_type: &LuaType,
+) -> Option<Vec<LuaType>> {
     const MAX_CANDIDATES: usize = 128;
 
     match antecedent_type {

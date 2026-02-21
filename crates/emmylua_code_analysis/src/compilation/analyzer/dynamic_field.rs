@@ -50,22 +50,21 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                     // Also handles TableOf(SelfInfer) — when SelfInfer couldn't
                     // be resolved during compilation (e.g. localized GetTable),
                     // we fall back to the file's class type.
-                    let effective_type =
-                        if is_unresolved_table_type(&prefix_type) {
-                            if let Some(class_type) = &file_class_type {
-                                class_type.clone()
-                            } else {
-                                prefix_type
-                            }
-                        } else if has_unresolved_self_infer(&prefix_type) {
-                            if let Some(class_type) = &file_class_type {
-                                replace_self_infer(&prefix_type, class_type)
-                            } else {
-                                prefix_type
-                            }
+                    let effective_type = if is_unresolved_table_type(&prefix_type) {
+                        if let Some(class_type) = &file_class_type {
+                            class_type.clone()
                         } else {
                             prefix_type
-                        };
+                        }
+                    } else if has_unresolved_self_infer(&prefix_type) {
+                        if let Some(class_type) = &file_class_type {
+                            replace_self_infer(&prefix_type, class_type)
+                        } else {
+                            prefix_type
+                        }
+                    } else {
+                        prefix_type
+                    };
 
                     collect_for_type(
                         &effective_type,
@@ -148,7 +147,9 @@ fn has_unresolved_self_infer(typ: &LuaType) -> bool {
 fn replace_self_infer(typ: &LuaType, class_type: &LuaType) -> LuaType {
     match typ {
         LuaType::SelfInfer => class_type.clone(),
-        LuaType::TableOf(inner) => LuaType::TableOf(Box::new(replace_self_infer(inner, class_type))),
+        LuaType::TableOf(inner) => {
+            LuaType::TableOf(Box::new(replace_self_infer(inner, class_type)))
+        }
         LuaType::Union(union_type) => {
             let new_types: Vec<LuaType> = union_type
                 .into_vec()

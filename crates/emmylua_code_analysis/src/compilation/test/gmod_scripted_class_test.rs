@@ -3324,12 +3324,10 @@ mod test {
             .collect();
 
         assert!(
-            !undefined_field_names
-                .iter()
-                .any(|name| matches!(
-                    name.as_str(),
-                    "Help" | "AddControl" | "NumSlider" | "ConCommand" | "GetOwner"
-                )),
+            !undefined_field_names.iter().any(|name| matches!(
+                name.as_str(),
+                "Help" | "AddControl" | "NumSlider" | "ConCommand" | "GetOwner"
+            )),
             "unexpected undefined-field diagnostics for TOOL methods (type from @field): {undefined_field_diags:?}"
         );
     }
@@ -3417,9 +3415,7 @@ mod test {
             "#,
         );
 
-        let result = ws
-            .analysis
-            .diagnose_file(file_id, CancellationToken::new());
+        let result = ws.analysis.diagnose_file(file_id, CancellationToken::new());
         let diags: Vec<_> = result
             .unwrap_or_default()
             .into_iter()
@@ -3431,10 +3427,7 @@ mod test {
             })
             .collect();
 
-        let field_names: Vec<String> = diags
-            .iter()
-            .map(|d| d.message.clone())
-            .collect();
+        let field_names: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
 
         assert!(
             !field_names.iter().any(|m| m.contains("throttleRamp")),
@@ -3482,9 +3475,7 @@ mod test {
             "#,
         );
 
-        let result = ws
-            .analysis
-            .diagnose_file(file_id, CancellationToken::new());
+        let result = ws.analysis.diagnose_file(file_id, CancellationToken::new());
         let diags: Vec<_> = result
             .unwrap_or_default()
             .into_iter()
@@ -3546,9 +3537,7 @@ mod test {
             "#,
         );
 
-        let result = ws
-            .analysis
-            .diagnose_file(file_id, CancellationToken::new());
+        let result = ws.analysis.diagnose_file(file_id, CancellationToken::new());
         let diags: Vec<_> = result
             .unwrap_or_default()
             .into_iter()
@@ -3563,7 +3552,9 @@ mod test {
         let field_names: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
 
         assert!(
-            !field_names.iter().any(|m| m.contains("frontBrake") || m.contains("rearBrake")),
+            !field_names
+                .iter()
+                .any(|m| m.contains("frontBrake") || m.contains("rearBrake")),
             "frontBrake/rearBrake should not trigger undefined-field when assigned via table-typed selfTbl in class file: {field_names:?}"
         );
     }

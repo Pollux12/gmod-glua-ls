@@ -576,9 +576,7 @@ fn find_best_function_type(
     if let Ok(result) = find_decl_function_type(db, cache, prefix_type, index_member_expr) {
         if result.is_current_owner {
             // 对应当前类型下的声明, 我们需要过滤掉所有`signature`类型
-            if let Some(filtered_types) =
-                filter_signature_type(db, &result.typ, origin_sig_id)
-            {
+            if let Some(filtered_types) = filter_signature_type(db, &result.typ, origin_sig_id) {
                 match filtered_types.len() {
                     0 => {}
                     1 => return Some(LuaType::DocFunction(filtered_types[0].clone())),

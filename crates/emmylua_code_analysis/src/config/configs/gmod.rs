@@ -156,7 +156,10 @@ mod tests {
         verify_that!(gmod.hook_mappings.method_to_hook.is_empty(), eq(true))?;
         verify_that!(gmod.hook_mappings.emitter_to_hook.is_empty(), eq(true))?;
         verify_that!(gmod.hook_mappings.method_prefixes.is_empty(), eq(true))?;
-        verify_that!(gmod.param_type_hints.get("ply"), eq(Some(&"Player".to_string())))?;
+        verify_that!(
+            gmod.param_type_hints.get("ply"),
+            eq(Some(&"Player".to_string()))
+        )?;
         verify_that!(
             gmod.param_type_hints.get("vehicle"),
             eq(Some(&"Entity".to_string()))

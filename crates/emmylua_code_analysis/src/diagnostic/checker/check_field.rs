@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use emmylua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat,
-    LuaExpr, LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat,
-    LuaRepeatStat, LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr,
+    LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaRepeatStat,
+    LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat,
 };
 
 use crate::{
@@ -93,7 +93,10 @@ fn check_index_expr(
         return Some(());
     }
 
-    if matches!(code, DiagnosticCode::UndefinedField) && !is_enum_type(db, &prefix_typ) && is_nil_guarded_in_scope(index_expr) {
+    if matches!(code, DiagnosticCode::UndefinedField)
+        && !is_enum_type(db, &prefix_typ)
+        && is_nil_guarded_in_scope(index_expr)
+    {
         return Some(());
     }
 
@@ -184,7 +187,10 @@ fn is_invalid_prefix_type(typ: &LuaType) -> bool {
 fn is_tableof_colon_access(prefix_typ: &LuaType, index_expr: &LuaIndexExpr) -> bool {
     let is_tableof = match prefix_typ {
         LuaType::TableOf(_) => true,
-        LuaType::Union(union) => union.into_vec().iter().any(|t| matches!(t, LuaType::TableOf(_))),
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .any(|t| matches!(t, LuaType::TableOf(_))),
         _ => false,
     };
     if !is_tableof {
@@ -263,7 +269,11 @@ pub(super) fn is_valid_member(
                 }
                 if let LuaType::Ref(id) | LuaType::Def(id) = member {
                     let owner = LuaMemberOwner::Type(id.clone());
-                    if db.get_member_index().get_member_item(&owner, &key).is_some() {
+                    if db
+                        .get_member_index()
+                        .get_member_item(&owner, &key)
+                        .is_some()
+                    {
                         return Some(());
                     }
                     // Also check parent types (e.g. Player inherits from Entity)
@@ -616,9 +626,10 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
                         // expression (short-circuit guard: `x.method and x:method()`).
                         if let Some(parent) = ancestor.parent() {
                             if let Some(binary) = LuaBinaryExpr::cast(parent) {
-                                let has_and = binary.syntax().children_with_tokens().any(
-                                    |child| child.kind() == LuaTokenKind::TkAnd.into(),
-                                );
+                                let has_and = binary
+                                    .syntax()
+                                    .children_with_tokens()
+                                    .any(|child| child.kind() == LuaTokenKind::TkAnd.into());
                                 if has_and {
                                     // Check that the call is the right operand (guarded side)
                                     if let Some((_, right)) = binary.get_exprs() {
@@ -840,9 +851,10 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
             // `or` default pattern: `field or DEFAULT` — field is nil-checked by the or.
             LuaSyntaxKind::BinaryExpr => {
                 if let Some(binary) = LuaBinaryExpr::cast(ancestor.clone()) {
-                    let has_or = binary.syntax().children_with_tokens().any(|child| {
-                        child.kind() == LuaTokenKind::TkOr.into()
-                    });
+                    let has_or = binary
+                        .syntax()
+                        .children_with_tokens()
+                        .any(|child| child.kind() == LuaTokenKind::TkOr.into());
                     if has_or {
                         // Check if the field is on the left side of `or`
                         let exprs: Vec<LuaExpr> = binary
@@ -857,9 +869,10 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                             }
                         }
                     }
-                    let has_and = binary.syntax().children_with_tokens().any(|child| {
-                        child.kind() == LuaTokenKind::TkAnd.into()
-                    });
+                    let has_and = binary
+                        .syntax()
+                        .children_with_tokens()
+                        .any(|child| child.kind() == LuaTokenKind::TkAnd.into());
                     if has_and {
                         // `field and expr` — field is being used as a guard
                         let exprs: Vec<LuaExpr> = binary
@@ -911,21 +924,17 @@ fn extract_root_identifier(field_text: &str) -> Option<&str> {
 }
 
 fn has_root_reassignment_before_usage(index_expr: &LuaIndexExpr, root_name: &str) -> bool {
-    let containing_stat = match index_expr
-        .syntax()
-        .ancestors()
-        .find(|n| {
-            let k: LuaSyntaxKind = n.kind().into();
-            matches!(
-                k,
-                LuaSyntaxKind::LocalStat
-                    | LuaSyntaxKind::AssignStat
-                    | LuaSyntaxKind::CallExprStat
-                    | LuaSyntaxKind::IfStat
-                    | LuaSyntaxKind::ReturnStat
-            )
-        })
-    {
+    let containing_stat = match index_expr.syntax().ancestors().find(|n| {
+        let k: LuaSyntaxKind = n.kind().into();
+        matches!(
+            k,
+            LuaSyntaxKind::LocalStat
+                | LuaSyntaxKind::AssignStat
+                | LuaSyntaxKind::CallExprStat
+                | LuaSyntaxKind::IfStat
+                | LuaSyntaxKind::ReturnStat
+        )
+    }) {
         Some(s) => s,
         None => return false,
     };
@@ -1060,9 +1069,10 @@ fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
 fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
     match condition {
         LuaExpr::BinaryExpr(binary) => {
-            let has_ne_nil = binary.syntax().children_with_tokens().any(|child| {
-                child.kind() == LuaTokenKind::TkNe.into()
-            });
+            let has_ne_nil = binary
+                .syntax()
+                .children_with_tokens()
+                .any(|child| child.kind() == LuaTokenKind::TkNe.into());
             if has_ne_nil {
                 let exprs: Vec<LuaExpr> = binary
                     .syntax()
@@ -1079,9 +1089,10 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
                     }
                 }
             }
-            let has_and = binary.syntax().children_with_tokens().any(|child| {
-                child.kind() == LuaTokenKind::TkAnd.into()
-            });
+            let has_and = binary
+                .syntax()
+                .children_with_tokens()
+                .any(|child| child.kind() == LuaTokenKind::TkAnd.into());
             if has_and {
                 let exprs: Vec<LuaExpr> = binary
                     .syntax()
@@ -1162,11 +1173,7 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
 /// e.g., `local x = obj.field; if x then ...` or `local x = obj.field; if not x then return end`
 fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr, _field_text: &str) -> bool {
     // Walk up to find the parent LocalStat
-    let local_stat = match index_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaLocalStat::cast)
-    {
+    let local_stat = match index_expr.syntax().ancestors().find_map(LuaLocalStat::cast) {
         Some(s) => s,
         None => return false,
     };
@@ -1221,21 +1228,17 @@ fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr, _field_text: &str) 
 /// e.g., `if not obj.field then return end; ... obj.field`
 fn is_guarded_by_early_return(index_expr: &LuaIndexExpr, field_text: &str) -> bool {
     // Find the statement containing the field access
-    let containing_stat = match index_expr
-        .syntax()
-        .ancestors()
-        .find(|n| {
-            let k: LuaSyntaxKind = n.kind().into();
-            matches!(
-                k,
-                LuaSyntaxKind::LocalStat
-                    | LuaSyntaxKind::AssignStat
-                    | LuaSyntaxKind::CallExprStat
-                    | LuaSyntaxKind::IfStat
-                    | LuaSyntaxKind::ReturnStat
-            )
-        })
-    {
+    let containing_stat = match index_expr.syntax().ancestors().find(|n| {
+        let k: LuaSyntaxKind = n.kind().into();
+        matches!(
+            k,
+            LuaSyntaxKind::LocalStat
+                | LuaSyntaxKind::AssignStat
+                | LuaSyntaxKind::CallExprStat
+                | LuaSyntaxKind::IfStat
+                | LuaSyntaxKind::ReturnStat
+        )
+    }) {
         Some(s) => s,
         None => return false,
     };
@@ -1383,9 +1386,7 @@ fn has_dynamic_field_for_type(
         LuaType::Instance(instance) => {
             has_dynamic_field_for_type(db, index, instance.get_base(), field_name)
         }
-        LuaType::TableOf(inner) => {
-            has_dynamic_field_for_type(db, index, inner, field_name)
-        }
+        LuaType::TableOf(inner) => has_dynamic_field_for_type(db, index, inner, field_name),
         LuaType::Union(union_type) => union_type
             .into_vec()
             .iter()

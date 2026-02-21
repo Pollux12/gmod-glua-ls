@@ -1,12 +1,12 @@
+use internment::ArcIntern;
+use rowan::TextRange;
+use smol_str::SmolStr;
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
     ops::Deref,
     sync::Arc,
 };
-use internment::ArcIntern;
-use rowan::TextRange;
-use smol_str::SmolStr;
 
 use crate::{
     AsyncState, DbIndex, FileId, InFiled, SemanticModel,

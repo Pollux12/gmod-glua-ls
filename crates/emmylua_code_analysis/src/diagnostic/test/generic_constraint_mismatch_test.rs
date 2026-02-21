@@ -246,10 +246,7 @@ mod test {
             .find(|diag| diag.code == code)
             .expect("expected generic-constraint-mismatch diagnostic");
 
-        expect_that!(
-            diagnostic.severity,
-            eq(Some(DiagnosticSeverity::HINT))
-        );
+        expect_that!(diagnostic.severity, eq(Some(DiagnosticSeverity::HINT)));
         expect_that!(
             diagnostic.message.contains(
                 "Type `sent_custom` is not explicitly defined; auto-created inheriting `Entity`"

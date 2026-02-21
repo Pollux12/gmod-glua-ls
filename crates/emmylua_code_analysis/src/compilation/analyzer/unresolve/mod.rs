@@ -361,18 +361,39 @@ impl UnResolve {
     fn sort_key(&self) -> (u32, u32) {
         match self {
             UnResolve::Decl(d) => (d.file_id.id, u32::from(d.decl_id.position)),
-            UnResolve::IterDecl(d) => (d.file_id.id, d.iter_vars.first()
-                .map(|v| u32::from(v.syntax().text_range().start()))
-                .unwrap_or(0)),
+            UnResolve::IterDecl(d) => (
+                d.file_id.id,
+                d.iter_vars
+                    .first()
+                    .map(|v| u32::from(v.syntax().text_range().start()))
+                    .unwrap_or(0),
+            ),
             UnResolve::Member(d) => (d.file_id.id, u32::from(d.member_id.get_position())),
-            UnResolve::Module(d) => (d.file_id.id, u32::from(d.expr.syntax().text_range().start())),
+            UnResolve::Module(d) => (
+                d.file_id.id,
+                u32::from(d.expr.syntax().text_range().start()),
+            ),
             UnResolve::Return(d) => (d.file_id.id, u32::from(d.signature_id.get_position())),
-            UnResolve::ClosureParams(d) => (d.file_id.id, u32::from(d.call_expr.syntax().text_range().start())),
-            UnResolve::ClosureReturn(d) => (d.file_id.id, u32::from(d.call_expr.syntax().text_range().start())),
-            UnResolve::ClosureParentParams(d) => (d.file_id.id, u32::from(d.signature_id.get_position())),
+            UnResolve::ClosureParams(d) => (
+                d.file_id.id,
+                u32::from(d.call_expr.syntax().text_range().start()),
+            ),
+            UnResolve::ClosureReturn(d) => (
+                d.file_id.id,
+                u32::from(d.call_expr.syntax().text_range().start()),
+            ),
+            UnResolve::ClosureParentParams(d) => {
+                (d.file_id.id, u32::from(d.signature_id.get_position()))
+            }
             UnResolve::ModuleRef(d) => (0, u32::from(d.module_file_id.id)),
-            UnResolve::TableField(d) => (d.file_id.id, u32::from(d.field.syntax().text_range().start())),
-            UnResolve::ClassCtor(d) => (d.file_id.id, u32::from(d.call_expr.syntax().text_range().start())),
+            UnResolve::TableField(d) => (
+                d.file_id.id,
+                u32::from(d.field.syntax().text_range().start()),
+            ),
+            UnResolve::ClassCtor(d) => (
+                d.file_id.id,
+                u32::from(d.call_expr.syntax().text_range().start()),
+            ),
         }
     }
 }

@@ -7,8 +7,8 @@ use emmylua_code_analysis::{
     SemanticInfo, SemanticModel,
 };
 use emmylua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaSyntaxKind, LuaSyntaxToken,
-    LuaIndexExpr, LuaTableExpr, LuaTableField,
+    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaIndexExpr, LuaSyntaxKind,
+    LuaSyntaxToken, LuaTableExpr, LuaTableField,
 };
 use lsp_types::{Hover, HoverContents, MarkedString, MarkupContent};
 use rowan::TextRange;
@@ -59,7 +59,8 @@ fn build_hover_without_property(
     token: LuaSyntaxToken,
     typ: LuaType,
 ) -> Option<Hover> {
-    if let Some(hover) = build_dynamic_field_hover_without_property(db, semantic_model, &token, &typ)
+    if let Some(hover) =
+        build_dynamic_field_hover_without_property(db, semantic_model, &token, &typ)
     {
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -94,10 +95,7 @@ fn build_dynamic_field_hover_without_property(
     token: &LuaSyntaxToken,
     typ: &LuaType,
 ) -> Option<String> {
-    let index_expr = token
-        .parent()?
-        .ancestors()
-        .find_map(LuaIndexExpr::cast)?;
+    let index_expr = token.parent()?.ancestors().find_map(LuaIndexExpr::cast)?;
     let index_key = index_expr.get_index_key()?;
     let key_range = index_key.get_range()?;
     if !key_range.contains_range(token.text_range()) {
@@ -109,7 +107,9 @@ fn build_dynamic_field_hover_without_property(
         return None;
     }
 
-    let prefix_type = semantic_model.infer_expr(index_expr.get_prefix_expr()?).ok()?;
+    let prefix_type = semantic_model
+        .infer_expr(index_expr.get_prefix_expr()?)
+        .ok()?;
     if !is_dynamic_field_for_type(db, &prefix_type, &field_name) {
         return None;
     }

@@ -961,9 +961,7 @@ fn contains_self_infer(typ: &LuaType) -> bool {
 fn resolve_self_infer(typ: &LuaType, self_type: &LuaType) -> LuaType {
     match typ {
         LuaType::SelfInfer => self_type.clone(),
-        LuaType::TableOf(inner) => {
-            LuaType::TableOf(Box::new(resolve_self_infer(inner, self_type)))
-        }
+        LuaType::TableOf(inner) => LuaType::TableOf(Box::new(resolve_self_infer(inner, self_type))),
         LuaType::Union(u) => {
             let types: Vec<_> = u
                 .into_vec()

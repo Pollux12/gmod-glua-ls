@@ -101,10 +101,8 @@ fn check_call_expr(
                 // instead of the method's original class when a method is captured and stored
                 // on a different object. We only skip for class types, not primitives like string,
                 // to preserve genuine error detection (e.g., passing a string where entity is expected).
-                if matches!(
-                    check_type,
-                    LuaType::Never | LuaType::SelfInfer
-                ) || matches!(arg_type, LuaType::Never | LuaType::SelfInfer)
+                if matches!(check_type, LuaType::Never | LuaType::SelfInfer)
+                    || matches!(arg_type, LuaType::Never | LuaType::SelfInfer)
                     || (was_self_infer
                         && matches!(
                             arg_type,
