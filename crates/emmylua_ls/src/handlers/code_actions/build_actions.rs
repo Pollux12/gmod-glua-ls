@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use emmylua_code_analysis::{DiagnosticCode, FileId, SemanticModel};
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionResponse, Diagnostic,
@@ -30,8 +28,8 @@ pub fn build_actions(
 
         if let Some(code) = diagnostic.code
             && let NumberOrString::String(action_string) = code
-            && let Ok(diagnostic_code) = DiagnosticCode::from_str(&action_string)
         {
+            let diagnostic_code = DiagnosticCode::from_name_or_legacy(&action_string);
             add_fix_code_action(
                 semantic_model,
                 &mut actions,

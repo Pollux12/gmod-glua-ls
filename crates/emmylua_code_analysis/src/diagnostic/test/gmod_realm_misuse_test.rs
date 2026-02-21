@@ -2,7 +2,7 @@
 mod tests {
     use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
     use googletest::prelude::*;
-    use lsp_types::NumberOrString;
+    use lsp_types::{DiagnosticSeverity, NumberOrString};
     use tokio_util::sync::CancellationToken;
 
     #[gtest]
@@ -24,7 +24,7 @@ mod tests {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         let code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         assert!(!diagnostics.iter().any(|diagnostic| diagnostic.code == code));
     }
@@ -37,7 +37,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuseRisky);
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
         ws.def_file(
             "addons/test/lua/autorun/server/sv_api.lua",
             r#"function ServerOnlyApi() return true end"#,
@@ -51,7 +51,9 @@ mod tests {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         let code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuseRisky.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
         ));
         assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == code));
     }
@@ -74,10 +76,12 @@ mod tests {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         let misuse_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         let risky_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuseRisky.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
         ));
         assert!(
             !diagnostics
@@ -107,10 +111,12 @@ mod tests {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         let misuse_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         let risky_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuseRisky.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
         ));
         assert!(
             !diagnostics
@@ -146,7 +152,7 @@ mod tests {
             .unwrap_or_default();
 
         let strict_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         assert!(
             diagnostics
@@ -163,7 +169,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuse);
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         let file_id = ws.def_file(
             "addons/test/lua/autorun/sh_test.lua",
@@ -185,10 +191,12 @@ mod tests {
             .unwrap_or_default();
 
         let strict_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         let risky_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuseRisky.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
         ));
 
         assert!(
@@ -211,7 +219,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuseRisky);
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
 
         ws.def_file(
             "addons/test/lua/autorun/server/sv_api.lua",
@@ -235,10 +243,12 @@ mod tests {
             .unwrap_or_default();
 
         let risky_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuseRisky.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
         ));
         let strict_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
 
         assert!(
@@ -254,6 +264,94 @@ mod tests {
     }
 
     #[gtest]
+    fn test_reports_unknown_realm_when_callsite_realm_is_unresolved() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.default_realm = crate::EmmyrcGmodRealm::Menu;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodUnknownRealm);
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_decl.lua",
+            r#"
+                ---@realm server
+                function ServerOnlyApi()
+                    return true
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/use_api.lua",
+            r#"
+                ServerOnlyApi()
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let unknown_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodUnknownRealm.get_name().to_string(),
+        ));
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == unknown_code);
+        assert!(diagnostic.is_some());
+        assert_eq!(
+            diagnostic.and_then(|diagnostic| diagnostic.severity),
+            Some(DiagnosticSeverity::HINT)
+        );
+    }
+
+    #[gtest]
+    fn test_does_not_report_unknown_realm_for_shared_callee() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.default_realm = crate::EmmyrcGmodRealm::Menu;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodUnknownRealm);
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_decl.lua",
+            r#"
+                function SharedApi()
+                    return true
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/use_api.lua",
+            r#"
+                SharedApi()
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let unknown_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodUnknownRealm.get_name().to_string(),
+        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == unknown_code)
+        );
+    }
+
+    #[gtest]
     fn test_prefers_compatible_shared_member_over_client_member() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -261,7 +359,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuse);
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
             "addons/test/lua/autorun/client/cl_item.lua",
@@ -297,7 +395,7 @@ mod tests {
             .unwrap_or_default();
 
         let strict_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         assert!(
             !diagnostics
@@ -314,7 +412,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuse);
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         let file_id = ws.def_file(
             "addons/test/lua/autorun/sh_test.lua",
@@ -337,7 +435,7 @@ mod tests {
             .unwrap_or_default();
 
         let strict_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         assert!(
             !diagnostics
@@ -354,7 +452,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuse);
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
             "addons/test/lua/autorun/sh_item.lua",
@@ -388,7 +486,7 @@ mod tests {
             .unwrap_or_default();
 
         let strict_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         assert!(
             !diagnostics
@@ -405,7 +503,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuse);
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
             "addons/test/lua/autorun/sh_override.lua",
@@ -444,7 +542,7 @@ mod tests {
             .unwrap_or_default();
 
         let strict_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         assert!(
             !diagnostics
@@ -461,7 +559,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuse);
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         let library_root = ws.virtual_url_generator.base.join("library");
         ws.analysis.add_library_workspace(library_root);
@@ -503,12 +601,287 @@ mod tests {
             .unwrap_or_default();
 
         let strict_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         assert!(
             !diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == strict_code)
+        );
+    }
+
+    #[gtest]
+    fn test_reports_strict_mismatch_for_client_calling_gm_method_with_server_annotation() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_gm_decl.lua",
+            r#"
+                ---@realm server
+                function GM:RealmReproOnly()
+                    return true
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/sh_gm_call.lua",
+            r#"
+                if CLIENT then
+                    GM:RealmReproOnly()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let strict_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == strict_code)
+        );
+    }
+
+    #[gtest]
+    fn test_reports_strict_mismatch_for_server_calling_gm_method_with_client_annotation() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_gm_decl_client.lua",
+            r#"
+                ---@realm client
+                function GM:PreRender()
+                    return true
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/sh_gm_call_server.lua",
+            r#"
+                if SERVER then
+                    GM:PreRender()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let strict_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == strict_code)
+        );
+    }
+
+    #[gtest]
+    fn test_reports_strict_mismatch_for_server_calling_shared_file_annotated_table_method() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_table_method_decl.lua",
+            r#"
+                testTbl = testTbl or {}
+
+                ---@realm client
+                function testTbl:TestMethod()
+                    return true
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/sh_table_method_call.lua",
+            r#"
+                if SERVER then
+                    testTbl:TestMethod()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let strict_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == strict_code)
+        );
+    }
+
+    #[gtest]
+    fn test_reports_strict_mismatch_for_server_calling_shared_file_annotated_global_function() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_global_function_decl.lua",
+            r#"
+                ---@realm client
+                function TestFunction()
+                    return true
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/sh_global_function_call.lua",
+            r#"
+                if SERVER then
+                    TestFunction()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let strict_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == strict_code)
+        );
+    }
+
+    #[gtest]
+    fn test_redefinition_prefers_explicit_annotation_over_shared_definition() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_redef_shared.lua",
+            r#"
+                function RealmRedefinitionTarget()
+                    return true
+                end
+            "#,
+        );
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_redef_client.lua",
+            r#"
+                ---@realm client
+                function RealmRedefinitionTarget()
+                    return true
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/sh_redef_call.lua",
+            r#"
+                if SERVER then
+                    RealmRedefinitionTarget()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let strict_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == strict_code)
+        );
+    }
+
+    #[gtest]
+    fn test_reports_risky_mismatch_for_client_calling_annotated_server_ent_method() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
+
+        ws.def_file(
+            "addons/test/lua/entities/realm_repro_entity/shared.lua",
+            r#"
+                ---@realm server
+                function ENT:ServerRealmOnlyMethod()
+                    return true
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/entities/realm_repro_entity/cl_init.lua",
+            r#"
+                ENT:ServerRealmOnlyMethod()
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let risky_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == risky_code)
         );
     }
 
@@ -524,7 +897,7 @@ mod tests {
         );
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuse);
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
         let file_id = ws.def_file(
             "addons/test/lua/autorun/client/cl_test.lua",
             r#"ServerOnlyApi()"#,
@@ -534,19 +907,21 @@ mod tests {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         let code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuse.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
         ));
         assert!(!diagnostics.iter().any(|diagnostic| diagnostic.code == code));
 
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::GmodRealmMisuseRisky);
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
         let diagnostics = ws
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         let risky_code = Some(NumberOrString::String(
-            DiagnosticCode::GmodRealmMisuseRisky.get_name().to_string(),
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
         ));
         assert!(
             !diagnostics

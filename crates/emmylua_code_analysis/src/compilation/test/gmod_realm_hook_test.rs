@@ -132,6 +132,60 @@ mod test {
     }
 
     #[gtest]
+    fn test_meta_file_without_annotation_stays_unknown() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let meta_file_id = ws.def_file("sv_meta.lua", "---@meta\n");
+        ws.def_file(
+            "sv_boot.lua",
+            r#"
+            AddCSLuaFile("sv_meta.lua")
+            include("sv_meta.lua")
+            local dep = require("sv_meta")
+            "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&meta_file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        assert_eq!(metadata.inferred_realm, GmodRealm::Unknown);
+        assert_eq!(metadata.annotation_realm, None);
+        assert_eq!(metadata.filename_hint, None);
+        assert!(metadata.dependency_hints.is_empty());
+    }
+
+    #[gtest]
+    fn test_meta_file_uses_only_realm_annotation() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let meta_file_id = ws.def_file("cl_meta_annotated.lua", "---@meta\n---@realm server\n");
+        ws.def_file(
+            "cl_boot.lua",
+            r#"
+            AddCSLuaFile("cl_meta_annotated.lua")
+            include("cl_meta_annotated.lua")
+            local dep = require("cl_meta_annotated")
+            "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&meta_file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        assert_eq!(metadata.inferred_realm, GmodRealm::Server);
+        assert_eq!(metadata.annotation_realm, Some(GmodRealm::Server));
+        assert_eq!(metadata.filename_hint, None);
+        assert!(metadata.dependency_hints.is_empty());
+    }
+
+    #[gtest]
     fn test_hook_detection_for_add_emit_and_gamemode_methods() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

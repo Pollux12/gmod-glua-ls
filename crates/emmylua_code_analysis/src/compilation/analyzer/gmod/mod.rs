@@ -358,8 +358,11 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
 
         for call in &metadata.vgui_register_calls {
             // Extract table var name and panel name before synthesizing
-            if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first() {
-                if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) = call.literal_args.get(1) {
+            if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first()
+            {
+                if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
+                    call.literal_args.get(1)
+                {
                     vgui_table_vars.push((file_id, table_var.clone(), panel_name.clone()));
                 }
             }
@@ -367,8 +370,11 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
         }
 
         for call in &metadata.derma_define_control_calls {
-            if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first() {
-                if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) = call.literal_args.get(2) {
+            if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first()
+            {
+                if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
+                    call.literal_args.get(2)
+                {
                     vgui_table_vars.push((file_id, table_var.clone(), panel_name.clone()));
                 }
             }
@@ -386,11 +392,19 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
             None => continue,
         };
 
-        log::debug!("VGUI AccessorFunc: file {:?} has {} accessor_func_calls for table_var={} panel={}", file_id, metadata.accessor_func_calls.len(), table_var_name, panel_name);
+        log::debug!(
+            "VGUI AccessorFunc: file {:?} has {} accessor_func_calls for table_var={} panel={}",
+            file_id,
+            metadata.accessor_func_calls.len(),
+            table_var_name,
+            panel_name
+        );
         let class_decl_id = LuaTypeDeclId::global(panel_name);
         for call in &metadata.accessor_func_calls {
             // Check if the AccessorFunc's first arg matches this table variable
-            if let Some(Some(GmodClassCallLiteral::NameRef(target_name))) = call.literal_args.first() {
+            if let Some(Some(GmodClassCallLiteral::NameRef(target_name))) =
+                call.literal_args.first()
+            {
                 if target_name == table_var_name {
                     synthesize_accessor_func(db, *file_id, &class_decl_id, call);
                 }
@@ -2186,6 +2200,14 @@ fn rebuild_realm_metadata(
     analyzed_file_ids: &[FileId],
 ) {
     let file_ids = db.get_vfs().get_all_local_file_ids();
+    let meta_file_ids: HashSet<FileId> = {
+        let module_index = db.get_module_index();
+        file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| module_index.is_meta_file(file_id))
+            .collect()
+    };
     let default_realm = gmod_config_default_realm(db);
     let detect_filename = db
         .get_emmyrc()
@@ -2234,9 +2256,17 @@ fn rebuild_realm_metadata(
         let realm_metadata = file_ids
             .into_iter()
             .map(|file_id| {
-                let ranges = resolve_branch_ranges(&file_id);
+                let ranges = if meta_file_ids.contains(&file_id) {
+                    Vec::new()
+                } else {
+                    resolve_branch_ranges(&file_id)
+                };
                 let annotation_realm = resolve_annotation_realm(&file_id);
-                let realm = annotation_realm.unwrap_or(default_realm);
+                let realm = if meta_file_ids.contains(&file_id) {
+                    annotation_realm.unwrap_or(GmodRealm::Unknown)
+                } else {
+                    annotation_realm.unwrap_or(default_realm)
+                };
                 (
                     file_id,
                     GmodRealmFileMetadata {
@@ -2305,11 +2335,15 @@ fn rebuild_realm_metadata(
         .map(|file_id| {
             (
                 *file_id,
-                infer_realm(
-                    filename_hints.get(file_id).copied().flatten(),
-                    dependency_hints.get(file_id),
-                    default_realm,
-                ),
+                if meta_file_ids.contains(file_id) {
+                    GmodRealm::Unknown
+                } else {
+                    infer_realm(
+                        filename_hints.get(file_id).copied().flatten(),
+                        dependency_hints.get(file_id),
+                        default_realm,
+                    )
+                },
             )
         })
         .collect();
@@ -2346,11 +2380,15 @@ fn rebuild_realm_metadata(
                 .map(|file_id| {
                     (
                         *file_id,
-                        infer_realm(
-                            filename_hints.get(file_id).copied().flatten(),
-                            next_dependency_hints.get(file_id),
-                            default_realm,
-                        ),
+                        if meta_file_ids.contains(file_id) {
+                            GmodRealm::Unknown
+                        } else {
+                            infer_realm(
+                                filename_hints.get(file_id).copied().flatten(),
+                                next_dependency_hints.get(file_id),
+                                default_realm,
+                            )
+                        },
                     )
                 })
                 .collect();
@@ -2366,28 +2404,46 @@ fn rebuild_realm_metadata(
 
     let mut realm_metadata = HashMap::new();
     for file_id in file_ids {
-        let mut hints = dependency_hints
-            .remove(&file_id)
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>();
-        hints.sort_by_key(|realm| realm_sort_key(*realm));
-
-        let ranges = resolve_branch_ranges(&file_id);
+        let ranges = if meta_file_ids.contains(&file_id) {
+            Vec::new()
+        } else {
+            resolve_branch_ranges(&file_id)
+        };
 
         let annotation_realm = resolve_annotation_realm(&file_id);
-        let final_realm = annotation_realm.unwrap_or_else(|| {
-            inferred_realms
-                .get(&file_id)
-                .copied()
-                .unwrap_or(default_realm)
-        });
+        let is_meta_file = meta_file_ids.contains(&file_id);
+        let hints = if is_meta_file {
+            Vec::new()
+        } else {
+            let mut hints = dependency_hints
+                .remove(&file_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            hints.sort_by_key(|realm| realm_sort_key(*realm));
+            hints
+        };
+
+        let final_realm = if is_meta_file {
+            annotation_realm.unwrap_or(GmodRealm::Unknown)
+        } else {
+            annotation_realm.unwrap_or_else(|| {
+                inferred_realms
+                    .get(&file_id)
+                    .copied()
+                    .unwrap_or(default_realm)
+            })
+        };
 
         realm_metadata.insert(
             file_id,
             GmodRealmFileMetadata {
                 inferred_realm: final_realm,
-                filename_hint: filename_hints.get(&file_id).copied().flatten(),
+                filename_hint: if is_meta_file {
+                    None
+                } else {
+                    filename_hints.get(&file_id).copied().flatten()
+                },
                 dependency_hints: hints,
                 annotation_realm,
                 branch_realm_ranges: ranges,

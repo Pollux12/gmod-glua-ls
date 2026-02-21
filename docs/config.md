@@ -140,8 +140,9 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `invert-if` | **Off** | Warning | If can be inverted for clarity |
 | `call-non-callable` | **Off** | Warning | Calling non-callable value |
 | `gmod-invalid-hook-name` | On | Warning | Invalid hook name |
-| `gmod-realm-misuse` | On | Warning | Client/server API used in wrong realm |
-| `gmod-realm-misuse-risky` | On | Hint | Risky realm usage detected |
+| `gmod-realm-mismatch` | On | Warning | Strict realm mismatch (client/server API used in wrong realm) |
+| `gmod-realm-mismatch-heuristic` | On | Warning | Heuristic realm mismatch based on inferred realm evidence |
+| `gmod-unknown-realm` | On | Hint | Realm could not be resolved for a realm-aware call |
 | `gmod-unknown-net-message` | On | Warning | Unknown net message identifier |
 | `gmod-duplicate-system-registration` | On | Hint | Duplicate registration (concommand, net, timer, etc.) |
 

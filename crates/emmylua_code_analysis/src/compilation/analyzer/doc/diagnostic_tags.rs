@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use emmylua_parser::{LuaAstNode, LuaAstToken, LuaBlock, LuaChunk, LuaDocTagDiagnostic};
 use rowan::TextRange;
 
@@ -40,11 +38,7 @@ fn analyze_diagnostic_disable(
     if let Some(diagnostic_code_list) = diagnostic.get_code_list() {
         for code in diagnostic_code_list.get_codes() {
             let name = code.get_name_text();
-            let diagnostic_code = if let Ok(code) = DiagnosticCode::from_str(name) {
-                code
-            } else {
-                continue;
-            };
+            let diagnostic_code = DiagnosticCode::from_name_or_legacy(name);
 
             if is_file_disable {
                 diagnostic_index.add_file_diagnostic_disabled(analyzer.file_id, diagnostic_code);
@@ -83,11 +77,7 @@ fn analyze_diagnostic_disable_next_line(
     if let Some(diagnostic_code_list) = diagnostic.get_code_list() {
         for code in diagnostic_code_list.get_codes() {
             let name = code.get_name_text();
-            let diagnostic_code = if let Ok(code) = DiagnosticCode::from_str(name) {
-                code
-            } else {
-                continue;
-            };
+            let diagnostic_code = DiagnosticCode::from_name_or_legacy(name);
 
             diagnostic_index.add_diagnostic_action(
                 analyzer.file_id,
@@ -118,11 +108,7 @@ fn analyze_diagnostic_disable_line(
     if let Some(diagnostic_code_list) = diagnostic.get_code_list() {
         for code in diagnostic_code_list.get_codes() {
             let name = code.get_name_text();
-            let diagnostic_code = if let Ok(code) = DiagnosticCode::from_str(name) {
-                code
-            } else {
-                continue;
-            };
+            let diagnostic_code = DiagnosticCode::from_name_or_legacy(name);
 
             diagnostic_index.add_diagnostic_action(
                 analyzer.file_id,
@@ -147,11 +133,7 @@ fn analyze_diagnostic_enable(
     let diagnostic_code_list = diagnostic.get_code_list()?;
     for code in diagnostic_code_list.get_codes() {
         let name = code.get_name_text();
-        let diagnostic_code = if let Ok(code) = DiagnosticCode::from_str(name) {
-            code
-        } else {
-            continue;
-        };
+        let diagnostic_code = DiagnosticCode::from_name_or_legacy(name);
 
         diagnostic_index.add_file_diagnostic_enabled(analyzer.file_id, diagnostic_code);
     }

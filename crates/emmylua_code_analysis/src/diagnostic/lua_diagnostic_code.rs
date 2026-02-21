@@ -121,10 +121,14 @@ pub enum DiagnosticCode {
     CallNonCallable,
     /// gmod-invalid-hook-name
     GmodInvalidHookName,
-    /// gmod-realm-misuse
-    GmodRealmMisuse,
-    /// gmod-realm-misuse-risky
-    GmodRealmMisuseRisky,
+    /// gmod-realm-mismatch (strict realm mismatch)
+    #[serde(alias = "gmod-realm-misuse")]
+    GmodRealmMismatch,
+    /// gmod-realm-mismatch-heuristic (heuristic realm mismatch)
+    #[serde(alias = "gmod-realm-misuse-risky")]
+    GmodRealmMismatchHeuristic,
+    /// gmod-unknown-realm (realm could not be resolved)
+    GmodUnknownRealm,
     /// gmod-unknown-net-message
     GmodUnknownNetMessage,
     /// gmod-duplicate-system-registration
@@ -160,8 +164,12 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::CallNonCallable => DiagnosticSeverity::WARNING,
         DiagnosticCode::NeedCheckNil => DiagnosticSeverity::HINT,
         DiagnosticCode::GenericConstraintMismatch => DiagnosticSeverity::INFORMATION,
+        DiagnosticCode::GmodInvalidHookName => DiagnosticSeverity::WARNING,
+        DiagnosticCode::GmodRealmMismatch => DiagnosticSeverity::WARNING,
+        DiagnosticCode::GmodRealmMismatchHeuristic => DiagnosticSeverity::WARNING,
+        DiagnosticCode::GmodUnknownRealm => DiagnosticSeverity::HINT,
+        DiagnosticCode::GmodUnknownNetMessage => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodDuplicateSystemRegistration => DiagnosticSeverity::HINT,
-        DiagnosticCode::GmodRealmMisuseRisky => DiagnosticSeverity::HINT,
         _ => DiagnosticSeverity::WARNING,
     }
 }
@@ -187,8 +195,9 @@ pub fn is_code_default_enable(code: &DiagnosticCode, level: LuaLanguageLevel) ->
         DiagnosticCode::InvertIf => false,
 
         // gmod diagnostics
-        DiagnosticCode::GmodRealmMisuse => true,
-        DiagnosticCode::GmodRealmMisuseRisky => true,
+        DiagnosticCode::GmodRealmMismatch => true,
+        DiagnosticCode::GmodRealmMismatchHeuristic => true,
+        DiagnosticCode::GmodUnknownRealm => true,
         DiagnosticCode::GmodDuplicateSystemRegistration => true,
         DiagnosticCode::GmodUnknownNetMessage => true,
         DiagnosticCode::GmodInvalidHookName => true,
@@ -197,5 +206,102 @@ pub fn is_code_default_enable(code: &DiagnosticCode, level: LuaLanguageLevel) ->
         DiagnosticCode::NonLiteralExpressionsInAssert => false,
 
         _ => true,
+    }
+}
+
+impl DiagnosticCode {
+    pub fn from_name_or_legacy(name: &str) -> Self {
+        match name {
+            "gmod-realm-misuse" => DiagnosticCode::GmodRealmMismatch,
+            "gmod-realm-misuse-risky" => DiagnosticCode::GmodRealmMismatchHeuristic,
+            _ => name.parse().unwrap_or(DiagnosticCode::None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_default_severity, is_code_default_enable};
+    use crate::{DiagnosticCode, Emmyrc};
+    use emmylua_parser::LuaLanguageLevel;
+    use googletest::prelude::*;
+    use lsp_types::DiagnosticSeverity;
+    use serde_json::json;
+
+    #[gtest]
+    fn legacy_realm_diagnostic_codes_map_to_renamed_codes() {
+        assert_eq!(
+            DiagnosticCode::from_name_or_legacy("gmod-realm-misuse"),
+            DiagnosticCode::GmodRealmMismatch
+        );
+        assert_eq!(
+            DiagnosticCode::from_name_or_legacy("gmod-realm-misuse-risky"),
+            DiagnosticCode::GmodRealmMismatchHeuristic
+        );
+    }
+
+    #[gtest]
+    fn legacy_realm_codes_are_accepted_in_config_diagnostic_lists() {
+        let parsed: Emmyrc = serde_json::from_value(json!({
+            "diagnostics": {
+                "disable": ["gmod-realm-misuse"],
+                "enables": ["gmod-realm-misuse-risky"]
+            }
+        }))
+        .expect("valid config");
+
+        assert_that!(
+            parsed.diagnostics.disable,
+            contains(eq(&DiagnosticCode::GmodRealmMismatch))
+        );
+        assert_that!(
+            parsed.diagnostics.enables,
+            contains(eq(&DiagnosticCode::GmodRealmMismatchHeuristic))
+        );
+    }
+
+    #[gtest]
+    fn gmod_diagnostics_are_default_enabled() {
+        let level = LuaLanguageLevel::Lua54;
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::GmodRealmMismatch, level),
+            eq(true)
+        );
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::GmodRealmMismatchHeuristic, level),
+            eq(true)
+        );
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::GmodUnknownRealm, level),
+            eq(true)
+        );
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::GmodUnknownNetMessage, level),
+            eq(true)
+        );
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::GmodDuplicateSystemRegistration, level),
+            eq(true)
+        );
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::GmodInvalidHookName, level),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn gmod_realm_default_severity_matches_expected_levels() {
+        assert_that!(
+            get_default_severity(DiagnosticCode::GmodRealmMismatch),
+            eq(DiagnosticSeverity::WARNING)
+        );
+        assert_that!(
+            get_default_severity(DiagnosticCode::GmodRealmMismatchHeuristic),
+            eq(DiagnosticSeverity::WARNING)
+        );
+        assert_that!(
+            get_default_severity(DiagnosticCode::GmodUnknownRealm),
+            eq(DiagnosticSeverity::HINT)
+        );
     }
 }

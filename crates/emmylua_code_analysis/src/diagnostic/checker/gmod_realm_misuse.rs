@@ -1,9 +1,12 @@
-use emmylua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, PathTrait};
+use emmylua_parser::{
+    LuaAstNode, LuaCallExpr, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
+    LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaVarExpr, PathTrait,
+};
 use rowan::{NodeOrToken, TextSize};
 
 use crate::{
-    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaSemanticDeclId, SemanticDeclLevel,
-    SemanticModel,
+    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaMemberKey, LuaSemanticDeclId,
+    LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -12,8 +15,9 @@ pub struct GmodRealmMisuseChecker;
 
 impl Checker for GmodRealmMisuseChecker {
     const CODES: &[DiagnosticCode] = &[
-        DiagnosticCode::GmodRealmMisuse,
-        DiagnosticCode::GmodRealmMisuseRisky,
+        DiagnosticCode::GmodRealmMismatch,
+        DiagnosticCode::GmodRealmMismatchHeuristic,
+        DiagnosticCode::GmodUnknownRealm,
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
@@ -50,14 +54,44 @@ impl Checker for GmodRealmMisuseChecker {
                 );
             }
 
-            if callee_realms
-                .iter()
-                .any(|callee| !is_cross_realm_misuse(call_realm.realm, callee.realm))
-            {
+            let call_name = call_expr
+                .get_access_path()
+                .unwrap_or_else(|| "function".to_string());
+            if let Some(callee_realm) = unknown_realm_candidate(call_realm, &callee_realms) {
+                context.add_diagnostic(
+                    DiagnosticCode::GmodUnknownRealm,
+                    call_expr.get_range(),
+                    mismatch_message(
+                        DiagnosticCode::GmodUnknownRealm,
+                        &call_name,
+                        call_realm.realm,
+                        callee_realm.realm,
+                    ),
+                    None,
+                );
                 continue;
             }
 
-            let callee_realm = pick_best_mismatch_candidate(&callee_realms);
+            let mismatch_candidates: Vec<ResolvedRealm> = callee_realms
+                .iter()
+                .copied()
+                .filter(|callee| is_cross_realm_misuse(call_realm.realm, callee.realm))
+                .collect();
+            if mismatch_candidates.is_empty() {
+                continue;
+            }
+            let compatible_candidate = callee_realms
+                .iter()
+                .copied()
+                .filter(|callee| !is_cross_realm_misuse(call_realm.realm, callee.realm))
+                .max_by_key(|realm| evidence_priority(realm.evidence));
+
+            let callee_realm = pick_best_mismatch_candidate(&mismatch_candidates);
+            if compatible_candidate.is_some_and(|candidate| {
+                evidence_priority(candidate.evidence) >= evidence_priority(callee_realm.evidence)
+            }) {
+                continue;
+            }
 
             let Some(code) =
                 diagnostic_code_for_mismatch(call_realm.evidence, callee_realm.evidence)
@@ -65,9 +99,6 @@ impl Checker for GmodRealmMisuseChecker {
                 continue;
             };
 
-            let call_name = call_expr
-                .get_access_path()
-                .unwrap_or_else(|| "function".to_string());
             context.add_diagnostic(
                 code,
                 call_expr.get_range(),
@@ -117,6 +148,11 @@ fn resolve_callee_realms(
         return realms;
     };
 
+    for realm in resolve_global_name_candidate_realms(semantic_model, &prefix_expr, &semantic_decl)
+    {
+        push_unique_realm(&mut realms, realm);
+    }
+
     if let Some(realm) = resolve_decl_realm(semantic_model, &semantic_decl) {
         push_unique_realm(&mut realms, realm);
     }
@@ -131,24 +167,68 @@ fn resolve_callee_realms(
     realms
 }
 
+fn resolve_global_name_candidate_realms(
+    semantic_model: &SemanticModel,
+    prefix_expr: &LuaExpr,
+    semantic_decl: &LuaSemanticDeclId,
+) -> Vec<ResolvedRealm> {
+    let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_decl else {
+        return Vec::new();
+    };
+    let Some(decl) = semantic_model.get_db().get_decl_index().get_decl(decl_id) else {
+        return Vec::new();
+    };
+    if !decl.is_global() {
+        return Vec::new();
+    }
+
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return Vec::new();
+    };
+    let Some(name) = name_expr.get_name_text() else {
+        return Vec::new();
+    };
+
+    let mut realms = Vec::new();
+    let member_key = LuaMemberKey::Name(name.into());
+    if let Some(member_infos) =
+        semantic_model.get_member_info_with_key(&LuaType::Global, member_key, true)
+    {
+        for member_info in member_infos {
+            let Some(property_owner_id) = member_info.property_owner_id else {
+                continue;
+            };
+            if let Some(realm) = resolve_decl_realm(semantic_model, &property_owner_id) {
+                push_unique_realm(&mut realms, realm);
+            }
+        }
+    }
+
+    realms
+}
+
 fn resolve_member_candidate_realms(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
 ) -> Option<Vec<ResolvedRealm>> {
     let prefix_expr = call_expr.get_prefix_expr()?;
     let index_expr = LuaIndexExpr::cast(prefix_expr.syntax().clone())?;
-    let member_key = semantic_model.get_member_key(&index_expr.get_index_key()?)?;
-    let owner_expr = index_expr.get_prefix_expr()?;
-    let owner_type = semantic_model.infer_expr(owner_expr).ok()?;
-    let member_infos = semantic_model.get_member_info_with_key(&owner_type, member_key, true)?;
+    let mut realms = resolve_annotated_gm_method_realms(semantic_model, &index_expr);
 
-    let mut realms = Vec::new();
-    for member_info in member_infos {
-        let Some(property_owner_id) = member_info.property_owner_id else {
-            continue;
-        };
-        if let Some(realm) = resolve_decl_realm(semantic_model, &property_owner_id) {
-            push_unique_realm(&mut realms, realm);
+    if let Some(index_key) = index_expr.get_index_key()
+        && let Some(member_key) = semantic_model.get_member_key(&index_key)
+        && let Some(owner_expr) = index_expr.get_prefix_expr()
+        && let Ok(owner_type) = semantic_model.infer_expr(owner_expr)
+        && let Some(member_infos) =
+            semantic_model.get_member_info_with_key(&owner_type, member_key, true)
+    {
+        for member_info in member_infos {
+            let Some(property_owner_id) = member_info.property_owner_id else {
+                continue;
+            };
+            if let Some(realm) = resolve_decl_realm(semantic_model, &property_owner_id) {
+                push_unique_realm(&mut realms, realm);
+            }
         }
     }
 
@@ -162,12 +242,147 @@ fn resolve_decl_realm(
     let (decl_file_id, decl_offset) = semantic_decl_position(semantic_decl)?;
     let infer_index = semantic_model.get_db().get_gmod_infer_index();
     let metadata = infer_index.get_realm_file_metadata(&decl_file_id)?;
+    if let Some(annotation_realm) =
+        resolve_decl_annotation_realm_at_offset(semantic_model, &decl_file_id, decl_offset)
+    {
+        return Some(ResolvedRealm {
+            realm: annotation_realm,
+            evidence: RealmEvidence::ExplicitAnnotation,
+        });
+    }
+
     Some(resolve_realm_at_offset(
         infer_index,
         &decl_file_id,
         metadata,
         decl_offset,
     ))
+}
+
+fn resolve_decl_annotation_realm_at_offset(
+    semantic_model: &SemanticModel,
+    file_id: &FileId,
+    offset: TextSize,
+) -> Option<GmodRealm> {
+    let tree = semantic_model.get_db().get_vfs().get_syntax_tree(file_id)?;
+    for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
+        if func_stat.get_range().contains(offset)
+            && let Some(comment) = func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            return Some(realm);
+        }
+    }
+
+    for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
+        if local_func_stat.get_range().contains(offset)
+            && let Some(comment) = local_func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            return Some(realm);
+        }
+    }
+
+    None
+}
+
+fn resolve_annotated_gm_method_realms(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> Vec<ResolvedRealm> {
+    let Some(LuaExpr::NameExpr(prefix_name)) = index_expr.get_prefix_expr() else {
+        return Vec::new();
+    };
+    let Some(prefix_text) = prefix_name.get_name_text() else {
+        return Vec::new();
+    };
+    if !matches!(prefix_text.as_str(), "GM" | "GAMEMODE") {
+        return Vec::new();
+    }
+    let Some(LuaIndexKey::Name(target_method_name)) = index_expr.get_index_key() else {
+        return Vec::new();
+    };
+
+    let db = semantic_model.get_db();
+    let module_index = db.get_module_index();
+    let current_workspace_id = module_index.get_workspace_id(semantic_model.get_file_id());
+    let mut realms = Vec::new();
+    for file_id in db.get_vfs().get_all_local_file_ids() {
+        if let Some(current_workspace_id) = current_workspace_id {
+            let candidate_workspace_id = module_index
+                .get_workspace_id(file_id)
+                .unwrap_or(WorkspaceId::MAIN);
+            if module_index
+                .workspace_resolution_priority(current_workspace_id, candidate_workspace_id)
+                .is_none()
+            {
+                continue;
+            }
+        }
+
+        let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+            continue;
+        };
+        for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
+            let Some(LuaVarExpr::IndexExpr(function_name_expr)) = func_stat.get_func_name() else {
+                continue;
+            };
+            let Some(LuaExpr::NameExpr(function_prefix_name)) =
+                function_name_expr.get_prefix_expr()
+            else {
+                continue;
+            };
+            let Some(function_prefix_text) = function_prefix_name.get_name_text() else {
+                continue;
+            };
+            if !matches!(function_prefix_text.as_str(), "GM" | "GAMEMODE") {
+                continue;
+            }
+            let Some(LuaIndexKey::Name(function_method_name)) = function_name_expr.get_index_key()
+            else {
+                continue;
+            };
+            if function_method_name.get_name_text() != target_method_name.get_name_text() {
+                continue;
+            }
+
+            if let Some(comment) = func_stat.get_left_comment()
+                && let Some(realm) = realm_from_doc_comment(&comment)
+            {
+                push_unique_realm(
+                    &mut realms,
+                    ResolvedRealm {
+                        realm,
+                        evidence: RealmEvidence::ExplicitAnnotation,
+                    },
+                );
+            }
+        }
+    }
+
+    realms
+}
+
+fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {
+    for tag in comment.get_doc_tags() {
+        if let LuaDocTag::Realm(realm_tag) = tag
+            && let Some(realm) = realm_from_doc_tag(&realm_tag)
+        {
+            return Some(realm);
+        }
+    }
+
+    None
+}
+
+fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
+    let name = tag.get_name_token()?;
+    match name.get_name_text() {
+        "client" => Some(GmodRealm::Client),
+        "server" => Some(GmodRealm::Server),
+        "shared" => Some(GmodRealm::Shared),
+        _ => None,
+    }
 }
 
 fn push_unique_realm(realms: &mut Vec<ResolvedRealm>, realm: ResolvedRealm) {
@@ -255,14 +470,39 @@ fn diagnostic_code_for_mismatch(
     callee_evidence: RealmEvidence,
 ) -> Option<DiagnosticCode> {
     if is_strict_evidence(call_evidence) && is_strict_evidence(callee_evidence) {
-        return Some(DiagnosticCode::GmodRealmMisuse);
+        return Some(DiagnosticCode::GmodRealmMismatch);
     }
 
     if is_known_evidence(call_evidence) && is_known_evidence(callee_evidence) {
-        return Some(DiagnosticCode::GmodRealmMisuseRisky);
+        return Some(DiagnosticCode::GmodRealmMismatchHeuristic);
     }
 
     None
+}
+
+fn unknown_realm_candidate(
+    call_realm: ResolvedRealm,
+    callee_realms: &[ResolvedRealm],
+) -> Option<ResolvedRealm> {
+    if call_realm.realm != GmodRealm::Unknown || call_realm.evidence != RealmEvidence::Unknown {
+        return None;
+    }
+
+    callee_realms
+        .iter()
+        .copied()
+        .filter(|callee| matches!(callee.realm, GmodRealm::Client | GmodRealm::Server))
+        .filter(|callee| supports_unknown_realm_diagnostic(callee.evidence))
+        .max_by_key(|realm| evidence_priority(realm.evidence))
+}
+
+fn supports_unknown_realm_diagnostic(evidence: RealmEvidence) -> bool {
+    matches!(
+        evidence,
+        RealmEvidence::ExplicitBranch
+            | RealmEvidence::ExplicitAnnotation
+            | RealmEvidence::InferredFilename
+    )
 }
 
 fn is_known_evidence(evidence: RealmEvidence) -> bool {
@@ -293,17 +533,23 @@ fn mismatch_message(
     let callee_realm = realm_label(callee_realm);
 
     match code {
-        DiagnosticCode::GmodRealmMisuse => t!(
+        DiagnosticCode::GmodRealmMismatch => t!(
             "Realm mismatch: calling `%{name}` in %{call_realm} realm but declaration is %{decl_realm}.",
             name = call_name,
             call_realm = call_realm,
             decl_realm = callee_realm,
         )
         .to_string(),
-        DiagnosticCode::GmodRealmMisuseRisky => t!(
+        DiagnosticCode::GmodRealmMismatchHeuristic => t!(
             "Potential realm mismatch (heuristic): `%{name}` is called in inferred %{call_realm} realm while declaration is inferred %{decl_realm}.",
             name = call_name,
             call_realm = call_realm,
+            decl_realm = callee_realm,
+        )
+        .to_string(),
+        DiagnosticCode::GmodUnknownRealm => t!(
+            "Unable to resolve call realm for `%{name}`; declaration appears to be %{decl_realm}.",
+            name = call_name,
             decl_realm = callee_realm,
         )
         .to_string(),

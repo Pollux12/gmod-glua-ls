@@ -485,14 +485,19 @@
           "const": "gmod-invalid-hook-name"
         },
         {
-          "description": "gmod-realm-misuse",
+          "description": "gmod-realm-mismatch (strict realm mismatch)",
           "type": "string",
-          "const": "gmod-realm-misuse"
+          "const": "gmod-realm-mismatch"
         },
         {
-          "description": "gmod-realm-misuse-risky",
+          "description": "gmod-realm-mismatch-heuristic (heuristic realm mismatch)",
           "type": "string",
-          "const": "gmod-realm-misuse-risky"
+          "const": "gmod-realm-mismatch-heuristic"
+        },
+        {
+          "description": "gmod-unknown-realm (realm could not be resolved)",
+          "type": "string",
+          "const": "gmod-unknown-realm"
         },
         {
           "description": "gmod-unknown-net-message",
