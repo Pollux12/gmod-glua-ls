@@ -284,7 +284,7 @@ fn infer_realm_badge_markdown(
     realm_badge_markdown(realm)
 }
 
-fn infer_property_owner_realm(
+pub(crate) fn infer_property_owner_realm(
     semantic_model: &SemanticModel,
     property_owner: &LuaSemanticDeclId,
 ) -> Option<GmodRealm> {

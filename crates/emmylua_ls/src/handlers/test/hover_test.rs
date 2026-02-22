@@ -826,6 +826,111 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_hook_add_string_uses_registered_hook_docs() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "library/lua/includes/extensions/sandbox_hooks.lua",
+            r#"
+                ---@class SANDBOX
+                ---@type SANDBOX
+                SANDBOX = SANDBOX or {}
+
+                ---Called when a player attempts to spawn a SENT.
+                ---@param ply Player
+                ---@param class string
+                ---@return boolean
+                function SANDBOX:PlayerSpawnSENT(ply, class)
+                end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                hook.Add("PlayerSpawnSE<??>NT", "test", function() end)
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("(method) SANDBOX:PlayerSpawnSENT"),
+            "expected hook.Add hook-name hover to include SANDBOX method signature, got: {}",
+            markup.value
+        );
+        assert!(
+            markup
+                .value
+                .contains("Called when a player attempts to spawn a SENT"),
+            "expected hook.Add hook-name hover to include hook description, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_hook_add_callback_parameter_usage_shows_inferred_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Entity
+
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@param ent Entity
+                ---@param input string
+                ---@param activator Entity
+                ---@param caller Entity
+                ---@param value any
+                ---@return boolean
+                function GM:AcceptInput(ent, input, activator, caller, value) end
+
+                hook = {}
+                ---@param eventName string
+                ---@param identifier any
+                ---@param func function
+                function hook.Add(eventName, identifier, func) end
+
+                hook.Add("AcceptInput", "test", function(ent, input, activator, caller, value)
+                    print(in<??>put)
+                end)
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("input: string"),
+            "expected inferred hook callback parameter type in hover, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_gm_hook_method_shows_realm_badge_without_description() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
