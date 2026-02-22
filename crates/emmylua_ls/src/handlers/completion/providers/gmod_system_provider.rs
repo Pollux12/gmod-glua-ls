@@ -97,7 +97,7 @@ fn add_hook_completion_items(
         add_count: usize,
         method_count: usize,
         emit_count: usize,
-        callback_params: Option<Vec<String>>,
+        callback_params: Option<(u8, Vec<String>)>,
     }
 
     let before_count = builder.get_completion_items_mut().len();
@@ -130,8 +130,23 @@ fn add_hook_completion_items(
                 emmylua_code_analysis::GmodHookKind::Emit => stats.emit_count += 1,
             }
 
-            if stats.callback_params.is_none() && !hook_site.callback_params.is_empty() {
-                stats.callback_params = Some(hook_site.callback_params.clone());
+            let callback_priority = match hook_site.kind {
+                emmylua_code_analysis::GmodHookKind::GamemodeMethod => 2,
+                emmylua_code_analysis::GmodHookKind::Add => 1,
+                emmylua_code_analysis::GmodHookKind::Emit => 0,
+            };
+            if !hook_site.callback_params.is_empty()
+                && stats
+                    .callback_params
+                    .as_ref()
+                    .is_none_or(|(priority, params)| {
+                        callback_priority > *priority
+                            || (callback_priority == *priority
+                                && hook_site.callback_params.len() > params.len())
+                    })
+            {
+                stats.callback_params =
+                    Some((callback_priority, hook_site.callback_params.clone()));
             }
         }
     }
@@ -148,8 +163,8 @@ fn add_hook_completion_items(
         let args_detail = stats
             .callback_params
             .as_ref()
-            .filter(|params| !params.is_empty())
-            .map(|params| format!(" args: {}", params.join(", ")))
+            .filter(|(_, params)| !params.is_empty())
+            .map(|(_, params)| format!(" args: {}", params.join(", ")))
             .unwrap_or_default();
         let _ = builder.add_completion_item(CompletionItem {
             label: name,

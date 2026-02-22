@@ -232,16 +232,35 @@ fn infer_param_list(
     param_list: LuaParamList,
 ) -> Option<Vec<LuaType>> {
     let closure_expr = param_list.get_parent::<LuaClosureExpr>()?;
-
-    let doc_params = get_closure_expr_comment(&closure_expr)?.children::<LuaDocTagParam>();
     let mut names = Vec::new();
-    for doc_param in doc_params {
-        let name = doc_param.get_name_token()?.get_name_text().to_string();
-        if !names.contains(&name) {
-            // 不在这里添加补全项, 拼接的优先级应在单独添加之上
-            names.push(name.clone());
+
+    if let Some(comment) = get_closure_expr_comment(&closure_expr) {
+        let doc_params = comment.children::<LuaDocTagParam>();
+        for doc_param in doc_params {
+            if let Some(name_token) = doc_param.get_name_token() {
+                let name = name_token.get_name_text().to_string();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
         }
     }
+
+    if names.is_empty() {
+        let mut expected_type = builder.semantic_model.infer_bind_value_type(closure_expr.clone().into());
+        if expected_type.is_none() || matches!(expected_type, Some(LuaType::Function) | Some(LuaType::Any) | Some(LuaType::Unknown)) {
+            expected_type = builder.semantic_model.infer_expr(closure_expr.clone().into()).ok();
+        }
+
+        if let Some(LuaType::DocFunction(func)) = expected_type {
+            for (name, _) in func.get_params() {
+                if name != "..." && !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+
     let params = param_list
         .get_params()
         .map(|it| {

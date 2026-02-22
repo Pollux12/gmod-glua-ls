@@ -2524,6 +2524,60 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_hook_completion_in_hook_add_string_context() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            hook.Add("<??>", "id", function() end)
+            "#,
+            vec![VirtualCompletionItem {
+                label: "PlayerSpawn".to_string(),
+                kind: CompletionItemKind::CONSTANT,
+                label_detail: Some("(0 add, 1 methods, 0 emits) args: ply, transition".to_string()),
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_hook_completion_prefers_method_callback_params_over_hook_add_callback()
+    -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            hook.Add("PlayerSpawn", "id", function(a, b) end)
+            function GM:PlayerSpawn(ply, transition) end
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            hook.Run("<??>")
+            "#,
+            vec![VirtualCompletionItem {
+                label: "PlayerSpawn".to_string(),
+                kind: CompletionItemKind::CONSTANT,
+                label_detail: Some("(1 add, 1 methods, 0 emits) args: ply, transition".to_string()),
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_hook_completion_filters_realm_in_client_context() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
