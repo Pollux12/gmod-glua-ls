@@ -885,6 +885,201 @@ mod tests {
         );
     }
 
+    /// ENT method defined in server file (init.lua) AND in a CLIENT block of shared.lua.
+    /// Calling it from init.lua (server) must NOT produce a realm mismatch because
+    /// the server definition is realm-compatible.
+    #[gtest]
+    fn test_no_mismatch_for_ent_method_defined_in_both_server_and_client_realms() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Server file defines the method
+        ws.def_file(
+            "addons/test/lua/entities/dual_realm_ent/init.lua",
+            r#"
+                function ENT:GetFuelAmountUnits()
+                    return self.fuelAmount or 0
+                end
+            "#,
+        );
+
+        // Client block in shared.lua also defines the same method
+        ws.def_file(
+            "addons/test/lua/entities/dual_realm_ent/shared.lua",
+            r#"
+                if CLIENT then
+                    function ENT:GetFuelAmountUnits()
+                        return self:GetNWFloat("fuel", 0)
+                    end
+                end
+            "#,
+        );
+
+        // Server file calls the method — should see both candidates
+        let file_id = ws.def_file(
+            "addons/test/lua/entities/dual_realm_ent/sv_fuel.lua",
+            r#"
+                function ENT:ConsumeFuel()
+                    local current = self:GetFuelAmountUnits()
+                    return current
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        let heuristic_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
+        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == mismatch_code || d.code == heuristic_code),
+            "Expected no realm mismatch for ENT method defined in both server and client, got: {:?}",
+            diagnostics
+                .iter()
+                .filter(|d| d.code == mismatch_code || d.code == heuristic_code)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Same pattern but calling the method from the client realm — also should be fine
+    /// since there's a CLIENT-block definition.
+    #[gtest]
+    fn test_no_mismatch_for_ent_method_defined_in_both_realms_called_from_client() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/entities/dual_realm_ent2/init.lua",
+            r#"
+                function ENT:GetFuelAmountUnits()
+                    return self.fuelAmount or 0
+                end
+            "#,
+        );
+
+        ws.def_file(
+            "addons/test/lua/entities/dual_realm_ent2/shared.lua",
+            r#"
+                if CLIENT then
+                    function ENT:GetFuelAmountUnits()
+                        return self:GetNWFloat("fuel", 0)
+                    end
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/test/lua/entities/dual_realm_ent2/cl_init.lua",
+            r#"
+                function ENT:Draw()
+                    local fuel = self:GetFuelAmountUnits()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        let heuristic_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
+        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == mismatch_code || d.code == heuristic_code),
+            "Expected no realm mismatch for ENT method defined in both realms, got: {:?}",
+            diagnostics
+                .iter()
+                .filter(|d| d.code == mismatch_code || d.code == heuristic_code)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Same dual-realm pattern but with a plain global table (not ENT), not in
+    /// entity directory. Tests that the issue is not specific to scripted classes.
+    #[gtest]
+    fn test_no_mismatch_for_global_table_method_defined_in_both_realms() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Server file defines the method on a table
+        ws.def_file(
+            "addons/test/lua/autorun/server/sv_mylib.lua",
+            r#"
+                MyLib = MyLib or {}
+                function MyLib:GetValue()
+                    return self.value or 0
+                end
+            "#,
+        );
+
+        // Client file also defines the same method
+        ws.def_file(
+            "addons/test/lua/autorun/client/cl_mylib.lua",
+            r#"
+                MyLib = MyLib or {}
+                function MyLib:GetValue()
+                    return self.netValue or 0
+                end
+            "#,
+        );
+
+        // Server file calls the method — should see both definitions
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/server/sv_use_mylib.lua",
+            r#"
+                local val = MyLib:GetValue()
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        let heuristic_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
+        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == mismatch_code || d.code == heuristic_code),
+            "Expected no realm mismatch for table method defined in both realms, got: {:?}",
+            diagnostics
+                .iter()
+                .filter(|d| d.code == mismatch_code || d.code == heuristic_code)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[gtest]
     fn test_disabled_when_gmod_off_even_if_diagnostic_enabled() {
         let mut ws = VirtualWorkspace::new();

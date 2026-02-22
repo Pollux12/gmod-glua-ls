@@ -3558,4 +3558,59 @@ mod test {
             "frontBrake/rearBrake should not trigger undefined-field when assigned via table-typed selfTbl in class file: {field_names:?}"
         );
     }
+
+    /// Verify that a method defined in two entity files (init.lua + shared.lua CLIENT block)
+    /// is stored as Many with both member IDs in the member index.
+    #[gtest]
+    fn test_dual_realm_ent_method_stores_both_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/entities/dual_realm_ent/init.lua",
+            r#"
+            function ENT:GetFuelAmountUnits()
+                return self.fuelAmount or 0
+            end
+        "#,
+        );
+
+        ws.def_file(
+            "addons/test/lua/entities/dual_realm_ent/shared.lua",
+            r#"
+            if CLIENT then
+                function ENT:GetFuelAmountUnits()
+                    return self:GetNWFloat("fuel", 0)
+                end
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("dual_realm_ent");
+        let owner = LuaMemberOwner::Type(class_id.clone());
+
+        // Get all members of the class
+        let members = db.get_member_index().get_members(&owner);
+        let fuel_members: Vec<_> = members
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| {
+                m.get_key()
+                    .get_name()
+                    .is_some_and(|n| n == "GetFuelAmountUnits")
+            })
+            .collect();
+
+        // We expect BOTH definitions (init.lua server + shared.lua client)
+        assert!(
+            fuel_members.len() >= 2,
+            "Expected at least 2 member definitions for GetFuelAmountUnits on dual_realm_ent, got {} from files {:?}",
+            fuel_members.len(),
+            fuel_members.iter().map(|m| m.get_file_id()).collect::<Vec<_>>()
+        );
+    }
 }

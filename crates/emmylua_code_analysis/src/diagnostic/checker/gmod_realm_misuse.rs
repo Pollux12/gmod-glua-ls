@@ -88,7 +88,18 @@ impl Checker for GmodRealmMisuseChecker {
 
             let callee_realm = pick_best_mismatch_candidate(&mismatch_candidates);
             if compatible_candidate.is_some_and(|candidate| {
-                evidence_priority(candidate.evidence) >= evidence_priority(callee_realm.evidence)
+                // When the mismatch comes from an explicit `---@realm` annotation the
+                // developer deliberately restricted the function.  Only suppress if the
+                // compatible candidate has equally strong (or stronger) evidence.
+                // For every other evidence kind (branch, filename, dependency) it means
+                // the function simply *exists* in another realm – any concrete compatible
+                // definition should suppress the diagnostic.
+                if callee_realm.evidence == RealmEvidence::ExplicitAnnotation {
+                    evidence_priority(candidate.evidence)
+                        >= evidence_priority(callee_realm.evidence)
+                } else {
+                    candidate.evidence != RealmEvidence::Unknown
+                }
             }) {
                 continue;
             }
