@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use emmylua_code_analysis::{EmmyLuaAnalysis, FileId, Profile};
-use log::{debug, info};
+use log::{debug, info, warn};
 use lsp_types::{Diagnostic, Uri};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -173,6 +173,15 @@ impl FileDiagnostic {
             .get_module_index()
             .get_main_workspace_file_ids();
         drop(analysis);
+        let profile_text = format!(
+            "workspace diagnostic pull slow: {} files",
+            main_workspace_file_ids.len()
+        );
+        let _p = Profile::new(profile_text.as_str());
+        info!(
+            "workspace diagnostic pull slow started: files={}",
+            main_workspace_file_ids.len()
+        );
 
         for file_id in main_workspace_file_ids {
             if cancel_token.is_cancelled() {
@@ -218,6 +227,12 @@ impl FileDiagnostic {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
         let valid_file_count = main_workspace_file_ids.len();
+        let profile_text = format!("workspace diagnostic pull fast: {} files", valid_file_count);
+        let _p = Profile::new(profile_text.as_str());
+        info!(
+            "workspace diagnostic pull fast started: files={}",
+            valid_file_count
+        );
 
         let analysis = self.analysis.clone();
         for file_id in main_workspace_file_ids {
@@ -266,6 +281,12 @@ impl FileDiagnostic {
                 }
             }
         }
+        if count < valid_file_count && !cancel_token.is_cancelled() {
+            warn!(
+                "workspace diagnostic pull fast ended early: completed={} expected={}",
+                count, valid_file_count
+            );
+        }
 
         status_bar.finish_progress_task(
             ProgressTask::DiagnoseWorkspace,
@@ -293,6 +314,15 @@ async fn push_workspace_diagnostic(
     // diagnostic files
     let (tx, mut rx) = tokio::sync::mpsc::channel::<FileId>(100);
     let valid_file_count = main_workspace_file_ids.len();
+    let profile_text = format!(
+        "workspace diagnostic push (silent={}): {} files",
+        silent, valid_file_count
+    );
+    let _p = Profile::new(profile_text.as_str());
+    info!(
+        "workspace diagnostic push started: files={}, silent={}",
+        valid_file_count, silent
+    );
     if !silent {
         status_bar
             .create_progress_task(ProgressTask::DiagnoseWorkspace)
@@ -330,8 +360,6 @@ async fn push_workspace_diagnostic(
                 }
             }
         } else {
-            let text = format!("diagnose {} files", valid_file_count);
-            let _p = Profile::new(text.as_str());
             let mut last_percentage = 0;
             while (rx.recv().await).is_some() {
                 count += 1;
@@ -349,6 +377,12 @@ async fn push_workspace_diagnostic(
                     break;
                 }
             }
+        }
+        if count < valid_file_count && !cancel_token.is_cancelled() {
+            warn!(
+                "workspace diagnostic push ended early: completed={} expected={} silent={}",
+                count, valid_file_count, silent
+            );
         }
     }
 

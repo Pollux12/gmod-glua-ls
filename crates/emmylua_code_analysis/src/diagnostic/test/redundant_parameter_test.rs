@@ -127,6 +127,22 @@ mod test {
     }
 
     #[test]
+    fn test_inferred_callback_params_with_fewer_explicit_params() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+                ---@param cb fun(self: table, width: number, height: number)
+                local function set_paint(cb)
+                end
+
+                set_paint(function(self)
+                end)
+        "#
+        ));
+    }
+
+    #[test]
     fn test_generic_infer_function() {
         let mut ws = VirtualWorkspace::new();
         ws.def(

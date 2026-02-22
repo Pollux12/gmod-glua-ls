@@ -38,13 +38,14 @@ fn check_closure_expr(
     semantic_model: &SemanticModel,
     closure_expr: &LuaClosureExpr,
 ) -> Option<()> {
-    let current_signature = context
-        .db
-        .get_signature_index()
-        .get(&LuaSignatureId::from_closure(
-            semantic_model.get_file_id(),
-            closure_expr,
-        ))?;
+    let _current_signature =
+        context
+            .db
+            .get_signature_index()
+            .get(&LuaSignatureId::from_closure(
+                semantic_model.get_file_id(),
+                closure_expr,
+            ))?;
 
     let source_typ = semantic_model.infer_bind_value_type(closure_expr.clone().into())?;
 
@@ -72,23 +73,24 @@ fn check_closure_expr(
         _ => return Some(()),
     }?;
 
-    // 只检查右值参数多于左值参数的情况, 右值参数少于左值参数的情况是能够接受的
-    if source_params_len > current_signature.params.len() {
-        return Some(());
-    }
     let params = closure_expr
         .get_params_list()?
         .get_params()
         .collect::<Vec<_>>();
 
-    for param in params[source_params_len..].iter() {
+    // 只检查右值参数多于左值参数的情况, 右值参数少于左值参数的情况是能够接受的
+    if source_params_len > params.len() {
+        return Some(());
+    }
+
+    for param in params.iter().skip(source_params_len) {
         context.add_diagnostic(
             DiagnosticCode::RedundantParameter,
             param.get_range(),
             t!(
                 "expected %{num} parameters but found %{found_num}",
                 num = source_params_len,
-                found_num = current_signature.params.len(),
+                found_num = params.len(),
             )
             .to_string(),
             None,
