@@ -165,8 +165,8 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::NeedCheckNil => DiagnosticSeverity::HINT,
         DiagnosticCode::GenericConstraintMismatch => DiagnosticSeverity::INFORMATION,
         DiagnosticCode::GmodInvalidHookName => DiagnosticSeverity::WARNING,
-        DiagnosticCode::GmodRealmMismatch => DiagnosticSeverity::WARNING,
-        DiagnosticCode::GmodRealmMismatchHeuristic => DiagnosticSeverity::WARNING,
+        DiagnosticCode::GmodRealmMismatch => DiagnosticSeverity::ERROR,
+        DiagnosticCode::GmodRealmMismatchHeuristic => DiagnosticSeverity::ERROR,
         DiagnosticCode::GmodUnknownRealm => DiagnosticSeverity::HINT,
         DiagnosticCode::GmodUnknownNetMessage => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodDuplicateSystemRegistration => DiagnosticSeverity::HINT,
@@ -293,11 +293,11 @@ mod tests {
     fn gmod_realm_default_severity_matches_expected_levels() {
         assert_that!(
             get_default_severity(DiagnosticCode::GmodRealmMismatch),
-            eq(DiagnosticSeverity::WARNING)
+            eq(DiagnosticSeverity::ERROR)
         );
         assert_that!(
             get_default_severity(DiagnosticCode::GmodRealmMismatchHeuristic),
-            eq(DiagnosticSeverity::WARNING)
+            eq(DiagnosticSeverity::ERROR)
         );
         assert_that!(
             get_default_severity(DiagnosticCode::GmodUnknownRealm),
