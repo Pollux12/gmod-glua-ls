@@ -24,6 +24,9 @@ use resolve::{
 use resolve_closure::{
     try_resolve_call_closure_params, try_resolve_closure_parent_params, try_resolve_closure_return,
 };
+
+pub use resolve_closure::resolve_gmod_hook_add_callback_doc_function;
+pub use resolve_closure::extract_hook_name;
 use rowan::TextRange;
 
 use super::{AnalyzeContext, infer_cache_manager::InferCacheManager, lua::LuaReturnPoint};

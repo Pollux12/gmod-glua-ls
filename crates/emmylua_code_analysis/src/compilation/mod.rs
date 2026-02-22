@@ -1,5 +1,7 @@
-mod analyzer;
+pub(crate) mod analyzer;
 mod test;
+
+pub use analyzer::unresolve::extract_hook_name;
 
 use std::sync::Arc;
 

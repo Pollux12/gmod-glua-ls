@@ -294,7 +294,7 @@ pub fn infer_bind_value_type(
             let func_type = infer_call_expr_func(
                 db,
                 cache,
-                call_expr,
+                call_expr.clone(),
                 expr_type.clone(),
                 &InferGuard::new(),
                 None,
@@ -315,7 +315,24 @@ pub fn infer_bind_value_type(
             }
 
             let param_info = func_type.get_params().get(param_pos)?;
-            param_info.1.clone()
+            let mut param_type = param_info.1.clone();
+
+            if let Some(typ) = &param_type {
+                if matches!(typ, LuaType::Function | LuaType::Any) {
+                    let file_id = cache.get_file_id();
+                    if let Some(gmod_func) = crate::compilation::analyzer::unresolve::resolve_gmod_hook_add_callback_doc_function(
+                        db,
+                        &call_expr,
+                        param_pos,
+                        None,
+                        file_id,
+                    ) {
+                        param_type = Some(LuaType::DocFunction(gmod_func));
+                    }
+                }
+            }
+
+            param_type
         }
         _ => None,
     }

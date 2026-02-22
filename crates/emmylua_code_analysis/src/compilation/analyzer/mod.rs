@@ -6,7 +6,7 @@ mod flow;
 mod gmod;
 mod infer_cache_manager;
 mod lua;
-mod unresolve;
+pub(crate) mod unresolve;
 
 use std::{
     collections::{HashMap, HashSet},

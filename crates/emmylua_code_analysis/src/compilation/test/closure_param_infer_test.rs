@@ -549,4 +549,66 @@ mod test {
         let expected = ws.ty("ControlPanel");
         assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
     }
+
+    #[test]
+    fn test_gmod_hook_add_callback_params_infer_from_hook_name() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class GM
+            GM = {}
+
+            ---@hook AcceptInput
+            ---@param ent Entity
+            ---@param input string
+            ---@param activator Entity
+            ---@param caller Entity
+            ---@param value any
+            ---@return boolean
+            function GM:AcceptInput(ent, input, activator, caller, value) end
+
+            hook = {}
+            ---@param eventName string
+            ---@param identifier any
+            ---@param func function
+            function hook.Add(eventName, identifier, func) end
+
+            hook.Add("AcceptInput", "Test", function(ent, input, activator, caller, value)
+                gmod_hook_ent = ent
+                gmod_hook_input = input
+                gmod_hook_activator = activator
+                gmod_hook_caller = caller
+                gmod_hook_value = value
+            end)
+            "#,
+        );
+
+        let hook_ent = ws.expr_ty("gmod_hook_ent");
+        let hook_input = ws.expr_ty("gmod_hook_input");
+        let hook_activator = ws.expr_ty("gmod_hook_activator");
+        let hook_caller = ws.expr_ty("gmod_hook_caller");
+        let hook_value = ws.expr_ty("gmod_hook_value");
+        let entity_type = ws.ty("Entity");
+        let string_type = ws.ty("string");
+        let any_type = ws.ty("any");
+
+        assert_eq!(
+            ws.humanize_type(hook_ent),
+            ws.humanize_type(entity_type.clone())
+        );
+        assert_eq!(ws.humanize_type(hook_input), ws.humanize_type(string_type));
+        assert_eq!(
+            ws.humanize_type(hook_activator),
+            ws.humanize_type(entity_type.clone())
+        );
+        assert_eq!(ws.humanize_type(hook_caller), ws.humanize_type(entity_type));
+        assert_eq!(ws.humanize_type(hook_value), ws.humanize_type(any_type));
+    }
 }

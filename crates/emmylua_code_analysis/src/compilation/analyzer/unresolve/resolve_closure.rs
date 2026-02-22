@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
-use emmylua_parser::{LuaAstNode, LuaIndexMemberExpr, LuaTableExpr, LuaVarExpr};
+use emmylua_parser::{
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr,
+    LuaVarExpr, PathTrait,
+};
 
 use crate::{
     DbIndex, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo, LuaDocReturnInfo,
-    LuaFunctionType, LuaInferCache, LuaSignature, LuaSignatureId, LuaType, SignatureReturnStatus,
-    TypeOps, get_real_type, infer_call_expr_func, infer_expr, infer_table_should_be,
+    LuaFunctionType, LuaInferCache, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaSignature,
+    LuaSignatureId, LuaType, LuaTypeDeclId, SignatureReturnStatus, TypeOps, get_real_type,
+    infer_call_expr_func, infer_expr, infer_table_should_be,
 };
 
 use super::{
@@ -50,31 +54,18 @@ pub fn try_resolve_call_closure_params(
         _ => {}
     }
 
-    let (async_state, params_to_insert) = if let Some(param_type) =
-        call_doc_func.get_params().get(param_idx)
-    {
-        let Some(param_type) = get_real_type(db, param_type.1.as_ref().unwrap_or(&LuaType::Any))
-        else {
-            return Ok(());
-        };
-        match param_type {
-            LuaType::DocFunction(func) => (func.get_async_state(), func.get_params().to_vec()),
-            LuaType::Union(union_types) => {
-                if let Some(LuaType::DocFunction(func)) = union_types
-                    .into_vec()
-                    .iter()
-                    .find(|typ| matches!(typ, LuaType::DocFunction(_)))
-                {
-                    (func.get_async_state(), func.get_params().to_vec())
-                } else {
-                    return Ok(());
-                }
-            }
-            _ => return Ok(()),
-        }
-    } else {
+    let Some(callback_func) = resolve_call_param_doc_function(
+        db,
+        &call_expr,
+        &call_doc_func,
+        param_idx,
+        closure_params.signature_id,
+        closure_params.file_id,
+    ) else {
         return Ok(());
     };
+    let async_state = callback_func.get_async_state();
+    let params_to_insert = callback_func.get_params().to_vec();
 
     let signature = db
         .get_signature_index_mut()
@@ -97,6 +88,12 @@ pub fn try_resolve_call_closure_params(
                 attributes: None,
             },
         );
+    }
+    if signature.params.len() < params_to_insert.len() {
+        let missing_start = signature.params.len();
+        for (name, _) in params_to_insert.iter().skip(missing_start) {
+            signature.params.push(name.clone());
+        }
     }
 
     signature.async_state = async_state;
@@ -137,19 +134,17 @@ pub fn try_resolve_closure_return(
         _ => {}
     }
 
-    let ret_type = if let Some(param_type) = call_doc_func.get_params().get(param_idx) {
-        let Some(param_type) = get_real_type(db, param_type.1.as_ref().unwrap_or(&LuaType::Any))
-        else {
-            return Ok(());
-        };
-        if let LuaType::DocFunction(func) = param_type {
-            func.get_ret().clone()
-        } else {
-            return Ok(());
-        }
-    } else {
+    let Some(callback_func) = resolve_call_param_doc_function(
+        db,
+        &call_expr,
+        &call_doc_func,
+        param_idx,
+        closure_return.signature_id,
+        closure_return.file_id,
+    ) else {
         return Ok(());
     };
+    let ret_type = callback_func.get_ret().clone();
 
     let signature = db
         .get_signature_index_mut()
@@ -193,6 +188,167 @@ fn try_convert_to_func_body_infer(
     try_resolve_return_point(db, cache, &mut unresolve)
 }
 
+fn resolve_call_param_doc_function(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    call_doc_func: &LuaFunctionType,
+    param_idx: usize,
+    origin_signature_id: LuaSignatureId,
+    call_file_id: crate::FileId,
+) -> Option<Arc<LuaFunctionType>> {
+    if let Some(param_type) = call_doc_func.get_params().get(param_idx) {
+        let param_type = get_real_type(db, param_type.1.as_ref().unwrap_or(&LuaType::Any))?;
+        match param_type {
+            LuaType::DocFunction(func) => return Some(func.clone()),
+            LuaType::Union(union_types) => {
+                if let Some(LuaType::DocFunction(func)) = union_types
+                    .into_vec()
+                    .iter()
+                    .find(|typ| matches!(typ, LuaType::DocFunction(_)))
+                {
+                    return Some(func.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    resolve_gmod_hook_add_callback_doc_function(
+        db,
+        call_expr,
+        param_idx,
+        Some(origin_signature_id),
+        call_file_id,
+    )
+}
+
+pub fn resolve_gmod_hook_add_callback_doc_function(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    param_idx: usize,
+    origin_signature_id: Option<LuaSignatureId>,
+    call_file_id: crate::FileId,
+) -> Option<Arc<LuaFunctionType>> {
+    if !db.get_emmyrc().gmod.enabled || param_idx != 2 {
+        return None;
+    }
+
+    let call_path = call_expr.get_access_path()?;
+    if !matches_call_path(&call_path, "hook.Add") {
+        return None;
+    }
+
+    let hook_name = extract_hook_name(call_expr)?;
+    let member_key = LuaMemberKey::Name(hook_name.into());
+    let call_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&call_file_id, call_expr.get_range().start());
+
+    let mut candidates = Vec::new();
+    for owner_name in iter_hook_owner_names(db) {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global(&owner_name));
+        let Some(item) = db.get_member_index().get_member_item(&owner, &member_key) else {
+            continue;
+        };
+
+        for member_id in member_ids_from_item(item) {
+            let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into()) else {
+                continue;
+            };
+            let Some(function_types) =
+                filter_signature_type(db, type_cache.as_type(), origin_signature_id.as_ref())
+            else {
+                continue;
+            };
+            let member_realm = db
+                .get_gmod_infer_index()
+                .get_realm_at_offset(&member_id.file_id, member_id.get_position());
+            let is_compatible = is_realm_compatible(call_realm, member_realm);
+
+            for func in function_types {
+                candidates.push((is_compatible, func));
+            }
+        }
+    }
+
+    candidates.sort_by(
+        |(left_compatible, left_func), (right_compatible, right_func)| {
+            right_compatible.cmp(left_compatible).then_with(|| {
+                right_func
+                    .get_params()
+                    .len()
+                    .cmp(&left_func.get_params().len())
+            })
+        },
+    );
+    candidates.into_iter().map(|(_, func)| func).next()
+}
+
+fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
+    let mut names = vec![
+        "GM".to_string(),
+        "GAMEMODE".to_string(),
+        "SANDBOX".to_string(),
+        "PLUGIN".to_string(),
+    ];
+    for configured_prefix in &db.get_emmyrc().gmod.hook_mappings.method_prefixes {
+        let normalized = configured_prefix
+            .trim()
+            .trim_end_matches([':', '.'])
+            .to_string();
+        if normalized.is_empty() {
+            continue;
+        }
+
+        if !names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&normalized))
+        {
+            names.push(normalized);
+        }
+    }
+
+    names
+}
+
+fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<crate::LuaMemberId> {
+    match item {
+        LuaMemberIndexItem::One(id) => vec![*id],
+        LuaMemberIndexItem::Many(ids) => ids.clone(),
+    }
+}
+
+pub fn extract_hook_name(call_expr: &LuaCallExpr) -> Option<String> {
+    let args = call_expr.get_args_list()?;
+    let first_arg = args.get_args().next()?;
+    let LuaExpr::LiteralExpr(literal_expr) = first_arg else {
+        return None;
+    };
+    let LuaLiteralToken::String(string_token) = literal_expr.get_literal()? else {
+        return None;
+    };
+
+    let hook_name = string_token.get_value();
+    let trimmed = hook_name.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn matches_call_path(path: &str, target: &str) -> bool {
+    path == target || path.ends_with(&format!(".{target}")) || path.ends_with(&format!(":{target}"))
+}
+
+fn is_realm_compatible(call_realm: crate::GmodRealm, item_realm: crate::GmodRealm) -> bool {
+    !matches!(
+        (call_realm, item_realm),
+        (crate::GmodRealm::Client, crate::GmodRealm::Server)
+            | (crate::GmodRealm::Server, crate::GmodRealm::Client)
+    )
+}
+
 pub fn try_resolve_closure_parent_params(
     db: &mut DbIndex,
     cache: &mut LuaInferCache,
@@ -221,7 +377,7 @@ pub fn try_resolve_closure_parent_params(
                         &prefix_type,
                         LuaIndexMemberExpr::IndexExpr(index_expr),
                         signature,
-                        &origin_sig_id,
+                        Some(&origin_sig_id),
                     )
                     .ok_or(InferFailReason::None)?
                 }
@@ -240,7 +396,7 @@ pub fn try_resolve_closure_parent_params(
                 &parent_table_type,
                 LuaIndexMemberExpr::TableField(table_field.clone()),
                 signature,
-                &origin_sig_id,
+                Some(&origin_sig_id),
             )
             .ok_or(InferFailReason::None)?
         }
@@ -263,7 +419,7 @@ pub fn try_resolve_closure_parent_params(
                         &prefix_expr_type,
                         LuaIndexMemberExpr::IndexExpr(index_expr.clone()),
                         signature,
-                        &origin_sig_id,
+                        Some(&origin_sig_id),
                     )
                     .ok_or(InferFailReason::None)?
                 }
@@ -498,7 +654,7 @@ fn resolve_doc_function(
 fn filter_signature_type(
     db: &DbIndex,
     typ: &LuaType,
-    origin_signature_id: &LuaSignatureId,
+    origin_signature_id: Option<&LuaSignatureId>,
 ) -> Option<Vec<Arc<LuaFunctionType>>> {
     let mut result: Vec<Arc<LuaFunctionType>> = Vec::new();
     let mut stack = Vec::new();
@@ -511,7 +667,7 @@ fn filter_signature_type(
             }
             LuaType::Signature(sig_id) => {
                 // Skip the current closure's own signature to avoid self-reference
-                if &sig_id != origin_signature_id {
+                if origin_signature_id.map_or(true, |id| &sig_id != id) {
                     if let Some(sig) = db.get_signature_index().get(&sig_id) {
                         // Convert annotated signature to DocFunction for param propagation only.
                         // Use Nil return type so we don't force return constraints on closures
@@ -570,7 +726,7 @@ fn find_best_function_type(
     prefix_type: &LuaType,
     index_member_expr: LuaIndexMemberExpr,
     origin_signature: &LuaSignature,
-    origin_sig_id: &LuaSignatureId,
+    origin_sig_id: Option<&LuaSignatureId>,
 ) -> Option<LuaType> {
     // 寻找非自身定义的签名
     if let Ok(result) = find_decl_function_type(db, cache, prefix_type, index_member_expr) {
