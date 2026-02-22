@@ -3,7 +3,7 @@ use emmylua_code_analysis::{
     LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
     LuaTypeDeclId, RenderLevel, SemanticModel, TypeSubstitutor,
 };
-use emmylua_parser::{LuaAstNode, LuaCallExpr, LuaSyntaxToken, LuaTokenKind};
+use emmylua_parser::{LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaSyntaxToken, LuaTokenKind};
 use lsp_types::{
     Documentation, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, SignatureHelp,
     SignatureInformation,
@@ -79,6 +79,45 @@ pub fn get_current_param_index(call_expr: &LuaCallExpr, token: &LuaSyntaxToken) 
     }
 
     Some(current_idx)
+}
+
+pub fn build_callback_signature_helper(
+    semantic_model: &SemanticModel,
+    compilation: &LuaCompilation,
+    closure_expr: LuaClosureExpr,
+    token: LuaSyntaxToken,
+) -> Option<SignatureHelp> {
+    let param_list = closure_expr.get_params_list()?;
+    let mut current_idx = 0;
+    let token_position = token.text_range().start();
+    for node_or_token in param_list.syntax().children_with_tokens() {
+        if let NodeOrToken::Token(token) = node_or_token
+            && token.kind() == LuaTokenKind::TkComma.into()
+            && token.text_range().start() <= token_position
+        {
+            current_idx += 1;
+        }
+    }
+
+    let mut expected_type = semantic_model.infer_bind_value_type(closure_expr.clone().into());
+
+    if expected_type.is_none() || matches!(expected_type, Some(LuaType::Function) | Some(LuaType::Any) | Some(LuaType::Unknown)) {
+        expected_type = semantic_model.infer_expr(closure_expr.clone().into()).ok();
+    }
+
+    let expected_type = expected_type?;
+
+    match expected_type {
+        LuaType::DocFunction(func_type) => {
+            let builder = SignatureHelperBuilder::new_for_callback(compilation, semantic_model);
+            build_doc_function_signature_help(&builder, &func_type, false, current_idx, None)
+        }
+        LuaType::Signature(signature_id) => {
+            let builder = SignatureHelperBuilder::new_for_callback(compilation, semantic_model);
+            build_sig_id_signature_help(&builder, signature_id, false, current_idx, false)
+        }
+        _ => None,
+    }
 }
 
 fn build_doc_function_signature_help(

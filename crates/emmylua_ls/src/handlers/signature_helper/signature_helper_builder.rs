@@ -16,7 +16,7 @@ pub struct SignatureHelperBuilder<'a> {
     pub semantic_model: &'a SemanticModel<'a>,
     pub compilation: &'a LuaCompilation,
 
-    pub call_expr: LuaCallExpr,
+    pub call_expr: Option<LuaCallExpr>,
     pub prefix_name: Option<String>,
     pub function_name: String,
     self_type: Option<LuaType>,
@@ -34,7 +34,7 @@ impl<'a> SignatureHelperBuilder<'a> {
         let mut builder = Self {
             compilation,
             semantic_model,
-            call_expr,
+            call_expr: Some(call_expr),
             prefix_name: None,
             function_name: String::new(),
             self_type: None,
@@ -48,8 +48,26 @@ impl<'a> SignatureHelperBuilder<'a> {
         builder
     }
 
+    pub fn new_for_callback(
+        compilation: &'a LuaCompilation,
+        semantic_model: &'a SemanticModel<'a>,
+    ) -> Self {
+        Self {
+            compilation,
+            semantic_model,
+            call_expr: None,
+            prefix_name: None,
+            function_name: String::from("callback"),
+            self_type: None,
+            params_info: Vec::new(),
+            best_call_function_label: String::new(),
+            description: None,
+        }
+    }
+
     fn infer_self_type(&self) -> Option<LuaType> {
-        let prefix_expr = self.call_expr.get_prefix_expr();
+        let call_expr = self.call_expr.as_ref()?;
+        let prefix_expr = call_expr.get_prefix_expr();
         if let Some(prefix_expr) = prefix_expr
             && let LuaExpr::IndexExpr(index) = prefix_expr
             && let Some(self_expr) = index.get_prefix_expr()
@@ -64,9 +82,10 @@ impl<'a> SignatureHelperBuilder<'a> {
     }
 
     fn build_full_name(&mut self) -> Option<()> {
+        let call_expr = self.call_expr.as_ref()?;
         let semantic_model = self.semantic_model;
         let db = semantic_model.get_db();
-        let prefix_expr = self.call_expr.get_prefix_expr()?;
+        let prefix_expr = call_expr.get_prefix_expr()?;
         let mut semantic_decl = semantic_model.find_decl(
             NodeOrToken::Node(prefix_expr.syntax().clone()),
             SemanticDeclLevel::Trace(50),
@@ -158,9 +177,10 @@ impl<'a> SignatureHelperBuilder<'a> {
         if !self.params_info.is_empty() {
             return Some(());
         }
+        let call_expr = self.call_expr.as_ref()?;
         let func = self
             .semantic_model
-            .infer_call_expr_func(self.call_expr.clone(), None)?;
+            .infer_call_expr_func(call_expr.clone(), None)?;
         for param in func.get_params() {
             let param_label = generate_param_label(self.semantic_model.get_db(), param.clone());
             self.params_info.push(ParameterInformation {
@@ -168,7 +188,7 @@ impl<'a> SignatureHelperBuilder<'a> {
                 documentation: None,
             });
         }
-        match (func.is_colon_define(), self.call_expr.is_colon_call()) {
+        match (func.is_colon_define(), call_expr.is_colon_call()) {
             (true, false) => {
                 let param_label = generate_param_label(
                     self.semantic_model.get_db(),

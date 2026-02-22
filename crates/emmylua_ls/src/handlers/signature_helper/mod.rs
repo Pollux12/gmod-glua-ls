@@ -2,7 +2,7 @@ mod build_signature_helper;
 mod signature_helper_builder;
 
 use crate::context::ServerContextSnapshot;
-use build_signature_helper::build_signature_helper;
+use build_signature_helper::{build_signature_helper, build_callback_signature_helper};
 pub use build_signature_helper::get_current_param_index;
 use emmylua_code_analysis::{EmmyLuaAnalysis, FileId};
 use emmylua_parser::{LuaAstNode, LuaCallExpr, LuaSyntaxKind, LuaTokenKind};
@@ -58,44 +58,42 @@ pub fn signature_help(
             return None;
         }
     };
-    if !param_context.is_retrigger {
-        let node = token.parent()?;
-        match node.kind().into() {
-            LuaSyntaxKind::CallArgList => {
-                let call_expr = LuaCallExpr::cast(node.parent()?)?;
-                build_signature_helper(&semantic_model, &analysis.compilation, call_expr, token)
-            }
-            // todo
-            LuaSyntaxKind::TypeGeneric | LuaSyntaxKind::DocTypeList => None,
-            _ => None,
-        }
-    } else if matches!(
+    if param_context.is_retrigger && matches!(
         token.kind().into(),
         LuaTokenKind::TkWhitespace | LuaTokenKind::TkEndOfLine
     ) {
-        if token.parent()?.kind() == LuaSyntaxKind::CallArgList.into() {
-            param_context.active_signature_help
+        let parent_kind = token.parent().map(|p| p.kind().into());
+        if parent_kind == Some(LuaSyntaxKind::CallArgList) || parent_kind == Some(LuaSyntaxKind::ParamList) {
+            // We don't return the active signature help here because we want to re-evaluate
+            // the signature help based on the current context (e.g., which parameter we are on).
+            // Returning the active signature help directly might cause the active parameter index
+            // to be stale.
         } else {
-            None
+            return None;
         }
-    } else {
-        let node = token.parent_ancestors().find(|node| {
-            matches!(
-                node.kind().into(),
-                LuaSyntaxKind::CallArgList
-                    | LuaSyntaxKind::TypeGeneric
-                    | LuaSyntaxKind::DocTypeList
-            )
-        })?;
-        match node.kind().into() {
-            LuaSyntaxKind::CallArgList => {
-                let call_expr = LuaCallExpr::cast(node.parent()?)?;
-                build_signature_helper(&semantic_model, &analysis.compilation, call_expr, token)
-            }
-            // todo
-            LuaSyntaxKind::TypeGeneric | LuaSyntaxKind::DocTypeList => None,
-            _ => None,
+    }
+
+    let node = token.parent_ancestors().find(|node| {
+        matches!(
+            node.kind().into(),
+            LuaSyntaxKind::CallArgList
+                | LuaSyntaxKind::ParamList
+                | LuaSyntaxKind::TypeGeneric
+                | LuaSyntaxKind::DocTypeList
+        )
+    })?;
+    match node.kind().into() {
+        LuaSyntaxKind::CallArgList => {
+            let call_expr = LuaCallExpr::cast(node.parent()?)?;
+            build_signature_helper(&semantic_model, &analysis.compilation, call_expr, token)
         }
+        LuaSyntaxKind::ParamList => {
+            let closure_expr = emmylua_parser::LuaClosureExpr::cast(node.parent()?)?;
+            build_callback_signature_helper(&semantic_model, &analysis.compilation, closure_expr, token)
+        }
+        // todo
+        LuaSyntaxKind::TypeGeneric | LuaSyntaxKind::DocTypeList => None,
+        _ => None,
     }
 }
 
