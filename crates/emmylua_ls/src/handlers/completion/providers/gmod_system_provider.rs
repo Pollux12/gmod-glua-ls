@@ -9,6 +9,8 @@ use lsp_types::{CompletionItem, CompletionTextEdit, TextEdit};
 use rowan::TextSize;
 
 use crate::handlers::completion::completion_builder::CompletionBuilder;
+use crate::handlers::completion::completion_data::CompletionData;
+use crate::handlers::hover::resolve_hook_property_owner;
 
 use super::get_text_edit_range_in_string;
 
@@ -153,6 +155,7 @@ fn add_hook_completion_items(
 
     let mut names = hook_stats.into_iter().collect::<Vec<_>>();
     names.sort_by(|a, b| a.0.cmp(&b.0));
+    let file_id = builder.semantic_model.get_file_id();
     for (name, stats) in names {
         let text_edit = text_edit_range.map(|range| {
             CompletionTextEdit::Edit(TextEdit {
@@ -166,6 +169,13 @@ fn add_hook_completion_items(
             .filter(|(_, params)| !params.is_empty())
             .map(|(_, params)| format!(" args: {}", params.join(", ")))
             .unwrap_or_default();
+        let data = resolve_hook_property_owner(
+            &builder.semantic_model,
+            file_id,
+            builder.position_offset,
+            &name,
+        )
+        .and_then(|id| CompletionData::from_property_owner_id(builder, id, None));
         let _ = builder.add_completion_item(CompletionItem {
             label: name,
             kind: Some(lsp_types::CompletionItemKind::CONSTANT),
@@ -177,6 +187,7 @@ fn add_hook_completion_items(
                 description: None,
             }),
             detail: Some("GMod hook".to_string()),
+            data,
             text_edit,
             ..Default::default()
         });

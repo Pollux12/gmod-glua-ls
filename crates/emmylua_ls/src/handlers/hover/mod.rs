@@ -272,7 +272,7 @@ fn hover_gmod_hook_callback_function(
     builder.build_hover_result(document.to_lsp_range(token.text_range()))
 }
 
-fn resolve_hook_property_owner(
+pub(crate) fn resolve_hook_property_owner(
     semantic_model: &emmylua_code_analysis::SemanticModel,
     file_id: FileId,
     position_offset: TextSize,
