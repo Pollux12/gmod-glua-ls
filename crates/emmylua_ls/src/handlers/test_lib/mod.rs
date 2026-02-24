@@ -457,7 +457,8 @@ impl ProviderVirtualWorkspace {
         expected: Vec<VirtualInlayHint>,
     ) -> Result<()> {
         let file_id = self.def(block_str);
-        let result = inlay_hint(&self.analysis, file_id, ClientId::VSCode)
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let result = inlay_hint(&self.analysis, file_id, ClientId::VSCode, &cancel_token)
             .ok_or("failed to get inlay hints")
             .or_fail()?;
 

@@ -29,16 +29,26 @@ pub async fn on_completion_handler(
     params: CompletionParams,
     cancel_token: CancellationToken,
 ) -> Option<CompletionResponse> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+
     let uri = params.text_document_position.text_document.uri;
     let position = params.text_document_position.position;
+
     let analysis = context.analysis().read().await;
+
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     if !semantic_model.get_emmyrc().completion.enable {
         return None;
     }
 
-    completion(
+    let result = completion(
         &analysis,
         file_id,
         position,
@@ -47,7 +57,9 @@ pub async fn on_completion_handler(
             .map(|context| context.trigger_kind)
             .unwrap_or(CompletionTriggerKind::INVOKED),
         cancel_token,
-    )
+    );
+
+    result
 }
 
 pub fn completion(

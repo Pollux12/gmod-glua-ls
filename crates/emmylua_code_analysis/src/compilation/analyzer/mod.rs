@@ -34,18 +34,19 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
         context.workspace_id = Some(workspace_id);
         let profile_log = format!("analyze workspace {}", workspace_id);
         let _p = Profile::cond_new(&profile_log, context.tree_list.len() > 1);
+
         run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
         run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
         run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
+
         if db.get_emmyrc().gmod.enabled {
             run_analysis::<gmod::GmodAnalysisPipeline>(db, &mut context);
         }
+
         synthesize_accessorfunc_members(db);
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
-        // Dynamic field analysis runs AFTER unresolve so that all declaration types
-        // (e.g. function parameters with @type annotations on reassignments) are
-        // fully resolved before we try to infer prefix types for field assignments.
+
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
             context.infer_manager.clear();
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);

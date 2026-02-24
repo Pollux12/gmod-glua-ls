@@ -19,10 +19,18 @@ use super::RegisterCapabilities;
 pub async fn on_signature_helper_handler(
     context: ServerContextSnapshot,
     params: SignatureHelpParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<SignatureHelp> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = params.text_document_position_params.text_document.uri;
     let analysis = context.analysis().read().await;
+
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+
     let file_id = analysis.get_file_id(&uri)?;
     let position = params.text_document_position_params.position;
     let param_context = params.context.unwrap_or(SignatureHelpContext {
@@ -31,6 +39,7 @@ pub async fn on_signature_helper_handler(
         is_retrigger: false,
         active_signature_help: None,
     });
+
     signature_help(&analysis, file_id, position, param_context)
 }
 

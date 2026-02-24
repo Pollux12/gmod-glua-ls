@@ -20,10 +20,18 @@ use tokio_util::sync::CancellationToken;
 pub async fn on_emmy_gutter_handler(
     context: ServerContextSnapshot,
     params: EmmyGutterParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<GutterInfo>> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = Uri::from_str(&params.uri).ok()?;
     let analysis = context.analysis().read().await;
+
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
 

@@ -16,6 +16,7 @@ use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, Lo
 use rowan::NodeOrToken;
 
 use rowan::TokenAtOffset;
+use tokio_util::sync::CancellationToken;
 
 use crate::context::ClientId;
 use crate::handlers::completion::get_index_alias_name;
@@ -25,10 +26,14 @@ use crate::handlers::inlay_hint::build_function_hint::{build_closure_hint, build
 pub fn build_inlay_hints(
     semantic_model: &SemanticModel,
     client_id: ClientId,
+    cancel_token: &CancellationToken,
 ) -> Option<Vec<InlayHint>> {
     let mut result = Vec::new();
     let root = semantic_model.get_root();
     for node in root.clone().descendants::<LuaAst>() {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         match node {
             LuaAst::LuaClosureExpr(closure) => {
                 build_closure_hint(semantic_model, &mut result, closure);

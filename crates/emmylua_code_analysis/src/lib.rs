@@ -137,6 +137,7 @@ impl EmmyLuaAnalysis {
             .set_file_content(uri, text);
 
         self.compilation.remove_index(vec![file_id]);
+
         if !is_removed {
             self.compilation.update_index(vec![file_id]);
         }

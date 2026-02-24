@@ -144,10 +144,17 @@ impl FileDiagnostic {
         uri: Uri,
         cancel_token: CancellationToken,
     ) -> Vec<Diagnostic> {
+        if cancel_token.is_cancelled() {
+            return vec![];
+        }
         let analysis = self.analysis.read().await;
         let Some(file_id) = analysis.get_file_id(&uri) else {
             return vec![];
         };
+
+        if cancel_token.is_cancelled() {
+            return vec![];
+        }
 
         let diagnostics = analysis.diagnose_file(file_id, cancel_token);
         diagnostics.unwrap_or_default()

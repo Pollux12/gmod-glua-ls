@@ -64,9 +64,10 @@ pub async fn on_notification_handler(
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     dispatch_notification!(notification, server_context, {
         sync: {
-            DidChangeTextDocument => on_did_change_text_document,
+            // Intentionally empty - async to keep the message for $/cancelRequest processing.
         }
         async: {
+            DidChangeTextDocument => on_did_change_text_document,
             DidOpenTextDocument => on_did_open_text_document,
             DidSaveTextDocument => on_did_save_text_document,
             DidCloseTextDocument => on_did_close_document,
