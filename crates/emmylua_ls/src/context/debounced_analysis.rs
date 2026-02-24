@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use super::ClientProxy;
+
 /// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
 pub struct DebouncedAnalysis {
     pending_files: Mutex<HashSet<FileId>>,
@@ -12,6 +14,7 @@ pub struct DebouncedAnalysis {
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     debounce_duration: Duration,
     shutdown: CancellationToken,
+    client: Arc<ClientProxy>,
 }
 
 impl DebouncedAnalysis {
@@ -19,6 +22,7 @@ impl DebouncedAnalysis {
         analysis: Arc<RwLock<EmmyLuaAnalysis>>,
         debounce_ms: u64,
         shutdown: CancellationToken,
+        client: Arc<ClientProxy>,
     ) -> Self {
         Self {
             pending_files: Mutex::new(HashSet::new()),
@@ -26,6 +30,7 @@ impl DebouncedAnalysis {
             analysis,
             debounce_duration: Duration::from_millis(debounce_ms),
             shutdown,
+            client,
         }
     }
 
@@ -80,6 +85,10 @@ impl DebouncedAnalysis {
 
             let mut analysis = self.analysis.write().await;
             analysis.reindex_files(file_ids);
+            drop(analysis);
+
+            // Trigger diagnostic refresh so the client re-pulls with fresh index data
+            self.client.refresh_workspace_diagnostics();
         }
     }
 }

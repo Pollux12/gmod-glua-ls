@@ -135,6 +135,7 @@ impl ServerContext {
             analysis.clone(),
             200,
             debounced_shutdown.clone(),
+            client.clone(),
         ));
 
         // Spawn the debounced analysis background loop
