@@ -1830,7 +1830,10 @@ fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<Gmod
         .unwrap_or_default();
     let (hook_name, mut name_issue) = if let Some((hook_name, name_issue)) = mapped_method_hook {
         (hook_name, name_issue)
-    } else if let Some(annotation_hook) = annotation {
+    } else if let Some(annotation_hook) = annotation
+        && (is_builtin_method_hook_prefix(&prefix_name)
+            || is_configured_method_hook_prefix(db, &prefix_name))
+    {
         let hook_name = annotation_hook.hook_name.or_else(|| {
             (!trimmed_method_name.is_empty()).then_some(trimmed_method_name.to_string())
         });
