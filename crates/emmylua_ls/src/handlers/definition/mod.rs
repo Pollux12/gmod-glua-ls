@@ -5,11 +5,12 @@ mod goto_module_file;
 mod goto_path;
 
 use emmylua_code_analysis::{
-    EmmyLuaAnalysis, FileId, LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
+    EmmyLuaAnalysis, FileId, LuaCompilation, LuaType, SemanticDeclLevel, SemanticModel,
+    WorkspaceId,
 };
 use emmylua_parser::{
-    LuaAstNode, LuaAstToken, LuaDocDescription, LuaDocTagSee, LuaGeneralToken, LuaIndexExpr,
-    LuaStringToken, LuaTokenKind,
+    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaDocDescription, LuaDocTagSee,
+    LuaGeneralToken, LuaIndexExpr, LuaLiteralExpr, LuaStringToken, LuaTokenKind, PathTrait,
 };
 pub use goto_def_definition::goto_def_definition;
 use goto_def_definition::goto_str_tpl_ref_definition;
@@ -96,6 +97,15 @@ pub fn definition(
     } else if let Some(string_token) = LuaStringToken::cast(token.clone()) {
         if let Some(module_response) = goto_module_file(&semantic_model, string_token.clone()) {
             return Some(module_response);
+        }
+        if let Some(hook_response) = goto_hook_definition(
+            &semantic_model,
+            &analysis.compilation,
+            file_id,
+            position_offset,
+            string_token.clone(),
+        ) {
+            return Some(hook_response);
         }
         if let Some(str_tpl_ref_response) =
             goto_str_tpl_ref_definition(&semantic_model, string_token)
@@ -210,6 +220,51 @@ fn collect_dynamic_field_locations(
         }
         _ => {}
     }
+}
+
+fn goto_hook_definition(
+    semantic_model: &SemanticModel,
+    compilation: &LuaCompilation,
+    file_id: FileId,
+    position_offset: rowan::TextSize,
+    string_token: LuaStringToken,
+) -> Option<GotoDefinitionResponse> {
+    if !semantic_model.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let literal_expr = string_token.get_parent::<LuaLiteralExpr>()?;
+    let call_expr = literal_expr
+        .get_parent::<LuaCallArgList>()?
+        .get_parent::<LuaCallExpr>()?;
+
+    let call_path = call_expr.get_access_path()?;
+    if !call_path.ends_with("hook.Add")
+        && !call_path.ends_with("hook.Run")
+        && !call_path.ends_with("hook.Call")
+    {
+        return None;
+    }
+    let args_list = call_expr.get_args_list()?;
+    if args_list.get_args().next()?.get_position() != literal_expr.get_position() {
+        return None;
+    }
+
+    let hook_name = string_token.get_value();
+    let hook_name = hook_name.trim();
+    if hook_name.is_empty() {
+        return None;
+    }
+
+    let property_owner = crate::handlers::hover::resolve_hook_property_owner(
+        semantic_model,
+        file_id,
+        position_offset,
+        hook_name,
+    )?;
+
+    let trigger_token = string_token.syntax().clone();
+    goto_def_definition(semantic_model, compilation, property_owner, &trigger_token)
 }
 
 pub struct DefinitionCapabilities;
