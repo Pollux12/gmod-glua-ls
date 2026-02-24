@@ -15,10 +15,16 @@ use super::RegisterCapabilities;
 pub async fn on_document_highlight_handler(
     context: ServerContextSnapshot,
     params: DocumentHighlightParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<DocumentHighlight>> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = params.text_document_position_params.text_document.uri;
     let analysis = context.analysis().read().await;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let file_id = analysis.get_file_id(&uri)?;
     let position = params.text_document_position_params.position;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;

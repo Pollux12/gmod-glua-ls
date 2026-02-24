@@ -27,10 +27,16 @@ use super::RegisterCapabilities;
 pub async fn on_folding_range_handler(
     context: ServerContextSnapshot,
     params: FoldingRangeParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<FoldingRange>> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = params.text_document.uri;
     let analysis = context.analysis().read().await;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let client_id = context
         .workspace_manager()
         .read()

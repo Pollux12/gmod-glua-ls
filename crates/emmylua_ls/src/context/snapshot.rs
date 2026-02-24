@@ -6,7 +6,8 @@ use emmylua_code_analysis::EmmyLuaAnalysis;
 use crate::context::lsp_features::LspFeatures;
 
 use super::{
-    client::ClientProxy, file_diagnostic::FileDiagnostic, status_bar::StatusBar,
+    client::ClientProxy, debounced_analysis::DebouncedAnalysis,
+    file_diagnostic::FileDiagnostic, status_bar::StatusBar,
     workspace_manager::WorkspaceManager,
 };
 
@@ -43,6 +44,10 @@ impl ServerContextSnapshot {
     pub fn lsp_features(&self) -> &LspFeatures {
         &self.inner.lsp_features
     }
+
+    pub fn debounced_analysis(&self) -> &DebouncedAnalysis {
+        &self.inner.debounced_analysis
+    }
 }
 
 pub struct ServerContextInner {
@@ -52,4 +57,5 @@ pub struct ServerContextInner {
     pub workspace_manager: Arc<RwLock<WorkspaceManager>>,
     pub status_bar: Arc<StatusBar>,
     pub lsp_features: Arc<LspFeatures>,
+    pub debounced_analysis: Arc<DebouncedAnalysis>,
 }

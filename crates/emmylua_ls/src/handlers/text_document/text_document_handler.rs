@@ -118,14 +118,20 @@ pub async fn on_did_change_text_document(
         return None;
     }
 
-    // Update file and get settings
+    // VFS-only update: parse and store text
+    // Leave the index stale — features get slightly outdated but quicker results.
     let (file_id, emmyrc, supports_pull) = {
         let mut analysis = context.analysis().write().await;
-        let file_id = analysis.update_file_by_uri(&uri, Some(text));
+        let file_id = analysis.update_file_text_only(&uri, text);
         let emmyrc = analysis.get_emmyrc();
         let supports_pull = context.lsp_features().supports_pull_diagnostic();
         (file_id, emmyrc, supports_pull)
     };
+
+    // Schedule debounced reindex — rapid edits into a single reindex
+    if let Some(file_id) = file_id {
+        context.debounced_analysis().schedule(file_id).await;
+    }
 
     let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
 

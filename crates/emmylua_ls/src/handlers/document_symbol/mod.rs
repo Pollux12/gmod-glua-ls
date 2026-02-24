@@ -29,10 +29,16 @@ use comment::build_doc_region_symbol;
 pub async fn on_document_symbol(
     context: ServerContextSnapshot,
     params: DocumentSymbolParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<DocumentSymbolResponse> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = params.text_document.uri;
     let analysis = context.analysis().read().await;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     let document_symbol_root = build_document_symbol(&semantic_model)?;

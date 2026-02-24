@@ -18,12 +18,14 @@ use emmylua_parser::{
 use emmylua_parser_desc::{CodeBlockHighlightKind, DescItem, DescItemKind};
 use lsp_types::{SemanticToken, SemanticTokenModifier, SemanticTokenType};
 use rowan::{NodeOrToken, TextRange, TextSize};
+use tokio_util::sync::CancellationToken;
 
 pub fn build_semantic_tokens(
     semantic_model: &SemanticModel,
     support_muliline_token: bool,
     client_id: ClientId,
     emmyrc: &Emmyrc,
+    cancel_token: &CancellationToken,
 ) -> Option<Vec<SemanticToken>> {
     let root = semantic_model.get_root();
     let document = semantic_model.get_document();
@@ -35,6 +37,9 @@ pub fn build_semantic_tokens(
     );
 
     for node_or_token in root.syntax().descendants_with_tokens() {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         match node_or_token {
             NodeOrToken::Node(node) => {
                 build_node_semantic_token(semantic_model, &mut builder, node, emmyrc);

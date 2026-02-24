@@ -1,5 +1,6 @@
 mod client;
 mod client_id;
+mod debounced_analysis;
 mod file_diagnostic;
 mod lsp_features;
 mod snapshot;
@@ -8,6 +9,7 @@ mod workspace_manager;
 
 pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
+pub use debounced_analysis::DebouncedAnalysis;
 use emmylua_code_analysis::EmmyLuaAnalysis;
 pub use file_diagnostic::FileDiagnostic;
 pub use lsp_features::LspFeatures;
@@ -102,6 +104,7 @@ pub struct ServerContext {
     #[allow(unused)]
     conn: Connection,
     cancellations: Arc<Mutex<HashMap<RequestId, CancellationToken>>>,
+    debounced_shutdown: CancellationToken,
     inner: Arc<ServerContextInner>,
 }
 
@@ -127,10 +130,23 @@ impl ServerContext {
             file_diagnostic.clone(),
             lsp_features.clone(),
         )));
+        let debounced_shutdown = CancellationToken::new();
+        let debounced_analysis = Arc::new(DebouncedAnalysis::new(
+            analysis.clone(),
+            200,
+            debounced_shutdown.clone(),
+        ));
+
+        // Spawn the debounced analysis background loop
+        {
+            let da = debounced_analysis.clone();
+            tokio::spawn(async move { da.run().await });
+        }
 
         ServerContext {
             conn,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            debounced_shutdown,
             inner: Arc::new(ServerContextInner {
                 analysis,
                 client,
@@ -138,6 +154,7 @@ impl ServerContext {
                 workspace_manager,
                 status_bar,
                 lsp_features,
+                debounced_analysis,
             }),
         }
     }
@@ -198,6 +215,7 @@ impl ServerContext {
     }
 
     pub async fn close(&self) {
+        self.debounced_shutdown.cancel();
         let mut workspace_manager = self.inner.workspace_manager.write().await;
         workspace_manager.watcher = None;
     }

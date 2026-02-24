@@ -22,10 +22,19 @@ use super::RegisterCapabilities;
 pub async fn on_semantic_token_handler(
     context: ServerContextSnapshot,
     params: SemanticTokensParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<SemanticTokensResult> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+
     let uri = params.text_document.uri;
     let analysis = context.analysis().read().await;
+
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+
     let file_id = analysis.get_file_id(&uri)?;
 
     let workspace_manager = context.workspace_manager().read().await;
@@ -37,6 +46,7 @@ pub async fn on_semantic_token_handler(
         file_id,
         context.lsp_features().supports_multiline_tokens(),
         client_id,
+        &cancel_token,
     )
 }
 
@@ -45,6 +55,7 @@ pub fn semantic_token(
     file_id: FileId,
     supports_multiline_tokens: bool,
     client_id: ClientId,
+    cancel_token: &CancellationToken,
 ) -> Option<SemanticTokensResult> {
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     let emmyrc = semantic_model.get_emmyrc();
@@ -57,6 +68,7 @@ pub fn semantic_token(
         supports_multiline_tokens,
         client_id,
         emmyrc,
+        cancel_token,
     )?;
 
     Some(SemanticTokensResult::Tokens(SemanticTokens {

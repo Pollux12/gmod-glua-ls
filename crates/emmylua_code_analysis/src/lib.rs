@@ -145,6 +145,41 @@ impl EmmyLuaAnalysis {
         Some(file_id)
     }
 
+    /// VFS-only update: parse and store the new text without touching the index.
+    /// The index remains stale but functional until `reindex_files` is called.
+    /// This is much faster than `update_file_by_uri`
+    pub fn update_file_text_only(&mut self, uri: &Uri, text: String) -> Option<FileId> {
+        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(uri);
+        if let Some(file_id) = existing_file_id {
+            if let Some(old_text) = self
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_content(&file_id)
+                .map(String::as_str)
+            {
+                if old_text == text.as_str() {
+                    return Some(file_id);
+                }
+            }
+        }
+
+        let file_id = self
+            .compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .set_file_content(uri, Some(text));
+
+        Some(file_id)
+    }
+
+    /// Reindex specific files: remove old index entries + run full analysis pipeline.
+    /// Call this after `update_file_text_only` once the user has paused typing.
+    pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
+        self.compilation.remove_index(file_ids.clone());
+        self.compilation.update_index(file_ids);
+    }
+
     pub fn update_remote_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> FileId {
         let is_removed = text.is_none();
         let fid = self

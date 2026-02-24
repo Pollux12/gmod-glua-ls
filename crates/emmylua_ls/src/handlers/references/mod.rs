@@ -16,10 +16,16 @@ use super::RegisterCapabilities;
 pub async fn on_references_handler(
     context: ServerContextSnapshot,
     params: ReferenceParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<Location>> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = params.text_document_position.text_document.uri;
     let analysis = context.analysis().read().await;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let file_id = analysis.get_file_id(&uri)?;
     let position = params.text_document_position.position;
 

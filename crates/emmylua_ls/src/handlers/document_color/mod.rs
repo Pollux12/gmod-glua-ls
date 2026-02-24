@@ -30,10 +30,16 @@ fn convert_color_to_gmod(color: Color, original_text: &str) -> String {
 pub async fn on_document_color(
     context: ServerContextSnapshot,
     params: DocumentColorParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Vec<ColorInformation> {
+    if cancel_token.is_cancelled() {
+        return vec![];
+    }
     let uri = params.text_document.uri;
     let analysis = context.analysis().read().await;
+    if cancel_token.is_cancelled() {
+        return vec![];
+    }
     let file_id = if let Some(file_id) = analysis.get_file_id(&uri) {
         file_id
     } else {

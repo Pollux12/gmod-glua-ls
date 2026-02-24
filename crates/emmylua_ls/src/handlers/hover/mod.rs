@@ -35,11 +35,17 @@ use tokio_util::sync::CancellationToken;
 pub async fn on_hover(
     context: ServerContextSnapshot,
     params: HoverParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Hover> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
     let analysis = context.analysis().read().await;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let file_id = analysis.get_file_id(&uri)?;
     hover(&analysis, file_id, position)
 }

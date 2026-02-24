@@ -14,10 +14,16 @@ use super::RegisterCapabilities;
 pub async fn on_document_link_handler(
     context: ServerContextSnapshot,
     params: DocumentLinkParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<DocumentLink>> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = params.text_document.uri;
     let analysis = context.analysis().read().await;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     let root = semantic_model.get_root();
