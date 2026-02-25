@@ -101,3 +101,6 @@
   - `crates/emmylua_code_analysis/src/semantic/**/test.rs`
 - For GMod-specific changes, prioritize extending existing `gmod_*` tests rather than adding isolated ad-hoc coverage.
 - For GMod realm/path-sensitive tests, use realistic addon or gamemode style paths.
+
+**IMPORTANT**
+When using your file read tool, read entire files unless the file is extremely large - in this case, read in 1000 line chunks. Do not read files in tiny chunks, this will be slower and make you lose important context.

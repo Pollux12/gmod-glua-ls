@@ -430,6 +430,25 @@ pub fn analyze_func_stat(analyzer: &mut LuaAnalyzer, func_stat: LuaFuncStat) -> 
     let signature_type = analyzer.infer_expr(&closure.clone().into()).ok()?;
     let type_owner = get_var_owner(analyzer, func_name.clone());
     set_index_expr_owner(analyzer, func_name.clone());
+
+    // For Ref types, set_index_expr_owner only populates member_current_owner
+    // (not owner_members). Ensure the func-stat method is also added to the
+    // owner's member list so it's resolvable for hover/goto-def/completion.
+    if let LuaVarExpr::IndexExpr(index_expr) = &func_name {
+        let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+        if let Some(owner) = analyzer
+            .db
+            .get_member_index()
+            .get_current_owner(&member_id)
+            .cloned()
+        {
+            analyzer
+                .db
+                .get_member_index_mut()
+                .add_member_to_owner(owner, member_id);
+        }
+    }
+
     analyzer
         .db
         .get_type_index_mut()

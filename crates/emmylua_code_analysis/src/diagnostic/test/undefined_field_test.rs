@@ -1676,4 +1676,122 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_func_stat_method_def_on_returned_type_not_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        // Definition-only: should NOT produce undefined-field.
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class FuncStatRetPanel
+                ---@field name string
+
+                ---@return FuncStatRetPanel
+                local function CreatePanel() return {} end
+
+                local row = CreatePanel()
+
+                function row:RefreshFieldVisibility()
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_func_stat_method_call_after_def_not_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        // Call after definition: should NOT produce undefined-field.
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class FuncStatCallPanel
+                ---@field name string
+
+                ---@return FuncStatCallPanel
+                local function CreatePanel() return {} end
+
+                local row = CreatePanel()
+
+                function row:RefreshFieldVisibility()
+                end
+
+                row:RefreshFieldVisibility()
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_func_stat_dot_def_on_returned_type_not_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class FuncStatDotRetPanel
+                ---@field name string
+
+                ---@return FuncStatDotRetPanel
+                local function CreatePanel() return {} end
+
+                local row = CreatePanel()
+
+                function row.MyStaticFunc()
+                    return 1
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_func_stat_multiple_method_defs_and_calls() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class FuncStatMultiPanel
+                ---@field data table
+
+                ---@return FuncStatMultiPanel
+                local function CreatePanel() return {} end
+
+                local row = CreatePanel()
+
+                function row:RefreshLayout()
+                end
+
+                function row:RefreshFieldVisibility()
+                end
+
+                row:RefreshFieldVisibility()
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_func_stat_method_is_resolvable_on_ref_type() {
+        let mut ws = VirtualWorkspace::new();
+        // Verify the method is actually resolvable (not just diagnostic-suppressed).
+        // The method should be a Signature type, not Unknown.
+        ws.def(
+            r#"
+                ---@class FuncStatResolvePanel
+                ---@field name string
+
+                ---@return FuncStatResolvePanel
+                local function CreatePanel() return {} end
+
+                local row = CreatePanel()
+
+                function row:RefreshFieldVisibility()
+                end
+
+                A = row.RefreshFieldVisibility
+            "#,
+        );
+        let ty = ws.expr_ty("A");
+        assert!(
+            !ty.is_unknown(),
+            "func-stat method on Ref type should be resolvable, got Unknown"
+        );
+    }
 }

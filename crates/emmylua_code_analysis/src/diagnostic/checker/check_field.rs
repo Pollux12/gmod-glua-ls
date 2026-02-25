@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use emmylua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr,
-    LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaRepeatStat,
-    LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat,
+    LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat,
+    LuaRepeatStat, LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat,
 };
 
 use crate::{
@@ -35,6 +35,19 @@ impl Checker for CheckFieldChecker {
                                 DiagnosticCode::InjectField,
                             );
                         }
+                    }
+                }
+                LuaAst::LuaFuncStat(func_stat) => {
+                    if let Some(LuaVarExpr::IndexExpr(index_expr)) =
+                        func_stat.get_func_name()
+                    {
+                        checked_index_expr.insert(index_expr.syntax().clone());
+                        check_index_expr(
+                            context,
+                            semantic_model,
+                            &index_expr,
+                            DiagnosticCode::InjectField,
+                        );
                     }
                 }
                 LuaAst::LuaIndexExpr(index_expr) => {
