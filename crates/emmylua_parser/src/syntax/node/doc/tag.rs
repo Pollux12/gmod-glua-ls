@@ -479,6 +479,10 @@ impl LuaDocTagType {
     pub fn get_type_list(&self) -> LuaAstChildren<LuaDocType> {
         self.children()
     }
+
+    pub fn get_type_flag(&self) -> Option<LuaDocTypeFlag> {
+        self.child()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -568,6 +572,10 @@ impl LuaDocTagReturn {
 
     pub fn get_types(&self) -> LuaAstChildren<LuaDocType> {
         self.children()
+    }
+
+    pub fn get_type_flag(&self) -> Option<LuaDocTypeFlag> {
+        self.child()
     }
 
     pub fn get_info_list(&self) -> Vec<(LuaDocType, Option<LuaNameToken>)> {

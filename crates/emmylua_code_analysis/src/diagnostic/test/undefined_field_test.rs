@@ -1794,4 +1794,29 @@ mod test {
             "func-stat method on Ref type should be resolvable, got Unknown"
         );
     }
+
+    #[test]
+    fn test_func_stat_method_does_not_pollute_class() {
+        let mut ws = VirtualWorkspace::new();
+        // Regression test: a method defined via func-stat on a Ref-typed local
+        // must NOT leak to other instances of the same class.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class FuncStatPollutionPanel
+                ---@field name string
+
+                ---@return FuncStatPollutionPanel
+                local function CreatePanel() return {} end
+
+                local row = CreatePanel()
+
+                function row:LocalOnlyMethod()
+                end
+
+                local other = CreatePanel()
+                other:LocalOnlyMethod()
+            "#
+        ));
+    }
 }

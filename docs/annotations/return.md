@@ -14,6 +14,12 @@ Define return value types and description information for functions.
 -- Multiple return values
 ---@return <type1> [name1] [description1]
 ---@return <type2> [name2] [description2]
+
+-- Instance return (creates a new instance of the class)
+---@return (instance) <type> [variable_name] [description]
+
+-- Definition return (returns the class definition itself)
+---@return (definition) <type> [variable_name] [description]
 ```
 
 ## Examples
@@ -182,3 +188,53 @@ end
 4. **Function return values**
 5. **Async return values**
 6. **Conditional return values**
+7. **Instance and definition modifiers**
+
+## Instance and Definition Modifiers
+
+### `(instance)` — New Instance
+
+Use `(instance)` when a function creates and returns a new object (table) that inherits from a class. Fields and methods added to the returned variable will be scoped to that specific instance and will not pollute the global class definition.
+
+```lua
+---@class Panel
+---@field name string
+
+---@return (instance) Panel
+function CreatePanel()
+    return {}
+end
+
+local row = CreatePanel()
+-- row is an instance of Panel. Adding members here only affects this variable:
+function row:Refresh()
+end
+row:Refresh() -- works
+row.name      -- base class fields still accessible
+
+local other = CreatePanel()
+other:Refresh() -- undefined-field: Refresh is only on `row`, not `other`
+```
+
+This is particularly useful for factory functions like `vgui.Create` in Garry's Mod, where each call returns a new table inheriting from the class metatable.
+
+### `(definition)` — Class Definition Table
+
+Use `(definition)` when a function returns the class definition table itself (not an instance). Fields and methods added to the returned variable will be registered globally on the class.
+
+```lua
+---@class MyClass
+---@field name string
+
+---@return (definition) MyClass
+function GetMyClassDef()
+    return MyClass
+end
+
+local def = GetMyClassDef()
+def.newMethod = function() end  -- Added to MyClass globally
+```
+
+### Default Behavior (Reference)
+
+Without any modifier, `---@return Type` creates a reference. Assignments to fields are tracked locally but do not add members to the class or to a per-instance scope. This is the default and backward-compatible behavior.

@@ -343,6 +343,17 @@ pub(super) fn is_valid_member(
         match semantic_model.get_semantic_info(index_expr.syntax().clone().into()) {
             Some(info) => {
                 let mut need = info.semantic_decl.is_none();
+                if need && code == DiagnosticCode::UndefinedField {
+                    // For UndefinedField, if flow analysis resolved the type to a
+                    // Signature (func-stat method definitions on Ref-typed variables),
+                    // the field is genuinely defined on this variable and no diagnostic
+                    // should be reported. This is more targeted than checking for any
+                    // non-Unknown type, which would suppress legitimate undefined-field
+                    // diagnostics from condition narrowing.
+                    if matches!(info.typ, LuaType::Signature(_)) {
+                        need = false;
+                    }
+                }
                 if need {
                     let decl_type = semantic_model.get_index_decl_type(index_expr.clone());
                     if decl_type.is_some_and(|typ| !typ.is_unknown()) {
@@ -847,15 +858,16 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                             if is_truthy_check_in_condition(&condition_expr, &normalized_target) {
                                 return true;
                             }
-                        } else {
-                            if condition_nil_guards_field(&condition_expr, &normalized_target) {
-                                if let Some(root_name) = target_root_name
-                                    && has_root_reassignment_before_usage(index_expr, root_name)
-                                {
-                                    break;
-                                }
-                                return true;
+                        } else if condition_nil_guards_field(
+                            &condition_expr,
+                            &normalized_target,
+                        ) {
+                            if let Some(root_name) = target_root_name
+                                && has_root_reassignment_before_usage(index_expr, root_name)
+                            {
+                                break;
                             }
+                            return true;
                         }
                     }
                 }

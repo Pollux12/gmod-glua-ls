@@ -201,12 +201,21 @@ impl LuaDocParamInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReturnTypeKind {
+    #[default]
+    Reference,
+    Instance,
+    Definition,
+}
+
 #[derive(Debug, Clone)]
 pub struct LuaDocReturnInfo {
     pub name: Option<String>,
     pub type_ref: LuaType,
     pub description: Option<String>,
     pub attributes: Option<Vec<LuaAttributeUse>>,
+    pub return_kind: ReturnTypeKind,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]

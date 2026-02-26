@@ -2,8 +2,9 @@ use std::{collections::HashSet, sync::Arc, vec};
 
 use emmylua_code_analysis::{
     AsyncState, DbIndex, InferGuard, LuaDocReturnInfo, LuaFunctionType, LuaMember, LuaMemberOwner,
-    LuaSemanticDeclId, LuaType, RenderLevel, TypeSubstitutor, VariadicType, humanize_type,
-    infer_call_expr_func, instantiate_doc_function, try_extract_signature_id_from_field,
+    LuaSemanticDeclId, LuaType, RenderLevel, ReturnTypeKind, TypeSubstitutor, VariadicType,
+    humanize_type, infer_call_expr_func, instantiate_doc_function,
+    try_extract_signature_id_from_field,
 };
 
 use crate::handlers::hover::{
@@ -381,6 +382,7 @@ fn convert_function_return_to_docs(func: &LuaFunctionType) -> Vec<LuaDocReturnIn
                 type_ref: base.clone(),
                 description: None,
                 attributes: None,
+                return_kind: ReturnTypeKind::default(),
             }],
             VariadicType::Multi(types) => types
                 .iter()
@@ -389,6 +391,7 @@ fn convert_function_return_to_docs(func: &LuaFunctionType) -> Vec<LuaDocReturnIn
                     type_ref: ty.clone(),
                     description: None,
                     attributes: None,
+                    return_kind: ReturnTypeKind::default(),
                 })
                 .collect(),
         },
@@ -397,6 +400,7 @@ fn convert_function_return_to_docs(func: &LuaFunctionType) -> Vec<LuaDocReturnIn
             type_ref: func.get_ret().clone(),
             description: None,
             attributes: None,
+            return_kind: ReturnTypeKind::default(),
         }],
     }
 }

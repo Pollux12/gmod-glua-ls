@@ -2,8 +2,8 @@ use emmylua_parser::LuaAstNode;
 
 use crate::{
     DbIndex, InFiled, InferFailReason, LuaDocReturnInfo, LuaSemanticDeclId, LuaType, LuaTypeCache,
-    SignatureReturnStatus, compilation::analyzer::infer_cache_manager::InferCacheManager,
-    infer_expr, infer_param,
+    ReturnTypeKind, SignatureReturnStatus,
+    compilation::analyzer::infer_cache_manager::InferCacheManager, infer_expr, infer_param,
 };
 
 use super::UnResolve;
@@ -107,6 +107,7 @@ pub fn resolve_as_any(db: &mut DbIndex, reason: &InferFailReason, loop_count: us
                     type_ref: LuaType::Any,
                     description: None,
                     attributes: None,
+                    return_kind: ReturnTypeKind::default(),
                 }];
                 signature.resolve_return = SignatureReturnStatus::InferResolve;
             }

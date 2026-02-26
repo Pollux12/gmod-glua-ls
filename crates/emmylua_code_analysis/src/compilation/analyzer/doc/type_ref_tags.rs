@@ -1,8 +1,8 @@
 use emmylua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaDocDescriptionOwner, LuaDocTagAs, LuaDocTagCast,
     LuaDocTagModule, LuaDocTagOther, LuaDocTagOverload, LuaDocTagParam, LuaDocTagReturn,
-    LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaExpr, LuaIndexKey,
-    LuaLocalName, LuaTokenKind, LuaVarExpr,
+    LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaDocTypeFlag, LuaExpr,
+    LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
 };
 
 use super::{
@@ -13,11 +13,11 @@ use super::{
 };
 use crate::{
     InFiled, JsonSchemaFile, LuaOperatorMetaMethod, LuaTypeCache, LuaTypeOwner, OperatorFunction,
-    SignatureReturnStatus, TypeOps,
+    ReturnTypeKind, SignatureReturnStatus, TypeOps,
     compilation::analyzer::common::bind_type,
     db_index::{
-        AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaMemberId,
-        LuaOperator, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType,
+        LuaMemberId, LuaOperator, LuaSemanticDeclId, LuaSignatureId, LuaType,
     },
 };
 use crate::{
@@ -33,9 +33,26 @@ pub fn analyze_type(analyzer: &mut DocAnalyzer, tag: LuaDocTagType) -> Option<()
         .get_description()
         .map(|des| preprocess_description(&des.get_description_text(), None));
 
+    let type_kind = get_return_type_kind(tag.get_type_flag());
+
     let mut type_list = Vec::new();
     for lua_doc_type in tag.get_type_list() {
-        let type_ref = infer_type(analyzer, lua_doc_type);
+        let mut type_ref = infer_type(analyzer, lua_doc_type);
+        match type_kind {
+            ReturnTypeKind::Instance => {
+                let range =
+                    InFiled::new(analyzer.file_id, tag.syntax().text_range());
+                type_ref = LuaType::Instance(
+                    LuaInstanceType::new(type_ref, range).into(),
+                );
+            }
+            ReturnTypeKind::Definition => {
+                if let LuaType::Ref(ref_id) = type_ref {
+                    type_ref = LuaType::Def(ref_id);
+                }
+            }
+            ReturnTypeKind::Reference => {}
+        }
         type_list.push(type_ref);
     }
 
@@ -244,10 +261,25 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
     Some(())
 }
 
+fn get_return_type_kind(flag: Option<LuaDocTypeFlag>) -> ReturnTypeKind {
+    if let Some(flag) = flag {
+        for token in flag.get_attrib_tokens() {
+            match token.get_name_text() {
+                "instance" => return ReturnTypeKind::Instance,
+                "definition" => return ReturnTypeKind::Definition,
+                _ => {}
+            }
+        }
+    }
+    ReturnTypeKind::Reference
+}
+
 pub fn analyze_return(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturn) -> Option<()> {
     let description = tag
         .get_description()
         .map(|des| preprocess_description(&des.get_description_text(), None));
+
+    let return_kind = get_return_type_kind(tag.get_type_flag());
 
     if let Some(closure) = find_owner_closure_or_report(analyzer, &tag) {
         let signature_id = LuaSignatureId::from_closure(analyzer.file_id, &closure);
@@ -255,12 +287,28 @@ pub fn analyze_return(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturn) -> Optio
         for (doc_type, name_token) in returns {
             let name = name_token.map(|name| name.get_name_text().to_string());
 
-            let type_ref = infer_type(analyzer, doc_type);
+            let mut type_ref = infer_type(analyzer, doc_type);
+            match return_kind {
+                ReturnTypeKind::Instance => {
+                    let range =
+                        InFiled::new(analyzer.file_id, tag.syntax().text_range());
+                    type_ref = LuaType::Instance(
+                        LuaInstanceType::new(type_ref, range).into(),
+                    );
+                }
+                ReturnTypeKind::Definition => {
+                    if let LuaType::Ref(ref_id) = type_ref {
+                        type_ref = LuaType::Def(ref_id);
+                    }
+                }
+                ReturnTypeKind::Reference => {}
+            }
             let return_info = LuaDocReturnInfo {
                 name,
                 type_ref,
                 description: description.clone(),
                 attributes: None,
+                return_kind,
             };
 
             let signature = analyzer

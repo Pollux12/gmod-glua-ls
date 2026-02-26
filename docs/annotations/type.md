@@ -6,6 +6,12 @@ Specify concrete type information for variables, expressions, or objects.
 
 ```lua
 ---@type <type_expression>
+
+-- Instance type (variable holds a new instance of the class)
+---@type (instance) <type_expression>
+
+-- Definition type (variable holds the class definition itself)
+---@type (definition) <type_expression>
 ```
 
 ## Examples
@@ -219,3 +225,42 @@ end
 4. **Function types**
 5. **Generic types**
 6. **Conditional types**
+7. **Instance and definition modifiers**
+
+## Instance and Definition Modifiers
+
+### `(instance)` — New Instance
+
+Use `(instance)` when a variable holds a newly created object that inherits from a class. Fields and methods added to the variable will be scoped to that specific instance and will not affect the global class definition.
+
+```lua
+---@class Panel
+---@field name string
+
+---@type (instance) Panel
+local row = {}
+-- row is treated as a new instance of Panel.
+-- Adding members only affects this variable:
+function row:Refresh() end
+row:Refresh()   -- works
+row.name        -- base class fields still accessible
+```
+
+This is useful when you receive or create a new table that inherits from a class (e.g., via `setmetatable`) and want to add instance-specific fields or methods.
+
+### `(definition)` — Class Definition Table
+
+Use `(definition)` when a variable holds the class definition table itself. Fields added to it will be registered globally on the class.
+
+```lua
+---@class MyClass
+---@field name string
+
+---@type (definition) MyClass
+local def = MyClass
+def.newMethod = function() end  -- Added to MyClass globally
+```
+
+### Default Behavior (Reference)
+
+Without any modifier, `---@type Type` creates a reference. This is the default and backward-compatible behavior.

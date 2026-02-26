@@ -11,6 +11,27 @@ use super::{
     types::{parse_fun_type, parse_type, parse_type_list, parse_typed_param},
 };
 
+/// Checks if the current `(` token begins a type flag like `(instance)` or
+/// `(definition)` rather than a parenthesized type expression like `(number|string)`.
+fn is_type_modifier_flag(p: &LuaDocParser) -> bool {
+    let text = p.origin_text();
+    let start = p.current_token_range().end_offset();
+    if start >= text.len() {
+        return false;
+    }
+    let remaining = &text[start..];
+    let trimmed = remaining.trim_start();
+    for keyword in &["instance", "definition"] {
+        if trimmed.starts_with(keyword) {
+            let after = trimmed[keyword.len()..].trim_start();
+            if after.starts_with(')') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn parse_tag(p: &mut LuaDocParser) {
     let level = p.get_mark_level();
     match parse_tag_detail(p) {
@@ -329,6 +350,9 @@ fn parse_tag_type(p: &mut LuaDocParser) -> DocParseResult {
     p.set_lexer_state(LuaDocLexerState::Normal);
     let m = p.mark(LuaSyntaxKind::DocTagType);
     p.bump();
+    if p.current_token() == LuaTokenKind::TkLeftParen && is_type_modifier_flag(p) {
+        parse_doc_type_flag(p)?;
+    }
     parse_type(p)?;
     while p.current_token() == LuaTokenKind::TkComma {
         p.bump();
@@ -374,10 +398,16 @@ fn parse_tag_param(p: &mut LuaDocParser) -> DocParseResult {
 // ---@return number
 // ---@return number, string
 // ---@return number <name> , this just compact luals
+// ---@return (instance) DPanel
+// ---@return (definition) DPanel
 fn parse_tag_return(p: &mut LuaDocParser) -> DocParseResult {
     p.set_lexer_state(LuaDocLexerState::Normal);
     let m = p.mark(LuaSyntaxKind::DocTagReturn);
     p.bump();
+
+    if p.current_token() == LuaTokenKind::TkLeftParen && is_type_modifier_flag(p) {
+        parse_doc_type_flag(p)?;
+    }
 
     parse_type(p)?;
 

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 pub use async_state::AsyncState;
 pub use signature::{
     LuaDocParamInfo, LuaDocReturnInfo, LuaGenericParamInfo, LuaNoDiscard, LuaSignature,
-    LuaSignatureId, SignatureReturnStatus,
+    LuaSignatureId, ReturnTypeKind, SignatureReturnStatus,
 };
 
 use crate::FileId;

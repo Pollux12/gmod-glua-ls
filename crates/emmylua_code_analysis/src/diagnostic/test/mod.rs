@@ -18,6 +18,7 @@ mod gmod_realm_misuse_test;
 mod gmod_systems_test;
 mod incomplete_signature_doc_test;
 mod inject_field_test;
+mod instance_type_test;
 mod missing_fields_test;
 mod missing_parameter_test;
 mod need_check_nil_test;

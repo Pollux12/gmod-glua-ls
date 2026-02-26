@@ -5,7 +5,8 @@ use emmylua_parser::{
 };
 
 use crate::{
-    DbIndex, InferFailReason, LuaInferCache, LuaType, SignatureReturnStatus, TypeOps, VariadicType,
+    DbIndex, InferFailReason, LuaInferCache, LuaType, ReturnTypeKind, SignatureReturnStatus,
+    TypeOps, VariadicType,
     compilation::analyzer::unresolve::{
         UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
         UnResolveParentClosureParams, UnResolveReturn,
@@ -152,6 +153,7 @@ fn analyze_return(
                 description: None,
                 name: None,
                 attributes: None,
+                return_kind: ReturnTypeKind::default(),
             }]
         }
         Err(reason) => {
@@ -238,6 +240,7 @@ pub fn analyze_return_point(
         description: None,
         name: None,
         attributes: None,
+        return_kind: ReturnTypeKind::default(),
     }])
 }
 

@@ -114,15 +114,31 @@ pub fn get_type_at_flow(
                 };
 
                 if ref_id == *var_ref_id {
-                    let Some(closure) = func_stat.get_closure() else {
-                        return Err(InferFailReason::None);
-                    };
+                    // Only use the func-stat's signature when the member isn't
+                    // already declared (origin type is Nil). For Def types with
+                    // @field annotations, let the flow continue so the declared
+                    // type is preserved instead of being overridden by the
+                    // implementation signature.
+                    let is_undeclared = cache
+                        .index_ref_origin_type_cache
+                        .get(var_ref_id)
+                        .is_some_and(|entry| {
+                            matches!(entry, CacheEntry::Cache(t) if t.is_nil())
+                        });
 
-                    result_type = LuaType::Signature(LuaSignatureId::from_closure(
-                        cache.get_file_id(),
-                        &closure,
-                    ));
-                    break;
+                    if is_undeclared {
+                        let Some(closure) = func_stat.get_closure() else {
+                            return Err(InferFailReason::None);
+                        };
+
+                        result_type = LuaType::Signature(LuaSignatureId::from_closure(
+                            cache.get_file_id(),
+                            &closure,
+                        ));
+                        break;
+                    }
+
+                    antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 } else {
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }

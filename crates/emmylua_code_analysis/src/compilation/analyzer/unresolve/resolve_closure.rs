@@ -8,8 +8,8 @@ use emmylua_parser::{
 use crate::{
     DbIndex, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo, LuaDocReturnInfo,
     LuaFunctionType, LuaInferCache, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaSignature,
-    LuaSignatureId, LuaType, LuaTypeDeclId, SignatureReturnStatus, TypeOps, get_real_type,
-    infer_call_expr_func, infer_expr, infer_table_should_be,
+    LuaSignatureId, LuaType, LuaTypeDeclId, ReturnTypeKind, SignatureReturnStatus, TypeOps,
+    get_real_type, infer_call_expr_func, infer_expr, infer_table_should_be,
 };
 
 use super::{
@@ -168,6 +168,7 @@ pub fn try_resolve_closure_return(
         type_ref: ret_type.clone(),
         description: None,
         attributes: None,
+        return_kind: ReturnTypeKind::default(),
     });
 
     signature.resolve_return = SignatureReturnStatus::DocResolve;
@@ -645,6 +646,7 @@ fn resolve_doc_function(
             type_ref: doc_func.get_ret().clone(),
             description: None,
             attributes: None,
+            return_kind: ReturnTypeKind::default(),
         });
     }
 
