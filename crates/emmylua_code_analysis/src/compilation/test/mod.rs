@@ -14,6 +14,7 @@ mod flow;
 mod for_range_var_infer_test;
 mod generic_infer_test;
 mod generic_test;
+mod gmod_network_test;
 mod gmod_realm_hook_test;
 mod gmod_scripted_class_test;
 mod infer_str_tpl_test;
