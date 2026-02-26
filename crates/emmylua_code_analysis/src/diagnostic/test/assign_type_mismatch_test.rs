@@ -1606,6 +1606,39 @@ return t
         ));
     }
 
+    // Global variable with an INFERRED type (no ---@type annotation) should NOT produce
+    // assign-type-mismatch when reassigned to a different type (e.g. tonumber()).
+    // Regression test for the `_` arm in check_name_expr missing `is_infer()` guard.
+    #[test]
+    fn test_global_inferred_type_tonumber_no_false_positive() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        // value is a global inferred as `string`; reassigning via tonumber() returns `number?`.
+        // This should NOT produce a diagnostic — the type was inferred, not explicitly annotated.
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                value = "hello"
+                value = tonumber(value)
+            "#
+        ));
+    }
+
+    // Annotated global (---@type string) SHOULD still produce a diagnostic on type mismatch.
+    // This confirms the fix does not regress the annotated-global case.
+    #[test]
+    fn test_global_annotated_type_tonumber_still_errors() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        // value is explicitly annotated as `string`; reassigning to `number?` SHOULD error.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@type string
+                value = "hello"
+                value = tonumber(value)
+            "#
+        ));
+    }
+
     #[test]
     fn test_startup_stale_index_refresh_no_assign_mismatch_before_edit() {
         let mut ws = VirtualWorkspace::new();

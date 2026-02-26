@@ -107,11 +107,18 @@ fn check_name_expr(
                     }
                     Some(type_cache.as_type().clone())
                 }
-                _ => semantic_model
-                    .get_db()
-                    .get_type_index()
-                    .get_type_cache(&decl_id.into())
-                    .map(|cache| cache.as_type().clone()),
+                _ => {
+                    let type_cache = semantic_model
+                        .get_db()
+                        .get_type_index()
+                        .get_type_cache(&decl_id.into())?;
+                    // Global variables (and ImplicitSelf) may also have inferred types.
+                    // Only enforce type checks when the type was explicitly annotated.
+                    if type_cache.is_infer() {
+                        return Some(());
+                    }
+                    Some(type_cache.as_type().clone())
+                }
             }
         }
         _ => None,
