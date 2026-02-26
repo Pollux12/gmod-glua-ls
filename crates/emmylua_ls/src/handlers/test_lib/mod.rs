@@ -560,9 +560,15 @@ impl ProviderVirtualWorkspace {
 
     pub fn get_semantic_token_data_for_file(&mut self, file_id: FileId) -> Result<Vec<u32>> {
         let cancel_token = CancellationToken::new();
-        let result = semantic_token(&self.analysis, file_id, true, ClientId::VSCode, &cancel_token)
-            .ok_or("failed to get semantic tokens")
-            .or_fail()?;
+        let result = semantic_token(
+            &self.analysis,
+            file_id,
+            true,
+            ClientId::VSCode,
+            &cancel_token,
+        )
+        .ok_or("failed to get semantic tokens")
+        .or_fail()?;
         let SemanticTokensResult::Tokens(result) = result else {
             return Err(format!(
                 "expected SemanticTokensResult::Tokens, got {result:?}"

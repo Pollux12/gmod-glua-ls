@@ -81,6 +81,18 @@
           "methodToHook": {}
         },
         "inferDynamicFields": true,
+        "network": {
+          "completion": {
+            "mismatchHints": true,
+            "smartReadSuggestions": true
+          },
+          "diagnostics": {
+            "missingCounterpart": true,
+            "orderMismatch": true,
+            "typeMismatch": true
+          },
+          "enabled": true
+        },
         "paramTypeHints": {
           "ent": "Entity",
           "entity": "Entity",
@@ -505,6 +517,21 @@
           "const": "gmod-unknown-net-message"
         },
         {
+          "description": "gmod-net-read-write-type-mismatch",
+          "type": "string",
+          "const": "gmod-net-read-write-type-mismatch"
+        },
+        {
+          "description": "gmod-net-read-write-order-mismatch",
+          "type": "string",
+          "const": "gmod-net-read-write-order-mismatch"
+        },
+        {
+          "description": "gmod-net-missing-network-counterpart",
+          "type": "string",
+          "const": "gmod-net-missing-network-counterpart"
+        },
+        {
           "description": "gmod-duplicate-system-registration",
           "type": "string",
           "const": "gmod-duplicate-system-registration"
@@ -894,6 +921,21 @@
           "type": "boolean",
           "default": true
         },
+        "network": {
+          "$ref": "#/$defs/EmmyrcGmodNetwork",
+          "default": {
+            "completion": {
+              "mismatchHints": true,
+              "smartReadSuggestions": true
+            },
+            "diagnostics": {
+              "missingCounterpart": true,
+              "orderMismatch": true,
+              "typeMismatch": true
+            },
+            "enabled": true
+          }
+        },
         "paramTypeHints": {
           "type": "object",
           "additionalProperties": {
@@ -950,6 +992,60 @@
             "type": "string"
           },
           "default": {}
+        }
+      }
+    },
+    "EmmyrcGmodNetwork": {
+      "type": "object",
+      "properties": {
+        "completion": {
+          "$ref": "#/$defs/EmmyrcGmodNetworkCompletion",
+          "default": {
+            "mismatchHints": true,
+            "smartReadSuggestions": true
+          }
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/EmmyrcGmodNetworkDiagnostics",
+          "default": {
+            "missingCounterpart": true,
+            "orderMismatch": true,
+            "typeMismatch": true
+          }
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "EmmyrcGmodNetworkCompletion": {
+      "type": "object",
+      "properties": {
+        "mismatchHints": {
+          "type": "boolean",
+          "default": true
+        },
+        "smartReadSuggestions": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "EmmyrcGmodNetworkDiagnostics": {
+      "type": "object",
+      "properties": {
+        "missingCounterpart": {
+          "type": "boolean",
+          "default": true
+        },
+        "orderMismatch": {
+          "type": "boolean",
+          "default": true
+        },
+        "typeMismatch": {
+          "type": "boolean",
+          "default": true
         }
       }
     },

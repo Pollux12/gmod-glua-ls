@@ -4,9 +4,10 @@ use std::{
 };
 
 use emmylua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr,
-    LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
-    LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaVarExpr, PathTrait,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk,
+    LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag, LuaDocTagRealm,
+    LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat,
+    LuaStat, LuaVarExpr, PathTrait,
 };
 
 use crate::{
@@ -20,6 +21,7 @@ use crate::{
         GmodConcommandSiteMetadata, GmodHookKind, GmodHookNameIssue, GmodHookSiteMetadata,
         GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata, GmodRealm, GmodRealmFileMetadata,
         GmodRealmRange, GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind, LuaMemberOwner,
+        NetOpEntry, NetOpKind, NetReceiveFlow, NetSendFlow, NetSendKind,
     },
     profile::Profile,
 };
@@ -45,6 +47,7 @@ impl AnalysisPipeline for GmodAnalysisPipeline {
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
             collect_hook_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone());
+            collect_network_flow_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone());
             if is_in_scope {
                 if let Some(scope_match) = detect_scoped_class_from_path(db, in_filed_tree.file_id)
                 {
@@ -101,6 +104,354 @@ fn collect_hook_metadata(db: &mut DbIndex, file_id: FileId, root: LuaChunk) {
         if let Some(site) = collect_hook_method_site(db, func_stat) {
             db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
         }
+    }
+}
+
+fn collect_network_flow_metadata(db: &mut DbIndex, file_id: FileId, root: LuaChunk) {
+    let mut send_flows = collect_net_send_flows(&root);
+    send_flows.extend(collect_wrapped_net_send_flows(&root));
+    send_flows.sort_by_key(|flow| flow.start_range.start());
+
+    let data = crate::db_index::FileNetworkData {
+        send_flows,
+        receive_flows: collect_net_receive_flows(&root),
+    };
+    db.get_gmod_network_index_mut().add_file_data(file_id, data);
+}
+
+fn collect_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
+    let mut flows = Vec::new();
+
+    for block in root.descendants::<LuaBlock>() {
+        let stats: Vec<LuaStat> = block.get_stats().collect();
+        for (index, stat) in stats.iter().enumerate() {
+            let Some(call_expr) = call_expr_from_stat(stat) else {
+                continue;
+            };
+
+            let Some(method_name) = get_exact_net_method_name(&call_expr) else {
+                continue;
+            };
+
+            if method_name != "Start" {
+                continue;
+            }
+
+            let Some(message_name) = extract_static_string_arg_value(&call_expr, 0) else {
+                continue;
+            };
+
+            let mut writes = Vec::new();
+            let mut send = None;
+
+            for next_stat in stats.iter().skip(index + 1) {
+                let Some(next_call_expr) = call_expr_from_stat(next_stat) else {
+                    continue;
+                };
+
+                let Some(next_method_name) = get_exact_net_method_name(&next_call_expr) else {
+                    continue;
+                };
+
+                if next_method_name == "Start" {
+                    break;
+                }
+
+                if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
+                    send = Some((next_call_expr.get_range(), send_kind));
+                    break;
+                }
+
+                if let Some(op_kind) = NetOpKind::from_fn_name(next_method_name.as_str())
+                    && op_kind.is_write()
+                {
+                    writes.push(NetOpEntry {
+                        kind: op_kind,
+                        range: next_call_expr.get_range(),
+                    });
+                }
+            }
+
+            let Some((send_range, send_kind)) = send else {
+                continue;
+            };
+
+            writes.sort_by_key(|entry| entry.range.start());
+            flows.push(NetSendFlow {
+                message_name,
+                start_range: call_expr.get_range(),
+                writes,
+                send_range,
+                send_kind,
+                is_wrapped: false,
+            });
+        }
+    }
+
+    flows.sort_by_key(|flow| flow.start_range.start());
+    flows
+}
+
+fn collect_wrapped_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
+    let mut flows = Vec::new();
+
+    for func_stat in root.descendants::<LuaFuncStat>() {
+        if let Some(block) = func_stat
+            .get_closure()
+            .and_then(|closure_expr| closure_expr.get_block())
+        {
+            collect_wrapped_net_send_flows_in_function_block(&block, &mut flows);
+        }
+    }
+
+    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
+        if let Some(block) = local_func_stat
+            .get_closure()
+            .and_then(|closure_expr| closure_expr.get_block())
+        {
+            collect_wrapped_net_send_flows_in_function_block(&block, &mut flows);
+        }
+    }
+
+    for local_stat in root.descendants::<LuaLocalStat>() {
+        for value_expr in local_stat.get_value_exprs() {
+            if let LuaExpr::ClosureExpr(closure_expr) = value_expr
+                && let Some(block) = closure_expr.get_block()
+            {
+                collect_wrapped_net_send_flows_in_function_block(&block, &mut flows);
+            }
+        }
+    }
+
+    for assign_stat in root.descendants::<LuaAssignStat>() {
+        let (_, value_exprs) = assign_stat.get_var_and_expr_list();
+        for value_expr in value_exprs {
+            if let LuaExpr::ClosureExpr(closure_expr) = value_expr
+                && let Some(block) = closure_expr.get_block()
+            {
+                collect_wrapped_net_send_flows_in_function_block(&block, &mut flows);
+            }
+        }
+    }
+
+    flows.sort_by_key(|flow| flow.start_range.start());
+    flows
+}
+
+fn collect_wrapped_net_send_flows_in_function_block(
+    function_block: &LuaBlock,
+    flows: &mut Vec<NetSendFlow>,
+) {
+    for block in function_block
+        .syntax()
+        .descendants()
+        .filter_map(LuaBlock::cast)
+    {
+        if block.syntax() != function_block.syntax()
+            && is_block_in_nested_closure(function_block, &block)
+        {
+            continue;
+        }
+
+        let stats: Vec<LuaStat> = block.get_stats().collect();
+        for (index, stat) in stats.iter().enumerate() {
+            let Some(call_expr) = call_expr_from_stat(stat) else {
+                continue;
+            };
+
+            let Some(method_name) = get_exact_net_method_name(&call_expr) else {
+                continue;
+            };
+
+            if method_name != "Start" {
+                continue;
+            }
+
+            let Some(message_name) = extract_static_string_arg_value(&call_expr, 0) else {
+                continue;
+            };
+
+            let mut writes = Vec::new();
+            let mut send = None;
+
+            for next_stat in stats.iter().skip(index + 1) {
+                let Some(next_call_expr) = call_expr_from_stat(next_stat) else {
+                    continue;
+                };
+
+                let Some(next_method_name) = get_exact_net_method_name(&next_call_expr) else {
+                    continue;
+                };
+
+                if next_method_name == "Start" {
+                    break;
+                }
+
+                if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
+                    send = Some((next_call_expr.get_range(), send_kind));
+                    break;
+                }
+
+                if let Some(op_kind) = NetOpKind::from_fn_name(next_method_name.as_str())
+                    && op_kind.is_write()
+                {
+                    writes.push(NetOpEntry {
+                        kind: op_kind,
+                        range: next_call_expr.get_range(),
+                    });
+                }
+            }
+
+            writes.sort_by_key(|entry| entry.range.start());
+
+            if let Some((send_range, send_kind)) = send {
+                flows.push(NetSendFlow {
+                    message_name,
+                    start_range: call_expr.get_range(),
+                    writes,
+                    send_range,
+                    send_kind,
+                    is_wrapped: true,
+                });
+                continue;
+            }
+
+            // Wrapped helper flows can start a net message in one function and send at call-site.
+            // Keep a conservative stub so counterpart diagnostics can still resolve by message name.
+            flows.push(NetSendFlow {
+                message_name,
+                start_range: call_expr.get_range(),
+                writes: Vec::new(),
+                send_range: call_expr.get_range(),
+                send_kind: NetSendKind::Broadcast,
+                is_wrapped: true,
+            });
+        }
+    }
+}
+
+fn is_block_in_nested_closure(function_block: &LuaBlock, candidate_block: &LuaBlock) -> bool {
+    candidate_block
+        .syntax()
+        .ancestors()
+        .take_while(|node| node != function_block.syntax())
+        .any(|node| LuaClosureExpr::can_cast(node.kind().into()))
+}
+
+fn collect_net_receive_flows(root: &LuaChunk) -> Vec<NetReceiveFlow> {
+    let mut flows = Vec::new();
+
+    for call_expr in root.descendants::<LuaCallExpr>() {
+        let Some(method_name) = get_exact_net_method_name(&call_expr) else {
+            continue;
+        };
+
+        if method_name != "Receive" {
+            continue;
+        }
+
+        let Some(message_name) = extract_static_string_arg_value(&call_expr, 0) else {
+            continue;
+        };
+
+        let mut reads = Vec::new();
+        if let Some(callback_expr) = call_expr
+            .get_args_list()
+            .and_then(|args| args.get_args().nth(1))
+            && let LuaExpr::ClosureExpr(closure_expr) = callback_expr
+            && let Some(callback_block) = closure_expr.get_block()
+        {
+            collect_net_read_ops_from_block(callback_block, &mut reads);
+        }
+
+        reads.sort_by_key(|entry| entry.range.start());
+        flows.push(NetReceiveFlow {
+            message_name,
+            receive_range: call_expr.get_range(),
+            reads,
+        });
+    }
+
+    flows.sort_by_key(|flow| flow.receive_range.start());
+    flows
+}
+
+fn collect_net_read_ops_from_block(block: LuaBlock, reads: &mut Vec<NetOpEntry>) {
+    for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        if is_call_expr_in_nested_closure(&block, &call_expr) {
+            continue;
+        }
+
+        let Some(method_name) = get_exact_net_method_name(&call_expr) else {
+            continue;
+        };
+
+        if let Some(op_kind) = NetOpKind::from_fn_name(method_name.as_str())
+            && op_kind.is_read()
+        {
+            reads.push(NetOpEntry {
+                kind: op_kind,
+                range: call_expr.get_range(),
+            });
+        }
+    }
+}
+
+fn is_call_expr_in_nested_closure(block: &LuaBlock, call_expr: &LuaCallExpr) -> bool {
+    call_expr
+        .syntax()
+        .ancestors()
+        .take_while(|node| node != block.syntax())
+        .any(|node| LuaClosureExpr::can_cast(node.kind().into()))
+}
+
+fn call_expr_from_stat(stat: &LuaStat) -> Option<LuaCallExpr> {
+    let LuaStat::CallExprStat(call_expr_stat) = stat else {
+        return None;
+    };
+
+    call_expr_stat.get_call_expr()
+}
+
+fn get_exact_net_method_name(call_expr: &LuaCallExpr) -> Option<String> {
+    let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+
+    let LuaExpr::NameExpr(prefix_name_expr) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+
+    if prefix_name_expr.get_name_text()? != "net" {
+        return None;
+    }
+
+    let LuaIndexKey::Name(method_name_token) = index_expr.get_index_key()? else {
+        return None;
+    };
+
+    Some(method_name_token.get_name_text().to_string())
+}
+
+fn extract_static_string_arg_value(call_expr: &LuaCallExpr, arg_idx: usize) -> Option<String> {
+    let arg_expr = call_expr.get_args_list()?.get_args().nth(arg_idx)?;
+    let LuaExpr::LiteralExpr(literal_expr) = arg_expr else {
+        return None;
+    };
+
+    let LuaLiteralToken::String(string_token) = literal_expr.get_literal()? else {
+        return None;
+    };
+
+    Some(string_token.get_value())
+}
+
+fn net_send_kind_from_method_name(method_name: &str) -> Option<NetSendKind> {
+    match method_name {
+        "Send" => Some(NetSendKind::Send),
+        "Broadcast" => Some(NetSendKind::Broadcast),
+        "SendToServer" => Some(NetSendKind::SendToServer),
+        _ => None,
     }
 }
 

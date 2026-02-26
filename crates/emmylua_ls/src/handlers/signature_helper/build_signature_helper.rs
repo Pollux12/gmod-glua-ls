@@ -101,7 +101,12 @@ pub fn build_callback_signature_helper(
 
     let mut expected_type = semantic_model.infer_bind_value_type(closure_expr.clone().into());
 
-    if expected_type.is_none() || matches!(expected_type, Some(LuaType::Function) | Some(LuaType::Any) | Some(LuaType::Unknown)) {
+    if expected_type.is_none()
+        || matches!(
+            expected_type,
+            Some(LuaType::Function) | Some(LuaType::Any) | Some(LuaType::Unknown)
+        )
+    {
         expected_type = semantic_model.infer_expr(closure_expr.clone().into()).ok();
     }
 

@@ -6,9 +6,8 @@ use emmylua_code_analysis::EmmyLuaAnalysis;
 use crate::context::lsp_features::LspFeatures;
 
 use super::{
-    client::ClientProxy, debounced_analysis::DebouncedAnalysis,
-    file_diagnostic::FileDiagnostic, status_bar::StatusBar,
-    workspace_manager::WorkspaceManager,
+    client::ClientProxy, debounced_analysis::DebouncedAnalysis, file_diagnostic::FileDiagnostic,
+    status_bar::StatusBar, workspace_manager::WorkspaceManager,
 };
 
 #[derive(Clone)]

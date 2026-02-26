@@ -45,6 +45,7 @@ mod test {
         let flow = &data.send_flows[0];
         assert_that!(flow.message_name.as_str(), eq("MyMessage"));
         assert_that!(flow.send_kind, eq(NetSendKind::Broadcast));
+        assert_that!(flow.is_wrapped, eq(false));
         assert_that!(
             send_op_kinds(flow),
             eq(&vec![
@@ -209,5 +210,42 @@ mod test {
 
         assert_that!(data.send_flows.len(), eq(0usize));
         expect_that!(data.receive_flows.len(), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_wrapped_send_flow_stub_is_recorded_for_function_body_start_without_send() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let file_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/net_wrapped_stub.lua",
+            r#"
+            function Glide.StartCommand(id)
+                net.Start("glide.command")
+                net.WriteUInt(id, 8)
+            end
+
+            Glide.StartCommand(1)
+            net.Send(Entity(1))
+            "#,
+        );
+
+        let data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(file_id)
+            .expect("expected network data");
+
+        let wrapped_flows: Vec<_> = data
+            .send_flows
+            .iter()
+            .filter(|flow| flow.message_name == "glide.command" && flow.is_wrapped)
+            .collect();
+
+        assert_that!(wrapped_flows.len(), ge(1usize));
+        let wrapped_flow = wrapped_flows[0];
+        assert_that!(wrapped_flow.writes.len(), eq(0usize));
+        assert_that!(wrapped_flow.send_kind, eq(NetSendKind::Broadcast));
+        assert_that!(wrapped_flow.send_range, eq(wrapped_flow.start_range));
     }
 }

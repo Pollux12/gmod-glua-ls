@@ -22,8 +22,8 @@ fn is_type_modifier_flag(p: &LuaDocParser) -> bool {
     let remaining = &text[start..];
     let trimmed = remaining.trim_start();
     for keyword in &["instance", "definition"] {
-        if trimmed.starts_with(keyword) {
-            let after = trimmed[keyword.len()..].trim_start();
+        if let Some(stripped) = trimmed.strip_prefix(keyword) {
+            let after = stripped.trim_start();
             if after.starts_with(')') {
                 return true;
             }

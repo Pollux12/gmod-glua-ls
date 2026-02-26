@@ -2,8 +2,8 @@ mod build_signature_helper;
 mod signature_helper_builder;
 
 use crate::context::ServerContextSnapshot;
-use build_signature_helper::{build_signature_helper, build_callback_signature_helper};
 pub use build_signature_helper::get_current_param_index;
+use build_signature_helper::{build_callback_signature_helper, build_signature_helper};
 use emmylua_code_analysis::{EmmyLuaAnalysis, FileId};
 use emmylua_parser::{LuaAstNode, LuaCallExpr, LuaSyntaxKind, LuaTokenKind};
 use lsp_types::Position;
@@ -67,12 +67,16 @@ pub fn signature_help(
             return None;
         }
     };
-    if param_context.is_retrigger && matches!(
-        token.kind().into(),
-        LuaTokenKind::TkWhitespace | LuaTokenKind::TkEndOfLine
-    ) {
+    if param_context.is_retrigger
+        && matches!(
+            token.kind().into(),
+            LuaTokenKind::TkWhitespace | LuaTokenKind::TkEndOfLine
+        )
+    {
         let parent_kind = token.parent().map(|p| p.kind().into());
-        if parent_kind == Some(LuaSyntaxKind::CallArgList) || parent_kind == Some(LuaSyntaxKind::ParamList) {
+        if parent_kind == Some(LuaSyntaxKind::CallArgList)
+            || parent_kind == Some(LuaSyntaxKind::ParamList)
+        {
             // We don't return the active signature help here because we want to re-evaluate
             // the signature help based on the current context (e.g., which parameter we are on).
             // Returning the active signature help directly might cause the active parameter index
@@ -98,7 +102,12 @@ pub fn signature_help(
         }
         LuaSyntaxKind::ParamList => {
             let closure_expr = emmylua_parser::LuaClosureExpr::cast(node.parent()?)?;
-            build_callback_signature_helper(&semantic_model, &analysis.compilation, closure_expr, token)
+            build_callback_signature_helper(
+                &semantic_model,
+                &analysis.compilation,
+                closure_expr,
+                token,
+            )
         }
         // todo
         LuaSyntaxKind::TypeGeneric | LuaSyntaxKind::DocTypeList => None,

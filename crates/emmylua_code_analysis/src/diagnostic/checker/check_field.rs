@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use emmylua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr,
-    LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat,
-    LuaRepeatStat, LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat,
+    LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaRepeatStat,
+    LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat,
 };
 
 use crate::{
@@ -38,9 +38,7 @@ impl Checker for CheckFieldChecker {
                     }
                 }
                 LuaAst::LuaFuncStat(func_stat) => {
-                    if let Some(LuaVarExpr::IndexExpr(index_expr)) =
-                        func_stat.get_func_name()
-                    {
+                    if let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() {
                         checked_index_expr.insert(index_expr.syntax().clone());
                         check_index_expr(
                             context,
@@ -858,10 +856,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                             if is_truthy_check_in_condition(&condition_expr, &normalized_target) {
                                 return true;
                             }
-                        } else if condition_nil_guards_field(
-                            &condition_expr,
-                            &normalized_target,
-                        ) {
+                        } else if condition_nil_guards_field(&condition_expr, &normalized_target) {
                             if let Some(root_name) = target_root_name
                                 && has_root_reassignment_before_usage(index_expr, root_name)
                             {

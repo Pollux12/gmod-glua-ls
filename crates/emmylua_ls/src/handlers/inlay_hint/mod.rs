@@ -34,7 +34,12 @@ pub async fn on_inlay_hint_handler(
         .await
         .client_config
         .client_id;
-    let result = inlay_hint(&analysis, analysis.get_file_id(&uri)?, client_id, &cancel_token);
+    let result = inlay_hint(
+        &analysis,
+        analysis.get_file_id(&uri)?,
+        client_id,
+        &cancel_token,
+    );
 
     result
 }

@@ -669,7 +669,7 @@ fn filter_signature_type(
             }
             LuaType::Signature(sig_id) => {
                 // Skip the current closure's own signature to avoid self-reference
-                if origin_signature_id.map_or(true, |id| &sig_id != id) {
+                if origin_signature_id != Some(&sig_id) {
                     if let Some(sig) = db.get_signature_index().get(&sig_id) {
                         // Convert annotated signature to DocFunction for param propagation only.
                         // Use Nil return type so we don't force return constraints on closures

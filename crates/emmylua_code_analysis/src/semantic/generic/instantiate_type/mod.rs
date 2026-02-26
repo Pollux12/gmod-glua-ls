@@ -8,8 +8,8 @@ use std::{
 
 use crate::{
     DbIndex, GenericTpl, GenericTplId, LuaAliasCallKind, LuaArrayType, LuaConditionalType,
-    LuaMappedType, LuaMemberKey, LuaOperatorMetaMethod, LuaSignatureId, LuaTupleStatus,
-    LuaTypeDeclId, TypeOps, check_type_compact,
+    LuaInstanceType, LuaMappedType, LuaMemberKey, LuaOperatorMetaMethod, LuaSignatureId,
+    LuaTupleStatus, LuaTypeDeclId, TypeOps, check_type_compact,
     db_index::{
         LuaFunctionType, LuaGenericType, LuaIntersectionType, LuaObjectType, LuaTupleType, LuaType,
         LuaUnionType, VariadicType,
@@ -60,6 +60,10 @@ pub fn instantiate_type_generic(
         LuaType::TableOf(inner) => {
             let inner = instantiate_type_generic(db, inner.deref(), substitutor);
             LuaType::TableOf(inner.into())
+        }
+        LuaType::Instance(inst) => {
+            let base = instantiate_type_generic(db, inst.get_base(), substitutor);
+            LuaType::Instance(LuaInstanceType::new(base, inst.get_range().clone()).into())
         }
         LuaType::Conditional(conditional) => instantiate_conditional(db, conditional, substitutor),
         LuaType::Mapped(mapped) => instantiate_mapped_type(db, mapped.deref(), substitutor),

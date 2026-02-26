@@ -5,8 +5,7 @@ mod goto_module_file;
 mod goto_path;
 
 use emmylua_code_analysis::{
-    EmmyLuaAnalysis, FileId, LuaCompilation, LuaType, SemanticDeclLevel, SemanticModel,
-    WorkspaceId,
+    EmmyLuaAnalysis, FileId, LuaCompilation, LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
 };
 use emmylua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaDocDescription, LuaDocTagSee,

@@ -1651,6 +1651,10 @@ return t
         let code_string = Some(NumberOrString::String(
             DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
         ));
-        assert!(diagnostics.iter().all(|diagnostic| diagnostic.code != code_string));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != code_string)
+        );
     }
 }

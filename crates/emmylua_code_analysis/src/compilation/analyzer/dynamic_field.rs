@@ -123,7 +123,7 @@ fn is_unresolved_table_type(typ: &LuaType) -> bool {
         LuaType::TableConst(_) => true,
         LuaType::Union(union_type) => {
             let types = union_type.into_vec();
-            types.iter().any(|t| is_unresolved_table_type(t))
+            types.iter().any(is_unresolved_table_type)
                 && types
                     .iter()
                     .all(|t| is_unresolved_table_type(t) || matches!(t, LuaType::Nil))

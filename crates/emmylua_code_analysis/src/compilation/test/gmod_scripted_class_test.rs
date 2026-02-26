@@ -3610,7 +3610,10 @@ mod test {
             fuel_members.len() >= 2,
             "Expected at least 2 member definitions for GetFuelAmountUnits on dual_realm_ent, got {} from files {:?}",
             fuel_members.len(),
-            fuel_members.iter().map(|m| m.get_file_id()).collect::<Vec<_>>()
+            fuel_members
+                .iter()
+                .map(|m| m.get_file_id())
+                .collect::<Vec<_>>()
         );
     }
 }

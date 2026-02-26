@@ -529,9 +529,7 @@ fn resolve_param_hint_type(db: &DbIndex, hint: &str) -> Option<LuaType> {
         "nil" => LuaType::Nil,
         _ => {
             let type_decl_id = LuaTypeDeclId::global(type_name);
-            if db.get_type_index().get_type_decl(&type_decl_id).is_none() {
-                return None;
-            }
+            db.get_type_index().get_type_decl(&type_decl_id)?;
             LuaType::Ref(type_decl_id)
         }
     };

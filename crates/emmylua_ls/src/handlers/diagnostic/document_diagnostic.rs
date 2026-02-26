@@ -19,7 +19,10 @@ pub async fn on_pull_document_diagnostic(
         analysis.get_file_id(&uri)
     };
     if let Some(file_id) = file_id {
-        context.debounced_analysis().wait_for_reindex(file_id, token.clone()).await;
+        context
+            .debounced_analysis()
+            .wait_for_reindex(file_id, token.clone())
+            .await;
     }
 
     let diagnostics = context

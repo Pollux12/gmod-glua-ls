@@ -14,6 +14,8 @@ pub struct EmmyrcGmod {
     pub scripted_class_scopes: EmmyrcGmodScriptedClassScopes,
     #[serde(default)]
     pub hook_mappings: EmmyrcGmodHookMappings,
+    #[serde(default)]
+    pub network: EmmyrcGmodNetwork,
     #[serde(default = "param_type_hints_default")]
     pub param_type_hints: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +74,7 @@ impl Default for EmmyrcGmod {
             default_realm: EmmyrcGmodRealm::default(),
             scripted_class_scopes: EmmyrcGmodScriptedClassScopes::default(),
             hook_mappings: EmmyrcGmodHookMappings::default(),
+            network: EmmyrcGmodNetwork::default(),
             param_type_hints: param_type_hints_default(),
             detect_realm_from_filename: None,
             detect_realm_from_calls: None,
@@ -132,6 +135,90 @@ pub struct EmmyrcGmodHookMappings {
     pub method_prefixes: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EmmyrcGmodNetwork {
+    #[serde(default = "network_enabled_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub diagnostics: EmmyrcGmodNetworkDiagnostics,
+    #[serde(default)]
+    pub completion: EmmyrcGmodNetworkCompletion,
+}
+
+fn network_enabled_default() -> bool {
+    true
+}
+
+impl Default for EmmyrcGmodNetwork {
+    fn default() -> Self {
+        Self {
+            enabled: network_enabled_default(),
+            diagnostics: EmmyrcGmodNetworkDiagnostics::default(),
+            completion: EmmyrcGmodNetworkCompletion::default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EmmyrcGmodNetworkDiagnostics {
+    #[serde(default = "network_type_mismatch_default")]
+    pub type_mismatch: bool,
+    #[serde(default = "network_order_mismatch_default")]
+    pub order_mismatch: bool,
+    #[serde(default = "network_missing_counterpart_default")]
+    pub missing_counterpart: bool,
+}
+
+fn network_type_mismatch_default() -> bool {
+    true
+}
+
+fn network_order_mismatch_default() -> bool {
+    true
+}
+
+fn network_missing_counterpart_default() -> bool {
+    true
+}
+
+impl Default for EmmyrcGmodNetworkDiagnostics {
+    fn default() -> Self {
+        Self {
+            type_mismatch: network_type_mismatch_default(),
+            order_mismatch: network_order_mismatch_default(),
+            missing_counterpart: network_missing_counterpart_default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EmmyrcGmodNetworkCompletion {
+    #[serde(default = "network_smart_read_suggestions_default")]
+    pub smart_read_suggestions: bool,
+    #[serde(default = "network_mismatch_hints_default")]
+    pub mismatch_hints: bool,
+}
+
+fn network_smart_read_suggestions_default() -> bool {
+    true
+}
+
+fn network_mismatch_hints_default() -> bool {
+    true
+}
+
+impl Default for EmmyrcGmodNetworkCompletion {
+    fn default() -> Self {
+        Self {
+            smart_read_suggestions: network_smart_read_suggestions_default(),
+            mismatch_hints: network_mismatch_hints_default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +243,12 @@ mod tests {
         verify_that!(gmod.hook_mappings.method_to_hook.is_empty(), eq(true))?;
         verify_that!(gmod.hook_mappings.emitter_to_hook.is_empty(), eq(true))?;
         verify_that!(gmod.hook_mappings.method_prefixes.is_empty(), eq(true))?;
+        verify_that!(gmod.network.enabled, eq(true))?;
+        verify_that!(gmod.network.diagnostics.type_mismatch, eq(true))?;
+        verify_that!(gmod.network.diagnostics.order_mismatch, eq(true))?;
+        verify_that!(gmod.network.diagnostics.missing_counterpart, eq(true))?;
+        verify_that!(gmod.network.completion.smart_read_suggestions, eq(true))?;
+        verify_that!(gmod.network.completion.mismatch_hints, eq(true))?;
         verify_that!(
             gmod.param_type_hints.get("ply"),
             eq(Some(&"Player".to_string()))
@@ -168,5 +261,33 @@ mod tests {
         verify_that!(gmod.detect_realm_from_calls, eq(None))?;
         verify_that!(gmod.infer_dynamic_fields, eq(true))?;
         verify_that!(gmod.dynamic_fields_global, eq(true))
+    }
+
+    #[gtest]
+    fn test_gmod_network_camel_case_keys() -> Result<()> {
+        let gmod: EmmyrcGmod = serde_json::from_str(
+            r#"{
+                "network": {
+                    "enabled": false,
+                    "diagnostics": {
+                        "typeMismatch": false,
+                        "orderMismatch": false,
+                        "missingCounterpart": false
+                    },
+                    "completion": {
+                        "smartReadSuggestions": false,
+                        "mismatchHints": false
+                    }
+                }
+            }"#,
+        )
+        .or_fail()?;
+
+        verify_that!(gmod.network.enabled, eq(false))?;
+        verify_that!(gmod.network.diagnostics.type_mismatch, eq(false))?;
+        verify_that!(gmod.network.diagnostics.order_mismatch, eq(false))?;
+        verify_that!(gmod.network.diagnostics.missing_counterpart, eq(false))?;
+        verify_that!(gmod.network.completion.smart_read_suggestions, eq(false))?;
+        verify_that!(gmod.network.completion.mismatch_hints, eq(false))
     }
 }

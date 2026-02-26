@@ -22,6 +22,7 @@ mod enum_value_mismatch;
 mod generic;
 mod global_non_module;
 mod gmod_hook_name;
+mod gmod_network;
 mod gmod_realm_misuse;
 mod gmod_systems;
 mod incomplete_signature_doc;
@@ -132,6 +133,7 @@ pub fn check_file(context: &mut DiagnosticContext, semantic_model: &SemanticMode
     run_check::<global_non_module::GlobalInNonModuleChecker>(context, semantic_model);
     if semantic_model.get_emmyrc().gmod.enabled {
         run_check::<gmod_hook_name::GmodHookNameChecker>(context, semantic_model);
+        run_check::<gmod_network::GmodNetworkChecker>(context, semantic_model);
         run_check::<gmod_realm_misuse::GmodRealmMisuseChecker>(context, semantic_model);
         run_check::<gmod_systems::GmodSystemsChecker>(context, semantic_model);
     }

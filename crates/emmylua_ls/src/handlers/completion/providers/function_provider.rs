@@ -247,9 +247,19 @@ fn infer_param_list(
     }
 
     if names.is_empty() {
-        let mut expected_type = builder.semantic_model.infer_bind_value_type(closure_expr.clone().into());
-        if expected_type.is_none() || matches!(expected_type, Some(LuaType::Function) | Some(LuaType::Any) | Some(LuaType::Unknown)) {
-            expected_type = builder.semantic_model.infer_expr(closure_expr.clone().into()).ok();
+        let mut expected_type = builder
+            .semantic_model
+            .infer_bind_value_type(closure_expr.clone().into());
+        if expected_type.is_none()
+            || matches!(
+                expected_type,
+                Some(LuaType::Function) | Some(LuaType::Any) | Some(LuaType::Unknown)
+            )
+        {
+            expected_type = builder
+                .semantic_model
+                .infer_expr(closure_expr.clone().into())
+                .ok();
         }
 
         if let Some(LuaType::DocFunction(func)) = expected_type {

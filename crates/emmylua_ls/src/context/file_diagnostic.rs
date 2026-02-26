@@ -97,7 +97,8 @@ impl FileDiagnostic {
         debounced_analysis: Option<Arc<crate::context::DebouncedAnalysis>>,
     ) {
         for file_id in file_ids {
-            self.add_diagnostic_task(file_id, interval, debounced_analysis.clone()).await;
+            self.add_diagnostic_task(file_id, interval, debounced_analysis.clone())
+                .await;
         }
     }
 

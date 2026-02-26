@@ -2467,6 +2467,168 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_net_read_completion_in_receive_callback() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.completion.smart_read_suggestions = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            net.Start("MyMsg")
+            net.WriteEntity(e)
+            net.WriteString("hello")
+            net.Broadcast()
+            "#,
+        );
+
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            net.Receive("MyMsg", function()
+                local x = net.<??>
+            end)
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/receive.lua",
+            receive_content.as_str(),
+        );
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let has_smart_prefix = |item: &lsp_types::CompletionItem| {
+            item.sort_text
+                .as_deref()
+                .is_some_and(|sort_text| sort_text.starts_with("000_gmod_net_read"))
+        };
+
+        verify_that!(
+            items
+                .iter()
+                .any(|item| item.label == "net.ReadEntity" && has_smart_prefix(item)),
+            eq(true)
+        )?;
+        verify_that!(
+            items
+                .iter()
+                .any(|item| item.label == "net.ReadString" && has_smart_prefix(item)),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_read_completion_disabled_when_config_off() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.completion.smart_read_suggestions = false;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            net.Start("MyMsg")
+            net.WriteEntity(e)
+            net.WriteString("hello")
+            net.Broadcast()
+            "#,
+        );
+
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            net.Receive("MyMsg", function()
+                local x = net.<??>
+            end)
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/receive.lua",
+            receive_content.as_str(),
+        );
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(
+            items.iter().any(|item| {
+                item.sort_text
+                    .as_deref()
+                    .is_some_and(|sort_text| sort_text.starts_with("000_gmod_net_read"))
+            }),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_read_completion_not_suggested_outside_receive_callback() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            net.<??>
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(
+            items.iter().any(|item| {
+                item.sort_text
+                    .as_deref()
+                    .is_some_and(|sort_text| sort_text.starts_with("000_gmod_net_read"))
+            }),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_hook_completion_from_registry() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

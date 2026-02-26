@@ -25,8 +25,8 @@ use resolve_closure::{
     try_resolve_call_closure_params, try_resolve_closure_parent_params, try_resolve_closure_return,
 };
 
-pub use resolve_closure::resolve_gmod_hook_add_callback_doc_function;
 pub use resolve_closure::extract_hook_name;
+pub use resolve_closure::resolve_gmod_hook_add_callback_doc_function;
 use rowan::TextRange;
 
 use super::{AnalyzeContext, infer_cache_manager::InferCacheManager, lua::LuaReturnPoint};
@@ -127,7 +127,7 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
 #[allow(unused)]
 fn record_unresolve_info(
     time_hash_map: HashMap<usize, (u128, usize)>,
-    reason_unresolves: &Vec<(InferFailReason, Vec<UnResolve>)>,
+    reason_unresolves: &[(InferFailReason, Vec<UnResolve>)],
 ) {
     let mut unresolve_info: HashMap<String, usize> = HashMap::new();
     for (check_reason, unresolves) in reason_unresolves.iter() {
@@ -388,7 +388,7 @@ impl UnResolve {
             UnResolve::ClosureParentParams(d) => {
                 (d.file_id.id, u32::from(d.signature_id.get_position()))
             }
-            UnResolve::ModuleRef(d) => (0, u32::from(d.module_file_id.id)),
+            UnResolve::ModuleRef(d) => (0, d.module_file_id.id),
             UnResolve::TableField(d) => (
                 d.file_id.id,
                 u32::from(d.field.syntax().text_range().start()),

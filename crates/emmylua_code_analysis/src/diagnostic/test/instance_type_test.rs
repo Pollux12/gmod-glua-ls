@@ -440,4 +440,32 @@ mod test {
             ty
         );
     }
+
+    // ── Generic @return (instance) ──────────────────────────────────────
+
+    #[test]
+    fn test_return_instance_generic_resolves_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class GenericInstancePanel
+                ---@field name string
+
+                ---@generic T
+                ---@param class `T`
+                ---@return (instance) T
+                local function Create(class) return {} end
+
+                A = Create("GenericInstancePanel")
+            "#,
+        );
+        let ty = ws.expr_ty("A");
+        let humanized = ws.humanize_type(ty.clone());
+        assert!(
+            humanized.contains("GenericInstancePanel"),
+            "expected generic to resolve to GenericInstancePanel, got {:?} (humanized: {})",
+            ty,
+            humanized
+        );
+    }
 }

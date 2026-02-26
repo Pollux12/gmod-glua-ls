@@ -23,7 +23,8 @@ pub use diagnostics::{DiagnosticSeveritySetting, EmmyrcDiagnostic};
 pub use doc::{DocSyntax, EmmyrcDoc};
 pub use document_color::EmmyrcDocumentColor;
 pub use gmod::{
-    EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes,
+    EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodNetwork, EmmyrcGmodNetworkCompletion,
+    EmmyrcGmodNetworkDiagnostics, EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes,
 };
 pub use hover::EmmyrcHover;
 pub use inlayhint::EmmyrcInlayHint;

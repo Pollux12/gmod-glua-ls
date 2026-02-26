@@ -140,6 +140,9 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `invert-if` | **Off** | Warning | If can be inverted for clarity |
 | `call-non-callable` | **Off** | Warning | Calling non-callable value |
 | `gmod-invalid-hook-name` | On | Warning | Invalid hook name |
+| `gmod-net-missing-network-counterpart` | On | Warning | Emitted when a `net.Start` send block has no corresponding `net.Receive` in the expected opposite realm, or vice versa. Controlled by `gmod.network.diagnostics.missingCounterpart`. |
+| `gmod-net-read-write-order-mismatch` | On | Warning | Emitted when the order of `net.Read*` calls in a receive callback does not match the order of `net.Write*` calls in the corresponding send block. Controlled by `gmod.network.diagnostics.orderMismatch`. |
+| `gmod-net-read-write-type-mismatch` | On | Warning | Emitted when the type read in a `net.Receive` callback does not match the type written in the corresponding `net.Start` block. Controlled by `gmod.network.diagnostics.typeMismatch`. |
 | `gmod-realm-mismatch` | On | Warning | Strict realm mismatch (client/server API used in wrong realm) |
 | `gmod-realm-mismatch-heuristic` | On | Warning | Heuristic realm mismatch based on inferred realm evidence |
 | `gmod-unknown-realm` | On | Hint | Realm could not be resolved for a realm-aware call |
@@ -219,6 +222,73 @@ Hint precedence for parameters is:
 1. Explicit signature/doc annotations (`---@param`)
 2. File-level `---@paramhint`
 3. `gmod.paramTypeHints` config map
+
+### gmod.network
+
+Controls network message flow analysis, which tracks `net.Start`/`net.Receive` write and read sequences and validates cross-realm consistency.
+
+#### gmod.network.enabled
+
+- **Type**: `boolean`
+- **Default**: `true`
+
+Enables or disables all network flow analysis. When `false`, all network diagnostics and smart completion are disabled.
+
+#### gmod.network.diagnostics.typeMismatch
+
+- **Type**: `boolean`
+- **Default**: `true`
+
+Emits a warning when the types read in a `net.Receive` callback do not match the types written by the corresponding `net.Start` block on the opposite realm.
+
+#### gmod.network.diagnostics.orderMismatch
+
+- **Type**: `boolean`
+- **Default**: `true`
+
+Emits a warning when the order of `net.Read*` calls in a receive callback does not match the order of `net.Write*` calls in the corresponding send block.
+
+#### gmod.network.diagnostics.missingCounterpart
+
+- **Type**: `boolean`
+- **Default**: `true`
+
+Emits a warning when a `net.Start` send block has no `net.Receive` defined in the expected opposite realm, or vice versa.
+
+#### gmod.network.completion.smartReadSuggestions
+
+- **Type**: `boolean`
+- **Default**: `true`
+
+When typing inside a `net.Receive` callback, suggests `net.Read*` calls in the order they are expected based on the tracked send flow for that message name.
+
+#### gmod.network.completion.mismatchHints
+
+- **Type**: `boolean`
+- **Default**: `true`
+
+Annotates smart read suggestions with hints when the expected read does not match what is currently written.
+
+#### Example
+
+```json
+{
+  "gmod": {
+    "network": {
+      "enabled": true,
+      "diagnostics": {
+        "typeMismatch": true,
+        "orderMismatch": true,
+        "missingCounterpart": true
+      },
+      "completion": {
+        "smartReadSuggestions": true,
+        "mismatchHints": true
+      }
+    }
+  }
+}
+```
 
 ### Scripted Class Analysis
 

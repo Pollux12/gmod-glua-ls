@@ -40,11 +40,8 @@ pub fn analyze_type(analyzer: &mut DocAnalyzer, tag: LuaDocTagType) -> Option<()
         let mut type_ref = infer_type(analyzer, lua_doc_type);
         match type_kind {
             ReturnTypeKind::Instance => {
-                let range =
-                    InFiled::new(analyzer.file_id, tag.syntax().text_range());
-                type_ref = LuaType::Instance(
-                    LuaInstanceType::new(type_ref, range).into(),
-                );
+                let range = InFiled::new(analyzer.file_id, tag.syntax().text_range());
+                type_ref = LuaType::Instance(LuaInstanceType::new(type_ref, range).into());
             }
             ReturnTypeKind::Definition => {
                 if let LuaType::Ref(ref_id) = type_ref {
@@ -290,11 +287,8 @@ pub fn analyze_return(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturn) -> Optio
             let mut type_ref = infer_type(analyzer, doc_type);
             match return_kind {
                 ReturnTypeKind::Instance => {
-                    let range =
-                        InFiled::new(analyzer.file_id, tag.syntax().text_range());
-                    type_ref = LuaType::Instance(
-                        LuaInstanceType::new(type_ref, range).into(),
-                    );
+                    let range = InFiled::new(analyzer.file_id, tag.syntax().text_range());
+                    type_ref = LuaType::Instance(LuaInstanceType::new(type_ref, range).into());
                 }
                 ReturnTypeKind::Definition => {
                     if let LuaType::Ref(ref_id) = type_ref {
