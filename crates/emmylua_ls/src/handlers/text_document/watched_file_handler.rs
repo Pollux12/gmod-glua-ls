@@ -73,7 +73,7 @@ pub async fn on_did_change_watched_files(
     let file_ids = analysis.update_files_by_uri(watched_lua_files);
     context
         .file_diagnostic()
-        .add_files_diagnostic_task(file_ids, interval)
+        .add_files_diagnostic_task(file_ids, interval, Some(context.debounced_analysis_arc()))
         .await;
 
     Some(())

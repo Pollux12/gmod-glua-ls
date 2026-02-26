@@ -10,7 +10,9 @@ use super::ClientProxy;
 /// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
 pub struct DebouncedAnalysis {
     pending_files: Mutex<HashSet<FileId>>,
+    reindexing_files: Mutex<HashSet<FileId>>,
     notify: Notify,
+    reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     debounce_duration: Duration,
     shutdown: CancellationToken,
@@ -26,7 +28,9 @@ impl DebouncedAnalysis {
     ) -> Self {
         Self {
             pending_files: Mutex::new(HashSet::new()),
+            reindexing_files: Mutex::new(HashSet::new()),
             notify: Notify::new(),
+            reindex_notify: Notify::new(),
             analysis,
             debounce_duration: Duration::from_millis(debounce_ms),
             shutdown,
@@ -41,6 +45,42 @@ impl DebouncedAnalysis {
             pending.insert(file_id);
         }
         self.notify.notify_waiters();
+    }
+
+    /// Wait until the given file is no longer pending reindex.
+    pub async fn wait_for_reindex(&self, file_id: FileId, cancel_token: CancellationToken) {
+        loop {
+            let is_pending = {
+                let pending = self.pending_files.lock().await;
+                let reindexing = self.reindexing_files.lock().await;
+                pending.contains(&file_id) || reindexing.contains(&file_id)
+            };
+            if !is_pending {
+                return;
+            }
+            tokio::select! {
+                _ = self.reindex_notify.notified() => {}
+                _ = cancel_token.cancelled() => return,
+            }
+        }
+    }
+
+    /// Wait until all pending reindexes are finished.
+    pub async fn wait_for_all_reindex(&self, cancel_token: CancellationToken) {
+        loop {
+            let is_pending = {
+                let pending = self.pending_files.lock().await;
+                let reindexing = self.reindexing_files.lock().await;
+                !pending.is_empty() || !reindexing.is_empty()
+            };
+            if !is_pending {
+                return;
+            }
+            tokio::select! {
+                _ = self.reindex_notify.notified() => {}
+                _ = cancel_token.cancelled() => return,
+            }
+        }
     }
 
     /// Background loop: waits for events, debounces, then runs reindex.
@@ -70,7 +110,12 @@ impl DebouncedAnalysis {
             // Timer expired — drain pending files and reindex
             let file_ids: Vec<FileId> = {
                 let mut pending = self.pending_files.lock().await;
-                pending.drain().collect()
+                let mut reindexing = self.reindexing_files.lock().await;
+                let ids: Vec<FileId> = pending.drain().collect();
+                for id in &ids {
+                    reindexing.insert(*id);
+                }
+                ids
             };
 
             if file_ids.is_empty() {
@@ -84,8 +129,17 @@ impl DebouncedAnalysis {
             );
 
             let mut analysis = self.analysis.write().await;
-            analysis.reindex_files(file_ids);
+            analysis.reindex_files(file_ids.clone());
             drop(analysis);
+
+            {
+                let mut reindexing = self.reindexing_files.lock().await;
+                for id in &file_ids {
+                    reindexing.remove(id);
+                }
+            }
+
+            self.reindex_notify.notify_waiters();
 
             // Trigger diagnostic refresh so the client re-pulls with fresh index data
             self.client.refresh_workspace_diagnostics();

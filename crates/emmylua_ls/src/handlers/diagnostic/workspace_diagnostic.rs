@@ -11,6 +11,9 @@ pub async fn on_pull_workspace_diagnostic(
     _: WorkspaceDiagnosticParams,
     token: CancellationToken,
 ) -> WorkspaceDiagnosticReport {
+    // Wait for any pending debounced reindex to finish before diagnosing
+    context.debounced_analysis().wait_for_all_reindex(token.clone()).await;
+
     let workspace_manager = context.workspace_manager().read().await;
     let status = workspace_manager.get_workspace_diagnostic_level();
     if status == WorkspaceDiagnosticLevel::None {

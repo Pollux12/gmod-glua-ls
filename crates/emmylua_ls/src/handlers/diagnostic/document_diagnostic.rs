@@ -12,6 +12,16 @@ pub async fn on_pull_document_diagnostic(
     token: CancellationToken,
 ) -> DocumentDiagnosticReportResult {
     let uri = params.text_document.uri;
+
+    // Wait for any pending debounced reindex to finish before diagnosing
+    let file_id = {
+        let analysis = context.analysis().read().await;
+        analysis.get_file_id(&uri)
+    };
+    if let Some(file_id) = file_id {
+        context.debounced_analysis().wait_for_reindex(file_id, token.clone()).await;
+    }
+
     let diagnostics = context
         .file_diagnostic()
         .pull_file_diagnostics(uri, token)

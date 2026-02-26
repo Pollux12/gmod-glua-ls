@@ -48,6 +48,10 @@ impl ServerContextSnapshot {
     pub fn debounced_analysis(&self) -> &DebouncedAnalysis {
         &self.inner.debounced_analysis
     }
+
+    pub fn debounced_analysis_arc(&self) -> Arc<DebouncedAnalysis> {
+        self.inner.debounced_analysis.clone()
+    }
 }
 
 pub struct ServerContextInner {

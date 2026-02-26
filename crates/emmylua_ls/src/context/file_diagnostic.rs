@@ -31,7 +31,12 @@ impl FileDiagnostic {
         }
     }
 
-    pub async fn add_diagnostic_task(&self, file_id: FileId, interval: u64) {
+    pub async fn add_diagnostic_task(
+        &self,
+        file_id: FileId,
+        interval: u64,
+        debounced_analysis: Option<Arc<crate::context::DebouncedAnalysis>>,
+    ) {
         let mut tokens = self.diagnostic_tokens.lock().await;
 
         if let Some(token) = tokens.get(&file_id) {
@@ -53,9 +58,15 @@ impl FileDiagnostic {
         tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {
+                    if let Some(da) = debounced_analysis {
+                        da.wait_for_reindex(file_id_clone, cancel_token.clone()).await;
+                    }
+                    if cancel_token.is_cancelled() {
+                        return;
+                    }
                     let analysis = analysis.read().await;
                     if let Some(uri) = analysis.get_uri(file_id_clone) {
-                        let diagnostics = analysis.diagnose_file(file_id_clone, cancel_token);
+                        let diagnostics = analysis.diagnose_file(file_id_clone, cancel_token.clone());
                         if let Some(diagnostics) = diagnostics {
                             let diagnostic_param = lsp_types::PublishDiagnosticsParams {
                                 uri,
@@ -79,9 +90,14 @@ impl FileDiagnostic {
     }
 
     // todo add message show
-    pub async fn add_files_diagnostic_task(&self, file_ids: Vec<FileId>, interval: u64) {
+    pub async fn add_files_diagnostic_task(
+        &self,
+        file_ids: Vec<FileId>,
+        interval: u64,
+        debounced_analysis: Option<Arc<crate::context::DebouncedAnalysis>>,
+    ) {
         for file_id in file_ids {
-            self.add_diagnostic_task(file_id, interval).await;
+            self.add_diagnostic_task(file_id, interval, debounced_analysis.clone()).await;
         }
     }
 

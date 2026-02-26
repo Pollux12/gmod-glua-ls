@@ -47,7 +47,7 @@ pub async fn on_did_open_text_document(
         if let Some(file_id) = file_id {
             context
                 .file_diagnostic()
-                .add_diagnostic_task(file_id, interval)
+                .add_diagnostic_task(file_id, interval, Some(context.debounced_analysis_arc()))
                 .await;
         }
     }
@@ -146,7 +146,7 @@ pub async fn on_did_change_text_document(
         if let Some(file_id) = file_id {
             context
                 .file_diagnostic()
-                .add_diagnostic_task(file_id, interval)
+                .add_diagnostic_task(file_id, interval, Some(context.debounced_analysis_arc()))
                 .await;
         }
     }
