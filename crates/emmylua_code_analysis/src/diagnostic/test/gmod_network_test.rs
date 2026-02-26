@@ -132,7 +132,8 @@ mod tests {
             util.AddNetworkString("Orphan")
             net.Start("Orphan")
             net.WriteString("hello")
-            net.Broadcast()
+            -- exercise new send method
+            net.SendPAS(Vector(0,0,0))
             "#,
         );
 
@@ -304,7 +305,7 @@ mod tests {
             util.AddNetworkString("Orphan")
             net.Start("Orphan")
             net.WriteString("hello")
-            net.Broadcast()
+            net.SendPAS(Vector(0,0,0))
             "#,
         );
 

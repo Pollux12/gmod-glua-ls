@@ -136,6 +136,56 @@ mod test {
     }
 
     #[gtest]
+    fn test_extended_send_methods_are_recognized() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let file_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/net_send_kinds.lua",
+            r#"
+            net.Start("A")
+            net.WriteString("x")
+            net.SendOmit(ply)
+
+            net.Start("B")
+            net.WriteString("y")
+            net.SendPAS(Vector(0,0,0))
+
+            net.Start("C")
+            net.WriteString("z")
+            net.SendPVS(Vector(0,0,0))
+
+            net.Start("D")
+            net.WriteString("w")
+            net.Broadcast()
+
+            net.Start("E")
+            net.WriteString("u")
+            net.SendToServer()
+            "#,
+        );
+
+        let data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(file_id)
+            .expect("expected network data");
+
+        assert_that!(data.send_flows.len(), eq(5usize));
+        let kinds: Vec<NetSendKind> = data.send_flows.iter().map(|f| f.send_kind).collect();
+        assert_that!(
+            kinds,
+            eq(&vec![
+                NetSendKind::Omit,
+                NetSendKind::PAS,
+                NetSendKind::PVS,
+                NetSendKind::Broadcast,
+                NetSendKind::SendToServer,
+            ])
+        );
+    }
+
+    #[gtest]
     fn test_nested_closure_reads_are_not_included_in_parent_callback() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

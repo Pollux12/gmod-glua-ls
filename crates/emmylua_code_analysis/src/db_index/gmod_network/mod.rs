@@ -182,6 +182,12 @@ pub enum NetSendKind {
     Send,
     Broadcast,
     SendToServer,
+    /// net.SendOmit
+    Omit,
+    /// net.SendPAS
+    PAS,
+    /// net.SendPVS
+    PVS,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

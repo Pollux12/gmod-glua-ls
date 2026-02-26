@@ -263,7 +263,11 @@ fn choose_preferred_send_flow<'a>(
 
 fn expected_receiver_realm(send_kind: NetSendKind) -> Option<GmodRealm> {
     match send_kind {
-        NetSendKind::Send | NetSendKind::Broadcast => Some(GmodRealm::Client),
+        NetSendKind::Send
+        | NetSendKind::Broadcast
+        | NetSendKind::Omit
+        | NetSendKind::PAS
+        | NetSendKind::PVS => Some(GmodRealm::Client),
         NetSendKind::SendToServer => Some(GmodRealm::Server),
     }
 }

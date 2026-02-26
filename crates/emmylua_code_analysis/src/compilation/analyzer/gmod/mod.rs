@@ -451,6 +451,9 @@ fn net_send_kind_from_method_name(method_name: &str) -> Option<NetSendKind> {
         "Send" => Some(NetSendKind::Send),
         "Broadcast" => Some(NetSendKind::Broadcast),
         "SendToServer" => Some(NetSendKind::SendToServer),
+        "SendOmit" => Some(NetSendKind::Omit),
+        "SendPAS" => Some(NetSendKind::PAS),
+        "SendPVS" => Some(NetSendKind::PVS),
         _ => None,
     }
 }
