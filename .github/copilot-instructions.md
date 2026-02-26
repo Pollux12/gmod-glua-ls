@@ -9,10 +9,15 @@
 ## Architecture (Read This First)
 - Workspace layout by responsibility:
   - `crates/emmylua_parser`: parser + CST/AST foundation (`rowan`-based).
+  - `crates/emmylua_parser_desc`: parser descriptor metadata used by tooling/codegen.
   - `crates/emmylua_code_analysis`: semantic core (compilation DB, diagnostics, VFS, config, GMod inference/indexes).
+  - `crates/emmylua_code_style`: code-style support consumed by analysis/check flows.
+  - `crates/emmylua_diagnostic_macro`: proc-macro crate for diagnostics definitions.
   - `crates/emmylua_ls`: LSP server runtime and handlers.
   - `crates/emmylua_check`: CLI diagnostics runner.
   - `crates/emmylua_doc_cli`: annotation-to-docs generator.
+  - `crates/schema_to_emmylua`: schema-to-annotation conversion helpers.
+  - `tools/schema_json_gen`: schema generator binary used by CI drift checks.
 - Runtime flow is parser → analysis/indexing → LS/CLI consumers.
 - Analysis pipeline order is in `crates/emmylua_code_analysis/src/compilation/analyzer/mod.rs`.
   - GMod analysis is conditionally inserted via `gmod::GmodAnalysisPipeline` when `emmyrc.gmod.enabled` is true.
@@ -31,9 +36,9 @@
 - Preserve defaults from `crates/emmylua_code_analysis/src/config/configs/gmod.rs`:
   - `gmod.enabled = true`
   - `gmod.defaultRealm = shared`
-  - scripted class include defaults: `entities/**`, `weapons/**`, `effects/**`, `weapons/gmod_tool/stools/**`
-- Preserve hook/realm behavior described in `docs/config/gmod_setup_EN.md`:
-  - method hooks: `GM:*`, `GAMEMODE:*`
+  - scripted class include defaults: `entities/**`, `weapons/**`, `effects/**`, `weapons/gmod_tool/stools/**`, `plugins/**`
+- Preserve hook/realm behavior described in `docs/config.md` and `docs/annotations/hook.md`:
+  - method hooks: `GM:*`, `GAMEMODE:*`, `PLUGIN:*`, `SANDBOX:*`
   - hook API parsing: `hook.Add`, `hook.Run`, `hook.Call`
   - annotation hooks: `---@hook`
   - realm inference from filename + dependency/call signals
@@ -44,15 +49,16 @@
 - All non-standard GMod operators should be treated as standard, with first-class support in completion/signature/diagnostics (C style operators)
 
 ## Config and Schema Rules
-- Configuration entry points are `.emmyrc.json` / `.luarc.json` (plus `.emmyrc.lua` in LS/CLI loaders).
+- Configuration entry points are `.gluarc.json` (exclusive priority when present), otherwise `.luarc.json` → `.emmyrc.json` → `.emmyrc.lua`.
 - LS config priority is implemented in `crates/emmylua_ls/src/context/workspace_manager.rs`:
-  - global home config → global config-dir config → `$EMMYLUALS_CONFIG` → local workspace config.
+  - global home config → global config-dir (`gluals`) config → `$GLUALS_CONFIG` → local workspace config.
+  - for merged LS config, the first workspace root with local config is preferred for scalar fields; selected list-like fields are extend-unique merged from additional roots.
 - For new config options, update all of these together:
   - code: `crates/emmylua_code_analysis/src/config/**`
   - schema: `crates/emmylua_code_analysis/resources/schema.json`
-  - docs: `docs/config/emmyrc_json_EN.md` and/or `docs/config/gmod_setup_EN.md`
+  - docs: `docs/config.md` (and any detailed docs under `docs/config/` if applicable)
 - Keep schema generation clean: `cargo run --bin schema_json_gen` must not leave a git diff.
-- Make sure all config is documented, garry's mod config docs are in `docs/config/gmod_setup_EN.md`
+- Make sure all config is documented in `docs/config.md`.
 
 ## Build, Test, and Validation Commands
 - Build all: `cargo build --release`
@@ -83,7 +89,7 @@
 - Parser tree infra: `rowan`.
 - Config/data formats: `serde`, `serde_json`, `schemars`.
 - Schema-to-annotation path: `schema_to_emmylua` consumed by analysis crate.
-- External formatter options are documented in `docs/external_format/`.
+- External formatter options are documented in `docs/config.md` (`format` section).
 
 ## Security and High-Risk Areas
 - `emmylua_code_analysis` denies panic/unwrap patterns in non-test builds (`clippy::panic`, `clippy::unwrap_used`, etc.).

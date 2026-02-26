@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{DiagnosticCode, VirtualWorkspace};
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn test_1() {
@@ -1602,5 +1604,53 @@ return t
                 matchesFilter = 42
             "#
         ));
+    }
+
+    #[test]
+    fn test_startup_stale_index_refresh_no_assign_mismatch_before_edit() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::AssignTypeMismatch);
+
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("startup_stale_index_refresh.lua");
+        let content = r#"
+            ---@class Foo
+            ---@field value integer
+
+            ---@type Foo
+            local foo = { value = 1 }
+            foo.value = 2
+        "#;
+
+        let file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(content.to_string()))
+            .expect("file id should exist");
+
+        ws.analysis.compilation.clear_index();
+        let updated_file_ids = ws
+            .analysis
+            .update_files_by_uri(vec![(uri, Some(content.to_string()))]);
+        assert_eq!(updated_file_ids, vec![file_id]);
+        assert!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_module_index()
+                .get_module(file_id)
+                .is_some()
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .expect("diagnostics should be available");
+        let code_string = Some(NumberOrString::String(
+            DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
+        ));
+        assert!(diagnostics.iter().all(|diagnostic| diagnostic.code != code_string));
     }
 }

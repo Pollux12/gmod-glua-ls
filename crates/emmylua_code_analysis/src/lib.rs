@@ -123,6 +123,8 @@ impl EmmyLuaAnalysis {
                     .map(String::as_str),
             ) && old_text == new_text
             {
+                self.compilation.remove_index(vec![file_id]);
+                self.compilation.update_index(vec![file_id]);
                 return Some(file_id);
             }
         } else if text.is_none() {
@@ -217,6 +219,8 @@ impl EmmyLuaAnalysis {
                             .map(String::as_str),
                     ) && old_text == new_text
                     {
+                        removed_files.insert(file_id);
+                        updated_files.insert(file_id);
                         continue;
                     }
                 } else if text.is_none() {
@@ -268,6 +272,8 @@ impl EmmyLuaAnalysis {
                             .map(String::as_str),
                     ) && old_text == new_text
                     {
+                        removed_files.insert(file_id);
+                        updated_files.insert(file_id);
                         continue;
                     }
                 } else if text.is_none() {
@@ -476,3 +482,68 @@ impl Default for EmmyLuaAnalysis {
 
 unsafe impl Send for EmmyLuaAnalysis {}
 unsafe impl Sync for EmmyLuaAnalysis {}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, str::FromStr};
+
+    use lsp_types::Uri;
+
+    use crate::EmmyLuaAnalysis;
+
+    #[test]
+    fn unchanged_update_file_by_uri_rebuilds_index() {
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.add_main_workspace(PathBuf::from("C:\\workspace"));
+
+        let uri = Uri::from_str("file:///C:/workspace/test.lua").expect("uri should parse");
+        let content = "local IsValid = IsValid";
+        let file_id = analysis
+            .update_file_by_uri(&uri, Some(content.to_string()))
+            .expect("file id should exist");
+
+        analysis.compilation.clear_index();
+        assert!(
+            analysis
+                .compilation
+                .get_db()
+                .get_module_index()
+                .get_module(file_id)
+                .is_none()
+        );
+
+        analysis.update_file_by_uri(&uri, Some(content.to_string()));
+        assert!(
+            analysis
+                .compilation
+                .get_db()
+                .get_module_index()
+                .get_module(file_id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn unchanged_update_files_by_uri_rebuilds_index() {
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.add_main_workspace(PathBuf::from("C:\\workspace"));
+
+        let uri = Uri::from_str("file:///C:/workspace/test.lua").expect("uri should parse");
+        let content = "local IsValid = IsValid";
+        let file_id = analysis
+            .update_file_by_uri(&uri, Some(content.to_string()))
+            .expect("file id should exist");
+
+        analysis.compilation.clear_index();
+        let updated = analysis.update_files_by_uri(vec![(uri, Some(content.to_string()))]);
+        assert_eq!(updated, vec![file_id]);
+        assert!(
+            analysis
+                .compilation
+                .get_db()
+                .get_module_index()
+                .get_module(file_id)
+                .is_some()
+        );
+    }
+}
