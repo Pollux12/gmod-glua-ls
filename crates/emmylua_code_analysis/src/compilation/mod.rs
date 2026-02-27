@@ -2,6 +2,7 @@ pub(crate) mod analyzer;
 mod test;
 
 pub use analyzer::unresolve::extract_hook_name;
+pub use analyzer::gmod::get_scripted_class_info_for_file;
 
 use std::sync::Arc;
 

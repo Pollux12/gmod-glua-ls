@@ -1884,6 +1884,16 @@ pub fn get_gmod_class_name_for_file(db: &DbIndex, file_id: FileId) -> Option<Str
     detect_scoped_class_from_path(db, file_id).map(|m| m.class_name)
 }
 
+/// Returns the scripted class info `(class_name, global_name)` for a file, if it belongs to a
+/// GMod scripted class scope.  `global_name` is the well-known table name used in the file
+/// (e.g. `"ENT"`, `"SWEP"`, `"TOOL"`, `"EFFECT"`, `"PLUGIN"`).
+pub fn get_scripted_class_info_for_file(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Option<(String, &'static str)> {
+    detect_scoped_class_from_path(db, file_id).map(|m| (m.class_name, m.global_name))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GmodSystemCallKind {
     AddNetworkString,

@@ -1,12 +1,31 @@
 use std::collections::HashMap;
 
 use emmylua_code_analysis::{
-    DbIndex, FileId, GmodClassCallLiteral, GmodScriptedClassCallMetadata, LuaDecl, LuaDeclId,
-    LuaDeclarationTree, LuaDocument, LuaType, LuaTypeOwner,
+    DbIndex, EmmyrcGmodOutlineVerbosity, FileId, GmodClassCallLiteral, GmodHookKind,
+    GmodScriptedClassCallMetadata, GmodTimerKind, LuaDecl, LuaDeclId, LuaDeclarationTree,
+    LuaDocument, LuaType, LuaTypeOwner, get_scripted_class_info_for_file,
 };
 use emmylua_parser::{LuaAstNode, LuaChunk, LuaSyntaxId, LuaSyntaxNode, LuaSyntaxToken};
 use lsp_types::{DocumentSymbol, SymbolKind};
 use rowan::{TextRange, TextSize};
+
+/// An entry in the gmod-call symbol map keyed by the call-expression syntax id.
+pub struct GmodCallEntry {
+    pub kind: SymbolKind,
+    pub label: String,
+    /// 0-based index of the callback closure argument in the call expression.
+    pub callback_arg_index: Option<usize>,
+}
+
+struct ScriptedClassInfo {
+    /// Human-readable class name (e.g. "my_entity").
+    #[allow(dead_code)]
+    class_name: String,
+    /// Global variable name used in the file (e.g. "ENT", "SWEP", "TOOL").
+    global_name: &'static str,
+    /// Label to show in the outline (e.g. "my_entity (Entity)").
+    class_label: String,
+}
 
 pub struct DocumentSymbolBuilder<'a> {
     db: &'a DbIndex,
@@ -14,7 +33,18 @@ pub struct DocumentSymbolBuilder<'a> {
     document: &'a LuaDocument<'a>,
     document_symbols: HashMap<LuaSyntaxId, Box<LuaSymbol>>,
     decl_symbol_ids: HashMap<LuaDeclId, LuaSyntaxId>,
+    /// Maps a variable's decl id to its display name for VGUI panels and scripted entity classes.
     vgui_panel_names: HashMap<LuaDeclId, String>,
+    /// Maps call-expression syntax ids to gmod-specific symbol data (hook.Add, net.Receive, …).
+    gmod_call_map: HashMap<LuaSyntaxId, GmodCallEntry>,
+    /// Information about the scripted entity class this file belongs to (if any).
+    scripted_class_info: Option<ScriptedClassInfo>,
+    /// Syntax id of the lazily-created top-level class symbol for scripted entities.
+    scripted_class_symbol_id: Option<LuaSyntaxId>,
+    /// Outline verbosity setting from config.
+    verbosity: EmmyrcGmodOutlineVerbosity,
+    /// Whether GMod analysis is enabled.
+    gmod_enabled: bool,
 }
 
 impl<'a> DocumentSymbolBuilder<'a> {
@@ -23,8 +53,32 @@ impl<'a> DocumentSymbolBuilder<'a> {
         decl_tree: &'a LuaDeclarationTree,
         document: &'a LuaDocument,
     ) -> Self {
+        let emmyrc = db.get_emmyrc();
+        let gmod_enabled = emmyrc.gmod.enabled;
+        let verbosity = if gmod_enabled {
+            emmyrc.gmod.outline.verbosity
+        } else {
+            // Keep non-GMod workspaces on legacy outline behavior unless GMod analysis is enabled.
+            EmmyrcGmodOutlineVerbosity::Verbose
+        };
+
+        let file_id = document.get_file_id();
         let vgui_panel_names =
-            Self::collect_vgui_panel_names(db, decl_tree, document.get_file_id());
+            Self::collect_class_panel_names(db, decl_tree, file_id, gmod_enabled);
+        let gmod_call_map = Self::collect_gmod_call_map(db, file_id, gmod_enabled);
+        let scripted_class_info = if gmod_enabled {
+            get_scripted_class_info_for_file(db, file_id).map(|(class_name, global_name)| {
+                let type_label = scripted_class_type_label(global_name);
+                let class_label = format!("{class_name} ({type_label})");
+                ScriptedClassInfo {
+                    class_name,
+                    global_name,
+                    class_label,
+                }
+            })
+        } else {
+            None
+        };
 
         Self {
             db,
@@ -33,28 +87,51 @@ impl<'a> DocumentSymbolBuilder<'a> {
             document_symbols: HashMap::new(),
             decl_symbol_ids: HashMap::new(),
             vgui_panel_names,
+            gmod_call_map,
+            scripted_class_info,
+            scripted_class_symbol_id: None,
+            verbosity,
+            gmod_enabled,
         }
     }
 
-    fn collect_vgui_panel_names(
+    /// Collect panel/class names for VGUI panels, derma controls, and scripted entity classes.
+    fn collect_class_panel_names(
         db: &DbIndex,
         decl_tree: &LuaDeclarationTree,
         file_id: FileId,
+        gmod_enabled: bool,
     ) -> HashMap<LuaDeclId, String> {
         let mut panel_names = HashMap::new();
-        let Some(file_metadata) = db
-            .get_gmod_class_metadata_index()
-            .get_file_metadata(&file_id)
-        else {
+        if !gmod_enabled {
             return panel_names;
-        };
-
-        for call in &file_metadata.vgui_register_calls {
-            Self::collect_vgui_panel_call(decl_tree, call, 1, &mut panel_names);
         }
 
-        for call in &file_metadata.derma_define_control_calls {
-            Self::collect_vgui_panel_call(decl_tree, call, 2, &mut panel_names);
+        if let Some(file_metadata) = db.get_gmod_class_metadata_index().get_file_metadata(&file_id)
+        {
+            for call in &file_metadata.vgui_register_calls {
+                Self::collect_vgui_panel_call(decl_tree, call, 1, &mut panel_names);
+            }
+            for call in &file_metadata.derma_define_control_calls {
+                Self::collect_vgui_panel_call(decl_tree, call, 2, &mut panel_names);
+            }
+        }
+
+        // Scripted entity classes (ENT, SWEP, TOOL, EFFECT, PLUGIN).
+        if let Some((class_name, global_name)) =
+            get_scripted_class_info_for_file(db, file_id)
+        {
+            let type_label = scripted_class_type_label(global_name);
+            let class_label = format!("{class_name} ({type_label})");
+            let class_decl_id = decl_tree
+                .get_decls()
+                .values()
+                .filter(|decl| decl.get_name() == global_name)
+                .min_by_key(|decl| decl.get_position())
+                .map(|decl| decl.get_id());
+            if let Some(class_decl_id) = class_decl_id {
+                panel_names.insert(class_decl_id, class_label);
+            }
         }
 
         panel_names
@@ -81,7 +158,96 @@ impl<'a> DocumentSymbolBuilder<'a> {
             return;
         };
 
-        panel_names.insert(decl.get_id(), panel_name.clone());
+        panel_names.insert(decl.get_id(), format!("{panel_name} (VGUI)"));
+    }
+
+    /// Build the lookup map from gmod call-expression syntax ids to outline entries.
+    fn collect_gmod_call_map(
+        db: &DbIndex,
+        file_id: FileId,
+        gmod_enabled: bool,
+    ) -> HashMap<LuaSyntaxId, GmodCallEntry> {
+        let mut map = HashMap::new();
+        if !gmod_enabled {
+            return map;
+        }
+
+        let infer_index = db.get_gmod_infer_index();
+
+        // hook.Add / gamemode method hooks
+        if let Some(hook_meta) = infer_index.get_hook_file_metadata(&file_id) {
+            for site in &hook_meta.sites {
+                if site.kind != GmodHookKind::Add {
+                    continue;
+                }
+                let label = match &site.hook_name {
+                    Some(name) if !name.is_empty() => format!("hook: {name}"),
+                    _ => "hook: (dynamic)".to_string(),
+                };
+                map.insert(
+                    site.syntax_id,
+                    GmodCallEntry {
+                        kind: SymbolKind::EVENT,
+                        label,
+                        callback_arg_index: Some(2),
+                    },
+                );
+            }
+        }
+
+        // System calls: net.Receive, concommand.Add, timer.Create, timer.Simple
+        if let Some(sys_meta) = infer_index.get_system_file_metadata(&file_id) {
+            for site in &sys_meta.net_receive_calls {
+                let label = match &site.message_name {
+                    Some(name) if !name.is_empty() => format!("net.Receive: {name}"),
+                    _ => "net.Receive: (dynamic)".to_string(),
+                };
+                map.insert(
+                    site.syntax_id,
+                    GmodCallEntry {
+                        kind: SymbolKind::EVENT,
+                        label,
+                        callback_arg_index: Some(1),
+                    },
+                );
+            }
+
+            for site in &sys_meta.concommand_add_calls {
+                let label = match &site.command_name {
+                    Some(name) if !name.is_empty() => format!("concommand: {name}"),
+                    _ => "concommand: (dynamic)".to_string(),
+                };
+                map.insert(
+                    site.syntax_id,
+                    GmodCallEntry {
+                        kind: SymbolKind::FUNCTION,
+                        label,
+                        callback_arg_index: Some(1),
+                    },
+                );
+            }
+
+            for site in &sys_meta.timer_calls {
+                let label = match &site.timer_name {
+                    Some(name) if !name.is_empty() => format!("timer: {name}"),
+                    _ => "timer.Simple".to_string(),
+                };
+                let callback_arg_index = match site.kind {
+                    GmodTimerKind::Create => Some(3),
+                    GmodTimerKind::Simple => Some(1),
+                };
+                map.insert(
+                    site.syntax_id,
+                    GmodCallEntry {
+                        kind: SymbolKind::EVENT,
+                        label,
+                        callback_arg_index,
+                    },
+                );
+            }
+        }
+
+        map
     }
 
     pub fn get_file_id(&self) -> FileId {
@@ -100,6 +266,86 @@ impl<'a> DocumentSymbolBuilder<'a> {
 
     pub fn get_vgui_panel_name(&self, decl_id: &LuaDeclId) -> Option<&str> {
         self.vgui_panel_names.get(decl_id).map(String::as_str)
+    }
+
+    pub fn get_gmod_call_entry(&self, syntax_id: &LuaSyntaxId) -> Option<&GmodCallEntry> {
+        self.gmod_call_map.get(syntax_id)
+    }
+
+    pub fn get_verbosity(&self) -> EmmyrcGmodOutlineVerbosity {
+        self.verbosity
+    }
+
+    pub fn is_gmod_enabled(&self) -> bool {
+        self.gmod_enabled
+    }
+
+    /// Returns true if a symbol with the given type is "interesting" enough to show at the given
+    /// verbosity level.  Always true for `Verbose`.
+    pub fn is_type_interesting(&self, ty: &LuaType) -> bool {
+        match self.verbosity {
+            EmmyrcGmodOutlineVerbosity::Verbose => true,
+            EmmyrcGmodOutlineVerbosity::Normal => {
+                // Show anything that is more than a plain primitive.
+                !matches!(
+                    ty,
+                    LuaType::String
+                        | LuaType::StringConst(_)
+                        | LuaType::Integer
+                        | LuaType::IntegerConst(_)
+                        | LuaType::Number
+                        | LuaType::FloatConst(_)
+                        | LuaType::Boolean
+                        | LuaType::BooleanConst(_)
+                        | LuaType::Nil
+                        | LuaType::Unknown
+                )
+            }
+            EmmyrcGmodOutlineVerbosity::Minimal => {
+                // Only keep functions, classes, and named type references.
+                matches!(
+                    ty,
+                    LuaType::Signature(_)
+                        | LuaType::DocFunction(_)
+                        | LuaType::Def(_)
+                        | LuaType::Ref(_)
+                )
+            }
+        }
+    }
+
+    /// Returns the global name prefix this file uses for scripted class methods (e.g. "ENT"),
+    /// if the file is in a scripted entity scope.
+    pub fn scripted_class_global_name(&self) -> Option<&str> {
+        self.scripted_class_info
+            .as_ref()
+            .map(|info| info.global_name)
+    }
+
+    /// Returns the syntax id of the pre-created top-level scripted class symbol, if one exists.
+    pub fn get_scripted_class_symbol_id(&self) -> Option<LuaSyntaxId> {
+        self.scripted_class_symbol_id
+    }
+
+    /// Create the top-level scripted-class symbol using the chunk's block node as anchor.
+    /// Must be called before processing any statements so that function routing works.
+    /// Does nothing if the file is not in a scripted entity scope or it's already created.
+    pub fn maybe_ensure_scripted_class_symbol(
+        &mut self,
+        block_node: LuaSyntaxNode,
+        root_id: LuaSyntaxId,
+        file_range: TextRange,
+    ) {
+        if self.scripted_class_symbol_id.is_some() {
+            return;
+        }
+        let Some(info) = self.scripted_class_info.as_ref() else {
+            return;
+        };
+        let label = info.class_label.clone();
+        let symbol = LuaSymbol::new(label, None, SymbolKind::CLASS, file_range);
+        let id = self.add_node_symbol(block_node, symbol, Some(root_id));
+        self.scripted_class_symbol_id = Some(id);
     }
 
     pub fn bind_decl_symbol(&mut self, decl_id: LuaDeclId, symbol_id: LuaSyntaxId) {
@@ -321,9 +567,9 @@ impl<'a> DocumentSymbolBuilder<'a> {
                         }
 
                         let detail = format!("({})", param_names.join(", "));
-                        return (SymbolKind::FUNCTION, Some(detail));
+                        (SymbolKind::FUNCTION, Some(detail))
                     } else {
-                        return (SymbolKind::FUNCTION, None);
+                        (SymbolKind::FUNCTION, None)
                     }
                 }
                 _ => (SymbolKind::FUNCTION, None),
@@ -336,14 +582,26 @@ impl<'a> DocumentSymbolBuilder<'a> {
     }
 }
 
+/// Returns a human-readable type label for a scripted entity global name.
+pub fn scripted_class_type_label(global_name: &str) -> &'static str {
+    match global_name {
+        "ENT" => "Entity",
+        "SWEP" => "Weapon",
+        "TOOL" => "Tool",
+        "EFFECT" => "Effect",
+        "PLUGIN" => "Plugin",
+        _ => "Class",
+    }
+}
+
 #[derive(Debug)]
 pub struct LuaSymbol {
-    name: String,
-    detail: Option<String>,
-    kind: SymbolKind,
-    range: TextRange,
-    selection_range: Option<TextRange>,
-    children: Vec<LuaSyntaxId>,
+    pub name: String,
+    pub detail: Option<String>,
+    pub kind: SymbolKind,
+    pub range: TextRange,
+    pub selection_range: Option<TextRange>,
+    pub children: Vec<LuaSyntaxId>,
 }
 
 impl LuaSymbol {

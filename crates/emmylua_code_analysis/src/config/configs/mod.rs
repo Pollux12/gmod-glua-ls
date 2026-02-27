@@ -24,7 +24,8 @@ pub use doc::{DocSyntax, EmmyrcDoc};
 pub use document_color::EmmyrcDocumentColor;
 pub use gmod::{
     EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodNetwork, EmmyrcGmodNetworkCompletion,
-    EmmyrcGmodNetworkDiagnostics, EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes,
+    EmmyrcGmodNetworkDiagnostics, EmmyrcGmodOutline, EmmyrcGmodOutlineVerbosity, EmmyrcGmodRealm,
+    EmmyrcGmodScriptedClassScopes,
 };
 pub use hover::EmmyrcHover;
 pub use inlayhint::EmmyrcInlayHint;

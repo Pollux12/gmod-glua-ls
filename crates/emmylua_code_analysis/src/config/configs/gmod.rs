@@ -18,6 +18,8 @@ pub struct EmmyrcGmod {
     pub network: EmmyrcGmodNetwork,
     #[serde(default)]
     pub vgui: EmmyrcGmodVgui,
+    #[serde(default)]
+    pub outline: EmmyrcGmodOutline,
     #[serde(default = "param_type_hints_default")]
     pub param_type_hints: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +80,7 @@ impl Default for EmmyrcGmod {
             hook_mappings: EmmyrcGmodHookMappings::default(),
             network: EmmyrcGmodNetwork::default(),
             vgui: EmmyrcGmodVgui::default(),
+            outline: EmmyrcGmodOutline::default(),
             param_type_hints: param_type_hints_default(),
             detect_realm_from_filename: None,
             detect_realm_from_calls: None,
@@ -149,6 +152,39 @@ impl Default for EmmyrcGmodScriptedClassScopes {
         Self {
             include: scripted_scope_include_default(),
             exclude: Vec::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EmmyrcGmodOutlineVerbosity {
+    /// Show only functions, classes, VGUI panels, hooks, net receivers, timers, concommands.
+    Minimal,
+    /// Show functions, classes, important tables, hooks, net receivers, timers, concommands, and
+    /// non-primitive variables. Hides `if`/`for`/`do` blocks.
+    #[default]
+    Normal,
+    /// Show everything (legacy behavior, includes control-flow blocks and all locals).
+    Verbose,
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EmmyrcGmodOutline {
+    /// Controls how much detail the document outline shows.
+    /// - `minimal`: functions, classes, hooks, net.Receive, timers, concommands only.
+    /// - `normal` (default): same as minimal plus non-primitive variables and tables; hides
+    ///   control-flow blocks.
+    /// - `verbose`: everything including `if`, `for`, `do` blocks and all locals.
+    #[serde(default)]
+    pub verbosity: EmmyrcGmodOutlineVerbosity,
+}
+
+impl Default for EmmyrcGmodOutline {
+    fn default() -> Self {
+        Self {
+            verbosity: EmmyrcGmodOutlineVerbosity::Normal,
         }
     }
 }

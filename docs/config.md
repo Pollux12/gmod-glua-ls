@@ -310,6 +310,26 @@ Enables Code Lenses for VGUI panel definitions.
 
 Enables Inlay Hints for VGUI panel definitions.
 
+### gmod.outline
+
+Controls how the document **Outline** view (symbols) appears for Lua files.
+
+This setting is applied when `gmod.enabled` is `true`. When GMod analysis is disabled,
+outline behavior remains on the legacy (verbose) mode.
+
+#### gmod.outline.verbosity
+
+- **Type**: `"minimal" | "normal" | "verbose"`
+- **Default**: `"normal"`
+
+Sets the level of detail shown in the document outline.
+
+| Value | Behavior |
+|---|---|
+| `minimal` | Only functions, classes, VGUI panels, hooks (`hook.Add`), net receivers (`net.Receive`), timers, and concommands. Primitive-typed locals are hidden. |
+| `normal` (default) | Same as `minimal`, plus non-primitive variables and typed tables. `if`, `for`, and `do` blocks are not shown as outline items but their contents are promoted to the enclosing scope. |
+| `verbose` | Full legacy view: all locals, all assignments, and control-flow blocks (`if`, `for`, `do`) appear as outline items. |
+
 ### Scripted Class Analysis
 
 Scripted class analysis runs on files matched by `gmod.scriptedClassScopes` and synthesizes members for common Garry's Mod patterns:

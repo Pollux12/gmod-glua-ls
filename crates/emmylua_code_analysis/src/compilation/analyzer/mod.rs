@@ -3,7 +3,7 @@ mod decl;
 mod doc;
 mod dynamic_field;
 mod flow;
-mod gmod;
+pub(crate) mod gmod;
 mod infer_cache_manager;
 mod lua;
 pub(crate) mod unresolve;

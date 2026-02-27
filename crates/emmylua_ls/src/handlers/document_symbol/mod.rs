@@ -4,10 +4,10 @@ mod expr;
 mod stats;
 
 use builder::{DocumentSymbolBuilder, LuaSymbol};
-use emmylua_code_analysis::SemanticModel;
+use emmylua_code_analysis::{EmmyrcGmodOutlineVerbosity, SemanticModel};
 use emmylua_parser::{
-    LuaAstNode, LuaBlock, LuaChunk, LuaComment, LuaExpr, LuaFuncStat, LuaSingleArgExpr, LuaStat,
-    LuaSyntaxId, LuaSyntaxNode, LuaVarExpr,
+    LuaAstNode, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaComment, LuaExpr, LuaFuncStat,
+    LuaSingleArgExpr, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaVarExpr,
 };
 use expr::{build_closure_expr_symbol, build_table_symbol};
 use lsp_types::{
@@ -15,9 +15,9 @@ use lsp_types::{
     DocumentSymbolResponse, OneOf, ServerCapabilities, SymbolKind,
 };
 use stats::{
-    IfSymbolContext, build_assign_stat_symbol, build_do_stat_symbol, build_for_range_stat_symbol,
+    build_assign_stat_symbol, build_do_stat_symbol, build_for_range_stat_symbol,
     build_for_stat_symbol, build_func_stat_symbol, build_if_stat_symbol,
-    build_local_func_stat_symbol, build_local_stat_symbol,
+    build_local_func_stat_symbol, build_local_stat_symbol, IfSymbolContext,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -71,6 +71,15 @@ fn build_child_document_symbols(
     root: &LuaChunk,
     root_id: LuaSyntaxId,
 ) -> Option<()> {
+    // Pre-create the scripted entity class symbol (e.g. "my_entity (Entity)") before processing
+    // any statements so that method routing in resolve_func_parent_id can find it.
+    if let Some(block) = root.syntax().children().find_map(LuaBlock::cast) {
+        builder.maybe_ensure_scripted_class_symbol(
+            block.syntax().clone(),
+            root_id,
+            root.get_range(),
+        );
+    }
     process_chunk(builder, root, root_id)
 }
 
@@ -131,6 +140,8 @@ fn process_stat(
     stat: LuaStat,
     parent_id: LuaSyntaxId,
 ) -> Option<()> {
+    let verbose = builder.get_verbosity() == EmmyrcGmodOutlineVerbosity::Verbose;
+
     match stat {
         LuaStat::LocalStat(local_stat) => {
             let bindings = build_local_stat_symbol(builder, local_stat, parent_id)?;
@@ -168,29 +179,67 @@ fn process_stat(
             }
         }
         LuaStat::ForStat(for_stat) => {
-            let for_id = build_for_stat_symbol(builder, for_stat.clone(), parent_id)?;
-            process_exprs(builder, for_stat.syntax(), for_id)?;
-            if let Some(block) = for_stat.get_block() {
-                process_block(builder, block, for_id)?;
+            if verbose {
+                let for_id = build_for_stat_symbol(builder, for_stat.clone(), parent_id)?;
+                process_exprs(builder, for_stat.syntax(), for_id)?;
+                if let Some(block) = for_stat.get_block() {
+                    process_block(builder, block, for_id)?;
+                }
+            } else {
+                // Promote children directly to parent — no `for` clutter.
+                process_exprs(builder, for_stat.syntax(), parent_id)?;
+                if let Some(block) = for_stat.get_block() {
+                    process_block(builder, block, parent_id)?;
+                }
             }
         }
         LuaStat::ForRangeStat(for_range_stat) => {
-            let for_range_id =
-                build_for_range_stat_symbol(builder, for_range_stat.clone(), parent_id)?;
-            process_exprs(builder, for_range_stat.syntax(), for_range_id)?;
-            if let Some(block) = for_range_stat.get_block() {
-                process_block(builder, block, for_range_id)?;
+            if verbose {
+                let for_range_id =
+                    build_for_range_stat_symbol(builder, for_range_stat.clone(), parent_id)?;
+                process_exprs(builder, for_range_stat.syntax(), for_range_id)?;
+                if let Some(block) = for_range_stat.get_block() {
+                    process_block(builder, block, for_range_id)?;
+                }
+            } else {
+                process_exprs(builder, for_range_stat.syntax(), parent_id)?;
+                if let Some(block) = for_range_stat.get_block() {
+                    process_block(builder, block, parent_id)?;
+                }
             }
         }
         LuaStat::IfStat(if_stat) => {
-            let ctx = build_if_stat_symbol(builder, if_stat.clone(), parent_id)?;
-            if let Some(condition) = if_stat.get_condition_expr() {
-                process_expr(builder, condition, ctx.if_id, false)?;
+            if verbose {
+                let ctx = build_if_stat_symbol(builder, if_stat.clone(), parent_id)?;
+                if let Some(condition) = if_stat.get_condition_expr() {
+                    process_expr(builder, condition, ctx.if_id, false)?;
+                }
+                if let Some(block) = if_stat.get_block() {
+                    process_block(builder, block, ctx.if_id)?;
+                }
+                process_if_clauses(builder, ctx)?;
+            } else {
+                // Promote all if/elseif/else children to parent — no `if` clutter.
+                if let Some(condition) = if_stat.get_condition_expr() {
+                    process_expr(builder, condition, parent_id, false)?;
+                }
+                if let Some(block) = if_stat.get_block() {
+                    process_block(builder, block, parent_id)?;
+                }
+                for clause in if_stat.get_all_clause() {
+                    use emmylua_parser::LuaIfClauseStat;
+                    let (condition, block) = match &clause {
+                        LuaIfClauseStat::ElseIf(c) => (c.get_condition_expr(), c.get_block()),
+                        LuaIfClauseStat::Else(c) => (None, c.get_block()),
+                    };
+                    if let Some(condition) = condition {
+                        process_expr(builder, condition, parent_id, false)?;
+                    }
+                    if let Some(block) = block {
+                        process_block(builder, block, parent_id)?;
+                    }
+                }
             }
-            if let Some(block) = if_stat.get_block() {
-                process_block(builder, block, ctx.if_id)?;
-            }
-            process_if_clauses(builder, ctx)?;
         }
         LuaStat::WhileStat(while_stat) => {
             if let Some(condition) = while_stat.get_condition_expr() {
@@ -209,12 +258,62 @@ fn process_stat(
             }
         }
         LuaStat::DoStat(do_stat) => {
-            let do_id = build_do_stat_symbol(builder, do_stat.clone(), parent_id)?;
-            if let Some(block) = do_stat.get_block() {
-                process_block(builder, block, do_id)?;
+            if verbose {
+                let do_id = build_do_stat_symbol(builder, do_stat.clone(), parent_id)?;
+                if let Some(block) = do_stat.get_block() {
+                    process_block(builder, block, do_id)?;
+                }
+            } else {
+                if let Some(block) = do_stat.get_block() {
+                    process_block(builder, block, parent_id)?;
+                }
             }
         }
         LuaStat::CallExprStat(call_stat) => {
+            // Check whether this is a named GMod call (hook.Add, net.Receive, …).
+            if builder.is_gmod_enabled() {
+                if let Some(call_expr) = call_stat
+                    .syntax()
+                    .children()
+                    .find_map(LuaCallExpr::cast)
+                {
+                    let call_syntax_id = call_expr.get_syntax_id();
+                    if let Some(entry) = builder.get_gmod_call_entry(&call_syntax_id) {
+                        let label = entry.label.clone();
+                        let kind = entry.kind;
+                        let cb_arg_idx = entry.callback_arg_index;
+                        let symbol = LuaSymbol::new(
+                            label,
+                            None,
+                            kind,
+                            call_stat.get_range(),
+                        );
+                        let call_symbol_id = builder.add_node_symbol(
+                            call_stat.syntax().clone(),
+                            symbol,
+                            Some(parent_id),
+                        );
+                        // Traverse the callback closure body so that nested functions appear
+                        // as children of the hook/net/timer symbol.
+                        if let Some(arg_idx) = cb_arg_idx {
+                            if let Some(closure) =
+                                get_call_arg_closure(&call_expr, arg_idx)
+                            {
+                                let scope_parent = build_closure_expr_symbol(
+                                    builder,
+                                    closure.clone(),
+                                    call_symbol_id,
+                                )?;
+                                if let Some(block) = closure.get_block() {
+                                    process_block(builder, block, scope_parent)?;
+                                }
+                            }
+                        }
+                        return Some(());
+                    }
+                }
+            }
+            // Fall through: no named GMod symbol — scan for interesting exprs inside.
             process_exprs(builder, call_stat.syntax(), parent_id)?;
         }
         LuaStat::ReturnStat(return_stat) => {
@@ -233,8 +332,18 @@ fn process_stat(
     Some(())
 }
 
+/// Extract the closure expression at a specific argument index from a call expression.
+fn get_call_arg_closure(call_expr: &LuaCallExpr, arg_index: usize) -> Option<LuaClosureExpr> {
+    let args = call_expr.get_args_list()?;
+    let arg = args.get_args().nth(arg_index)?;
+    match arg {
+        LuaExpr::ClosureExpr(closure) => Some(closure),
+        _ => None,
+    }
+}
+
 fn resolve_func_parent_id(
-    builder: &DocumentSymbolBuilder,
+    builder: &mut DocumentSymbolBuilder,
     func_stat: &LuaFuncStat,
     default_parent_id: LuaSyntaxId,
 ) -> LuaSyntaxId {
@@ -258,18 +367,40 @@ fn resolve_func_parent_id(
         return default_parent_id;
     };
 
-    let Some(decl_id) = builder.resolve_local_decl_id(&prefix_name, func_stat.get_range().start())
-    else {
-        return default_parent_id;
-    };
+    // Check VGUI / scripted-entity decl-based grouping first.
+    if let Some(decl_id) =
+        builder.resolve_local_decl_id(&prefix_name, func_stat.get_range().start())
+    {
+        if builder.get_vgui_panel_name(&decl_id).is_some() {
+            if let Some(sym_id) = builder.get_decl_symbol_id(&decl_id) {
+                return sym_id;
+            }
 
-    if builder.get_vgui_panel_name(&decl_id).is_none() {
+            if let Some(decl) = builder.get_decl(&decl_id)
+                && decl.is_global()
+                && builder.scripted_class_global_name() == Some(prefix_name.as_ref())
+                && let Some(class_sym_id) = builder.get_scripted_class_symbol_id()
+            {
+                return class_sym_id;
+            }
+        }
+
+        // Local shadow exists but is not a class panel/scripted-class declaration.
+        // Do not fall back to the file-level scripted class symbol in this case.
         return default_parent_id;
     }
 
-    builder
-        .get_decl_symbol_id(&decl_id)
-        .unwrap_or(default_parent_id)
+    // Fallback: check whether the prefix matches the scripted class global name (handles files
+    // that define methods without an explicit `ENT = {}` assignment).
+    if let Some(class_global) = builder.scripted_class_global_name() {
+        if prefix_name == class_global {
+            if let Some(class_sym_id) = builder.get_scripted_class_symbol_id() {
+                return class_sym_id;
+            }
+        }
+    }
+
+    default_parent_id
 }
 
 fn process_if_clauses(builder: &mut DocumentSymbolBuilder, ctx: IfSymbolContext) -> Option<()> {
@@ -408,7 +539,7 @@ impl RegisterCapabilities for DocumentSymbolCapabilities {
 
 #[cfg(test)]
 mod tests {
-    use emmylua_code_analysis::{Emmyrc, VirtualWorkspace};
+    use emmylua_code_analysis::{Emmyrc, EmmyrcGmodOutlineVerbosity, VirtualWorkspace};
     use googletest::prelude::*;
     use lsp_types::{DocumentSymbol, SymbolKind};
 
@@ -419,6 +550,28 @@ mod tests {
         name: &str,
     ) -> Option<&'a DocumentSymbol> {
         symbols.iter().find(|symbol| symbol.name == name)
+    }
+
+    fn top_level_names(symbols: &[DocumentSymbol]) -> Vec<String> {
+        symbols.iter().map(|symbol| symbol.name.clone()).collect()
+    }
+
+    fn any_symbol_matches<F>(symbols: &[DocumentSymbol], predicate: &F) -> bool
+    where
+        F: Fn(&DocumentSymbol) -> bool,
+    {
+        for symbol in symbols {
+            if predicate(symbol) {
+                return true;
+            }
+            if let Some(children) = symbol.children.as_ref()
+                && any_symbol_matches(children, predicate)
+            {
+                return true;
+            }
+        }
+
+        false
     }
 
     #[gtest]
@@ -481,5 +634,284 @@ mod tests {
                 .any(|symbol| symbol.name == "PANEL"),
             eq(false)
         )
+    }
+
+    #[gtest]
+    fn normal_verbosity_hides_primitive_locals() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.outline.verbosity = EmmyrcGmodOutlineVerbosity::Normal;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/outline_normal.lua",
+            r#"
+            local primitive = 1
+            local fn = function() end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+        let names = top_level_names(top_level_symbols);
+
+        verify_that!(names.contains(&"primitive".to_string()), eq(false))?;
+        verify_that!(names.contains(&"fn".to_string()), eq(true))
+    }
+
+    #[gtest]
+    fn verbose_verbosity_keeps_primitive_locals() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.outline.verbosity = EmmyrcGmodOutlineVerbosity::Verbose;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/outline_verbose.lua",
+            r#"
+            local primitive = 1
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+        let names = top_level_names(top_level_symbols);
+
+        verify_that!(names.contains(&"primitive".to_string()), eq(true))
+    }
+
+    #[gtest]
+    fn hook_add_has_named_outline_symbol() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/server/hook_symbol.lua",
+            r#"
+            hook.Add("Think", "MyHook", function()
+                local x = 1
+            end)
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let hook_symbol = find_top_level_symbol(top_level_symbols, "hook: Think").or_fail()?;
+        verify_that!(hook_symbol.kind, eq(SymbolKind::EVENT))
+    }
+
+    #[gtest]
+    fn scripted_entity_methods_group_without_explicit_decl() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/entities/my_entity/init.lua",
+            r#"
+            function ENT:Think()
+            end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let class_symbol =
+            find_top_level_symbol(top_level_symbols, "my_entity (Entity)").or_fail()?;
+        let children = class_symbol.children.as_ref().or_fail()?;
+        let child_names = top_level_names(children);
+        verify_that!(child_names.contains(&"ENT:Think".to_string()), eq(true))
+    }
+
+    #[gtest]
+    fn scripted_entity_explicit_decl_does_not_duplicate_class_symbol() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/entities/my_entity/init.lua",
+            r#"
+            ENT = {}
+
+            function ENT:Think()
+            end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.unwrap_or_default();
+
+        let class_symbols = top_level_symbols
+            .iter()
+            .filter(|symbol| symbol.name == "my_entity (Entity)")
+            .collect::<Vec<_>>();
+        verify_that!(class_symbols.len(), eq(1))?;
+
+        let bad_label_exists = top_level_symbols
+            .iter()
+            .any(|symbol| symbol.name == "my_entity (Entity) (VGUI)");
+        verify_that!(bad_label_exists, eq(false))?;
+
+        let children = class_symbols[0].children.as_ref().or_fail()?;
+        let child_names = top_level_names(children);
+        verify_that!(child_names.contains(&"ENT:Think".to_string()), eq(true))
+    }
+
+    #[gtest]
+    fn local_function_symbol_keeps_function_kind() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/function_symbol.lua",
+            r#"
+            local function foo(a, b)
+            end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let func_symbol = find_top_level_symbol(top_level_symbols, "foo").or_fail()?;
+        verify_that!(func_symbol.kind, eq(SymbolKind::FUNCTION))?;
+        verify_that!(func_symbol.detail.as_ref().is_some(), eq(true))
+    }
+
+    #[gtest]
+    fn gmod_disabled_uses_legacy_verbose_outline_behavior() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = false;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/non_gmod_verbose.lua",
+            r#"
+            local primitive = 1
+            if true then
+                local nested = 2
+            end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+        let names = top_level_names(top_level_symbols);
+
+        verify_that!(names.contains(&"primitive".to_string()), eq(true))?;
+        verify_that!(names.contains(&"if".to_string()), eq(true))
+    }
+
+    #[gtest]
+    fn shadowed_local_scripted_global_is_not_promoted_to_class() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/entities/my_entity/init.lua",
+            r#"
+            function ENT:Think()
+                local ENT = {}
+            end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let class_symbol =
+            find_top_level_symbol(top_level_symbols, "my_entity (Entity)").or_fail()?;
+        let children = class_symbol.children.as_ref().or_fail()?;
+        let has_nested_class_symbol = any_symbol_matches(children, &|symbol| {
+            symbol.kind == SymbolKind::CLASS && symbol.name == "my_entity (Entity)"
+        });
+        verify_that!(has_nested_class_symbol, eq(false))
+    }
+
+    #[gtest]
+    fn minimal_verbosity_does_not_leak_fields_from_hidden_tables() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.outline.verbosity = EmmyrcGmodOutlineVerbosity::Minimal;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/minimal_hidden_table.lua",
+            r#"
+            local hidden = {
+                BuildPanel = function() end,
+            }
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.unwrap_or_default();
+
+        let has_hidden = top_level_symbols.iter().any(|symbol| symbol.name == "hidden");
+        let has_field = top_level_symbols
+            .iter()
+            .any(|symbol| symbol.name == "BuildPanel");
+        verify_that!(has_hidden, eq(false))?;
+        verify_that!(has_field, eq(false))
     }
 }

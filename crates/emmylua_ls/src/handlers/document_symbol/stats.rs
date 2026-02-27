@@ -1,4 +1,4 @@
-use emmylua_code_analysis::{LuaDeclId, LuaSignatureId, LuaType};
+use emmylua_code_analysis::{EmmyrcGmodOutlineVerbosity, LuaDeclId, LuaSignatureId, LuaType};
 use emmylua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat,
     LuaFuncStat, LuaIfClauseStat, LuaIfStat, LuaLocalFuncStat, LuaLocalStat, LuaSyntaxId,
@@ -36,8 +36,27 @@ pub fn build_local_stat_symbol(
         let desc = builder.get_symbol_kind_and_detail(Some(&typ));
         let mut symbol_name = decl.get_name().to_string();
         let mut symbol_kind = desc.0;
-        if let Some(panel_name) = builder.get_vgui_panel_name(&decl_id) {
-            symbol_name = format!("{panel_name} (VGUI)");
+        let vgui_name = builder.get_vgui_panel_name(&decl_id).map(str::to_string);
+        if vgui_name.is_some() && builder.scripted_class_global_name() == Some(decl.get_name()) {
+            if let Some(scripted_symbol_id) = builder.get_scripted_class_symbol_id() {
+                builder.bind_decl_symbol(decl_id, scripted_symbol_id);
+                let value_expr = local_values.get(index).cloned();
+                bindings.push(SymbolBinding {
+                    symbol_id: scripted_symbol_id,
+                    value_expr,
+                });
+                continue;
+            }
+        }
+        // Minimal verbosity: drop uninteresting (primitive) locals.
+        if vgui_name.is_none()
+            && builder.get_verbosity() != EmmyrcGmodOutlineVerbosity::Verbose
+            && !builder.is_type_interesting(&typ)
+        {
+            continue;
+        }
+        if let Some(panel_name) = vgui_name {
+            symbol_name = panel_name;
             symbol_kind = SymbolKind::CLASS;
         }
         let range = if simple_local {
@@ -85,8 +104,27 @@ pub fn build_assign_stat_symbol(
         let desc = builder.get_symbol_kind_and_detail(Some(&typ));
         let mut symbol_name = decl.get_name().to_string();
         let mut symbol_kind = desc.0;
-        if let Some(panel_name) = builder.get_vgui_panel_name(&decl_id) {
-            symbol_name = format!("{panel_name} (VGUI)");
+        let vgui_name = builder.get_vgui_panel_name(&decl_id).map(str::to_string);
+        if vgui_name.is_some() && builder.scripted_class_global_name() == Some(decl.get_name()) {
+            if let Some(scripted_symbol_id) = builder.get_scripted_class_symbol_id() {
+                builder.bind_decl_symbol(decl_id, scripted_symbol_id);
+                let value_expr = exprs.get(index).cloned();
+                bindings.push(SymbolBinding {
+                    symbol_id: scripted_symbol_id,
+                    value_expr,
+                });
+                continue;
+            }
+        }
+        // Minimal verbosity: drop uninteresting (primitive) assignments.
+        if vgui_name.is_none()
+            && builder.get_verbosity() != EmmyrcGmodOutlineVerbosity::Verbose
+            && !builder.is_type_interesting(&typ)
+        {
+            continue;
+        }
+        if let Some(panel_name) = vgui_name {
+            symbol_name = panel_name;
             symbol_kind = SymbolKind::CLASS;
         }
 

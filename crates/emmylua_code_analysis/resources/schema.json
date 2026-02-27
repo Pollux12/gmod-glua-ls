@@ -93,6 +93,9 @@
           },
           "enabled": true
         },
+        "outline": {
+          "verbosity": "normal"
+        },
         "paramTypeHints": {
           "ent": "Entity",
           "entity": "Entity",
@@ -940,6 +943,12 @@
             "enabled": true
           }
         },
+        "outline": {
+          "$ref": "#/$defs/EmmyrcGmodOutline",
+          "default": {
+            "verbosity": "normal"
+          }
+        },
         "paramTypeHints": {
           "type": "object",
           "additionalProperties": {
@@ -1059,6 +1068,35 @@
           "default": true
         }
       }
+    },
+    "EmmyrcGmodOutline": {
+      "type": "object",
+      "properties": {
+        "verbosity": {
+          "description": "Controls how much detail the document outline shows.\n- `minimal`: functions, classes, hooks, net.Receive, timers, concommands only.\n- `normal` (default): same as minimal plus non-primitive variables and tables; hides\n  control-flow blocks.\n- `verbose`: everything including `if`, `for`, `do` blocks and all locals.",
+          "$ref": "#/$defs/EmmyrcGmodOutlineVerbosity",
+          "default": "normal"
+        }
+      }
+    },
+    "EmmyrcGmodOutlineVerbosity": {
+      "oneOf": [
+        {
+          "description": "Show only functions, classes, VGUI panels, hooks, net receivers, timers, concommands.",
+          "type": "string",
+          "const": "minimal"
+        },
+        {
+          "description": "Show functions, classes, important tables, hooks, net receivers, timers, concommands, and\nnon-primitive variables. Hides `if`/`for`/`do` blocks.",
+          "type": "string",
+          "const": "normal"
+        },
+        {
+          "description": "Show everything (legacy behavior, includes control-flow blocks and all locals).",
+          "type": "string",
+          "const": "verbose"
+        }
+      ]
     },
     "EmmyrcGmodRealm": {
       "type": "string",
