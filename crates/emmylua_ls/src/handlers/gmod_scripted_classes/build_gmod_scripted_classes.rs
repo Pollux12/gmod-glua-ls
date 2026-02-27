@@ -1,6 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use emmylua_code_analysis::{DbIndex, FileId, file_path_to_uri};
+use emmylua_code_analysis::{
+    DbIndex, FileId, GmodClassCallLiteral, GmodScriptedClassCallMetadata, file_path_to_uri,
+};
 use tokio_util::sync::CancellationToken;
 use wax::Pattern;
 
@@ -100,7 +102,7 @@ pub fn build_gmod_scripted_classes(
         let Some(scope_match) = detect_scoped_class_from_path(file_path) else {
             continue;
         };
-        let Some(uri) = file_uri_string(db, file_id, file_path.clone()) else {
+        let Some(uri) = file_uri_string(db, file_id) else {
             continue;
         };
 
@@ -109,6 +111,23 @@ pub fn build_gmod_scripted_classes(
             class_type: scope_match.class_type.to_string(),
             class_name: scope_match.class_name,
         });
+    }
+
+    for (file_id, file_metadata) in db.get_gmod_class_metadata_index().iter_file_metadata() {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
+
+        let Some(uri) = file_uri_string(db, *file_id) else {
+            continue;
+        };
+
+        push_vgui_panel_entries(&mut entries, &uri, &file_metadata.vgui_register_calls);
+        push_vgui_panel_entries(
+            &mut entries,
+            &uri,
+            &file_metadata.derma_define_control_calls,
+        );
     }
 
     entries.sort_by(|left, right| {
@@ -126,11 +145,40 @@ pub fn build_gmod_scripted_classes(
     Some(entries)
 }
 
-fn file_uri_string(db: &DbIndex, file_id: FileId, file_path: PathBuf) -> Option<String> {
+fn file_uri_string(db: &DbIndex, file_id: FileId) -> Option<String> {
     db.get_vfs()
         .get_uri(&file_id)
-        .or_else(|| file_path_to_uri(&file_path))
+        .or_else(|| {
+            db.get_vfs()
+                .get_file_path(&file_id)
+                .and_then(|file_path| file_path_to_uri(&file_path))
+        })
         .map(|uri| uri.to_string())
+}
+
+fn push_vgui_panel_entries(
+    entries: &mut Vec<GmodScriptedClassEntry>,
+    uri: &str,
+    calls: &[GmodScriptedClassCallMetadata],
+) {
+    for call in calls {
+        let Some(panel_name) = extract_vgui_panel_name(call) else {
+            continue;
+        };
+
+        entries.push(GmodScriptedClassEntry {
+            uri: uri.to_string(),
+            class_type: "VGUI".to_string(),
+            class_name: panel_name.to_string(),
+        });
+    }
+}
+
+fn extract_vgui_panel_name(call: &GmodScriptedClassCallMetadata) -> Option<&str> {
+    match call.literal_args.first() {
+        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => Some(name.as_str()),
+        _ => None,
+    }
 }
 
 fn is_file_in_scope(
@@ -311,6 +359,54 @@ mod tests {
         )?;
         verify_that!(
             entries.iter().any(|entry| entry.class_name == "ignored"),
+            eq(false)
+        )
+    }
+
+    #[gtest]
+    fn build_gmod_scripted_classes_includes_vgui_panels_from_metadata() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/client/cl_panel_defs.lua",
+            r#"
+            vgui.Register("MyPanel", {}, "DPanel")
+            derma.DefineControl("MyControl", "desc", {}, "DPanel")
+
+            local panel_name = "DynamicPanel"
+            vgui.Register(panel_name, {}, "DFrame")
+            derma.DefineControl("", "desc", {}, "DLabel")
+        "#,
+        );
+
+        let entries =
+            build_gmod_scripted_classes(ws.get_db_mut(), &CancellationToken::new()).or_fail()?;
+
+        verify_that!(
+            entries
+                .iter()
+                .any(|entry| { entry.class_type == "VGUI" && entry.class_name == "MyPanel" }),
+            eq(true)
+        )?;
+        verify_that!(
+            entries
+                .iter()
+                .any(|entry| { entry.class_type == "VGUI" && entry.class_name == "MyControl" }),
+            eq(true)
+        )?;
+        verify_that!(
+            entries
+                .iter()
+                .any(|entry| { entry.class_type == "VGUI" && entry.class_name == "DynamicPanel" }),
+            eq(false)
+        )?;
+        verify_that!(
+            entries
+                .iter()
+                .any(|entry| entry.class_type == "VGUI" && entry.class_name.is_empty()),
             eq(false)
         )
     }

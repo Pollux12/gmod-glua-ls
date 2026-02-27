@@ -16,6 +16,8 @@ pub struct EmmyrcGmod {
     pub hook_mappings: EmmyrcGmodHookMappings,
     #[serde(default)]
     pub network: EmmyrcGmodNetwork,
+    #[serde(default)]
+    pub vgui: EmmyrcGmodVgui,
     #[serde(default = "param_type_hints_default")]
     pub param_type_hints: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,6 +77,7 @@ impl Default for EmmyrcGmod {
             scripted_class_scopes: EmmyrcGmodScriptedClassScopes::default(),
             hook_mappings: EmmyrcGmodHookMappings::default(),
             network: EmmyrcGmodNetwork::default(),
+            vgui: EmmyrcGmodVgui::default(),
             param_type_hints: param_type_hints_default(),
             detect_realm_from_filename: None,
             detect_realm_from_calls: None,
@@ -82,6 +85,32 @@ impl Default for EmmyrcGmod {
             dynamic_fields_global: dynamic_fields_global_default(),
             annotations_path: None,
             auto_load_annotations: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EmmyrcGmodVgui {
+    #[serde(default = "vgui_code_lens_default")]
+    pub code_lens_enabled: bool,
+    #[serde(default = "vgui_inlay_hint_default")]
+    pub inlay_hint_enabled: bool,
+}
+
+fn vgui_code_lens_default() -> bool {
+    true
+}
+
+fn vgui_inlay_hint_default() -> bool {
+    false
+}
+
+impl Default for EmmyrcGmodVgui {
+    fn default() -> Self {
+        Self {
+            code_lens_enabled: vgui_code_lens_default(),
+            inlay_hint_enabled: vgui_inlay_hint_default(),
         }
     }
 }
@@ -249,6 +278,8 @@ mod tests {
         verify_that!(gmod.network.diagnostics.missing_counterpart, eq(true))?;
         verify_that!(gmod.network.completion.smart_read_suggestions, eq(true))?;
         verify_that!(gmod.network.completion.mismatch_hints, eq(true))?;
+        verify_that!(gmod.vgui.code_lens_enabled, eq(true))?;
+        verify_that!(gmod.vgui.inlay_hint_enabled, eq(false))?;
         verify_that!(
             gmod.param_type_hints.get("ply"),
             eq(Some(&"Player".to_string()))
@@ -278,6 +309,10 @@ mod tests {
                         "smartReadSuggestions": false,
                         "mismatchHints": false
                     }
+                },
+                "vgui": {
+                    "codeLensEnabled": false,
+                    "inlayHintEnabled": true
                 }
             }"#,
         )
@@ -288,6 +323,8 @@ mod tests {
         verify_that!(gmod.network.diagnostics.order_mismatch, eq(false))?;
         verify_that!(gmod.network.diagnostics.missing_counterpart, eq(false))?;
         verify_that!(gmod.network.completion.smart_read_suggestions, eq(false))?;
-        verify_that!(gmod.network.completion.mismatch_hints, eq(false))
+        verify_that!(gmod.network.completion.mismatch_hints, eq(false))?;
+        verify_that!(gmod.vgui.code_lens_enabled, eq(false))?;
+        verify_that!(gmod.vgui.inlay_hint_enabled, eq(true))
     }
 }

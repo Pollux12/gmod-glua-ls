@@ -283,6 +283,16 @@ fn build_decl_hover(
         }
     }
 
+    if let Some((panel_name, base_name)) = get_vgui_panel_name(db, &typ) {
+        if let Some(base_name) = base_name {
+            builder.add_annotation_description(format!(
+                "---\n**VGUI Panel:** `{panel_name}` (Base: `{base_name}`)"
+            ));
+        } else {
+            builder.add_annotation_description(format!("---\n**VGUI Panel:** `{panel_name}`"));
+        }
+    }
+
     if let LuaDeclExtra::Param {
         idx, signature_id, ..
     } = &decl.extra
@@ -379,7 +389,48 @@ fn build_member_hover(
         }
     }
 
+    if let Some((panel_name, base_name)) = get_vgui_panel_name(db, &typ) {
+        if let Some(base_name) = base_name {
+            builder.add_annotation_description(format!(
+                "---\n**VGUI Panel:** `{panel_name}` (Base: `{base_name}`)"
+            ));
+        } else {
+            builder.add_annotation_description(format!("---\n**VGUI Panel:** `{panel_name}`"));
+        }
+    }
+
     Some(())
+}
+
+fn get_vgui_panel_name(db: &DbIndex, typ: &LuaType) -> Option<(String, Option<String>)> {
+    match typ {
+        LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
+            let type_name = type_decl_id.get_simple_name();
+            let base_name = db
+                .get_gmod_class_metadata_index()
+                .get_vgui_panel_base(type_name)?;
+            Some((type_name.to_string(), base_name))
+        }
+        LuaType::Generic(generic) => {
+            let type_decl_id = generic.get_base_type_id_ref();
+            let type_name = type_decl_id.get_simple_name();
+            let base_name = db
+                .get_gmod_class_metadata_index()
+                .get_vgui_panel_base(type_name)?;
+            Some((type_name.to_string(), base_name))
+        }
+        LuaType::Instance(instance) => get_vgui_panel_name(db, instance.get_base()),
+        LuaType::Union(union_type) => {
+            for union_member in union_type.into_vec() {
+                if let Some(panel_info) = get_vgui_panel_name(db, &union_member) {
+                    return Some(panel_info);
+                }
+            }
+
+            None
+        }
+        _ => None,
+    }
 }
 
 fn extend_gmod_hook_semantic_decls(

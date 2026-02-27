@@ -12,12 +12,17 @@ use super::CodeLensData;
 
 pub fn build_code_lens(semantic_model: &SemanticModel) -> Option<Vec<CodeLens>> {
     let mut result = Vec::new();
-    let enable_vgui_code_lens = semantic_model.get_emmyrc().gmod.vgui.code_lens;
+    let enable_vgui_code_lens = semantic_model.get_emmyrc().gmod.vgui.code_lens_enabled;
     let root = semantic_model.get_root().clone();
     for node in root.descendants::<LuaAst>() {
         match node {
             LuaAst::LuaFuncStat(func_stat) => {
-                add_func_stat_code_lens(semantic_model, &mut result, func_stat, enable_vgui_code_lens)?;
+                add_func_stat_code_lens(
+                    semantic_model,
+                    &mut result,
+                    func_stat,
+                    enable_vgui_code_lens,
+                )?;
             }
             LuaAst::LuaLocalFuncStat(local_func_stat) => {
                 add_local_func_stat_code_lens(
@@ -88,7 +93,8 @@ fn add_func_stat_code_lens(
             });
 
             if enable_vgui_code_lens
-                && let Some((panel_name, base_name)) = find_vgui_panel_from_decl(semantic_model, decl_id)
+                && let Some((panel_name, base_name)) =
+                    find_vgui_panel_from_decl(semantic_model, decl_id)
             {
                 push_vgui_panel_code_lens(result, range, &panel_name, base_name.as_deref());
             }
@@ -140,7 +146,8 @@ fn add_local_stat_code_lens(
         };
 
         let decl_id = LuaDeclId::new(file_id, name_token.get_position());
-        let Some((panel_name, base_name)) = find_vgui_panel_from_decl(semantic_model, decl_id) else {
+        let Some((panel_name, base_name)) = find_vgui_panel_from_decl(semantic_model, decl_id)
+        else {
             continue;
         };
 

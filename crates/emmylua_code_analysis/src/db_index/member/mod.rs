@@ -228,6 +228,10 @@ impl LuaMemberIndex {
     pub fn get_current_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
         self.member_current_owner.get(id)
     }
+
+    pub fn get_member_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
+        self.member_current_owner.get(id)
+    }
 }
 
 impl LuaIndex for LuaMemberIndex {

@@ -34,15 +34,22 @@ pub fn build_local_stat_symbol(
         let decl = builder.get_decl(&decl_id)?;
         let typ = builder.get_type(decl_id.into());
         let desc = builder.get_symbol_kind_and_detail(Some(&typ));
+        let mut symbol_name = decl.get_name().to_string();
+        let mut symbol_kind = desc.0;
+        if let Some(panel_name) = builder.get_vgui_panel_name(&decl_id) {
+            symbol_name = format!("{panel_name} (VGUI)");
+            symbol_kind = SymbolKind::CLASS;
+        }
         let range = if simple_local {
             local_stat.get_range()
         } else {
             decl.get_range()
         };
 
-        let symbol = LuaSymbol::new(decl.get_name().to_string(), desc.1, desc.0, range);
+        let symbol = LuaSymbol::new(symbol_name, desc.1, symbol_kind, range);
         let symbol_id =
             builder.add_node_symbol(local_name.syntax().clone(), symbol, Some(parent_id));
+        builder.bind_decl_symbol(decl_id, symbol_id);
         let value_expr = local_values.get(index).cloned();
         bindings.push(SymbolBinding {
             symbol_id,
@@ -76,9 +83,17 @@ pub fn build_assign_stat_symbol(
         };
         let typ = builder.get_type(decl_id.into());
         let desc = builder.get_symbol_kind_and_detail(Some(&typ));
-        let symbol = LuaSymbol::new(decl.get_name().to_string(), desc.1, desc.0, range);
+        let mut symbol_name = decl.get_name().to_string();
+        let mut symbol_kind = desc.0;
+        if let Some(panel_name) = builder.get_vgui_panel_name(&decl_id) {
+            symbol_name = format!("{panel_name} (VGUI)");
+            symbol_kind = SymbolKind::CLASS;
+        }
+
+        let symbol = LuaSymbol::new(symbol_name, desc.1, symbol_kind, range);
 
         let symbol_id = builder.add_node_symbol(var.syntax().clone(), symbol, Some(parent_id));
+        builder.bind_decl_symbol(decl_id, symbol_id);
         let value_expr = exprs.get(index).cloned();
         bindings.push(SymbolBinding {
             symbol_id,

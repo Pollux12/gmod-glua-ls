@@ -1,17 +1,20 @@
 use std::collections::HashMap;
 
 use emmylua_code_analysis::{
-    DbIndex, FileId, LuaDecl, LuaDeclId, LuaDeclarationTree, LuaDocument, LuaType, LuaTypeOwner,
+    DbIndex, FileId, GmodClassCallLiteral, GmodScriptedClassCallMetadata, LuaDecl, LuaDeclId,
+    LuaDeclarationTree, LuaDocument, LuaType, LuaTypeOwner,
 };
 use emmylua_parser::{LuaAstNode, LuaChunk, LuaSyntaxId, LuaSyntaxNode, LuaSyntaxToken};
 use lsp_types::{DocumentSymbol, SymbolKind};
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 pub struct DocumentSymbolBuilder<'a> {
     db: &'a DbIndex,
     decl_tree: &'a LuaDeclarationTree,
     document: &'a LuaDocument<'a>,
     document_symbols: HashMap<LuaSyntaxId, Box<LuaSymbol>>,
+    decl_symbol_ids: HashMap<LuaDeclId, LuaSyntaxId>,
+    vgui_panel_names: HashMap<LuaDeclId, String>,
 }
 
 impl<'a> DocumentSymbolBuilder<'a> {
@@ -20,12 +23,65 @@ impl<'a> DocumentSymbolBuilder<'a> {
         decl_tree: &'a LuaDeclarationTree,
         document: &'a LuaDocument,
     ) -> Self {
+        let vgui_panel_names =
+            Self::collect_vgui_panel_names(db, decl_tree, document.get_file_id());
+
         Self {
             db,
             decl_tree,
             document,
             document_symbols: HashMap::new(),
+            decl_symbol_ids: HashMap::new(),
+            vgui_panel_names,
         }
+    }
+
+    fn collect_vgui_panel_names(
+        db: &DbIndex,
+        decl_tree: &LuaDeclarationTree,
+        file_id: FileId,
+    ) -> HashMap<LuaDeclId, String> {
+        let mut panel_names = HashMap::new();
+        let Some(file_metadata) = db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+        else {
+            return panel_names;
+        };
+
+        for call in &file_metadata.vgui_register_calls {
+            Self::collect_vgui_panel_call(decl_tree, call, 1, &mut panel_names);
+        }
+
+        for call in &file_metadata.derma_define_control_calls {
+            Self::collect_vgui_panel_call(decl_tree, call, 2, &mut panel_names);
+        }
+
+        panel_names
+    }
+
+    fn collect_vgui_panel_call(
+        decl_tree: &LuaDeclarationTree,
+        call: &GmodScriptedClassCallMetadata,
+        table_var_arg_index: usize,
+        panel_names: &mut HashMap<LuaDeclId, String>,
+    ) {
+        let panel_name = match call.literal_args.first() {
+            Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name,
+            _ => return,
+        };
+
+        let table_var_name = match call.literal_args.get(table_var_arg_index) {
+            Some(Some(GmodClassCallLiteral::NameRef(name))) if !name.is_empty() => name,
+            _ => return,
+        };
+
+        let register_position = call.syntax_id.get_range().start();
+        let Some(decl) = decl_tree.find_local_decl(table_var_name, register_position) else {
+            return;
+        };
+
+        panel_names.insert(decl.get_id(), panel_name.clone());
     }
 
     pub fn get_file_id(&self) -> FileId {
@@ -34,6 +90,24 @@ impl<'a> DocumentSymbolBuilder<'a> {
 
     pub fn get_decl(&self, id: &LuaDeclId) -> Option<&LuaDecl> {
         self.decl_tree.get_decl(id)
+    }
+
+    pub fn resolve_local_decl_id(&self, name: &str, position: TextSize) -> Option<LuaDeclId> {
+        self.decl_tree
+            .find_local_decl(name, position)
+            .map(|decl| decl.get_id())
+    }
+
+    pub fn get_vgui_panel_name(&self, decl_id: &LuaDeclId) -> Option<&str> {
+        self.vgui_panel_names.get(decl_id).map(String::as_str)
+    }
+
+    pub fn bind_decl_symbol(&mut self, decl_id: LuaDeclId, symbol_id: LuaSyntaxId) {
+        self.decl_symbol_ids.insert(decl_id, symbol_id);
+    }
+
+    pub fn get_decl_symbol_id(&self, decl_id: &LuaDeclId) -> Option<LuaSyntaxId> {
+        self.decl_symbol_ids.get(decl_id).copied()
     }
 
     pub fn get_type(&self, id: LuaTypeOwner) -> LuaType {
@@ -193,6 +267,25 @@ impl<'a> DocumentSymbolBuilder<'a> {
         }
 
         let ty = ty.unwrap();
+
+        if let LuaType::Def(decl_id) = ty {
+            if let Some(base_name) = self
+                .db
+                .get_gmod_class_metadata_index()
+                .get_vgui_panel_base(decl_id.get_simple_name())
+            {
+                let detail = if let Some(base_name) = base_name {
+                    format!(
+                        "VGUI Panel: {} (Base: {})",
+                        decl_id.get_simple_name(),
+                        base_name
+                    )
+                } else {
+                    format!("VGUI Panel: {}", decl_id.get_simple_name())
+                };
+                return (SymbolKind::CLASS, Some(detail));
+            }
+        }
 
         if ty.is_def() {
             return (SymbolKind::CLASS, None);

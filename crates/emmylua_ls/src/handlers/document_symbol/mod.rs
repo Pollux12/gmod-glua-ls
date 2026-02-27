@@ -6,8 +6,8 @@ mod stats;
 use builder::{DocumentSymbolBuilder, LuaSymbol};
 use emmylua_code_analysis::SemanticModel;
 use emmylua_parser::{
-    LuaAstNode, LuaBlock, LuaChunk, LuaComment, LuaExpr, LuaSingleArgExpr, LuaStat, LuaSyntaxId,
-    LuaSyntaxNode,
+    LuaAstNode, LuaBlock, LuaChunk, LuaComment, LuaExpr, LuaFuncStat, LuaSingleArgExpr, LuaStat,
+    LuaSyntaxId, LuaSyntaxNode, LuaVarExpr,
 };
 use expr::{build_closure_expr_symbol, build_table_symbol};
 use lsp_types::{
@@ -149,7 +149,8 @@ fn process_stat(
             }
         }
         LuaStat::FuncStat(func_stat) => {
-            let func_id = build_func_stat_symbol(builder, func_stat.clone(), parent_id)?;
+            let func_parent_id = resolve_func_parent_id(builder, &func_stat, parent_id);
+            let func_id = build_func_stat_symbol(builder, func_stat.clone(), func_parent_id)?;
             if let Some(closure) = func_stat.get_closure() {
                 let scope_parent = build_closure_expr_symbol(builder, closure.clone(), func_id)?;
                 if let Some(block) = closure.get_block() {
@@ -230,6 +231,45 @@ fn process_stat(
     }
 
     Some(())
+}
+
+fn resolve_func_parent_id(
+    builder: &DocumentSymbolBuilder,
+    func_stat: &LuaFuncStat,
+    default_parent_id: LuaSyntaxId,
+) -> LuaSyntaxId {
+    let Some(func_name) = func_stat.get_func_name() else {
+        return default_parent_id;
+    };
+
+    let LuaVarExpr::IndexExpr(index_expr) = func_name else {
+        return default_parent_id;
+    };
+
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return default_parent_id;
+    };
+
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return default_parent_id;
+    };
+
+    let Some(prefix_name) = name_expr.get_name_text() else {
+        return default_parent_id;
+    };
+
+    let Some(decl_id) = builder.resolve_local_decl_id(&prefix_name, func_stat.get_range().start())
+    else {
+        return default_parent_id;
+    };
+
+    if builder.get_vgui_panel_name(&decl_id).is_none() {
+        return default_parent_id;
+    }
+
+    builder
+        .get_decl_symbol_id(&decl_id)
+        .unwrap_or(default_parent_id)
 }
 
 fn process_if_clauses(builder: &mut DocumentSymbolBuilder, ctx: IfSymbolContext) -> Option<()> {
@@ -363,5 +403,83 @@ impl RegisterCapabilities for DocumentSymbolCapabilities {
             label: Some("GLuaLS".into()),
             work_done_progress_options: Default::default(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use emmylua_code_analysis::{Emmyrc, VirtualWorkspace};
+    use googletest::prelude::*;
+    use lsp_types::{DocumentSymbol, SymbolKind};
+
+    use super::build_document_symbol;
+
+    fn find_top_level_symbol<'a>(
+        symbols: &'a [DocumentSymbol],
+        name: &str,
+    ) -> Option<&'a DocumentSymbol> {
+        symbols.iter().find(|symbol| symbol.name == name)
+    }
+
+    #[gtest]
+    fn vgui_panel_symbols_are_class_named_and_methods_are_nested() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/vgui/my_panel.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+            end
+
+            function PANEL:Paint(w, h)
+            end
+
+            vgui.Register("MyPanel", PANEL, "DPanel")
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let panel_symbol = find_top_level_symbol(top_level_symbols, "MyPanel (VGUI)").or_fail()?;
+        verify_that!(panel_symbol.kind, eq(SymbolKind::CLASS))?;
+
+        let panel_children = panel_symbol.children.as_ref().or_fail()?;
+        let child_names = panel_children
+            .iter()
+            .map(|child| child.name.clone())
+            .collect::<Vec<_>>();
+
+        verify_that!(child_names.contains(&"PANEL:Init".to_string()), eq(true))?;
+        verify_that!(child_names.contains(&"PANEL:Paint".to_string()), eq(true))?;
+
+        verify_that!(
+            top_level_symbols
+                .iter()
+                .any(|symbol| symbol.name == "PANEL:Init"),
+            eq(false)
+        )?;
+        verify_that!(
+            top_level_symbols
+                .iter()
+                .any(|symbol| symbol.name == "PANEL:Paint"),
+            eq(false)
+        )?;
+        verify_that!(
+            top_level_symbols
+                .iter()
+                .any(|symbol| symbol.name == "PANEL"),
+            eq(false)
+        )
     }
 }

@@ -114,6 +114,10 @@
             "weapons/gmod_tool/stools/**",
             "plugins/**"
           ]
+        },
+        "vgui": {
+          "codeLensEnabled": true,
+          "inlayHintEnabled": false
         }
       }
     },
@@ -966,6 +970,13 @@
               "plugins/**"
             ]
           }
+        },
+        "vgui": {
+          "$ref": "#/$defs/EmmyrcGmodVgui",
+          "default": {
+            "codeLensEnabled": true,
+            "inlayHintEnabled": false
+          }
         }
       }
     },
@@ -1080,6 +1091,19 @@
           "items": {
             "type": "string"
           }
+        }
+      }
+    },
+    "EmmyrcGmodVgui": {
+      "type": "object",
+      "properties": {
+        "codeLensEnabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "inlayHintEnabled": {
+          "type": "boolean",
+          "default": false
         }
       }
     },

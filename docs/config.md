@@ -209,6 +209,8 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `hookMappings.methodToHook` | `object` | `{}` | Map methods to hook names |
 | `hookMappings.emitterToHook` | `object` | `{}` | Map custom emitters to hook names |
 | `hookMappings.methodPrefixes` | `string[]` | `[]` | Additional prefixes for hook auto-detection |
+| `vgui.codeLensEnabled` | `boolean` | `true` | Enable Code Lenses for VGUI panel definitions |
+| `vgui.inlayHintEnabled` | `boolean` | `false` | Enable Inlay Hints for VGUI panel definitions |
 
 File-level parameter hints can be added with `---@paramhint <paramName> <typeName>` comments in Lua files. These act as defaults for unannotated parameters in that file only.
 
@@ -289,6 +291,24 @@ Annotates smart read suggestions with hints when the expected read does not matc
   }
 }
 ```
+
+### gmod.vgui
+
+Controls VGUI/Derma editor assistance features.
+
+#### gmod.vgui.codeLensEnabled
+
+- **Type**: `boolean`
+- **Default**: `true`
+
+Enables Code Lenses for VGUI panel definitions.
+
+#### gmod.vgui.inlayHintEnabled
+
+- **Type**: `boolean`
+- **Default**: `false`
+
+Enables Inlay Hints for VGUI panel definitions.
 
 ### Scripted Class Analysis
 

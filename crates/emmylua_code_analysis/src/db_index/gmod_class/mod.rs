@@ -102,13 +102,92 @@ impl GmodScriptedClassFileMetadata {
 #[derive(Debug, Default)]
 pub struct GmodClassMetadataIndex {
     file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
+    vgui_panels: HashMap<String, Option<String>>,
 }
 
 impl GmodClassMetadataIndex {
     pub fn new() -> Self {
         Self {
             file_metadata: HashMap::new(),
+            vgui_panels: HashMap::new(),
         }
+    }
+
+    fn extract_non_empty_string_literal(literal: &GmodClassCallLiteral) -> Option<String> {
+        match literal {
+            GmodClassCallLiteral::String(value) if !value.is_empty() => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn extract_non_empty_string_arg(
+        call_metadata: &GmodScriptedClassCallMetadata,
+        arg_index: usize,
+    ) -> Option<String> {
+        call_metadata
+            .args
+            .get(arg_index)
+            .and_then(|arg| arg.value.as_ref())
+            .and_then(Self::extract_non_empty_string_literal)
+    }
+
+    fn maybe_extract_vgui_panel(
+        kind: GmodScriptedClassCallKind,
+        call_metadata: &GmodScriptedClassCallMetadata,
+    ) -> Option<(String, Option<String>)> {
+        let base_arg_index = match kind {
+            GmodScriptedClassCallKind::VguiRegister => 2,
+            GmodScriptedClassCallKind::DermaDefineControl => 3,
+            _ => return None,
+        };
+
+        let panel_name = Self::extract_non_empty_string_arg(call_metadata, 0)?;
+        let base_name = Self::extract_non_empty_string_arg(call_metadata, base_arg_index);
+        Some((panel_name, base_name))
+    }
+
+    fn insert_vgui_panel_from_call(
+        vgui_panels: &mut HashMap<String, Option<String>>,
+        kind: GmodScriptedClassCallKind,
+        call_metadata: &GmodScriptedClassCallMetadata,
+    ) {
+        let Some((panel_name, base_name)) = Self::maybe_extract_vgui_panel(kind, call_metadata)
+        else {
+            return;
+        };
+
+        vgui_panels.insert(panel_name, base_name);
+    }
+
+    fn update_vgui_panels_from_call(
+        &mut self,
+        kind: GmodScriptedClassCallKind,
+        call_metadata: &GmodScriptedClassCallMetadata,
+    ) {
+        Self::insert_vgui_panel_from_call(&mut self.vgui_panels, kind, call_metadata);
+    }
+
+    fn recompute_vgui_panels(&mut self) {
+        let mut vgui_panels = HashMap::new();
+
+        for file_metadata in self.file_metadata.values() {
+            for call in &file_metadata.vgui_register_calls {
+                Self::insert_vgui_panel_from_call(
+                    &mut vgui_panels,
+                    GmodScriptedClassCallKind::VguiRegister,
+                    call,
+                );
+            }
+            for call in &file_metadata.derma_define_control_calls {
+                Self::insert_vgui_panel_from_call(
+                    &mut vgui_panels,
+                    GmodScriptedClassCallKind::DermaDefineControl,
+                    call,
+                );
+            }
+        }
+
+        self.vgui_panels = vgui_panels;
     }
 
     pub fn add_call(
@@ -117,6 +196,8 @@ impl GmodClassMetadataIndex {
         kind: GmodScriptedClassCallKind,
         call_metadata: GmodScriptedClassCallMetadata,
     ) {
+        self.update_vgui_panels_from_call(kind, &call_metadata);
+
         self.file_metadata
             .entry(file_id)
             .or_default()
@@ -137,14 +218,20 @@ impl GmodClassMetadataIndex {
     ) -> impl Iterator<Item = (&FileId, &GmodScriptedClassFileMetadata)> {
         self.file_metadata.iter()
     }
+
+    pub fn get_vgui_panel_base(&self, name: &str) -> Option<Option<String>> {
+        self.vgui_panels.get(name).cloned()
+    }
 }
 
 impl LuaIndex for GmodClassMetadataIndex {
     fn remove(&mut self, file_id: FileId) {
         self.file_metadata.remove(&file_id);
+        self.recompute_vgui_panels();
     }
 
     fn clear(&mut self) {
         self.file_metadata.clear();
+        self.recompute_vgui_panels();
     }
 }

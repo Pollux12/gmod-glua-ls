@@ -7,9 +7,9 @@ use emmylua_code_analysis::{
     SemanticModel,
 };
 use emmylua_parser::{
-    LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
-    LuaLiteralToken, LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaStat, LuaSyntaxId,
-    LuaVarExpr,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
+    LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaStat,
+    LuaSyntaxId, LuaVarExpr,
 };
 use emmylua_parser::{LuaAstToken, LuaTokenKind};
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, Location};
@@ -46,6 +46,9 @@ pub fn build_inlay_hints(
             }
             LuaAst::LuaLocalName(local_name) => {
                 build_local_name_hint(semantic_model, &mut result, local_name);
+            }
+            LuaAst::LuaAssignStat(assign_stat) => {
+                build_assign_stat_hint(semantic_model, &mut result, assign_stat);
             }
             LuaAst::LuaFuncStat(func_stat) => {
                 if client_id.is_intellij() {
@@ -315,7 +318,9 @@ fn build_local_name_hint(
     result: &mut Vec<InlayHint>,
     local_name: LuaLocalName,
 ) -> Option<()> {
-    if !semantic_model.get_emmyrc().hint.local_hint {
+    let enable_local_hint = semantic_model.get_emmyrc().hint.local_hint;
+    let enable_vgui_inlay_hint = semantic_model.get_emmyrc().gmod.vgui.inlay_hint_enabled;
+    if !enable_local_hint && !enable_vgui_inlay_hint {
         return Some(());
     }
     // local function 不显示
@@ -343,11 +348,23 @@ fn build_local_name_hint(
         ))?
         .typ;
 
+    let vgui_panel_name = if enable_vgui_inlay_hint {
+        get_vgui_panel_name(semantic_model, &typ)
+    } else {
+        None
+    };
+
+    if !enable_local_hint && vgui_panel_name.is_none() {
+        return Some(());
+    }
+
     // 目前没时间完善结合 ast 的类型过滤, 所以只允许一些类型显示
-    match typ {
-        LuaType::Ref(_) | LuaType::Generic(_) => {}
-        _ => {
-            return Some(());
+    if vgui_panel_name.is_none() {
+        match typ {
+            LuaType::Ref(_) | LuaType::Generic(_) | LuaType::Instance(_) => {}
+            _ => {
+                return Some(());
+            }
         }
     }
 
@@ -355,10 +372,19 @@ fn build_local_name_hint(
     let range = local_name.get_range();
     let lsp_range = document.to_lsp_range(range)?;
 
-    let label_parts = build_label_parts(semantic_model, &typ);
+    let label = if let Some((panel_name, base_name)) = vgui_panel_name {
+        if let Some(base_name) = base_name {
+            InlayHintLabel::String(format!(": VGUI Panel ({panel_name} : {base_name})"))
+        } else {
+            InlayHintLabel::String(format!(": VGUI Panel ({panel_name})"))
+        }
+    } else {
+        InlayHintLabel::LabelParts(build_label_parts(semantic_model, &typ))
+    };
+
     let hint = InlayHint {
         kind: Some(InlayHintKind::TYPE),
-        label: InlayHintLabel::LabelParts(label_parts),
+        label,
         position: lsp_range.end,
         text_edits: None,
         tooltip: None,
@@ -369,6 +395,94 @@ fn build_local_name_hint(
     result.push(hint);
 
     Some(())
+}
+
+fn build_assign_stat_hint(
+    semantic_model: &SemanticModel,
+    result: &mut Vec<InlayHint>,
+    assign_stat: LuaAssignStat,
+) -> Option<()> {
+    if !semantic_model.get_emmyrc().gmod.vgui.inlay_hint_enabled {
+        return Some(());
+    }
+
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    let document = semantic_model.get_document();
+
+    for var in vars {
+        let Some(semantic_info) =
+            semantic_model.get_semantic_info(NodeOrToken::Node(var.syntax().clone()))
+        else {
+            continue;
+        };
+
+        let Some((panel_name, base_name)) = get_vgui_panel_name(semantic_model, &semantic_info.typ)
+        else {
+            continue;
+        };
+
+        let Some(lsp_range) = document.to_lsp_range(var.get_range()) else {
+            continue;
+        };
+
+        let label_string = if let Some(base_name) = base_name {
+            format!(": VGUI Panel ({panel_name} : {base_name})")
+        } else {
+            format!(": VGUI Panel ({panel_name})")
+        };
+
+        let hint = InlayHint {
+            kind: Some(InlayHintKind::TYPE),
+            label: InlayHintLabel::String(label_string),
+            position: lsp_range.end,
+            text_edits: None,
+            tooltip: None,
+            padding_left: None,
+            padding_right: None,
+            data: None,
+        };
+        result.push(hint);
+    }
+
+    Some(())
+}
+
+fn get_vgui_panel_name(
+    semantic_model: &SemanticModel,
+    typ: &LuaType,
+) -> Option<(String, Option<String>)> {
+    match typ {
+        LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
+            let type_name = type_decl_id.get_simple_name();
+            let base_name = semantic_model
+                .get_db()
+                .get_gmod_class_metadata_index()
+                .get_vgui_panel_base(type_name)?;
+
+            Some((type_name.to_string(), base_name))
+        }
+        LuaType::Generic(generic) => {
+            let type_decl_id = generic.get_base_type_id_ref();
+            let type_name = type_decl_id.get_simple_name();
+            let base_name = semantic_model
+                .get_db()
+                .get_gmod_class_metadata_index()
+                .get_vgui_panel_base(type_name)?;
+
+            Some((type_name.to_string(), base_name))
+        }
+        LuaType::Instance(instance) => get_vgui_panel_name(semantic_model, instance.get_base()),
+        LuaType::Union(union_type) => {
+            for union_member in union_type.into_vec() {
+                if let Some(panel_info) = get_vgui_panel_name(semantic_model, &union_member) {
+                    return Some(panel_info);
+                }
+            }
+
+            None
+        }
+        _ => None,
+    }
 }
 
 fn build_func_stat_override_hint(
