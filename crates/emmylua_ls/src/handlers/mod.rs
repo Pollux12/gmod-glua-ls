@@ -19,6 +19,7 @@ mod emmy_annotator;
 mod emmy_gutter;
 mod emmy_syntax_tree;
 mod fold_range;
+mod gmod_string_context;
 mod gmod_scripted_classes;
 mod hover;
 mod implementation;

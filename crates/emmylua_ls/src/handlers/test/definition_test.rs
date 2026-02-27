@@ -637,4 +637,87 @@ mod tests {
 
         Ok(())
     }
+
+    #[gtest]
+    fn test_goto_vgui_panel_definition_from_string() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                local PANEL = {}
+                vgui.Register("MyPanel", PANEL, "DPanel")
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                local pnl = vgui.Create("MyPa<??>nel")
+            "#,
+            vec![Expected {
+                file: "panels.lua".to_string(),
+                line: 2,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_net_message_definition_from_start_string() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "receive.lua",
+            r#"
+                net.Receive("MyMessage", function() end)
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                net.Start("MyMes<??>sage")
+            "#,
+            vec![Expected {
+                file: "receive.lua".to_string(),
+                line: 1,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_net_message_definition_from_receive_string() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "send.lua",
+            r#"
+                net.Start("MyMessage")
+                net.Broadcast()
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                net.Receive("MyMes<??>sage", function() end)
+            "#,
+            vec![Expected {
+                file: "send.lua".to_string(),
+                line: 1,
+            }],
+        ));
+
+        Ok(())
+    }
 }

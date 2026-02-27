@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use emmylua_code_analysis::{
-    DbIndex, FileId, GmodClassCallLiteral, GmodScriptedClassCallMetadata, file_path_to_uri,
+    DbIndex, FileId, GmodClassCallLiteral, GmodScriptedClassCallMetadata, LuaDocument,
+    file_path_to_uri,
 };
 use tokio_util::sync::CancellationToken;
 use wax::Pattern;
@@ -110,6 +111,7 @@ pub fn build_gmod_scripted_classes(
             uri,
             class_type: scope_match.class_type.to_string(),
             class_name: scope_match.class_name,
+            range: None,
         });
     }
 
@@ -121,11 +123,18 @@ pub fn build_gmod_scripted_classes(
         let Some(uri) = file_uri_string(db, *file_id) else {
             continue;
         };
+        let document = db.get_vfs().get_document(file_id);
 
-        push_vgui_panel_entries(&mut entries, &uri, &file_metadata.vgui_register_calls);
         push_vgui_panel_entries(
             &mut entries,
             &uri,
+            document.as_ref(),
+            &file_metadata.vgui_register_calls,
+        );
+        push_vgui_panel_entries(
+            &mut entries,
+            &uri,
+            document.as_ref(),
             &file_metadata.derma_define_control_calls,
         );
     }
@@ -159,17 +168,20 @@ fn file_uri_string(db: &DbIndex, file_id: FileId) -> Option<String> {
 fn push_vgui_panel_entries(
     entries: &mut Vec<GmodScriptedClassEntry>,
     uri: &str,
+    document: Option<&LuaDocument<'_>>,
     calls: &[GmodScriptedClassCallMetadata],
 ) {
     for call in calls {
         let Some(panel_name) = extract_vgui_panel_name(call) else {
             continue;
         };
+        let range = document.and_then(|doc| doc.to_lsp_range(call.syntax_id.get_range()));
 
         entries.push(GmodScriptedClassEntry {
             uri: uri.to_string(),
             class_type: "VGUI".to_string(),
             class_name: panel_name.to_string(),
+            range,
         });
     }
 }
@@ -358,6 +370,14 @@ mod tests {
             eq(true)
         )?;
         verify_that!(
+            entries.iter().any(|entry| {
+                entry.class_type == "ENT"
+                    && entry.class_name == "test_entity"
+                    && entry.range.is_none()
+            }),
+            eq(true)
+        )?;
+        verify_that!(
             entries.iter().any(|entry| entry.class_name == "ignored"),
             eq(false)
         )
@@ -395,6 +415,14 @@ mod tests {
             entries
                 .iter()
                 .any(|entry| { entry.class_type == "VGUI" && entry.class_name == "MyControl" }),
+            eq(true)
+        )?;
+        verify_that!(
+            entries.iter().any(|entry| {
+                entry.class_type == "VGUI"
+                    && entry.class_name == "MyPanel"
+                    && entry.range.is_some()
+            }),
             eq(true)
         )?;
         verify_that!(

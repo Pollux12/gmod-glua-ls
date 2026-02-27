@@ -27,6 +27,10 @@ use super::RegisterCapabilities;
 use crate::context::ServerContextSnapshot;
 use crate::handlers::definition::goto_function::goto_overload_function;
 use crate::handlers::definition::goto_path::goto_path;
+use crate::handlers::gmod_string_context::{
+    NetMessageCallKind, extract_string_call_context, is_vgui_panel_string_context,
+    matches_call_path, net_message_call_kind,
+};
 use crate::util::find_ref_at;
 
 pub async fn on_goto_definition_handler(
@@ -105,6 +109,16 @@ pub fn definition(
             string_token.clone(),
         ) {
             return Some(hook_response);
+        }
+        if let Some(vgui_panel_response) =
+            goto_vgui_panel_definition(&semantic_model, string_token.clone())
+        {
+            return Some(vgui_panel_response);
+        }
+        if let Some(net_message_response) =
+            goto_net_message_definition(&semantic_model, string_token.clone())
+        {
+            return Some(net_message_response);
         }
         if let Some(str_tpl_ref_response) =
             goto_str_tpl_ref_definition(&semantic_model, string_token)
@@ -238,9 +252,9 @@ fn goto_hook_definition(
         .get_parent::<LuaCallExpr>()?;
 
     let call_path = call_expr.get_access_path()?;
-    if !call_path.ends_with("hook.Add")
-        && !call_path.ends_with("hook.Run")
-        && !call_path.ends_with("hook.Call")
+    if !matches_call_path(&call_path, "hook.Add")
+        && !matches_call_path(&call_path, "hook.Run")
+        && !matches_call_path(&call_path, "hook.Call")
     {
         return None;
     }
@@ -264,6 +278,90 @@ fn goto_hook_definition(
 
     let trigger_token = string_token.syntax().clone();
     goto_def_definition(semantic_model, compilation, property_owner, &trigger_token)
+}
+
+fn goto_vgui_panel_definition(
+    semantic_model: &SemanticModel,
+    string_token: LuaStringToken,
+) -> Option<GotoDefinitionResponse> {
+    if !semantic_model.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let context = extract_string_call_context(&string_token)?;
+    if !is_vgui_panel_string_context(&context.call_path, context.arg_index) {
+        return None;
+    }
+
+    let panel_name = context.name;
+    let definitions = semantic_model
+        .get_db()
+        .get_gmod_class_metadata_index()
+        .find_vgui_panel_definitions(&panel_name);
+
+    let mut locations = Vec::new();
+    for (file_id, call) in definitions {
+        let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
+            continue;
+        };
+        let Some(location) = document.to_lsp_location(call.syntax_id.get_range()) else {
+            continue;
+        };
+        locations.push(location);
+    }
+
+    if locations.is_empty() {
+        return None;
+    }
+
+    Some(GotoDefinitionResponse::Array(locations))
+}
+
+fn goto_net_message_definition(
+    semantic_model: &SemanticModel,
+    string_token: LuaStringToken,
+) -> Option<GotoDefinitionResponse> {
+    if !semantic_model.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let context = extract_string_call_context(&string_token)?;
+    let call_kind = net_message_call_kind(&context.call_path, context.arg_index)?;
+    let message_name = context.name;
+
+    let network_index = semantic_model.get_db().get_gmod_network_index();
+    let mut locations = Vec::new();
+
+    match call_kind {
+        NetMessageCallKind::Start => {
+            for (file_id, flow) in network_index.get_receive_flows_for_message(&message_name) {
+                let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
+                    continue;
+                };
+                let Some(location) = document.to_lsp_location(flow.receive_range) else {
+                    continue;
+                };
+                locations.push(location);
+            }
+        }
+        NetMessageCallKind::Receive => {
+            for (file_id, flow) in network_index.get_send_flows_for_message(&message_name) {
+                let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
+                    continue;
+                };
+                let Some(location) = document.to_lsp_location(flow.start_range) else {
+                    continue;
+                };
+                locations.push(location);
+            }
+        }
+    }
+
+    if locations.is_empty() {
+        return None;
+    }
+
+    Some(GotoDefinitionResponse::Array(locations))
 }
 
 pub struct DefinitionCapabilities;

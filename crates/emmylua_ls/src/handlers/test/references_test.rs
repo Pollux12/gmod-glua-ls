@@ -4,6 +4,7 @@ mod tests {
 
     use crate::handlers::references::references;
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualLocation, check};
+    use emmylua_code_analysis::Emmyrc;
     use googletest::prelude::*;
 
     #[gtest]
@@ -205,6 +206,83 @@ mod tests {
         assert!(lines.contains(&2));
         assert!(lines.contains(&3));
         assert!(lines.contains(&4));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_vgui_panel_string_references() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_references(
+            r#"
+                local parent = vgui.Create("MyPa<??>nel")
+
+
+                parent:Add("MyPanel")
+            "#,
+            vec![
+                (
+                    "defs.lua",
+                    "\n\n\n\n\n\n\n\nvgui.Register(\"MyPanel\", PANEL, \"DPanel\")\n",
+                ),
+                (
+                    "usage.lua",
+                    "\n\n\n\n\n\n\n\n\n\n\n\nlocal created = vgui.Create(\"MyPanel\")\n",
+                ),
+            ],
+            vec![
+                VirtualLocation {
+                    file: "virtual_0.lua".to_string(),
+                    line: 1,
+                },
+                VirtualLocation {
+                    file: "virtual_0.lua".to_string(),
+                    line: 4,
+                },
+                VirtualLocation {
+                    file: "defs.lua".to_string(),
+                    line: 8,
+                },
+                VirtualLocation {
+                    file: "usage.lua".to_string(),
+                    line: 12,
+                },
+            ],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_message_string_references() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_references(
+            r#"
+                net.Receive("MyMe<??>ssage", function() end)
+            "#,
+            vec![(
+                "send.lua",
+                "\n\n\n\n\n\n\nnet.Start(\"MyMessage\")\nnet.Broadcast()\n",
+            )],
+            vec![
+                VirtualLocation {
+                    file: "virtual_0.lua".to_string(),
+                    line: 1,
+                },
+                VirtualLocation {
+                    file: "send.lua".to_string(),
+                    line: 7,
+                },
+            ],
+        ));
+
         Ok(())
     }
 }

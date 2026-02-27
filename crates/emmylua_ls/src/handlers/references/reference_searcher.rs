@@ -8,10 +8,16 @@ use emmylua_code_analysis::{
     LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
 };
 use emmylua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaNameToken, LuaStringToken,
-    LuaSyntaxNode, LuaSyntaxToken, LuaTableField,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaLiteralToken,
+    LuaNameToken, LuaStringToken, LuaSyntaxNode,
+    LuaSyntaxToken, LuaTableField, PathTrait,
 };
 use lsp_types::Location;
+
+use crate::handlers::gmod_string_context::{
+    extract_string_call_context, is_vgui_panel_string_context, net_message_call_kind,
+    normalize_string_name,
+};
 
 #[derive(Default)]
 struct ReferenceSearchContext {
@@ -47,8 +53,27 @@ pub fn search_references(
             }
             _ => {}
         }
-    } else if let Some(token) = LuaStringToken::cast(token.clone()) {
-        let _ = search_string_references(semantic_model, token, &mut result);
+    } else if let Some(string_token) = LuaStringToken::cast(token.clone()) {
+        if semantic_model.get_emmyrc().gmod.enabled {
+            if search_vgui_panel_string_references(
+                semantic_model,
+                compilation,
+                string_token.clone(),
+                &mut result,
+            )
+            .is_some()
+            {
+                return Some(result);
+            }
+
+            if search_net_message_references(semantic_model, string_token.clone(), &mut result)
+                .is_some()
+            {
+                return Some(result);
+            }
+        }
+
+        let _ = search_string_references(semantic_model, string_token, &mut result);
     } else if semantic_model.get_emmyrc().references.fuzzy_search {
         let _ = fuzzy_search_references(compilation, token, &mut result);
     }
@@ -305,6 +330,180 @@ fn search_string_references(
     }
 
     Some(())
+}
+
+fn search_vgui_panel_string_references(
+    semantic_model: &SemanticModel,
+    compilation: &LuaCompilation,
+    token: LuaStringToken,
+    result: &mut Vec<Location>,
+) -> Option<()> {
+    let context = extract_string_call_context(&token)?;
+    if !is_vgui_panel_string_context(&context.call_path, context.arg_index) {
+        return None;
+    }
+
+    for (file_id, call) in semantic_model
+        .get_db()
+        .get_gmod_class_metadata_index()
+        .find_vgui_panel_definitions(&context.name)
+    {
+        let definition_range = call
+            .args
+            .first()
+            .map(|arg| arg.syntax_id.get_range())
+            .unwrap_or(call.syntax_id.get_range());
+        let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
+            continue;
+        };
+        let Some(location) = document.to_lsp_location(definition_range) else {
+            continue;
+        };
+        push_unique_location(result, location);
+    }
+
+    let string_refs = semantic_model
+        .get_db()
+        .get_reference_index()
+        .get_string_references(&context.name);
+    let before_usage_refs = result.len();
+    let mut semantic_cache = HashMap::new();
+    for in_filed_reference_range in string_refs {
+        let Some(reference_semantic_model) = get_semantic_model_cached(
+            compilation,
+            &mut semantic_cache,
+            in_filed_reference_range.file_id,
+        ) else {
+            continue;
+        };
+
+        let root = reference_semantic_model.get_root();
+        let Some(reference_token) = root
+            .syntax()
+            .token_at_offset(in_filed_reference_range.value.start())
+            .right_biased()
+        else {
+            continue;
+        };
+        let Some(reference_string_token) = LuaStringToken::cast(reference_token) else {
+            continue;
+        };
+        let Some(reference_context) = extract_string_call_context(&reference_string_token) else {
+            continue;
+        };
+        if !is_vgui_panel_string_context(&reference_context.call_path, reference_context.arg_index)
+            || reference_context.name != context.name
+        {
+            continue;
+        }
+
+        let document = reference_semantic_model.get_document();
+        let Some(location) = document.to_lsp_location(in_filed_reference_range.value) else {
+            continue;
+        };
+        push_unique_location(result, location);
+    }
+
+    if result.len() == before_usage_refs {
+        collect_vgui_context_string_references_from_ast(compilation, &context.name, result);
+    }
+
+    Some(())
+}
+
+/// Fallback: scans all files' ASTs for VGUI-context string references.
+/// Triggered when the string reference index has no results for the panel name
+/// (e.g., when short string indexing is disabled or the index is incomplete).
+/// This is O(files x calls) but only runs as a last resort.
+fn collect_vgui_context_string_references_from_ast(
+    compilation: &LuaCompilation,
+    panel_name: &str,
+    result: &mut Vec<Location>,
+) {
+    let mut semantic_cache = HashMap::new();
+    let file_ids = compilation.get_db().get_vfs().get_all_file_ids();
+    for file_id in file_ids {
+        let Some(semantic_model) = get_semantic_model_cached(compilation, &mut semantic_cache, file_id)
+        else {
+            continue;
+        };
+
+        let root = semantic_model.get_root();
+        for call_expr in root.descendants::<LuaCallExpr>() {
+            let Some(call_path) = call_expr.get_access_path() else {
+                continue;
+            };
+            let Some(args_list) = call_expr.get_args_list() else {
+                continue;
+            };
+
+            for (arg_index, arg) in args_list.get_args().enumerate() {
+                let LuaExpr::LiteralExpr(literal_expr) = arg else {
+                    continue;
+                };
+                let Some(LuaLiteralToken::String(string_token)) = literal_expr.get_literal() else {
+                    continue;
+                };
+                let Some(name) = normalize_string_name(string_token.get_value()) else {
+                    continue;
+                };
+
+                if name != panel_name || !is_vgui_panel_string_context(&call_path, arg_index) {
+                    continue;
+                }
+
+                let Some(location) = semantic_model
+                    .get_document()
+                    .to_lsp_location(string_token.get_range())
+                else {
+                    continue;
+                };
+                push_unique_location(result, location);
+            }
+        }
+    }
+}
+
+fn search_net_message_references(
+    semantic_model: &SemanticModel,
+    token: LuaStringToken,
+    result: &mut Vec<Location>,
+) -> Option<()> {
+    let context = extract_string_call_context(&token)?;
+    let _ = net_message_call_kind(&context.call_path, context.arg_index)?;
+
+    let network_index = semantic_model.get_db().get_gmod_network_index();
+
+    for (file_id, flow) in network_index.get_send_flows_for_message(&context.name) {
+        let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
+            continue;
+        };
+        let Some(location) = document.to_lsp_location(flow.start_range) else {
+            continue;
+        };
+        push_unique_location(result, location);
+    }
+
+    for (file_id, flow) in network_index.get_receive_flows_for_message(&context.name) {
+        let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
+            continue;
+        };
+        let Some(location) = document.to_lsp_location(flow.receive_range) else {
+            continue;
+        };
+        push_unique_location(result, location);
+    }
+
+    Some(())
+}
+
+fn push_unique_location(result: &mut Vec<Location>, location: Location) {
+    if !result
+        .iter()
+        .any(|existing| existing.uri == location.uri && existing.range == location.range)
+    {
+        result.push(location);
+    }
 }
 
 fn fuzzy_search_references(

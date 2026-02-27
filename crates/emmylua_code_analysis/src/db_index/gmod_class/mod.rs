@@ -219,6 +219,36 @@ impl GmodClassMetadataIndex {
         self.file_metadata.iter()
     }
 
+    pub fn find_vgui_panel_definitions(
+        &self,
+        name: &str,
+    ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
+        if name.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let mut definitions = Vec::new();
+        for (file_id, file_metadata) in &self.file_metadata {
+            for call in file_metadata
+                .vgui_register_calls
+                .iter()
+                .chain(file_metadata.derma_define_control_calls.iter())
+            {
+                let Some(Some(GmodClassCallLiteral::String(panel_name))) =
+                    call.literal_args.first()
+                else {
+                    continue;
+                };
+
+                if panel_name == name {
+                    definitions.push((*file_id, call));
+                }
+            }
+        }
+
+        definitions
+    }
+
     pub fn get_vgui_panel_base(&self, name: &str) -> Option<Option<String>> {
         self.vgui_panels.get(name).cloned()
     }

@@ -20,4 +20,6 @@ pub struct GmodScriptedClassEntry {
     pub uri: String,
     pub class_type: String,
     pub class_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<lsp_types::Range>,
 }
