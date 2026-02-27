@@ -127,6 +127,8 @@
     "hint": {
       "$ref": "#/$defs/EmmyrcInlayHint",
       "default": {
+        "closingEndHint": true,
+        "closingEndHintMinLines": 10,
         "enumParamHint": false,
         "indexHint": true,
         "localHint": true,
@@ -1170,6 +1172,20 @@
     "EmmyrcInlayHint": {
       "type": "object",
       "properties": {
+        "closingEndHint": {
+          "description": "Show an inlay hint after closing `end` keywords indicating what block\nthey belong to (e.g. function name). Only shown when the block spans\nat least `closingEndHintMinLines` lines.",
+          "type": "boolean",
+          "default": true,
+          "x-vscode-setting": true
+        },
+        "closingEndHintMinLines": {
+          "description": "Minimum number of lines a block must span before a closing `end` hint\nis shown.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 10,
+          "minimum": 0,
+          "x-vscode-setting": true
+        },
         "enumParamHint": {
           "description": "Show name of enumerator when passing a literal value to a function\nthat expects an enum.\n\nExample:\n\n```lua\n--- @enum Level\nlocal Foo = {\n   Info = 1,\n   Error = 2,\n}\n\n--- @param l Level\nfunction print_level(l) end\n\nprint_level(1 --[[ Hint: Level.Info ]])\n```",
           "type": "boolean",

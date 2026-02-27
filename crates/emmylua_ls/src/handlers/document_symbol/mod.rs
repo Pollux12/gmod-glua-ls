@@ -263,10 +263,8 @@ fn process_stat(
                 if let Some(block) = do_stat.get_block() {
                     process_block(builder, block, do_id)?;
                 }
-            } else {
-                if let Some(block) = do_stat.get_block() {
-                    process_block(builder, block, parent_id)?;
-                }
+            } else if let Some(block) = do_stat.get_block() {
+                process_block(builder, block, parent_id)?;
             }
         }
         LuaStat::CallExprStat(call_stat) => {

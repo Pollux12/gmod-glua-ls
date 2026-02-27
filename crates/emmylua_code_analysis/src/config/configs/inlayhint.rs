@@ -55,6 +55,17 @@ pub struct EmmyrcInlayHint {
     #[serde(default = "default_false")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub enum_param_hint: bool,
+    /// Show an inlay hint after closing `end` keywords indicating what block
+    /// they belong to (e.g. function name). Only shown when the block spans
+    /// at least `closingEndHintMinLines` lines.
+    #[serde(default = "default_true")]
+    #[schemars(extend("x-vscode-setting" = true))]
+    pub closing_end_hint: bool,
+    /// Minimum number of lines a block must span before a closing `end` hint
+    /// is shown.
+    #[serde(default = "default_min_lines")]
+    #[schemars(extend("x-vscode-setting" = true))]
+    pub closing_end_hint_min_lines: u32,
 }
 
 impl Default for EmmyrcInlayHint {
@@ -66,6 +77,8 @@ impl Default for EmmyrcInlayHint {
             override_hint: default_true(),
             meta_call_hint: default_true(),
             enum_param_hint: default_false(),
+            closing_end_hint: default_true(),
+            closing_end_hint_min_lines: default_min_lines(),
         }
     }
 }
@@ -76,4 +89,8 @@ fn default_true() -> bool {
 
 fn default_false() -> bool {
     false
+}
+
+fn default_min_lines() -> u32 {
+    10
 }

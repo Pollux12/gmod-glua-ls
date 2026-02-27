@@ -283,14 +283,8 @@ fn build_decl_hover(
         }
     }
 
-    if let Some((panel_name, base_name)) = get_vgui_panel_name(db, &typ) {
-        if let Some(base_name) = base_name {
-            builder.add_annotation_description(format!(
-                "---\n**VGUI Panel:** `{panel_name}` (Base: `{base_name}`)"
-            ));
-        } else {
-            builder.add_annotation_description(format!("---\n**VGUI Panel:** `{panel_name}`"));
-        }
+    if let Some(desc) = get_gmod_class_description(db, &typ) {
+        builder.add_annotation_description(desc);
     }
 
     if let LuaDeclExtra::Param {
@@ -389,17 +383,56 @@ fn build_member_hover(
         }
     }
 
-    if let Some((panel_name, base_name)) = get_vgui_panel_name(db, &typ) {
-        if let Some(base_name) = base_name {
-            builder.add_annotation_description(format!(
-                "---\n**VGUI Panel:** `{panel_name}` (Base: `{base_name}`)"
-            ));
-        } else {
-            builder.add_annotation_description(format!("---\n**VGUI Panel:** `{panel_name}`"));
-        }
+    if let Some(desc) = get_gmod_class_description(db, &typ) {
+        builder.add_annotation_description(desc);
     }
 
     Some(())
+}
+
+fn get_gmod_class_description(db: &DbIndex, typ: &LuaType) -> Option<String> {
+    if !db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    // Check VGUI panels first
+    if let Some((panel_name, base_name)) = get_vgui_panel_name(db, typ) {
+        return Some(match base_name {
+            Some(base) => format!("---\n**VGUI Panel:** `{panel_name}` (Base: `{base}`)"),
+            None => format!("---\n**VGUI Panel:** `{panel_name}`"),
+        });
+    }
+
+    // Check scripted entity supers
+    let type_id = match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => id,
+        _ => return None,
+    };
+
+    let supers = db.get_type_index().get_super_types(type_id)?;
+    for super_type in supers {
+        let super_name = match &super_type {
+            LuaType::Def(id) | LuaType::Ref(id) => id.get_simple_name(),
+            _ => continue,
+        };
+
+        let label = match super_name {
+            "Entity" => "Scripted Entity",
+            "Weapon" => "Scripted Weapon",
+            "CEffect" => "Scripted Effect",
+            "Tool" => "Tool",
+            "Plugin" => "Plugin",
+            "Gamemode" => "Gamemode",
+            _ => continue,
+        };
+
+        return Some(format!(
+            "---\n**{label}:** `{}` (Base: `{super_name}`)",
+            type_id.get_simple_name()
+        ));
+    }
+
+    None
 }
 
 fn get_vgui_panel_name(db: &DbIndex, typ: &LuaType) -> Option<(String, Option<String>)> {

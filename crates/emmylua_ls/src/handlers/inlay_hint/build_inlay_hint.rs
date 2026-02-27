@@ -51,13 +51,68 @@ pub fn build_inlay_hints(
                 build_assign_stat_hint(semantic_model, &mut result, assign_stat);
             }
             LuaAst::LuaFuncStat(func_stat) => {
-                if client_id.is_intellij() {
-                    continue;
+                if !client_id.is_intellij() {
+                    build_func_stat_override_hint(
+                        semantic_model,
+                        &mut result,
+                        func_stat.clone(),
+                    );
+                    build_func_stat_closing_end_hint(
+                        semantic_model,
+                        &mut result,
+                        func_stat,
+                    );
                 }
-                build_func_stat_override_hint(semantic_model, &mut result, func_stat);
             }
             LuaAst::LuaIndexExpr(index_expr) => {
                 build_index_expr_hint(semantic_model, &mut result, index_expr);
+            }
+            LuaAst::LuaLocalFuncStat(local_func_stat) => {
+                build_local_func_stat_closing_end_hint(
+                    semantic_model,
+                    &mut result,
+                    local_func_stat,
+                );
+            }
+            LuaAst::LuaIfStat(if_stat) => {
+                build_control_flow_closing_end_hint(
+                    semantic_model,
+                    &mut result,
+                    if_stat.syntax(),
+                    "if",
+                );
+            }
+            LuaAst::LuaWhileStat(while_stat) => {
+                build_control_flow_closing_end_hint(
+                    semantic_model,
+                    &mut result,
+                    while_stat.syntax(),
+                    "while",
+                );
+            }
+            LuaAst::LuaDoStat(do_stat) => {
+                build_control_flow_closing_end_hint(
+                    semantic_model,
+                    &mut result,
+                    do_stat.syntax(),
+                    "do",
+                );
+            }
+            LuaAst::LuaForStat(for_stat) => {
+                build_control_flow_closing_end_hint(
+                    semantic_model,
+                    &mut result,
+                    for_stat.syntax(),
+                    "for",
+                );
+            }
+            LuaAst::LuaForRangeStat(for_range_stat) => {
+                build_control_flow_closing_end_hint(
+                    semantic_model,
+                    &mut result,
+                    for_range_stat.syntax(),
+                    "for",
+                );
             }
             _ => {}
         }
@@ -975,4 +1030,243 @@ fn find_matching_enum_member<'a>(
         }
     }
     None
+}
+
+fn exceeds_min_lines(
+    semantic_model: &SemanticModel,
+    start_offset: rowan::TextSize,
+    end_offset: rowan::TextSize,
+) -> bool {
+    let document = semantic_model.get_document();
+    let min_lines = semantic_model.get_emmyrc().hint.closing_end_hint_min_lines;
+    let Some(start_line) = document.get_line(start_offset) else {
+        return false;
+    };
+    let Some(end_line) = document.get_line(end_offset) else {
+        return false;
+    };
+    end_line.saturating_sub(start_line) >= min_lines as usize
+}
+
+fn get_scripted_entity_suffix(
+    semantic_model: &SemanticModel,
+    member_owner: &LuaMemberOwner,
+) -> Option<String> {
+    let type_id = match member_owner {
+        LuaMemberOwner::Type(type_id) => type_id,
+        _ => return None,
+    };
+
+    // Check VGUI panels first
+    let type_name = type_id.get_simple_name();
+    if let Some(base_name) = semantic_model
+        .get_db()
+        .get_gmod_class_metadata_index()
+        .get_vgui_panel_base(type_name)
+    {
+        return Some(match base_name {
+            Some(base) => format!(" ({type_name} : {base})"),
+            None => format!(" ({type_name})"),
+        });
+    }
+
+    // Check scripted entity types
+    let supers = semantic_model
+        .get_db()
+        .get_type_index()
+        .get_super_types(type_id)?;
+
+    for super_type in supers {
+        let super_id = match &super_type {
+            LuaType::Ref(id) => id,
+            _ => continue,
+        };
+        let super_name = super_id.get_simple_name();
+        match super_name {
+            "ENT" | "Entity" | "SWEP" | "Weapon" | "EFFECT" | "TOOL" | "Tool" | "PLUGIN"
+            | "GM" => {
+                return Some(format!(" ({type_name} : {super_name})"));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn build_func_stat_closing_end_hint(
+    semantic_model: &SemanticModel,
+    result: &mut Vec<InlayHint>,
+    func_stat: LuaFuncStat,
+) -> Option<()> {
+    if !semantic_model.get_emmyrc().hint.closing_end_hint {
+        return Some(());
+    }
+
+    let closure = func_stat.get_closure()?;
+    let end_token = closure.token_by_kind(LuaTokenKind::TkEnd)?;
+    let stat_range = func_stat.get_range();
+
+    if !exceeds_min_lines(semantic_model, stat_range.start(), end_token.get_range().end()) {
+        return Some(());
+    }
+
+    let document = semantic_model.get_document();
+    let end_pos = document.to_lsp_position(end_token.get_range().end())?;
+
+    let func_name = func_stat.get_func_name()?;
+    let (label_text, location) = match &func_name {
+        LuaVarExpr::IndexExpr(index_expr) => {
+            let index_name_token = index_expr.get_index_name_token()?;
+            let name_range = document.to_lsp_range(index_name_token.text_range())?;
+
+            // Build the full name e.g. "PANEL:OnRemove" or "MyClass.method"
+            let prefix_text = index_expr
+                .get_prefix_expr()
+                .map(|p| p.syntax().text().to_string());
+            let separator = if index_expr.get_index_name_token().is_some() {
+                // Check if it uses : or .
+                index_expr
+                    .syntax()
+                    .children_with_tokens()
+                    .filter_map(|it| it.into_token())
+                    .find(|t| {
+                        t.kind() == LuaTokenKind::TkColon.into()
+                            || t.kind() == LuaTokenKind::TkDot.into()
+                    })
+                    .map(|t| t.text().to_string())
+                    .unwrap_or_else(|| ".".to_string())
+            } else {
+                ".".to_string()
+            };
+            let method_name = index_name_token.text().to_string();
+            let full_name = match prefix_text {
+                Some(prefix) => format!("{prefix}{separator}{method_name}"),
+                None => method_name,
+            };
+
+            let location = Location::new(document.get_uri(), name_range);
+
+            // Check for scripted entity suffix
+            let file_id = semantic_model.get_file_id();
+            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+            let suffix = semantic_model
+                .get_db()
+                .get_member_index()
+                .get_member_owner(&member_id)
+                .and_then(|owner| get_scripted_entity_suffix(semantic_model, owner))
+                .unwrap_or_default();
+
+            (format!("{full_name}{suffix}"), location)
+        }
+        LuaVarExpr::NameExpr(name_expr) => {
+            let name_token = name_expr.get_name_token()?;
+            let name_range = document.to_lsp_range(name_token.get_range())?;
+            let name_text = name_token.get_name_text().to_string();
+            let location = Location::new(document.get_uri(), name_range);
+            (name_text, location)
+        }
+    };
+
+    let hint = InlayHint {
+        kind: Some(InlayHintKind::TYPE),
+        label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
+            value: format!("← {label_text}"),
+            location: Some(location),
+            ..Default::default()
+        }]),
+        position: end_pos,
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(true),
+        padding_right: None,
+        data: None,
+    };
+    result.push(hint);
+
+    Some(())
+}
+
+fn build_local_func_stat_closing_end_hint(
+    semantic_model: &SemanticModel,
+    result: &mut Vec<InlayHint>,
+    local_func_stat: LuaLocalFuncStat,
+) -> Option<()> {
+    if !semantic_model.get_emmyrc().hint.closing_end_hint {
+        return Some(());
+    }
+
+    let closure = local_func_stat.get_closure()?;
+    let end_token = closure.token_by_kind(LuaTokenKind::TkEnd)?;
+    let stat_range = local_func_stat.get_range();
+
+    if !exceeds_min_lines(semantic_model, stat_range.start(), end_token.get_range().end()) {
+        return Some(());
+    }
+
+    let document = semantic_model.get_document();
+    let end_pos = document.to_lsp_position(end_token.get_range().end())?;
+
+    let local_name = local_func_stat.get_local_name()?;
+    let name_token = local_name.get_name_token()?;
+    let name_text = name_token.get_name_text().to_string();
+    let name_range = document.to_lsp_range(name_token.get_range())?;
+    let location = Location::new(document.get_uri(), name_range);
+
+    let hint = InlayHint {
+        kind: Some(InlayHintKind::TYPE),
+        label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
+            value: format!("← {name_text}"),
+            location: Some(location),
+            ..Default::default()
+        }]),
+        position: end_pos,
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(true),
+        padding_right: None,
+        data: None,
+    };
+    result.push(hint);
+
+    Some(())
+}
+
+fn build_control_flow_closing_end_hint(
+    semantic_model: &SemanticModel,
+    result: &mut Vec<InlayHint>,
+    stat_syntax: &emmylua_parser::LuaSyntaxNode,
+    keyword: &str,
+) -> Option<()> {
+    if !semantic_model.get_emmyrc().hint.closing_end_hint {
+        return Some(());
+    }
+
+    let end_token = stat_syntax
+        .children_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|t| t.kind() == LuaTokenKind::TkEnd.into())
+        .last()?;
+    let end_range = end_token.text_range();
+
+    if !exceeds_min_lines(semantic_model, stat_syntax.text_range().start(), end_range.end()) {
+        return Some(());
+    }
+
+    let document = semantic_model.get_document();
+    let end_pos = document.to_lsp_position(end_range.end())?;
+
+    let hint = InlayHint {
+        kind: Some(InlayHintKind::TYPE),
+        label: InlayHintLabel::String(format!("← {keyword}")),
+        position: end_pos,
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(true),
+        padding_right: None,
+        data: None,
+    };
+    result.push(hint);
+
+    Some(())
 }
