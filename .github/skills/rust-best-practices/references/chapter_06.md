@@ -10,7 +10,7 @@ Understanding the trade-offs lets you write faster, smaller and more flexible co
 
 ## 6.1 [Generics](https://doc.rust-lang.org/book/ch10-00-generics.html)
 
-Every programming language has tools for effectively handling the duplication of concepts. In Rust, one such tool is generics: abstract stand-ins for concrete types or other properties. We can express the behavior of generics or how they relate to other generics without knowing what will be in their place when compiling and running the code. 
+Every programming language has tools for effectively handling the duplication of concepts. In Rust, one such tool is generics: abstract stand-ins for concrete types or other properties. We can express the behavior of generics or how they relate to other generics without knowing what will be in their place when compiling and running the code.
 
 We use generics to create definitions for items like function signatures or structs, which we can then use with many different concrete data types. Let's first look at how to define functions, structs, enums, and methods using generics. Generics can also be used to implement Type State Pattern and constrain a struct functionality to certain expected types, more on type state on [Chapter 7](./chapter_07.md).
 
@@ -158,4 +158,4 @@ struct Renderer {
     trait Factory {
         fn create<T>() -> T; // generic methods are not allowed
     }
-    ```
+}

@@ -24,7 +24,7 @@ mod test {
         // If it's Ref, Def.name works (instance field).
         // If it's Def, Def.name works (class field/static).
         // Let's add a static field.
-        
+
         ws.def(
              r#"
                 ---@class MyDefClass2
@@ -37,10 +37,10 @@ mod test {
                 Def.newMethod = function() end -- Should add to class
             "#,
         );
-        
+
         // If Def is Ref, newMethod adds to instance.
         // If Def is Def, newMethod adds to class.
-        
+
         // Check if another instance sees it.
         ws.def(
             r#"

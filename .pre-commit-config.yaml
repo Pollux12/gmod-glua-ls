@@ -13,9 +13,9 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: '(^crates/glua_ls/std_i18n/.*\.yaml$|^/skills/.*)'
+        exclude: '(^crates/glua_ls/std_i18n/.*\.yaml$|^\.github/skills/.*)'
       - id: end-of-file-fixer
-        exclude: '^crates/glua_ls/std_i18n/.*\.yaml$'
+        exclude: '(^crates/glua_ls/std_i18n/.*\.yaml$|^\.github/skills/.*)'
       - id: fix-byte-order-marker
       - id: mixed-line-ending
         args: [--fix=lf]
