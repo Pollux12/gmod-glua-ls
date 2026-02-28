@@ -177,15 +177,51 @@ fn get_custom_type_operator(
     }
 }
 
-pub fn infer_expr_list_types(
+pub fn infer_expr_list_value_type_at(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    exprs: &[LuaExpr],
+    value_idx: usize,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let exprs_len = exprs.len();
+    if exprs_len == 0 {
+        Ok(None)
+    } else if value_idx < exprs_len {
+        Ok(
+            infer_expr_list_types(db, cache, &exprs[value_idx..], Some(1), infer_expr)?
+                .first()
+                .map(|(ty, _)| ty.clone()),
+        )
+    } else {
+        let last_idx = exprs_len - 1;
+        let offset = value_idx - last_idx;
+        Ok(
+            infer_expr_list_types(db, cache, &exprs[last_idx..], Some(offset + 1), infer_expr)?
+                .get(offset)
+                .map(|(ty, _)| ty.clone()),
+        )
+    }
+}
+
+pub fn infer_expr_list_types<F>(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     exprs: &[LuaExpr],
     var_count: Option<usize>,
-) -> Vec<(LuaType, TextRange)> {
+    mut infer: F,
+) -> Result<Vec<(LuaType, TextRange)>, InferFailReason>
+where
+    F: FnMut(&DbIndex, &mut LuaInferCache, LuaExpr) -> InferResult,
+{
     let mut value_types = Vec::new();
     for (idx, expr) in exprs.iter().enumerate() {
-        let expr_type = infer_expr(db, cache, expr.clone()).unwrap_or(LuaType::Unknown);
+        if let Some(var_count) = var_count
+            && value_types.len() >= var_count
+        {
+            break;
+        }
+
+        let expr_type = infer(db, cache, expr.clone())?;
         match expr_type {
             LuaType::Variadic(variadic) => {
                 if let Some(var_count) = var_count {
@@ -213,11 +249,11 @@ pub fn infer_expr_list_types(
 
                 break;
             }
-            _ => value_types.push((expr_type.clone(), expr.get_range())),
+            _ => value_types.push((expr_type, expr.get_range())),
         }
     }
 
-    value_types
+    Ok(value_types)
 }
 
 /// 推断值已经绑定的类型(不是推断值的类型). 例如从右值推断左值类型, 从调用参数推断函数参数类型参数类型

@@ -216,12 +216,11 @@ impl<'a> SemanticModel<'a> {
         exprs: &[LuaExpr],
         var_count: Option<usize>,
     ) -> Vec<(LuaType, TextRange)> {
-        infer_expr_list_types(
-            self.db,
-            &mut self.infer_cache.borrow_mut(),
-            exprs,
-            var_count,
-        )
+        let cache = &mut self.infer_cache.borrow_mut();
+        infer_expr_list_types(self.db, cache, exprs, var_count, |db, cache, expr| {
+            Ok(infer_expr(db, cache, expr).unwrap_or(LuaType::Unknown))
+        })
+        .unwrap_or_default()
     }
 
     /// 推断值已经绑定的类型(不是推断值的类型). 例如从右值推断左值类型, 从调用参数推断函数参数类型

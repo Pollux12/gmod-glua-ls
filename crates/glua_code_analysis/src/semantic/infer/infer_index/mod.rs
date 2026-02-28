@@ -224,6 +224,10 @@ pub fn infer_member_by_member_key(
             let module_info = db.get_module_index().get_module(*file_id);
             if let Some(module_info) = module_info {
                 if let Some(export_type) = &module_info.export_type {
+                    if export_type.is_module_ref() {
+                        return Err(InferFailReason::RecursiveInfer);
+                    }
+
                     return infer_member_by_member_key(
                         db,
                         cache,
@@ -730,9 +734,16 @@ fn infer_instance_member(
     let base_result =
         infer_member_by_member_key(db, cache, origin_type, index_expr.clone(), infer_guard);
     match base_result {
-        Ok(typ) => {
-            return Ok(typ);
-        }
+        Ok(typ) => match infer_table_member(db, cache, range.clone(), index_expr.clone()) {
+            Ok(table_type) => {
+                return Ok(match TypeOps::Intersect.apply(db, &typ, &table_type) {
+                    LuaType::Never => typ,
+                    intersected => intersected,
+                });
+            }
+            Err(InferFailReason::FieldNotFound) => return Ok(typ),
+            Err(err) => return Err(err),
+        },
         Err(InferFailReason::FieldNotFound) => {}
         Err(err) => return Err(err),
     }

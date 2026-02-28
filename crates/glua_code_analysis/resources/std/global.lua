@@ -241,9 +241,9 @@ function next(table, index) end
 ---
 --- See function `next` for the caveats of modifying the table during its
 --- traversal.
----@generic K, V
+---@generic K, V, I
 ---@param t table<K, V> | V[] | {[K]: V}
----@return fun(tbl: any):K, V
+---@return (fun(tbl: table<I, V>, index: I?):K, V), table<I, V>, I?
 function pairs(t) end
 
 ---

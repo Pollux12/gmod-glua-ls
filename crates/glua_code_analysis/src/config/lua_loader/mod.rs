@@ -5,22 +5,26 @@ use luars::{
 use serde_json::Value;
 
 pub fn load_lua_config(content: &str) -> Result<Value, String> {
-    let mut lua = LuaVM::new(SafeOption {
-        max_call_depth: 64,
-        max_stack_size: 256,
-        max_memory_limit: 100 * 1024 * 1024, // 100 MB
-    });
+    let mut safe_option = SafeOption::default();
+    safe_option.max_call_depth = 64;
+    safe_option.base_call_depth = 64;
+    safe_option.max_stack_size = 256;
+    safe_option.max_memory_limit = 100 * 1024 * 1024; // 100 MB
+    let mut lua = LuaVM::new(safe_option);
 
-    let _ = lua.open_stdlib(luars::Stdlib::Package);
-    let _ = lua.open_stdlib(luars::Stdlib::Basic);
-    let _ = lua.open_stdlib(luars::Stdlib::Table);
-    let _ = lua.open_stdlib(luars::Stdlib::String);
-    let _ = lua.open_stdlib(luars::Stdlib::Math);
-    let _ = lua.open_stdlib(luars::Stdlib::Os);
-    let _ = lua.open_stdlib(luars::Stdlib::Utf8);
+    let _ = lua.open_stdlibs(&[
+        luars::Stdlib::Package,
+        luars::Stdlib::Basic,
+        luars::Stdlib::Table,
+        luars::Stdlib::String,
+        luars::Stdlib::Math,
+        luars::Stdlib::Os,
+        luars::Stdlib::Utf8,
+    ]);
+
     let _ = lua.set_global("print", LuaValue::cfunction(ls_println));
 
-    let values = match lua.execute_string(content) {
+    let values = match lua.execute(content) {
         Ok(v) => v,
         Err(e) => {
             let err_msg = lua.main_state().get_error_msg(e);

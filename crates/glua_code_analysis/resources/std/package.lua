@@ -168,7 +168,8 @@ package.searchers = {}
 ---@param path? string
 ---@param sep? string
 ---@param rep? string
----@return string
+---@return string? filename
+---@return string? error
 function package.searchpath(name, path, sep, rep) end
 
 ---@version 5.1, JIT

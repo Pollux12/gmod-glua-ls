@@ -1569,16 +1569,28 @@ dependencies = [
 
 [[package]]
 name = "luars"
-version = "0.2.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b38178a99c76f10b9dd5c1ef0306eb83fbd00ef5cb20e9aa9910bbc6d7716f61"
+checksum = "a36fe74e7e8be1fbfcd9139e1fdeeae504e29cb8853236f9b5f1103e159c0bf7"
 dependencies = [
  "ahash",
  "chrono",
  "itoa",
- "rand 0.8.5",
+ "luars-derive",
  "serde",
  "serde_json",
+ "smol_str",
+]
+
+[[package]]
+name = "luars-derive"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bf6760985f0fedec009332a92ac45353645958c555fcfb097611607653c7463"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

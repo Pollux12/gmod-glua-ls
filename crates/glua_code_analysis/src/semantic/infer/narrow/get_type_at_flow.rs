@@ -4,14 +4,13 @@ use crate::{
     CacheEntry, DbIndex, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason, LuaDeclId,
     LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, TypeOps, infer_expr,
     semantic::infer::{
-        InferResult, VarRefId,
+        InferResult, VarRefId, infer_expr_list_value_type_at,
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{InferConditionFlow, get_type_at_condition_flow},
             get_multi_antecedents, get_single_antecedent,
             get_type_at_cast_flow::get_type_at_cast_flow,
-            get_var_ref_type,
-            narrow_type::narrow_down_type,
+            get_var_ref_type, narrow_down_type,
             var_ref_id::get_var_expr_var_ref_id,
         },
     },
@@ -227,68 +226,47 @@ fn get_type_at_assign_stat(
         }
 
         // Check if there's an explicit type annotation (not just inferred type)
-        let explicit_var_type = match var {
+        let var_id = match var {
             LuaVarExpr::NameExpr(name_expr) => {
-                let decl_id = LuaDeclId::new(cache.get_file_id(), name_expr.get_position());
-                db.get_type_index()
-                    .get_type_cache(&decl_id.into())
-                    .filter(|tc| tc.is_doc())
-                    .map(|tc| tc.as_type().clone())
+                Some(LuaDeclId::new(cache.get_file_id(), name_expr.get_position()).into())
             }
             LuaVarExpr::IndexExpr(index_expr) => {
-                let member_id = LuaMemberId::new(index_expr.get_syntax_id(), cache.get_file_id());
-                db.get_type_index()
-                    .get_type_cache(&member_id.into())
-                    .filter(|tc| tc.is_doc())
-                    .map(|tc| tc.as_type().clone())
+                Some(LuaMemberId::new(index_expr.get_syntax_id(), cache.get_file_id()).into())
             }
         };
 
-        // infer from expr
-        let expr_type = match exprs.get(i) {
-            Some(expr) => {
-                let expr_type = infer_expr(db, cache, expr.clone())?;
-                match &expr_type {
-                    LuaType::Variadic(variadic) => match variadic.get_type(0) {
-                        Some(typ) => typ.clone(),
-                        None => return Ok(ResultTypeOrContinue::Continue),
-                    },
-                    _ => expr_type,
-                }
-            }
-            None => {
-                let expr_len = exprs.len();
-                if expr_len == 0 {
-                    return Ok(ResultTypeOrContinue::Continue);
-                }
+        let explicit_var_type = var_id
+            .and_then(|id| db.get_type_index().get_type_cache(&id))
+            .filter(|tc| tc.is_doc())
+            .map(|tc| tc.as_type().clone());
 
-                let last_expr = exprs[expr_len - 1].clone();
-                let last_expr_type = infer_expr(db, cache, last_expr)?;
-                if let LuaType::Variadic(variadic) = last_expr_type {
-                    let idx = i - expr_len + 1;
-                    match variadic.get_type(idx) {
-                        Some(typ) => typ.clone(),
-                        None => return Ok(ResultTypeOrContinue::Continue),
-                    }
-                } else {
-                    return Ok(ResultTypeOrContinue::Continue);
-                }
-            }
+        let expr_type = infer_expr_list_value_type_at(db, cache, &exprs, i)?;
+        let Some(expr_type) = expr_type else {
+            return Ok(ResultTypeOrContinue::Continue);
         };
 
-        let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-        let antecedent_type =
-            get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
-
-        // If there's an explicit type annotation (from ---@type comment), use it
-        // Otherwise, use flow-based narrowing
-        let result_type = if let Some(annotation) = explicit_var_type {
-            annotation
-        } else if antecedent_type == LuaType::Nil {
-            expr_type.clone()
+        let source_type = if let Some(explicit) = explicit_var_type.clone() {
+            explicit
         } else {
-            narrow_down_type(db, antecedent_type, expr_type.clone()).unwrap_or(expr_type)
+            let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+            get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?
         };
+
+        let narrowed = if source_type == LuaType::Nil {
+            None
+        } else {
+            let declared =
+                get_var_ref_type(db, cache, var_ref_id)
+                    .ok()
+                    .and_then(|decl| match decl {
+                        LuaType::Def(_) | LuaType::Ref(_) => Some(decl),
+                        _ => None,
+                    });
+
+            narrow_down_type(db, source_type.clone(), expr_type.clone(), declared)
+        };
+
+        let result_type = narrowed.unwrap_or(explicit_var_type.unwrap_or(expr_type));
 
         return Ok(ResultTypeOrContinue::Result(result_type));
     }

@@ -1,9 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use crate::{
-        FileId, WorkspaceId,
+        Emmyrc, FileId, WorkspaceId,
         db_index::{WorkspaceKind, module::LuaModuleIndex, traits::LuaIndex},
     };
 
@@ -270,5 +273,48 @@ mod tests {
         m.add_workspace_root_with_kind(std_root, WorkspaceId::STD, WorkspaceKind::Std);
 
         assert_eq!(m.get_main_workspace_roots(), vec![main_a, main_b]);
+    }
+
+    #[test]
+    fn test_require_fuzzy_match_honors_segment_boundaries() {
+        let mut m = LuaModuleIndex::new();
+        m.update_config(Arc::new(Emmyrc::default()));
+        m.add_workspace_root(
+            Path::new("C:/Users/username/Documents").into(),
+            WorkspaceId::MAIN,
+        );
+
+        let file_id = FileId { id: 1 };
+        m.add_module_by_path(
+            file_id,
+            "C:/Users/username/Documents/nvim-cmp/lua/cmp/utils/event.lua",
+        );
+
+        assert!(m.find_module("pckr.event").is_none());
+        let module_info = m.find_module("event").unwrap();
+        assert_eq!(module_info.full_module_name, "nvim-cmp.lua.cmp.utils.event");
+    }
+
+    #[test]
+    fn test_require_fuzzy_match_prefers_shortest_prefix_independent_of_insert_order() {
+        const PLUGIN_ENTRY: &str = "C:/Users/username/Documents/plugin/treesitter-context.lua";
+        const LUA_ENTRY: &str = "C:/Users/username/Documents/lua/treesitter-context.lua";
+
+        // Validate both insertion orders to ensure lookup does not depend on indexing order.
+        for paths in [[PLUGIN_ENTRY, LUA_ENTRY], [LUA_ENTRY, PLUGIN_ENTRY]] {
+            let mut m = LuaModuleIndex::new();
+            m.update_config(Arc::new(Emmyrc::default()));
+            m.add_workspace_root(
+                Path::new("C:/Users/username/Documents").into(),
+                WorkspaceId::MAIN,
+            );
+
+            for (file_id, path) in [FileId { id: 1 }, FileId { id: 2 }].into_iter().zip(paths) {
+                m.add_module_by_path(file_id, path);
+            }
+
+            let module_info = m.find_module("treesitter-context").unwrap();
+            assert_eq!(module_info.full_module_name, "lua.treesitter-context");
+        }
     }
 }

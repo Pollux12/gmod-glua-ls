@@ -72,6 +72,19 @@ mod test {
         let h = ws.expr_ty("h");
         let expected = LuaType::IntegerConst(2);
         assert_eq!(h, expected);
+
+        // select(n, func()) where func() returns multiple values
+        ws.def(
+            r#"
+        ---@return integer, string
+        function multi_ret() end
+        g = select(2, multi_ret())
+        "#,
+        );
+
+        let g = ws.expr_ty("g");
+        let expected_g = ws.ty("string");
+        assert_eq!(g, expected_g);
     }
 
     #[test]

@@ -335,21 +335,40 @@ impl LuaModuleIndex {
         self.select_module_for_workspace(&node.file_ids, workspace_id)
     }
 
+    /// Find a module by suffix when exact lookup fails.
+    ///
+    /// Candidates must either exactly equal `module_path` or end with `.{module_path}`.
+    /// Among matches, prefer the one with the fewest leading path segments before the suffix,
+    /// then use lexicographic `full_module_name` ordering as a stable tie-break.
     fn fuzzy_find_module(&self, module_path: &str, last_name: &str) -> Option<&ModuleInfo> {
         let file_ids = self.module_name_to_file_ids.get(last_name)?;
-        if file_ids.len() == 1 {
-            return self.file_module_map.get(&file_ids[0]);
-        }
+        let suffix_with_boundary = format!(".{}", module_path);
+        file_ids
+            .iter()
+            .filter_map(|file_id| {
+                let module_info = self.file_module_map.get(file_id)?;
+                let full_module_name = module_info.full_module_name.as_str();
+                let leading_segment_count = if full_module_name == module_path {
+                    Some(0)
+                } else {
+                    full_module_name
+                        .strip_suffix(&suffix_with_boundary)
+                        .map(|prefix| {
+                            prefix
+                                .split('.')
+                                .filter(|segment| !segment.is_empty())
+                                .count()
+                        })
+                }?;
 
-        // find the first matched module
-        for file_id in file_ids {
-            let module_info = self.file_module_map.get(file_id)?;
-            if module_info.full_module_name.ends_with(module_path) {
-                return Some(module_info);
-            }
-        }
-
-        None
+                Some((leading_segment_count, module_info))
+            })
+            .min_by(|(left_count, left_info), (right_count, right_info)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| left_info.full_module_name.cmp(&right_info.full_module_name))
+            })
+            .map(|(_, module_info)| module_info)
     }
 
     fn fuzzy_find_module_in_workspace(

@@ -830,9 +830,40 @@ pub fn variadic_tpl_pattern_match(
                         context.substitutor.insert_type(tpl_id, LuaType::Nil, true);
                     }
                     1 => {
-                        context
-                            .substitutor
-                            .insert_type(tpl_id, target_rest_types[0].clone(), true);
+                        // If the single argument is itself a multi-return (e.g. a function call
+                        // returning multiple values), expand it so that `T...` receives all the
+                        // return values rather than a single Variadic wrapper.
+                        match &target_rest_types[0] {
+                            LuaType::Variadic(variadic) => match variadic.deref() {
+                                VariadicType::Multi(types) => match types.len() {
+                                    0 => {
+                                        context.substitutor.insert_type(tpl_id, LuaType::Nil, true);
+                                    }
+                                    1 => {
+                                        context.substitutor.insert_type(
+                                            tpl_id,
+                                            types[0].clone(),
+                                            true,
+                                        );
+                                    }
+                                    _ => {
+                                        context.substitutor.insert_multi_types(
+                                            tpl_id,
+                                            types
+                                                .iter()
+                                                .map(|t| constant_decay(t.clone()))
+                                                .collect(),
+                                        );
+                                    }
+                                },
+                                VariadicType::Base(base) => {
+                                    context.substitutor.insert_multi_base(tpl_id, base.clone());
+                                }
+                            },
+                            arg => {
+                                context.substitutor.insert_type(tpl_id, arg.clone(), true);
+                            }
+                        }
                     }
                     _ => {
                         context.substitutor.insert_multi_types(
