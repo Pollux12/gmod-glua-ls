@@ -7,10 +7,10 @@ mod render;
 use std::path::PathBuf;
 
 use crate::OutputDestination;
-use glua_code_analysis::EmmyLuaAnalysis;
 use generator::{
     generate_global_markdown, generate_index, generate_module_markdown, generate_type_markdown,
 };
+use glua_code_analysis::EmmyLuaAnalysis;
 use markdown_types::MkdocsIndex;
 
 pub fn generate_markdown(

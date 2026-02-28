@@ -1,6 +1,4 @@
-use glua_parser::{
-    LuaDoStat, LuaForRangeStat, LuaForStat, LuaIfStat, LuaRepeatStat, LuaWhileStat,
-};
+use glua_parser::{LuaDoStat, LuaForRangeStat, LuaForStat, LuaIfStat, LuaRepeatStat, LuaWhileStat};
 use lsp_types::{FoldingRange, FoldingRangeKind};
 
 use super::builder::FoldingRangeBuilder;

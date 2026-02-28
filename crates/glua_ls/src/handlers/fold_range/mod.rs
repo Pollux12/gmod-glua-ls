@@ -6,9 +6,9 @@ mod stats;
 
 use builder::FoldingRangeBuilder;
 use comment::build_comment_fold_range;
+use expr::{build_closure_expr_fold_range, build_string_fold_range, build_table_expr_fold_range};
 use glua_code_analysis::Emmyrc;
 use glua_parser::{LuaAst, LuaAstNode};
-use expr::{build_closure_expr_fold_range, build_string_fold_range, build_table_expr_fold_range};
 use imports::build_imports_fold_range;
 use lsp_types::{
     ClientCapabilities, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,

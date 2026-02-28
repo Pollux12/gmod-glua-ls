@@ -107,7 +107,9 @@ impl<'a> DocumentSymbolBuilder<'a> {
             return panel_names;
         }
 
-        if let Some(file_metadata) = db.get_gmod_class_metadata_index().get_file_metadata(&file_id)
+        if let Some(file_metadata) = db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
         {
             for call in &file_metadata.vgui_register_calls {
                 Self::collect_vgui_panel_call(decl_tree, call, 1, &mut panel_names);
@@ -118,9 +120,7 @@ impl<'a> DocumentSymbolBuilder<'a> {
         }
 
         // Scripted entity classes (ENT, SWEP, TOOL, EFFECT, PLUGIN).
-        if let Some((class_name, global_name)) =
-            get_scripted_class_info_for_file(db, file_id)
-        {
+        if let Some((class_name, global_name)) = get_scripted_class_info_for_file(db, file_id) {
             let type_label = scripted_class_type_label(global_name);
             let class_label = format!("{class_name} ({type_label})");
             let class_decl_id = decl_tree

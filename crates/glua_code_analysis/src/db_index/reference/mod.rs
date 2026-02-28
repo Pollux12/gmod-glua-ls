@@ -3,8 +3,8 @@ mod string_reference;
 
 use std::collections::{HashMap, HashSet};
 
-use glua_parser::LuaSyntaxId;
 pub use file_reference::{DeclReference, DeclReferenceCell, FileReference};
+use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
 use smol_str::SmolStr;
 use string_reference::StringReference;

@@ -5,9 +5,9 @@ mod signature_cast;
 use std::collections::HashMap;
 
 use crate::{FileId, LuaSignatureId};
-use glua_parser::{LuaAstPtr, LuaDocOpType};
 pub use flow_node::*;
 pub use flow_tree::FlowTree;
+use glua_parser::{LuaAstPtr, LuaDocOpType};
 pub use signature_cast::LuaSignatureCast;
 
 use super::traits::LuaIndex;

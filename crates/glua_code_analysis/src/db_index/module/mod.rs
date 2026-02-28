@@ -510,37 +510,46 @@ impl LuaModuleIndex {
     }
 
     pub fn extract_module_path(&self, path: &str) -> Option<(String, WorkspaceId)> {
-        let path = Path::new(path);
+        let normalized_path = path.replace('\\', "/");
+        let normalized_path = normalized_path.trim_end_matches('/');
         let mut matched_module_path: Option<(String, WorkspaceId)> = None;
         for workspace in &self.workspaces {
-            if let Ok(relative_path) = path.strip_prefix(&workspace.root) {
-                let relative_path_str = relative_path.to_str().unwrap_or("");
-                if relative_path_str.is_empty() {
-                    if let Some(file_name) = workspace.root.file_prefix() {
-                        let module_path = file_name.to_string_lossy().to_string();
-                        return Some((module_path, workspace.id));
-                    }
+            let workspace_root = workspace.root.to_string_lossy().replace('\\', "/");
+            let workspace_root = workspace_root.trim_end_matches('/');
+            let relative_path_str = if normalized_path == workspace_root {
+                ""
+            } else if let Some(relative) =
+                normalized_path.strip_prefix(&format!("{workspace_root}/"))
+            {
+                relative
+            } else {
+                continue;
+            };
+            if relative_path_str.is_empty() {
+                if let Some(file_name) = workspace.root.file_prefix() {
+                    let module_path = file_name.to_string_lossy().to_string();
+                    return Some((module_path, workspace.id));
                 }
+            }
 
-                let module_path = self.match_pattern(relative_path_str);
-                if let Some(module_path) = module_path {
-                    if matched_module_path.is_none() {
-                        matched_module_path = Some((module_path, workspace.id));
-                    } else {
-                        let (matched, matched_workspace_id) = match matched_module_path.as_ref() {
-                            Some((matched, id)) => (matched, id),
-                            None => continue,
+            let module_path = self.match_pattern(relative_path_str);
+            if let Some(module_path) = module_path {
+                if matched_module_path.is_none() {
+                    matched_module_path = Some((module_path, workspace.id));
+                } else {
+                    let (matched, matched_workspace_id) = match matched_module_path.as_ref() {
+                        Some((matched, id)) => (matched, id),
+                        None => continue,
+                    };
+                    if module_path.len() < matched.len() {
+                        // Libraries could be in a subdirectory of the main workspace
+                        // In case of a conflict, we prioritise the non-main workspace ID
+                        let workspace_id = if workspace.kind == WorkspaceKind::Main {
+                            *matched_workspace_id
+                        } else {
+                            workspace.id
                         };
-                        if module_path.len() < matched.len() {
-                            // Libraries could be in a subdirectory of the main workspace
-                            // In case of a conflict, we prioritise the non-main workspace ID
-                            let workspace_id = if workspace.kind == WorkspaceKind::Main {
-                                *matched_workspace_id
-                            } else {
-                                workspace.id
-                            };
-                            matched_module_path = Some((module_path, workspace_id));
-                        }
+                        matched_module_path = Some((module_path, workspace_id));
                     }
                 }
             }

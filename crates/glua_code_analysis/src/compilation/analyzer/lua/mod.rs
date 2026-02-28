@@ -11,10 +11,10 @@ use std::collections::HashSet;
 
 use closure::analyze_closure;
 pub use closure::analyze_return_point;
-use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
 use for_range_stat::analyze_for_range_stat;
 pub use for_range_stat::infer_for_range_iter_expr_func;
 pub use func_body::LuaReturnPoint;
+use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 use stats::{

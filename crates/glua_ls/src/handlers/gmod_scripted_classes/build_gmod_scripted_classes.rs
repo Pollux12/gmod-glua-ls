@@ -419,9 +419,7 @@ mod tests {
         )?;
         verify_that!(
             entries.iter().any(|entry| {
-                entry.class_type == "VGUI"
-                    && entry.class_name == "MyPanel"
-                    && entry.range.is_some()
+                entry.class_type == "VGUI" && entry.class_name == "MyPanel" && entry.range.is_some()
             }),
             eq(true)
         )?;

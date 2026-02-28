@@ -1,7 +1,7 @@
+use fern::Dispatch;
 use glua_code_analysis::{
     EmmyLuaAnalysis, WorkspaceFolder, collect_workspace_files, load_configs, update_code_style,
 };
-use fern::Dispatch;
 use log::LevelFilter;
 use std::{
     path::{Path, PathBuf},

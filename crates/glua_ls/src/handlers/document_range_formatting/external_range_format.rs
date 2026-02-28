@@ -1,7 +1,5 @@
 use crate::handlers::document_formatting::{FormattingRange, external_tool_format};
-use glua_code_analysis::{
-    EmmyrcExternalTool, FormattingOptions, LuaDocument, RangeFormatResult,
-};
+use glua_code_analysis::{EmmyrcExternalTool, FormattingOptions, LuaDocument, RangeFormatResult};
 
 pub async fn external_tool_range_format(
     emmyrc_external_tool: &EmmyrcExternalTool,

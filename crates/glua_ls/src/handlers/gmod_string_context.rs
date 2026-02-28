@@ -1,6 +1,5 @@
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken,
-    PathTrait,
+    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken, PathTrait,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,7 +15,9 @@ pub(crate) struct StringCallContext {
     pub(crate) name: String,
 }
 
-pub(crate) fn extract_string_call_context(string_token: &LuaStringToken) -> Option<StringCallContext> {
+pub(crate) fn extract_string_call_context(
+    string_token: &LuaStringToken,
+) -> Option<StringCallContext> {
     let literal_expr = string_token.get_parent::<LuaLiteralExpr>()?;
     let call_arg_list = literal_expr.get_parent::<LuaCallArgList>()?;
     let arg_index = call_arg_list
@@ -49,7 +50,10 @@ pub(crate) fn is_vgui_panel_string_context(call_path: &str, arg_index: usize) ->
     matches_call_path(call_path, "Add") && arg_index == 0
 }
 
-pub(crate) fn net_message_call_kind(call_path: &str, arg_index: usize) -> Option<NetMessageCallKind> {
+pub(crate) fn net_message_call_kind(
+    call_path: &str,
+    arg_index: usize,
+) -> Option<NetMessageCallKind> {
     if arg_index != 0 {
         return None;
     }

@@ -15,9 +15,9 @@ mod postfix_provider;
 mod table_field_provider;
 
 use super::completion_builder::CompletionBuilder;
+pub use function_provider::get_function_remove_nil;
 use glua_parser::LuaAstToken;
 use glua_parser::LuaStringToken;
-pub use function_provider::get_function_remove_nil;
 use rowan::TextRange;
 
 pub fn add_completions(builder: &mut CompletionBuilder) -> Option<()> {

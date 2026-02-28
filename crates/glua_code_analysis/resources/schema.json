@@ -129,7 +129,7 @@
       "default": {
         "closingEndHint": true,
         "closingEndHintControlFlow": false,
-        "closingEndHintMinLines": 10,
+        "closingEndHintMinLines": 15,
         "enumParamHint": false,
         "indexHint": true,
         "localHint": true,
@@ -1189,7 +1189,7 @@
           "description": "Minimum number of lines a block must span before a closing `end` hint\nis shown.",
           "type": "integer",
           "format": "uint32",
-          "default": 10,
+          "default": 15,
           "minimum": 0,
           "x-vscode-setting": true
         },

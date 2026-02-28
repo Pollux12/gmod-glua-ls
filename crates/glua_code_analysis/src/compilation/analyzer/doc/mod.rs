@@ -15,8 +15,8 @@ use crate::{
     db_index::{DbIndex, LuaTypeDeclId},
     profile::Profile,
 };
-use glua_parser::{LuaAstNode, LuaComment, LuaSyntaxNode};
 use file_generic_index::FileGenericIndex;
+use glua_parser::{LuaAstNode, LuaComment, LuaSyntaxNode};
 use tags::get_owner_id;
 pub struct DocAnalysisPipeline;
 

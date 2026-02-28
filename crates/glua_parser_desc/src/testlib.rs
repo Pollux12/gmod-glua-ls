@@ -1,8 +1,6 @@
 use crate::util::sort_result;
 use crate::{DescItem, LuaDescParser};
-use glua_parser::{
-    LuaAstNode, LuaDocDescription, LuaKind, LuaParser, LuaSyntaxKind, ParserConfig,
-};
+use glua_parser::{LuaAstNode, LuaDocDescription, LuaKind, LuaParser, LuaSyntaxKind, ParserConfig};
 use googletest::prelude::*;
 
 pub fn test(code: &str, mut parser: Box<dyn LuaDescParser>, expected: &str) -> Result<()> {

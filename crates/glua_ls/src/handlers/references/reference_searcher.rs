@@ -9,8 +9,7 @@ use glua_code_analysis::{
 };
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaLiteralToken,
-    LuaNameToken, LuaStringToken, LuaSyntaxNode,
-    LuaSyntaxToken, LuaTableField, PathTrait,
+    LuaNameToken, LuaStringToken, LuaSyntaxNode, LuaSyntaxToken, LuaTableField, PathTrait,
 };
 use lsp_types::Location;
 
@@ -423,7 +422,8 @@ fn collect_vgui_context_string_references_from_ast(
     let mut semantic_cache = HashMap::new();
     let file_ids = compilation.get_db().get_vfs().get_all_file_ids();
     for file_id in file_ids {
-        let Some(semantic_model) = get_semantic_model_cached(compilation, &mut semantic_cache, file_id)
+        let Some(semantic_model) =
+            get_semantic_model_cached(compilation, &mut semantic_cache, file_id)
         else {
             continue;
         };

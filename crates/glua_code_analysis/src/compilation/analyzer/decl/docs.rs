@@ -1,9 +1,9 @@
+use flagset::FlagSet;
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaComment, LuaDocTag, LuaDocTagAlias, LuaDocTagAttribute,
     LuaDocTagClass, LuaDocTagEnum, LuaDocTagMeta, LuaDocTagNamespace, LuaDocTagUsing,
     LuaDocTypeFlag,
 };
-use flagset::FlagSet;
 use rowan::TextRange;
 
 use crate::{

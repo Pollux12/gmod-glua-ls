@@ -1,7 +1,5 @@
 use crate::handlers::definition::goto_path::goto_path;
-use glua_code_analysis::{
-    LuaCompilation, LuaMemberKey, LuaSemanticDeclId, LuaType, SemanticModel,
-};
+use glua_code_analysis::{LuaCompilation, LuaMemberKey, LuaSemanticDeclId, LuaType, SemanticModel};
 use glua_parser::{LuaAstToken, LuaGeneralToken};
 use glua_parser_desc::parse_ref_target;
 use lsp_types::GotoDefinitionResponse;

@@ -11,6 +11,7 @@ use crate::context::ServerContextSnapshot;
 use crate::util::{find_ref_at, resolve_ref_single};
 pub use build_hover::build_hover_content_for_completion;
 use build_hover::build_semantic_info_hover;
+pub use find_origin::{find_all_same_named_members, find_member_origin_owner};
 use glua_code_analysis::{
     EmmyLuaAnalysis, FileId, GmodRealm, LuaMemberKey, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     WorkspaceId,
@@ -20,7 +21,6 @@ use glua_parser::{
     LuaStringToken, LuaTokenKind, PathTrait,
 };
 use glua_parser_desc::parse_ref_target;
-pub use find_origin::{find_all_same_named_members, find_member_origin_owner};
 pub use hover_builder::HoverBuilder;
 pub use humanize_types::infer_prefix_global_name;
 use humanize_types::infer_property_owner_realm;

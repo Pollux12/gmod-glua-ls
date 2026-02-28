@@ -7,9 +7,9 @@ mod virtual_url;
 
 pub use collect_workspace_files::*;
 pub use document::LuaDocument;
-use glua_parser::{LineIndex, LuaParseError, LuaParser, LuaSyntaxTree};
 pub use file_id::{FileId, InFiled};
 pub use file_uri_handler::{file_path_to_uri, uri_to_file_path};
+use glua_parser::{LineIndex, LuaParseError, LuaParser, LuaSyntaxTree};
 pub use loader::{LuaFileInfo, load_workspace_files, read_file_with_encoding};
 use lsp_types::Uri;
 use rowan::NodeCache;

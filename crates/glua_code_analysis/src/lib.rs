@@ -485,18 +485,25 @@ unsafe impl Sync for EmmyLuaAnalysis {}
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, str::FromStr};
+    use std::path::PathBuf;
 
     use lsp_types::Uri;
 
     use crate::EmmyLuaAnalysis;
 
+    fn test_workspace_and_uri() -> (PathBuf, Uri) {
+        let workspace = std::env::temp_dir().join("gmod_glua_ls_analysis_test_workspace");
+        let test_file = workspace.join("test.lua");
+        let uri = Uri::parse_from_file_path(&test_file).expect("uri should parse");
+        (workspace, uri)
+    }
+
     #[test]
     fn unchanged_update_file_by_uri_rebuilds_index() {
         let mut analysis = EmmyLuaAnalysis::new();
-        analysis.add_main_workspace(PathBuf::from("C:\\workspace"));
+        let (workspace, uri) = test_workspace_and_uri();
+        analysis.add_main_workspace(workspace);
 
-        let uri = Uri::from_str("file:///C:/workspace/test.lua").expect("uri should parse");
         let content = "local IsValid = IsValid";
         let file_id = analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
@@ -526,9 +533,9 @@ mod tests {
     #[test]
     fn unchanged_update_files_by_uri_rebuilds_index() {
         let mut analysis = EmmyLuaAnalysis::new();
-        analysis.add_main_workspace(PathBuf::from("C:\\workspace"));
+        let (workspace, uri) = test_workspace_and_uri();
+        analysis.add_main_workspace(workspace);
 
-        let uri = Uri::from_str("file:///C:/workspace/test.lua").expect("uri should parse");
         let content = "local IsValid = IsValid";
         let file_id = analysis
             .update_file_by_uri(&uri, Some(content.to_string()))

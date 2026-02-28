@@ -4,20 +4,20 @@ mod expr;
 mod stats;
 
 use builder::{DocumentSymbolBuilder, LuaSymbol};
+use expr::{build_closure_expr_symbol, build_table_symbol};
 use glua_code_analysis::{EmmyrcGmodOutlineVerbosity, SemanticModel};
 use glua_parser::{
     LuaAstNode, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaComment, LuaExpr, LuaFuncStat,
     LuaSingleArgExpr, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaVarExpr,
 };
-use expr::{build_closure_expr_symbol, build_table_symbol};
 use lsp_types::{
     ClientCapabilities, DocumentSymbol, DocumentSymbolOptions, DocumentSymbolParams,
     DocumentSymbolResponse, OneOf, ServerCapabilities, SymbolKind,
 };
 use stats::{
-    build_assign_stat_symbol, build_do_stat_symbol, build_for_range_stat_symbol,
+    IfSymbolContext, build_assign_stat_symbol, build_do_stat_symbol, build_for_range_stat_symbol,
     build_for_stat_symbol, build_func_stat_symbol, build_if_stat_symbol,
-    build_local_func_stat_symbol, build_local_stat_symbol, IfSymbolContext,
+    build_local_func_stat_symbol, build_local_stat_symbol,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -270,22 +270,13 @@ fn process_stat(
         LuaStat::CallExprStat(call_stat) => {
             // Check whether this is a named GMod call (hook.Add, net.Receive, …).
             if builder.is_gmod_enabled() {
-                if let Some(call_expr) = call_stat
-                    .syntax()
-                    .children()
-                    .find_map(LuaCallExpr::cast)
-                {
+                if let Some(call_expr) = call_stat.syntax().children().find_map(LuaCallExpr::cast) {
                     let call_syntax_id = call_expr.get_syntax_id();
                     if let Some(entry) = builder.get_gmod_call_entry(&call_syntax_id) {
                         let label = entry.label.clone();
                         let kind = entry.kind;
                         let cb_arg_idx = entry.callback_arg_index;
-                        let symbol = LuaSymbol::new(
-                            label,
-                            None,
-                            kind,
-                            call_stat.get_range(),
-                        );
+                        let symbol = LuaSymbol::new(label, None, kind, call_stat.get_range());
                         let call_symbol_id = builder.add_node_symbol(
                             call_stat.syntax().clone(),
                             symbol,
@@ -294,9 +285,7 @@ fn process_stat(
                         // Traverse the callback closure body so that nested functions appear
                         // as children of the hook/net/timer symbol.
                         if let Some(arg_idx) = cb_arg_idx {
-                            if let Some(closure) =
-                                get_call_arg_closure(&call_expr, arg_idx)
-                            {
+                            if let Some(closure) = get_call_arg_closure(&call_expr, arg_idx) {
                                 let scope_parent = build_closure_expr_symbol(
                                     builder,
                                     closure.clone(),
@@ -905,7 +894,9 @@ mod tests {
         let root = build_document_symbol(&semantic_model).or_fail()?;
         let top_level_symbols = root.children.unwrap_or_default();
 
-        let has_hidden = top_level_symbols.iter().any(|symbol| symbol.name == "hidden");
+        let has_hidden = top_level_symbols
+            .iter()
+            .any(|symbol| symbol.name == "hidden");
         let has_field = top_level_symbols
             .iter()
             .any(|symbol| symbol.name == "BuildPanel");

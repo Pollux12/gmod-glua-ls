@@ -1,9 +1,7 @@
 use std::collections::HashSet;
 
 use glua_code_analysis::{LuaSignatureId, LuaType};
-use glua_parser::{
-    LuaAst, LuaAstNode, LuaCallArgList, LuaClosureExpr, LuaParamList, LuaTokenKind,
-};
+use glua_parser::{LuaAst, LuaAstNode, LuaCallArgList, LuaClosureExpr, LuaParamList, LuaTokenKind};
 use lsp_types::{CompletionItem, CompletionItemKind, CompletionTriggerKind};
 
 use crate::handlers::completion::{

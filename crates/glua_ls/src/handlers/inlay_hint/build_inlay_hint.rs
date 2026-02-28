@@ -52,16 +52,8 @@ pub fn build_inlay_hints(
             }
             LuaAst::LuaFuncStat(func_stat) => {
                 if !client_id.is_intellij() {
-                    build_func_stat_override_hint(
-                        semantic_model,
-                        &mut result,
-                        func_stat.clone(),
-                    );
-                    build_func_stat_closing_end_hint(
-                        semantic_model,
-                        &mut result,
-                        func_stat,
-                    );
+                    build_func_stat_override_hint(semantic_model, &mut result, func_stat.clone());
+                    build_func_stat_closing_end_hint(semantic_model, &mut result, func_stat);
                 }
             }
             LuaAst::LuaIndexExpr(index_expr) => {
@@ -990,8 +982,7 @@ fn process_enum_hint_for_arg(
         LuaExpr::IndexExpr(index_expr) => {
             // 对索引访问需要完全匹配尾名称
             if let Some(index_name_token) = index_expr.get_index_name_token()
-                && let Some(name_token) =
-                    glua_parser::LuaNameToken::cast(index_name_token.clone())
+                && let Some(name_token) = glua_parser::LuaNameToken::cast(index_name_token.clone())
             {
                 let index_name = name_token.get_name_text();
                 if index_name == member_name {
@@ -1113,8 +1104,7 @@ fn get_scripted_entity_suffix(
         };
         let super_name = super_id.get_simple_name();
         match super_name {
-            "ENT" | "Entity" | "SWEP" | "Weapon" | "EFFECT" | "TOOL" | "Tool" | "PLUGIN"
-            | "GM" => {
+            "ENT" | "Entity" | "SWEP" | "Weapon" | "EFFECT" | "TOOL" | "Tool" | "PLUGIN" | "GM" => {
                 return Some(format!(" ({type_name} : {super_name})"));
             }
             _ => {}
@@ -1137,7 +1127,11 @@ fn build_func_stat_closing_end_hint(
     let end_token = closure.token_by_kind(LuaTokenKind::TkEnd)?;
     let stat_range = func_stat.get_range();
 
-    if !exceeds_min_lines(semantic_model, stat_range.start(), end_token.get_range().end()) {
+    if !exceeds_min_lines(
+        semantic_model,
+        stat_range.start(),
+        end_token.get_range().end(),
+    ) {
         return Some(());
     }
 
@@ -1230,7 +1224,11 @@ fn build_local_func_stat_closing_end_hint(
     let end_token = closure.token_by_kind(LuaTokenKind::TkEnd)?;
     let stat_range = local_func_stat.get_range();
 
-    if !exceeds_min_lines(semantic_model, stat_range.start(), end_token.get_range().end()) {
+    if !exceeds_min_lines(
+        semantic_model,
+        stat_range.start(),
+        end_token.get_range().end(),
+    ) {
         return Some(());
     }
 
@@ -1279,7 +1277,11 @@ fn build_control_flow_closing_end_hint(
         .last()?;
     let end_range = end_token.text_range();
 
-    if !exceeds_min_lines(semantic_model, stat_syntax.text_range().start(), end_range.end()) {
+    if !exceeds_min_lines(
+        semantic_model,
+        stat_syntax.text_range().start(),
+        end_range.end(),
+    ) {
         return Some(());
     }
 

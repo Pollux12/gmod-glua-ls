@@ -14,9 +14,7 @@ fn is_top_level_stat(syntax: &glua_parser::LuaSyntaxNode) -> bool {
     syntax
         .parent()
         .and_then(|block| block.parent())
-        .is_some_and(|grandparent| {
-            glua_parser::LuaChunk::can_cast(grandparent.kind().into())
-        })
+        .is_some_and(|grandparent| glua_parser::LuaChunk::can_cast(grandparent.kind().into()))
 }
 
 pub fn build_code_lens(semantic_model: &SemanticModel) -> Option<Vec<CodeLens>> {
@@ -84,8 +82,7 @@ fn add_func_stat_code_lens(
                     .get_db()
                     .get_member_index()
                     .get_member_owner(&member_id)
-                && let Some(info) =
-                    find_gmod_class_from_member_owner(semantic_model, owner)
+                && let Some(info) = find_gmod_class_from_member_owner(semantic_model, owner)
             {
                 push_gmod_class_code_lens(result, range, &info);
             }
@@ -131,8 +128,7 @@ fn add_local_func_stat_code_lens(
         data: Some(serde_json::to_value(data).unwrap()),
     });
 
-    if enable_vgui_code_lens
-        && let Some(info) = find_gmod_class_from_decl(semantic_model, decl_id)
+    if enable_vgui_code_lens && let Some(info) = find_gmod_class_from_decl(semantic_model, decl_id)
     {
         push_gmod_class_code_lens(result, range, &info);
     }

@@ -910,13 +910,9 @@ fn format_index_expr_path(index: &LuaIndexExpr) -> Option<String> {
     let prefix = format_expr_path(&index.get_prefix_expr()?)?;
     let key = index.get_index_key()?;
     match key {
-        glua_parser::LuaIndexKey::Name(name) => {
-            Some(format!("{prefix}.{}", name.get_name_text()))
-        }
+        glua_parser::LuaIndexKey::Name(name) => Some(format!("{prefix}.{}", name.get_name_text())),
         glua_parser::LuaIndexKey::String(s) => Some(format!("{prefix}.{}", s.get_value())),
-        glua_parser::LuaIndexKey::Integer(i) => {
-            Some(format!("{prefix}.{}", i.get_number_value()))
-        }
+        glua_parser::LuaIndexKey::Integer(i) => Some(format!("{prefix}.{}", i.get_number_value())),
         _ => None,
     }
 }
