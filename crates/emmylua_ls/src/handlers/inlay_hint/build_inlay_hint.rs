@@ -75,44 +75,74 @@ pub fn build_inlay_hints(
                 );
             }
             LuaAst::LuaIfStat(if_stat) => {
-                build_control_flow_closing_end_hint(
-                    semantic_model,
-                    &mut result,
-                    if_stat.syntax(),
-                    "if",
-                );
+                if semantic_model
+                    .get_emmyrc()
+                    .hint
+                    .closing_end_hint_control_flow
+                {
+                    build_control_flow_closing_end_hint(
+                        semantic_model,
+                        &mut result,
+                        if_stat.syntax(),
+                        "if",
+                    );
+                }
             }
             LuaAst::LuaWhileStat(while_stat) => {
-                build_control_flow_closing_end_hint(
-                    semantic_model,
-                    &mut result,
-                    while_stat.syntax(),
-                    "while",
-                );
+                if semantic_model
+                    .get_emmyrc()
+                    .hint
+                    .closing_end_hint_control_flow
+                {
+                    build_control_flow_closing_end_hint(
+                        semantic_model,
+                        &mut result,
+                        while_stat.syntax(),
+                        "while",
+                    );
+                }
             }
             LuaAst::LuaDoStat(do_stat) => {
-                build_control_flow_closing_end_hint(
-                    semantic_model,
-                    &mut result,
-                    do_stat.syntax(),
-                    "do",
-                );
+                if semantic_model
+                    .get_emmyrc()
+                    .hint
+                    .closing_end_hint_control_flow
+                {
+                    build_control_flow_closing_end_hint(
+                        semantic_model,
+                        &mut result,
+                        do_stat.syntax(),
+                        "do",
+                    );
+                }
             }
             LuaAst::LuaForStat(for_stat) => {
-                build_control_flow_closing_end_hint(
-                    semantic_model,
-                    &mut result,
-                    for_stat.syntax(),
-                    "for",
-                );
+                if semantic_model
+                    .get_emmyrc()
+                    .hint
+                    .closing_end_hint_control_flow
+                {
+                    build_control_flow_closing_end_hint(
+                        semantic_model,
+                        &mut result,
+                        for_stat.syntax(),
+                        "for",
+                    );
+                }
             }
             LuaAst::LuaForRangeStat(for_range_stat) => {
-                build_control_flow_closing_end_hint(
-                    semantic_model,
-                    &mut result,
-                    for_range_stat.syntax(),
-                    "for",
-                );
+                if semantic_model
+                    .get_emmyrc()
+                    .hint
+                    .closing_end_hint_control_flow
+                {
+                    build_control_flow_closing_end_hint(
+                        semantic_model,
+                        &mut result,
+                        for_range_stat.syntax(),
+                        "for",
+                    );
+                }
             }
             _ => {}
         }
@@ -1171,7 +1201,7 @@ fn build_func_stat_closing_end_hint(
     let hint = InlayHint {
         kind: Some(InlayHintKind::TYPE),
         label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
-            value: format!("← {label_text}"),
+            value: label_text,
             location: Some(location),
             ..Default::default()
         }]),
@@ -1216,7 +1246,7 @@ fn build_local_func_stat_closing_end_hint(
     let hint = InlayHint {
         kind: Some(InlayHintKind::TYPE),
         label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
-            value: format!("← {name_text}"),
+            value: name_text.to_string(),
             location: Some(location),
             ..Default::default()
         }]),
@@ -1258,7 +1288,7 @@ fn build_control_flow_closing_end_hint(
 
     let hint = InlayHint {
         kind: Some(InlayHintKind::TYPE),
-        label: InlayHintLabel::String(format!("← {keyword}")),
+        label: InlayHintLabel::String(keyword.to_string()),
         position: end_pos,
         text_edits: None,
         tooltip: None,

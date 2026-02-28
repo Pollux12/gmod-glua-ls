@@ -381,7 +381,8 @@ end
 | `overrideHint` | `boolean` | `true` | Show methods that override base class |
 | `metaCallHint` | `boolean` | `true` | Show `__call` metatable hints |
 | `enumParamHint` | `boolean` | `false` | Show enum names for literal values |
-| `closingEndHint` | `boolean` | `true` | Show closing `end` hints (e.g. `end -- function MyFunc`) |
+| `closingEndHint` | `boolean` | `true` | Show closing `end` hints for functions and methods |
+| `closingEndHintControlFlow` | `boolean` | `false` | Also show closing `end` hints for control flow blocks (if, while, do, for) |
 | `closingEndHintMinLines` | `integer` | `10` | Minimum line span for a block to show a closing `end` hint |
 
 ---

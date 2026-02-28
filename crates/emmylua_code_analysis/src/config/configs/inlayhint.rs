@@ -61,6 +61,11 @@ pub struct EmmyrcInlayHint {
     #[serde(default = "default_true")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub closing_end_hint: bool,
+    /// Also show closing `end` hints for control flow blocks (if, while, do,
+    /// for). Only effective when `closingEndHint` is enabled.
+    #[serde(default = "default_false")]
+    #[schemars(extend("x-vscode-setting" = true))]
+    pub closing_end_hint_control_flow: bool,
     /// Minimum number of lines a block must span before a closing `end` hint
     /// is shown.
     #[serde(default = "default_min_lines")]
@@ -78,6 +83,7 @@ impl Default for EmmyrcInlayHint {
             meta_call_hint: default_true(),
             enum_param_hint: default_false(),
             closing_end_hint: default_true(),
+            closing_end_hint_control_flow: default_false(),
             closing_end_hint_min_lines: default_min_lines(),
         }
     }
@@ -92,5 +98,5 @@ fn default_false() -> bool {
 }
 
 fn default_min_lines() -> u32 {
-    10
+    15
 }

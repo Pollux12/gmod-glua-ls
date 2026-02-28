@@ -128,6 +128,7 @@
       "$ref": "#/$defs/EmmyrcInlayHint",
       "default": {
         "closingEndHint": true,
+        "closingEndHintControlFlow": false,
         "closingEndHintMinLines": 10,
         "enumParamHint": false,
         "indexHint": true,
@@ -1176,6 +1177,12 @@
           "description": "Show an inlay hint after closing `end` keywords indicating what block\nthey belong to (e.g. function name). Only shown when the block spans\nat least `closingEndHintMinLines` lines.",
           "type": "boolean",
           "default": true,
+          "x-vscode-setting": true
+        },
+        "closingEndHintControlFlow": {
+          "description": "Also show closing `end` hints for control flow blocks (if, while, do,\nfor). Only effective when `closingEndHint` is enabled.",
+          "type": "boolean",
+          "default": false,
           "x-vscode-setting": true
         },
         "closingEndHintMinLines": {
