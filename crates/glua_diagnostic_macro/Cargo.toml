@@ -1,0 +1,19 @@
+[package]
+name = "glua_diagnostic_macro"
+version = "0.5.0"
+edition = "2024"
+authors = ["CppCXY"]
+description = "A proc-macro for generating diagnostic code for emmylua-analyzer-rust"
+license = "MIT"
+repository = "https://github.com/CppCXY/emmylua-analyzer-rust"
+readme = "README.md"
+keywords = ["emmylua", "lua"]
+categories = ["development-tools"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+syn.workspace = true
+quote.workspace = true

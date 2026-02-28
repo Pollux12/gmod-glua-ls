@@ -1,5 +1,5 @@
 use crate::extractor::owner_symbol_from_ast;
-use emmylua_parser::{LuaAst, LuaAstNode, LuaComment, LuaDocTag, LuaParser, ParserConfig};
+use glua_parser::{LuaAst, LuaAstNode, LuaComment, LuaDocTag, LuaParser, ParserConfig};
 use std::collections::HashMap;
 
 /// 从 std 源文件中构建“模块表 -> class 名”的映射。

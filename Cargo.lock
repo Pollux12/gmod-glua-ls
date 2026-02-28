@@ -594,73 +594,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "emmylua_check"
-version = "0.20.0"
-dependencies = [
- "ansi_term",
- "clap",
- "emmy_lsp_types",
- "emmylua_code_analysis",
- "emmylua_parser",
- "fern",
- "log",
- "mimalloc",
- "rowan",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "walkdir",
-]
-
-[[package]]
-name = "emmylua_code_analysis"
-version = "0.20.0"
-dependencies = [
- "dirs",
- "emmy_lsp_types",
- "emmylua_codestyle",
- "emmylua_diagnostic_macro",
- "emmylua_parser",
- "encoding_rs",
- "flagset",
- "googletest",
- "include_dir",
- "internment",
- "itertools 0.14.0",
- "log",
- "luars",
- "percent-encoding",
- "regex",
- "reqwest",
- "rowan",
- "rust-i18n",
- "schema_to_emmylua",
- "schemars 1.0.4",
- "serde",
- "serde_json",
- "serde_with",
- "smol_str",
- "tokio-util",
- "url",
- "walkdir",
- "wax",
-]
-
-[[package]]
-name = "emmylua_code_style"
-version = "0.1.0"
-dependencies = [
- "clap",
- "emmylua_parser",
- "mimalloc",
- "rowan",
- "serde",
- "serde_json",
- "serde_yml",
-]
-
-[[package]]
 name = "emmylua_codestyle"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -669,86 +602,6 @@ dependencies = [
  "cc",
  "glob",
  "libc",
-]
-
-[[package]]
-name = "emmylua_diagnostic_macro"
-version = "0.5.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "emmylua_doc_cli"
-version = "0.20.0"
-dependencies = [
- "clap",
- "emmy_lsp_types",
- "emmylua_code_analysis",
- "emmylua_parser",
- "fern",
- "include_dir",
- "log",
- "mimalloc",
- "num-traits",
- "rowan",
- "serde",
- "serde_json",
- "tera",
- "walkdir",
-]
-
-[[package]]
-name = "emmylua_ls"
-version = "0.20.0"
-dependencies = [
- "chrono",
- "clap",
- "dirs",
- "emmy_lsp_types",
- "emmylua_code_analysis",
- "emmylua_parser",
- "emmylua_parser_desc",
- "fern",
- "glob",
- "googletest",
- "include_dir",
- "internment",
- "itertools 0.14.0",
- "log",
- "lsp-server",
- "mimalloc",
- "notify",
- "rowan",
- "rust-i18n",
- "serde",
- "serde_json",
- "serde_yml",
- "tokio",
- "tokio-util",
- "walkdir",
- "wax",
-]
-
-[[package]]
-name = "emmylua_parser"
-version = "0.23.0"
-dependencies = [
- "rowan",
- "rust-i18n",
- "serde",
-]
-
-[[package]]
-name = "emmylua_parser_desc"
-version = "0.23.0"
-dependencies = [
- "emmylua_parser",
- "googletest",
- "rowan",
- "unicode-general-category",
 ]
 
 [[package]]
@@ -948,6 +801,153 @@ dependencies = [
  "bitflags 2.9.4",
  "ignore",
  "walkdir",
+]
+
+[[package]]
+name = "glua_check"
+version = "0.20.0"
+dependencies = [
+ "ansi_term",
+ "clap",
+ "emmy_lsp_types",
+ "fern",
+ "glua_code_analysis",
+ "glua_parser",
+ "log",
+ "mimalloc",
+ "rowan",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "walkdir",
+]
+
+[[package]]
+name = "glua_code_analysis"
+version = "0.20.0"
+dependencies = [
+ "dirs",
+ "emmy_lsp_types",
+ "emmylua_codestyle",
+ "encoding_rs",
+ "flagset",
+ "glua_diagnostic_macro",
+ "glua_parser",
+ "googletest",
+ "include_dir",
+ "internment",
+ "itertools 0.14.0",
+ "log",
+ "luars",
+ "percent-encoding",
+ "regex",
+ "reqwest",
+ "rowan",
+ "rust-i18n",
+ "schema_to_glua",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "smol_str",
+ "tokio-util",
+ "url",
+ "walkdir",
+ "wax",
+]
+
+[[package]]
+name = "glua_code_style"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "glua_parser",
+ "mimalloc",
+ "rowan",
+ "serde",
+ "serde_json",
+ "serde_yml",
+]
+
+[[package]]
+name = "glua_diagnostic_macro"
+version = "0.5.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "glua_doc_cli"
+version = "0.20.0"
+dependencies = [
+ "clap",
+ "emmy_lsp_types",
+ "fern",
+ "glua_code_analysis",
+ "glua_parser",
+ "include_dir",
+ "log",
+ "mimalloc",
+ "num-traits",
+ "rowan",
+ "serde",
+ "serde_json",
+ "tera",
+ "walkdir",
+]
+
+[[package]]
+name = "glua_ls"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "dirs",
+ "emmy_lsp_types",
+ "fern",
+ "glob",
+ "glua_code_analysis",
+ "glua_parser",
+ "glua_parser_desc",
+ "googletest",
+ "include_dir",
+ "internment",
+ "itertools 0.14.0",
+ "log",
+ "lsp-server",
+ "mimalloc",
+ "notify",
+ "rowan",
+ "rust-i18n",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "tokio",
+ "tokio-util",
+ "walkdir",
+ "wax",
+]
+
+[[package]]
+name = "glua_parser"
+version = "0.23.0"
+dependencies = [
+ "rowan",
+ "rust-i18n",
+ "serde",
+]
+
+[[package]]
+name = "glua_parser_desc"
+version = "0.23.0"
+dependencies = [
+ "glua_parser",
+ "googletest",
+ "rowan",
+ "unicode-general-category",
 ]
 
 [[package]]
@@ -2331,14 +2331,14 @@ name = "schema_json_gen"
 version = "0.1.0"
 dependencies = [
  "emmy_lsp_types",
- "emmylua_code_analysis",
+ "glua_code_analysis",
  "schemars 1.0.4",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "schema_to_emmylua"
+name = "schema_to_glua"
 version = "0.1.0"
 dependencies = [
  "serde_json",
@@ -2628,7 +2628,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 name = "std_i18n"
 version = "0.1.0"
 dependencies = [
- "emmylua_parser",
+ "glua_parser",
  "serde",
  "serde_yml",
  "walkdir",

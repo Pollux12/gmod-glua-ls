@@ -31,7 +31,7 @@
           in
           (builtins.mapAttrs (name: value: pkgs.callPackage value { }) packages)
           // {
-            default = self.packages.${system}.emmylua_ls;
+            default = self.packages.${system}.glua_ls;
           };
 
         devShells.default = pkgs.mkShell {

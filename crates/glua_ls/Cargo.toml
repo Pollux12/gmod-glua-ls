@@ -1,0 +1,63 @@
+[package]
+name = "glua_ls"
+version = "0.20.0"
+edition = "2024"
+authors = ["CppCXY"]
+description = "A language server for emmylua."
+license = "MIT"
+repository = "https://github.com/CppCXY/emmylua-analyzer-rust"
+readme = "README.md"
+keywords = ["emmylua", "doc", "lua"]
+categories = ["development-tools"]
+
+# Inherit workspace lints configuration
+[lints]
+workspace = true
+
+[dependencies]
+# local
+glua_code_analysis.workspace = true
+glua_parser.workspace = true
+glua_parser_desc.workspace = true
+
+# external
+lsp-server.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lsp_types.workspace = true
+log.workspace = true
+fern.workspace = true
+chrono.workspace = true
+notify.workspace = true
+tokio-util.workspace = true
+rowan.workspace = true
+walkdir.workspace = true
+rust-i18n.workspace = true
+glob.workspace = true
+serde_yml.workspace = true
+itertools.workspace = true
+dirs.workspace = true
+wax.workspace = true
+internment.workspace = true
+include_dir.workspace = true
+
+[dependencies.clap]
+workspace = true
+optional = true
+
+[dependencies.mimalloc]
+workspace = true
+optional = true
+
+[dev-dependencies]
+googletest.workspace = true
+
+
+[[bin]]
+name = "glua_ls"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:mimalloc"]

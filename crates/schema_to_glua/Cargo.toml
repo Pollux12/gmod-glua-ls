@@ -1,0 +1,17 @@
+[package]
+name = "schema_to_glua"
+version = "0.1.0"
+edition = "2024"
+authors = ["CppCXY"]
+description = "A tool to convert JSON schema to EmmyLua annotations."
+license = "MIT"
+repository = "https://github.com/CppCXY/emmylua-analyzer-rust"
+readme = "README.md"
+keywords = ["emmylua", "doc", "lua"]
+categories = ["development-tools"]
+
+[dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

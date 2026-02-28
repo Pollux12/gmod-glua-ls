@@ -37,18 +37,21 @@ jobs:
       - name: Build
         run: |
           rustup target add ${{ matrix.target }}
-          cargo build --release --target ${{ matrix.target }} -p emmylua_ls
+          cargo build --release --target ${{ matrix.target }} -p glua_ls
+          cargo build --release --target ${{ matrix.target }} -p glua_check
       - name: Copy binary (Linux)
         if: ${{ matrix.os != 'windows-latest' }}
         run: |
           mkdir -p ${{ github.workspace }}/artifact/
-          cp ${{ github.workspace }}/target/${{ matrix.target }}/release/emmylua_ls ${{ github.workspace }}/artifact/glua_ls
+          cp ${{ github.workspace }}/target/${{ matrix.target }}/release/glua_ls ${{ github.workspace }}/artifact/glua_ls
+          cp ${{ github.workspace }}/target/${{ matrix.target }}/release/glua_check ${{ github.workspace }}/artifact/glua_check
       - name: Copy binary (Windows)
         if: ${{ matrix.os == 'windows-latest' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/artifact/"
-          Copy-Item "${{ github.workspace }}/target/${{ matrix.target }}/release/emmylua_ls.exe" "${{ github.workspace }}/artifact/glua_ls.exe"
+          Copy-Item "${{ github.workspace }}/target/${{ matrix.target }}/release/glua_ls.exe" "${{ github.workspace }}/artifact/glua_ls.exe"
+          Copy-Item "${{ github.workspace }}/target/${{ matrix.target }}/release/glua_check.exe" "${{ github.workspace }}/artifact/glua_check.exe"
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
@@ -64,11 +67,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: general,  crate: emmylua_ls, output: glua_ls }
-          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: zigbuild, crate: emmylua_ls, output: glua_ls, glibc: 2.17 }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   platform: win32-x64, cross: general,  crate: emmylua_ls, output: glua_ls }
-          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: general,  crate: emmylua_check, output: glua_check }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   platform: win32-x64, cross: general,  crate: emmylua_check, output: glua_check }
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: general,  crate: glua_ls, output: glua_ls }
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: zigbuild, crate: glua_ls, output: glua_ls, glibc: 2.17 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   platform: win32-x64, cross: general,  crate: glua_ls, output: glua_ls }
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: general,  crate: glua_check, output: glua_check }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   platform: win32-x64, cross: general,  crate: glua_check, output: glua_check }
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: general,  crate: glua_doc_cli, output: glua_doc_cli }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   platform: win32-x64, cross: general,  crate: glua_doc_cli, output: glua_doc_cli }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -132,16 +137,20 @@ jobs:
           chmod +x glua_ls-linux-x64/glua_ls
           chmod +x glua_ls-linux-x64-glibc.2.17/glua_ls
           chmod +x glua_check-linux-x64/glua_check
+          chmod +x glua_doc_cli-linux-x64/glua_doc_cli
 
           tar -zcvf glua_ls-linux-x64.tar.gz        -C glua_ls-linux-x64        glua_ls
           tar -zcvf glua_ls-linux-x64-glibc.2.17.tar.gz -C glua_ls-linux-x64-glibc.2.17 glua_ls
           tar -zcvf glua_check-linux-x64.tar.gz     -C glua_check-linux-x64     glua_check
+          tar -zcvf glua_doc_cli-linux-x64.tar.gz   -C glua_doc_cli-linux-x64   glua_doc_cli
       - name: Compress (Windows)
         run: |
           cd glua_ls-win32-x64
           7z a glua_ls-win32-x64.zip glua_ls.exe
           cd ../glua_check-win32-x64
           7z a glua_check-win32-x64.zip glua_check.exe
+          cd ../glua_doc_cli-win32-x64
+          7z a glua_doc_cli-win32-x64.zip glua_doc_cli.exe
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
@@ -151,7 +160,9 @@ jobs:
           files: |
             glua_ls-win32-x64/glua_ls-win32-x64.zip
             glua_check-win32-x64/glua_check-win32-x64.zip
+            glua_doc_cli-win32-x64/glua_doc_cli-win32-x64.zip
             glua_ls-linux-x64.tar.gz
             glua_ls-linux-x64-glibc.2.17.tar.gz
             glua_check-linux-x64.tar.gz
+            glua_doc_cli-linux-x64.tar.gz
           token: ${{ secrets.RELEASE }}

@@ -8,7 +8,7 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/refs/heads/main/crates/emmylua_code_analysis/resources/schema.json",
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/refs/heads/main/crates/glua_code_analysis/resources/schema.json",
   "diagnostics": {
     "enable": true,
     "diagnosticInterval": 500,
@@ -538,7 +538,7 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/Pollux-Dev/gmod-glua-ls/main/crates/emmylua_code_analysis/resources/schema.json",
+  "$schema": "https://raw.githubusercontent.com/Pollux-Dev/gmod-glua-ls/main/crates/glua_code_analysis/resources/schema.json",
   "gmod": {
     "enabled": true,
     "defaultRealm": "shared",

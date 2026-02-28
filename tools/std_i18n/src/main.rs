@@ -20,8 +20,8 @@ fn main() {
         .expect("tools/std_i18n is two levels under repo root")
         .to_path_buf();
 
-    let std_dir = repo_root.join("crates/emmylua_code_analysis/resources/std");
-    let out_root = repo_root.join("crates/emmylua_ls/std_i18n");
+    let std_dir = repo_root.join("crates/glua_code_analysis/resources/std");
+    let out_root = repo_root.join("crates/glua_ls/std_i18n");
 
     // zh_CN
     merger::write_std_locales_yaml(&std_dir, "zh_CN", &out_root, full_output)

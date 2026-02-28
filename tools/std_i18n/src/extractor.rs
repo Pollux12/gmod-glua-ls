@@ -6,7 +6,7 @@ use crate::keys::{
 use crate::model::{
     AnalyzedLuaDocFile, ExtractedComment, ExtractedEntry, ExtractedFile, ExtractedKind, SourceSpan,
 };
-use emmylua_parser::{
+use glua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaComment, LuaDocDescriptionOwner, LuaDocMultiLineUnionType,
     LuaDocTag, LuaDocType, LuaExpr, LuaIndexExpr, LuaLiteralToken, LuaParser, LuaVarExpr,
     ParserConfig,
@@ -665,7 +665,7 @@ fn make_key(
 }
 
 fn preprocess_description(description: &str) -> String {
-    // 行为尽量对齐 crates/emmylua_code_analysis/src/compilation/analyzer/doc/mod.rs
+    // 行为尽量对齐 crates/glua_code_analysis/src/compilation/analyzer/doc/mod.rs
     let mut description = description;
     if description.starts_with(['#', '@']) {
         description = description.trim_start_matches(['#', '@']);
@@ -806,12 +806,12 @@ fn is_whitespace_between(content: &str, from: usize, to: usize) -> bool {
     slice.chars().all(|c| c.is_whitespace())
 }
 
-fn format_doc_field_key(key: emmylua_parser::LuaDocFieldKey) -> Option<String> {
+fn format_doc_field_key(key: glua_parser::LuaDocFieldKey) -> Option<String> {
     match key {
-        emmylua_parser::LuaDocFieldKey::Name(name) => Some(name.get_name_text().to_string()),
-        emmylua_parser::LuaDocFieldKey::String(s) => Some(s.get_value()),
-        emmylua_parser::LuaDocFieldKey::Integer(i) => Some(i.get_number_value().to_string()),
-        emmylua_parser::LuaDocFieldKey::Type(t) => Some(t.syntax().text().to_string()),
+        glua_parser::LuaDocFieldKey::Name(name) => Some(name.get_name_text().to_string()),
+        glua_parser::LuaDocFieldKey::String(s) => Some(s.get_value()),
+        glua_parser::LuaDocFieldKey::Integer(i) => Some(i.get_number_value().to_string()),
+        glua_parser::LuaDocFieldKey::Type(t) => Some(t.syntax().text().to_string()),
     }
 }
 
@@ -910,11 +910,11 @@ fn format_index_expr_path(index: &LuaIndexExpr) -> Option<String> {
     let prefix = format_expr_path(&index.get_prefix_expr()?)?;
     let key = index.get_index_key()?;
     match key {
-        emmylua_parser::LuaIndexKey::Name(name) => {
+        glua_parser::LuaIndexKey::Name(name) => {
             Some(format!("{prefix}.{}", name.get_name_text()))
         }
-        emmylua_parser::LuaIndexKey::String(s) => Some(format!("{prefix}.{}", s.get_value())),
-        emmylua_parser::LuaIndexKey::Integer(i) => {
+        glua_parser::LuaIndexKey::String(s) => Some(format!("{prefix}.{}", s.get_value())),
+        glua_parser::LuaIndexKey::Integer(i) => {
             Some(format!("{prefix}.{}", i.get_number_value()))
         }
         _ => None,

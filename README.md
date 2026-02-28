@@ -60,7 +60,7 @@ The recommended way is to use the GLua extension (coming soon). You can also con
 
 ### Other Editors
 
-Any LSP-compatible editor should work. Point your LSP client to the `emmylua_ls` binary.
+Any LSP-compatible editor should work. Point your LSP client to the `glua_ls` binary.
 
 ### Build from Source
 
@@ -70,7 +70,7 @@ cd gmod-glua-ls
 cargo build --release
 ```
 
-Binary location: `target/release/emmylua_ls` (or `emmylua_ls.exe` on Windows)
+Binary location: `target/release/glua_ls` (or `glua_ls.exe` on Windows)
 
 ## Configuration
 
@@ -82,7 +82,7 @@ Here's a config that should be a good default for most:
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/refs/heads/main/crates/emmylua_code_analysis/resources/schema.json",
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/refs/heads/main/crates/glua_code_analysis/resources/schema.json",
   "diagnostics": {
     "enable": true,
     "diagnosticInterval": 500,

@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # local
-emmylua_code_analysis.workspace = true
+glua_code_analysis.workspace = true
 
 # external
 schemars.workspace = true

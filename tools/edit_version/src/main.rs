@@ -2,10 +2,15 @@ use std::fs;
 use toml_edit::{value, DocumentMut};
 
 const CARGOS: &[&str] = &[
-    "crates/emmylua_code_analysis/Cargo.toml",
-    "crates/emmylua_doc_cli/Cargo.toml",
-    "crates/emmylua_ls/Cargo.toml",
-    "crates/emmylua_check/Cargo.toml",
+    "crates/glua_code_analysis/Cargo.toml",
+    "crates/glua_code_style/Cargo.toml",
+    "crates/glua_diagnostic_macro/Cargo.toml",
+    "crates/glua_parser_desc/Cargo.toml",
+    "crates/glua_parser/Cargo.toml",
+    "crates/schema_to_glua/Cargo.toml",
+    "crates/glua_doc_cli/Cargo.toml",
+    "crates/glua_ls/Cargo.toml",
+    "crates/glua_check/Cargo.toml",
 ];
 
 fn main() {
@@ -44,8 +49,16 @@ fn main() {
         .unwrap_or_else(|_| panic!("Failed to parse {:?}", workspacec_cargo));
 
     let dependencies = doc["workspace"]["dependencies"].as_table_mut().unwrap();
-    if let Some(dep) = dependencies.get_mut("emmylua_code_analysis") {
-        dep["version"] = value(version.clone());
+    for dep_name in [
+        "glua_code_analysis",
+        "glua_parser",
+        "glua_parser_desc",
+        "glua_diagnostic_macro",
+        "schema_to_glua",
+    ] {
+        if let Some(dep) = dependencies.get_mut(dep_name) {
+            dep["version"] = value(version.clone());
+        }
     }
 
     fs::write(&workspacec_cargo, doc.to_string())

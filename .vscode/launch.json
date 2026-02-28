@@ -7,16 +7,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'emmylua_ls-rust'",
+            "name": "Debug executable 'glua_ls-rust'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=emmylua_ls",
-                    "--package=emmylua_ls",
+                    "--bin=glua_ls",
+                    "--package=glua_ls",
                     "--target=x86_64-pc-windows-gnu",
                 ],
                 "filter": {
-                    "name": "emmylua_ls",
+                    "name": "glua_ls",
                     "kind": "bin"
                 }
             },

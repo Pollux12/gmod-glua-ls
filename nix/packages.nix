@@ -33,7 +33,7 @@ in
     (
       x:
       let
-        name = "emmylua_${x}";
+        name = "glua_${x}";
       in
       {
         inherit name;
