@@ -413,7 +413,11 @@ impl EmmyLuaAnalysis {
 
     pub fn remove_file_by_uri(&mut self, uri: &Uri) -> Option<FileId> {
         if let Some(file_id) = self.compilation.get_db_mut().get_vfs_mut().remove_file(uri) {
-            log::info!("remove_file_by_uri: uri={} file_id={:?}", uri.as_str(), file_id);
+            log::info!(
+                "remove_file_by_uri: uri={} file_id={:?}",
+                uri.as_str(),
+                file_id
+            );
             self.compilation.remove_index(vec![file_id]);
             return Some(file_id);
         }

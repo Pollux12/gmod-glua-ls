@@ -499,7 +499,8 @@ async fn push_workspace_diagnostic(
         let semaphore = semaphore.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            let result = diagnose_workspace_file_off_thread(analysis, semaphore, file_id, token).await;
+            let result =
+                diagnose_workspace_file_off_thread(analysis, semaphore, file_id, token).await;
             if let Some((diagnostics, uri)) = result {
                 let diagnostic_param = lsp_types::PublishDiagnosticsParams {
                     uri,

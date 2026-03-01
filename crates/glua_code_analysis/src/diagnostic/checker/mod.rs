@@ -95,7 +95,11 @@ pub fn check_file(
     run_check::<unused::UnusedChecker>(context, semantic_model, cancel_token);
     run_check::<deprecated::DeprecatedChecker>(context, semantic_model, cancel_token);
     run_check::<undefined_global::UndefinedGlobalChecker>(context, semantic_model, cancel_token);
-    run_check::<unnecessary_assert::UnnecessaryAssertChecker>(context, semantic_model, cancel_token);
+    run_check::<unnecessary_assert::UnnecessaryAssertChecker>(
+        context,
+        semantic_model,
+        cancel_token,
+    );
     run_check::<unnecessary_if::UnnecessaryIfChecker>(context, semantic_model, cancel_token);
     run_check::<access_invisible::AccessInvisibleChecker>(context, semantic_model, cancel_token);
     run_check::<local_const_reassign::LocalConstReassignChecker>(
@@ -153,7 +157,11 @@ pub fn check_file(
         cancel_token,
     );
     run_check::<unknown_doc_tag::UnknownDocTag>(context, semantic_model, cancel_token);
-    run_check::<enum_value_mismatch::EnumValueMismatchChecker>(context, semantic_model, cancel_token);
+    run_check::<enum_value_mismatch::EnumValueMismatchChecker>(
+        context,
+        semantic_model,
+        cancel_token,
+    );
     run_check::<attribute_check::AttributeCheckChecker>(context, semantic_model, cancel_token);
 
     run_check::<code_style::non_literal_expressions_in_assert::NonLiteralExpressionsInAssertChecker>(
@@ -172,7 +180,11 @@ pub fn check_file(
     if semantic_model.get_emmyrc().gmod.enabled {
         run_check::<gmod_hook_name::GmodHookNameChecker>(context, semantic_model, cancel_token);
         run_check::<gmod_network::GmodNetworkChecker>(context, semantic_model, cancel_token);
-        run_check::<gmod_realm_misuse::GmodRealmMisuseChecker>(context, semantic_model, cancel_token);
+        run_check::<gmod_realm_misuse::GmodRealmMisuseChecker>(
+            context,
+            semantic_model,
+            cancel_token,
+        );
         run_check::<gmod_systems::GmodSystemsChecker>(context, semantic_model, cancel_token);
     }
     Some(())
