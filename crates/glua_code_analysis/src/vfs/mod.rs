@@ -119,8 +119,56 @@ impl Vfs {
         self.file_data[fid.id as usize] = data.map(|content| FileContent {
             content,
             is_remote: false,
+            version: None,
         });
         fid
+    }
+
+    pub fn set_file_content_preparsed(
+        &mut self,
+        uri: &Uri,
+        text: Option<String>,
+        tree: LuaSyntaxTree,
+        line_index: LineIndex,
+        version: Option<i32>,
+    ) -> Option<FileId> {
+        let existing_file_id = self.get_file_id(uri);
+        if text.is_none() && existing_file_id.is_none() {
+            return None;
+        }
+
+        let fid = existing_file_id.unwrap_or_else(|| self.file_id(uri));
+        log::debug!("file_id (preparsed): {:?}, uri: {}", fid, uri.as_str());
+
+        let current_version = self
+            .file_data
+            .get(fid.id as usize)
+            .and_then(Option::as_ref)
+            .and_then(|content| content.version);
+        if let (Some(incoming_version), Some(current_version)) = (version, current_version)
+            && incoming_version < current_version
+        {
+            return None;
+        }
+
+        match text {
+            Some(content) => {
+                self.tree_map.insert(fid, tree);
+                self.line_index_map.insert(fid, line_index);
+                self.file_data[fid.id as usize] = Some(FileContent {
+                    content,
+                    is_remote: false,
+                    version,
+                });
+            }
+            None => {
+                self.line_index_map.remove(&fid);
+                self.tree_map.remove(&fid);
+                self.file_data[fid.id as usize] = None;
+            }
+        }
+
+        Some(fid)
     }
 
     pub fn set_remote_file_content(&mut self, uri: &Uri, data: Option<String>) -> FileId {
@@ -144,6 +192,7 @@ impl Vfs {
         self.file_data[fid.id as usize] = data.map(|content| FileContent {
             content,
             is_remote: true,
+            version: None,
         });
         fid
     }
@@ -171,6 +220,19 @@ impl Vfs {
             Some(&s.content)
         } else {
             None
+        }
+    }
+
+    pub fn get_file_version(&self, id: &FileId) -> Option<i32> {
+        self.file_data
+            .get(id.id as usize)
+            .and_then(Option::as_ref)
+            .and_then(|content| content.version)
+    }
+
+    pub fn update_file_version(&mut self, id: &FileId, version: Option<i32>) {
+        if let Some(Some(content)) = self.file_data.get_mut(id.id as usize) {
+            content.version = version;
         }
     }
 
@@ -254,4 +316,5 @@ impl Vfs {
 struct FileContent {
     content: String,
     is_remote: bool,
+    version: Option<i32>,
 }

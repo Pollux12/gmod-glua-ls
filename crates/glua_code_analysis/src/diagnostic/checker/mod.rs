@@ -47,6 +47,7 @@ use glua_parser::{LuaAstNode, LuaClosureExpr, LuaComment, LuaReturnStat, LuaStat
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::TextRange;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     FileId, LuaType, RenderLevel, db_index::DbIndex, humanize_type, semantic::SemanticModel,
@@ -64,7 +65,15 @@ pub trait Checker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel);
 }
 
-fn run_check<T: Checker>(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
+fn run_check<T: Checker>(
+    context: &mut DiagnosticContext,
+    semantic_model: &SemanticModel,
+    cancel_token: &CancellationToken,
+) {
+    if cancel_token.is_cancelled() {
+        return;
+    }
+
     if T::CODES
         .iter()
         .any(|code| context.is_checker_enable_by_code(code))
@@ -76,64 +85,95 @@ fn run_check<T: Checker>(context: &mut DiagnosticContext, semantic_model: &Seman
     }
 }
 
-pub fn check_file(context: &mut DiagnosticContext, semantic_model: &SemanticModel) -> Option<()> {
-    run_check::<syntax_error::SyntaxErrorChecker>(context, semantic_model);
-    run_check::<analyze_error::AnalyzeErrorChecker>(context, semantic_model);
-    run_check::<unused::UnusedChecker>(context, semantic_model);
-    run_check::<deprecated::DeprecatedChecker>(context, semantic_model);
-    run_check::<undefined_global::UndefinedGlobalChecker>(context, semantic_model);
-    run_check::<unnecessary_assert::UnnecessaryAssertChecker>(context, semantic_model);
-    run_check::<unnecessary_if::UnnecessaryIfChecker>(context, semantic_model);
-    run_check::<access_invisible::AccessInvisibleChecker>(context, semantic_model);
-    run_check::<local_const_reassign::LocalConstReassignChecker>(context, semantic_model);
-    run_check::<discard_returns::DiscardReturnsChecker>(context, semantic_model);
-    run_check::<await_in_sync::AwaitInSyncChecker>(context, semantic_model);
-    run_check::<call_non_callable::CallNonCallableChecker>(context, semantic_model);
-    run_check::<missing_fields::MissingFieldsChecker>(context, semantic_model);
-    run_check::<param_type_check::ParamTypeCheckChecker>(context, semantic_model);
-    run_check::<need_check_nil::NeedCheckNilChecker>(context, semantic_model);
-    run_check::<code_style_check::CodeStyleCheckChecker>(context, semantic_model);
-    run_check::<return_type_mismatch::ReturnTypeMismatch>(context, semantic_model);
-    run_check::<undefined_doc_param::UndefinedDocParamChecker>(context, semantic_model);
-    run_check::<redefined_local::RedefinedLocalChecker>(context, semantic_model);
-    run_check::<check_export::CheckExportChecker>(context, semantic_model);
-    run_check::<check_field::CheckFieldChecker>(context, semantic_model);
-    run_check::<circle_doc_class::CircleDocClassChecker>(context, semantic_model);
-    run_check::<incomplete_signature_doc::IncompleteSignatureDocChecker>(context, semantic_model);
-    run_check::<assign_type_mismatch::AssignTypeMismatchChecker>(context, semantic_model);
-    run_check::<duplicate_require::DuplicateRequireChecker>(context, semantic_model);
-    run_check::<duplicate_type::DuplicateTypeChecker>(context, semantic_model);
-    run_check::<check_return_count::CheckReturnCount>(context, semantic_model);
-    run_check::<unbalanced_assignments::UnbalancedAssignmentsChecker>(context, semantic_model);
-    run_check::<check_param_count::CheckParamCountChecker>(context, semantic_model);
-    run_check::<duplicate_field::DuplicateFieldChecker>(context, semantic_model);
-    run_check::<duplicate_index::DuplicateIndexChecker>(context, semantic_model);
+pub fn check_file(
+    context: &mut DiagnosticContext,
+    semantic_model: &SemanticModel,
+    cancel_token: &CancellationToken,
+) -> Option<()> {
+    run_check::<syntax_error::SyntaxErrorChecker>(context, semantic_model, cancel_token);
+    run_check::<analyze_error::AnalyzeErrorChecker>(context, semantic_model, cancel_token);
+    run_check::<unused::UnusedChecker>(context, semantic_model, cancel_token);
+    run_check::<deprecated::DeprecatedChecker>(context, semantic_model, cancel_token);
+    run_check::<undefined_global::UndefinedGlobalChecker>(context, semantic_model, cancel_token);
+    run_check::<unnecessary_assert::UnnecessaryAssertChecker>(context, semantic_model, cancel_token);
+    run_check::<unnecessary_if::UnnecessaryIfChecker>(context, semantic_model, cancel_token);
+    run_check::<access_invisible::AccessInvisibleChecker>(context, semantic_model, cancel_token);
+    run_check::<local_const_reassign::LocalConstReassignChecker>(
+        context,
+        semantic_model,
+        cancel_token,
+    );
+    run_check::<discard_returns::DiscardReturnsChecker>(context, semantic_model, cancel_token);
+    run_check::<await_in_sync::AwaitInSyncChecker>(context, semantic_model, cancel_token);
+    run_check::<call_non_callable::CallNonCallableChecker>(context, semantic_model, cancel_token);
+    run_check::<missing_fields::MissingFieldsChecker>(context, semantic_model, cancel_token);
+    run_check::<param_type_check::ParamTypeCheckChecker>(context, semantic_model, cancel_token);
+    run_check::<need_check_nil::NeedCheckNilChecker>(context, semantic_model, cancel_token);
+    run_check::<code_style_check::CodeStyleCheckChecker>(context, semantic_model, cancel_token);
+    run_check::<return_type_mismatch::ReturnTypeMismatch>(context, semantic_model, cancel_token);
+    run_check::<undefined_doc_param::UndefinedDocParamChecker>(
+        context,
+        semantic_model,
+        cancel_token,
+    );
+    run_check::<redefined_local::RedefinedLocalChecker>(context, semantic_model, cancel_token);
+    run_check::<check_export::CheckExportChecker>(context, semantic_model, cancel_token);
+    run_check::<check_field::CheckFieldChecker>(context, semantic_model, cancel_token);
+    run_check::<circle_doc_class::CircleDocClassChecker>(context, semantic_model, cancel_token);
+    run_check::<incomplete_signature_doc::IncompleteSignatureDocChecker>(
+        context,
+        semantic_model,
+        cancel_token,
+    );
+    run_check::<assign_type_mismatch::AssignTypeMismatchChecker>(
+        context,
+        semantic_model,
+        cancel_token,
+    );
+    run_check::<duplicate_require::DuplicateRequireChecker>(context, semantic_model, cancel_token);
+    run_check::<duplicate_type::DuplicateTypeChecker>(context, semantic_model, cancel_token);
+    run_check::<check_return_count::CheckReturnCount>(context, semantic_model, cancel_token);
+    run_check::<unbalanced_assignments::UnbalancedAssignmentsChecker>(
+        context,
+        semantic_model,
+        cancel_token,
+    );
+    run_check::<check_param_count::CheckParamCountChecker>(context, semantic_model, cancel_token);
+    run_check::<duplicate_field::DuplicateFieldChecker>(context, semantic_model, cancel_token);
+    run_check::<duplicate_index::DuplicateIndexChecker>(context, semantic_model, cancel_token);
     run_check::<generic::generic_constraint_mismatch::GenericConstraintMismatchChecker>(
         context,
         semantic_model,
+        cancel_token,
     );
-    run_check::<cast_type_mismatch::CastTypeMismatchChecker>(context, semantic_model);
-    run_check::<require_module_visibility::RequireModuleVisibilityChecker>(context, semantic_model);
-    run_check::<unknown_doc_tag::UnknownDocTag>(context, semantic_model);
-    run_check::<enum_value_mismatch::EnumValueMismatchChecker>(context, semantic_model);
-    run_check::<attribute_check::AttributeCheckChecker>(context, semantic_model);
+    run_check::<cast_type_mismatch::CastTypeMismatchChecker>(context, semantic_model, cancel_token);
+    run_check::<require_module_visibility::RequireModuleVisibilityChecker>(
+        context,
+        semantic_model,
+        cancel_token,
+    );
+    run_check::<unknown_doc_tag::UnknownDocTag>(context, semantic_model, cancel_token);
+    run_check::<enum_value_mismatch::EnumValueMismatchChecker>(context, semantic_model, cancel_token);
+    run_check::<attribute_check::AttributeCheckChecker>(context, semantic_model, cancel_token);
 
     run_check::<code_style::non_literal_expressions_in_assert::NonLiteralExpressionsInAssertChecker>(
         context,
         semantic_model,
+        cancel_token,
     );
     run_check::<code_style::preferred_local_alias::PreferredLocalAliasChecker>(
         context,
         semantic_model,
+        cancel_token,
     );
-    run_check::<code_style::invert_if::InvertIfChecker>(context, semantic_model);
-    run_check::<readonly_check::ReadOnlyChecker>(context, semantic_model);
-    run_check::<global_non_module::GlobalInNonModuleChecker>(context, semantic_model);
+    run_check::<code_style::invert_if::InvertIfChecker>(context, semantic_model, cancel_token);
+    run_check::<readonly_check::ReadOnlyChecker>(context, semantic_model, cancel_token);
+    run_check::<global_non_module::GlobalInNonModuleChecker>(context, semantic_model, cancel_token);
     if semantic_model.get_emmyrc().gmod.enabled {
-        run_check::<gmod_hook_name::GmodHookNameChecker>(context, semantic_model);
-        run_check::<gmod_network::GmodNetworkChecker>(context, semantic_model);
-        run_check::<gmod_realm_misuse::GmodRealmMisuseChecker>(context, semantic_model);
-        run_check::<gmod_systems::GmodSystemsChecker>(context, semantic_model);
+        run_check::<gmod_hook_name::GmodHookNameChecker>(context, semantic_model, cancel_token);
+        run_check::<gmod_network::GmodNetworkChecker>(context, semantic_model, cancel_token);
+        run_check::<gmod_realm_misuse::GmodRealmMisuseChecker>(context, semantic_model, cancel_token);
+        run_check::<gmod_systems::GmodSystemsChecker>(context, semantic_model, cancel_token);
     }
     Some(())
 }

@@ -9,7 +9,7 @@ pub async fn on_did_change_watched_files(
     context: ServerContextSnapshot,
     params: DidChangeWatchedFilesParams,
 ) -> Option<()> {
-    // Phase 1: Classify events and read files from disk WITHOUT
+    // Classify events and read files from disk WITHOUT
     // the analysis write lock so that slow disk I/O does not block
     // hover, completion, and diagnostic handlers.
     let (encoding, interval) = {
@@ -77,8 +77,7 @@ pub async fn on_did_change_watched_files(
         }
     } // workspace read lock released here, before any write lock
 
-    // Phase 2: Apply mutations under the write lock — no disk I/O
-    // occurs here so the lock is held only briefly.
+    // Apply mutations under the write lock
     let file_ids = {
         let mut analysis = context.analysis().write().await;
 
@@ -89,7 +88,7 @@ pub async fn on_did_change_watched_files(
         analysis.update_files_by_uri(watched_lua_files)
     };
 
-    // Phase 3: Schedule diagnostics and config reloads (no locks needed)
+    // Schedule diagnostics and config reloads (no locks needed)
     if !lsp_features.supports_pull_diagnostic() {
         for uri in deleted_lua_uris {
             context

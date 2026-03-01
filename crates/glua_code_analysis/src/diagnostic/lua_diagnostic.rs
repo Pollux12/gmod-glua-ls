@@ -95,7 +95,11 @@ impl LuaDiagnostic {
         let semantic_model = compilation.get_semantic_model(file_id)?;
         let mut context = DiagnosticContext::new(file_id, db, config);
 
-        check_file(&mut context, &semantic_model);
+        check_file(&mut context, &semantic_model, &cancel_token);
+
+        if cancel_token.is_cancelled() {
+            return None;
+        }
 
         Some(context.get_diagnostics())
     }

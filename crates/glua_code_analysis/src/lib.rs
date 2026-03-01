@@ -24,6 +24,7 @@ pub use config::*;
 pub use db_index::*;
 pub use diagnostic::*;
 pub use glua_codestyle::*;
+use glua_parser::{LineIndex, LuaSyntaxTree};
 pub use locale::get_locale_code;
 use lsp_types::Uri;
 pub use profile::Profile;
@@ -170,6 +171,84 @@ impl EmmyLuaAnalysis {
 
         if !is_removed {
             self.compilation.update_index(vec![file_id]);
+        }
+
+        Some(file_id)
+    }
+
+    pub fn update_file_preparsed(
+        &mut self,
+        uri: Uri,
+        text: Option<String>,
+        tree: LuaSyntaxTree,
+        line_index: LineIndex,
+        version: Option<i32>,
+        trigger_reindex: bool,
+    ) -> Option<FileId> {
+        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
+        if let Some(file_id) = existing_file_id {
+            if let (Some(incoming_version), Some(current_version)) = (
+                version,
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_version(&file_id),
+            ) && incoming_version < current_version
+            {
+                return None;
+            }
+
+            if let (Some(new_text), Some(old_text)) = (
+                text.as_deref(),
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_content(&file_id)
+                    .map(String::as_str),
+            ) && old_text == new_text
+            {
+                if self
+                    .compilation
+                    .get_db()
+                    .get_module_index()
+                    .get_module(file_id)
+                    .is_some()
+                {
+                    self.compilation
+                        .get_db_mut()
+                        .get_vfs_mut()
+                        .update_file_version(&file_id, version);
+                    return Some(file_id);
+                }
+
+                if trigger_reindex {
+                    self.compilation.remove_index(vec![file_id]);
+                    self.compilation.update_index(vec![file_id]);
+                }
+
+                self.compilation
+                    .get_db_mut()
+                    .get_vfs_mut()
+                    .update_file_version(&file_id, version);
+                return Some(file_id);
+            }
+        } else if text.is_none() {
+            return None;
+        }
+
+        let is_removed = text.is_none();
+        let file_id = self
+            .compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .set_file_content_preparsed(&uri, text, tree, line_index, version)?;
+
+        if trigger_reindex {
+            self.compilation.remove_index(vec![file_id]);
+
+            if !is_removed {
+                self.compilation.update_index(vec![file_id]);
+            }
         }
 
         Some(file_id)

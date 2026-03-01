@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use glua_code_analysis::{EmmyLuaAnalysis, FileId, Profile};
 use log::{debug, info, warn};
 use lsp_types::{Diagnostic, Uri};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::{ClientProxy, ProgressTask, StatusBar};
@@ -39,7 +39,7 @@ impl FileDiagnostic {
     ) {
         let mut tokens = self.diagnostic_tokens.lock().await;
 
-        if let Some(token) = tokens.get(&file_id) {
+        if let Some(token) = tokens.remove(&file_id) {
             token.cancel();
             debug!("cancel diagnostic: {:?}", file_id);
         }
@@ -64,10 +64,22 @@ impl FileDiagnostic {
                     if cancel_token.is_cancelled() {
                         return;
                     }
-                    let analysis = analysis.read().await;
-                    if let Some(uri) = analysis.get_uri(file_id_clone) {
-                        let diagnostics = analysis.diagnose_file(file_id_clone, cancel_token.clone());
-                        if let Some(diagnostics) = diagnostics {
+                    let blocking_analysis = analysis.clone();
+                    let blocking_token = cancel_token.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        if blocking_token.is_cancelled() {
+                            return None;
+                        }
+
+                        // Diagnose under a blocking read lock so CPU work does not run on Tokio workers.
+                        let guard = blocking_analysis.blocking_read();
+                        let uri = guard.get_uri(file_id_clone)?;
+                        let diagnostics = guard.diagnose_file(file_id_clone, blocking_token.clone())?;
+                        Some((uri, diagnostics))
+                    })
+                    .await
+                    {
+                        Ok(Some((uri, diagnostics))) => {
                             let diagnostic_param = lsp_types::PublishDiagnosticsParams {
                                 uri,
                                 diagnostics,
@@ -75,12 +87,24 @@ impl FileDiagnostic {
                             };
                             client.publish_diagnostics(diagnostic_param);
                         }
-                    } else {
-                        info!("file not found: {:?}", file_id_clone);
+                        Ok(None) => {
+                            if !cancel_token.is_cancelled() {
+                                info!("file not found: {:?}", file_id_clone);
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                "single-file diagnostic worker failed for file {:?}: {}",
+                                file_id_clone, err
+                            );
+                        }
                     }
-                    // After completion, remove from HashMap
+                    // Remove our token only if this task was not cancelled.
+                    // Keeping the check inside the lock avoids a check/remove race with replacements.
                     let mut tokens = diagnostic_tokens.lock().await;
-                    tokens.remove(&file_id_clone);
+                    if !cancel_token.is_cancelled() {
+                        tokens.remove(&file_id_clone);
+                    }
                 }
                 _ = cancel_token.cancelled() => {
                     debug!("cancel diagnostic: {:?}", file_id_clone);
@@ -147,6 +171,14 @@ impl FileDiagnostic {
         tokens.clear();
     }
 
+    pub async fn cancel_file_diagnostic(&self, file_id: FileId) {
+        let mut tokens = self.diagnostic_tokens.lock().await;
+        if let Some(token) = tokens.remove(&file_id) {
+            token.cancel();
+            debug!("cancel diagnostic: {:?}", file_id);
+        }
+    }
+
     pub async fn cancel_workspace_diagnostic(&self) {
         let mut token = self.workspace_diagnostic_token.lock().await;
         if let Some(token) = token.as_ref() {
@@ -164,17 +196,35 @@ impl FileDiagnostic {
         if cancel_token.is_cancelled() {
             return vec![];
         }
-        let analysis = self.analysis.read().await;
-        let Some(file_id) = analysis.get_file_id(&uri) else {
-            return vec![];
-        };
 
-        if cancel_token.is_cancelled() {
-            return vec![];
+        let analysis = self.analysis.clone();
+        match tokio::task::spawn_blocking(move || {
+            if cancel_token.is_cancelled() {
+                return Vec::new();
+            }
+
+            // Pull diagnostics under a blocking read lock to avoid blocking async workers.
+            let guard = analysis.blocking_read();
+            let Some(file_id) = guard.get_file_id(&uri) else {
+                return Vec::new();
+            };
+
+            if cancel_token.is_cancelled() {
+                return Vec::new();
+            }
+
+            guard
+                .diagnose_file(file_id, cancel_token)
+                .unwrap_or_default()
+        })
+        .await
+        {
+            Ok(diagnostics) => diagnostics,
+            Err(err) => {
+                warn!("pull-file diagnostic worker failed: {}", err);
+                Vec::new()
+            }
         }
-
-        let diagnostics = analysis.diagnose_file(file_id, cancel_token);
-        diagnostics.unwrap_or_default()
     }
 
     pub async fn pull_workspace_diagnostics_slow(
@@ -207,17 +257,46 @@ impl FileDiagnostic {
             main_workspace_file_ids.len()
         );
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
+        let valid_file_count = main_workspace_file_ids.len();
+        let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
+
         for file_id in main_workspace_file_ids {
-            if cancel_token.is_cancelled() {
-                break;
-            }
-            let analysis = self.analysis.read().await;
-            if let Some(uri) = analysis.get_uri(file_id) {
-                let diagnostics = analysis.diagnose_file(file_id, cancel_token.clone());
-                if let Some(diagnostics) = diagnostics {
-                    result.push((uri, diagnostics));
+            let analysis = self.analysis.clone();
+            let token = cancel_token.clone();
+            let tx = tx.clone();
+            let semaphore = semaphore.clone();
+            tokio::spawn(async move {
+                let result =
+                    diagnose_workspace_file_off_thread(analysis, semaphore, file_id, token).await;
+                let _ = tx.send(result).await;
+            });
+        }
+        drop(tx);
+
+        let mut count = 0;
+        while count < valid_file_count {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    break;
+                }
+                file_diagnostic_result = rx.recv() => {
+                    let Some(file_diagnostic_result) = file_diagnostic_result else {
+                        break;
+                    };
+
+                    if let Some((diagnostics, uri)) = file_diagnostic_result {
+                        result.push((uri, diagnostics));
+                    }
+                    count += 1;
                 }
             }
+        }
+        if count < valid_file_count && !cancel_token.is_cancelled() {
+            warn!(
+                "workspace diagnostic pull slow ended early: completed={} expected={}",
+                count, valid_file_count
+            );
         }
 
         result
@@ -259,49 +338,52 @@ impl FileDiagnostic {
         );
 
         let analysis = self.analysis.clone();
+        let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
         for file_id in main_workspace_file_ids {
             let analysis = analysis.clone();
             let token = cancel_token.clone();
             let tx = tx.clone();
+            let semaphore = semaphore.clone();
             tokio::spawn(async move {
-                let analysis = analysis.read().await;
-                let diagnostics = analysis.diagnose_file(file_id, token);
-                if let Some(diagnostics) = diagnostics {
-                    let uri = analysis.get_uri(file_id).unwrap();
-                    let _ = tx.send(Some((diagnostics, uri))).await;
-                } else {
-                    let _ = tx.send(None).await;
-                }
+                let result =
+                    diagnose_workspace_file_off_thread(analysis, semaphore, file_id, token).await;
+                let _ = tx.send(result).await;
             });
         }
+        drop(tx);
 
         let mut count = 0;
         if valid_file_count != 0 {
             let text = format!("diagnose {} files", valid_file_count);
             let _p = Profile::new(text.as_str());
             let mut last_percentage = 0;
-            while let Some(file_diagnostic_result) = rx.recv().await {
-                if cancel_token.is_cancelled() {
-                    break;
-                }
 
-                if let Some((diagnostics, uri)) = file_diagnostic_result {
-                    result.push((uri, diagnostics));
-                }
+            while count < valid_file_count {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        break;
+                    }
+                    file_diagnostic_result = rx.recv() => {
+                        let Some(file_diagnostic_result) = file_diagnostic_result else {
+                            break;
+                        };
 
-                count += 1;
-                let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
-                if last_percentage != percentage_done {
-                    last_percentage = percentage_done;
-                    let message = format!("diagnostic {}%", percentage_done);
-                    status_bar.update_progress_task(
-                        ProgressTask::DiagnoseWorkspace,
-                        Some(percentage_done),
-                        Some(message),
-                    );
-                }
-                if count == valid_file_count {
-                    break;
+                        if let Some((diagnostics, uri)) = file_diagnostic_result {
+                            result.push((uri, diagnostics));
+                        }
+
+                        count += 1;
+                        let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
+                        if last_percentage != percentage_done {
+                            last_percentage = percentage_done;
+                            let message = format!("diagnostic {}%", percentage_done);
+                            status_bar.update_progress_task(
+                                ProgressTask::DiagnoseWorkspace,
+                                Some(percentage_done),
+                                Some(message),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -318,6 +400,62 @@ impl FileDiagnostic {
         );
 
         result
+    }
+}
+
+fn workspace_diagnostic_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(8)
+}
+
+async fn diagnose_workspace_file_off_thread(
+    analysis: Arc<RwLock<EmmyLuaAnalysis>>,
+    semaphore: Arc<Semaphore>,
+    file_id: FileId,
+    cancel_token: CancellationToken,
+) -> Option<(Vec<Diagnostic>, Uri)> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+
+    let permit = tokio::select! {
+        _ = cancel_token.cancelled() => {
+            return None;
+        }
+        permit = semaphore.acquire_owned() => {
+            match permit {
+                Ok(permit) => permit,
+                Err(_) => return None,
+            }
+        }
+    };
+
+    let blocking_analysis = analysis;
+    let blocking_token = cancel_token.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if blocking_token.is_cancelled() {
+            return None;
+        }
+
+        // Diagnose under a blocking read lock to avoid starving Tokio worker threads.
+        let guard = blocking_analysis.blocking_read();
+        let diagnostics = guard.diagnose_file(file_id, blocking_token.clone())?;
+        let uri = guard.get_uri(file_id)?;
+        Some((diagnostics, uri))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            warn!(
+                "workspace diagnostic worker failed for file {:?}: {}",
+                file_id, err
+            );
+            None
+        }
     }
 }
 
@@ -353,16 +491,16 @@ async fn push_workspace_diagnostic(
             .await;
     }
 
+    let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
     for file_id in main_workspace_file_ids {
         let analysis = analysis.clone();
         let token = cancel_token.clone();
         let client = client_proxy.clone();
+        let semaphore = semaphore.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            let analysis = analysis.read().await;
-            let diagnostics = analysis.diagnose_file(file_id, token);
-            if let Some(diagnostics) = diagnostics {
-                let uri = analysis.get_uri(file_id).unwrap();
+            let result = diagnose_workspace_file_off_thread(analysis, semaphore, file_id, token).await;
+            if let Some((diagnostics, uri)) = result {
                 let diagnostic_param = lsp_types::PublishDiagnosticsParams {
                     uri,
                     diagnostics,
@@ -373,6 +511,7 @@ async fn push_workspace_diagnostic(
             let _ = tx.send(file_id).await;
         });
     }
+    drop(tx);
 
     let mut count = 0;
     if valid_file_count != 0 {
