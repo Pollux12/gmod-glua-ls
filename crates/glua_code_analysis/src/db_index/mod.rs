@@ -108,6 +108,11 @@ impl DbIndex {
 
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {
         for file_id in file_ids {
+            if let Some(path) = self.get_vfs().get_file_path(&file_id) {
+                log::debug!("remove_index: file_id={:?} path={}", file_id, path.display());
+            } else {
+                log::debug!("remove_index: file_id={:?} (no path)", file_id);
+            }
             self.remove(file_id);
         }
     }

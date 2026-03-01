@@ -166,32 +166,13 @@ pub async fn on_did_close_document(
     drop(workspace);
     let lsp_features = context.lsp_features();
 
-    // 如果关闭后文件不存在, 则移除
+    // Only remove from the index when the file no longer exists on disk
+    // (e.g. it was deleted while open). Files that still exist on disk —
+    // including library/annotation files opened via "Go to Definition" —
+    // must stay in the index.
     if let Some(file_path) = uri_to_file_path(uri)
         && !file_path.exists()
     {
-        let mut mut_analysis = context.analysis().write().await;
-        mut_analysis.remove_file_by_uri(uri);
-        drop(mut_analysis);
-
-        if !lsp_features.supports_pull_diagnostic() {
-            context
-                .file_diagnostic()
-                .clear_push_file_diagnostics(uri.clone());
-        }
-
-        return Some(());
-    }
-
-    let analysis = context.analysis().read().await;
-    let file_id = analysis.get_file_id(uri)?;
-    let module_info = analysis
-        .compilation
-        .get_db()
-        .get_module_index()
-        .get_module(file_id);
-    if module_info.is_none() {
-        drop(analysis);
         let mut mut_analysis = context.analysis().write().await;
         mut_analysis.remove_file_by_uri(uri);
         drop(mut_analysis);

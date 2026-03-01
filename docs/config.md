@@ -1,6 +1,6 @@
 # Configuration
 
-Configuration is done via `.emmyrc.json` (or `.luarc.json` for compatibility) in your workspace root.
+Configuration is done via `.gluarc.json` in your workspace root.
 
 ## Quick Start
 

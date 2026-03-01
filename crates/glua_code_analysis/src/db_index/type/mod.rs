@@ -310,6 +310,11 @@ impl LuaIndex for LuaTypeIndex {
                     if decl.get_mut_locations().is_empty() {
                         self.full_name_type_map.remove(&id);
                         remove_type = true;
+                        log::info!(
+                            "type_index: type '{}' fully removed (file_id={:?})",
+                            id.get_simple_name(),
+                            file_id,
+                        );
                     }
                 }
 

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 mod builder;
 mod comment;
 mod expr;
@@ -8,7 +10,7 @@ use expr::{build_closure_expr_symbol, build_table_symbol};
 use glua_code_analysis::{EmmyrcGmodOutlineVerbosity, SemanticModel};
 use glua_parser::{
     LuaAstNode, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaComment, LuaExpr, LuaFuncStat,
-    LuaSingleArgExpr, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaVarExpr,
+    LuaSingleArgExpr, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaVarExpr, PathTrait,
 };
 use lsp_types::{
     ClientCapabilities, DocumentSymbol, DocumentSymbolOptions, DocumentSymbolParams,
@@ -144,26 +146,46 @@ fn process_stat(
 
     match stat {
         LuaStat::LocalStat(local_stat) => {
-            let bindings = build_local_stat_symbol(builder, local_stat, parent_id)?;
+            let bindings = build_local_stat_symbol(builder, local_stat.clone(), parent_id)?;
+            let mut processed_value_expr_ids = HashSet::new();
             for binding in bindings {
                 if let Some(expr) = binding.value_expr {
+                    processed_value_expr_ids.insert(expr.get_syntax_id());
                     process_expr(builder, expr, binding.symbol_id, true)?;
                 }
+            }
+
+            for expr in local_stat.get_value_exprs() {
+                if processed_value_expr_ids.contains(&expr.get_syntax_id()) {
+                    continue;
+                }
+                process_expr(builder, expr, parent_id, false)?;
             }
         }
         LuaStat::AssignStat(assign_stat) => {
             let bindings = build_assign_stat_symbol(builder, assign_stat.clone(), parent_id)?;
+            let mut processed_value_expr_ids = HashSet::new();
             for binding in bindings {
                 if let Some(expr) = binding.value_expr {
+                    processed_value_expr_ids.insert(expr.get_syntax_id());
                     process_expr(builder, expr, binding.symbol_id, true)?;
                 }
+            }
+
+            let (_, value_exprs) = assign_stat.get_var_and_expr_list();
+            for expr in value_exprs {
+                if processed_value_expr_ids.contains(&expr.get_syntax_id()) {
+                    continue;
+                }
+                process_expr(builder, expr, parent_id, false)?;
             }
         }
         LuaStat::FuncStat(func_stat) => {
             let func_parent_id = resolve_func_parent_id(builder, &func_stat, parent_id);
             let func_id = build_func_stat_symbol(builder, func_stat.clone(), func_parent_id)?;
             if let Some(closure) = func_stat.get_closure() {
-                let scope_parent = build_closure_expr_symbol(builder, closure.clone(), func_id)?;
+                let scope_parent =
+                    build_closure_expr_symbol(builder, closure.clone(), func_id, false)?;
                 if let Some(block) = closure.get_block() {
                     process_block(builder, block, scope_parent)?;
                 }
@@ -172,7 +194,8 @@ fn process_stat(
         LuaStat::LocalFuncStat(local_func) => {
             let func_id = build_local_func_stat_symbol(builder, local_func.clone(), parent_id)?;
             if let Some(closure) = local_func.get_closure() {
-                let scope_parent = build_closure_expr_symbol(builder, closure.clone(), func_id)?;
+                let scope_parent =
+                    build_closure_expr_symbol(builder, closure.clone(), func_id, false)?;
                 if let Some(block) = closure.get_block() {
                     process_block(builder, block, scope_parent)?;
                 }
@@ -290,6 +313,7 @@ fn process_stat(
                                     builder,
                                     closure.clone(),
                                     call_symbol_id,
+                                    true,
                                 )?;
                                 if let Some(block) = closure.get_block() {
                                     process_block(builder, block, scope_parent)?;
@@ -327,6 +351,53 @@ fn get_call_arg_closure(call_expr: &LuaCallExpr, arg_index: usize) -> Option<Lua
         LuaExpr::ClosureExpr(closure) => Some(closure),
         _ => None,
     }
+}
+
+fn check_and_build_net_op_symbol(
+    builder: &mut DocumentSymbolBuilder,
+    call_expr: &LuaCallExpr,
+    parent_id: LuaSyntaxId,
+) -> bool {
+    if !builder.is_gmod_enabled() {
+        return false;
+    }
+
+    let Some(call_path) = call_expr.get_access_path() else {
+        return false;
+    };
+
+    let Some(op_name) = call_path.strip_prefix("net.") else {
+        return false;
+    };
+
+    let is_net_op = op_name == "Broadcast"
+        || op_name == "Start"
+        || op_name.starts_with("Read")
+        || op_name.starts_with("Write")
+        || op_name.starts_with("Send");
+
+    if !is_net_op {
+        return false;
+    }
+
+    let call_id = call_expr.get_syntax_id();
+    if builder.contains_symbol(&call_id) {
+        return false;
+    }
+
+    let text = call_expr.syntax().text().to_string();
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name = if normalized.chars().count() > 60 {
+        let mut truncated: String = normalized.chars().take(56).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        normalized
+    };
+
+    let symbol = LuaSymbol::new(name, None, SymbolKind::EVENT, call_expr.get_range());
+    builder.add_node_symbol(call_expr.syntax().clone(), symbol, Some(parent_id));
+    true
 }
 
 fn resolve_func_parent_id(
@@ -457,7 +528,8 @@ fn process_expr(
             if !inline_table_to_parent {
                 return Some(());
             }
-            let scope_parent = build_closure_expr_symbol(builder, closure.clone(), parent_id)?;
+            let scope_parent =
+                build_closure_expr_symbol(builder, closure.clone(), parent_id, false)?;
             if let Some(block) = closure.get_block() {
                 process_block(builder, block, scope_parent)?;
             }
@@ -479,6 +551,7 @@ fn process_expr(
             }
         }
         LuaExpr::CallExpr(call) => {
+            check_and_build_net_op_symbol(builder, &call, parent_id);
             if let Some(prefix) = call.get_prefix_expr() {
                 process_expr(builder, prefix, parent_id, inline_table_to_parent)?;
             }
@@ -653,6 +726,61 @@ mod tests {
     }
 
     #[gtest]
+    fn hidden_local_value_exprs_are_still_processed() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.outline.verbosity = EmmyrcGmodOutlineVerbosity::Normal;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/server/hidden_local_value_exprs.lua",
+            r#"
+            local hidden = net.ReadUInt(8)
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let symbol = find_top_level_symbol(top_level_symbols, "net.ReadUInt(8)").or_fail()?;
+        verify_that!(symbol.kind, eq(SymbolKind::EVENT))
+    }
+
+    #[gtest]
+    fn hidden_assign_value_exprs_are_still_processed() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.outline.verbosity = EmmyrcGmodOutlineVerbosity::Normal;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/server/hidden_assign_value_exprs.lua",
+            r#"
+            local hidden = 1
+            hidden = net.ReadUInt(8)
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let symbol = find_top_level_symbol(top_level_symbols, "net.ReadUInt(8)").or_fail()?;
+        verify_that!(symbol.kind, eq(SymbolKind::EVENT))
+    }
+
+    #[gtest]
     fn verbose_verbosity_keeps_primitive_locals() -> Result<()> {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -705,6 +833,112 @@ mod tests {
 
         let hook_symbol = find_top_level_symbol(top_level_symbols, "hook: Think").or_fail()?;
         verify_that!(hook_symbol.kind, eq(SymbolKind::EVENT))
+    }
+
+    #[gtest]
+    fn net_operations_are_reported_as_event_symbols() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/server/net_ops.lua",
+            r#"
+            net.Start("MyMessage")
+            net.WriteUInt(16, 8)
+            net.Broadcast()
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        for expected in [
+            "net.Start(\"MyMessage\")",
+            "net.WriteUInt(16, 8)",
+            "net.Broadcast()",
+        ] {
+            let symbol = find_top_level_symbol(top_level_symbols, expected).or_fail()?;
+            verify_that!(symbol.kind, eq(SymbolKind::EVENT))?;
+        }
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn net_operation_symbol_name_is_normalized_and_truncated() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/server/net_op_label_format.lua",
+            r#"
+            net.WriteString(
+                "ThisIsAnExtremelyLongMessageNameThatShouldForceOutlineLabelTruncationBecauseItKeepsGoing"
+            )
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let symbol = top_level_symbols
+            .iter()
+            .find(|symbol| symbol.name.starts_with("net.WriteString"))
+            .or_fail()?;
+
+        verify_that!(symbol.kind, eq(SymbolKind::EVENT))?;
+        verify_that!(symbol.name.contains('\n'), eq(false))?;
+        verify_that!(symbol.name.contains('\t'), eq(false))?;
+        verify_that!(symbol.name.ends_with("..."), eq(true))?;
+        verify_that!(symbol.name.len() <= 59, eq(true))
+    }
+
+    #[gtest]
+    fn net_receive_callback_params_are_inlined_to_call_symbol() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/server/net_receive_inlined.lua",
+            r#"
+            net.Receive("MyMessage", function(len, ply)
+                local captured = len
+            end)
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let receive_symbol =
+            find_top_level_symbol(top_level_symbols, "net.Receive: MyMessage").or_fail()?;
+        let children = receive_symbol.children.as_ref().or_fail()?;
+        let child_names = top_level_names(children);
+
+        verify_that!(child_names.contains(&"len".to_string()), eq(true))?;
+        verify_that!(child_names.contains(&"ply".to_string()), eq(true))?;
+        verify_that!(child_names.contains(&"closure".to_string()), eq(false))
     }
 
     #[gtest]

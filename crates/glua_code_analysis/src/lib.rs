@@ -49,6 +49,17 @@ pub fn set_locale(locale: &str) {
     rust_i18n::set_locale(locale);
 }
 
+/// Normalize a workspace root path so it uses the same drive-letter
+/// casing that the VFS applies (uppercase on Windows).  Without this,
+/// `extract_module_path` would fail to match VFS paths against
+/// library workspace roots supplied by the editor with a lowercase
+/// drive letter.
+fn normalize_workspace_root(root: PathBuf) -> PathBuf {
+    file_path_to_uri(&root)
+        .and_then(|uri| uri_to_file_path(&uri))
+        .unwrap_or(root)
+}
+
 #[derive(Debug)]
 pub struct EmmyLuaAnalysis {
     pub compilation: LuaCompilation,
@@ -96,6 +107,7 @@ impl EmmyLuaAnalysis {
     }
 
     pub fn add_main_workspace(&mut self, root: PathBuf) {
+        let root = normalize_workspace_root(root);
         let module_index = self.compilation.get_db_mut().get_module_index_mut();
         let id = WorkspaceId {
             id: module_index.next_main_workspace_id(),
@@ -104,6 +116,7 @@ impl EmmyLuaAnalysis {
     }
 
     pub fn add_library_workspace(&mut self, root: PathBuf) {
+        let root = normalize_workspace_root(root);
         let module_index = self.compilation.get_db_mut().get_module_index_mut();
         let id = WorkspaceId {
             id: module_index.next_library_workspace_id(),
@@ -123,6 +136,21 @@ impl EmmyLuaAnalysis {
                     .map(String::as_str),
             ) && old_text == new_text
             {
+                // Text unchanged — if the index is already built (has module info),
+                // skip the costly remove+re-add cycle. This avoids unnecessary
+                // reindexing when VS Code opens already-loaded files for
+                // peek/definition (e.g. annotation/library files).
+                if self
+                    .compilation
+                    .get_db()
+                    .get_module_index()
+                    .get_module(file_id)
+                    .is_some()
+                {
+                    return Some(file_id);
+                }
+
+                // Index was cleared — fall through to rebuild it.
                 self.compilation.remove_index(vec![file_id]);
                 self.compilation.update_index(vec![file_id]);
                 return Some(file_id);
@@ -306,6 +334,7 @@ impl EmmyLuaAnalysis {
 
     pub fn remove_file_by_uri(&mut self, uri: &Uri) -> Option<FileId> {
         if let Some(file_id) = self.compilation.get_db_mut().get_vfs_mut().remove_file(uri) {
+            log::info!("remove_file_by_uri: uri={} file_id={:?}", uri.as_str(), file_id);
             self.compilation.remove_index(vec![file_id]);
             return Some(file_id);
         }
@@ -381,8 +410,20 @@ impl EmmyLuaAnalysis {
             if let Some(path) = vfs.get_file_path(&file_id).filter(|path| !path.exists())
                 && let Some(uri) = file_path_to_uri(path)
             {
+                log::info!(
+                    "cleanup_nonexistent_files: removing file_id={:?} path={}",
+                    file_id,
+                    path.display(),
+                );
                 files_to_remove.push(uri);
             }
+        }
+
+        if !files_to_remove.is_empty() {
+            log::info!(
+                "cleanup_nonexistent_files: removing {} files total",
+                files_to_remove.len()
+            );
         }
 
         // 移除不存在的文件

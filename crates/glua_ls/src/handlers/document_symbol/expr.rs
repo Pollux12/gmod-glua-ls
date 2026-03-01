@@ -10,16 +10,21 @@ pub fn build_closure_expr_symbol(
     builder: &mut DocumentSymbolBuilder,
     closure: LuaClosureExpr,
     parent_id: LuaSyntaxId,
+    inline_to_parent: bool,
 ) -> Option<LuaSyntaxId> {
     let parent_kind = closure.syntax().parent().map(|parent| parent.kind().into());
     let convert_parent_to_function = matches!(
         parent_kind,
         Some(LuaSyntaxKind::TableFieldAssign | LuaSyntaxKind::TableFieldValue)
     );
-    let needs_own_symbol = match parent_kind {
-        Some(LuaSyntaxKind::LocalFuncStat | LuaSyntaxKind::FuncStat) => false,
-        Some(_) if convert_parent_to_function => false,
-        _ => true,
+    let needs_own_symbol = if inline_to_parent {
+        false
+    } else {
+        match parent_kind {
+            Some(LuaSyntaxKind::LocalFuncStat | LuaSyntaxKind::FuncStat) => false,
+            Some(_) if convert_parent_to_function => false,
+            _ => true,
+        }
     };
 
     let param_list = closure.get_params_list()?;

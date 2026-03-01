@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use glua_code_analysis::{read_file_with_encoding, uri_to_file_path};
 use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, Uri};
 
@@ -7,74 +9,110 @@ pub async fn on_did_change_watched_files(
     context: ServerContextSnapshot,
     params: DidChangeWatchedFilesParams,
 ) -> Option<()> {
-    let workspace = context.workspace_manager().read().await;
-    let mut analysis = context.analysis().write().await;
-    let emmyrc = analysis.get_emmyrc();
-    let encoding = &emmyrc.workspace.encoding;
-    let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
-    let mut watched_lua_files: Vec<(Uri, Option<String>)> = Vec::new();
-    let lsp_features = context.lsp_features();
-    // let
-    for file_event in params.changes.into_iter() {
-        let file_type = get_file_type(&file_event.uri);
-        match file_type {
-            Some(WatchedFileType::Lua) => {
-                if file_event.typ == FileChangeType::DELETED {
-                    analysis.remove_file_by_uri(&file_event.uri);
-                    if !lsp_features.supports_pull_diagnostic() {
-                        context
-                            .file_diagnostic()
-                            .clear_push_file_diagnostics(file_event.uri);
-                    }
-                    continue;
-                }
+    // Phase 1: Classify events and read files from disk WITHOUT
+    // the analysis write lock so that slow disk I/O does not block
+    // hover, completion, and diagnostic handlers.
+    let (encoding, interval) = {
+        let analysis = context.analysis().read().await;
+        let emmyrc = analysis.get_emmyrc();
+        (
+            emmyrc.workspace.encoding.clone(),
+            emmyrc.diagnostics.diagnostic_interval.unwrap_or(500),
+        )
+    };
 
-                if !workspace.current_open_files.contains(&file_event.uri) {
-                    if !workspace.is_workspace_file(&file_event.uri) {
+    let lsp_features = context.lsp_features();
+    let mut watched_lua_files: Vec<(Uri, Option<String>)> = Vec::new();
+    let mut deleted_lua_uris: Vec<Uri> = Vec::new();
+    let mut editorconfig_paths: Vec<PathBuf> = Vec::new();
+    let mut emmyrc_dirs: Vec<PathBuf> = Vec::new();
+
+    {
+        let workspace = context.workspace_manager().read().await;
+
+        for file_event in params.changes.into_iter() {
+            let file_type = get_file_type(&file_event.uri);
+            match file_type {
+                Some(WatchedFileType::Lua) => {
+                    if file_event.typ == FileChangeType::DELETED {
+                        // Only remove files that belong to this workspace.
+                        // Library files (e.g. downloaded annotations) may
+                        // receive spurious delete events and must not be
+                        // purged from the index.
+                        if workspace.is_workspace_file(&file_event.uri) {
+                            deleted_lua_uris.push(file_event.uri);
+                        }
                         continue;
                     }
 
-                    collect_lua_files(
-                        &mut watched_lua_files,
-                        file_event.uri,
-                        file_event.typ,
-                        encoding,
-                    );
+                    if !workspace.current_open_files.contains(&file_event.uri)
+                        && workspace.is_workspace_file(&file_event.uri)
+                    {
+                        collect_lua_files(
+                            &mut watched_lua_files,
+                            file_event.uri,
+                            file_event.typ,
+                            &encoding,
+                        );
+                    }
                 }
-            }
-            Some(WatchedFileType::Editorconfig) => {
-                if file_event.typ == FileChangeType::DELETED {
-                    continue;
+                Some(WatchedFileType::Editorconfig) => {
+                    if file_event.typ != FileChangeType::DELETED {
+                        if let Some(path) = uri_to_file_path(&file_event.uri) {
+                            editorconfig_paths.push(path);
+                        }
+                    }
                 }
-                let editorconfig_path = uri_to_file_path(&file_event.uri).unwrap();
-                context
-                    .workspace_manager()
-                    .read()
-                    .await
-                    .update_editorconfig(editorconfig_path);
-            }
-            Some(WatchedFileType::Emmyrc) => {
-                if file_event.typ == FileChangeType::DELETED {
-                    continue;
+                Some(WatchedFileType::Emmyrc) => {
+                    if file_event.typ != FileChangeType::DELETED {
+                        if let Some(path) = uri_to_file_path(&file_event.uri) {
+                            if let Some(dir) = path.parent() {
+                                emmyrc_dirs.push(dir.to_path_buf());
+                            }
+                        }
+                    }
                 }
-                let emmyrc_path = uri_to_file_path(&file_event.uri).unwrap();
-                let file_dir = emmyrc_path.parent().unwrap().to_path_buf();
-                context
-                    .workspace_manager()
-                    .read()
-                    .await
-                    .add_update_emmyrc_task(file_dir)
-                    .await;
+                None => {}
             }
-            None => {}
+        }
+    } // workspace read lock released here, before any write lock
+
+    // Phase 2: Apply mutations under the write lock — no disk I/O
+    // occurs here so the lock is held only briefly.
+    let file_ids = {
+        let mut analysis = context.analysis().write().await;
+
+        for uri in &deleted_lua_uris {
+            analysis.remove_file_by_uri(uri);
+        }
+
+        analysis.update_files_by_uri(watched_lua_files)
+    };
+
+    // Phase 3: Schedule diagnostics and config reloads (no locks needed)
+    if !lsp_features.supports_pull_diagnostic() {
+        for uri in deleted_lua_uris {
+            context
+                .file_diagnostic()
+                .clear_push_file_diagnostics(uri);
         }
     }
 
-    let file_ids = analysis.update_files_by_uri(watched_lua_files);
     context
         .file_diagnostic()
         .add_files_diagnostic_task(file_ids, interval, Some(context.debounced_analysis_arc()))
         .await;
+
+    // Handle editorconfig / emmyrc updates
+    {
+        let workspace = context.workspace_manager().read().await;
+        for path in editorconfig_paths {
+            workspace.update_editorconfig(path);
+        }
+        for dir in emmyrc_dirs {
+            workspace.add_update_emmyrc_task(dir).await;
+        }
+    }
 
     Some(())
 }
@@ -87,7 +125,12 @@ fn collect_lua_files(
 ) {
     match file_change_event {
         FileChangeType::CREATED | FileChangeType::CHANGED => {
-            let path = uri_to_file_path(&uri).unwrap();
+            let Some(path) = uri_to_file_path(&uri) else {
+                return;
+            };
+            // Only push the file if we can actually read it. A transient read
+            // failure (file locked by antivirus, editor mid-save, etc.) must NOT
+            // be treated as a deletion — just skip the update for this event.
             if let Some(text) = read_file_with_encoding(&path, encoding) {
                 watched_lua_files.push((uri, Some(text)));
             }

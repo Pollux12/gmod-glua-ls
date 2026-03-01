@@ -106,8 +106,17 @@ impl LuaGlobalIndex {
 
 impl LuaIndex for LuaGlobalIndex {
     fn remove(&mut self, file_id: FileId) {
-        self.global_decl.retain(|_, v| {
+        self.global_decl.retain(|global_id, v| {
+            let before_len = v.len();
             v.retain(|decl_id| decl_id.file_id != file_id);
+            // Log when a global is completely removed (last declaration gone)
+            if v.is_empty() && before_len > 0 {
+                log::info!(
+                    "global_index: global '{}' fully removed (file_id={:?})",
+                    global_id.get_name(),
+                    file_id,
+                );
+            }
             !v.is_empty()
         });
     }
