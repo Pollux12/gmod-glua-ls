@@ -78,6 +78,35 @@ mod tests {
     }
 
     #[gtest]
+    fn test_reports_duplicate_system_registration_across_files() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "sv_init.lua",
+            r#"
+            util.AddNetworkString("cross_file_dup")
+            "#,
+        );
+        let second_file = ws.def_file(
+            "sv_second.lua",
+            r#"
+            util.AddNetworkString("cross_file_dup")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(second_file, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::GmodDuplicateSystemRegistration
+                .get_name()
+                .to_string(),
+        ));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == code));
+    }
+
+    #[gtest]
     fn test_gmod_systems_checker_is_disabled_with_gmod_off() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

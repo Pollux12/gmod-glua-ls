@@ -1805,11 +1805,14 @@ fn resolve_networkvar_type(type_name: &str) -> LuaType {
 fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodScopedClassMatch> {
     let file_path = db.get_vfs().get_file_path(&file_id)?;
     let normalized_path = file_path.to_string_lossy().replace('\\', "/");
-    let lower_segments = normalized_path
-        .to_ascii_lowercase()
+    let lower_normalized_path = normalized_path.to_ascii_lowercase();
+    let lower_segments = lower_normalized_path
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let original_segments = normalized_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     if lower_segments.is_empty() {
         return None;
@@ -1854,17 +1857,19 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
 
     let (rule, best_end_idx, _) = best_match?;
     let class_idx = best_end_idx + 1;
-    if class_idx >= lower_segments.len() {
+    if class_idx >= lower_segments.len() || class_idx >= original_segments.len() {
         return None;
     }
 
-    let class_name = if class_idx == lower_segments.len() - 1 {
-        lower_segments[class_idx]
-            .strip_suffix(".lua")
-            .unwrap_or(lower_segments[class_idx].as_str())
-            .to_string()
+    let class_name = if class_idx == original_segments.len() - 1 {
+        let class_segment = original_segments[class_idx];
+        if lower_segments[class_idx].ends_with(".lua") && class_segment.len() >= 4 {
+            class_segment[..class_segment.len() - 4].to_string()
+        } else {
+            class_segment.to_string()
+        }
     } else {
-        lower_segments[class_idx].clone()
+        original_segments[class_idx].to_string()
     };
 
     if class_name.is_empty() {

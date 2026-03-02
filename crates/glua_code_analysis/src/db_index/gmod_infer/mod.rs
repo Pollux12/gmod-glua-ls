@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::OnceLock,
+};
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
@@ -110,6 +113,38 @@ pub struct GmodSystemFileMetadata {
     pub timer_calls: Vec<GmodTimerSiteMetadata>,
 }
 
+#[derive(Debug, Default)]
+pub struct GmodSystemAggregate {
+    known_net_messages: HashSet<String>,
+    net_registration_count: HashMap<String, usize>,
+    concommand_registration_count: HashMap<String, usize>,
+    convar_registration_count: HashMap<String, usize>,
+}
+
+impl GmodSystemAggregate {
+    pub fn is_known_net_message(&self, name: &str) -> bool {
+        self.known_net_messages.contains(name)
+    }
+
+    pub fn net_registration_count(&self, name: &str) -> usize {
+        self.net_registration_count.get(name).copied().unwrap_or(0)
+    }
+
+    pub fn concommand_registration_count(&self, name: &str) -> usize {
+        self.concommand_registration_count
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn convar_registration_count(&self, name: &str) -> usize {
+        self.convar_registration_count
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// A range within a file that has a narrowed realm (from `if CLIENT then` etc).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodRealmRange {
@@ -144,6 +179,7 @@ impl Default for GmodRealmFileMetadata {
 pub struct GmodInferIndex {
     hook_file_metadata: HashMap<FileId, GmodHookFileMetadata>,
     system_file_metadata: HashMap<FileId, GmodSystemFileMetadata>,
+    system_aggregate_cache: OnceLock<GmodSystemAggregate>,
     realm_file_metadata: HashMap<FileId, GmodRealmFileMetadata>,
 }
 
@@ -152,8 +188,49 @@ impl GmodInferIndex {
         Self {
             hook_file_metadata: HashMap::new(),
             system_file_metadata: HashMap::new(),
+            system_aggregate_cache: OnceLock::new(),
             realm_file_metadata: HashMap::new(),
         }
+    }
+
+    fn invalidate_system_aggregate_cache(&mut self) {
+        let _ = self.system_aggregate_cache.take();
+    }
+
+    fn build_system_aggregate(&self) -> GmodSystemAggregate {
+        let mut aggregate = GmodSystemAggregate::default();
+
+        for metadata in self.system_file_metadata.values() {
+            for site in &metadata.net_add_string_calls {
+                if let Some(name) = normalize_system_name(site.name.as_deref()) {
+                    aggregate.known_net_messages.insert(name.to_string());
+                    *aggregate
+                        .net_registration_count
+                        .entry(name.to_string())
+                        .or_insert(0) += 1;
+                }
+            }
+
+            for site in &metadata.concommand_add_calls {
+                if let Some(name) = normalize_system_name(site.command_name.as_deref()) {
+                    *aggregate
+                        .concommand_registration_count
+                        .entry(name.to_string())
+                        .or_insert(0) += 1;
+                }
+            }
+
+            for site in &metadata.convar_create_calls {
+                if let Some(name) = normalize_system_name(site.convar_name.as_deref()) {
+                    *aggregate
+                        .convar_registration_count
+                        .entry(name.to_string())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+
+        aggregate
     }
 
     pub fn add_hook_site(&mut self, file_id: FileId, site: GmodHookSiteMetadata) {
@@ -175,6 +252,7 @@ impl GmodInferIndex {
     }
 
     pub fn add_net_message_registration(&mut self, file_id: FileId, site: GmodNamedSiteMetadata) {
+        self.invalidate_system_aggregate_cache();
         self.system_file_metadata
             .entry(file_id)
             .or_default()
@@ -199,6 +277,7 @@ impl GmodInferIndex {
     }
 
     pub fn add_concommand_site(&mut self, file_id: FileId, site: GmodConcommandSiteMetadata) {
+        self.invalidate_system_aggregate_cache();
         self.system_file_metadata
             .entry(file_id)
             .or_default()
@@ -207,6 +286,7 @@ impl GmodInferIndex {
     }
 
     pub fn add_convar_site(&mut self, file_id: FileId, site: GmodConVarSiteMetadata) {
+        self.invalidate_system_aggregate_cache();
         self.system_file_metadata
             .entry(file_id)
             .or_default()
@@ -230,6 +310,11 @@ impl GmodInferIndex {
         &self,
     ) -> impl Iterator<Item = (&FileId, &GmodSystemFileMetadata)> {
         self.system_file_metadata.iter()
+    }
+
+    pub fn get_system_aggregate(&self) -> &GmodSystemAggregate {
+        self.system_aggregate_cache
+            .get_or_init(|| self.build_system_aggregate())
     }
 
     pub fn get_realm_file_metadata(&self, file_id: &FileId) -> Option<&GmodRealmFileMetadata> {
@@ -264,12 +349,24 @@ impl LuaIndex for GmodInferIndex {
     fn remove(&mut self, file_id: FileId) {
         self.hook_file_metadata.remove(&file_id);
         self.system_file_metadata.remove(&file_id);
+        self.invalidate_system_aggregate_cache();
         self.realm_file_metadata.remove(&file_id);
     }
 
     fn clear(&mut self) {
         self.hook_file_metadata.clear();
         self.system_file_metadata.clear();
+        self.invalidate_system_aggregate_cache();
         self.realm_file_metadata.clear();
+    }
+}
+
+fn normalize_system_name(name: Option<&str>) -> Option<&str> {
+    let name = name?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }

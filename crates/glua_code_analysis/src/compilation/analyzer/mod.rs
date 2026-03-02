@@ -34,6 +34,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
         context.workspace_id = Some(workspace_id);
         let profile_log = format!("analyze workspace {}", workspace_id);
         let _p = Profile::cond_new(&profile_log, context.tree_list.len() > 1);
+        let workspace_file_ids = context
+            .tree_list
+            .iter()
+            .map(|in_filed_tree| in_filed_tree.file_id)
+            .collect::<Vec<_>>();
 
         run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
         run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
@@ -44,7 +49,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
             run_analysis::<gmod::GmodAnalysisPipeline>(db, &mut context);
         }
 
-        synthesize_accessorfunc_members(db);
+        synthesize_accessorfunc_members(db, &workspace_file_ids);
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
 
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
@@ -54,10 +59,12 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
     }
 }
 
-fn synthesize_accessorfunc_members(db: &mut DbIndex) {
+fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
+    let workspace_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
     let all_calls = db
         .get_accessor_func_call_index()
         .iter()
+        .filter(|(file_id, _)| workspace_file_ids.contains(file_id))
         .map(|(file_id, calls)| (*file_id, calls.clone()))
         .collect::<Vec<_>>();
 

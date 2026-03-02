@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
     LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaVarExpr, PathTrait,
 };
-use rowan::{NodeOrToken, TextSize};
+use rowan::{NodeOrToken, TextRange, TextSize};
 
 use crate::{
     DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaMemberKey, LuaSemanticDeclId,
@@ -27,6 +29,8 @@ impl Checker for GmodRealmMisuseChecker {
         let Some(file_realm_metadata) = infer_index.get_realm_file_metadata(&file_id) else {
             return;
         };
+        let gm_method_realms = collect_annotated_gm_method_realms(semantic_model);
+        let mut decl_annotation_cache = HashMap::new();
 
         for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
             let call_realm = resolve_realm_at_offset(
@@ -36,7 +40,12 @@ impl Checker for GmodRealmMisuseChecker {
                 call_expr.get_range().start(),
             );
 
-            let mut callee_realms = resolve_callee_realms(semantic_model, &call_expr);
+            let mut callee_realms = resolve_callee_realms(
+                semantic_model,
+                &call_expr,
+                &gm_method_realms,
+                &mut decl_annotation_cache,
+            );
             if callee_realms.is_empty() {
                 continue;
             }
@@ -136,12 +145,27 @@ struct ResolvedRealm {
     evidence: RealmEvidence,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct AnnotatedRealmRange {
+    range: TextRange,
+    realm: GmodRealm,
+}
+
+type GmMethodRealmMap = HashMap<String, Vec<ResolvedRealm>>;
+type DeclAnnotationRealmCache = HashMap<FileId, Vec<AnnotatedRealmRange>>;
+
 fn resolve_callee_realms(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
+    gm_method_realms: &GmMethodRealmMap,
+    decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Vec<ResolvedRealm> {
-    if let Some(realms) = resolve_member_candidate_realms(semantic_model, call_expr)
-        && !realms.is_empty()
+    if let Some(realms) = resolve_member_candidate_realms(
+        semantic_model,
+        call_expr,
+        gm_method_realms,
+        decl_annotation_cache,
+    ) && !realms.is_empty()
     {
         return realms;
     }
@@ -159,18 +183,23 @@ fn resolve_callee_realms(
         return realms;
     };
 
-    for realm in resolve_global_name_candidate_realms(semantic_model, &prefix_expr, &semantic_decl)
-    {
+    for realm in resolve_global_name_candidate_realms(
+        semantic_model,
+        &prefix_expr,
+        &semantic_decl,
+        decl_annotation_cache,
+    ) {
         push_unique_realm(&mut realms, realm);
     }
 
-    if let Some(realm) = resolve_decl_realm(semantic_model, &semantic_decl) {
+    if let Some(realm) = resolve_decl_realm(semantic_model, &semantic_decl, decl_annotation_cache) {
         push_unique_realm(&mut realms, realm);
     }
 
     if let LuaSemanticDeclId::Member(member_id) = semantic_decl
         && let Some(origin_owner) = semantic_model.get_member_origin_owner(member_id)
-        && let Some(realm) = resolve_decl_realm(semantic_model, &origin_owner)
+        && let Some(realm) =
+            resolve_decl_realm(semantic_model, &origin_owner, decl_annotation_cache)
     {
         push_unique_realm(&mut realms, realm);
     }
@@ -182,6 +211,7 @@ fn resolve_global_name_candidate_realms(
     semantic_model: &SemanticModel,
     prefix_expr: &LuaExpr,
     semantic_decl: &LuaSemanticDeclId,
+    decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Vec<ResolvedRealm> {
     let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_decl else {
         return Vec::new();
@@ -209,7 +239,9 @@ fn resolve_global_name_candidate_realms(
             let Some(property_owner_id) = member_info.property_owner_id else {
                 continue;
             };
-            if let Some(realm) = resolve_decl_realm(semantic_model, &property_owner_id) {
+            if let Some(realm) =
+                resolve_decl_realm(semantic_model, &property_owner_id, decl_annotation_cache)
+            {
                 push_unique_realm(&mut realms, realm);
             }
         }
@@ -221,10 +253,12 @@ fn resolve_global_name_candidate_realms(
 fn resolve_member_candidate_realms(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
+    gm_method_realms: &GmMethodRealmMap,
+    decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Option<Vec<ResolvedRealm>> {
     let prefix_expr = call_expr.get_prefix_expr()?;
     let index_expr = LuaIndexExpr::cast(prefix_expr.syntax().clone())?;
-    let mut realms = resolve_annotated_gm_method_realms(semantic_model, &index_expr);
+    let mut realms = resolve_annotated_gm_method_realms(&index_expr, gm_method_realms);
 
     if let Some(index_key) = index_expr.get_index_key()
         && let Some(member_key) = semantic_model.get_member_key(&index_key)
@@ -237,7 +271,9 @@ fn resolve_member_candidate_realms(
             let Some(property_owner_id) = member_info.property_owner_id else {
                 continue;
             };
-            if let Some(realm) = resolve_decl_realm(semantic_model, &property_owner_id) {
+            if let Some(realm) =
+                resolve_decl_realm(semantic_model, &property_owner_id, decl_annotation_cache)
+            {
                 push_unique_realm(&mut realms, realm);
             }
         }
@@ -249,13 +285,17 @@ fn resolve_member_candidate_realms(
 fn resolve_decl_realm(
     semantic_model: &SemanticModel,
     semantic_decl: &LuaSemanticDeclId,
+    decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Option<ResolvedRealm> {
     let (decl_file_id, decl_offset) = semantic_decl_position(semantic_decl)?;
     let infer_index = semantic_model.get_db().get_gmod_infer_index();
     let metadata = infer_index.get_realm_file_metadata(&decl_file_id)?;
-    if let Some(annotation_realm) =
-        resolve_decl_annotation_realm_at_offset(semantic_model, &decl_file_id, decl_offset)
-    {
+    if let Some(annotation_realm) = resolve_decl_annotation_realm_at_offset(
+        semantic_model,
+        &decl_file_id,
+        decl_offset,
+        decl_annotation_cache,
+    ) {
         return Some(ResolvedRealm {
             realm: annotation_realm,
             evidence: RealmEvidence::ExplicitAnnotation,
@@ -274,32 +314,55 @@ fn resolve_decl_annotation_realm_at_offset(
     semantic_model: &SemanticModel,
     file_id: &FileId,
     offset: TextSize,
+    decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Option<GmodRealm> {
-    let tree = semantic_model.get_db().get_vfs().get_syntax_tree(file_id)?;
+    let file_entries = decl_annotation_cache
+        .entry(file_id.clone())
+        .or_insert_with(|| collect_decl_annotation_realms_for_file(semantic_model, file_id));
+
+    file_entries
+        .iter()
+        .find(|entry| entry.range.contains(offset))
+        .map(|entry| entry.realm)
+}
+
+fn collect_decl_annotation_realms_for_file(
+    semantic_model: &SemanticModel,
+    file_id: &FileId,
+) -> Vec<AnnotatedRealmRange> {
+    let Some(tree) = semantic_model.get_db().get_vfs().get_syntax_tree(file_id) else {
+        return Vec::new();
+    };
+
+    let mut realms = Vec::new();
     for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
-        if func_stat.get_range().contains(offset)
-            && let Some(comment) = func_stat.get_left_comment()
+        if let Some(comment) = func_stat.get_left_comment()
             && let Some(realm) = realm_from_doc_comment(&comment)
         {
-            return Some(realm);
+            realms.push(AnnotatedRealmRange {
+                range: func_stat.get_range(),
+                realm,
+            });
         }
     }
 
     for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
-        if local_func_stat.get_range().contains(offset)
-            && let Some(comment) = local_func_stat.get_left_comment()
+        if let Some(comment) = local_func_stat.get_left_comment()
             && let Some(realm) = realm_from_doc_comment(&comment)
         {
-            return Some(realm);
+            realms.push(AnnotatedRealmRange {
+                range: local_func_stat.get_range(),
+                realm,
+            });
         }
     }
 
-    None
+    realms
 }
 
 fn resolve_annotated_gm_method_realms(
-    semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
+    gm_method_realms: &GmMethodRealmMap,
 ) -> Vec<ResolvedRealm> {
     let Some(LuaExpr::NameExpr(prefix_name)) = index_expr.get_prefix_expr() else {
         return Vec::new();
@@ -313,11 +376,20 @@ fn resolve_annotated_gm_method_realms(
     let Some(LuaIndexKey::Name(target_method_name)) = index_expr.get_index_key() else {
         return Vec::new();
     };
+    let target_method_name = target_method_name.get_name_text().to_string();
+
+    gm_method_realms
+        .get(&target_method_name)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn collect_annotated_gm_method_realms(semantic_model: &SemanticModel) -> GmMethodRealmMap {
+    let mut gm_method_realms = HashMap::new();
 
     let db = semantic_model.get_db();
     let module_index = db.get_module_index();
     let current_workspace_id = module_index.get_workspace_id(semantic_model.get_file_id());
-    let mut realms = Vec::new();
     for file_id in db.get_vfs().get_all_local_file_ids() {
         if let Some(current_workspace_id) = current_workspace_id {
             let candidate_workspace_id = module_index
@@ -353,15 +425,14 @@ fn resolve_annotated_gm_method_realms(
             else {
                 continue;
             };
-            if function_method_name.get_name_text() != target_method_name.get_name_text() {
-                continue;
-            }
 
             if let Some(comment) = func_stat.get_left_comment()
                 && let Some(realm) = realm_from_doc_comment(&comment)
             {
+                let method_name = function_method_name.get_name_text().to_string();
+                let entry = gm_method_realms.entry(method_name).or_insert_with(Vec::new);
                 push_unique_realm(
-                    &mut realms,
+                    entry,
                     ResolvedRealm {
                         realm,
                         evidence: RealmEvidence::ExplicitAnnotation,
@@ -371,7 +442,7 @@ fn resolve_annotated_gm_method_realms(
         }
     }
 
-    realms
+    gm_method_realms
 }
 
 fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {

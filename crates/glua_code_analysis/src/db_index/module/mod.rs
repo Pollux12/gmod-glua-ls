@@ -89,7 +89,7 @@ impl LuaModuleIndex {
                 Ok(re) => re,
                 Err(e) => {
                     error!("Invalid module replace pattern: {}, error: {}", key, e);
-                    return;
+                    continue;
                 }
             };
 
