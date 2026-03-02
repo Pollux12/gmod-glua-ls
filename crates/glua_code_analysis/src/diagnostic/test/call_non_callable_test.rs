@@ -195,4 +195,22 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_no_call_non_callable_for_generic_function_param_in_a_lua() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::CallNonCallable,
+            r#"
+            --- @generic F: function
+            --- @param fn F
+            --- @return F
+            function once(fn)
+              return function(...)
+                return fn(...)
+              end
+            end
+            "#,
+        ));
+    }
 }

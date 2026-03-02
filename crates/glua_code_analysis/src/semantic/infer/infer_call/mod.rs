@@ -15,7 +15,7 @@ use crate::{
 use crate::{
     InferGuardRef,
     semantic::{
-        generic::{TypeSubstitutor, instantiate_doc_function},
+        generic::{TypeSubstitutor, get_tpl_ref_extend_type, instantiate_doc_function},
         infer::narrow::get_type_at_call_expr_inline_cast,
     },
 };
@@ -81,6 +81,14 @@ pub fn infer_call_expr_func(
         ),
         LuaType::Instance(inst) => infer_instance_type_doc_function(db, inst),
         LuaType::TableConst(meta_table) => infer_table_type_doc_function(db, meta_table.clone()),
+        LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_) => infer_tpl_ref_call(
+            db,
+            cache,
+            call_expr.clone(),
+            &call_expr_type,
+            infer_guard,
+            args_count,
+        ),
         LuaType::Union(union) => {
             // 此时我们将其视为泛型实例化联合体
             if union
@@ -141,6 +149,23 @@ pub fn infer_call_expr_func(
     }
 
     result
+}
+
+fn infer_tpl_ref_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: LuaCallExpr,
+    call_expr_type: &LuaType,
+    infer_guard: &InferGuardRef,
+    args_count: Option<usize>,
+) -> InferCallFuncResult {
+    let prefix_expr = call_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
+    let extend_type = get_tpl_ref_extend_type(db, cache, call_expr_type, prefix_expr, 0)
+        .ok_or(InferFailReason::None)?;
+    if &extend_type == call_expr_type {
+        return Err(InferFailReason::None);
+    }
+    infer_call_expr_func(db, cache, call_expr, extend_type, infer_guard, args_count)
 }
 
 fn infer_doc_function(
