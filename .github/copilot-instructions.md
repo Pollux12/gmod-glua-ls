@@ -42,7 +42,7 @@
   - hook API parsing: `hook.Add`, `hook.Run`, `hook.Call`
   - annotation hooks: `---@hook`
   - realm inference from filename + dependency/call signals
-- Do not introduce generic-Lua fallback behavior that weakens GMod inference unless explicitly requested.
+- Do not introduce generic-Lua fallback behavior that weakens GMod inference unless explicitly requested. Backwards compatibility with regular Lua is not required.
 - If changing GMod hook/realm logic, keep tests aligned:
   - `crates/glua_code_analysis/src/compilation/test/gmod_realm_hook_test.rs`
   - `crates/glua_code_analysis/src/compilation/test/gmod_scripted_class_test.rs`
@@ -73,7 +73,7 @@
 
 ## Code Style and Conventions
 - Rust edition is `2024`; `rustfmt.toml` uses `max_width = 100`, 4 spaces.
-- Follow workspace lint policy in `Cargo.toml` + thresholds in `.clippy.toml`.
+- Follow workspace lint policy in `Cargo.toml` + thresholds in `.clippy.toml` - prehook used to enforce style
 - Match crate structure style:
   - private `mod` declarations
   - deliberate `pub use` re-exports from crate roots
@@ -91,7 +91,7 @@
 - Schema-to-annotation path: `schema_to_glua` consumed by analysis crate.
 - External formatter options are documented in `docs/config.md` (`format` section).
 
-## Security and High-Risk Areas
+## High-Risk Areas
 - `glua_code_analysis` denies panic/unwrap patterns in non-test builds (`clippy::panic`, `clippy::unwrap_used`, etc.).
 - `EmmyLuaAnalysis` has manual thread-safety boundaries (`unsafe impl Send/Sync`) in `crates/glua_code_analysis/src/lib.rs`; treat related changes as high risk.
 - `update_schema` fetches remote schema URLs via `reqwest`; treat network/file schema sources as untrusted input.
@@ -109,4 +109,5 @@
 - For GMod realm/path-sensitive tests, use realistic addon or gamemode style paths.
 
 **IMPORTANT**
-When using your file read tool, read entire files unless the file is extremely large - in this case, read in 1000 line chunks. Do not read files in tiny chunks, this will be slower and make you lose important context.
+- When using your file read tool, read entire files unless the file is extremely large - in this case, read in 1000 line chunks. Do not read files in tiny chunks, this will be slower and make you lose important context.
+- Do not use your terminal tool unless no other tool can accomplish the task. Never use terminal tools for reading, writing or searching code - use the relevant tool instead. If you get no results when you are expecting something, it may be due to ignored files being excluded - you can toggle this behaviour off and try again.

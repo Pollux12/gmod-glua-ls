@@ -156,6 +156,7 @@ jobs:
         with:
           name: gmod-glua-ls ${{ github.ref_name }}
           draft: false
+          prerelease: true
           generate_release_notes: true
           files: |
             glua_ls-win32-x64/glua_ls-win32-x64.zip
