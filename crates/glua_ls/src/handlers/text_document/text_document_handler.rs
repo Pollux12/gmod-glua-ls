@@ -1,4 +1,4 @@
-use glua_code_analysis::{DiagnosticCode, Emmyrc, uri_to_file_path};
+use glua_code_analysis::{DiagnosticCode, Emmyrc, fetch_schema_urls, uri_to_file_path};
 use glua_parser::{LineIndex, LuaParseError, LuaParseErrorKind, LuaParser, LuaSyntaxTree};
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -14,6 +14,26 @@ struct PreparsedDocument {
     tree: LuaSyntaxTree,
     line_index: LineIndex,
     syntax_diagnostics: Vec<Diagnostic>,
+}
+
+async fn check_schema_update(context: &ServerContextSnapshot) {
+    let urls = {
+        let read_analysis = context.analysis().read().await;
+        if !read_analysis.check_schema_update() {
+            return;
+        }
+
+        read_analysis.get_schemas_to_fetch()
+    };
+
+    if urls.is_empty() {
+        return;
+    }
+
+    let url_contents = fetch_schema_urls(urls).await;
+
+    let mut write_analysis = context.analysis().write().await;
+    write_analysis.apply_fetched_schemas(url_contents);
 }
 
 async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<PreparsedDocument> {
@@ -196,9 +216,13 @@ pub async fn on_did_save_text_document(
                 .file_diagnostic()
                 .cancel_workspace_diagnostic()
                 .await;
-            let workspace_manager = context.workspace_manager().write().await;
-            workspace_manager.update_workspace_version(WorkspaceDiagnosticLevel::Slow, true);
-            workspace_manager.check_schema_update().await;
+
+            {
+                let workspace_manager = context.workspace_manager().write().await;
+                workspace_manager.update_workspace_version(WorkspaceDiagnosticLevel::Slow, true);
+            }
+
+            check_schema_update(&context).await;
         }
 
         return Some(());
@@ -209,11 +233,14 @@ pub async fn on_did_save_text_document(
     if duration < 1000 {
         duration = 1000;
     }
-    let workspace = context.workspace_manager().read().await;
-    workspace
-        .reindex_workspace(Duration::from_millis(duration))
-        .await;
-    workspace.check_schema_update().await;
+    {
+        let workspace = context.workspace_manager().read().await;
+        workspace
+            .reindex_workspace(Duration::from_millis(duration))
+            .await;
+    }
+
+    check_schema_update(&context).await;
     Some(())
 }
 

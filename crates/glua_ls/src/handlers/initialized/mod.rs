@@ -24,7 +24,7 @@ pub use client_config::{ClientConfig, get_client_config};
 use codestyle::load_editorconfig;
 use glua_code_analysis::{
     EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, calculate_include_and_exclude,
-    collect_workspace_files, uri_to_file_path,
+    collect_workspace_files, fetch_schema_urls, uri_to_file_path,
 };
 use lsp_types::InitializeParams;
 use tokio::sync::RwLock;
@@ -133,11 +133,6 @@ pub async fn init_analysis(
     workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
     workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
 ) {
-    let mut mut_analysis = analysis.write().await;
-
-    // update config
-    mut_analysis.update_config(emmyrc.clone());
-
     if let Ok(emmyrc_json) = serde_json::to_string_pretty(emmyrc.as_ref()) {
         log::info!("current config : {}", emmyrc_json);
     }
@@ -175,6 +170,42 @@ pub async fn init_analysis(
         }
     }
 
+    status_bar.update_progress_task(
+        ProgressTask::LoadWorkspace,
+        None,
+        Some(String::from("Collecting files")),
+    );
+
+    // load files with per-workspace configs
+    let mut files = Vec::new();
+    let mut loaded_paths = HashSet::new();
+    for (workspace_config, workspace_group) in &workspace_collection_groups {
+        for file in collect_workspace_files(workspace_group, workspace_config.as_ref(), None, None)
+        {
+            let normalized_path = PathBuf::from(&file.path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&file.path));
+            if loaded_paths.insert(normalized_path) {
+                files.push(file.into_tuple());
+            }
+        }
+    }
+
+    let file_count = files.len();
+    if file_count != 0 {
+        status_bar.update_progress_task(
+            ProgressTask::LoadWorkspace,
+            None,
+            Some(format!("Indexing {} files", file_count)),
+        );
+    }
+
+    // Hold the write lock only for analysis state mutations.
+    let mut mut_analysis = analysis.write().await;
+
+    // update config
+    mut_analysis.update_config(emmyrc.clone());
+
     let mut added_main_roots = HashSet::new();
     let mut added_library_roots = HashSet::new();
     for (_, workspace_group) in &workspace_collection_groups {
@@ -209,37 +240,17 @@ pub async fn init_analysis(
         }
     }
 
-    status_bar.update_progress_task(
-        ProgressTask::LoadWorkspace,
-        None,
-        Some(String::from("Collecting files")),
-    );
-
-    // load files with per-workspace configs
-    let mut files = Vec::new();
-    let mut loaded_paths = HashSet::new();
-    for (workspace_config, workspace_group) in &workspace_collection_groups {
-        for file in collect_workspace_files(workspace_group, workspace_config.as_ref(), None, None)
-        {
-            let normalized_path = PathBuf::from(&file.path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&file.path));
-            if loaded_paths.insert(normalized_path) {
-                files.push(file.into_tuple());
-            }
-        }
-    }
-
-    let file_count = files.len();
     if file_count != 0 {
-        status_bar.update_progress_task(
-            ProgressTask::LoadWorkspace,
-            None,
-            Some(format!("Indexing {} files", file_count)),
-        );
-
         mut_analysis.update_files_by_path(files);
     }
+
+    let schema_urls = if mut_analysis.check_schema_update() {
+        mut_analysis.get_schemas_to_fetch()
+    } else {
+        Vec::new()
+    };
+
+    drop(mut_analysis);
 
     status_bar.update_progress_task(
         ProgressTask::LoadWorkspace,
@@ -251,11 +262,11 @@ pub async fn init_analysis(
         Some("Indexing complete".to_string()),
     );
 
-    if mut_analysis.check_schema_update() {
-        mut_analysis.update_schema().await;
+    if !schema_urls.is_empty() {
+        let url_contents = fetch_schema_urls(schema_urls).await;
+        let mut mut_analysis = analysis.write().await;
+        mut_analysis.apply_fetched_schemas(url_contents);
     }
-
-    drop(mut_analysis);
 
     if !lsp_features.supports_workspace_diagnostic() {
         file_diagnostic

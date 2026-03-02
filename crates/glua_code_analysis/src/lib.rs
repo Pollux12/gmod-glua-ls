@@ -39,6 +39,7 @@ use std::str::FromStr;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 pub use test_lib::VirtualWorkspace;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 pub use vfs::*;
 
 #[macro_use]
@@ -48,6 +49,37 @@ rust_i18n::i18n!("./locales", fallback = "en");
 
 pub fn set_locale(locale: &str) {
     rust_i18n::set_locale(locale);
+}
+
+pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
+    let mut url_contents = HashMap::new();
+    for url in urls {
+        if url.scheme() == "file" {
+            if let Ok(path) = url.to_file_path()
+                && path.exists()
+            {
+                let result = read_file_with_encoding(&path, "utf-8");
+                if let Some(content) = result {
+                    url_contents.insert(url, content);
+                } else {
+                    log::error!("Failed to read schema file: {:?}", path);
+                }
+            }
+        } else {
+            let result = reqwest::get(url.as_str()).await;
+            if let Ok(response) = result {
+                if let Ok(content) = response.text().await {
+                    url_contents.insert(url, content);
+                } else {
+                    log::error!("Failed to read schema content from URL: {:?}", url);
+                }
+            } else {
+                log::error!("Failed to fetch schema from URL: {:?}", url);
+            }
+        }
+    }
+
+    url_contents
 }
 
 /// Normalize a workspace root path so it uses the same drive-letter
@@ -522,39 +554,14 @@ impl EmmyLuaAnalysis {
             .has_need_resolve_schemas()
     }
 
-    pub async fn update_schema(&mut self) {
-        let urls = self
-            .compilation
+    pub fn get_schemas_to_fetch(&self) -> Vec<Url> {
+        self.compilation
             .get_db()
             .get_json_schema_index()
-            .get_need_resolve_schemas();
-        let mut url_contents = HashMap::new();
-        for url in urls {
-            if url.scheme() == "file" {
-                if let Ok(path) = url.to_file_path() {
-                    if path.exists() {
-                        let result = read_file_with_encoding(&path, "utf-8");
-                        if let Some(content) = result {
-                            url_contents.insert(url.clone(), content);
-                        } else {
-                            log::error!("Failed to read schema file: {:?}", url);
-                        }
-                    }
-                }
-            } else {
-                let result = reqwest::get(url.as_str()).await;
-                if let Ok(response) = result {
-                    if let Ok(content) = response.text().await {
-                        url_contents.insert(url.clone(), content);
-                    } else {
-                        log::error!("Failed to read schema content from URL: {:?}", url);
-                    }
-                } else {
-                    log::error!("Failed to fetch schema from URL: {:?}", url);
-                }
-            }
-        }
+            .get_need_resolve_schemas()
+    }
 
+    pub fn apply_fetched_schemas(&mut self, url_contents: HashMap<Url, String>) {
         if url_contents.is_empty() {
             return;
         }
@@ -596,6 +603,12 @@ impl EmmyLuaAnalysis {
             .get_json_schema_index_mut()
             .reset_rest_schemas();
     }
+
+    pub async fn update_schema(&mut self) {
+        let urls = self.get_schemas_to_fetch();
+        let url_contents = fetch_schema_urls(urls).await;
+        self.apply_fetched_schemas(url_contents);
+    }
 }
 
 impl Default for EmmyLuaAnalysis {
@@ -603,9 +616,6 @@ impl Default for EmmyLuaAnalysis {
         Self::new()
     }
 }
-
-unsafe impl Send for EmmyLuaAnalysis {}
-unsafe impl Sync for EmmyLuaAnalysis {}
 
 #[cfg(test)]
 mod tests {
