@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    rc::Rc,
 };
 
 use glua_code_analysis::{
@@ -144,7 +144,7 @@ fn search_decl_references_with_ctx<'a>(
     ctx: &mut ReferenceSearchContext,
     semantic_model: &SemanticModel<'a>,
     compilation: &'a LuaCompilation,
-    semantic_cache: &mut HashMap<FileId, Arc<SemanticModel<'a>>>,
+    semantic_cache: &mut HashMap<FileId, Rc<SemanticModel<'a>>>,
     decl_id: LuaDeclId,
     result: &mut Vec<Location>,
     worklist: &mut Vec<LuaSemanticDeclId>,
@@ -229,7 +229,7 @@ fn search_member_references_with_ctx<'a>(
     ctx: &mut ReferenceSearchContext,
     semantic_model: &SemanticModel<'a>,
     compilation: &'a LuaCompilation,
-    semantic_cache: &mut HashMap<FileId, Arc<SemanticModel<'a>>>,
+    semantic_cache: &mut HashMap<FileId, Rc<SemanticModel<'a>>>,
     member_id: LuaMemberId,
     result: &mut Vec<Location>,
     worklist: &mut Vec<LuaSemanticDeclId>,
@@ -611,7 +611,7 @@ fn extend_module_return_value_references<'a>(
     ctx: &mut ReferenceSearchContext,
     semantic_model: &SemanticModel<'a>,
     compilation: &'a LuaCompilation,
-    semantic_cache: &mut HashMap<FileId, Arc<SemanticModel<'a>>>,
+    semantic_cache: &mut HashMap<FileId, Rc<SemanticModel<'a>>>,
     decl_id: LuaDeclId,
     result: &mut Vec<Location>,
     worklist: &mut Vec<LuaSemanticDeclId>,
@@ -800,22 +800,22 @@ fn enqueue_semantic_id(
 
 fn get_semantic_model_cached<'a>(
     compilation: &'a LuaCompilation,
-    semantic_cache: &mut HashMap<FileId, Arc<SemanticModel<'a>>>,
+    semantic_cache: &mut HashMap<FileId, Rc<SemanticModel<'a>>>,
     file_id: FileId,
-) -> Option<Arc<SemanticModel<'a>>> {
+) -> Option<Rc<SemanticModel<'a>>> {
     if let Some(cached) = semantic_cache.get(&file_id) {
-        return Some(Arc::clone(cached));
+        return Some(Rc::clone(cached));
     }
 
-    let semantic_model = Arc::new(compilation.get_semantic_model(file_id)?);
-    semantic_cache.insert(file_id, Arc::clone(&semantic_model));
+    let semantic_model = Rc::new(compilation.get_semantic_model(file_id)?);
+    semantic_cache.insert(file_id, Rc::clone(&semantic_model));
     Some(semantic_model)
 }
 
 fn search_semantic_references_with_ctx<'a>(
     ctx: &mut ReferenceSearchContext,
     compilation: &'a LuaCompilation,
-    semantic_cache: &mut HashMap<FileId, Arc<SemanticModel<'a>>>,
+    semantic_cache: &mut HashMap<FileId, Rc<SemanticModel<'a>>>,
     start: LuaSemanticDeclId,
     result: &mut Vec<Location>,
 ) -> Option<()> {
