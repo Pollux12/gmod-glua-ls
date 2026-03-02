@@ -12,17 +12,32 @@ pub fn load_lua_config(content: &str) -> Result<Value, String> {
     safe_option.max_memory_limit = 100 * 1024 * 1024; // 100 MB
     let mut lua = LuaVM::new(safe_option);
 
+    // SECURITY: never open `Stdlib::Os` for workspace-provided config files.
+    // It exposes APIs such as `os.execute`/`os.remove`/`os.rename`, which would
+    // allow arbitrary shell and filesystem operations when `.emmyrc.lua` loads.
+    //
+    // NOTE: `luars` currently does not provide a restricted/sandboxed `Basic`
+    // subset. We keep `Basic` to preserve existing `.emmyrc.lua` compatibility.
     let _ = lua.open_stdlibs(&[
         luars::Stdlib::Package,
         luars::Stdlib::Basic,
         luars::Stdlib::Table,
         luars::Stdlib::String,
         luars::Stdlib::Math,
-        luars::Stdlib::Os,
         luars::Stdlib::Utf8,
     ]);
 
     let _ = lua.set_global("print", LuaValue::cfunction(ls_println));
+
+    // SECURITY: `.emmyrc.lua` is expected to return a config table, not load or
+    // execute arbitrary external code. Remove dynamic code-loading and module-
+    // loading globals exposed by Basic/Package to reduce sandbox escape surface.
+    let _ = lua.set_global("load", LuaValue::nil());
+    let _ = lua.set_global("loadfile", LuaValue::nil());
+    let _ = lua.set_global("dofile", LuaValue::nil());
+    let _ = lua.set_global("loadstring", LuaValue::nil());
+    let _ = lua.set_global("require", LuaValue::nil());
+    let _ = lua.set_global("package", LuaValue::nil());
 
     let values = match lua.execute(content) {
         Ok(v) => v,

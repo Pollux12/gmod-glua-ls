@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::{collections::HashSet, path::PathBuf, process::Command};
+use std::{collections::HashSet, path::PathBuf, process::Command, sync::OnceLock};
 
 use crate::config::configs::{EmmyLibraryConfig, EmmyLibraryItem};
 
@@ -12,7 +12,7 @@ pub struct PreProcessContext {
 
 impl PreProcessContext {
     pub fn new(workspace: PathBuf) -> Self {
-        let luarocks_deploy_dir = get_luarocks_deploy_dir();
+        let luarocks_deploy_dir = get_luarocks_deploy_dir().to_string();
 
         Self {
             workspace,
@@ -161,17 +161,28 @@ impl PreProcessContext {
     }
 }
 
-fn get_luarocks_deploy_dir() -> String {
-    Command::new("luarocks")
-        .args(["config", "deploy_lua_dir"])
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
+fn get_luarocks_deploy_dir() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Command::new("luarocks")
+            .args(["config", "deploy_lua_dir"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if !output.status.success() {
+                    return None;
+                }
+
+                if output.stdout.len() > 4096 {
+                    log::warn!(
+                        "luarocks output too large ({}B), ignoring",
+                        output.stdout.len()
+                    );
+                    return Some(String::new());
+                }
+
                 Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    })
 }

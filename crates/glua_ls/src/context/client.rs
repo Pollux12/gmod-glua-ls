@@ -33,9 +33,17 @@ impl ClientProxy {
     }
 
     pub fn send_notification(&self, method: &str, params: impl serde::Serialize) {
+        let params = match serde_json::to_value(params) {
+            Ok(value) => value,
+            Err(e) => {
+                log::error!("Failed to serialize notification params: {}", e);
+                return;
+            }
+        };
+
         let _ = self.conn.sender.send(Message::Notification(Notification {
             method: method.to_string(),
-            params: serde_json::to_value(params).unwrap(),
+            params,
         }));
     }
 
@@ -51,10 +59,24 @@ impl ClientProxy {
             .lock()
             .await
             .insert(id.clone(), sender);
+
+        let params = match serde_json::to_value(params) {
+            Ok(value) => value,
+            Err(e) => {
+                log::error!(
+                    "Failed to serialize request params for method {}: {}",
+                    method,
+                    e
+                );
+                self.response_manager.lock().await.remove(&id);
+                return None;
+            }
+        };
+
         let _ = self.conn.sender.send(Message::Request(lsp_server::Request {
             id: id.clone(),
             method: method.to_string(),
-            params: serde_json::to_value(params).unwrap(),
+            params,
         }));
         let response = select! {
             response = receiver => response.ok(),
@@ -65,10 +87,22 @@ impl ClientProxy {
     }
 
     fn send_request_no_wait(&self, id: RequestId, method: &str, params: impl serde::Serialize) {
+        let params = match serde_json::to_value(params) {
+            Ok(value) => value,
+            Err(e) => {
+                log::error!(
+                    "Failed to serialize request params for method {}: {}",
+                    method,
+                    e
+                );
+                return;
+            }
+        };
+
         let _ = self.conn.sender.send(Message::Request(lsp_server::Request {
             id,
             method: method.to_string(),
-            params: serde_json::to_value(params).unwrap(),
+            params,
         }));
     }
 

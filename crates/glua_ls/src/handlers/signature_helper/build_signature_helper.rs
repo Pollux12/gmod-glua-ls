@@ -519,16 +519,15 @@ pub fn build_function_label(
     }
     label.push_str(&builder.function_name);
     label.push('(');
-    label.push_str(
-        &param_infos
-            .iter()
-            .map(|info| match &info.label {
-                ParameterLabel::Simple(label) => label.clone(),
-                ParameterLabel::LabelOffsets(_) => todo!(),
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
+    let rendered_params = param_infos
+        .iter()
+        .filter_map(|info| match &info.label {
+            ParameterLabel::Simple(label) => Some(label.clone()),
+            // Label offsets refer to spans in an existing signature string; skip if unavailable.
+            ParameterLabel::LabelOffsets(_) => None,
+        })
+        .collect::<Vec<_>>();
+    label.push_str(&rendered_params.join(", "));
     label.push(')');
     match return_type {
         LuaType::Nil => {}

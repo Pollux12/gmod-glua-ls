@@ -50,6 +50,8 @@ impl DebouncedAnalysis {
     /// Wait until the given file is no longer pending reindex.
     pub async fn wait_for_reindex(&self, file_id: FileId, cancel_token: CancellationToken) {
         loop {
+            // Subscribe before checking state to avoid missing a notify between check and await.
+            let notified = self.reindex_notify.notified();
             let is_pending = {
                 let pending = self.pending_files.lock().await;
                 let reindexing = self.reindexing_files.lock().await;
@@ -59,7 +61,7 @@ impl DebouncedAnalysis {
                 return;
             }
             tokio::select! {
-                _ = self.reindex_notify.notified() => {}
+                _ = notified => {}
                 _ = cancel_token.cancelled() => return,
             }
         }
@@ -68,6 +70,8 @@ impl DebouncedAnalysis {
     /// Wait until all pending reindexes are finished.
     pub async fn wait_for_all_reindex(&self, cancel_token: CancellationToken) {
         loop {
+            // Subscribe before checking state to avoid missing a notify between check and await.
+            let notified = self.reindex_notify.notified();
             let is_pending = {
                 let pending = self.pending_files.lock().await;
                 let reindexing = self.reindexing_files.lock().await;
@@ -77,7 +81,7 @@ impl DebouncedAnalysis {
                 return;
             }
             tokio::select! {
-                _ = self.reindex_notify.notified() => {}
+                _ = notified => {}
                 _ = cancel_token.cancelled() => return,
             }
         }

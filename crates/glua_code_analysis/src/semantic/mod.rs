@@ -10,9 +10,8 @@ mod semantic_info;
 mod type_check;
 mod visibility;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
@@ -62,16 +61,33 @@ pub use generic::get_keyof_members;
 pub use infer::{DocTypeInferContext, infer_doc_type};
 
 #[derive(Debug)]
+pub struct LuaInferCacheCell {
+    inner: Mutex<LuaInferCache>,
+}
+
+impl LuaInferCacheCell {
+    fn new(cache: LuaInferCache) -> Self {
+        Self {
+            inner: Mutex::new(cache),
+        }
+    }
+
+    pub fn borrow_mut(&self) -> MutexGuard<'_, LuaInferCache> {
+        // Keep analysis available even if a previous holder panicked while mutating the cache.
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Debug)]
 pub struct SemanticModel<'a> {
     file_id: FileId,
     db: &'a DbIndex,
-    infer_cache: RefCell<LuaInferCache>,
+    infer_cache: LuaInferCacheCell,
     emmyrc: Arc<Emmyrc>,
     root: LuaChunk,
 }
-
-unsafe impl<'a> Send for SemanticModel<'a> {}
-unsafe impl<'a> Sync for SemanticModel<'a> {}
 
 impl<'a> SemanticModel<'a> {
     pub fn new(
@@ -84,7 +100,7 @@ impl<'a> SemanticModel<'a> {
         Self {
             file_id,
             db,
-            infer_cache: RefCell::new(infer_config),
+            infer_cache: LuaInferCacheCell::new(infer_config),
             emmyrc,
             root,
         }
@@ -317,7 +333,7 @@ impl<'a> SemanticModel<'a> {
         self.file_id
     }
 
-    pub fn get_cache(&self) -> &RefCell<LuaInferCache> {
+    pub fn get_cache(&self) -> &LuaInferCacheCell {
         &self.infer_cache
     }
 
