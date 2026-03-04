@@ -1,6 +1,6 @@
-# EmmyLua Diagnostic Macro
+# GLua Diagnostic Macro
 
-A macro for enhanced diagnostics in EmmyLua projects.
+A macro for enhanced diagnostics in GLua projects.
 
 ## Installation
 

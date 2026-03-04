@@ -77,6 +77,7 @@ fn parse_tag_detail(p: &mut LuaDocParser) -> DocParseResult {
         LuaTokenKind::TkTagUsing => parse_tag_using(p),
         LuaTokenKind::TkTagMeta => parse_tag_meta(p),
         LuaTokenKind::TkTagRealm => parse_tag_realm(p),
+        LuaTokenKind::TkTagFileparam => parse_tag_fileparam(p),
         LuaTokenKind::TkTagExport => parse_tag_export(p),
         LuaTokenKind::TkLanguage => parse_tag_language(p),
         LuaTokenKind::TkTagAttribute => parse_tag_attribute(p),
@@ -708,6 +709,18 @@ fn parse_tag_realm(p: &mut LuaDocParser) -> DocParseResult {
     let m = p.mark(LuaSyntaxKind::DocTagRealm);
     p.bump();
     if_token_bump(p, LuaTokenKind::TkName);
+    Ok(m.complete(p))
+}
+
+// ---@fileparam <arg> <type>
+fn parse_tag_fileparam(p: &mut LuaDocParser) -> DocParseResult {
+    p.set_lexer_state(LuaDocLexerState::Normal);
+    let m = p.mark(LuaSyntaxKind::DocTagFileparam);
+    p.bump();
+    expect_token(p, LuaTokenKind::TkName)?; // param name
+    parse_type(p)?; // type
+    p.set_lexer_state(LuaDocLexerState::Description);
+    parse_description(p);
     Ok(m.complete(p))
 }
 

@@ -1795,7 +1795,7 @@ _2 = a[1]
         emmyrc.gmod.enabled = true;
         emmyrc
             .gmod
-            .param_type_hints
+            .file_param_defaults
             .insert("veh".to_string(), "HintVehicle".to_string());
         ws.update_emmyrc(emmyrc);
 
@@ -1827,7 +1827,7 @@ _2 = a[1]
         emmyrc.gmod.enabled = true;
         emmyrc
             .gmod
-            .param_type_hints
+            .file_param_defaults
             .insert("vehicle".to_string(), "Entity".to_string());
         ws.update_emmyrc(emmyrc);
 
@@ -1837,7 +1837,7 @@ _2 = a[1]
             ---@class base_glide: Entity
             ---@field GetFreeSeat fun(self: base_glide): Entity
 
-            ---@paramhint vehicle base_glide
+            ---@fileparam vehicle base_glide
             local function enter(vehicle)
                 local seat = vehicle:GetFreeSeat()
                 A = vehicle
@@ -1851,6 +1851,58 @@ _2 = a[1]
         assert_eq!(ws.humanize_type(a), "base_glide");
         let b = ws.expr_ty("B");
         assert_eq!(ws.humanize_type(b), "Entity");
+    }
+
+    #[test]
+    fn test_fileparam_annotation_works() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Vehicle
+            ---@field GetClass fun(self: Vehicle): string
+
+            ---@fileparam vehicle Vehicle
+            local function check(vehicle)
+                local class = vehicle:GetClass()
+                A = vehicle
+                B = class
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "Vehicle");
+        let b = ws.expr_ty("B");
+        assert_eq!(ws.humanize_type(b), "string");
+    }
+
+    #[test]
+    fn test_explicit_param_overrides_fileparam() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class BaseClass
+            ---@class OverrideClass: BaseClass
+
+            ---@fileparam v BaseClass
+
+            ---@param v OverrideClass
+            local function check(v)
+                A = v
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "OverrideClass");
     }
 
     #[test]

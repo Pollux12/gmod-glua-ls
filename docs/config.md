@@ -203,7 +203,7 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `detectRealmFromCalls` | `boolean \| null` | `true` | Detect realm from API usage |
 | `inferDynamicFields` | `boolean` | `true` | Track dynamic fields on GMod objects |
 | `dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files (`false` keeps completion results file-scoped) |
-| `paramTypeHints` | `object` | built-in map | Parameter-name to type-name hints for unannotated params (for example `{ "ply": "Player" }`) |
+| `fileParamDefaults` | `object` | built-in map | Parameter-name to type-name hints for unannotated params (for example `{ "ply": "Player" }`) |
 | `scriptedClassScopes.include` | `string[]` | `["entities/**", "weapons/**", "effects/**", "weapons/gmod_tool/stools/**"]` | Glob patterns for scripted class extraction |
 | `scriptedClassScopes.exclude` | `string[]` | `[]` | Patterns to exclude from scripted class extraction |
 | `hookMappings.methodToHook` | `object` | `{}` | Map methods to hook names |
@@ -211,19 +211,6 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `hookMappings.methodPrefixes` | `string[]` | `[]` | Additional prefixes for hook auto-detection |
 | `vgui.codeLensEnabled` | `boolean` | `true` | Enable Code Lenses for VGUI panel definitions |
 | `vgui.inlayHintEnabled` | `boolean` | `false` | Enable Inlay Hints for VGUI panel definitions |
-
-File-level parameter hints can be added with `---@paramhint <paramName> <typeName>` comments in Lua files. These act as defaults for unannotated parameters in that file only.
-
-```lua
----@paramhint vehicle base_glide
----@paramhint ply Player
-```
-
-Hint precedence for parameters is:
-
-1. Explicit signature/doc annotations (`---@param`)
-2. File-level `---@paramhint`
-3. `gmod.paramTypeHints` config map
 
 ### gmod.network
 
@@ -538,7 +525,7 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/Pollux-Dev/gmod-glua-ls/main/crates/glua_code_analysis/resources/schema.json",
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/crates/glua_code_analysis/resources/schema.json",
   "gmod": {
     "enabled": true,
     "defaultRealm": "shared",
@@ -546,7 +533,7 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
     "detectRealmFromCalls": true,
     "inferDynamicFields": true,
     "dynamicFieldsGlobal": true,
-    "paramTypeHints": {
+    "fileParamDefaults": {
       "ply": "Player",
       "vehicle": "Entity"
     },

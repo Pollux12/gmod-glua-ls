@@ -1,13 +1,13 @@
 <div align="center">
 
-# 🦀 EmmyLua Check
+# 🦀 GLua Check
 
 [![Crates.io](https://img.shields.io/crates/v/glua_check.svg?style=for-the-badge&logo=rust)](https://crates.io/crates/glua_check)
-[![GitHub license](https://img.shields.io/github/license/CppCXY/emmylua-analyzer-rust?style=for-the-badge&logo=mit&color=blue)](../../LICENSE)
+[![GitHub license](https://img.shields.io/github/license/Pollux12/gmod-glua-ls?style=for-the-badge&logo=mit&color=blue)](../../LICENSE)
 
 </div>
 
-`glua_check` is a powerful command-line tool designed to help developers identify and fix potential issues in Lua code during development. It leverages the core analysis engine of `emmylua-analyzer` to provide comprehensive code diagnostics, ensuring code quality and robustness.
+`glua_check` is a powerful command-line tool designed to help developers identify and fix potential issues in Lua code during development. It leverages the core analysis engine of `gmod-glua-ls` to provide comprehensive code diagnostics, ensuring code quality and robustness.
 
 ---
 
@@ -77,7 +77,7 @@ glua_check . -f json --output ./diag.json
 
 ## ⚙️ Configuration
 
-`glua_check` shares the same configuration system as the EmmyLua Language Server. You can create a `.emmyrc.json` file in your project root to configure diagnostic rules.
+`glua_check` shares the same configuration system as the GLua Language Server. You can create a `.gluarc.json` file in your project root to configure diagnostic rules.
 
 **Example `.emmyrc.json`:**
 ```json
@@ -90,7 +90,7 @@ glua_check . -f json --output ./diag.json
 }
 ```
 
-For detailed information on all available diagnostics and configuration options, see the [**EmmyLua Configuration Documentation**](../../docs/config/emmyrc_json_CN.md).
+For detailed information on all available diagnostics and configuration options, see the [**GLua Configuration Documentation**](../../docs/config.md).
 
 ---
 
@@ -100,7 +100,7 @@ You can easily integrate `glua_check` into your GitHub Actions workflow to autom
 
 **Example `.github/workflows/check.yml`:**
 ```yaml
-name: EmmyLua Check
+name: GLua Check
 
 on: [push, pull_request]
 

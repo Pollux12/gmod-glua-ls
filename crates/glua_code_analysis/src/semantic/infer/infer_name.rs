@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use glua_parser::{LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr, LuaVarExpr};
+use glua_parser::{
+    LuaAstNode, LuaDocTagFileparam, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr, LuaVarExpr,
+};
 use rowan::TextSize;
 use wax::Pattern;
 
@@ -448,7 +450,7 @@ fn infer_param_type_from_gmod_name_hint(db: &DbIndex, param_name: &str) -> Optio
         return None;
     }
 
-    let hints = &db.get_emmyrc().gmod.param_type_hints;
+    let hints = &db.get_emmyrc().gmod.file_param_defaults;
     if hints.is_empty() {
         return None;
     }
@@ -470,32 +472,23 @@ fn infer_param_type_from_file_hint(db: &DbIndex, decl: &LuaDecl) -> Option<LuaTy
         return None;
     }
 
-    let document = db.get_vfs().get_document(&decl.get_file_id())?;
-    let hint = find_file_level_param_hint(document.get_text(), decl.get_name())?;
-    resolve_param_hint_type(db, &hint)
-}
+    let tree = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+    let target_name = decl.get_name().to_ascii_lowercase();
+    let chunk = tree.get_chunk_node();
 
-fn find_file_level_param_hint(document_text: &str, param_name: &str) -> Option<String> {
-    let target_name = param_name.to_ascii_lowercase();
-    for line in document_text.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("---@paramhint") {
-            continue;
-        }
-
-        let rest = trimmed.trim_start_matches("---@paramhint").trim_start();
-        let mut segments = rest.splitn(2, char::is_whitespace);
-        let Some(name) = segments.next() else {
-            continue;
-        };
-        let Some(type_hint) = segments.next() else {
-            continue;
-        };
-
-        if name.to_ascii_lowercase() == target_name {
-            let normalized_hint = type_hint.trim();
-            if !normalized_hint.is_empty() {
-                return Some(normalized_hint.to_string());
+    for descendant in chunk.syntax().descendants() {
+        if LuaDocTagFileparam::can_cast(descendant.kind().into()) {
+            if let Some(fileparam) = LuaDocTagFileparam::cast(descendant) {
+                if let Some(name_token) = fileparam.get_name_token() {
+                    if name_token.get_name_text().to_ascii_lowercase() == target_name {
+                        if let Some(typ) = fileparam.get_type() {
+                            let type_text = typ.syntax().text().to_string();
+                            if let Some(resolved) = resolve_param_hint_type(db, &type_text) {
+                                return Some(resolved);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -93,6 +93,7 @@ pub enum LuaAst {
     LuaDocTagLanguage(LuaDocTagLanguage),
     LuaDocTagAttribute(LuaDocTagAttribute),
     LuaDocTagAttributeUse(LuaDocTagAttributeUse),
+    LuaDocTagFileparam(LuaDocTagFileparam),
     // doc description
     LuaDocDescription(LuaDocDescription),
 
@@ -185,6 +186,7 @@ impl LuaAstNode for LuaAst {
             LuaAst::LuaDocTagExport(node) => node.syntax(),
             LuaAst::LuaDocTagAttribute(node) => node.syntax(),
             LuaAst::LuaDocTagAttributeUse(node) => node.syntax(),
+            LuaAst::LuaDocTagFileparam(node) => node.syntax(),
             LuaAst::LuaDocTagLanguage(node) => node.syntax(),
             LuaAst::LuaDocDescription(node) => node.syntax(),
             LuaAst::LuaDocNameType(node) => node.syntax(),
@@ -301,6 +303,7 @@ impl LuaAstNode for LuaAst {
                 | LuaSyntaxKind::TypeStringTemplate
                 | LuaSyntaxKind::TypeMultiLineUnion
                 | LuaSyntaxKind::DocAttributeUse
+                | LuaSyntaxKind::DocTagFileparam
         )
     }
 
@@ -473,6 +476,9 @@ impl LuaAstNode for LuaAst {
             }
             LuaSyntaxKind::DocTagAttributeUse => {
                 LuaDocTagAttributeUse::cast(syntax).map(LuaAst::LuaDocTagAttributeUse)
+            }
+            LuaSyntaxKind::DocTagFileparam => {
+                LuaDocTagFileparam::cast(syntax).map(LuaAst::LuaDocTagFileparam)
             }
             _ => None,
         }

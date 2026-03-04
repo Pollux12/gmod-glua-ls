@@ -20,8 +20,8 @@ pub struct EmmyrcGmod {
     pub vgui: EmmyrcGmodVgui,
     #[serde(default)]
     pub outline: EmmyrcGmodOutline,
-    #[serde(default = "param_type_hints_default")]
-    pub param_type_hints: HashMap<String, String>,
+    #[serde(default = "file_param_defaults_default")]
+    pub file_param_defaults: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_realm_from_filename: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,7 +53,7 @@ fn dynamic_fields_global_default() -> bool {
     true
 }
 
-fn param_type_hints_default() -> HashMap<String, String> {
+fn file_param_defaults_default() -> HashMap<String, String> {
     [
         ("ply", "Player"),
         ("player", "Player"),
@@ -65,6 +65,22 @@ fn param_type_hints_default() -> HashMap<String, String> {
         ("weapon", "Weapon"),
         ("pnl", "Panel"),
         ("panel", "Panel"),
+        ("npc", "NPC"),
+        ("trace", "TraceResult"),
+        ("tr", "TraceResult"),
+        ("ang", "Angle"),
+        ("angle", "Angle"),
+        ("vec", "Vector"),
+        ("pos", "Vector"),
+        ("color", "Color"),
+        ("col", "Color"),
+        ("phys", "PhysObj"),
+        ("dmginfo", "CTakeDamageInfo"),
+        ("attacker", "Entity"),
+        ("inflictor", "Entity"),
+        ("victim", "Entity"),
+        ("cmd", "CUserCmd"),
+        ("mat", "IMaterial"),
     ]
     .into_iter()
     .map(|(name, type_name)| (name.to_string(), type_name.to_string()))
@@ -81,7 +97,7 @@ impl Default for EmmyrcGmod {
             network: EmmyrcGmodNetwork::default(),
             vgui: EmmyrcGmodVgui::default(),
             outline: EmmyrcGmodOutline::default(),
-            param_type_hints: param_type_hints_default(),
+            file_param_defaults: file_param_defaults_default(),
             detect_realm_from_filename: None,
             detect_realm_from_calls: None,
             infer_dynamic_fields: infer_dynamic_fields_default(),
@@ -317,11 +333,11 @@ mod tests {
         verify_that!(gmod.vgui.code_lens_enabled, eq(true))?;
         verify_that!(gmod.vgui.inlay_hint_enabled, eq(false))?;
         verify_that!(
-            gmod.param_type_hints.get("ply"),
+            gmod.file_param_defaults.get("ply"),
             eq(Some(&"Player".to_string()))
         )?;
         verify_that!(
-            gmod.param_type_hints.get("vehicle"),
+            gmod.file_param_defaults.get("vehicle"),
             eq(Some(&"Entity".to_string()))
         )?;
         verify_that!(gmod.detect_realm_from_filename, eq(None))?;

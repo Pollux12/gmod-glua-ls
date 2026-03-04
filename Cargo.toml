@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 description = "gmod-glua-ls — Garry's Mod Lua Language Server, a fork of EmmyLua Analyzer Rust optimized for GLua development"
 license = "MIT"
-repository = "https://github.com/Pollux-Dev/gmod-glua-ls"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
 keywords = ["gmod", "glua", "lua", "language-server", "garrysmod"]
 categories = ["development-tools"]
 

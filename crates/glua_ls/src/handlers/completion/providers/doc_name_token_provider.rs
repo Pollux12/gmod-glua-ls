@@ -41,6 +41,12 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         DocCompletionExpected::Export => {
             add_tag_export_completion(builder);
         }
+        DocCompletionExpected::Realm => {
+            add_tag_realm_completion(builder);
+        }
+        DocCompletionExpected::Fileparam => {
+            add_tag_param_name_completion(builder);
+        }
     }
 
     builder.stop_here();
@@ -54,6 +60,8 @@ fn get_doc_completion_expected(trigger_token: &LuaSyntaxToken) -> Option<DocComp
             let parent_node = trigger_token.parent()?;
             match parent_node.kind().into() {
                 LuaSyntaxKind::DocTagParam => Some(DocCompletionExpected::ParamName),
+                LuaSyntaxKind::DocTagFileparam => Some(DocCompletionExpected::Fileparam),
+                LuaSyntaxKind::DocTagRealm => Some(DocCompletionExpected::Realm),
                 LuaSyntaxKind::DocTagCast => Some(DocCompletionExpected::Cast),
                 LuaSyntaxKind::DocTagDiagnostic => Some(DocCompletionExpected::DiagnosticAction),
                 LuaSyntaxKind::DocDiagnosticCodeList => Some(DocCompletionExpected::DiagnosticCode),
@@ -64,6 +72,8 @@ fn get_doc_completion_expected(trigger_token: &LuaSyntaxToken) -> Option<DocComp
             let left_token = trigger_token.prev_token()?;
             match left_token.kind().into() {
                 LuaTokenKind::TkTagParam => Some(DocCompletionExpected::ParamName),
+                LuaTokenKind::TkTagFileparam => Some(DocCompletionExpected::Fileparam),
+                LuaTokenKind::TkTagRealm => Some(DocCompletionExpected::Realm),
                 LuaTokenKind::TkTagCast => Some(DocCompletionExpected::Cast),
                 LuaTokenKind::TkTagDiagnostic => Some(DocCompletionExpected::DiagnosticAction),
                 LuaTokenKind::TkColon => {
@@ -133,6 +143,8 @@ enum DocCompletionExpected {
     Namespace,
     Using,
     Export,
+    Realm,
+    Fileparam,
 }
 
 fn add_tag_param_name_completion(builder: &mut CompletionBuilder) -> Option<()> {
@@ -317,6 +329,19 @@ fn add_tag_export_completion(builder: &mut CompletionBuilder) {
     for (sorted_index, key) in key.iter().enumerate() {
         let completion_item = CompletionItem {
             label: key.to_string(),
+            kind: Some(lsp_types::CompletionItemKind::ENUM_MEMBER),
+            sort_text: Some(format!("{:03}", sorted_index)),
+            ..Default::default()
+        };
+        builder.add_completion_item(completion_item);
+    }
+}
+
+fn add_tag_realm_completion(builder: &mut CompletionBuilder) {
+    let realms = ["client", "server", "shared", "menu"];
+    for (sorted_index, realm) in realms.iter().enumerate() {
+        let completion_item = CompletionItem {
+            label: realm.to_string(),
             kind: Some(lsp_types::CompletionItemKind::ENUM_MEMBER),
             sort_text: Some(format!("{:03}", sorted_index)),
             ..Default::default()

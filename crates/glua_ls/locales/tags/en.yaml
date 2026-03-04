@@ -257,3 +257,21 @@ tags.attribute: |
   ---@[deprecated] # If `attribute` allows no parameters, the parentheses can be omitted
   ---@field c string
   ```
+tags.hook: |
+  The `hook` tag registers a function as a GMod hook.
+  Example:
+  ```lua
+  ---@hook PlayerSpawn
+  ```
+tags.realm: |
+  The `realm` tag indicates which realm(s) this field/function is available in (client, server, or shared).
+  Example:
+  ```lua
+  ---@realm client
+  ```
+tags.fileparam: |
+  The `fileparam` tag provides file-scoped default types for unannotated function parameters holding a specific name.
+  Example:
+  ```lua
+  ---@fileparam ply Player
+  ```

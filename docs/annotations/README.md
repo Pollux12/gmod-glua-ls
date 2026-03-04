@@ -30,6 +30,7 @@ Type annotations for GLua development using EmmyLua/LuaCATS syntax.
 | [`@accessorfunc`](./accessorfunc.md) | Accessor generator | `---@accessorfunc` |
 | [`@realm`](./realm.md) | Declare realm | `---@realm server` |
 | [`@hook`](./hook.md) | Register hook | `---@hook PlayerSpawn` |
+| [`@fileparam`](./fileparam.md) | File-level param hint | `---@fileparam ply Player` |
 
 ## Other
 

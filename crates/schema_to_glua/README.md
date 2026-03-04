@@ -1,12 +1,12 @@
 # schema_to_glua
 
-A tool and library that converts JSON Schema into EmmyLua annotations.
+A tool and library that converts JSON Schema into GLua annotations.
 
-Concise and suitable for automatically generating Lua/EmmyLua comments from backend or normalized JSON Schema (for IDE type hints and static checking).
+Concise and suitable for automatically generating Lua/GLua comments from backend or normalized JSON Schema (for IDE type hints and static checking).
 
 ## Features
 - Supports basic JSON Schema types: object, array, string, number, integer, boolean, null
-- Generates @class, @field, @alias and other EmmyLua annotations
+- Generates @class, @field, @alias and other GLua annotations
 - Provides CLI and library interfaces, can be embedded into build pipelines
 
 ## Install / Build
@@ -59,7 +59,7 @@ let emmylua = converter.convert_from_str(&schema);
 }
 ```
 
-## Generated EmmyLua Example
+## Generated GLua Example
 ```lua
 ---@class Person
 ---@field public name string

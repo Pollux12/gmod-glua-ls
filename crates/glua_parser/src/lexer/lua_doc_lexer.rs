@@ -734,6 +734,7 @@ fn to_tag(text: &str) -> LuaTokenKind {
         "attribute" => LuaTokenKind::TkTagAttribute,
         "schema" => LuaTokenKind::TKTagSchema,
         "realm" => LuaTokenKind::TkTagRealm,
+        "fileparam" => LuaTokenKind::TkTagFileparam,
         _ => LuaTokenKind::TkTagOther,
     }
 }

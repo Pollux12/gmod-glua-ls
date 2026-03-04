@@ -11,9 +11,9 @@ use glua_code_analysis::{
 };
 use glua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaComment, LuaDocFieldKey,
-    LuaDocGenericDecl, LuaDocGenericDeclList, LuaDocObjectFieldKey, LuaDocType, LuaExpr,
-    LuaGeneralToken, LuaKind, LuaLiteralToken, LuaNameToken, LuaSyntaxKind, LuaSyntaxNode,
-    LuaSyntaxToken, LuaTokenKind, LuaVarExpr,
+    LuaDocGenericDecl, LuaDocGenericDeclList, LuaDocObjectFieldKey, LuaDocTagFileparam,
+    LuaDocTagOther, LuaDocTagRealm, LuaDocType, LuaExpr, LuaGeneralToken, LuaKind, LuaLiteralToken,
+    LuaNameToken, LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken, LuaTokenKind, LuaVarExpr,
 };
 use glua_parser_desc::{CodeBlockHighlightKind, DescItem, DescItemKind};
 use lsp_types::{SemanticToken, SemanticTokenModifier, SemanticTokenType};
@@ -376,6 +376,24 @@ fn build_node_semantic_token(
                 SemanticTokenType::PARAMETER,
                 SemanticTokenModifier::DECLARATION,
             );
+        }
+        LuaAst::LuaDocTagRealm(doc_realm) => {
+            if let Some(realm) = doc_realm.get_name_token() {
+                builder.push_with_modifier(
+                    realm.syntax(),
+                    SemanticTokenType::ENUM_MEMBER,
+                    SemanticTokenModifier::DECLARATION,
+                );
+            }
+        }
+        LuaAst::LuaDocTagFileparam(doc_fileparam) => {
+            if let Some(name) = doc_fileparam.get_name_token() {
+                builder.push_with_modifier(
+                    name.syntax(),
+                    SemanticTokenType::PARAMETER,
+                    SemanticTokenModifier::DECLARATION,
+                );
+            }
         }
         LuaAst::LuaDocTagReturn(doc_return) => {
             let type_name_list = doc_return.get_info_list();
@@ -760,6 +778,17 @@ fn build_node_semantic_token(
             }
         }
         LuaAst::LuaDocDescription(description) => {
+            if let Some(parent) = description.syntax().parent() {
+                if let Some(doc_other) = LuaDocTagOther::cast(parent.clone()) {
+                    if doc_other.get_tag_name().as_deref() == Some("hook") {
+                        for token in description.tokens::<LuaGeneralToken>() {
+                            builder.push(token.syntax(), SemanticTokenType::FUNCTION);
+                        }
+                        return Some(());
+                    }
+                }
+            }
+
             if !emmyrc.semantic_tokens.render_documentation_markup {
                 for token in description.tokens::<LuaGeneralToken>() {
                     if matches!(

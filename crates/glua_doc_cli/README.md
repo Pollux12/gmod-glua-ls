@@ -1,20 +1,20 @@
 <div align="center">
 
-# 📚 EmmyLua Doc CLI
+# 📚 GLua Doc CLI
 
 [![Crates.io](https://img.shields.io/crates/v/glua_doc_cli.svg?style=for-the-badge&logo=rust)](https://crates.io/crates/glua_doc_cli)
-[![GitHub license](https://img.shields.io/github/license/CppCXY/emmylua-analyzer-rust?style=for-the-badge&logo=mit&color=blue)](../../LICENSE)
+[![GitHub license](https://img.shields.io/github/license/Pollux12/gmod-glua-ls?style=for-the-badge&logo=mit&color=blue)](../../LICENSE)
 
 </div>
 
-`glua_doc_cli` is a powerful command-line tool for generating documentation directly from your Lua source code and EmmyLua annotations. Built with Rust, it offers exceptional performance and is a core component of the `emmylua-analyzer-rust` ecosystem.
+`glua_doc_cli` is a powerful command-line tool for generating documentation directly from your Lua source code and GLua annotations. Built with Rust, it offers exceptional performance and is a core component of the `gmod-glua-ls` ecosystem.
 
 ---
 
 ## ✨ Features
 
 - **🚀 Blazing Fast**: Leverages Rust's performance to parse and generate documentation for large codebases in seconds.
-- **✍️ Rich Annotation Support**: Intelligently interprets EmmyLua annotations (`---@class`, `---@field`, `---@param`, etc.) to generate detailed and accurate documentation.
+- **✍️ Rich Annotation Support**: Intelligently interprets GLua annotations (`---@class`, `---@field`, `---@param`, etc.) to generate detailed and accurate documentation.
 - **🔧 Highly Customizable**:
     - Override the default templates with `--override-template` to match your project's branding.
     - Inject custom content into the main page using the `--mixin` option to add guides, tutorials, or other static pages.
@@ -29,7 +29,7 @@ Install `glua_doc_cli` via cargo:
 ```shell
 cargo install glua_doc_cli
 ```
-Alternatively, you can grab pre-built binaries from the [**GitHub Releases**](https://github.com/EmmyLua/emmylua-analyzer-rust/releases) page.
+Alternatively, you can grab pre-built binaries from the [**GitHub Releases**](https://github.com/Pollux12/gmod-glua-ls/releases) page.
 
 ---
 

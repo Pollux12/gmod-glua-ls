@@ -47,6 +47,7 @@ pub enum LuaDocTag {
     Export(LuaDocTagExport),
     Language(LuaDocTagLanguage),
     Realm(LuaDocTagRealm),
+    Fileparam(LuaDocTagFileparam),
 }
 
 impl LuaAstNode for LuaDocTag {
@@ -85,6 +86,7 @@ impl LuaAstNode for LuaDocTag {
             LuaDocTag::Language(it) => it.syntax(),
             LuaDocTag::AttributeUse(it) => it.syntax(),
             LuaDocTag::Realm(it) => it.syntax(),
+            LuaDocTag::Fileparam(it) => it.syntax(),
         }
     }
 
@@ -125,6 +127,7 @@ impl LuaAstNode for LuaDocTag {
             || kind == LuaSyntaxKind::DocTagAttributeUse
             || kind == LuaSyntaxKind::DocTagSchema
             || kind == LuaSyntaxKind::DocTagRealm
+            || kind == LuaSyntaxKind::DocTagFileparam
     }
 
     fn cast(syntax: LuaSyntaxNode) -> Option<Self>
@@ -227,6 +230,9 @@ impl LuaAstNode for LuaDocTag {
             LuaSyntaxKind::DocTagRealm => {
                 Some(LuaDocTag::Realm(LuaDocTagRealm::cast(syntax).unwrap()))
             }
+            LuaSyntaxKind::DocTagFileparam => Some(LuaDocTag::Fileparam(
+                LuaDocTagFileparam::cast(syntax).unwrap(),
+            )),
             _ => None,
         }
     }
@@ -1340,6 +1346,47 @@ impl LuaAstNode for LuaDocTagRealm {
 impl LuaDocTagRealm {
     pub fn get_name_token(&self) -> Option<LuaNameToken> {
         self.token()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaDocTagFileparam {
+    syntax: LuaSyntaxNode,
+}
+
+impl LuaAstNode for LuaDocTagFileparam {
+    fn syntax(&self) -> &LuaSyntaxNode {
+        &self.syntax
+    }
+
+    fn can_cast(kind: LuaSyntaxKind) -> bool
+    where
+        Self: Sized,
+    {
+        kind == LuaSyntaxKind::DocTagFileparam
+    }
+
+    fn cast(syntax: LuaSyntaxNode) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        if Self::can_cast(syntax.kind().into()) {
+            Some(Self { syntax })
+        } else {
+            None
+        }
+    }
+}
+
+impl LuaDocDescriptionOwner for LuaDocTagFileparam {}
+
+impl LuaDocTagFileparam {
+    pub fn get_name_token(&self) -> Option<LuaNameToken> {
+        self.token()
+    }
+
+    pub fn get_type(&self) -> Option<LuaDocType> {
+        self.child()
     }
 }
 

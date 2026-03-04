@@ -1,6 +1,6 @@
-## EmmyLua Language Server
+## GLua Language Server
 
-This README provides instructions on how to start the EmmyLua language server for testing purposes.
+This README provides instructions on how to start the GLua language server for testing purposes.
 
 # Install
 

@@ -33,4 +33,7 @@ pub const DOC_TAGS: &[&str] = &[
     "export",
     "language",
     "attribute",
+    "hook",
+    "realm",
+    "fileparam",
 ];

@@ -95,6 +95,7 @@ pub enum LuaSyntaxKind {
     DocTagAttribute,
     DocTagAttributeUse, // '@['
     DocTagRealm,
+    DocTagFileparam,
     DocTagCallGeneric,
     DocTagSchema,
 

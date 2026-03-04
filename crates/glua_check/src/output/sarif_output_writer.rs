@@ -56,8 +56,8 @@ impl SarifOutputWriter {
             let tool = json!({
                 "name": CRATE_NAME,
                 "version": CRATE_VERSION,
-                "informationUri": "https://github.com/Pollux-Dev/gmod-glua-ls",
-                "organization": "Pollux-Dev"
+                "informationUri": "https://github.com/Pollux12/gmod-glua-ls",
+                "organization": "Pollux12"
             });
             self.tools.insert(tool_name.clone(), tool);
         }

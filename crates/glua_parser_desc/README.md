@@ -1,11 +1,11 @@
-## EmmyLua-Parser-Desc
+## GLua-Parser-Desc
 
-EmmyLua-Parser-Desc is an extension for EmmyLua-Parser that uses its internal machinery to provide lexic information about markup of documentation comments. It supports parsing Markdown, MyST and RST.
+GLua-Parser-Desc is an extension for GLua-Parser that uses its internal machinery to provide lexic information about markup of documentation comments. It supports parsing Markdown, MyST and RST.
 
 
 ### Features
 
-- Ability to parse description blocks provided by EmmyLua-Parser and report ranges of interest: highlighted keywords,  code blocks, cross-references and so on
+- Ability to parse description blocks provided by GLua-Parser and report ranges of interest: highlighted keywords,  code blocks, cross-references and so on
 - Supports Markdown, MyST and RST
 - Ability to parse possible broken or unterminated MyST and RST cross-references in order to facilitate Autocompletion and Go To Definition functionality
 

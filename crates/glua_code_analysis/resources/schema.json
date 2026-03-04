@@ -75,6 +75,34 @@
         "defaultRealm": "shared",
         "dynamicFieldsGlobal": true,
         "enabled": true,
+        "fileParamDefaults": {
+          "ang": "Angle",
+          "angle": "Angle",
+          "attacker": "Entity",
+          "cmd": "CUserCmd",
+          "col": "Color",
+          "color": "Color",
+          "dmginfo": "CTakeDamageInfo",
+          "ent": "Entity",
+          "entity": "Entity",
+          "inflictor": "Entity",
+          "mat": "IMaterial",
+          "npc": "NPC",
+          "panel": "Panel",
+          "phys": "PhysObj",
+          "player": "Player",
+          "ply": "Player",
+          "pnl": "Panel",
+          "pos": "Vector",
+          "tr": "TraceResult",
+          "trace": "TraceResult",
+          "vec": "Vector",
+          "veh": "Entity",
+          "vehicle": "Entity",
+          "victim": "Entity",
+          "weapon": "Weapon",
+          "wep": "Weapon"
+        },
         "hookMappings": {
           "emitterToHook": {},
           "methodPrefixes": [],
@@ -95,18 +123,6 @@
         },
         "outline": {
           "verbosity": "normal"
-        },
-        "paramTypeHints": {
-          "ent": "Entity",
-          "entity": "Entity",
-          "panel": "Panel",
-          "player": "Player",
-          "ply": "Player",
-          "pnl": "Panel",
-          "veh": "Entity",
-          "vehicle": "Entity",
-          "weapon": "Weapon",
-          "wep": "Weapon"
         },
         "scriptedClassScopes": {
           "exclude": [],
@@ -919,6 +935,40 @@
           "type": "boolean",
           "default": true
         },
+        "fileParamDefaults": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {
+            "ang": "Angle",
+            "angle": "Angle",
+            "attacker": "Entity",
+            "cmd": "CUserCmd",
+            "col": "Color",
+            "color": "Color",
+            "dmginfo": "CTakeDamageInfo",
+            "ent": "Entity",
+            "entity": "Entity",
+            "inflictor": "Entity",
+            "mat": "IMaterial",
+            "npc": "NPC",
+            "panel": "Panel",
+            "phys": "PhysObj",
+            "player": "Player",
+            "ply": "Player",
+            "pnl": "Panel",
+            "pos": "Vector",
+            "tr": "TraceResult",
+            "trace": "TraceResult",
+            "vec": "Vector",
+            "veh": "Entity",
+            "vehicle": "Entity",
+            "victim": "Entity",
+            "weapon": "Weapon",
+            "wep": "Weapon"
+          }
+        },
         "hookMappings": {
           "$ref": "#/$defs/EmmyrcGmodHookMappings",
           "default": {
@@ -950,24 +1000,6 @@
           "$ref": "#/$defs/EmmyrcGmodOutline",
           "default": {
             "verbosity": "normal"
-          }
-        },
-        "paramTypeHints": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {
-            "ent": "Entity",
-            "entity": "Entity",
-            "panel": "Panel",
-            "player": "Player",
-            "ply": "Player",
-            "pnl": "Panel",
-            "veh": "Entity",
-            "vehicle": "Entity",
-            "weapon": "Weapon",
-            "wep": "Weapon"
           }
         },
         "scriptedClassScopes": {
