@@ -10,12 +10,13 @@ pub use config_loader::{load_configs, load_configs_raw};
 pub use configs::{
     DiagnosticSeveritySetting, DocSyntax, EmmyLibraryConfig, EmmyLibraryItem, EmmyrcCodeAction,
     EmmyrcCodeLens, EmmyrcCompletion, EmmyrcDiagnostic, EmmyrcDoc, EmmyrcDocumentColor,
-    EmmyrcExternalTool, EmmyrcFilenameConvention, EmmyrcGmod, EmmyrcGmodHookMappings,
-    EmmyrcGmodNetwork, EmmyrcGmodNetworkCompletion, EmmyrcGmodNetworkDiagnostics,
-    EmmyrcGmodOutline, EmmyrcGmodOutlineVerbosity, EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes,
-    EmmyrcHover, EmmyrcInlayHint, EmmyrcInlineValues, EmmyrcLuaVersion, EmmyrcReference,
-    EmmyrcReformat, EmmyrcResource, EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcStrict,
-    EmmyrcWorkspace, EmmyrcWorkspaceModuleMap,
+    EmmyrcExternalTool, EmmyrcFilenameConvention, EmmyrcFormatConfigPrecedence, EmmyrcFormatPreset,
+    EmmyrcFormatStyleOverrides, EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodNetwork,
+    EmmyrcGmodNetworkCompletion, EmmyrcGmodNetworkDiagnostics, EmmyrcGmodOutline,
+    EmmyrcGmodOutlineVerbosity, EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes, EmmyrcHover,
+    EmmyrcInlayHint, EmmyrcInlineValues, EmmyrcLuaVersion, EmmyrcReference, EmmyrcReformat,
+    EmmyrcResource, EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcStrict, EmmyrcWorkspace,
+    EmmyrcWorkspaceModuleMap,
 };
 use glua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig, SpecialFunction};
 use rowan::NodeCache;

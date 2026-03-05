@@ -31,7 +31,10 @@ pub use hover::EmmyrcHover;
 pub use inlayhint::EmmyrcInlayHint;
 pub use inline_values::EmmyrcInlineValues;
 pub use references::EmmyrcReference;
-pub use reformat::{EmmyrcExternalTool, EmmyrcReformat};
+pub use reformat::{
+    EmmyrcExternalTool, EmmyrcFormatConfigPrecedence, EmmyrcFormatPreset,
+    EmmyrcFormatStyleOverrides, EmmyrcReformat,
+};
 pub use resource::EmmyrcResource;
 pub use runtime::{EmmyrcLuaVersion, EmmyrcRuntime};
 pub use semantictoken::EmmyrcSemanticToken;

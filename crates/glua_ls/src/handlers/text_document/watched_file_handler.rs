@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use glua_code_analysis::{read_file_with_encoding, uri_to_file_path};
 use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, Uri};
 
-use crate::context::ServerContextSnapshot;
+use crate::{codestyle::should_apply_editorconfig_updates, context::ServerContextSnapshot};
 
 pub async fn on_did_change_watched_files(
     context: ServerContextSnapshot,
@@ -12,12 +12,13 @@ pub async fn on_did_change_watched_files(
     // Classify events and read files from disk WITHOUT
     // the analysis write lock so that slow disk I/O does not block
     // hover, completion, and diagnostic handlers.
-    let (encoding, interval) = {
+    let (encoding, interval, apply_editorconfig_updates) = {
         let analysis = context.analysis().read().await;
         let emmyrc = analysis.get_emmyrc();
         (
             emmyrc.workspace.encoding.clone(),
             emmyrc.diagnostics.diagnostic_interval.unwrap_or(500),
+            should_apply_editorconfig_updates(&emmyrc),
         )
     };
 
@@ -103,8 +104,14 @@ pub async fn on_did_change_watched_files(
     // Handle editorconfig / emmyrc updates
     {
         let workspace = context.workspace_manager().read().await;
-        for path in editorconfig_paths {
-            workspace.update_editorconfig(path);
+        if apply_editorconfig_updates {
+            for path in &editorconfig_paths {
+                workspace.update_editorconfig(path.clone());
+            }
+        } else if !editorconfig_paths.is_empty() {
+            log::info!(
+                "skipping .editorconfig watched-file update because format.configPrecedence=preferGluarc"
+            );
         }
         for dir in emmyrc_dirs {
             workspace.add_update_emmyrc_task(dir).await;

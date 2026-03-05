@@ -93,7 +93,7 @@ pub async fn initialized_handler(
     let emmyrc = loaded.emmyrc;
     let workspace_diagnostic_configs = loaded.workspace_diagnostic_configs;
     let workspace_emmyrcs = loaded.workspace_emmyrcs;
-    load_editorconfig(workspace_folders.clone());
+    load_editorconfig(workspace_folders.clone(), emmyrc.as_ref());
 
     // init std lib
     init_std_lib(context.analysis(), &cmd_args, emmyrc.clone()).await;

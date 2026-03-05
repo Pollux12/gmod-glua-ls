@@ -63,8 +63,10 @@
     "format": {
       "$ref": "#/$defs/EmmyrcReformat",
       "default": {
+        "configPrecedence": "preferEditorconfig",
         "externalTool": null,
         "externalToolRangeFormat": null,
+        "preset": "default",
         "useDiff": false
       }
     },
@@ -893,6 +895,650 @@
         }
       ]
     },
+    "EmmyrcFormatAlignArrayTable": {
+      "type": "string",
+      "enum": [
+        "none",
+        "always",
+        "contain_curly"
+      ]
+    },
+    "EmmyrcFormatAlignChainExpr": {
+      "type": "string",
+      "enum": [
+        "none",
+        "always",
+        "only_call_stmt"
+      ]
+    },
+    "EmmyrcFormatAlignContinuousAssignStatement": {
+      "type": "string",
+      "enum": [
+        "true",
+        "false",
+        "always"
+      ]
+    },
+    "EmmyrcFormatCallArgParentheses": {
+      "type": "string",
+      "enum": [
+        "keep",
+        "remove",
+        "remove_table_only",
+        "remove_string_only"
+      ]
+    },
+    "EmmyrcFormatConfigPrecedence": {
+      "oneOf": [
+        {
+          "description": "Prefer discovered .editorconfig files over .gluarc formatter overrides.",
+          "type": "string",
+          "const": "preferEditorconfig"
+        },
+        {
+          "description": "Prefer .gluarc formatter overrides over discovered .editorconfig files.",
+          "type": "string",
+          "const": "preferGluarc"
+        }
+      ]
+    },
+    "EmmyrcFormatEndOfLine": {
+      "type": "string",
+      "enum": [
+        "crlf",
+        "lf",
+        "cr",
+        "auto",
+        "unset"
+      ]
+    },
+    "EmmyrcFormatEndStatementWithSemicolon": {
+      "type": "string",
+      "enum": [
+        "keep",
+        "always",
+        "same_line",
+        "replace_with_newline",
+        "never"
+      ]
+    },
+    "EmmyrcFormatIndentStyle": {
+      "type": "string",
+      "enum": [
+        "tab",
+        "space"
+      ]
+    },
+    "EmmyrcFormatKeepKeyword": {
+      "type": "string",
+      "enum": [
+        "keep"
+      ]
+    },
+    "EmmyrcFormatPreset": {
+      "oneOf": [
+        {
+          "description": "Preserve EmmyLuaCodeStyle defaults.",
+          "type": "string",
+          "const": "default"
+        },
+        {
+          "description": "Apply the built-in CFC-oriented formatting preset.",
+          "type": "string",
+          "const": "cfc"
+        },
+        {
+          "description": "Use only style_overrides.",
+          "type": "string",
+          "const": "custom"
+        }
+      ]
+    },
+    "EmmyrcFormatQuoteStyle": {
+      "type": "string",
+      "enum": [
+        "none",
+        "single",
+        "double"
+      ]
+    },
+    "EmmyrcFormatSpaceBeforeFunctionCallSingleArg": {
+      "type": "string",
+      "enum": [
+        "always",
+        "only_string",
+        "only_table",
+        "none"
+      ]
+    },
+    "EmmyrcFormatSpaceBeforeInlineComment": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "$ref": "#/$defs/EmmyrcFormatKeepKeyword"
+        }
+      ]
+    },
+    "EmmyrcFormatStyleOverrides": {
+      "description": "Typed EmmyLuaCodeStyle overrides for built-in formatting.",
+      "type": "object",
+      "properties": {
+        "align_array_table": {
+          "description": "Align array table items.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatAlignArrayTable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "align_call_args": {
+          "description": "Align function call arguments.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "align_chain_expr": {
+          "description": "Align chained expressions.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatAlignChainExpr"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "align_continuous_assign_statement": {
+          "description": "Align continuous assignment statements.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatAlignContinuousAssignStatement"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "align_continuous_inline_comment": {
+          "description": "Align inline comments in consecutive lines.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "align_continuous_line_space": {
+          "description": "Maximum blank-line gap considered part of one aligned block.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "align_continuous_rect_table_field": {
+          "description": "Align continuous rectangular table fields.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "align_continuous_similar_call_args": {
+          "description": "Align similar consecutive call arguments.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "align_function_params": {
+          "description": "Align function parameters.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "align_if_branch": {
+          "description": "Align `if`/`elseif`/`else` branches.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allow_non_indented_comments": {
+          "description": "Allow top-level comments to remain non-indented.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "auto_collapse_lines": {
+          "description": "Collapse short multi-line expressions into one line.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "break_all_list_when_line_exceed": {
+          "description": "Break all list items once max line length is exceeded.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "break_before_braces": {
+          "description": "Move opening braces onto a new line.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "call_arg_parentheses": {
+          "description": "Parenthesis handling for single table/string call arguments.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatCallArgParentheses"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "continuation_indent": {
+          "description": "Indentation width for continuation lines.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "detect_end_of_line": {
+          "description": "Detect line endings from file content.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "end_of_line": {
+          "description": "Line ending preference.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatEndOfLine"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "end_statement_with_semicolon": {
+          "description": "Semicolon handling at statement end.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatEndStatementWithSemicolon"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ignore_space_after_colon": {
+          "description": "Ignore spaces after colons.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "ignore_spaces_inside_function_call": {
+          "description": "Ignore spaces already present inside function calls.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "indent_size": {
+          "description": "Number of spaces used for one indentation level.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "indent_style": {
+          "description": "`tab` or `space` indentation mode.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatIndentStyle"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insert_final_newline": {
+          "description": "Ensure file ends with a newline.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "keep_indents_on_empty_lines": {
+          "description": "Preserve indentation on empty lines.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "line_space_after_comment": {
+          "description": "Line spacing after comments (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line_space_after_do_statement": {
+          "description": "Line spacing after `do` statements (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line_space_after_expression_statement": {
+          "description": "Line spacing after expression statements (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line_space_after_for_statement": {
+          "description": "Line spacing after `for` statements (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line_space_after_function_statement": {
+          "description": "Line spacing after function statements (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line_space_after_if_statement": {
+          "description": "Line spacing after `if` statements (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line_space_after_local_or_assign_statement": {
+          "description": "Line spacing after local/assignment statements (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line_space_after_repeat_statement": {
+          "description": "Line spacing after `repeat` statements (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line_space_after_while_statement": {
+          "description": "Line spacing after `while` statements (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line_space_around_block": {
+          "description": "Line spacing around blocks (`keep`, `fixed(n)`, `min(n)`, `max(n)`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_line_length": {
+          "description": "Maximum line length before wrapping.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "never_indent_before_if_condition": {
+          "description": "Do not indent before `if` conditions.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "never_indent_comment_on_if_branch": {
+          "description": "Do not indent comments on `if` branches.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "quote_style": {
+          "description": "Preferred quote style.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatQuoteStyle"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remove_call_expression_list_finish_comma": {
+          "description": "Remove trailing commas in call expression argument lists.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_after_comma": {
+          "description": "Add a space after commas.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_after_comma_in_for_statement": {
+          "description": "Add a space after commas in `for` statements.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_after_comment_dash": {
+          "description": "Insert one space after comment dashes (`--`).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_around_assign_operator": {
+          "description": "Add spaces around assignment operators.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_around_concat_operator": {
+          "description": "Add spaces around concatenation operators.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_around_logical_operator": {
+          "description": "Add spaces around logical operators.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_around_math_operator": {
+          "description": "Add spaces around math operators.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_around_table_append_operator": {
+          "description": "Add spaces around table append operator.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_around_table_field_list": {
+          "description": "Add spaces inside table braces.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_before_attribute": {
+          "description": "Add space before attributes.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_before_closure_open_parenthesis": {
+          "description": "Add space before `(` in closure/lambda syntax.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_before_function_call_open_parenthesis": {
+          "description": "Add space before `(` in function calls.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_before_function_call_single_arg": {
+          "description": "Space style for single function call arguments.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatSpaceBeforeFunctionCallSingleArg"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "space_before_function_open_parenthesis": {
+          "description": "Add space before `(` in function declarations.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_before_inline_comment": {
+          "description": "Spaces before inline comments.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatSpaceBeforeInlineComment"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "space_before_open_square_bracket": {
+          "description": "Add space before `[`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_inside_function_call_parentheses": {
+          "description": "Add spaces inside call parentheses.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_inside_function_param_list_parentheses": {
+          "description": "Add spaces inside function parameter list parentheses.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "space_inside_square_brackets": {
+          "description": "Add spaces inside square brackets.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tab_width": {
+          "description": "Visual width of a tab character.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "table_separator_style": {
+          "description": "Table field separator style.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatTableSeparatorStyle"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trailing_table_separator": {
+          "description": "Trailing separator policy for table literals.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatTrailingTableSeparator"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "EmmyrcFormatTableSeparatorStyle": {
+      "type": "string",
+      "enum": [
+        "none",
+        "comma",
+        "semicolon",
+        "only_kv_colon"
+      ]
+    },
+    "EmmyrcFormatTrailingTableSeparator": {
+      "type": "string",
+      "enum": [
+        "keep",
+        "never",
+        "always",
+        "smart"
+      ]
+    },
     "EmmyrcGmod": {
       "type": "object",
       "properties": {
@@ -1363,6 +2009,12 @@
     "EmmyrcReformat": {
       "type": "object",
       "properties": {
+        "configPrecedence": {
+          "description": "Precedence between formatter settings from .gluarc and discovered .editorconfig files.",
+          "$ref": "#/$defs/EmmyrcFormatConfigPrecedence",
+          "default": "preferEditorconfig",
+          "x-vscode-setting": true
+        },
         "externalTool": {
           "description": "Whether to enable external tool formatting.",
           "anyOf": [
@@ -1386,6 +2038,24 @@
             }
           ],
           "default": null
+        },
+        "preset": {
+          "description": "Preset formatting profile for the built-in formatter.",
+          "$ref": "#/$defs/EmmyrcFormatPreset",
+          "default": "default",
+          "x-vscode-setting": true
+        },
+        "styleOverrides": {
+          "description": "EmmyLuaCodeStyle overrides applied on top of the selected preset.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcFormatStyleOverrides"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-vscode-setting": true
         },
         "useDiff": {
           "description": "Whether to use the diff algorithm for formatting.",
@@ -1500,7 +2170,7 @@
         "docBaseConstMatchBaseType": {
           "description": "Base constant types defined in doc can match base types, allowing int to match `---@alias id 1|2|3`, same for string.",
           "type": "boolean",
-          "default": false
+          "default": true
         },
         "metaOverrideFileDefine": {
           "description": "meta define overrides file define",

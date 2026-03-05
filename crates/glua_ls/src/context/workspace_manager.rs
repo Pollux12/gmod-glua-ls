@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use super::{ClientProxy, FileDiagnostic, StatusBar};
+use crate::codestyle::{apply_editorconfig_file, apply_workspace_code_style};
 use crate::context::lsp_features::LspFeatures;
 use crate::handlers::{ClientConfig, init_analysis};
+use glua_code_analysis::uri_to_file_path;
 use glua_code_analysis::{
     EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, WorkspaceImport, load_configs,
 };
-use glua_code_analysis::{update_code_style, uri_to_file_path};
 use log::{debug, info};
 use lsp_types::Uri;
 use tokio::sync::{Mutex, RwLock};
@@ -104,6 +105,7 @@ impl WorkspaceManager {
 
             let config_roots = collect_config_roots(&workspace_folders, Some(file_dir.clone()));
             let loaded = load_emmy_config(config_roots, client_config);
+            apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
             init_analysis(
                 &analysis,
                 &status_bar,
@@ -125,16 +127,8 @@ impl WorkspaceManager {
     }
 
     pub fn update_editorconfig(&self, path: PathBuf) {
-        let parent_dir = path
-            .parent()
-            .unwrap()
-            .to_path_buf()
-            .to_string_lossy()
-            .to_string()
-            .replace("\\", "/");
-        let file_normalized = path.to_string_lossy().to_string().replace("\\", "/");
-        log::info!("update code style: {:?}", file_normalized);
-        update_code_style(&parent_dir, &file_normalized);
+        log::info!("update code style: {:?}", path);
+        let _ = apply_editorconfig_file(&path);
     }
 
     pub fn add_reload_workspace_task(&self) -> Option<()> {
@@ -148,6 +142,7 @@ impl WorkspaceManager {
         let client = self.client.clone();
         let workspace_diagnostic_status = self.workspace_diagnostic_level.clone();
         tokio::spawn(async move {
+            apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
             // Perform reindex with minimal lock holding time
             init_analysis(
                 &analysis,

@@ -23,7 +23,7 @@ pub struct EmmyrcStrict {
     #[serde(default = "default_true")]
     pub meta_override_file_define: bool,
     /// Base constant types defined in doc can match base types, allowing int to match `---@alias id 1|2|3`, same for string.
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     pub doc_base_const_match_base_type: bool,
     /// This option limits the visibility of third-party libraries.
     ///

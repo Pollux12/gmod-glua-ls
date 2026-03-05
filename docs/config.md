@@ -180,6 +180,9 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `externalTool` | `object \| null` | `null` | External formatter configuration |
 | `externalToolRangeFormat` | `object \| null` | `null` | External formatter for range formatting |
 | `useDiff` | `boolean` | `false` | Use diff algorithm for formatting |
+| `preset` | `string` | `"default"` | Built-in preset for EmmyLuaCodeStyle (`"default"`, `"cfc"`, `"custom"`) |
+| `configPrecedence` | `string` | `"preferEditorconfig"` | Conflict policy between `.gluarc` formatter settings and discovered `.editorconfig` files (`"preferEditorconfig"` or `"preferGluarc"`) |
+| `styleOverrides` | `object \| null` | `null` | Typed EmmyLuaCodeStyle overrides applied on top of the selected preset |
 
 ### External Tool Format
 
@@ -190,6 +193,130 @@ This config should be good for most, feel free to enable/disable diagnostics or 
   "timeout": 5000
 }
 ```
+
+### Built-in Preset + Overrides Example
+
+```json
+{
+  "format": {
+    "preset": "cfc",
+    "configPrecedence": "preferGluarc",
+    "styleOverrides": {
+      "max_line_length": 110,
+      "space_inside_function_call_parentheses": true,
+      "end_statement_with_semicolon": "replace_with_newline"
+    }
+  }
+}
+```
+
+### `format.styleOverrides`
+
+`styleOverrides` keys intentionally use EmmyLuaCodeStyle/editorconfig-style `snake_case` names.
+
+#### Basic
+
+| Key | Type | Values / Description |
+|-----|------|----------------------|
+| `indent_style` | `string` | `"tab"`, `"space"` |
+| `indent_size` | `integer` | Indent size in spaces |
+| `tab_width` | `integer` | Display width for tab characters |
+| `quote_style` | `string` | `"none"`, `"single"`, `"double"` |
+| `continuation_indent` | `integer` | Indent width for continuation lines |
+| `max_line_length` | `integer` | Maximum line length before wrapping |
+| `end_of_line` | `string` | `"crlf"`, `"lf"`, `"cr"`, `"auto"`, `"unset"` |
+| `table_separator_style` | `string` | `"none"`, `"comma"`, `"semicolon"`, `"only_kv_colon"` |
+| `trailing_table_separator` | `string` | `"keep"`, `"never"`, `"always"`, `"smart"` |
+| `call_arg_parentheses` | `string` | `"keep"`, `"remove"`, `"remove_table_only"`, `"remove_string_only"` |
+| `detect_end_of_line` | `boolean` | Detect line ending style from file content |
+| `insert_final_newline` | `boolean` | Insert final newline at end of file |
+
+#### Space
+
+| Key | Type | Values / Description |
+|-----|------|----------------------|
+| `space_around_table_field_list` | `boolean` | Spaces inside table braces (`{ a = 1 }`) |
+| `space_before_attribute` | `boolean` | Space before attributes |
+| `space_before_function_open_parenthesis` | `boolean` | Space before `(` in function declarations |
+| `space_before_function_call_open_parenthesis` | `boolean` | Space before `(` in function calls |
+| `space_before_closure_open_parenthesis` | `boolean` | Space before `(` in closures/lambdas |
+| `space_before_function_call_single_arg` | `string` | `"always"`, `"only_string"`, `"only_table"`, `"none"` |
+| `space_before_open_square_bracket` | `boolean` | Space before `[` |
+| `space_inside_function_call_parentheses` | `boolean` | Spaces inside call parentheses |
+| `space_inside_function_param_list_parentheses` | `boolean` | Spaces inside function parameter parentheses |
+| `space_inside_square_brackets` | `boolean` | Spaces inside square brackets |
+| `space_around_table_append_operator` | `boolean` | Spaces around table append operator |
+| `ignore_spaces_inside_function_call` | `boolean` | Preserve existing spaces inside call args |
+| `space_before_inline_comment` | `integer \| string` | Number of spaces before inline `--`, or `"keep"` |
+| `space_after_comment_dash` | `boolean` | Space after comment dashes (`--`) |
+
+#### Operator Space
+
+| Key | Type | Values / Description |
+|-----|------|----------------------|
+| `space_around_math_operator` | `boolean` | Spaces around math operators (`+`, `-`, `*`, `/`, etc.) |
+| `space_after_comma` | `boolean` | Space after commas |
+| `space_after_comma_in_for_statement` | `boolean` | Space after commas in `for` statements |
+| `space_around_concat_operator` | `boolean` | Spaces around concatenation operator (`..`) |
+| `space_around_logical_operator` | `boolean` | Spaces around logical operators (`and`, `or`, `not`) |
+| `space_around_assign_operator` | `boolean` | Spaces around assignment operator (`=`) |
+
+#### Align
+
+| Key | Type | Values / Description |
+|-----|------|----------------------|
+| `align_call_args` | `boolean` | Align multiline call arguments |
+| `align_function_params` | `boolean` | Align multiline function parameters |
+| `align_continuous_assign_statement` | `string` | `"true"`, `"false"`, `"always"` |
+| `align_continuous_rect_table_field` | `boolean` | Align continuous rectangular table fields |
+| `align_continuous_line_space` | `integer` | Allowed line gap inside one aligned block |
+| `align_if_branch` | `boolean` | Align `if`/`elseif`/`else` branches |
+| `align_array_table` | `string` | `"none"`, `"always"`, `"contain_curly"` |
+| `align_continuous_similar_call_args` | `boolean` | Align similar consecutive call arguments |
+| `align_continuous_inline_comment` | `boolean` | Align consecutive inline comments |
+| `align_chain_expr` | `string` | `"none"`, `"always"`, `"only_call_stmt"` |
+
+#### Indent
+
+| Key | Type | Values / Description |
+|-----|------|----------------------|
+| `never_indent_before_if_condition` | `boolean` | Do not indent before `if` conditions |
+| `never_indent_comment_on_if_branch` | `boolean` | Do not indent comments on `if` branches |
+| `keep_indents_on_empty_lines` | `boolean` | Preserve indentation on empty lines |
+| `allow_non_indented_comments` | `boolean` | Allow comments to remain non-indented |
+
+#### Line Space
+
+These keys accept string expressions such as `"keep"`, `"fixed(n)"`, `"min(n)"`, and `"max(n)"`.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `line_space_after_if_statement` | `string` | Line spacing after `if` statements |
+| `line_space_after_do_statement` | `string` | Line spacing after `do` statements |
+| `line_space_after_while_statement` | `string` | Line spacing after `while` statements |
+| `line_space_after_repeat_statement` | `string` | Line spacing after `repeat` statements |
+| `line_space_after_for_statement` | `string` | Line spacing after `for` statements |
+| `line_space_after_local_or_assign_statement` | `string` | Line spacing after local/assignment statements |
+| `line_space_after_function_statement` | `string` | Line spacing after function statements |
+| `line_space_after_expression_statement` | `string` | Line spacing after expression statements |
+| `line_space_after_comment` | `string` | Line spacing after comments |
+| `line_space_around_block` | `string` | Line spacing around blocks |
+
+#### Line Break
+
+| Key | Type | Values / Description |
+|-----|------|----------------------|
+| `break_all_list_when_line_exceed` | `boolean` | Break list items once a line exceeds max length |
+| `auto_collapse_lines` | `boolean` | Auto-collapse short multiline expressions |
+| `break_before_braces` | `boolean` | Place opening braces on new line |
+
+#### Preference
+
+| Key | Type | Values / Description |
+|-----|------|----------------------|
+| `ignore_space_after_colon` | `boolean` | Ignore spacing after `:` |
+| `remove_call_expression_list_finish_comma` | `boolean` | Remove trailing comma in call argument lists |
+| `end_statement_with_semicolon` | `string` | `"keep"`, `"always"`, `"same_line"`, `"replace_with_newline"`, `"never"` |
 
 ---
 
@@ -464,11 +591,11 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `requirePath` | `boolean` | `false` | Strict require path checking |
-| `typeCall` | `boolean` | `false` | Strict type call checking |
 | `arrayIndex` | `boolean` | `true` | Strict array index checking |
 | `metaOverrideFileDefine` | `boolean` | `true` | Meta definitions override file definitions |
-| `docBaseConstMatchBaseType` | `boolean` | `false` | Allow base constants to match base types |
+| `docBaseConstMatchBaseType` | `boolean` | `true` | Allow base constants to match base types |
 | `requireExportGlobal` | `boolean` | `false` | Require `---@export global` for library visibility |
+| `allowNullableAsNonNullable` | `boolean` | `true` | Allow nullable types (`T?`) to be passed where non-nullable (`T`) is expected |
 
 ---
 
