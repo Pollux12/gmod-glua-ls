@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcReformat {
-    /// Whether to enable external tool formatting.
+    /// External formatter tool configuration. When set, the specified program is used for formatting instead of the built-in formatter.
     #[serde(default)]
     pub external_tool: Option<EmmyrcExternalTool>,
 
-    /// Whether to enable external tool range formatting.
+    /// External formatter for range formatting. When set, range format requests use this tool instead of the built-in formatter.
     #[serde(default)]
     pub external_tool_range_format: Option<EmmyrcExternalTool>,
 
@@ -16,17 +16,17 @@ pub struct EmmyrcReformat {
     #[serde(default = "default_false")]
     pub use_diff: bool,
 
-    /// Preset formatting profile for the built-in formatter.
+    /// Built-in formatter preset. `default` uses EmmyLuaCodeStyle defaults. `cfc` applies the CFC style preset. `custom` applies no preset — only the `styleOverrides` you configure below take effect.
     #[serde(default)]
     #[schemars(extend("x-vscode-setting" = true))]
     pub preset: EmmyrcFormatPreset,
 
-    /// Precedence between formatter settings from .gluarc and discovered .editorconfig files.
+    /// Controls which takes precedence when both `.editorconfig` and `.gluarc.json` formatter settings apply to the same option: `preferEditorconfig` (default) or `preferGluarc`.
     #[serde(default)]
     #[schemars(extend("x-vscode-setting" = true))]
     pub config_precedence: EmmyrcFormatConfigPrecedence,
 
-    /// EmmyLuaCodeStyle overrides applied on top of the selected preset.
+    /// Per-key EmmyLuaCodeStyle style overrides applied on top of the selected preset. Keys not configured here inherit their value from the active preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub style_overrides: Option<EmmyrcFormatStyleOverrides>,
@@ -42,28 +42,28 @@ pub struct EmmyrcFormatStyleOverrides {
     /// Number of spaces used for one indentation level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indent_size: Option<u32>,
-    /// Visual width of a tab character.
+    /// Display width of a tab character in spaces, used for visual alignment calculations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_width: Option<u32>,
-    /// Preferred quote style.
+    /// Preferred quote style for string literals. `none` preserves the original style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote_style: Option<EmmyrcFormatQuoteStyle>,
-    /// Indentation width for continuation lines.
+    /// Number of extra spaces used for indenting continuation lines when a line is wrapped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_indent: Option<u32>,
-    /// Maximum line length before wrapping.
+    /// Column limit before the formatter wraps items onto new lines. Set to `"unset"` to disable line length enforcement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_line_length: Option<EmmyrcFormatMaxLineLength>,
     /// Line ending preference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_of_line: Option<EmmyrcFormatEndOfLine>,
-    /// Table field separator style.
+    /// Separator character used between table fields (`none`, `comma`, `semicolon`, `only_kv_colon`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_separator_style: Option<EmmyrcFormatTableSeparatorStyle>,
-    /// Trailing separator policy for table literals.
+    /// Whether to add or remove a trailing separator after the last field in a table (`keep`, `never`, `always`, `smart`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trailing_table_separator: Option<EmmyrcFormatTrailingTableSeparator>,
-    /// Parenthesis handling for single table/string call arguments.
+    /// How to handle parentheses around single-argument function calls with a string or table literal (`keep`, `remove`, `remove_table_only`, `remove_string_only`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_arg_parentheses: Option<EmmyrcFormatCallArgParentheses>,
     /// Detect line endings from file content.
@@ -72,106 +72,108 @@ pub struct EmmyrcFormatStyleOverrides {
     /// Ensure file ends with a newline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insert_final_newline: Option<bool>,
-    /// Add spaces inside table braces.
+    /// Add spaces inside table braces, e.g. `{ a = 1 }` vs `{a = 1}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_around_table_field_list: Option<bool>,
-    /// Add space before attributes.
+    /// Add a space before Lua attribute annotations, e.g. `local x <const>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_before_attribute: Option<bool>,
-    /// Add space before `(` in function declarations.
+    /// Add a space before `(` in function declarations, e.g. `function foo ()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_before_function_open_parenthesis: Option<bool>,
-    /// Add space before `(` in function calls.
+    /// Add a space before `(` in function calls, e.g. `print ('hello')`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_before_function_call_open_parenthesis: Option<bool>,
-    /// Add space before `(` in closure/lambda syntax.
+    /// Add a space before `(` in anonymous function expressions, e.g. `function ()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_before_closure_open_parenthesis: Option<bool>,
-    /// Space style for single function call arguments.
+    /// Space handling before a single string or table literal argument: `always`, `only_string`, `only_table`, or `none`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_before_function_call_single_arg: Option<EmmyrcFormatSpaceBeforeFunctionCallSingleArg>,
-    /// Add space before `[`.
+    /// Add a space before `[` in table index expressions, e.g. `t [key]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_before_open_square_bracket: Option<bool>,
-    /// Add spaces inside call parentheses.
+    /// Add spaces inside function call parentheses, e.g. `print( 'hello' )`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_inside_function_call_parentheses: Option<bool>,
-    /// Add spaces inside function parameter list parentheses.
+    /// Add spaces inside function parameter list parentheses, e.g. `function foo( a, b )`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_inside_function_param_list_parentheses: Option<bool>,
-    /// Add spaces inside square brackets.
+    /// Add spaces inside square bracket index expressions, e.g. `t[ 1 ]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_inside_square_brackets: Option<bool>,
-    /// Add spaces around table append operator.
+    /// Add spaces around the table append operator (`#t + 1` style appends).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_around_table_append_operator: Option<bool>,
-    /// Ignore spaces already present inside function calls.
+    /// When `true`, preserve existing spacing inside function call arguments instead of normalizing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_spaces_inside_function_call: Option<bool>,
-    /// Spaces before inline comments.
+    /// Number of spaces to enforce before inline comments (`--`), or `"keep"` to preserve existing spacing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_before_inline_comment: Option<EmmyrcFormatSpaceBeforeInlineComment>,
-    /// Insert one space after comment dashes (`--`).
+    /// Ensure a single space exists after the comment dash prefix (`--`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_after_comment_dash: Option<bool>,
-    /// Add spaces around math operators.
+    /// Add spaces around math operators (`+`, `-`, `*`, `/`, `%`, `^`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_around_math_operator: Option<bool>,
-    /// Add a space after commas.
+    /// Add a space after commas in expressions and argument lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_after_comma: Option<bool>,
-    /// Add a space after commas in `for` statements.
+    /// Add a space after commas in `for` loop range expressions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_after_comma_in_for_statement: Option<bool>,
-    /// Add spaces around concatenation operators.
+    /// Spaces around the concatenation operator (`..`). Accepts `true`/`false`, or `"none"` (no spaces), `"always"` (spaces on both sides), `"no_space_asym"` (space on left side only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<EmmyrcFormatAsymmetricOperatorSpacing>")]
     pub space_around_concat_operator: Option<EmmyrcFormatSpaceAroundConcatOperator>,
-    /// Add spaces around logical operators.
+    /// Add spaces around logical operators (`and`, `or`, `not`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_around_logical_operator: Option<bool>,
-    /// Add spaces around assignment operators.
+    /// Spaces around assignment operators (`=`). Accepts `true`/`false`, or `"none"` (no spaces), `"always"` (spaces on both sides), `"no_space_asym"` (asymmetric spacing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<EmmyrcFormatAsymmetricOperatorSpacing>")]
     pub space_around_assign_operator: Option<EmmyrcFormatSpaceAroundAssignOperator>,
-    /// Align function call arguments.
+    /// Vertically align arguments of multi-line function calls to the opening parenthesis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_call_args: Option<bool>,
-    /// Align function parameters.
+    /// Vertically align parameters in multi-line function declarations to the opening parenthesis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_function_params: Option<bool>,
-    /// Align continuous assignment statements.
+    /// Align consecutive assignment statements on their `=` sign (`true` aligns within a block, `always` aligns across blank lines, `false` disables).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_continuous_assign_statement: Option<EmmyrcFormatAlignContinuousAssignStatement>,
-    /// Align continuous rectangular table fields.
+    /// Align key-value fields in rectangular table literals so that `=` signs line up vertically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_continuous_rect_table_field: Option<bool>,
-    /// Maximum blank-line gap considered part of one aligned block.
+    /// Maximum number of blank lines between consecutive statements before they are no longer considered part of the same aligned block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_continuous_line_space: Option<u32>,
-    /// Align `if`/`elseif`/`else` branches.
+    /// Vertically align `if` / `elseif` / `else` condition keywords.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_if_branch: Option<bool>,
-    /// Align array table items.
+    /// Array table layout: `none` keeps items inline, `always` puts each item on its own line, `contain_curly` uses multiline only when a nested table is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_array_table: Option<EmmyrcFormatAlignArrayTable>,
-    /// Align similar consecutive call arguments.
+    /// Align arguments across similar consecutive function calls so that matching argument positions line up vertically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_continuous_similar_call_args: Option<bool>,
-    /// Align inline comments in consecutive lines.
+    /// Align the `--` of inline comments across consecutive lines so they form a vertical column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_continuous_inline_comment: Option<bool>,
-    /// Align chained expressions.
+    /// Align chained method / field expressions: `none` disables, `always` aligns all chains, `only_call_stmt` aligns only call statement chains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_chain_expr: Option<EmmyrcFormatAlignChainExpr>,
-    /// Do not indent before `if` conditions.
+    /// Do not add extra indentation to wrapped `if`/`elseif` condition expressions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub never_indent_before_if_condition: Option<bool>,
-    /// Do not indent comments on `if` branches.
+    /// Do not indent a lone comment that appears inside an `if` branch body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub never_indent_comment_on_if_branch: Option<bool>,
-    /// Preserve indentation on empty lines.
+    /// Keep indentation whitespace on otherwise blank lines instead of stripping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_indents_on_empty_lines: Option<bool>,
-    /// Allow top-level comments to remain non-indented.
+    /// Allow comments that start at column 0 to remain un-indented even when inside an indented block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_non_indented_comments: Option<bool>,
     /// Line spacing after `if` statements (`keep`, `fixed(n)`, `min(n)`, `max(n)`).
@@ -204,22 +206,22 @@ pub struct EmmyrcFormatStyleOverrides {
     /// Line spacing around blocks (`keep`, `fixed(n)`, `min(n)`, `max(n)`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_space_around_block: Option<String>,
-    /// Break all list items once max line length is exceeded.
+    /// When a line exceeds `max_line_length`, break every item in the containing list onto its own line rather than only the overflowing item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub break_all_list_when_line_exceed: Option<bool>,
-    /// Collapse short multi-line expressions into one line.
+    /// Collapse short multi-statement blocks into a single line when they fit within `max_line_length`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_collapse_lines: Option<bool>,
-    /// Move opening braces onto a new line.
+    /// Place the opening `{` of a table constructor on a new line instead of at the end of the preceding line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub break_before_braces: Option<bool>,
-    /// Ignore spaces after colons.
+    /// Do not normalize spacing after `:` in method call and definition syntax.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_space_after_colon: Option<bool>,
-    /// Remove trailing commas in call expression argument lists.
+    /// Remove trailing commas that appear at the end of function call argument lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_call_expression_list_finish_comma: Option<bool>,
-    /// Semicolon handling at statement end.
+    /// Semicolon handling: `keep` preserves existing, `always` adds to all statements, `same_line` adds between same-line statements, `replace_with_newline` replaces semicolons with newlines, `never` removes all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_statement_with_semicolon: Option<EmmyrcFormatEndStatementWithSemicolon>,
 }
@@ -417,12 +419,12 @@ pub struct EmmyrcExternalTool {
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum EmmyrcFormatPreset {
-    /// Preserve EmmyLuaCodeStyle defaults.
+    /// Use EmmyLuaCodeStyle built-in defaults. No style overrides are applied.
     #[default]
     Default,
-    /// Apply the built-in CFC-oriented formatting preset.
+    /// Apply the built-in CFC (Clockwork Fighters Community) style preset: 4-space indentation, spaces inside parentheses, semicolons replaced with newlines.
     Cfc,
-    /// Use only style_overrides.
+    /// Apply no preset. Only the `styleOverrides` you configure explicitly take effect; everything else uses the formatter's compiled-in default.
     Custom,
 }
 

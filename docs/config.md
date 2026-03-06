@@ -220,10 +220,10 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 |-----|------|----------------------|
 | `indent_style` | `string` | `"tab"`, `"space"` |
 | `indent_size` | `integer` | Indent size in spaces |
-| `tab_width` | `integer` | Display width for tab characters |
+| `tab_width` | `integer` | Visual display width of a tab character in spaces (for alignment calculations) |
 | `quote_style` | `string` | `"none"`, `"single"`, `"double"` |
-| `continuation_indent` | `integer` | Indent width for continuation lines |
-| `max_line_length` | `integer` | Maximum line length before wrapping |
+| `continuation_indent` | `integer` | Extra spaces added to wrapped continuation lines |
+| `max_line_length` | `integer \| string` | Column limit before wrapping; use `"unset"` to disable |
 | `end_of_line` | `string` | `"crlf"`, `"lf"`, `"cr"`, `"auto"`, `"unset"` |
 | `table_separator_style` | `string` | `"none"`, `"comma"`, `"semicolon"`, `"only_kv_colon"` |
 | `trailing_table_separator` | `string` | `"keep"`, `"never"`, `"always"`, `"smart"` |
@@ -257,9 +257,9 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `space_around_math_operator` | `boolean` | Spaces around math operators (`+`, `-`, `*`, `/`, etc.) |
 | `space_after_comma` | `boolean` | Space after commas |
 | `space_after_comma_in_for_statement` | `boolean` | Space after commas in `for` statements |
-| `space_around_concat_operator` | `boolean` | Spaces around concatenation operator (`..`) |
+| `space_around_concat_operator` | `boolean \| string` | Spaces around concatenation operator (`..`); also accepts `"none"`, `"always"`, `"no_space_asym"` |
 | `space_around_logical_operator` | `boolean` | Spaces around logical operators (`and`, `or`, `not`) |
-| `space_around_assign_operator` | `boolean` | Spaces around assignment operator (`=`) |
+| `space_around_assign_operator` | `boolean \| string` | Spaces around assignment operator (`=`); also accepts `"none"`, `"always"`, `"no_space_asym"` |
 
 #### Align
 
@@ -269,7 +269,7 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `align_function_params` | `boolean` | Align multiline function parameters |
 | `align_continuous_assign_statement` | `string` | `"true"`, `"false"`, `"always"` |
 | `align_continuous_rect_table_field` | `boolean` | Align continuous rectangular table fields |
-| `align_continuous_line_space` | `integer` | Allowed line gap inside one aligned block |
+| `align_continuous_line_space` | `integer` | Maximum blank-line gap between consecutive statements still considered part of the same aligned block |
 | `align_if_branch` | `boolean` | Align `if`/`elseif`/`else` branches |
 | `align_array_table` | `string` | `"none"`, `"always"`, `"contain_curly"` |
 | `align_continuous_similar_call_args` | `boolean` | Align similar consecutive call arguments |
