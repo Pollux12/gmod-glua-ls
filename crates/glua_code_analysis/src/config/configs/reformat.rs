@@ -63,7 +63,7 @@ pub struct EmmyrcFormatStyleOverrides {
     /// Whether to add or remove a trailing separator after the last field in a table (`keep`, `never`, `always`, `smart`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trailing_table_separator: Option<EmmyrcFormatTrailingTableSeparator>,
-    /// How to handle parentheses around single-argument function calls with a string or table literal (`keep`, `remove`, `remove_table_only`, `remove_string_only`).
+    /// How to handle parentheses around single-argument function calls with a string or table literal (`keep`, `remove`, `remove_table_only`, `remove_string_only`, `always`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_arg_parentheses: Option<EmmyrcFormatCallArgParentheses>,
     /// Detect line endings from file content.
@@ -125,14 +125,12 @@ pub struct EmmyrcFormatStyleOverrides {
     pub space_after_comma_in_for_statement: Option<bool>,
     /// Spaces around the concatenation operator (`..`). Accepts `true`/`false`, or `"none"` (no spaces), `"always"` (spaces on both sides), `"no_space_asym"` (space on left side only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<EmmyrcFormatAsymmetricOperatorSpacing>")]
     pub space_around_concat_operator: Option<EmmyrcFormatSpaceAroundConcatOperator>,
     /// Add spaces around logical operators (`and`, `or`, `not`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_around_logical_operator: Option<bool>,
     /// Spaces around assignment operators (`=`). Accepts `true`/`false`, or `"none"` (no spaces), `"always"` (spaces on both sides), `"no_space_asym"` (asymmetric spacing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<EmmyrcFormatAsymmetricOperatorSpacing>")]
     pub space_around_assign_operator: Option<EmmyrcFormatSpaceAroundAssignOperator>,
     /// Vertically align arguments of multi-line function calls to the opening parenthesis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,9 +141,9 @@ pub struct EmmyrcFormatStyleOverrides {
     /// Align consecutive assignment statements on their `=` sign (`true` aligns within a block, `always` aligns across blank lines, `false` disables).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_continuous_assign_statement: Option<EmmyrcFormatAlignContinuousAssignStatement>,
-    /// Align key-value fields in rectangular table literals so that `=` signs line up vertically.
+    /// Align key-value fields in rectangular table literals so that `=` signs line up vertically (`true`, `false`, `always`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub align_continuous_rect_table_field: Option<bool>,
+    pub align_continuous_rect_table_field: Option<EmmyrcFormatAlignContinuousAssignStatement>,
     /// Maximum number of blank lines between consecutive statements before they are no longer considered part of the same aligned block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_continuous_line_space: Option<u32>,
@@ -215,12 +213,18 @@ pub struct EmmyrcFormatStyleOverrides {
     /// Place the opening `{` of a table constructor on a new line instead of at the end of the preceding line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub break_before_braces: Option<bool>,
+    /// When a function call already spans multiple lines, put each argument and the closing `)` on their own lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub break_multiline_call_expression_list: Option<bool>,
     /// Do not normalize spacing after `:` in method call and definition syntax.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_space_after_colon: Option<bool>,
     /// Remove trailing commas that appear at the end of function call argument lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_call_expression_list_finish_comma: Option<bool>,
+    /// Remove redundant parentheses around single-line condition expressions such as `if (x) then`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_redundant_condition_parentheses: Option<bool>,
     /// Semicolon handling: `keep` preserves existing, `always` adds to all statements, `same_line` adds between same-line statements, `replace_with_newline` replaces semicolons with newlines, `never` removes all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_statement_with_semicolon: Option<EmmyrcFormatEndStatementWithSemicolon>,
@@ -283,6 +287,7 @@ pub enum EmmyrcFormatCallArgParentheses {
     Remove,
     RemoveTableOnly,
     RemoveStringOnly,
+    Always,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq, Eq)]

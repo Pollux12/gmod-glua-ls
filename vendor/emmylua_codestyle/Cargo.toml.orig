@@ -1,0 +1,28 @@
+[package]
+name = "emmylua_codestyle"
+version = "0.6.0"
+edition = "2024"
+authors = ["CppCXY"]
+description = "Lua code formatting lib with EmmyLuaCodeStyle"
+license = "MIT"
+readme = "README.md"
+keywords = ["lua", "emmylua", "code", "style", "format"]
+categories = ["development-tools"]
+repository = "https://github.com/CppCXY/emmylua-codestyle-sys"
+include = [
+    "Cargo.toml",
+    "build.rs",
+    "src/**",
+    "3rd/EmmyLuaCodeStyle/3rd/wildcards/**",
+    "3rd/EmmyLuaCodeStyle/CodeFormatCLib/**",
+    "3rd/EmmyLuaCodeStyle/CodeFormatCore/**",
+    "3rd/EmmyLuaCodeStyle/LuaParser/**",
+    "3rd/EmmyLuaCodeStyle/Util/**",
+]
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.0"
+glob = "0.3.0"

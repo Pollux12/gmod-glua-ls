@@ -64,6 +64,9 @@ unicode-general-category = "1.0.0"
 luars = { version = "0.11.0", features = ["serde"] }
 reqwest = "0.13.1"
 
+[patch.crates-io]
+emmylua_codestyle = { path = "vendor/emmylua_codestyle" }
+
 # Lint configuration for the entire workspace
 [workspace.lints.clippy]
 # ==== Domain-Specific Allowances ====

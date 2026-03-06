@@ -596,8 +596,6 @@ dependencies = [
 [[package]]
 name = "emmylua_codestyle"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2fb179dd808be6e4da3dfc7dcbb058a9f3ee840e238e1bce62d317d0afdfca8"
 dependencies = [
  "cc",
  "glob",

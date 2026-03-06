@@ -227,7 +227,7 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `end_of_line` | `string` | `"crlf"`, `"lf"`, `"cr"`, `"auto"`, `"unset"` |
 | `table_separator_style` | `string` | `"none"`, `"comma"`, `"semicolon"`, `"only_kv_colon"` |
 | `trailing_table_separator` | `string` | `"keep"`, `"never"`, `"always"`, `"smart"` |
-| `call_arg_parentheses` | `string` | `"keep"`, `"remove"`, `"remove_table_only"`, `"remove_string_only"` |
+| `call_arg_parentheses` | `string` | `"keep"`, `"remove"`, `"remove_table_only"`, `"remove_string_only"`, `"always"` |
 | `detect_end_of_line` | `boolean` | Detect line ending style from file content |
 | `insert_final_newline` | `boolean` | Insert final newline at end of file |
 
@@ -268,7 +268,7 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `align_call_args` | `boolean` | Align multiline call arguments |
 | `align_function_params` | `boolean` | Align multiline function parameters |
 | `align_continuous_assign_statement` | `string` | `"true"`, `"false"`, `"always"` |
-| `align_continuous_rect_table_field` | `boolean` | Align continuous rectangular table fields |
+| `align_continuous_rect_table_field` | `string` | `"true"`, `"false"`, `"always"` |
 | `align_continuous_line_space` | `integer` | Maximum blank-line gap between consecutive statements still considered part of the same aligned block |
 | `align_if_branch` | `boolean` | Align `if`/`elseif`/`else` branches |
 | `align_array_table` | `string` | `"none"`, `"always"`, `"contain_curly"` |
@@ -309,6 +309,7 @@ These keys accept string expressions such as `"keep"`, `"fixed(n)"`, `"min(n)"`,
 | `break_all_list_when_line_exceed` | `boolean` | Break list items once a line exceeds max length |
 | `auto_collapse_lines` | `boolean` | Auto-collapse short multiline expressions |
 | `break_before_braces` | `boolean` | Place opening braces on new line |
+| `break_multiline_call_expression_list` | `boolean` | When a function call is already multiline, place each argument and the closing `)` on their own lines |
 
 #### Preference
 
@@ -316,6 +317,7 @@ These keys accept string expressions such as `"keep"`, `"fixed(n)"`, `"min(n)"`,
 |-----|------|----------------------|
 | `ignore_space_after_colon` | `boolean` | Ignore spacing after `:` |
 | `remove_call_expression_list_finish_comma` | `boolean` | Remove trailing comma in call argument lists |
+| `remove_redundant_condition_parentheses` | `boolean` | Remove redundant parentheses around single-line condition expressions |
 | `end_statement_with_semicolon` | `string` | `"keep"`, `"always"`, `"same_line"`, `"replace_with_newline"`, `"never"` |
 
 ---
