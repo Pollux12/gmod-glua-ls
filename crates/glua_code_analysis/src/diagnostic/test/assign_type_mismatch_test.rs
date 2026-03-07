@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
@@ -690,6 +690,10 @@ return t
     #[test]
     fn test_pending() {
         let mut ws = VirtualWorkspace::new();
+        let mut config = Emmyrc::default();
+        config.strict.array_index = true;
+        ws.analysis.update_config(config.into());
+
         assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"

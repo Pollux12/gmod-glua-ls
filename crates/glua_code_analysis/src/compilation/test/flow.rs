@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, LuaType, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
 
     #[test]
     fn test_closure_return() {
@@ -1254,6 +1254,10 @@ end
     #[test]
     fn test_issue_524() {
         let mut ws = VirtualWorkspace::new();
+        let mut config = Emmyrc::default();
+        config.strict.array_index = true;
+        ws.analysis.update_config(config.into());
+
         ws.def(
             r#"
             ---@type string[]

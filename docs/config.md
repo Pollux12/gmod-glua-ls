@@ -593,7 +593,7 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `requirePath` | `boolean` | `false` | Strict require path checking |
-| `arrayIndex` | `boolean` | `true` | Strict array index checking |
+| `arrayIndex` | `boolean` | `false` | Strict array index checking |
 | `metaOverrideFileDefine` | `boolean` | `true` | Meta definitions override file definitions |
 | `docBaseConstMatchBaseType` | `boolean` | `true` | Allow base constants to match base types |
 | `requireExportGlobal` | `boolean` | `false` | Require `---@export global` for library visibility |
@@ -719,7 +719,7 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
   },
   "strict": {
     "requirePath": false,
-    "arrayIndex": true,
+    "arrayIndex": false,
     "metaOverrideFileDefine": true
   },
   "semanticTokens": {

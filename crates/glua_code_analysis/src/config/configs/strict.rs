@@ -17,7 +17,7 @@ pub struct EmmyrcStrict {
     #[serde(default)]
     pub require_path: bool,
     /// Whether to enable strict mode array indexing.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub array_index: bool,
     /// meta define overrides file define
     #[serde(default = "default_true")]
@@ -39,11 +39,28 @@ impl Default for EmmyrcStrict {
     fn default() -> Self {
         Self {
             require_path: false,
-            array_index: true,
+            array_index: false,
             meta_override_file_define: true,
             doc_base_const_match_base_type: true,
             require_export_global: false,
             allow_nullable_as_non_nullable: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmmyrcStrict;
+
+    #[test]
+    fn test_strict_defaults() {
+        let strict: EmmyrcStrict = serde_json::from_str("{}").unwrap();
+
+        assert!(!strict.require_path);
+        assert!(!strict.array_index);
+        assert!(strict.meta_override_file_define);
+        assert!(strict.doc_base_const_match_base_type);
+        assert!(!strict.require_export_global);
+        assert!(strict.allow_nullable_as_non_nullable);
     }
 }

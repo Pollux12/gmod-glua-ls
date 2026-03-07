@@ -213,7 +213,7 @@
       "$ref": "#/$defs/EmmyrcStrict",
       "default": {
         "allowNullableAsNonNullable": true,
-        "arrayIndex": true,
+        "arrayIndex": false,
         "docBaseConstMatchBaseType": true,
         "metaOverrideFileDefine": true,
         "requireExportGlobal": false,
@@ -2279,7 +2279,7 @@
         "arrayIndex": {
           "description": "Whether to enable strict mode array indexing.",
           "type": "boolean",
-          "default": true
+          "default": false
         },
         "docBaseConstMatchBaseType": {
           "description": "Base constant types defined in doc can match base types, allowing int to match `---@alias id 1|2|3`, same for string.",
