@@ -1,8 +1,12 @@
-use glua_parser::{LuaAssignStat, LuaAstNode, LuaChunk, LuaExpr, LuaVarExpr};
+use glua_parser::{
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey,
+    LuaLiteralToken, LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
+};
 
 use crate::{
-    CacheEntry, DbIndex, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason, LuaDeclId,
-    LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, TypeOps, infer_expr,
+    CacheEntry, DbIndex, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason, LuaArrayType,
+    LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType,
+    TypeOps, infer_expr,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
         narrow::{
@@ -216,6 +220,12 @@ fn get_type_at_assign_stat(
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let (vars, exprs) = assign_stat.get_var_and_expr_list();
     for (i, var) in vars.iter().cloned().enumerate() {
+        if let Some(prefix_collection_type) = maybe_get_collection_append_assignment_type(
+            db, tree, cache, root, var_ref_id, flow_node, &var, &exprs, i,
+        )? {
+            return Ok(ResultTypeOrContinue::Result(prefix_collection_type));
+        }
+
         let Some(maybe_ref_id) = get_var_expr_var_ref_id(db, cache, var.to_expr()) else {
             continue;
         };
@@ -272,6 +282,185 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_get_collection_append_assignment_type(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    var: &LuaVarExpr,
+    exprs: &[LuaExpr],
+    idx: usize,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let LuaVarExpr::IndexExpr(index_expr) = var else {
+        return Ok(None);
+    };
+    if !is_collection_append_write(index_expr) {
+        return Ok(None);
+    }
+
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return Ok(None);
+    };
+    let LuaExpr::IndexExpr(prefix_index_expr) = prefix_expr else {
+        return Ok(None);
+    };
+    let Some(prefix_var_ref_id) =
+        get_var_expr_var_ref_id(db, cache, LuaExpr::IndexExpr(prefix_index_expr.clone()))
+    else {
+        return Ok(None);
+    };
+    if prefix_var_ref_id != *var_ref_id {
+        return Ok(None);
+    }
+    if !is_inferred_member_collection_expr(db, cache, &prefix_index_expr)? {
+        return Ok(None);
+    }
+
+    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+    let source_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let Some(source_base) = infer_collection_base_type(db, &source_type) else {
+        return Ok(None);
+    };
+
+    let value_type = infer_expr_list_value_type_at(db, cache, exprs, idx)?;
+    let Some(value_type) = value_type else {
+        return Ok(None);
+    };
+
+    let widened_base = TypeOps::Union.apply(db, &source_base, &value_type);
+    Ok(Some(LuaType::Array(
+        LuaArrayType::from_base_type(widened_base).into(),
+    )))
+}
+
+fn is_collection_append_write(index_expr: &LuaIndexExpr) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(LuaIndexKey::Expr(index_key_expr)) = index_expr.get_index_key() else {
+        return false;
+    };
+    let LuaExpr::BinaryExpr(binary_expr) = index_key_expr else {
+        return false;
+    };
+    if binary_expr
+        .get_op_token()
+        .is_none_or(|token| token.get_op() != BinaryOperator::OpAdd)
+    {
+        return false;
+    }
+
+    let Some((left, right)) = binary_expr.get_exprs() else {
+        return false;
+    };
+    if !is_literal_integer_one(&right) {
+        return false;
+    }
+
+    let LuaExpr::UnaryExpr(unary_expr) = left else {
+        return false;
+    };
+    if unary_expr
+        .get_op_token()
+        .is_none_or(|token| token.get_op() != UnaryOperator::OpLen)
+    {
+        return false;
+    }
+
+    let Some(len_expr) = unary_expr.get_expr() else {
+        return false;
+    };
+    expr_access_path(&prefix_expr) == expr_access_path(&len_expr)
+}
+
+fn is_inferred_member_collection_expr(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> Result<bool, InferFailReason> {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return Ok(false);
+    };
+    let prefix_type = infer_expr(db, cache, prefix_expr)?;
+    let Some(owner) = get_member_owner_for_prefix_type(prefix_type) else {
+        return Ok(false);
+    };
+    let Some(index_key) = index_expr.get_index_key() else {
+        return Ok(false);
+    };
+    let member_key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
+    let members = db
+        .get_member_index()
+        .get_members_for_owner_key(&owner, &member_key);
+    if members.is_empty() {
+        return Ok(false);
+    }
+
+    let mut saw_collection = false;
+    for member in members {
+        let Some(type_cache) = db.get_type_index().get_type_cache(&member.get_id().into()) else {
+            continue;
+        };
+        if !type_cache.is_infer() {
+            return Ok(false);
+        }
+        if normalize_infer_collection_type(type_cache.as_type()).is_none() {
+            return Ok(false);
+        }
+        saw_collection = true;
+    }
+
+    Ok(saw_collection)
+}
+
+fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwner> {
+    match prefix_type {
+        LuaType::TableConst(in_file_range) => Some(LuaMemberOwner::Element(in_file_range)),
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(LuaMemberOwner::Type(def_id)),
+        LuaType::Instance(instance) => Some(LuaMemberOwner::Element(instance.get_range().clone())),
+        _ => None,
+    }
+}
+
+fn normalize_infer_collection_type(typ: &LuaType) -> Option<()> {
+    match typ {
+        LuaType::Array(_) => Some(()),
+        LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(()),
+        _ => None,
+    }
+}
+
+fn infer_collection_base_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
+    match typ {
+        LuaType::Array(array) => Some(array.get_base().clone()),
+        LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(tuple.cast_down_array_base(db)),
+        _ => None,
+    }
+}
+
+fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn is_literal_integer_one(expr: &LuaExpr) -> bool {
+    let LuaExpr::LiteralExpr(literal_expr) = expr else {
+        return false;
+    };
+
+    matches!(
+        literal_expr.get_literal(),
+        Some(LuaLiteralToken::Number(number))
+            if matches!(number.get_number_value(), NumberResult::Int(1))
+    )
 }
 
 fn try_infer_decl_initializer_type(

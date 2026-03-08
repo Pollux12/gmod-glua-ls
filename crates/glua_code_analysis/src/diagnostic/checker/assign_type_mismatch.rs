@@ -1,8 +1,9 @@
 use std::ops::Deref;
 
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaLocalStat,
-    LuaNameExpr, LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr, LuaVarExpr,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr,
+    LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr,
+    LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
 use rowan::{NodeOrToken, TextRange};
 
@@ -151,6 +152,10 @@ fn check_index_expr(
     expr: Option<LuaExpr>,
     value_type: LuaType,
 ) -> Option<()> {
+    if should_skip_inferred_member_collection_index_write(semantic_model, index_expr)? {
+        return Some(());
+    }
+
     let source_type = infer_index_expr(
         semantic_model.get_db(),
         &mut semantic_model.get_cache().borrow_mut(),
@@ -177,6 +182,127 @@ fn check_index_expr(
         );
     }
     Some(())
+}
+
+fn should_skip_inferred_member_collection_index_write(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> Option<bool> {
+    if !is_collection_append_write(index_expr)? {
+        return Some(false);
+    }
+
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let LuaExpr::IndexExpr(prefix_index_expr) = prefix_expr else {
+        return Some(false);
+    };
+
+    Some(is_inferred_member_collection_expr(
+        semantic_model,
+        &prefix_index_expr,
+    )?)
+}
+
+fn is_collection_append_write(index_expr: &LuaIndexExpr) -> Option<bool> {
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let glua_parser::LuaIndexKey::Expr(index_key_expr) = index_expr.get_index_key()? else {
+        return Some(false);
+    };
+    let LuaExpr::BinaryExpr(binary_expr) = index_key_expr else {
+        return Some(false);
+    };
+    if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpAdd {
+        return Some(false);
+    }
+
+    let (left, right) = binary_expr.get_exprs()?;
+    if !is_literal_integer_one(&right) {
+        return Some(false);
+    }
+
+    let LuaExpr::UnaryExpr(unary_expr) = left else {
+        return Some(false);
+    };
+    if unary_expr.get_op_token()?.get_op() != UnaryOperator::OpLen {
+        return Some(false);
+    }
+
+    let len_expr = unary_expr.get_expr()?;
+    Some(expr_access_path(&prefix_expr) == expr_access_path(&len_expr))
+}
+
+fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn is_literal_integer_one(expr: &LuaExpr) -> bool {
+    let LuaExpr::LiteralExpr(literal_expr) = expr else {
+        return false;
+    };
+
+    matches!(
+        literal_expr.get_literal(),
+        Some(LuaLiteralToken::Number(number))
+            if matches!(number.get_number_value(), NumberResult::Int(1))
+    )
+}
+
+fn is_inferred_member_collection_expr(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> Option<bool> {
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let prefix_type = semantic_model.infer_expr(prefix_expr).ok()?;
+    let owner = match prefix_type {
+        LuaType::TableConst(in_file_range) => crate::LuaMemberOwner::Element(in_file_range),
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => crate::LuaMemberOwner::Type(def_id),
+        LuaType::Instance(instance) => crate::LuaMemberOwner::Element(instance.get_range().clone()),
+        _ => return Some(false),
+    };
+
+    let index_key = index_expr.get_index_key()?;
+    let member_key = LuaMemberKey::from_index_key(
+        semantic_model.get_db(),
+        &mut semantic_model.get_cache().borrow_mut(),
+        &index_key,
+    )
+    .ok()?;
+    let members = semantic_model
+        .get_db()
+        .get_member_index()
+        .get_members_for_owner_key(&owner, &member_key);
+    if members.is_empty() {
+        return Some(false);
+    }
+
+    let mut saw_collection = false;
+    for member in members {
+        let Some(type_cache) = semantic_model
+            .get_db()
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())
+        else {
+            continue;
+        };
+        if !type_cache.is_infer() {
+            return Some(false);
+        }
+        let is_collection = match type_cache.as_type() {
+            LuaType::Array(_) => true,
+            LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
+            _ => false,
+        };
+        if !is_collection {
+            return Some(false);
+        }
+        saw_collection = true;
+    }
+
+    Some(saw_collection)
 }
 
 fn check_local_stat(

@@ -1644,6 +1644,133 @@ return t
     }
 
     #[test]
+    fn test_inferred_member_collection_can_be_reset_and_appended() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::AssignTypeMismatch);
+        let file_id = ws.def(
+            r#"
+                ---@class Seat
+                local Seat = {}
+
+                ---@class Vehicle
+                local Vehicle = {}
+
+                ---@param seat Seat
+                function Vehicle:test(seat)
+                    local selfTbl = self
+
+                    self.wheelTraceFilter = { self, "player", "npc_*" }
+                    selfTbl.wheelTraceFilter = { self, "player" }
+                    selfTbl.wheelTraceFilter[#selfTbl.wheelTraceFilter + 1] = seat
+                end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .expect("diagnostics should be available");
+        let code_string = Some(NumberOrString::String(
+            DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
+        ));
+        let assign_diags = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == code_string)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            assign_diags.is_empty(),
+            "unexpected assign-type-mismatch diagnostics: {:?}",
+            assign_diags
+        );
+    }
+
+    #[test]
+    fn test_inferred_member_collection_non_append_write_still_errors() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@class Seat
+                local Seat = {}
+
+                ---@class Vehicle
+                local Vehicle = {}
+
+                ---@param seat Seat
+                function Vehicle:test(seat)
+                    self.wheelTraceFilter = { self, "player" }
+                    self.wheelTraceFilter[2] = seat
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_inferred_member_collection_keeps_tuple_slot_precision() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@class Vehicle
+                local Vehicle = {}
+
+                function Vehicle:test()
+                    self.wheelTraceFilter = { self, "player" }
+
+                    ---@type string
+                    local tag = self.wheelTraceFilter[2]
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_annotated_tuple_member_collection_remains_strict() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@class Seat
+                local Seat = {}
+
+                ---@class Vehicle
+                ---@field wheelTraceFilter [Vehicle, "player", "npc_*"]
+                local Vehicle = {}
+
+                ---@param seat Seat
+                function Vehicle:test(seat)
+                    self.wheelTraceFilter = { self, "player" }
+                    self.wheelTraceFilter[#self.wheelTraceFilter + 1] = seat
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_annotated_array_member_collection_remains_strict() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@class Seat
+                local Seat = {}
+
+                ---@class Vehicle
+                ---@field wheelTraceFilter Vehicle[]
+                local Vehicle = {}
+
+                ---@param seat Seat
+                function Vehicle:test(seat)
+                    self.wheelTraceFilter = { self, self }
+                    self.wheelTraceFilter[#self.wheelTraceFilter + 1] = seat
+                end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_startup_stale_index_refresh_no_assign_mismatch_before_edit() {
         let mut ws = VirtualWorkspace::new();
         ws.analysis

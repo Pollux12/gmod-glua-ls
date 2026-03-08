@@ -232,6 +232,23 @@ impl LuaMemberIndex {
     pub fn get_member_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
         self.member_current_owner.get(id)
     }
+
+    pub fn get_members_for_owner_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> Vec<&LuaMember> {
+        self.members
+            .values()
+            .filter(|member| {
+                member.get_key() == key
+                    && self
+                        .member_current_owner
+                        .get(&member.get_id())
+                        .is_some_and(|current_owner| current_owner == owner)
+            })
+            .collect()
+    }
 }
 
 impl LuaIndex for LuaMemberIndex {

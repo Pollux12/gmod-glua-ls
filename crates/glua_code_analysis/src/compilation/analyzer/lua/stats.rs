@@ -1,11 +1,12 @@
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
-    LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaTableExpr, LuaTableField, LuaVarExpr,
-    PathTrait,
+    LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaTableExpr, LuaTableField,
+    LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
 
 use crate::{
-    InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId, LuaTypeCache, LuaTypeOwner,
+    InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId, LuaTypeCache,
+    LuaTypeOwner, TypeOps,
     compilation::analyzer::{
         common::{add_member, bind_type},
         unresolve::{UnResolveDecl, UnResolveMember},
@@ -326,6 +327,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 );
             }
         }
+        widen_existing_member_collection_type(analyzer, &var, &expr_type);
         assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0);
     }
 
@@ -381,9 +383,256 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = multi.get_type(idx).unwrap_or(&LuaType::Nil).clone();
     }
 
+    if let Some(widened_type) =
+        get_widened_member_assignment_collection_type(analyzer, &type_owner, &expr_type)
+    {
+        expr_type = widened_type;
+    }
+
     bind_type(analyzer.db, type_owner, LuaTypeCache::InferType(expr_type));
 
     Some(())
+}
+
+fn get_widened_member_assignment_collection_type(
+    analyzer: &mut LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+    incoming_type: &LuaType,
+) -> Option<LuaType> {
+    let LuaTypeOwner::Member(member_id) = type_owner else {
+        return None;
+    };
+    let incoming_array = normalize_infer_collection_type(analyzer.db, incoming_type)?;
+    let member_index = analyzer.db.get_member_index();
+    let owner = member_index.get_member_owner(member_id)?.clone();
+    let key = member_index.get_member(member_id)?.get_key().clone();
+    let related_members = member_index.get_members_for_owner_key(&owner, &key);
+    let mut widened_base = incoming_array.get_base().clone();
+    let mut saw_related_collection = false;
+
+    for related_member in related_members {
+        let related_member_id = related_member.get_id();
+        if related_member_id == *member_id {
+            continue;
+        }
+
+        let Some(existing_cache) = analyzer
+            .db
+            .get_type_index()
+            .get_type_cache(&related_member_id.into())
+            .cloned()
+        else {
+            continue;
+        };
+        if !existing_cache.is_infer() {
+            continue;
+        }
+
+        let Some(existing_array) =
+            normalize_infer_collection_type(analyzer.db, existing_cache.as_type())
+        else {
+            continue;
+        };
+        saw_related_collection = true;
+        widened_base = TypeOps::Union.apply(analyzer.db, existing_array.get_base(), &widened_base);
+    }
+
+    if !saw_related_collection {
+        return None;
+    }
+
+    Some(LuaType::Array(
+        LuaArrayType::from_base_type(widened_base).into(),
+    ))
+}
+
+fn widen_existing_member_collection_type(
+    analyzer: &mut LuaAnalyzer,
+    var: &LuaVarExpr,
+    value_type: &LuaType,
+) -> Option<()> {
+    let LuaVarExpr::IndexExpr(index_expr) = var else {
+        return Some(());
+    };
+
+    if let Some(member_ids) = find_related_member_ids(analyzer, index_expr.clone()) {
+        widen_member_collections_with_collection_type(analyzer, &member_ids, value_type);
+    }
+
+    if is_collection_append_write(index_expr)?
+        && let Some(prefix_expr) = index_expr.get_prefix_expr()
+        && let Some(prefix_index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
+        && let Some(member_ids) = find_related_member_ids(analyzer, prefix_index_expr)
+    {
+        widen_member_collections_with_element_type(analyzer, &member_ids, value_type);
+    }
+
+    Some(())
+}
+
+fn find_related_member_ids(
+    analyzer: &mut LuaAnalyzer,
+    index_expr: LuaIndexExpr,
+) -> Option<Vec<LuaMemberId>> {
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
+    let owner = get_member_owner_for_prefix_type(prefix_type)?;
+    let index_key = index_expr.get_index_key()?;
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let member_key = LuaMemberKey::from_index_key(analyzer.db, cache, &index_key).ok()?;
+    let members = analyzer
+        .db
+        .get_member_index()
+        .get_members_for_owner_key(&owner, &member_key);
+
+    if members.is_empty() {
+        return None;
+    }
+
+    Some(members.into_iter().map(|member| member.get_id()).collect())
+}
+
+fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwner> {
+    match prefix_type {
+        LuaType::TableConst(in_file_range) => Some(LuaMemberOwner::Element(in_file_range)),
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(LuaMemberOwner::Type(def_id)),
+        LuaType::Instance(instance) => Some(LuaMemberOwner::Element(instance.get_range().clone())),
+        _ => None,
+    }
+}
+
+fn is_collection_append_write(index_expr: &LuaIndexExpr) -> Option<bool> {
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let LuaIndexKey::Expr(index_key_expr) = index_expr.get_index_key()? else {
+        return Some(false);
+    };
+    let LuaExpr::BinaryExpr(binary_expr) = index_key_expr else {
+        return Some(false);
+    };
+    if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpAdd {
+        return Some(false);
+    }
+
+    let (left, right) = binary_expr.get_exprs()?;
+    if !is_literal_integer_one(&right) {
+        return Some(false);
+    }
+
+    let LuaExpr::UnaryExpr(unary_expr) = left else {
+        return Some(false);
+    };
+    if unary_expr.get_op_token()?.get_op() != UnaryOperator::OpLen {
+        return Some(false);
+    }
+
+    let len_expr = unary_expr.get_expr()?;
+    Some(expr_access_path(&prefix_expr) == expr_access_path(&len_expr))
+}
+
+fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn is_literal_integer_one(expr: &LuaExpr) -> bool {
+    let LuaExpr::LiteralExpr(literal_expr) = expr else {
+        return false;
+    };
+
+    matches!(
+        literal_expr.get_literal(),
+        Some(LuaLiteralToken::Number(number))
+            if matches!(number.get_number_value(), NumberResult::Int(1))
+    )
+}
+
+fn widen_member_collections_with_collection_type(
+    analyzer: &mut LuaAnalyzer,
+    member_ids: &[LuaMemberId],
+    incoming_type: &LuaType,
+) -> Option<()> {
+    let incoming_array = normalize_infer_collection_type(analyzer.db, incoming_type)?;
+
+    for member_id in member_ids {
+        let existing_cache = analyzer
+            .db
+            .get_type_index()
+            .get_type_cache(&(*member_id).into())
+            .cloned()?;
+        if !existing_cache.is_infer() {
+            continue;
+        }
+
+        let Some(existing_array) =
+            normalize_infer_collection_type(analyzer.db, existing_cache.as_type())
+        else {
+            continue;
+        };
+
+        let widened_base = TypeOps::Union.apply(
+            analyzer.db,
+            existing_array.get_base(),
+            incoming_array.get_base(),
+        );
+        analyzer.db.get_type_index_mut().force_bind_type(
+            (*member_id).into(),
+            LuaTypeCache::InferType(LuaType::Array(
+                LuaArrayType::from_base_type(widened_base).into(),
+            )),
+        );
+    }
+
+    Some(())
+}
+
+fn widen_member_collections_with_element_type(
+    analyzer: &mut LuaAnalyzer,
+    member_ids: &[LuaMemberId],
+    element_type: &LuaType,
+) -> Option<()> {
+    for member_id in member_ids {
+        let existing_cache = analyzer
+            .db
+            .get_type_index()
+            .get_type_cache(&(*member_id).into())
+            .cloned()?;
+        if !existing_cache.is_infer() {
+            continue;
+        }
+
+        let Some(existing_array) =
+            normalize_infer_collection_type(analyzer.db, existing_cache.as_type())
+        else {
+            continue;
+        };
+
+        let widened_base =
+            TypeOps::Union.apply(analyzer.db, existing_array.get_base(), element_type);
+        analyzer.db.get_type_index_mut().force_bind_type(
+            (*member_id).into(),
+            LuaTypeCache::InferType(LuaType::Array(
+                LuaArrayType::from_base_type(widened_base).into(),
+            )),
+        );
+    }
+
+    Some(())
+}
+
+fn normalize_infer_collection_type(db: &crate::DbIndex, typ: &LuaType) -> Option<LuaArrayType> {
+    match typ {
+        LuaType::Array(array) => Some(LuaArrayType::from_base_type(array.get_base().clone())),
+        LuaType::Tuple(tuple) if tuple.is_infer_resolve() => {
+            Some(LuaArrayType::from_base_type(tuple.cast_down_array_base(db)))
+        }
+        _ => None,
+    }
 }
 
 fn merge_type_owner_and_unresolve_expr(
