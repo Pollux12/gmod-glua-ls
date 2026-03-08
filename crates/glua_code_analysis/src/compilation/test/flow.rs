@@ -1793,6 +1793,41 @@ _2 = a[1]
     }
 
     #[test]
+    fn test_builtin_gmod_param_name_fallback_infers_common_params() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Player
+            ---@field Nick fun(self: Player): string
+
+            ---@class Entity
+            ---@field EntIndex fun(self: Entity): integer
+
+            local function enter(ply, ent)
+                A = ply
+                B = ent
+                C = ply:Nick()
+                D = ent:EntIndex()
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let a = ws.expr_ty("A");
+        let b = ws.expr_ty("B");
+        let c = ws.expr_ty("C");
+        let d = ws.expr_ty("D");
+
+        assert_eq!(ws.humanize_type(a), "Player");
+        assert_eq!(ws.humanize_type(b), "Entity");
+        assert_eq!(ws.humanize_type(c), "string");
+        assert_eq!(ws.humanize_type(d), "integer");
+    }
+
+    #[test]
     fn test_gmod_param_name_hint_infers_unannotated_param_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
@@ -1822,6 +1857,29 @@ _2 = a[1]
         assert_eq!(ws.humanize_type(a), "HintVehicle");
         let b = ws.expr_ty("B");
         assert_eq!(ws.humanize_type(b), "Entity");
+    }
+
+    #[test]
+    fn test_explicit_param_annotation_overrides_gmod_name_fallback() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Player
+            ---@class CustomPlayer: Player
+
+            ---@param ply CustomPlayer
+            local function enter(ply)
+                A = ply
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "CustomPlayer");
     }
 
     #[test]

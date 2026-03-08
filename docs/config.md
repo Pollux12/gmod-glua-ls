@@ -332,7 +332,7 @@ These keys accept string expressions such as `"keep"`, `"fixed(n)"`, `"min(n)"`,
 | `detectRealmFromCalls` | `boolean \| null` | `true` | Detect realm from API usage |
 | `inferDynamicFields` | `boolean` | `true` | Track dynamic fields on GMod objects |
 | `dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files (`false` keeps completion results file-scoped) |
-| `fileParamDefaults` | `object` | built-in map | Parameter-name to type-name hints for unannotated params (for example `{ "ply": "Player" }`) |
+| `fileParamDefaults` | `object` | built-in map | Parameter-name to type-name fallback hints for otherwise unresolved params. Fully configurable per workspace, and editable in the GLua settings UI. |
 | `scriptedClassScopes.include` | `string[]` | `["entities/**", "weapons/**", "effects/**", "weapons/gmod_tool/stools/**"]` | Glob patterns for scripted class extraction |
 | `scriptedClassScopes.exclude` | `string[]` | `[]` | Patterns to exclude from scripted class extraction |
 | `hookMappings.methodToHook` | `object` | `{}` | Map methods to hook names |
@@ -340,6 +340,8 @@ These keys accept string expressions such as `"keep"`, `"fixed(n)"`, `"min(n)"`,
 | `hookMappings.methodPrefixes` | `string[]` | `[]` | Additional prefixes for hook auto-detection |
 | `vgui.codeLensEnabled` | `boolean` | `true` | Enable Code Lenses for VGUI panel definitions |
 | `vgui.inlayHintEnabled` | `boolean` | `false` | Enable Inlay Hints for VGUI panel definitions |
+
+`gmod.fileParamDefaults` is applied as an override layer on top of the built-in fallback map. When editing raw JSON directly, set a value to `""` to remove a built-in fallback for your workspace while still inheriting future upstream additions.
 
 ### gmod.network
 
@@ -663,8 +665,10 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
     "inferDynamicFields": true,
     "dynamicFieldsGlobal": true,
     "fileParamDefaults": {
+      "ent": "Entity",
       "ply": "Player",
-      "vehicle": "Entity"
+      "vehicle": "base_glide",
+      "npc": ""
     },
     "scriptedClassScopes": {
       "include": [

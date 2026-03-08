@@ -709,8 +709,16 @@ mod tests {
             .collect::<Vec<_>>();
         let unique_titles = titles.iter().copied().collect::<HashSet<_>>();
 
-        assert_eq!(CFC_GUIDELINES.len(), 40, "update the inventory when the CFC guideline list changes");
-        assert_eq!(unique_titles.len(), CFC_GUIDELINES.len(), "each CFC guideline should appear exactly once in the inventory");
+        assert_eq!(
+            CFC_GUIDELINES.len(),
+            40,
+            "update the inventory when the CFC guideline list changes"
+        );
+        assert_eq!(
+            unique_titles.len(),
+            CFC_GUIDELINES.len(),
+            "each CFC guideline should appear exactly once in the inventory"
+        );
         assert!(
             CFC_GUIDELINES
                 .iter()
@@ -723,7 +731,8 @@ mod tests {
     fn cfc_guideline_inventory_tracks_output_and_preset_coverage() {
         let output_titles = guideline_titles_for(CfcGuidelineCoverageKind::CfcOutputCase);
         let preset_titles = guideline_titles_for(CfcGuidelineCoverageKind::CfcPresetSetting);
-        let upstream_titles = guideline_titles_for(CfcGuidelineCoverageKind::UpstreamFormatterBehavior);
+        let upstream_titles =
+            guideline_titles_for(CfcGuidelineCoverageKind::UpstreamFormatterBehavior);
         let output_case_titles = CFC_OUTPUT_CASES
             .iter()
             .map(|case| case.title)
@@ -747,26 +756,59 @@ mod tests {
             );
         }
 
-        assert_eq!(preset_titles, vec!["Lines should be around 110 characters long at the most"]);
+        assert_eq!(
+            preset_titles,
+            vec!["Lines should be around 110 characters long at the most"]
+        );
     }
 
     #[test]
     fn cfc_preset_map_matches_expected_cfc_settings() {
         let expected = BTreeMap::from([
-            (String::from("break_multiline_call_expression_list"), String::from("true")),
-            (String::from("end_statement_with_semicolon"), String::from("replace_with_newline")),
+            (
+                String::from("break_multiline_call_expression_list"),
+                String::from("true"),
+            ),
+            (
+                String::from("end_statement_with_semicolon"),
+                String::from("replace_with_newline"),
+            ),
             (String::from("indent_size"), String::from("4")),
             (String::from("indent_style"), String::from("space")),
-            (String::from("line_space_after_function_statement"), String::from("fixed(2)")),
-            (String::from("line_space_after_local_or_assign_statement"), String::from("fixed(2)")),
+            (
+                String::from("line_space_after_function_statement"),
+                String::from("fixed(2)"),
+            ),
+            (
+                String::from("line_space_after_local_or_assign_statement"),
+                String::from("fixed(2)"),
+            ),
             (String::from("max_line_length"), String::from("110")),
             (String::from("quote_style"), String::from("double")),
-            (String::from("remove_redundant_condition_parentheses"), String::from("true")),
-            (String::from("space_after_comment_dash"), String::from("true")),
-            (String::from("space_around_table_field_list"), String::from("true")),
-            (String::from("space_inside_function_call_parentheses"), String::from("true")),
-            (String::from("space_inside_function_param_list_parentheses"), String::from("true")),
-            (String::from("space_inside_square_brackets"), String::from("false")),
+            (
+                String::from("remove_redundant_condition_parentheses"),
+                String::from("true"),
+            ),
+            (
+                String::from("space_after_comment_dash"),
+                String::from("true"),
+            ),
+            (
+                String::from("space_around_table_field_list"),
+                String::from("true"),
+            ),
+            (
+                String::from("space_inside_function_call_parentheses"),
+                String::from("true"),
+            ),
+            (
+                String::from("space_inside_function_param_list_parentheses"),
+                String::from("true"),
+            ),
+            (
+                String::from("space_inside_square_brackets"),
+                String::from("false"),
+            ),
             (String::from("tab_width"), String::from("4")),
         ]);
 
@@ -798,7 +840,8 @@ mod tests {
             ),
         ]);
 
-        let paren_formatted = format_with_style_map("if ( x == y ) then\nend\n", &default_style_map);
+        let paren_formatted =
+            format_with_style_map("if ( x == y ) then\nend\n", &default_style_map);
         assert!(
             paren_formatted.contains("if ("),
             "formatter should keep condition parentheses when the CFC toggle is disabled: {paren_formatted:?}"
@@ -955,12 +998,18 @@ mod tests {
         );
 
         let style_map = build_style_map(&emmyrc);
-        assert_eq!(style_map.get("call_arg_parentheses"), Some(&String::from("always")));
+        assert_eq!(
+            style_map.get("call_arg_parentheses"),
+            Some(&String::from("always"))
+        );
         assert_eq!(
             style_map.get("align_continuous_rect_table_field"),
             Some(&String::from("always"))
         );
-        assert_eq!(style_map.get("align_array_table"), Some(&String::from("always")));
+        assert_eq!(
+            style_map.get("align_array_table"),
+            Some(&String::from("always"))
+        );
     }
 
     #[test]
@@ -1052,9 +1101,21 @@ mod tests {
 
     #[test]
     fn cfc_inventory_categories_are_stable() {
-        assert_eq!(guideline_titles_for(CfcGuidelineCoverageKind::CfcOutputCase).len(), 7);
-        assert_eq!(guideline_titles_for(CfcGuidelineCoverageKind::CfcPresetSetting).len(), 1);
-        assert_eq!(guideline_titles_for(CfcGuidelineCoverageKind::UpstreamFormatterBehavior).len(), 8);
-        assert_eq!(guideline_titles_for(CfcGuidelineCoverageKind::NonFormatterPolicy).len(), 24);
+        assert_eq!(
+            guideline_titles_for(CfcGuidelineCoverageKind::CfcOutputCase).len(),
+            7
+        );
+        assert_eq!(
+            guideline_titles_for(CfcGuidelineCoverageKind::CfcPresetSetting).len(),
+            1
+        );
+        assert_eq!(
+            guideline_titles_for(CfcGuidelineCoverageKind::UpstreamFormatterBehavior).len(),
+            8
+        );
+        assert_eq!(
+            guideline_titles_for(CfcGuidelineCoverageKind::NonFormatterPolicy).len(),
+            24
+        );
     }
 }

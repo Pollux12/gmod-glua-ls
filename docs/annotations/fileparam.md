@@ -42,6 +42,8 @@ When determining the type of an unannotated parameter, the language server check
 2. **File-level hints**: `---@fileparam ply Player` at the top of the file.
 3. **Workspace defaults**: Configured in `.gluarc.json` under `gmod.fileParamDefaults`.
 
+The GLua settings editor also exposes `gmod.fileParamDefaults` as an editable mapping table so projects can add, replace, or remove the built-in fallback names without changing source annotations. If you edit `.gluarc.json` directly, an empty string value removes a built-in fallback for that workspace.
+
 ## See Also
 
 - [Configuration](../config.md) — For project-wide `gmod.fileParamDefaults`

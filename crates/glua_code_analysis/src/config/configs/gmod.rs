@@ -1,7 +1,37 @@
 use std::collections::HashMap;
 
 use schemars::JsonSchema;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+
+const FILE_PARAM_DEFAULTS: &[(&str, &str)] = &[
+    ("ply", "Player"),
+    ("player", "Player"),
+    ("ent", "Entity"),
+    ("entity", "Entity"),
+    ("veh", "Entity"),
+    ("vehicle", "Entity"),
+    ("wep", "Weapon"),
+    ("weapon", "Weapon"),
+    ("pnl", "Panel"),
+    ("panel", "Panel"),
+    ("npc", "NPC"),
+    ("trace", "TraceResult"),
+    ("tr", "TraceResult"),
+    ("ang", "Angle"),
+    ("angle", "Angle"),
+    ("vec", "Vector"),
+    ("pos", "Vector"),
+    ("color", "Color"),
+    ("col", "Color"),
+    ("phys", "PhysObj"),
+    ("dmginfo", "CTakeDamageInfo"),
+    ("attacker", "Entity"),
+    ("inflictor", "Entity"),
+    ("victim", "Entity"),
+    ("cmd", "CUserCmd"),
+    ("mat", "IMaterial"),
+];
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -20,7 +50,16 @@ pub struct EmmyrcGmod {
     pub vgui: EmmyrcGmodVgui,
     #[serde(default)]
     pub outline: EmmyrcGmodOutline,
-    #[serde(default = "file_param_defaults_default")]
+    /// Parameter-name to type-name fallbacks for otherwise unresolved params.
+    #[serde(
+        default = "file_param_defaults_default",
+        deserialize_with = "deserialize_file_param_defaults"
+    )]
+    #[schemars(extend(
+        "x-gluals-editor" = "mappingTable",
+        "x-gluals-key-label" = "Parameter",
+        "x-gluals-value-label" = "Type"
+    ))]
     pub file_param_defaults: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_realm_from_filename: Option<bool>,
@@ -54,37 +93,38 @@ fn dynamic_fields_global_default() -> bool {
 }
 
 fn file_param_defaults_default() -> HashMap<String, String> {
-    [
-        ("ply", "Player"),
-        ("player", "Player"),
-        ("ent", "Entity"),
-        ("entity", "Entity"),
-        ("veh", "Entity"),
-        ("vehicle", "Entity"),
-        ("wep", "Weapon"),
-        ("weapon", "Weapon"),
-        ("pnl", "Panel"),
-        ("panel", "Panel"),
-        ("npc", "NPC"),
-        ("trace", "TraceResult"),
-        ("tr", "TraceResult"),
-        ("ang", "Angle"),
-        ("angle", "Angle"),
-        ("vec", "Vector"),
-        ("pos", "Vector"),
-        ("color", "Color"),
-        ("col", "Color"),
-        ("phys", "PhysObj"),
-        ("dmginfo", "CTakeDamageInfo"),
-        ("attacker", "Entity"),
-        ("inflictor", "Entity"),
-        ("victim", "Entity"),
-        ("cmd", "CUserCmd"),
-        ("mat", "IMaterial"),
-    ]
-    .into_iter()
-    .map(|(name, type_name)| (name.to_string(), type_name.to_string()))
-    .collect()
+    FILE_PARAM_DEFAULTS
+        .iter()
+        .map(|(name, type_name)| ((*name).to_string(), (*type_name).to_string()))
+        .collect()
+}
+
+fn deserialize_file_param_defaults<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let overrides = HashMap::<String, String>::deserialize(deserializer)?;
+    let mut merged_defaults = file_param_defaults_default();
+
+    for (param_name, type_name) in overrides {
+        let trimmed_name = param_name.trim();
+        if trimmed_name.is_empty() {
+            continue;
+        }
+
+        let trimmed_type_name = type_name.trim();
+
+        if trimmed_type_name.is_empty() {
+            merged_defaults.remove(trimmed_name);
+            continue;
+        }
+
+        merged_defaults.insert(trimmed_name.to_string(), trimmed_type_name.to_string());
+    }
+
+    Ok(merged_defaults)
 }
 
 impl Default for EmmyrcGmod {
@@ -378,5 +418,28 @@ mod tests {
         verify_that!(gmod.network.completion.mismatch_hints, eq(false))?;
         verify_that!(gmod.vgui.code_lens_enabled, eq(false))?;
         verify_that!(gmod.vgui.inlay_hint_enabled, eq(true))
+    }
+
+    #[gtest]
+    fn test_file_param_defaults_merge_workspace_overrides_and_removals() -> Result<()> {
+        let gmod: EmmyrcGmod = serde_json::from_str(
+            r#"{
+                "fileParamDefaults": {
+                    " vehicle ": "  base_glide  ",
+                    " ply ": " "
+                }
+            }"#,
+        )
+        .or_fail()?;
+
+        verify_that!(
+            gmod.file_param_defaults.get("vehicle"),
+            eq(Some(&"base_glide".to_string()))
+        )?;
+        verify_that!(gmod.file_param_defaults.contains_key("ply"), eq(false))?;
+        verify_that!(
+            gmod.file_param_defaults.get("ent"),
+            eq(Some(&"Entity".to_string()))
+        )
     }
 }
