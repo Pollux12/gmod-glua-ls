@@ -36,7 +36,7 @@ pub async fn on_completion_handler(
     let uri = params.text_document_position.text_document.uri;
     let position = params.text_document_position.position;
 
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
 
     if cancel_token.is_cancelled() {
         return None;
@@ -106,11 +106,18 @@ pub fn completion(
 pub async fn on_completion_resolve_handler(
     context: ServerContextSnapshot,
     params: CompletionItem,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> CompletionItem {
-    let analysis = context.analysis().read().await;
-    let workspace_manager = context.workspace_manager().read().await;
-    let client_id = workspace_manager.client_config.client_id;
+    let Some(wm) = context.read_workspace_manager(&cancel_token).await else {
+        return params;
+    };
+    let client_id = wm.client_config.client_id;
+    drop(wm);
+
+    let Some(analysis) = context.read_analysis(&cancel_token).await else {
+        return params;
+    };
+
     completion_resolve(&analysis, params, client_id)
 }
 

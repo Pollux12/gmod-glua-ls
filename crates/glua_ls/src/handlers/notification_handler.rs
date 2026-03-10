@@ -62,6 +62,15 @@ pub async fn on_notification_handler(
     notification: Notification,
     server_context: &mut ServerContext,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
+    // When document content changes, proactively cancel ALL in-flight requests.
+    // They are working on stale data — the editor will resend fresh ones.
+    // This breaks the RwLock convoy: stale readers bail out of their
+    // `tokio::select!` and release (or never acquire) the read lock, allowing
+    // the didChange write to proceed immediately.
+    if notification.method == <DidChangeTextDocument as LspNotification>::METHOD {
+        server_context.cancel_all_requests().await;
+    }
+
     dispatch_notification!(notification, server_context, {
         sync: {
             // Intentionally empty - async to keep the message for $/cancelRequest processing.

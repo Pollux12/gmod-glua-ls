@@ -11,12 +11,12 @@ use super::RegisterCapabilities;
 pub async fn on_inline_values_handler(
     context: ServerContextSnapshot,
     params: InlineValueParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<InlineValue>> {
     let uri = params.text_document.uri;
     let stop_location = params.context.stopped_location;
     let stop_position = stop_location.start;
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     if !semantic_model.get_emmyrc().inline_values.enable {

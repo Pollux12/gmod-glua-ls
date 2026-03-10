@@ -22,18 +22,19 @@ pub async fn on_inlay_hint_handler(
     }
 
     let uri = params.text_document.uri;
-    let analysis = context.analysis().read().await;
+
+    let client_id = context
+        .read_workspace_manager(&cancel_token)
+        .await?
+        .client_config
+        .client_id;
+
+    let analysis = context.read_analysis(&cancel_token).await?;
 
     if cancel_token.is_cancelled() {
         return None;
     }
 
-    let client_id = context
-        .workspace_manager()
-        .read()
-        .await
-        .client_config
-        .client_id;
     let result = inlay_hint(
         &analysis,
         analysis.get_file_id(&uri)?,
@@ -58,7 +59,7 @@ pub fn inlay_hint(
 pub async fn on_resolve_inlay_hint(
     context: ServerContextSnapshot,
     inlay_hint: InlayHint,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> InlayHint {
     inlay_hint
 }

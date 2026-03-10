@@ -42,7 +42,7 @@ pub async fn on_hover(
     }
     let uri = params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     if cancel_token.is_cancelled() {
         return None;
     }

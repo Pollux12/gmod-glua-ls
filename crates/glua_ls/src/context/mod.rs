@@ -215,6 +215,18 @@ impl ServerContext {
         }
     }
 
+    /// Cancel every in-flight request.
+    /// Called when a `textDocument/didChange` notification arrives so that
+    /// stale readers release the analysis RwLock promptly and the incoming
+    /// write (update_file_preparsed) is not blocked behind a convoy of
+    /// queued readers.
+    pub async fn cancel_all_requests(&self) {
+        let cancellations = self.cancellations.lock().await;
+        for cancel_token in cancellations.values() {
+            cancel_token.cancel();
+        }
+    }
+
     pub async fn close(&self) {
         self.debounced_shutdown.cancel();
         let mut workspace_manager = self.inner.workspace_manager.write().await;

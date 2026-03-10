@@ -13,7 +13,7 @@ pub async fn on_doc_search_handler(
     params: GluaDocSearchParams,
     cancel_token: CancellationToken,
 ) -> Option<GluaDocSearchResponse> {
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     let db = analysis.compilation.get_db();
     let items = build_doc_search(
         db,

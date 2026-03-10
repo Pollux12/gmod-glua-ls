@@ -17,13 +17,16 @@ use super::RegisterCapabilities;
 pub async fn on_range_formatting_handler(
     context: ServerContextSnapshot,
     params: DocumentRangeFormattingParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<TextEdit>> {
     let uri = params.text_document.uri;
     let request_range = params.range;
-    let analysis = context.analysis().read().await;
-    let workspace_manager = context.workspace_manager().read().await;
-    let client_id = workspace_manager.client_config.client_id;
+    let client_id = context
+        .read_workspace_manager(&cancel_token)
+        .await?
+        .client_config
+        .client_id;
+    let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let syntax_tree = analysis
         .compilation

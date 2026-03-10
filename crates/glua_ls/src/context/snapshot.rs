@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio_util::sync::CancellationToken;
 
 use glua_code_analysis::EmmyLuaAnalysis;
 
@@ -50,6 +51,32 @@ impl ServerContextSnapshot {
 
     pub fn debounced_analysis_arc(&self) -> Arc<DebouncedAnalysis> {
         self.inner.debounced_analysis.clone()
+    }
+
+    /// Acquire a read lock on the analysis, racing against a cancellation token.
+    /// Returns `None` immediately if the token fires before the lock is acquired.
+    /// This prevents handlers from blocking on a write-preferring RwLock when
+    /// their request has already been superseded.
+    pub async fn read_analysis(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Option<RwLockReadGuard<'_, EmmyLuaAnalysis>> {
+        tokio::select! {
+            guard = self.analysis().read() => Some(guard),
+            _ = cancel_token.cancelled() => None,
+        }
+    }
+
+    /// Acquire a read lock on the workspace manager, racing against a
+    /// cancellation token.
+    pub async fn read_workspace_manager(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Option<RwLockReadGuard<'_, WorkspaceManager>> {
+        tokio::select! {
+            guard = self.workspace_manager().read() => Some(guard),
+            _ = cancel_token.cancelled() => None,
+        }
     }
 }
 

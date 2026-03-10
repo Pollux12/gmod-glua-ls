@@ -33,14 +33,8 @@ pub async fn on_document_symbol(
     params: DocumentSymbolParams,
     cancel_token: CancellationToken,
 ) -> Option<DocumentSymbolResponse> {
-    if cancel_token.is_cancelled() {
-        return None;
-    }
     let uri = params.text_document.uri;
-    let analysis = context.analysis().read().await;
-    if cancel_token.is_cancelled() {
-        return None;
-    }
+    let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     let document_symbol_root = build_document_symbol(&semantic_model)?;

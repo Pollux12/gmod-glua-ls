@@ -16,7 +16,7 @@ pub async fn on_workspace_symbol_handler(
     cancel_token: CancellationToken,
 ) -> Option<WorkspaceSymbolResponse> {
     let query = params.query;
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     let compilation = &analysis.compilation;
 
     build_workspace_symbols(compilation, query, cancel_token)

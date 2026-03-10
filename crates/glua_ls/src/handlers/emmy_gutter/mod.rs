@@ -26,11 +26,7 @@ pub async fn on_emmy_gutter_handler(
         return None;
     }
     let uri = Uri::from_str(&params.uri).ok()?;
-    let analysis = context.analysis().read().await;
-
-    if cancel_token.is_cancelled() {
-        return None;
-    }
+    let analysis = context.read_analysis(&cancel_token).await?;
 
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
@@ -154,10 +150,10 @@ fn build_func_override_gutter_info(
 pub async fn on_emmy_gutter_detail_handler(
     context: ServerContextSnapshot,
     params: EmmyGutterDetailParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<GutterDetailResponse> {
     let type_name = params.data;
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     let db = &analysis.compilation.get_db();
     let type_index = db.get_type_index();
 

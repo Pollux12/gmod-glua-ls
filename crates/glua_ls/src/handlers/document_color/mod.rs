@@ -32,14 +32,10 @@ pub async fn on_document_color(
     params: DocumentColorParams,
     cancel_token: CancellationToken,
 ) -> Vec<ColorInformation> {
-    if cancel_token.is_cancelled() {
-        return vec![];
-    }
     let uri = params.text_document.uri;
-    let analysis = context.analysis().read().await;
-    if cancel_token.is_cancelled() {
+    let Some(analysis) = context.read_analysis(&cancel_token).await else {
         return vec![];
-    }
+    };
     let file_id = if let Some(file_id) = analysis.get_file_id(&uri) {
         file_id
     } else {
@@ -65,10 +61,12 @@ pub async fn on_document_color(
 pub async fn on_document_color_presentation(
     context: ServerContextSnapshot,
     params: ColorPresentationParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Vec<ColorPresentation> {
     let uri = params.text_document.uri;
-    let analysis = context.analysis().read().await;
+    let Some(analysis) = context.read_analysis(&cancel_token).await else {
+        return vec![];
+    };
     let file_id = if let Some(file_id) = analysis.get_file_id(&uri) {
         file_id
     } else {

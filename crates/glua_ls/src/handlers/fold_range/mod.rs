@@ -33,16 +33,18 @@ pub async fn on_folding_range_handler(
         return None;
     }
     let uri = params.text_document.uri;
-    let analysis = context.analysis().read().await;
+    let client_id = context
+        .read_workspace_manager(&cancel_token)
+        .await?
+        .client_config
+        .client_id;
+
+    let analysis = context.read_analysis(&cancel_token).await?;
+
     if cancel_token.is_cancelled() {
         return None;
     }
-    let client_id = context
-        .workspace_manager()
-        .read()
-        .await
-        .client_config
-        .client_id;
+
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     let document = semantic_model.get_document();

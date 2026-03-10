@@ -21,7 +21,7 @@ pub async fn on_document_highlight_handler(
         return None;
     }
     let uri = params.text_document_position_params.text_document.uri;
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     if cancel_token.is_cancelled() {
         return None;
     }

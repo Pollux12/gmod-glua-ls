@@ -13,12 +13,12 @@ use tokio_util::sync::CancellationToken;
 pub async fn on_document_selection_range_handle(
     context: ServerContextSnapshot,
     params: SelectionRangeParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<SelectionRange>> {
     let uri = params.text_document.uri;
     let position = params.positions;
 
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     let document = semantic_model.get_document();

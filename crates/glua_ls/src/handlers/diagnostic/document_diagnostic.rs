@@ -15,7 +15,16 @@ pub async fn on_pull_document_diagnostic(
 
     // Wait for any pending debounced reindex to finish before diagnosing
     let file_id = {
-        let analysis = context.analysis().read().await;
+        let Some(analysis) = context.read_analysis(&token).await else {
+            return DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items: vec![],
+                },
+            })
+            .into();
+        };
         analysis.get_file_id(&uri)
     };
     if let Some(file_id) = file_id {

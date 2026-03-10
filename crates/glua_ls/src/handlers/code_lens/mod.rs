@@ -17,10 +17,10 @@ use super::RegisterCapabilities;
 pub async fn on_code_lens_handler(
     context: ServerContextSnapshot,
     params: CodeLensParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<CodeLens>> {
     let uri = params.text_document.uri;
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
 
@@ -34,16 +34,18 @@ pub async fn on_code_lens_handler(
 pub async fn on_resolve_code_lens_handler(
     context: ServerContextSnapshot,
     code_lens: CodeLens,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> CodeLens {
-    let analysis = context.analysis().read().await;
+    let client_id = {
+        let Some(wm) = context.read_workspace_manager(&cancel_token).await else {
+            return code_lens;
+        };
+        wm.client_config.client_id
+    };
+    let Some(analysis) = context.read_analysis(&cancel_token).await else {
+        return code_lens;
+    };
     let compilation = &analysis.compilation;
-    let client_id = context
-        .workspace_manager()
-        .read()
-        .await
-        .client_config
-        .client_id;
 
     resolve_code_lens(compilation, code_lens.clone(), client_id).unwrap_or(code_lens)
 }

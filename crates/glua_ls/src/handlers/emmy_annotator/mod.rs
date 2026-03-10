@@ -19,7 +19,7 @@ pub async fn on_emmy_annotator_handler(
         return None;
     }
     let uri = Uri::from_str(&params.uri).ok()?;
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
 
     if cancel_token.is_cancelled() {
         return None;

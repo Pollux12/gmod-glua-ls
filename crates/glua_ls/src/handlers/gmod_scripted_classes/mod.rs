@@ -13,7 +13,7 @@ pub async fn on_gmod_scripted_classes_handler(
     _params: GmodScriptedClassesParams,
     cancel_token: CancellationToken,
 ) -> Option<Vec<GmodScriptedClassEntry>> {
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     let db = analysis.compilation.get_db();
     build_gmod_scripted_classes(db, &cancel_token)
 }

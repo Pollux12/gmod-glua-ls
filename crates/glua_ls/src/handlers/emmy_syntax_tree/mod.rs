@@ -17,10 +17,10 @@ pub use emmy_syntax_tree_request::*;
 pub async fn on_emmy_syntax_tree_handler(
     context: ServerContextSnapshot,
     params: EmmySyntaxTreeParams,
-    _: CancellationToken,
+    cancel_token: CancellationToken,
 ) -> Option<SyntaxTreeResponse> {
     let uri = Uri::from_str(&params.uri).ok()?;
-    let analysis = context.analysis().read().await;
+    let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
 
