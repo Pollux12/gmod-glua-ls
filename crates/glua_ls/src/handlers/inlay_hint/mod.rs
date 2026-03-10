@@ -23,6 +23,15 @@ pub async fn on_inlay_hint_handler(
 
     let uri = params.text_document.uri;
 
+    // Wait for any pending reindex so hints reflect up-to-date type information.
+    if !context
+        .debounced_analysis()
+        .wait_until_fresh(&cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let client_id = context
         .read_workspace_manager(&cancel_token)
         .await?

@@ -69,6 +69,11 @@ pub async fn on_notification_handler(
     // the didChange write to proceed immediately.
     if notification.method == <DidChangeTextDocument as LspNotification>::METHOD {
         server_context.cancel_all_requests().await;
+        // Mark analysis dirty BEFORE spawning the didChange handler so that
+        // any request handler dispatched next sees the flag and waits for
+        // reindex instead of computing on stale data (which causes flickering
+        // semantic tokens / inlay hints).
+        server_context.snapshot().debounced_analysis().mark_dirty();
     }
 
     dispatch_notification!(notification, server_context, {

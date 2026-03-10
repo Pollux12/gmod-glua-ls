@@ -19,6 +19,16 @@ pub async fn on_emmy_annotator_handler(
         return None;
     }
     let uri = Uri::from_str(&params.uri).ok()?;
+
+    // Wait for any pending reindex so annotations use fresh semantic data.
+    if !context
+        .debounced_analysis()
+        .wait_until_fresh(&cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let analysis = context.read_analysis(&cancel_token).await?;
 
     if cancel_token.is_cancelled() {

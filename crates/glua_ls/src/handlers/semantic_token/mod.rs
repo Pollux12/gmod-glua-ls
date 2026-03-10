@@ -30,6 +30,17 @@ pub async fn on_semantic_token_handler(
 
     let uri = params.text_document.uri;
 
+    // Wait for any pending reindex to complete before computing tokens.
+    // This prevents serving stale tokens (new parse tree + old semantic index)
+    // which causes syntax-highlighting flicker.
+    if !context
+        .debounced_analysis()
+        .wait_until_fresh(&cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let client_id = context
         .read_workspace_manager(&cancel_token)
         .await?

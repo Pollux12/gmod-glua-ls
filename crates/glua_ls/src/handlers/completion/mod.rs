@@ -36,6 +36,15 @@ pub async fn on_completion_handler(
     let uri = params.text_document_position.text_document.uri;
     let position = params.text_document_position.position;
 
+    // Wait for any pending reindex so completions use fresh type data.
+    if !context
+        .debounced_analysis()
+        .wait_until_fresh(&cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let analysis = context.read_analysis(&cancel_token).await?;
 
     if cancel_token.is_cancelled() {
