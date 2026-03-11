@@ -21,6 +21,18 @@ pub async fn on_inlay_hint_handler(
         return None;
     }
 
+    // Wait for any pending reindex to finish so we serve fresh hints
+    // instead of returning null/ContentModified (which clears hints and
+    // causes visible flickering). The wait is cancel-aware: if a new
+    // didChange arrives, the cancel token fires and we bail out cheaply.
+    if !context
+        .debounced_analysis()
+        .wait_until_fresh(&cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let uri = params.text_document.uri;
 
     let client_id = context

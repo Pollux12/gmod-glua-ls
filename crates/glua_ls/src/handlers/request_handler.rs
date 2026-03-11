@@ -145,6 +145,7 @@ pub async fn on_request_handler(
         WorkspaceSymbolRequest => on_workspace_symbol_handler,
         GluaDocSearchRequest => on_doc_search_handler,
         GmodScriptedClassesRequest => on_gmod_scripted_classes_handler,
+        InlayHintRequest => on_inlay_hint_handler,
         Formatting => on_formatting_handler,
         RangeFormatting => on_range_formatting_handler,
         OnTypeFormatting => on_type_formatting_handler,
@@ -154,7 +155,6 @@ pub async fn on_request_handler(
         DocumentDiagnosticRequest => on_pull_document_diagnostic,
         WorkspaceDiagnosticRequest => on_pull_workspace_diagnostic,
     }, content_modified_if_dirty: {
-        InlayHintRequest => on_inlay_hint_handler,
         SemanticTokensFullRequest => on_semantic_token_handler,
         EmmyAnnotatorRequest => on_emmy_annotator_handler,
         CodeLensRequest => on_code_lens_handler,
