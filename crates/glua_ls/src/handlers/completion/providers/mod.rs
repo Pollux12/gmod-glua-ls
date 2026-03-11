@@ -16,6 +16,7 @@ mod table_field_provider;
 
 use super::completion_builder::CompletionBuilder;
 pub use function_provider::get_function_remove_nil;
+pub use gmod_system_provider::apply_staged_call_snippet;
 use glua_parser::LuaAstToken;
 use glua_parser::LuaStringToken;
 use rowan::TextRange;

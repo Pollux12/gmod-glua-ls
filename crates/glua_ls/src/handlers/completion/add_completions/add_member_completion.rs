@@ -10,7 +10,8 @@ use lsp_types::CompletionItem;
 
 use crate::handlers::completion::{
     add_completions::get_function_snippet, completion_builder::CompletionBuilder,
-    completion_data::CompletionData, providers::get_function_remove_nil,
+    completion_data::CompletionData,
+    providers::{apply_staged_call_snippet, get_function_remove_nil},
 };
 
 use super::{
@@ -156,8 +157,11 @@ pub fn add_member_completion(
         );
     }
 
-    if can_add_snippet && builder.support_snippets(typ) {
-        if let Some(snippet) = get_function_snippet(builder, &label, typ, call_display) {
+    if can_add_snippet {
+        if apply_staged_call_snippet(builder, &label, status, &mut completion_item).is_none()
+            && builder.support_snippets(typ)
+            && let Some(snippet) = get_function_snippet(builder, &label, typ, call_display)
+        {
             completion_item.insert_text = Some(snippet);
             completion_item.insert_text_format = Some(lsp_types::InsertTextFormat::SNIPPET);
         }

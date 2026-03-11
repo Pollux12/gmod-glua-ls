@@ -116,11 +116,25 @@ fn try_build_color_information(
                 j += 1;
             }
 
+            let is_end_boundary = if j == len {
+                true
+            } else {
+                !bytes[j].is_ascii_alphanumeric()
+            };
+            if !is_end_boundary {
+                i = j;
+                continue;
+            }
+
             if j - i == 6 || j - i == 8 {
                 let color_text = &text[i..j];
                 if let Some(color) = parse_hex_color(color_text) {
                     let source_text_range = token.text_range();
-                    let start = if bytes[i - 1] == b'#' { i - 1 } else { i };
+                    let start = if i > 0 && bytes[i - 1] == b'#' {
+                        i - 1
+                    } else {
+                        i
+                    };
                     let text_range = TextRange::new(
                         source_text_range.start() + TextSize::new(start as u32),
                         source_text_range.start() + TextSize::new(j as u32),
@@ -190,5 +204,40 @@ pub fn convert_color_to_hex(color: Color, len: usize) -> String {
             format!("#{:02X}{:02X}{:02X}{:02X}", r, g, b, a)
         }
         _ => "".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use glua_code_analysis::FileId;
+    use glua_parser::{LineIndex, LuaParser, ParserConfig};
+    use googletest::prelude::*;
+
+    use super::build_colors;
+
+    fn collect_colors(text: &str) -> Vec<lsp_types::ColorInformation> {
+        let tree = LuaParser::parse(text, ParserConfig::default());
+        let line_index = LineIndex::parse(text);
+        let path = PathBuf::from("test.lua");
+        let document = glua_code_analysis::LuaDocument::new(FileId::new(0), &path, text, &line_index);
+        build_colors(tree.get_red_root(), &document)
+    }
+
+    #[gtest]
+    fn does_not_treat_hook_name_prefix_as_hex_color() -> Result<()> {
+        let colors = collect_colors(r#"hook.Add("AddDeathNotice", "id", function() end)"#);
+
+        verify_that!(colors, is_empty())?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn still_detects_real_hex_colors_inside_strings() -> Result<()> {
+        let colors = collect_colors(r##"print("#FF00AA")"##);
+
+        verify_that!(colors.len(), eq(1))?;
+        Ok(())
     }
 }

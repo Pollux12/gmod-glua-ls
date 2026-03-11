@@ -19,6 +19,20 @@ pub async fn on_code_lens_handler(
     params: CodeLensParams,
     cancel_token: CancellationToken,
 ) -> Option<Vec<CodeLens>> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+
+    // Wait for pending reindex work so VS Code keeps the current lenses visible
+    // instead of clearing them during the dirty window, which causes layout flicker.
+    if !context
+        .debounced_analysis()
+        .wait_until_fresh(&cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let uri = params.text_document.uri;
     let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;

@@ -2,7 +2,9 @@
 mod tests {
     use glua_code_analysis::{DocSyntax, Emmyrc, EmmyrcFilenameConvention};
     use googletest::prelude::*;
-    use lsp_types::{CompletionItemKind, CompletionResponse, CompletionTriggerKind};
+    use lsp_types::{
+        CompletionItemKind, CompletionResponse, CompletionTriggerKind, InsertTextFormat,
+    };
     use tokio_util::sync::CancellationToken;
 
     use crate::handlers::completion::completion;
@@ -2735,6 +2737,331 @@ mod tests {
                 label_detail: Some("(1 add, 1 methods, 0 emits) args: ply, transition".to_string()),
             }],
         ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_call_snippet_defaults_to_placeholder_args() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            local function SetOwner(owner) end
+
+            SetOw<??>
+            "#,
+        )?;
+        let file_id = ws.def(content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .iter()
+            .find(|item| item.label == "SetOwner")
+            .ok_or("missing SetOwner completion")
+            .or_fail()?;
+
+        verify_that!(item.insert_text.as_deref(), eq(Some("SetOwner(${1:owner})")))?;
+        verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_zero_arg_call_snippet_stays_plain_call() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            local function GetOwner() end
+
+            GetOw<??>
+            "#,
+        )?;
+        let file_id = ws.def(content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .iter()
+            .find(|item| item.label == "GetOwner")
+            .ok_or("missing GetOwner completion")
+            .or_fail()?;
+
+        verify_that!(item.insert_text.as_deref(), eq(Some("GetOwner()")))?;
+        verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_hook_add_completion_uses_staged_snippet() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            hook = hook or {}
+            function hook.Add(eventName, identifier, func) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            hook.<??>
+            "#,
+        )?;
+        let file_id = ws.def(content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .iter()
+            .find(|item| item.label == "Add")
+            .ok_or("missing Add completion")
+            .or_fail()?;
+
+        verify_that!(item.insert_text.as_deref(), eq(Some("Add(\"${1}\")")))?;
+        verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
+        verify_that!(
+            item.command.as_ref().map(|command| command.command.as_str()),
+            eq(Some("editor.action.triggerSuggest"))
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_hook_add_string_completion_expands_full_call_snippet() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            hook.Add("<??>")
+            "#,
+        )?;
+        let file_id = ws.def(content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .iter()
+            .find(|item| item.label == "PlayerSpawn")
+            .ok_or("missing PlayerSpawn completion")
+            .or_fail()?;
+        let text_edit = item
+            .text_edit
+            .as_ref()
+            .ok_or("missing staged hook.Add text edit")
+            .or_fail()?;
+        let lsp_types::CompletionTextEdit::Edit(text_edit) = text_edit else {
+            return fail!("expected text edit for staged hook.Add completion");
+        };
+
+        verify_that!(
+            text_edit.new_text.as_str(),
+            eq("PlayerSpawn\", \"${1:identifier}\", function(ply, transition)\n\t$0\nend)")
+        )?;
+        verify_that!(text_edit.range.start.line, eq(1))?;
+        verify_that!(text_edit.range.start.character, eq(22))?;
+        verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_hook_completion_works_in_empty_string_stage() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+            "#,
+        );
+
+        let file_id = ws.def(r#"hook.Add("")"#);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            lsp_types::Position {
+                line: 0,
+                character: 10,
+            },
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(
+            items.iter().any(|item| item.label == "PlayerSpawn"),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_receive_completion_uses_staged_snippet() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            net = net or {}
+            function net.Receive(name, func) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            net.<??>
+            "#,
+        )?;
+        let file_id = ws.def(content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .iter()
+            .find(|item| item.label == "Receive")
+            .ok_or("missing Receive completion")
+            .or_fail()?;
+
+        verify_that!(item.insert_text.as_deref(), eq(Some("Receive(\"${1}\")")))?;
+        verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
+        verify_that!(
+            item.command.as_ref().map(|command| command.command.as_str()),
+            eq(Some("editor.action.triggerSuggest"))
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_receive_string_completion_expands_full_call_snippet() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("MyMsg")
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            net.Receive("<??>")
+            "#,
+        )?;
+        let file_id = ws.def_file("addons/test/lua/autorun/server/receive.lua", content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .iter()
+            .find(|item| item.label == "MyMsg")
+            .ok_or("missing MyMsg completion")
+            .or_fail()?;
+        let text_edit = item
+            .text_edit
+            .as_ref()
+            .ok_or("missing staged net.Receive text edit")
+            .or_fail()?;
+        let lsp_types::CompletionTextEdit::Edit(text_edit) = text_edit else {
+            return fail!("expected text edit for staged net.Receive completion");
+        };
+
+        verify_that!(
+            text_edit.new_text.as_str(),
+            eq("MyMsg\", function(len, ply)\n\t$0\nend)")
+        )?;
+        verify_that!(text_edit.range.start.line, eq(1))?;
+        verify_that!(text_edit.range.start.character, eq(25))?;
+        verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
 
         Ok(())
     }

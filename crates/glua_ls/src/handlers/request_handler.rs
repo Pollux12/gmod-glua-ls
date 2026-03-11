@@ -131,6 +131,7 @@ pub async fn on_request_handler(
         Completion => on_completion_handler,
         ResolveCompletionItem => on_completion_resolve_handler,
         InlayHintResolveRequest => on_resolve_inlay_hint,
+        CodeLensRequest => on_code_lens_handler,
         GotoDefinition => on_goto_definition_handler,
         GotoImplementation => on_implementation_handler,
         References => on_references_handler,
@@ -157,7 +158,6 @@ pub async fn on_request_handler(
     }, content_modified_if_dirty: {
         SemanticTokensFullRequest => on_semantic_token_handler,
         EmmyAnnotatorRequest => on_emmy_annotator_handler,
-        CodeLensRequest => on_code_lens_handler,
     });
 
     Ok(())

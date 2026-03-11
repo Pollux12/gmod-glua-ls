@@ -26,9 +26,16 @@ pub struct EmmyrcCompletion {
     #[serde(default = "default_auto_require_separator")]
     pub auto_require_separator: String,
     /// Whether to use call snippets in completions.
-    #[serde(default)]
+    #[serde(default = "default_true")]
+    #[schemars(extend("x-vscode-setting" = true))]
     #[serde_as(deserialize_as = "DefaultOnError")]
     pub call_snippet: bool,
+    /// Whether to stage known API call snippets so autocomplete can guide
+    /// the user through the next relevant argument.
+    #[serde(default = "default_true")]
+    #[schemars(extend("x-vscode-setting" = true))]
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    pub staged_call_snippets: bool,
     /// Symbol that's used to trigger postfix autocompletion.
     #[serde(default = "default_postfix")]
     #[schemars(extend("x-vscode-setting" = {
@@ -52,7 +59,8 @@ impl Default for EmmyrcCompletion {
             auto_require: default_true(),
             auto_require_function: default_require_function(),
             auto_require_naming_convention: Default::default(),
-            call_snippet: false,
+            call_snippet: default_true(),
+            staged_call_snippets: default_true(),
             auto_require_separator: default_auto_require_separator(),
             postfix: default_postfix(),
             base_function_includes_name: default_true(),

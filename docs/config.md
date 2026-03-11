@@ -56,7 +56,8 @@ This config should be good for most, feel free to enable/disable diagnostics or 
 | `autoRequireFunction` | `string` | `"require"` | Function name used for auto-require |
 | `autoRequireNamingConvention` | `string` | `"keep"` | Naming convention: `"keep"`, `"snake-case"`, `"pascal-case"`, `"camel-case"`, `"keep-class"` |
 | `autoRequireSeparator` | `string` | `"."` | Separator used in auto-require paths |
-| `callSnippet` | `boolean` | `false` | Use call snippets in completions |
+| `callSnippet` | `boolean` | `true` | Use call snippets in completions |
+| `stagedCallSnippets` | `boolean` | `true` | Use staged snippets for known APIs like `hook.Add` and `net.Receive` |
 | `postfix` | `string` | `"@"` | Symbol to trigger postfix completion: `@`, `.`, `:` |
 | `baseFunctionIncludesName` | `boolean` | `true` | Include function name in base completion |
 
