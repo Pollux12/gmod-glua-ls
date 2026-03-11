@@ -10,7 +10,7 @@ pub struct EmmyrcSemanticToken {
     pub enable: bool,
 
     /// Render Markdown/RST in documentation. Set `doc.syntax` for this option to have effect.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub render_documentation_markup: bool,
 }

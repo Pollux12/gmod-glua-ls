@@ -2264,7 +2264,7 @@
         "renderDocumentationMarkup": {
           "description": "Render Markdown/RST in documentation. Set `doc.syntax` for this option to have effect.",
           "type": "boolean",
-          "default": false,
+          "default": true,
           "x-vscode-setting": true
         }
       }

@@ -579,7 +579,7 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enable` | `boolean` | `true` | Enable semantic tokens |
-| `renderDocumentationMarkup` | `boolean` | `false` | Render Markdown/RST in semantic token documentation |
+| `renderDocumentationMarkup` | `boolean` | `true` | Render Markdown/RST in semantic token documentation |
 
 ---
 
