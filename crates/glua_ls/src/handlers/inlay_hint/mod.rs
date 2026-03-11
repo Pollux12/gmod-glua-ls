@@ -21,13 +21,6 @@ pub async fn on_inlay_hint_handler(
         return None;
     }
 
-    // When changes are pending, tree and index are out of sync.
-    // Return None to avoid stale/mispositioned hints; the server
-    // triggers a refresh after reindex.
-    if context.debounced_analysis().is_dirty() {
-        return None;
-    }
-
     let uri = params.text_document.uri;
 
     let client_id = context

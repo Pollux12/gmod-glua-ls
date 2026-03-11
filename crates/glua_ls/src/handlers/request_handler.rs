@@ -61,6 +61,8 @@ use super::{
 macro_rules! dispatch_request {
     ($request:expr, $context:expr, {
         $($req_type:ty => $handler:expr),* $(,)?
+    }, content_modified_if_dirty: {
+        $($dirty_req_type:ty => $dirty_handler:expr),* $(,)?
     }) => {
         match $request.method.as_str() {
             $(
@@ -69,6 +71,28 @@ macro_rules! dispatch_request {
                         let snapshot = $context.snapshot();
                         $context.task(id.clone(), |cancel_token| async move {
                             let result = $handler(snapshot, params, cancel_token).await;
+                            Some(Response::new_ok(id, result))
+                        }).await;
+                        return Ok(());
+                    }
+                }
+            )*
+            $(
+                <$dirty_req_type>::METHOD => {
+                    if let Ok((id, params)) = $request.extract::<<$dirty_req_type as LspRequest>::Params>(<$dirty_req_type>::METHOD) {
+                        let snapshot = $context.snapshot();
+                        $context.task(id.clone(), |cancel_token| async move {
+                            // When changes are pending reindex, return ContentModified
+                            // so the client keeps its previous results instead of
+                            // clearing them (which causes flickering / layout shifts).
+                            if snapshot.debounced_analysis().is_dirty() {
+                                return Some(Response::new_err(
+                                    id,
+                                    lsp_server::ErrorCode::ContentModified as i32,
+                                    "content modified".to_owned(),
+                                ));
+                            }
+                            let result = $dirty_handler(snapshot, params, cancel_token).await;
                             Some(Response::new_ok(id, result))
                         }).await;
                         return Ok(());
@@ -107,7 +131,6 @@ pub async fn on_request_handler(
         SelectionRangeRequest => on_document_selection_range_handle,
         Completion => on_completion_handler,
         ResolveCompletionItem => on_completion_resolve_handler,
-        InlayHintRequest => on_inlay_hint_handler,
         InlayHintResolveRequest => on_resolve_inlay_hint,
         GotoDefinition => on_goto_definition_handler,
         GotoImplementation => on_implementation_handler,
@@ -118,7 +141,6 @@ pub async fn on_request_handler(
         CodeLensResolve => on_resolve_code_lens_handler,
         SignatureHelpRequest => on_signature_helper_handler,
         DocumentHighlightRequest => on_document_highlight_handler,
-        SemanticTokensFullRequest => on_semantic_token_handler,
         ExecuteCommand => on_execute_command_handler,
         CodeActionRequest => on_code_action_handler,
         InlineValueRequest => on_inline_values_handler,
@@ -133,6 +155,9 @@ pub async fn on_request_handler(
         CallHierarchyOutgoingCalls => on_outgoing_calls_handler,
         DocumentDiagnosticRequest => on_pull_document_diagnostic,
         WorkspaceDiagnosticRequest => on_pull_workspace_diagnostic,
+    }, content_modified_if_dirty: {
+        InlayHintRequest => on_inlay_hint_handler,
+        SemanticTokensFullRequest => on_semantic_token_handler,
     });
 
     Ok(())

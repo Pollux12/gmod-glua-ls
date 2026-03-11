@@ -28,15 +28,6 @@ pub async fn on_semantic_token_handler(
         return None;
     }
 
-    // When changes are pending reindex, the syntax tree and semantic index
-    // are out of sync.  Computing tokens now would produce wrong colors
-    // (flickering).  Return None so VS Code keeps its previous tokens /
-    // falls back to TextMate grammar.  After reindex, the server sends
-    // workspace/semanticTokens/refresh to trigger a fresh request.
-    if context.debounced_analysis().is_dirty() {
-        return None;
-    }
-
     let uri = params.text_document.uri;
 
     let client_id = context
