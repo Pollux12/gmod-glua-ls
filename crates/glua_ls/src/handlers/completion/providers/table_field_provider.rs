@@ -183,6 +183,9 @@ fn in_env(builder: &mut CompletionBuilder, target_name: &str, target_type: &LuaT
     let all_env = [local_env, global_env].concat();
 
     for decl_id in all_env.iter() {
+        if builder.is_cancelled() {
+            return None;
+        }
         let decl = builder
             .semantic_model
             .get_db()

@@ -124,7 +124,6 @@ pub async fn on_request_handler(
         ColorPresentationRequest => on_document_color_presentation,
         DocumentLinkRequest => on_document_link_handler,
         DocumentLinkResolve => on_document_link_resolve_handler,
-        EmmyAnnotatorRequest => on_emmy_annotator_handler,
         EmmyGutterRequest => on_emmy_gutter_handler,
         EmmyGutterDetailRequest => on_emmy_gutter_detail_handler,
         EmmySyntaxTreeRequest => on_emmy_syntax_tree_handler,
@@ -137,7 +136,6 @@ pub async fn on_request_handler(
         References => on_references_handler,
         Rename => on_rename_handler,
         PrepareRenameRequest => on_prepare_rename_handler,
-        CodeLensRequest => on_code_lens_handler,
         CodeLensResolve => on_resolve_code_lens_handler,
         SignatureHelpRequest => on_signature_helper_handler,
         DocumentHighlightRequest => on_document_highlight_handler,
@@ -158,6 +156,8 @@ pub async fn on_request_handler(
     }, content_modified_if_dirty: {
         InlayHintRequest => on_inlay_hint_handler,
         SemanticTokensFullRequest => on_semantic_token_handler,
+        EmmyAnnotatorRequest => on_emmy_annotator_handler,
+        CodeLensRequest => on_code_lens_handler,
     });
 
     Ok(())

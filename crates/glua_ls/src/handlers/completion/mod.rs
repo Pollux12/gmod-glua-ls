@@ -114,11 +114,14 @@ pub fn completion(
     let mut builder = CompletionBuilder::new(
         token,
         semantic_model,
-        cancel_token,
+        cancel_token.clone(),
         trigger_kind,
         position_offset,
     );
     add_completions(&mut builder);
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     Some(CompletionResponse::Array(builder.get_completion_items()))
 }
 

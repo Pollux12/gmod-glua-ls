@@ -1,0 +1,382 @@
+[2026-03-11 14:48:54 +00:00 INFO glua_ls::logger] glua_ls v0.20.0
+[2026-03-11 14:48:54 +00:00 INFO glua_ls::handlers::initialized] main root: Some("C:/Users/Pollux/Documents/glualangserver/emmylua-rust/gmod-glua-ls/test_addon")
+[2026-03-11 14:48:54 +00:00 INFO glua_ls::handlers::initialized] client_id: Other
+[2026-03-11 14:48:54 +00:00 INFO glua_ls::handlers::initialized] set workspace folders: [WorkspaceFolder { root: "C:/Users/Pollux/Documents/glualangserver/emmylua-rust/gmod-glua-ls/test_addon", import: All, is_library: false }]
+[2026-03-11 14:48:54 +00:00 INFO glua_ls::handlers::initialized] workspace folders set
+[2026-03-11 14:48:54 +00:00 INFO glua_ls::handlers::initialized::client_config::default_config] fetching client config for scope "gluals"
+[2026-03-11 14:48:59 +00:00 WARN glua_ls::handlers::initialized::client_config::default_config] failed to fetch client config for scope "gluals"
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::handlers::initialized::client_config::default_config] no client config found
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::handlers::initialized] client_config: ClientConfig { client_id: Other, exclude: [], extensions: [], encoding: "utf-8", partial_emmyrcs: Some([]), gmod_annotations_path: None }
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::handlers::initialized] initialization_params: {
+  "processId": 34940,
+  "rootUri": "file:///C:/Users/Pollux/Documents/glualangserver/emmylua-rust/gmod-glua-ls/test_addon",
+  "initializationOptions": {},
+  "capabilities": {
+    "workspace": {
+      "didChangeWatchedFiles": {
+        "dynamicRegistration": true
+      },
+      "workspaceFolders": true,
+      "configuration": true,
+      "diagnostics": {
+        "refreshSupport": true
+      }
+    },
+    "textDocument": {
+      "synchronization": {
+        "dynamicRegistration": true,
+        "willSave": true,
+        "willSaveWaitUntil": true,
+        "didSave": true
+      },
+      "completion": {
+        "completionItem": {
+          "snippetSupport": true,
+          "commitCharactersSupport": true,
+          "documentationFormat": [
+            "markdown",
+            "plaintext"
+          ],
+          "deprecatedSupport": true,
+          "preselectSupport": true,
+          "resolveSupport": {
+            "properties": [
+              "documentation",
+              "detail"
+            ]
+          },
+          "labelDetailsSupport": true
+        },
+        "contextSupport": true
+      },
+      "hover": {
+        "contentFormat": [
+          "markdown",
+          "plaintext"
+        ]
+      },
+      "signatureHelp": {
+        "signatureInformation": {
+          "documentationFormat": [
+            "markdown",
+            "plaintext"
+          ],
+          "parameterInformation": {
+            "labelOffsetSupport": true
+          }
+        }
+      },
+      "documentSymbol": {
+        "dynamicRegistration": true
+      },
+      "codeAction": {
+        "dynamicRegistration": true
+      },
+      "codeLens": {
+        "dynamicRegistration": true
+      },
+      "documentLink": {
+        "dynamicRegistration": true
+      },
+      "colorProvider": {
+        "dynamicRegistration": true
+      },
+      "publishDiagnostics": {
+        "relatedInformation": true,
+        "tagSupport": {
+          "valueSet": [
+            1,
+            2
+          ]
+        },
+        "versionSupport": true
+      },
+      "foldingRange": {
+        "dynamicRegistration": true
+      },
+      "semanticTokens": {
+        "dynamicRegistration": true,
+        "requests": {
+          "full": true
+        },
+        "tokenTypes": [
+          "namespace",
+          "type",
+          "class",
+          "enum",
+          "interface",
+          "struct",
+          "typeParameter",
+          "parameter",
+          "variable",
+          "property",
+          "enumMember",
+          "event",
+          "function",
+          "method",
+          "macro",
+          "keyword",
+          "modifier",
+          "comment",
+          "string",
+          "number",
+          "regexp",
+          "operator",
+          "decorator"
+        ],
+        "tokenModifiers": [
+          "declaration",
+          "definition",
+          "readonly",
+          "static",
+          "deprecated",
+          "abstract",
+          "async",
+          "modification",
+          "documentation",
+          "defaultLibrary"
+        ],
+        "formats": [
+          "relative"
+        ],
+        "multilineTokenSupport": true
+      },
+      "inlayHint": {
+        "dynamicRegistration": true
+      },
+      "diagnostic": {
+        "dynamicRegistration": true
+      }
+    },
+    "window": {
+      "workDoneProgress": true
+    }
+  },
+  "workspaceFolders": [
+    {
+      "uri": "file:///C:/Users/Pollux/Documents/glualangserver/emmylua-rust/gmod-glua-ls/test_addon",
+      "name": "test_addon"
+    }
+  ],
+  "clientInfo": {
+    "name": "test-harness",
+    "version": "1.0"
+  }
+}
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::config::config_loader] No valid config file found.
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::context::workspace_manager] No GMod annotations path available
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::config::config_loader] No valid config file found.
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::context::workspace_manager] No GMod annotations path available
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::context::workspace_manager] loaded emmyrc complete
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::handlers::initialized] initializing std lib with resources path: NoneableString(Some(""))
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::db_index::module] update module pattern: [Regex("^(.*)/init\\.lua$"), Regex("^(.*)\\.lua$")]
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::db_index::module] update module replace pattern: []
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] update files: cost 2.8768ms
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] module analyze: cost 74.1µs
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] decl analyze: cost 1.7119ms
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] doc analyze: cost 1.951ms
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] flow analyze: cost 180.8µs
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] lua analyze: cost 1.55ms
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] gmod analyze: cost 2.6923ms
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] resolve analyze: cost 340µs
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] dynamic field analyze: cost 543.5µs
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] analyze workspace std: cost 9.1073ms
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::handlers::initialized] initialized std lib complete
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::handlers::initialized] workspace manager updated with client config and watch file patterns
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::handlers::initialized] current config : {
+  "completion": {
+    "enable": true,
+    "autoRequire": true,
+    "autoRequireFunction": "require",
+    "autoRequireNamingConvention": "keep",
+    "autoRequireSeparator": ".",
+    "callSnippet": false,
+    "postfix": "@",
+    "baseFunctionIncludesName": true
+  },
+  "diagnostics": {
+    "disable": [],
+    "enable": true,
+    "globals": [],
+    "globalsRegex": [],
+    "severity": {},
+    "enables": [],
+    "diagnosticInterval": 500
+  },
+  "hint": {
+    "paramHint": true,
+    "indexHint": true,
+    "localHint": true,
+    "overrideHint": true,
+    "metaCallHint": true,
+    "enumParamHint": false,
+    "closingEndHint": true,
+    "closingEndHintControlFlow": false,
+    "closingEndHintMinLines": 15
+  },
+  "runtime": {
+    "version": "LuaJIT",
+    "requireLikeFunction": [],
+    "extensions": [],
+    "requirePattern": [],
+    "nonstandardSymbol": [
+      "//",
+      "/**/",
+      "continue",
+      "!=",
+      "||",
+      "&&",
+      "!"
+    ],
+    "special": {}
+  },
+  "gmod": {
+    "enabled": true,
+    "defaultRealm": "shared",
+    "scriptedClassScopes": {
+      "include": [
+        "entities/**",
+        "weapons/**",
+        "effects/**",
+        "weapons/gmod_tool/stools/**",
+        "plugins/**"
+      ],
+      "exclude": []
+    },
+    "hookMappings": {
+      "methodToHook": {},
+      "emitterToHook": {},
+      "methodPrefixes": []
+    },
+    "network": {
+      "enabled": true,
+      "diagnostics": {
+        "typeMismatch": true,
+        "orderMismatch": true,
+        "missingCounterpart": true
+      },
+      "completion": {
+        "smartReadSuggestions": true,
+        "mismatchHints": true
+      }
+    },
+    "vgui": {
+      "codeLensEnabled": true,
+      "inlayHintEnabled": false
+    },
+    "outline": {
+      "verbosity": "normal"
+    },
+    "fileParamDefaults": {
+      "panel": "Panel",
+      "ply": "Player",
+      "player": "Player",
+      "entity": "Entity",
+      "mat": "IMaterial",
+      "trace": "TraceResult",
+      "victim": "Entity",
+      "col": "Color",
+      "attacker": "Entity",
+      "tr": "TraceResult",
+      "weapon": "Weapon",
+      "npc": "NPC",
+      "vec": "Vector",
+      "color": "Color",
+      "phys": "PhysObj",
+      "pos": "Vector",
+      "dmginfo": "CTakeDamageInfo",
+      "angle": "Angle",
+      "veh": "Entity",
+      "ang": "Angle",
+      "wep": "Weapon",
+      "inflictor": "Entity",
+      "ent": "Entity",
+      "pnl": "Panel",
+      "vehicle": "Entity",
+      "cmd": "CUserCmd"
+    },
+    "inferDynamicFields": true,
+    "dynamicFieldsGlobal": true,
+    "autoLoadAnnotations": null
+  },
+  "workspace": {
+    "ignoreDir": [],
+    "ignoreGlobs": [],
+    "library": [],
+    "packageDirs": [],
+    "workspaceRoots": [],
+    "encoding": "utf-8",
+    "moduleMap": [],
+    "reindexDuration": 5000,
+    "enableReindex": false
+  },
+  "resource": {
+    "paths": []
+  },
+  "codeLens": {
+    "enable": true
+  },
+  "strict": {
+    "requirePath": false,
+    "arrayIndex": false,
+    "metaOverrideFileDefine": true,
+    "docBaseConstMatchBaseType": true,
+    "requireExportGlobal": false,
+    "allowNullableAsNonNullable": true
+  },
+  "semanticTokens": {
+    "enable": true,
+    "renderDocumentationMarkup": true
+  },
+  "references": {
+    "enable": true,
+    "fuzzySearch": true,
+    "shortStringSearch": false
+  },
+  "hover": {
+    "enable": true,
+    "customDetail": null
+  },
+  "documentColor": {
+    "enable": true
+  },
+  "codeAction": {
+    "insertSpace": false
+  },
+  "inlineValues": {
+    "enable": true
+  },
+  "doc": {
+    "privateName": [],
+    "knownTags": [],
+    "syntax": "md"
+  },
+  "format": {
+    "externalTool": null,
+    "externalToolRangeFormat": null,
+    "useDiff": false,
+    "preset": "default",
+    "configPrecedence": "preferEditorconfig"
+  }
+}
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::vfs::collect_workspace_files] collect_files from: [WorkspaceFolder { root: "C:/Users/Pollux/Documents/glualangserver/emmylua-rust/gmod-glua-ls/test_addon", import: All, is_library: false }] match_pattern: ["**/*.lua"] exclude: [], exclude_dir: []
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::vfs::collect_workspace_files] load files from workspace count: 234
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::db_index::module] update module pattern: [Regex("^(.*)/init\\.lua$"), Regex("^(.*)\\.lua$")]
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::db_index::module] update module replace pattern: []
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::handlers::initialized] add workspace root: "C:/Users/Pollux/Documents/glualangserver/emmylua-rust/gmod-glua-ls/test_addon"
+[2026-03-11 14:48:59 +00:00 INFO glua_ls::handlers::initialized] setting per-workspace diagnostic config for "C:/Users/Pollux/Documents/glualangserver/emmylua-rust/gmod-glua-ls/test_addon" (workspace_id: WorkspaceId { id: 1 })
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] update files: cost 72.3578ms
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] module analyze: cost 442.2µs
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] decl analyze: cost 92.6633ms
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] doc analyze: cost 14.9634ms
+[2026-03-11 14:48:59 +00:00 INFO glua_code_analysis::profile] flow analyze: cost 23.0101ms
+[2026-03-11 14:49:00 +00:00 INFO glua_code_analysis::profile] lua analyze: cost 977.3755ms
+[2026-03-11 14:49:00 +00:00 INFO glua_code_analysis::profile] gmod analyze: cost 149.3255ms
+[2026-03-11 14:49:01 +00:00 INFO glua_code_analysis::profile] resolve analyze: cost 600.4541ms
+[2026-03-11 14:49:01 +00:00 INFO glua_code_analysis::profile] dynamic field analyze: cost 70.1984ms
+[2026-03-11 14:49:01 +00:00 INFO glua_code_analysis::profile] analyze workspace main: cost 1.9281994s
+[2026-03-11 14:49:04 +00:00 INFO glua_ls::context::debounced_analysis] debounced reindex: 1 file(s) after 200ms quiet
+[2026-03-11 14:49:09 +00:00 INFO glua_ls::context::debounced_analysis] debounced reindex: 1 file(s) after 200ms quiet
+[2026-03-11 14:49:10 +00:00 INFO glua_ls::context::debounced_analysis] debounced reindex: 1 file(s) after 200ms quiet
+[2026-03-11 14:49:10 +00:00 INFO glua_code_analysis::db_index::global] global_index: global 'aswdoawkdawklfsekljgsdlkadwaijddsafjnaedajhxxxxxxxx' fully removed (file_id=FileId { id: 20 })
+[2026-03-11 14:49:12 +00:00 INFO glua_ls::context::debounced_analysis] debounced reindex: 1 file(s) after 200ms quiet

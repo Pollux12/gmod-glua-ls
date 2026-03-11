@@ -38,6 +38,9 @@ pub fn complete_types_by_prefix(
     let results = type_index.find_type_decls(file_id, prefix);
 
     for (name, type_decl) in results {
+        if builder.is_cancelled() {
+            return None;
+        }
         if let Some(filter) = filter
             && type_decl
                 .as_ref()

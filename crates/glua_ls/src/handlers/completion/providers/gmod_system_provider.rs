@@ -297,6 +297,9 @@ fn add_net_message_completion_items(
     let infer_index = builder.semantic_model.get_db().get_gmod_infer_index();
     let mut net_name_stats: HashMap<String, (usize, usize)> = HashMap::new();
     for (_, metadata) in infer_index.iter_system_file_metadata() {
+        if builder.is_cancelled() {
+            return false;
+        }
         for net_registration in &metadata.net_add_string_calls {
             if let Some(name) = normalize_name(net_registration.name.as_deref()) {
                 net_name_stats.entry(name.to_string()).or_default().0 += 1;
@@ -358,6 +361,9 @@ fn add_hook_completion_items(
     let should_filter_realm = matches!(call_realm, GmodRealm::Client | GmodRealm::Server);
 
     for (file_id, metadata) in infer_index.iter_hook_file_metadata() {
+        if builder.is_cancelled() {
+            return false;
+        }
         for hook_site in &metadata.sites {
             if should_filter_realm {
                 let hook_realm =

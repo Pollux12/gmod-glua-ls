@@ -123,6 +123,9 @@ fn add_local_env(
     let trigger_text = builder.get_trigger_text();
 
     for decl_id in local_env.iter() {
+        if builder.is_cancelled() {
+            return None;
+        }
         // 获取变量名和类型
         let (name, typ) = {
             let decl = builder
@@ -189,6 +192,9 @@ pub fn add_global_env(
         .get_global_index()
         .get_all_global_decl_ids();
     for decl_id in global_env.iter() {
+        if builder.is_cancelled() {
+            return None;
+        }
         let decl = builder
             .semantic_model
             .get_db()

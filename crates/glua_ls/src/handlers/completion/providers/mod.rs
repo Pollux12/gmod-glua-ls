@@ -22,22 +22,64 @@ use rowan::TextRange;
 
 pub fn add_completions(builder: &mut CompletionBuilder) -> Option<()> {
     postfix_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     // `function_provider`优先级必须高于`env_provider`
     function_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     equality_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     // 如果`table_field_provider`执行成功会中止补全, 同时优先级必须高于`env_provider`
     table_field_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     env_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     keywords_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     member_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     gmod_system_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
 
     module_path_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     file_path_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     auto_require_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     doc_tag_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     doc_type_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     doc_name_token_provider::add_completion(builder);
+    if builder.is_cancelled() {
+        return None;
+    }
     desc_provider::add_completions(builder);
 
     for (index, item) in builder.get_completion_items_mut().iter_mut().enumerate() {
