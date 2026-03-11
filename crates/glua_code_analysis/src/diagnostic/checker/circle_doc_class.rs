@@ -17,6 +17,9 @@ impl Checker for CircleDocClassChecker {
         let root = semantic_model.get_root().clone();
 
         for expr in root.descendants::<LuaDocTagClass>() {
+            if context.is_cancelled() {
+                return;
+            }
             check_doc_tag_class(context, semantic_model, &expr);
         }
     }
@@ -27,6 +30,10 @@ fn check_doc_tag_class(
     _: &SemanticModel,
     tag: &LuaDocTagClass,
 ) -> Option<()> {
+    if context.is_cancelled() {
+        return Some(());
+    }
+
     let type_index = context.db.get_type_index();
 
     let class_decl =
@@ -43,6 +50,9 @@ fn check_doc_tag_class(
 
     queue.push(class_decl.get_id());
     while let Some(current_id) = queue.pop() {
+        if context.is_cancelled() {
+            return Some(());
+        }
         if !visited.insert(current_id.clone()) {
             continue;
         }
@@ -50,6 +60,9 @@ fn check_doc_tag_class(
         let super_types = type_index.get_super_types(&current_id);
         if let Some(super_types) = super_types {
             for super_type in super_types {
+                if context.is_cancelled() {
+                    return Some(());
+                }
                 if let LuaType::Ref(super_type_id) = &super_type {
                     if super_type_id.get_name() == name {
                         context.add_diagnostic(

@@ -59,7 +59,8 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         && let Some(text_edit_range) = get_text_edit_range_in_string(builder, string_token)
     {
         let string_added = if is_net_message_string_context(&call_expr, literal_expr.clone()) {
-            if staged_call_snippets_enabled(builder) && matches_call_path(&call_path, "net.Receive") {
+            if staged_call_snippets_enabled(builder) && matches_call_path(&call_path, "net.Receive")
+            {
                 add_staged_net_receive_completion_items(builder, &call_expr)
             } else {
                 add_net_message_completion_items(builder, Some(text_edit_range))
@@ -93,7 +94,10 @@ pub fn apply_staged_call_snippet(
         return None;
     }
 
-    let index_expr = builder.trigger_token.parent_ancestors().find_map(LuaIndexExpr::cast)?;
+    let index_expr = builder
+        .trigger_token
+        .parent_ancestors()
+        .find_map(LuaIndexExpr::cast)?;
     let prefix_path = expr_access_path(&index_expr.get_prefix_expr()?)?;
     let call_path = format!("{prefix_path}.{label}");
     if !matches_call_path(&call_path, "hook.Add") && !matches_call_path(&call_path, "net.Receive") {
@@ -372,8 +376,7 @@ fn add_staged_net_receive_completion_items(
     let Some(string_token) = completion_string_token(builder) else {
         return false;
     };
-    let Some(replace_range) = staged_call_edit_range(builder, &string_token, call_expr)
-    else {
+    let Some(replace_range) = staged_call_edit_range(builder, &string_token, call_expr) else {
         return false;
     };
 
@@ -381,7 +384,10 @@ fn add_staged_net_receive_completion_items(
         .semantic_model
         .get_db()
         .get_gmod_infer_index()
-        .get_realm_at_offset(&builder.semantic_model.get_file_id(), builder.position_offset);
+        .get_realm_at_offset(
+            &builder.semantic_model.get_file_id(),
+            builder.position_offset,
+        );
 
     for (name, (registration_count, receiver_count)) in collect_net_message_stats(builder) {
         let snippet = build_net_receive_snippet(&name, call_realm);
@@ -454,8 +460,7 @@ fn add_staged_hook_add_completion_items(
     let Some(string_token) = completion_string_token(builder) else {
         return false;
     };
-    let Some(replace_range) = staged_call_edit_range(builder, &string_token, call_expr)
-    else {
+    let Some(replace_range) = staged_call_edit_range(builder, &string_token, call_expr) else {
         return false;
     };
 
@@ -535,7 +540,8 @@ fn collect_hook_completion_entries(
         }
         for hook_site in &metadata.sites {
             if should_filter_realm {
-                let hook_realm = resolve_hook_site_realm(&builder.semantic_model, file_id, hook_site);
+                let hook_realm =
+                    resolve_hook_site_realm(&builder.semantic_model, file_id, hook_site);
                 if !is_realm_compatible(call_realm, hook_realm) {
                     continue;
                 }
@@ -567,7 +573,8 @@ fn collect_hook_completion_entries(
                                 && hook_site.callback_params.len() > params.len())
                     })
             {
-                stats.callback_params = Some((callback_priority, hook_site.callback_params.clone()));
+                stats.callback_params =
+                    Some((callback_priority, hook_site.callback_params.clone()));
             }
         }
     }
@@ -660,8 +667,18 @@ fn expr_access_path(expr: &LuaExpr) -> Option<String> {
 
 fn completion_string_token(builder: &CompletionBuilder) -> Option<LuaStringToken> {
     LuaStringToken::cast(builder.trigger_token.clone())
-        .or_else(|| builder.trigger_token.prev_token().and_then(LuaStringToken::cast))
-        .or_else(|| builder.trigger_token.next_token().and_then(LuaStringToken::cast))
+        .or_else(|| {
+            builder
+                .trigger_token
+                .prev_token()
+                .and_then(LuaStringToken::cast)
+        })
+        .or_else(|| {
+            builder
+                .trigger_token
+                .next_token()
+                .and_then(LuaStringToken::cast)
+        })
         .or_else(|| {
             builder.trigger_token.parent_ancestors().find_map(|node| {
                 let literal_expr = LuaLiteralExpr::cast(node)?;
@@ -687,7 +704,11 @@ fn staged_call_edit_range(
     }
 
     let start_range = rowan::TextRange::new(start_offset.into(), start_offset.into());
-    let start = builder.semantic_model.get_document().to_lsp_range(start_range)?.start;
+    let start = builder
+        .semantic_model
+        .get_document()
+        .to_lsp_range(start_range)?
+        .start;
     let end = builder
         .semantic_model
         .get_document()
@@ -698,7 +719,11 @@ fn staged_call_edit_range(
 }
 
 fn staged_call_snippets_enabled(builder: &CompletionBuilder) -> bool {
-    builder.semantic_model.get_emmyrc().completion.staged_call_snippets
+    builder
+        .semantic_model
+        .get_emmyrc()
+        .completion
+        .staged_call_snippets
 }
 
 fn trigger_suggest_command() -> Command {

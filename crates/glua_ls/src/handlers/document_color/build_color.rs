@@ -221,7 +221,8 @@ mod tests {
         let tree = LuaParser::parse(text, ParserConfig::default());
         let line_index = LineIndex::parse(text);
         let path = PathBuf::from("test.lua");
-        let document = glua_code_analysis::LuaDocument::new(FileId::new(0), &path, text, &line_index);
+        let document =
+            glua_code_analysis::LuaDocument::new(FileId::new(0), &path, text, &line_index);
         build_colors(tree.get_red_root(), &document)
     }
 

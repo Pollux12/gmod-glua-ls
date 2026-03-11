@@ -7,7 +7,9 @@ mod resolve_completion;
 
 pub use add_completions::get_index_alias_name;
 use completion_builder::CompletionBuilder;
-use completion_data::CompletionData;
+pub(crate) use completion_data::CompletionData;
+#[cfg(test)]
+pub(crate) use completion_data::CompletionDataType;
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use glua_parser::LuaAstNode;
 use log::error;

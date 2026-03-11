@@ -9,6 +9,7 @@ use glua_parser::{
     LuaTableField,
 };
 use lsp_types::Location;
+use tokio_util::sync::CancellationToken;
 
 use crate::handlers::hover::find_member_origin_owner;
 
@@ -16,6 +17,7 @@ pub fn search_implementations(
     semantic_model: &SemanticModel,
     compilation: &LuaCompilation,
     token: LuaSyntaxToken,
+    cancel_token: &CancellationToken,
 ) -> Option<Vec<Location>> {
     let mut result = Vec::new();
     if let Some(semantic_decl) =
@@ -26,10 +28,22 @@ pub fn search_implementations(
                 search_type_implementations(semantic_model, compilation, type_decl_id, &mut result);
             }
             LuaSemanticDeclId::Member(member_id) => {
-                search_member_implementations(semantic_model, compilation, member_id, &mut result);
+                search_member_implementations(
+                    semantic_model,
+                    compilation,
+                    member_id,
+                    &mut result,
+                    cancel_token,
+                );
             }
             LuaSemanticDeclId::LuaDecl(decl_id) => {
-                search_decl_implementations(semantic_model, compilation, decl_id, &mut result);
+                search_decl_implementations(
+                    semantic_model,
+                    compilation,
+                    decl_id,
+                    &mut result,
+                    cancel_token,
+                );
             }
             _ => {}
         }
@@ -43,6 +57,7 @@ pub fn search_member_implementations(
     compilation: &LuaCompilation,
     member_id: LuaMemberId,
     result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let member = semantic_model
         .get_db()
@@ -60,6 +75,9 @@ pub fn search_member_implementations(
     let property_owner = find_member_origin_owner(compilation, semantic_model, member_id)
         .unwrap_or(LuaSemanticDeclId::Member(member_id));
     for in_filed_syntax_id in index_references {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         let semantic_model =
             if let Some(semantic_model) = semantic_cache.get_mut(&in_filed_syntax_id.file_id) {
                 semantic_model
@@ -201,6 +219,7 @@ pub fn search_decl_implementations(
     compilation: &LuaCompilation,
     decl_id: LuaDeclId,
     result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let decl = semantic_model
         .get_db()
@@ -237,6 +256,9 @@ pub fn search_decl_implementations(
         let mut semantic_cache = HashMap::new();
 
         for global_decl_id in global_decl_ids {
+            if cancel_token.is_cancelled() {
+                return None;
+            }
             let semantic_model =
                 if let Some(semantic_model) = semantic_cache.get_mut(&global_decl_id.file_id) {
                     semantic_model

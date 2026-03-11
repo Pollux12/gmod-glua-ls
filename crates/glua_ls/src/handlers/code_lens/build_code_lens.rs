@@ -8,7 +8,7 @@ use glua_parser::{
 use lsp_types::{CodeLens, Command, Range};
 use rowan::NodeOrToken;
 
-use super::CodeLensData;
+use super::{CodeLensData, CodeLensResolveData};
 
 fn is_top_level_stat(syntax: &glua_parser::LuaSyntaxNode) -> bool {
     syntax
@@ -68,7 +68,10 @@ fn add_func_stat_code_lens(
     match func_name {
         LuaVarExpr::IndexExpr(index_expr) => {
             let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
-            let data = CodeLensData::Member(member_id);
+            let data = CodeLensResolveData {
+                uri: Some(document.get_uri().clone()),
+                payload: CodeLensData::Member(member_id),
+            };
             let index_name_token = index_expr.get_index_name_token()?;
             let range = document.to_lsp_range(index_name_token.text_range())?;
             result.push(CodeLens {
@@ -90,7 +93,10 @@ fn add_func_stat_code_lens(
         LuaVarExpr::NameExpr(name_expr) => {
             let name_token = name_expr.get_name_token()?;
             let decl_id = LuaDeclId::new(file_id, name_token.get_position());
-            let data = CodeLensData::DeclId(decl_id);
+            let data = CodeLensResolveData {
+                uri: Some(document.get_uri().clone()),
+                payload: CodeLensData::DeclId(decl_id),
+            };
             let range = document.to_lsp_range(name_token.get_range())?;
             result.push(CodeLens {
                 range: range.clone(),
@@ -121,7 +127,10 @@ fn add_local_func_stat_code_lens(
     let range = document.to_lsp_range(func_name.get_range())?;
     let name_token = func_name.get_name_token()?;
     let decl_id = LuaDeclId::new(file_id, name_token.get_position());
-    let data = CodeLensData::DeclId(decl_id);
+    let data = CodeLensResolveData {
+        uri: Some(document.get_uri().clone()),
+        payload: CodeLensData::DeclId(decl_id),
+    };
     result.push(CodeLens {
         range: range.clone(),
         command: None,

@@ -19,6 +19,9 @@ impl Checker for GmodSystemsChecker {
         let aggregate = infer_index.get_system_aggregate();
 
         for site in &file_metadata.net_start_calls {
+            if context.is_cancelled() {
+                return;
+            }
             let Some(name) = normalize_name(site.name.as_deref()) else {
                 continue;
             };
@@ -42,6 +45,9 @@ impl Checker for GmodSystemsChecker {
         }
 
         for site in &file_metadata.net_add_string_calls {
+            if context.is_cancelled() {
+                return;
+            }
             let Some(name) = normalize_name(site.name.as_deref()) else {
                 continue;
             };
@@ -66,6 +72,9 @@ impl Checker for GmodSystemsChecker {
         }
 
         for site in &file_metadata.concommand_add_calls {
+            if context.is_cancelled() {
+                return;
+            }
             let Some(name) = normalize_name(site.command_name.as_deref()) else {
                 continue;
             };
@@ -90,6 +99,9 @@ impl Checker for GmodSystemsChecker {
         }
 
         for site in &file_metadata.convar_create_calls {
+            if context.is_cancelled() {
+                return;
+            }
             let Some(name) = normalize_name(site.convar_name.as_deref()) else {
                 continue;
             };

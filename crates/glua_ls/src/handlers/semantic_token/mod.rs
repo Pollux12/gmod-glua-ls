@@ -3,7 +3,7 @@ mod function_string_highlight;
 mod language_injector;
 mod semantic_token_builder;
 
-use crate::context::{ClientId, ServerContextSnapshot};
+use crate::context::{ClientId, EditorDisplayCacheKind, ServerContextSnapshot};
 use build_semantic_tokens::build_semantic_tokens;
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use lsp_types::{
@@ -30,27 +30,63 @@ pub async fn on_semantic_token_handler(
 
     let uri = params.text_document.uri;
 
+    if context.debounced_analysis().is_dirty()
+        && let Some(cached_tokens) = context
+            .editor_display_cache()
+            .get(EditorDisplayCacheKind::SemanticTokens, &uri)
+            .await
+    {
+        return Some(cached_tokens);
+    }
+
+    if !context
+        .debounced_analysis()
+        .wait_until_fresh(&cancel_token)
+        .await
+    {
+        return context
+            .editor_display_cache()
+            .get(EditorDisplayCacheKind::SemanticTokens, &uri)
+            .await;
+    }
+
     let client_id = context
         .read_workspace_manager(&cancel_token)
         .await?
         .client_config
         .client_id;
 
-    let analysis = context.read_analysis(&cancel_token).await?;
+    let result = {
+        let analysis = context.read_analysis(&cancel_token).await?;
 
-    if cancel_token.is_cancelled() {
-        return None;
+        if cancel_token.is_cancelled() {
+            return None;
+        }
+
+        let file_id = analysis.get_file_id(&uri)?;
+
+        semantic_token(
+            &analysis,
+            file_id,
+            context.lsp_features().supports_multiline_tokens(),
+            client_id,
+            &cancel_token,
+        )
+    };
+
+    if let Some(ref result) = result {
+        let _ = context
+            .editor_display_cache()
+            .insert(EditorDisplayCacheKind::SemanticTokens, &uri, result)
+            .await;
+    } else {
+        context
+            .editor_display_cache()
+            .remove_kind(EditorDisplayCacheKind::SemanticTokens, &uri)
+            .await;
     }
 
-    let file_id = analysis.get_file_id(&uri)?;
-
-    semantic_token(
-        &analysis,
-        file_id,
-        context.lsp_features().supports_multiline_tokens(),
-        client_id,
-        &cancel_token,
-    )
+    result
 }
 
 pub fn semantic_token(

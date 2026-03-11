@@ -91,9 +91,15 @@ pub async fn on_did_change_watched_files(
 
     // Schedule diagnostics and config reloads (no locks needed)
     if !lsp_features.supports_pull_diagnostic() {
-        for uri in deleted_lua_uris {
-            context.file_diagnostic().clear_push_file_diagnostics(uri);
+        for uri in &deleted_lua_uris {
+            context
+                .file_diagnostic()
+                .clear_push_file_diagnostics(uri.clone())
+                .await;
         }
+    }
+    for uri in &deleted_lua_uris {
+        context.editor_display_cache().remove_uri(uri).await;
     }
 
     context

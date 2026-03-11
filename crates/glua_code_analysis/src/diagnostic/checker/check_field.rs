@@ -22,6 +22,9 @@ impl Checker for CheckFieldChecker {
         let root = semantic_model.get_root().clone();
         let mut checked_index_expr = HashSet::new();
         for node in root.descendants::<LuaAst>() {
+            if context.is_cancelled() {
+                return;
+            }
             match node {
                 LuaAst::LuaAssignStat(assign) => {
                     let (vars, _) = assign.get_var_and_expr_list();
@@ -71,6 +74,10 @@ fn check_index_expr(
     index_expr: &LuaIndexExpr,
     code: DiagnosticCode,
 ) -> Option<()> {
+    if context.is_cancelled() {
+        return Some(());
+    }
+
     let db = context.db;
     let prefix_typ = semantic_model
         .infer_expr(index_expr.get_prefix_expr()?)
@@ -82,7 +89,16 @@ fn check_index_expr(
 
     let index_key = index_expr.get_index_key()?;
 
-    if is_valid_member(semantic_model, &prefix_typ, index_expr, &index_key, code).is_some() {
+    if is_valid_member(
+        context,
+        semantic_model,
+        &prefix_typ,
+        index_expr,
+        &index_key,
+        code,
+    )
+    .is_some()
+    {
         // TableOf types allow dot-access to all members but flag colon method calls.
         // GetTable() returns a plain table with fields; colon calls pass the wrong self.
         if is_tableof_colon_access(&prefix_typ, index_expr) {
@@ -213,6 +229,7 @@ fn is_tableof_colon_access(prefix_typ: &LuaType, index_expr: &LuaIndexExpr) -> b
 }
 
 pub(super) fn is_valid_member(
+    context: &DiagnosticContext,
     semantic_model: &SemanticModel,
     prefix_typ: &LuaType,
     index_expr: &LuaIndexExpr,
@@ -411,15 +428,21 @@ pub(super) fn is_valid_member(
             local field
             local a = Class[field]
     */
-    let key_types = get_key_types(&semantic_model.get_db(), &key_type);
+    let key_types = get_key_types(context, &semantic_model.get_db(), &key_type);
     if key_types.is_empty() {
         return None;
     }
 
-    let prefix_types = get_prefix_types(prefix_typ);
+    let prefix_types = get_prefix_types(context, prefix_typ);
     for prefix_type in prefix_types {
+        if context.is_cancelled() {
+            return Some(());
+        }
         if let Some(members) = semantic_model.get_member_infos(&prefix_type) {
             for info in &members {
+                if context.is_cancelled() {
+                    return Some(());
+                }
                 match &info.key {
                     LuaMemberKey::ExprType(typ) => {
                         if typ.is_string() {
@@ -482,12 +505,15 @@ fn check_enum_self_reference(
     None
 }
 
-fn get_prefix_types(prefix_typ: &LuaType) -> HashSet<LuaType> {
+fn get_prefix_types(context: &DiagnosticContext, prefix_typ: &LuaType) -> HashSet<LuaType> {
     let mut type_set = HashSet::new();
     let mut stack = vec![prefix_typ.clone()];
     let mut visited = HashSet::new();
 
     while let Some(current_type) = stack.pop() {
+        if context.is_cancelled() {
+            return type_set;
+        }
         if visited.contains(&current_type) {
             continue;
         }
@@ -507,12 +533,15 @@ fn get_prefix_types(prefix_typ: &LuaType) -> HashSet<LuaType> {
     type_set
 }
 
-fn get_key_types(db: &DbIndex, typ: &LuaType) -> HashSet<LuaType> {
+fn get_key_types(context: &DiagnosticContext, db: &DbIndex, typ: &LuaType) -> HashSet<LuaType> {
     let mut type_set = HashSet::new();
     let mut stack = vec![typ.clone()];
     let mut visited = HashSet::new();
 
     while let Some(current_type) = stack.pop() {
+        if context.is_cancelled() {
+            return type_set;
+        }
         if visited.contains(&current_type) {
             continue;
         }

@@ -14,6 +14,9 @@ impl Checker for DuplicateIndexChecker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
         for table in root.descendants::<LuaTableExpr>() {
+            if context.is_cancelled() {
+                return;
+            }
             check_table_duplicate_index(context, semantic_model, table);
         }
     }
@@ -24,6 +27,10 @@ fn check_table_duplicate_index(
     _: &SemanticModel,
     table: LuaTableExpr,
 ) -> Option<()> {
+    if context.is_cancelled() {
+        return Some(());
+    }
+
     let fields = table.get_fields().collect::<Vec<_>>();
     if fields.len() > 50 {
         // Skip checking if there are too many fields to avoid performance issues
@@ -33,6 +40,9 @@ fn check_table_duplicate_index(
     let mut index_map: HashMap<String, Vec<LuaIndexKey>> = HashMap::new();
 
     for field in fields {
+        if context.is_cancelled() {
+            return Some(());
+        }
         let key = field.get_field_key();
         if let Some(key) = key {
             index_map.entry(key.get_path_part()).or_default().push(key);
@@ -40,8 +50,14 @@ fn check_table_duplicate_index(
     }
 
     for (name, keys) in index_map {
+        if context.is_cancelled() {
+            return Some(());
+        }
         if keys.len() > 1 {
             for key in keys {
+                if context.is_cancelled() {
+                    return Some(());
+                }
                 let range = if let Some(range) = key.get_range() {
                     range
                 } else {

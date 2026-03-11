@@ -21,6 +21,9 @@ impl Checker for ParamTypeCheckChecker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
         for node in root.descendants::<LuaAst>() {
+            if context.is_cancelled() {
+                return;
+            }
             if let LuaAst::LuaCallExpr(call_expr) = node {
                 check_call_expr(context, semantic_model, call_expr);
             }
@@ -33,6 +36,10 @@ fn check_call_expr(
     semantic_model: &SemanticModel,
     call_expr: LuaCallExpr,
 ) -> Option<()> {
+    if context.is_cancelled() {
+        return Some(());
+    }
+
     let func = semantic_model.infer_call_expr_func(call_expr.clone(), None)?;
     let mut params = func.get_params().to_vec();
     let arg_exprs = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
@@ -57,6 +64,9 @@ fn check_call_expr(
     }
 
     for (idx, param) in params.iter().enumerate() {
+        if context.is_cancelled() {
+            return Some(());
+        }
         if param.0 == "..." {
             if arg_types.len() < idx {
                 break;
@@ -162,6 +172,9 @@ fn check_variadic_param_match_args(
     arg_ranges: &[TextRange],
 ) {
     for (arg_type, arg_range) in arg_types.iter().zip(arg_ranges.iter()) {
+        if context.is_cancelled() {
+            return;
+        }
         let result = semantic_model.type_check_detail(variadic_type, arg_type);
         if result.is_err() {
             try_add_diagnostic(

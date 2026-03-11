@@ -12,6 +12,7 @@ use glua_parser::{
     LuaNameToken, LuaStringToken, LuaSyntaxNode, LuaSyntaxToken, LuaTableField, PathTrait,
 };
 use lsp_types::Location;
+use tokio_util::sync::CancellationToken;
 
 use crate::handlers::gmod_string_context::{
     extract_string_call_context, is_vgui_panel_string_context, net_message_call_kind,
@@ -28,6 +29,7 @@ pub fn search_references(
     semantic_model: &SemanticModel,
     compilation: &LuaCompilation,
     token: LuaSyntaxToken,
+    cancel_token: &CancellationToken,
 ) -> Option<Vec<Location>> {
     let mut result = Vec::new();
     if let Some(semantic_decl) =
@@ -41,11 +43,17 @@ pub fn search_references(
                     decl_id,
                     token,
                     &mut result,
+                    cancel_token,
                 );
             }
             LuaSemanticDeclId::Member(member_id) => {
-                let _ =
-                    search_member_references(semantic_model, compilation, member_id, &mut result);
+                let _ = search_member_references(
+                    semantic_model,
+                    compilation,
+                    member_id,
+                    &mut result,
+                    cancel_token,
+                );
             }
             LuaSemanticDeclId::TypeDecl(type_decl_id) => {
                 let _ = search_type_decl_references(semantic_model, type_decl_id, &mut result);
@@ -59,6 +67,7 @@ pub fn search_references(
                 compilation,
                 string_token.clone(),
                 &mut result,
+                cancel_token,
             )
             .is_some()
             {
@@ -74,12 +83,8 @@ pub fn search_references(
 
         let _ = search_string_references(semantic_model, string_token, &mut result);
     } else if semantic_model.get_emmyrc().references.fuzzy_search {
-        let _ = fuzzy_search_references(compilation, token, &mut result);
+        let _ = fuzzy_search_references(compilation, token, &mut result, cancel_token);
     }
-
-    // 简单过滤, 同行的多个引用只保留一个
-    // let filtered_result = filter_duplicate_and_covered_locations(result);
-    // Some(filtered_result)
 
     Some(result)
 }
@@ -90,6 +95,7 @@ pub fn search_decl_references_with_token(
     decl_id: LuaDeclId,
     token: LuaSyntaxToken,
     result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let mut ctx = ReferenceSearchContext::default();
     let mut semantic_cache = HashMap::new();
@@ -100,6 +106,7 @@ pub fn search_decl_references_with_token(
         &mut semantic_cache,
         LuaSemanticDeclId::LuaDecl(decl_id),
         result,
+        cancel_token,
     );
     // 如果不等于当前文件, 那么我们可能是引用了其他文件的导出
     if ret.is_none()
@@ -116,6 +123,7 @@ pub fn search_decl_references_with_token(
                     &mut semantic_cache,
                     LuaSemanticDeclId::LuaDecl(decl_id),
                     result,
+                    cancel_token,
                 );
             }
         }
@@ -128,6 +136,7 @@ pub fn search_decl_references(
     compilation: &LuaCompilation,
     decl_id: LuaDeclId,
     result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let mut ctx = ReferenceSearchContext::default();
     let mut semantic_cache = HashMap::new();
@@ -137,6 +146,7 @@ pub fn search_decl_references(
         &mut semantic_cache,
         LuaSemanticDeclId::LuaDecl(decl_id),
         result,
+        cancel_token,
     )
 }
 
@@ -213,6 +223,7 @@ pub fn search_member_references(
     compilation: &LuaCompilation,
     member_id: LuaMemberId,
     result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let mut ctx = ReferenceSearchContext::default();
     let mut semantic_cache = HashMap::new();
@@ -222,6 +233,7 @@ pub fn search_member_references(
         &mut semantic_cache,
         LuaSemanticDeclId::Member(member_id),
         result,
+        cancel_token,
     )
 }
 
@@ -233,6 +245,7 @@ fn search_member_references_with_ctx<'a>(
     member_id: LuaMemberId,
     result: &mut Vec<Location>,
     worklist: &mut Vec<LuaSemanticDeclId>,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let member = semantic_model
         .get_db()
@@ -246,6 +259,9 @@ fn search_member_references_with_ctx<'a>(
 
     let semantic_id = LuaSemanticDeclId::Member(member_id);
     for in_filed_syntax_id in index_references {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         let reference_semantic_model =
             get_semantic_model_cached(compilation, semantic_cache, in_filed_syntax_id.file_id)?;
         let root = reference_semantic_model.get_root();
@@ -336,6 +352,7 @@ fn search_vgui_panel_string_references(
     compilation: &LuaCompilation,
     token: LuaStringToken,
     result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let context = extract_string_call_context(&token)?;
     if !is_vgui_panel_string_context(&context.call_path, context.arg_index) {
@@ -404,7 +421,12 @@ fn search_vgui_panel_string_references(
     }
 
     if result.len() == before_usage_refs {
-        collect_vgui_context_string_references_from_ast(compilation, &context.name, result);
+        collect_vgui_context_string_references_from_ast(
+            compilation,
+            &context.name,
+            result,
+            cancel_token,
+        );
     }
 
     Some(())
@@ -418,10 +440,14 @@ fn collect_vgui_context_string_references_from_ast(
     compilation: &LuaCompilation,
     panel_name: &str,
     result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
 ) {
     let mut semantic_cache = HashMap::new();
     let file_ids = compilation.get_db().get_vfs().get_all_file_ids();
     for file_id in file_ids {
+        if cancel_token.is_cancelled() {
+            return;
+        }
         let Some(semantic_model) =
             get_semantic_model_cached(compilation, &mut semantic_cache, file_id)
         else {
@@ -510,6 +536,7 @@ fn fuzzy_search_references(
     compilation: &LuaCompilation,
     token: LuaSyntaxToken,
     result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let name = LuaNameToken::cast(token)?;
     let name_text = name.get_name_text();
@@ -520,6 +547,9 @@ fn fuzzy_search_references(
 
     let mut semantic_cache = HashMap::new();
     for in_filed_syntax_id in fuzzy_references {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         let semantic_model =
             if let Some(semantic_model) = semantic_cache.get_mut(&in_filed_syntax_id.file_id) {
                 semantic_model
@@ -818,6 +848,7 @@ fn search_semantic_references_with_ctx<'a>(
     semantic_cache: &mut HashMap<FileId, Rc<SemanticModel<'a>>>,
     start: LuaSemanticDeclId,
     result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let mut worklist = Vec::new();
     if ctx.visited_semantic_ids.insert(start.clone()) {
@@ -830,6 +861,9 @@ fn search_semantic_references_with_ctx<'a>(
     let mut start_ret = Some(());
 
     while let Some(semantic_id) = worklist.pop() {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         let ret = match semantic_id {
             LuaSemanticDeclId::LuaDecl(decl_id) => {
                 match get_semantic_model_cached(compilation, semantic_cache, decl_id.file_id) {
@@ -855,6 +889,7 @@ fn search_semantic_references_with_ctx<'a>(
                         member_id,
                         result,
                         &mut worklist,
+                        cancel_token,
                     ),
                     None => None,
                 }

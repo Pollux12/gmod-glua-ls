@@ -93,7 +93,7 @@ impl LuaDiagnostic {
 
         let config = self.get_config_for_file(compilation, file_id);
         let semantic_model = compilation.get_semantic_model(file_id)?;
-        let mut context = DiagnosticContext::new(file_id, db, config);
+        let mut context = DiagnosticContext::new(file_id, db, config, cancel_token.clone());
 
         check_file(&mut context, &semantic_model, &cancel_token);
 

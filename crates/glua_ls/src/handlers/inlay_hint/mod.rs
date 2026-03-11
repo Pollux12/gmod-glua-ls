@@ -2,7 +2,7 @@ mod build_function_hint;
 mod build_inlay_hint;
 
 use super::RegisterCapabilities;
-use crate::context::{ClientId, ServerContextSnapshot};
+use crate::context::{ClientId, EditorDisplayCacheKind, ServerContextSnapshot};
 use build_inlay_hint::build_inlay_hints;
 pub use build_inlay_hint::{get_override_lsp_location, get_super_member_id};
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
@@ -21,6 +21,17 @@ pub async fn on_inlay_hint_handler(
         return None;
     }
 
+    let uri = params.text_document.uri;
+
+    if context.debounced_analysis().is_dirty()
+        && let Some(cached_hints) = context
+            .editor_display_cache()
+            .get(EditorDisplayCacheKind::InlayHints, &uri)
+            .await
+    {
+        return Some(cached_hints);
+    }
+
     // Wait for any pending reindex to finish so we serve fresh hints
     // instead of returning null/ContentModified (which clears hints and
     // causes visible flickering). The wait is cancel-aware: if a new
@@ -30,10 +41,11 @@ pub async fn on_inlay_hint_handler(
         .wait_until_fresh(&cancel_token)
         .await
     {
-        return None;
+        return context
+            .editor_display_cache()
+            .get(EditorDisplayCacheKind::InlayHints, &uri)
+            .await;
     }
-
-    let uri = params.text_document.uri;
 
     let client_id = context
         .read_workspace_manager(&cancel_token)
@@ -41,18 +53,32 @@ pub async fn on_inlay_hint_handler(
         .client_config
         .client_id;
 
-    let analysis = context.read_analysis(&cancel_token).await?;
+    let result = {
+        let analysis = context.read_analysis(&cancel_token).await?;
 
-    if cancel_token.is_cancelled() {
-        return None;
+        if cancel_token.is_cancelled() {
+            return None;
+        }
+
+        inlay_hint(
+            &analysis,
+            analysis.get_file_id(&uri)?,
+            client_id,
+            &cancel_token,
+        )
+    };
+
+    if let Some(ref result) = result {
+        let _ = context
+            .editor_display_cache()
+            .insert(EditorDisplayCacheKind::InlayHints, &uri, result)
+            .await;
+    } else {
+        context
+            .editor_display_cache()
+            .remove_kind(EditorDisplayCacheKind::InlayHints, &uri)
+            .await;
     }
-
-    let result = inlay_hint(
-        &analysis,
-        analysis.get_file_id(&uri)?,
-        client_id,
-        &cancel_token,
-    );
 
     result
 }

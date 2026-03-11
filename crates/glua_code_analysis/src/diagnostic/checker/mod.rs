@@ -195,15 +195,22 @@ pub struct DiagnosticContext<'a> {
     db: &'a DbIndex,
     diagnostics: Vec<Diagnostic>,
     pub config: Arc<LuaDiagnosticConfig>,
+    cancel_token: CancellationToken,
 }
 
 impl<'a> DiagnosticContext<'a> {
-    pub fn new(file_id: FileId, db: &'a DbIndex, config: Arc<LuaDiagnosticConfig>) -> Self {
+    pub fn new(
+        file_id: FileId,
+        db: &'a DbIndex,
+        config: Arc<LuaDiagnosticConfig>,
+        cancel_token: CancellationToken,
+    ) -> Self {
         Self {
             file_id,
             db,
             diagnostics: Vec::new(),
             config,
+            cancel_token,
         }
     }
 
@@ -213,6 +220,10 @@ impl<'a> DiagnosticContext<'a> {
 
     pub fn get_file_id(&self) -> FileId {
         self.file_id
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token.is_cancelled()
     }
 
     pub fn add_diagnostic(
@@ -233,6 +244,10 @@ impl<'a> DiagnosticContext<'a> {
         severity: Option<DiagnosticSeverity>,
         data: Option<serde_json::Value>,
     ) {
+        if self.is_cancelled() {
+            return;
+        }
+
         if !self.is_checker_enable_by_code(&code) {
             return;
         }

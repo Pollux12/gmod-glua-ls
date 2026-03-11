@@ -286,6 +286,52 @@ impl EmmyLuaAnalysis {
         Some(file_id)
     }
 
+    pub fn update_file_preparsed_deferred(
+        &mut self,
+        uri: Uri,
+        text: Option<String>,
+        tree: LuaSyntaxTree,
+        line_index: LineIndex,
+        version: Option<i32>,
+    ) -> Option<(FileId, DeferredVfsDrop)> {
+        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
+        if let Some(file_id) = existing_file_id {
+            if let (Some(incoming_version), Some(current_version)) = (
+                version,
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_version(&file_id),
+            ) && incoming_version < current_version
+            {
+                return None;
+            }
+
+            if let (Some(new_text), Some(old_text)) = (
+                text.as_deref(),
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_content(&file_id)
+                    .map(String::as_str),
+            ) && old_text == new_text
+            {
+                self.compilation
+                    .get_db_mut()
+                    .get_vfs_mut()
+                    .update_file_version(&file_id, version);
+                return Some((file_id, DeferredVfsDrop::default()));
+            }
+        } else if text.is_none() {
+            return None;
+        }
+
+        self.compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .set_file_content_preparsed_deferred(&uri, text, tree, line_index, version)
+    }
+
     /// VFS-only update: parse and store the new text without touching the index.
     /// The index remains stale but functional until `reindex_files` is called.
     /// This is much faster than `update_file_by_uri`

@@ -9,7 +9,8 @@ use glua_parser::{
 use lsp_types::CompletionItem;
 
 use crate::handlers::completion::{
-    add_completions::get_function_snippet, completion_builder::CompletionBuilder,
+    add_completions::get_function_snippet,
+    completion_builder::CompletionBuilder,
     completion_data::CompletionData,
     providers::{apply_staged_call_snippet, get_function_remove_nil},
 };

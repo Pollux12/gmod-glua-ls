@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use lsp_types::{
     FullDocumentDiagnosticReport, WorkspaceDiagnosticParams, WorkspaceDiagnosticReport,
     WorkspaceFullDocumentDiagnosticReport,
@@ -11,11 +13,10 @@ pub async fn on_pull_workspace_diagnostic(
     _: WorkspaceDiagnosticParams,
     token: CancellationToken,
 ) -> WorkspaceDiagnosticReport {
-    // Wait for any pending debounced reindex to finish before diagnosing
-    context
-        .debounced_analysis()
-        .wait_for_all_reindex(token.clone())
-        .await;
+    // Wait for any pending/in-flight document changes to finish before diagnosing.
+    if !context.debounced_analysis().wait_until_fresh(&token).await {
+        return WorkspaceDiagnosticReport { items: vec![] };
+    }
 
     let Some(workspace_manager) = context.read_workspace_manager(&token).await else {
         return WorkspaceDiagnosticReport { items: vec![] };
@@ -24,8 +25,8 @@ pub async fn on_pull_workspace_diagnostic(
     if status == WorkspaceDiagnosticLevel::None {
         return WorkspaceDiagnosticReport { items: vec![] };
     }
-    let version = workspace_manager.get_workspace_version();
     let client_id = workspace_manager.client_config.client_id;
+    let open_files = workspace_manager.current_open_files.clone();
     workspace_manager.update_workspace_version(WorkspaceDiagnosticLevel::None, false);
     drop(workspace_manager);
 
@@ -49,14 +50,38 @@ pub async fn on_pull_workspace_diagnostic(
                 .await
         }
     };
+    let open_file_versions = {
+        let analysis = context.analysis().read().await;
+        file_diagnostics
+            .iter()
+            .filter_map(|(uri, _)| {
+                if !open_files.contains(uri) {
+                    return None;
+                }
+
+                let version = analysis.get_file_id(uri).and_then(|file_id| {
+                    analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_version(&file_id)
+                });
+                Some((uri.clone(), version))
+            })
+            .collect::<HashMap<_, _>>()
+    };
 
     WorkspaceDiagnosticReport {
         items: file_diagnostics
             .into_iter()
             .map(|(uri, diagnostics)| {
                 WorkspaceFullDocumentDiagnosticReport {
+                    version: open_file_versions
+                        .get(&uri)
+                        .copied()
+                        .flatten()
+                        .map(i64::from),
                     uri,
-                    version: Some(version),
                     full_document_diagnostic_report: FullDocumentDiagnosticReport {
                         items: diagnostics,
                         result_id: None,

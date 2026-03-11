@@ -53,8 +53,10 @@ impl DidChangeCoalescer {
             // Drain remaining messages without blocking.
             let mut latest: HashMap<Uri, DidChangeTextDocumentParams> = HashMap::new();
             latest.insert(first.text_document.uri.clone(), first);
+            let mut drained_count = 1usize;
 
             while let Ok(params) = rx.try_recv() {
+                drained_count += 1;
                 latest.insert(params.text_document.uri.clone(), params);
             }
 
@@ -62,6 +64,11 @@ impl DidChangeCoalescer {
             for (_uri, params) in latest {
                 on_did_change_text_document(context.clone(), params).await;
             }
+
+            context
+                .debounced_analysis()
+                .finish_in_flight_changes(drained_count)
+                .await;
         }
     }
 }

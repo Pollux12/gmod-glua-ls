@@ -32,6 +32,13 @@ pub struct Vfs {
     node_cache: NodeCache,
 }
 
+#[derive(Default)]
+pub struct DeferredVfsDrop {
+    old_file_data: Option<FileContent>,
+    old_line_index: Option<LineIndex>,
+    old_tree: Option<LuaSyntaxTree>,
+}
+
 impl Default for Vfs {
     fn default() -> Self {
         Self::new()
@@ -169,6 +176,59 @@ impl Vfs {
         }
 
         Some(fid)
+    }
+
+    pub fn set_file_content_preparsed_deferred(
+        &mut self,
+        uri: &Uri,
+        text: Option<String>,
+        tree: LuaSyntaxTree,
+        line_index: LineIndex,
+        version: Option<i32>,
+    ) -> Option<(FileId, DeferredVfsDrop)> {
+        let existing_file_id = self.get_file_id(uri);
+        if text.is_none() && existing_file_id.is_none() {
+            return None;
+        }
+
+        let fid = existing_file_id.unwrap_or_else(|| self.file_id(uri));
+        log::debug!(
+            "file_id (preparsed deferred): {:?}, uri: {}",
+            fid,
+            uri.as_str()
+        );
+
+        let current_version = self
+            .file_data
+            .get(fid.id as usize)
+            .and_then(Option::as_ref)
+            .and_then(|content| content.version);
+        if let (Some(incoming_version), Some(current_version)) = (version, current_version)
+            && incoming_version < current_version
+        {
+            return None;
+        }
+
+        let mut deferred_drop = DeferredVfsDrop::default();
+
+        match text {
+            Some(content) => {
+                deferred_drop.old_tree = self.tree_map.insert(fid, tree);
+                deferred_drop.old_line_index = self.line_index_map.insert(fid, line_index);
+                deferred_drop.old_file_data = self.file_data[fid.id as usize].replace(FileContent {
+                    content,
+                    is_remote: false,
+                    version,
+                });
+            }
+            None => {
+                deferred_drop.old_line_index = self.line_index_map.remove(&fid);
+                deferred_drop.old_tree = self.tree_map.remove(&fid);
+                deferred_drop.old_file_data = self.file_data[fid.id as usize].take();
+            }
+        }
+
+        Some((fid, deferred_drop))
     }
 
     pub fn set_remote_file_content(&mut self, uri: &Uri, data: Option<String>) -> FileId {

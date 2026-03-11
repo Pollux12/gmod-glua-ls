@@ -33,18 +33,27 @@ pub async fn on_document_symbol(
     params: DocumentSymbolParams,
     cancel_token: CancellationToken,
 ) -> Option<DocumentSymbolResponse> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = params.text_document.uri;
     let analysis = context.read_analysis(&cancel_token).await?;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
-    let document_symbol_root = build_document_symbol(&semantic_model)?;
+    let document_symbol_root = build_document_symbol(&semantic_model, &cancel_token)?;
     // remove root file symbol
     let children = document_symbol_root.children?;
     let response = DocumentSymbolResponse::Nested(children);
     Some(response)
 }
 
-fn build_document_symbol(semantic_model: &SemanticModel) -> Option<DocumentSymbol> {
+fn build_document_symbol(
+    semantic_model: &SemanticModel,
+    cancel_token: &CancellationToken,
+) -> Option<DocumentSymbol> {
     let document = semantic_model.get_document();
     let root = semantic_model.get_root();
     let file_id = semantic_model.get_file_id();
@@ -57,7 +66,7 @@ fn build_document_symbol(semantic_model: &SemanticModel) -> Option<DocumentSymbo
     let mut builder = DocumentSymbolBuilder::new(db, decl_tree, &document);
     let symbol = LuaSymbol::new("".into(), None, SymbolKind::FILE, root.get_range());
     let root_id = builder.add_node_symbol(root.syntax().clone(), symbol, None);
-    build_child_document_symbols(&mut builder, root, root_id);
+    build_child_document_symbols(&mut builder, root, root_id, cancel_token);
 
     Some(builder.build(root))
 }
@@ -66,6 +75,7 @@ fn build_child_document_symbols(
     builder: &mut DocumentSymbolBuilder,
     root: &LuaChunk,
     root_id: LuaSyntaxId,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     // Pre-create the scripted entity class symbol (e.g. "my_entity (Entity)") before processing
     // any statements so that method routing in resolve_func_parent_id can find it.
@@ -76,15 +86,19 @@ fn build_child_document_symbols(
             root.get_range(),
         );
     }
-    process_chunk(builder, root, root_id)
+    process_chunk(builder, root, root_id, cancel_token)
 }
 
 fn process_chunk(
     builder: &mut DocumentSymbolBuilder,
     chunk: &LuaChunk,
     parent_id: LuaSyntaxId,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     for node in chunk.syntax().children() {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         match node {
             comment if LuaComment::can_cast(comment.kind().into()) => {
                 let comment = LuaComment::cast(comment.clone())?;
@@ -92,7 +106,7 @@ fn process_chunk(
             }
             block if LuaBlock::can_cast(block.kind().into()) => {
                 let block = LuaBlock::cast(block.clone())?;
-                process_block(builder, block, parent_id);
+                process_block(builder, block, parent_id, cancel_token);
             }
             _ => {}
         }
@@ -113,8 +127,12 @@ fn process_block(
     builder: &mut DocumentSymbolBuilder,
     block: LuaBlock,
     parent_id: LuaSyntaxId,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     for child in block.syntax().children() {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         match child {
             comment if LuaComment::can_cast(comment.kind().into()) => {
                 let comment = LuaComment::cast(comment.clone())?;
@@ -122,7 +140,7 @@ fn process_block(
             }
             stat if LuaStat::can_cast(stat.kind().into()) => {
                 let stat = LuaStat::cast(stat.clone())?;
-                process_stat(builder, stat, parent_id)?;
+                process_stat(builder, stat, parent_id, cancel_token)?;
             }
             _ => {}
         }
@@ -135,6 +153,7 @@ fn process_stat(
     builder: &mut DocumentSymbolBuilder,
     stat: LuaStat,
     parent_id: LuaSyntaxId,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     let verbose = builder.get_verbosity() == EmmyrcGmodOutlineVerbosity::Verbose;
 
@@ -145,7 +164,7 @@ fn process_stat(
             for binding in bindings {
                 if let Some(expr) = binding.value_expr {
                     processed_value_expr_ids.insert(expr.get_syntax_id());
-                    process_expr(builder, expr, binding.symbol_id, true)?;
+                    process_expr(builder, expr, binding.symbol_id, true, cancel_token)?;
                 }
             }
 
@@ -153,7 +172,7 @@ fn process_stat(
                 if processed_value_expr_ids.contains(&expr.get_syntax_id()) {
                     continue;
                 }
-                process_expr(builder, expr, parent_id, false)?;
+                process_expr(builder, expr, parent_id, false, cancel_token)?;
             }
         }
         LuaStat::AssignStat(assign_stat) => {
@@ -162,7 +181,7 @@ fn process_stat(
             for binding in bindings {
                 if let Some(expr) = binding.value_expr {
                     processed_value_expr_ids.insert(expr.get_syntax_id());
-                    process_expr(builder, expr, binding.symbol_id, true)?;
+                    process_expr(builder, expr, binding.symbol_id, true, cancel_token)?;
                 }
             }
 
@@ -171,7 +190,7 @@ fn process_stat(
                 if processed_value_expr_ids.contains(&expr.get_syntax_id()) {
                     continue;
                 }
-                process_expr(builder, expr, parent_id, false)?;
+                process_expr(builder, expr, parent_id, false, cancel_token)?;
             }
         }
         LuaStat::FuncStat(func_stat) => {
@@ -181,7 +200,7 @@ fn process_stat(
                 let scope_parent =
                     build_closure_expr_symbol(builder, closure.clone(), func_id, false)?;
                 if let Some(block) = closure.get_block() {
-                    process_block(builder, block, scope_parent)?;
+                    process_block(builder, block, scope_parent, cancel_token)?;
                 }
             }
         }
@@ -191,22 +210,22 @@ fn process_stat(
                 let scope_parent =
                     build_closure_expr_symbol(builder, closure.clone(), func_id, false)?;
                 if let Some(block) = closure.get_block() {
-                    process_block(builder, block, scope_parent)?;
+                    process_block(builder, block, scope_parent, cancel_token)?;
                 }
             }
         }
         LuaStat::ForStat(for_stat) => {
             if verbose {
                 let for_id = build_for_stat_symbol(builder, for_stat.clone(), parent_id)?;
-                process_exprs(builder, for_stat.syntax(), for_id)?;
+                process_exprs(builder, for_stat.syntax(), for_id, cancel_token)?;
                 if let Some(block) = for_stat.get_block() {
-                    process_block(builder, block, for_id)?;
+                    process_block(builder, block, for_id, cancel_token)?;
                 }
             } else {
                 // Promote children directly to parent — no `for` clutter.
-                process_exprs(builder, for_stat.syntax(), parent_id)?;
+                process_exprs(builder, for_stat.syntax(), parent_id, cancel_token)?;
                 if let Some(block) = for_stat.get_block() {
-                    process_block(builder, block, parent_id)?;
+                    process_block(builder, block, parent_id, cancel_token)?;
                 }
             }
         }
@@ -214,14 +233,14 @@ fn process_stat(
             if verbose {
                 let for_range_id =
                     build_for_range_stat_symbol(builder, for_range_stat.clone(), parent_id)?;
-                process_exprs(builder, for_range_stat.syntax(), for_range_id)?;
+                process_exprs(builder, for_range_stat.syntax(), for_range_id, cancel_token)?;
                 if let Some(block) = for_range_stat.get_block() {
-                    process_block(builder, block, for_range_id)?;
+                    process_block(builder, block, for_range_id, cancel_token)?;
                 }
             } else {
-                process_exprs(builder, for_range_stat.syntax(), parent_id)?;
+                process_exprs(builder, for_range_stat.syntax(), parent_id, cancel_token)?;
                 if let Some(block) = for_range_stat.get_block() {
-                    process_block(builder, block, parent_id)?;
+                    process_block(builder, block, parent_id, cancel_token)?;
                 }
             }
         }
@@ -229,19 +248,19 @@ fn process_stat(
             if verbose {
                 let ctx = build_if_stat_symbol(builder, if_stat.clone(), parent_id)?;
                 if let Some(condition) = if_stat.get_condition_expr() {
-                    process_expr(builder, condition, ctx.if_id, false)?;
+                    process_expr(builder, condition, ctx.if_id, false, cancel_token)?;
                 }
                 if let Some(block) = if_stat.get_block() {
-                    process_block(builder, block, ctx.if_id)?;
+                    process_block(builder, block, ctx.if_id, cancel_token)?;
                 }
-                process_if_clauses(builder, ctx)?;
+                process_if_clauses(builder, ctx, cancel_token)?;
             } else {
                 // Promote all if/elseif/else children to parent — no `if` clutter.
                 if let Some(condition) = if_stat.get_condition_expr() {
-                    process_expr(builder, condition, parent_id, false)?;
+                    process_expr(builder, condition, parent_id, false, cancel_token)?;
                 }
                 if let Some(block) = if_stat.get_block() {
-                    process_block(builder, block, parent_id)?;
+                    process_block(builder, block, parent_id, cancel_token)?;
                 }
                 for clause in if_stat.get_all_clause() {
                     use glua_parser::LuaIfClauseStat;
@@ -250,38 +269,38 @@ fn process_stat(
                         LuaIfClauseStat::Else(c) => (None, c.get_block()),
                     };
                     if let Some(condition) = condition {
-                        process_expr(builder, condition, parent_id, false)?;
+                        process_expr(builder, condition, parent_id, false, cancel_token)?;
                     }
                     if let Some(block) = block {
-                        process_block(builder, block, parent_id)?;
+                        process_block(builder, block, parent_id, cancel_token)?;
                     }
                 }
             }
         }
         LuaStat::WhileStat(while_stat) => {
             if let Some(condition) = while_stat.get_condition_expr() {
-                process_expr(builder, condition, parent_id, false)?;
+                process_expr(builder, condition, parent_id, false, cancel_token)?;
             }
             if let Some(block) = while_stat.get_block() {
-                process_block(builder, block, parent_id)?;
+                process_block(builder, block, parent_id, cancel_token)?;
             }
         }
         LuaStat::RepeatStat(repeat_stat) => {
             if let Some(block) = repeat_stat.get_block() {
-                process_block(builder, block, parent_id)?;
+                process_block(builder, block, parent_id, cancel_token)?;
             }
             if let Some(condition) = repeat_stat.get_condition_expr() {
-                process_expr(builder, condition, parent_id, false)?;
+                process_expr(builder, condition, parent_id, false, cancel_token)?;
             }
         }
         LuaStat::DoStat(do_stat) => {
             if verbose {
                 let do_id = build_do_stat_symbol(builder, do_stat.clone(), parent_id)?;
                 if let Some(block) = do_stat.get_block() {
-                    process_block(builder, block, do_id)?;
+                    process_block(builder, block, do_id, cancel_token)?;
                 }
             } else if let Some(block) = do_stat.get_block() {
-                process_block(builder, block, parent_id)?;
+                process_block(builder, block, parent_id, cancel_token)?;
             }
         }
         LuaStat::CallExprStat(call_stat) => {
@@ -310,7 +329,7 @@ fn process_stat(
                                     true,
                                 )?;
                                 if let Some(block) = closure.get_block() {
-                                    process_block(builder, block, scope_parent)?;
+                                    process_block(builder, block, scope_parent, cancel_token)?;
                                 }
                             }
                         }
@@ -319,14 +338,14 @@ fn process_stat(
                 }
             }
             // Fall through: no named GMod symbol — scan for interesting exprs inside.
-            process_exprs(builder, call_stat.syntax(), parent_id)?;
+            process_exprs(builder, call_stat.syntax(), parent_id, cancel_token)?;
         }
         LuaStat::ReturnStat(return_stat) => {
-            process_exprs(builder, return_stat.syntax(), parent_id)?;
+            process_exprs(builder, return_stat.syntax(), parent_id, cancel_token)?;
         }
         // GMod: dead path — Lua 5.5 `global` statement disabled
         LuaStat::GlobalStat(global_stat) => {
-            process_exprs(builder, global_stat.syntax(), parent_id)?;
+            process_exprs(builder, global_stat.syntax(), parent_id, cancel_token)?;
         }
         LuaStat::GotoStat(_)
         | LuaStat::BreakStat(_)
@@ -455,13 +474,17 @@ fn resolve_func_parent_id(
     default_parent_id
 }
 
-fn process_if_clauses(builder: &mut DocumentSymbolBuilder, ctx: IfSymbolContext) -> Option<()> {
+fn process_if_clauses(
+    builder: &mut DocumentSymbolBuilder,
+    ctx: IfSymbolContext,
+    cancel_token: &CancellationToken,
+) -> Option<()> {
     for (clause, clause_id) in ctx.clause_symbols {
         if let Some(condition) = clause.get_condition_expr() {
-            process_expr(builder, condition, clause_id, false)?;
+            process_expr(builder, condition, clause_id, false, cancel_token)?;
         }
         if let Some(block) = clause.get_block() {
-            process_block(builder, block, clause_id)?;
+            process_block(builder, block, clause_id, cancel_token)?;
         }
     }
 
@@ -472,12 +495,13 @@ fn process_exprs(
     builder: &mut DocumentSymbolBuilder,
     syntax: &LuaSyntaxNode,
     parent_id: LuaSyntaxId,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     for child in syntax.children() {
         match child {
             expr if LuaExpr::can_cast(expr.kind().into()) => {
                 let expr = LuaExpr::cast(expr.clone())?;
-                process_expr(builder, expr, parent_id, false)?;
+                process_expr(builder, expr, parent_id, false, cancel_token)?;
             }
             _ => {}
         }
@@ -490,6 +514,7 @@ fn process_expr(
     expr: LuaExpr,
     parent_id: LuaSyntaxId,
     inline_table_to_parent: bool,
+    cancel_token: &CancellationToken,
 ) -> Option<()> {
     match expr {
         LuaExpr::TableExpr(table) => {
@@ -497,7 +522,7 @@ fn process_expr(
                 if table.is_object() {
                     for field in table.get_fields() {
                         if let Some(value_expr) = field.get_value_expr() {
-                            process_expr(builder, value_expr, parent_id, false)?;
+                            process_expr(builder, value_expr, parent_id, false, cancel_token)?;
                         }
                     }
                 }
@@ -514,7 +539,7 @@ fn process_expr(
                     } else {
                         table_id
                     };
-                    process_expr(builder, value_expr, next_parent, true)?;
+                    process_expr(builder, value_expr, next_parent, true, cancel_token)?;
                 }
             }
         }
@@ -525,29 +550,59 @@ fn process_expr(
             let scope_parent =
                 build_closure_expr_symbol(builder, closure.clone(), parent_id, false)?;
             if let Some(block) = closure.get_block() {
-                process_block(builder, block, scope_parent)?;
+                process_block(builder, block, scope_parent, cancel_token)?;
             }
         }
         LuaExpr::BinaryExpr(binary) => {
             if let Some((left, right)) = binary.get_exprs() {
-                process_expr(builder, left, parent_id, inline_table_to_parent)?;
-                process_expr(builder, right, parent_id, inline_table_to_parent)?;
+                process_expr(
+                    builder,
+                    left,
+                    parent_id,
+                    inline_table_to_parent,
+                    cancel_token,
+                )?;
+                process_expr(
+                    builder,
+                    right,
+                    parent_id,
+                    inline_table_to_parent,
+                    cancel_token,
+                )?;
             }
         }
         LuaExpr::UnaryExpr(unary) => {
             if let Some(inner) = unary.get_expr() {
-                process_expr(builder, inner, parent_id, inline_table_to_parent)?;
+                process_expr(
+                    builder,
+                    inner,
+                    parent_id,
+                    inline_table_to_parent,
+                    cancel_token,
+                )?;
             }
         }
         LuaExpr::ParenExpr(paren) => {
             if let Some(inner) = paren.get_expr() {
-                process_expr(builder, inner, parent_id, inline_table_to_parent)?;
+                process_expr(
+                    builder,
+                    inner,
+                    parent_id,
+                    inline_table_to_parent,
+                    cancel_token,
+                )?;
             }
         }
         LuaExpr::CallExpr(call) => {
             check_and_build_net_op_symbol(builder, &call, parent_id);
             if let Some(prefix) = call.get_prefix_expr() {
-                process_expr(builder, prefix, parent_id, inline_table_to_parent)?;
+                process_expr(
+                    builder,
+                    prefix,
+                    parent_id,
+                    inline_table_to_parent,
+                    cancel_token,
+                )?;
             }
             if let Some(args) = call.get_args_list() {
                 let collected: Vec<_> = args.get_args().collect();
@@ -559,19 +614,32 @@ fn process_expr(
                                 LuaExpr::TableExpr(table),
                                 parent_id,
                                 inline_table_to_parent,
+                                cancel_token,
                             )?;
                         }
                     }
                 } else {
                     for arg in collected {
-                        process_expr(builder, arg, parent_id, inline_table_to_parent)?;
+                        process_expr(
+                            builder,
+                            arg,
+                            parent_id,
+                            inline_table_to_parent,
+                            cancel_token,
+                        )?;
                     }
                 }
             }
         }
         LuaExpr::IndexExpr(index_expr) => {
             if let Some(prefix) = index_expr.get_prefix_expr() {
-                process_expr(builder, prefix, parent_id, inline_table_to_parent)?;
+                process_expr(
+                    builder,
+                    prefix,
+                    parent_id,
+                    inline_table_to_parent,
+                    cancel_token,
+                )?;
             }
         }
         LuaExpr::NameExpr(_) | LuaExpr::LiteralExpr(_) => {}
@@ -596,6 +664,7 @@ mod tests {
     use glua_code_analysis::{Emmyrc, EmmyrcGmodOutlineVerbosity, VirtualWorkspace};
     use googletest::prelude::*;
     use lsp_types::{DocumentSymbol, SymbolKind};
+    use tokio_util::sync::CancellationToken;
 
     use super::build_document_symbol;
 
@@ -655,7 +724,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         let panel_symbol = find_top_level_symbol(top_level_symbols, "MyPanel (VGUI)").or_fail()?;
@@ -711,7 +780,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
         let names = top_level_names(top_level_symbols);
 
@@ -739,7 +808,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         let symbol = find_top_level_symbol(top_level_symbols, "net.ReadUInt(8)").or_fail()?;
@@ -767,7 +836,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         let symbol = find_top_level_symbol(top_level_symbols, "net.ReadUInt(8)").or_fail()?;
@@ -794,7 +863,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
         let names = top_level_names(top_level_symbols);
 
@@ -822,7 +891,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         let hook_symbol = find_top_level_symbol(top_level_symbols, "hook: Think").or_fail()?;
@@ -850,7 +919,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         for expected in [
@@ -886,7 +955,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         let symbol = top_level_symbols
@@ -922,7 +991,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         let receive_symbol =
@@ -955,7 +1024,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         let class_symbol =
@@ -987,7 +1056,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.unwrap_or_default();
 
         let class_symbols = top_level_symbols
@@ -1026,7 +1095,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         let func_symbol = find_top_level_symbol(top_level_symbols, "foo").or_fail()?;
@@ -1056,7 +1125,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
         let names = top_level_names(top_level_symbols);
 
@@ -1085,7 +1154,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
         let class_symbol =
@@ -1119,7 +1188,7 @@ mod tests {
             .compilation
             .get_semantic_model(file_id)
             .or_fail()?;
-        let root = build_document_symbol(&semantic_model).or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.unwrap_or_default();
 
         let has_hidden = top_level_symbols

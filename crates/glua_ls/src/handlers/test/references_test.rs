@@ -6,6 +6,7 @@ mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualLocation, check};
     use glua_code_analysis::Emmyrc;
     use googletest::prelude::*;
+    use tokio_util::sync::CancellationToken;
 
     #[gtest]
     fn test_function_references() -> Result<()> {
@@ -198,7 +199,7 @@ mod tests {
         ));
         let file_id = ws.def(&main_content);
 
-        let result = references(&ws.analysis, file_id, position)
+        let result = references(&ws.analysis, file_id, position, &CancellationToken::new())
             .ok_or("failed to get references")
             .or_fail()?;
 

@@ -9,9 +9,10 @@ use lsp_types::{
         DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, DidRenameFiles,
         DidSaveTextDocument, Notification as LspNotification, SetTrace,
     },
+    request::{Request as LspRequest, WorkspaceDiagnosticRequest},
 };
 
-use crate::context::ServerContext;
+use crate::context::{ServerContext, WorkspaceDiagnosticLevel};
 
 use super::{
     configuration::on_did_change_configuration,
@@ -62,28 +63,90 @@ pub async fn on_notification_handler(
     notification: Notification,
     server_context: &mut ServerContext,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
-    // When document content changes, proactively cancel ALL in-flight requests.
-    // They are working on stale data — the editor will resend fresh ones.
-    // This breaks the RwLock convoy: stale readers bail out of their
-    // `tokio::select!` and release (or never acquire) the read lock, allowing
-    // the didChange write to proceed immediately.
     if notification.method == <DidChangeTextDocument as LspNotification>::METHOD {
-        server_context.cancel_all_requests().await;
-        // Mark analysis dirty BEFORE spawning the didChange handler so that
-        // any request handler dispatched next sees the flag and waits for
-        // reindex instead of computing on stale data (which causes flickering
-        // semantic tokens / inlay hints).
-        server_context.snapshot().debounced_analysis().mark_dirty();
-
-        // Route through the coalescer instead of spawning a task directly.
-        // This ensures only the LATEST version per URI is processed when the
-        // user types rapidly, turning 33 write-lock acquisitions into 1–3.
         if let Ok(params) = notification
             .extract::<<DidChangeTextDocument as LspNotification>::Params>(
                 DidChangeTextDocument::METHOD,
             )
         {
+            let uri = params.text_document.uri.clone();
+            let snapshot = server_context.snapshot();
+            snapshot
+                .note_document_seen_version(&uri, params.text_document.version)
+                .await;
+            if snapshot.lsp_features().supports_workspace_diagnostic() {
+                let workspace = snapshot.workspace_manager().read().await;
+                workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
+            }
+            server_context.cancel_all_requests().await;
+            // Mark analysis dirty BEFORE handing the update to the coalescer so
+            // follow-up requests see the stale state immediately.
+            snapshot.debounced_analysis().mark_dirty();
             server_context.did_change_coalescer().enqueue(params);
+        }
+        return Ok(());
+    }
+
+    if notification.method == <DidOpenTextDocument as LspNotification>::METHOD {
+        if let Ok(params) = notification
+            .extract::<<DidOpenTextDocument as LspNotification>::Params>(
+                DidOpenTextDocument::METHOD,
+            )
+        {
+            let uri = params.text_document.uri.clone();
+            let snapshot = server_context.snapshot();
+            snapshot
+                .note_document_seen_version(&uri, params.text_document.version)
+                .await;
+            {
+                let mut workspace = snapshot.workspace_manager().write().await;
+                workspace.current_open_files.insert(uri.clone());
+                workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
+            }
+            server_context.cancel_text_requests_for_uri(&uri).await;
+            server_context
+                .cancel_requests_by_method(WorkspaceDiagnosticRequest::METHOD)
+                .await;
+            snapshot.debounced_analysis().mark_dirty();
+            let task_snapshot = snapshot.clone();
+            tokio::spawn(async move {
+                on_did_open_text_document(task_snapshot.clone(), params).await;
+                task_snapshot
+                    .debounced_analysis()
+                    .finish_in_flight_changes(1)
+                    .await;
+            });
+        }
+        return Ok(());
+    }
+
+    if notification.method == <DidCloseTextDocument as LspNotification>::METHOD {
+        if let Ok(params) = notification
+            .extract::<<DidCloseTextDocument as LspNotification>::Params>(
+                DidCloseTextDocument::METHOD,
+            )
+        {
+            let uri = params.text_document.uri.clone();
+            let snapshot = server_context.snapshot();
+            snapshot.mark_document_closed(&uri).await;
+            {
+                let mut workspace = snapshot.workspace_manager().write().await;
+                workspace.current_open_files.remove(&uri);
+                workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
+            }
+            server_context.cancel_text_requests_for_uri(&uri).await;
+            server_context
+                .cancel_requests_by_method(WorkspaceDiagnosticRequest::METHOD)
+                .await;
+            snapshot.debounced_analysis().mark_dirty();
+            let task_snapshot = snapshot.clone();
+            tokio::spawn(async move {
+                on_did_close_document(task_snapshot.clone(), params).await;
+                task_snapshot
+                    .debounced_analysis()
+                    .finish_in_flight_changes(1)
+                    .await;
+            });
         }
         return Ok(());
     }
@@ -93,9 +156,7 @@ pub async fn on_notification_handler(
             // Intentionally empty - async to keep the message for $/cancelRequest processing.
         }
         async: {
-            DidOpenTextDocument => on_did_open_text_document,
             DidSaveTextDocument => on_did_save_text_document,
-            DidCloseTextDocument => on_did_close_document,
             DidChangeWatchedFiles => on_did_change_watched_files,
             SetTrace => on_set_trace,
             DidChangeConfiguration => on_did_change_configuration,

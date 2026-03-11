@@ -52,13 +52,23 @@ pub async fn on_folding_range_handler(
     let emmyrc = semantic_model.get_emmyrc();
 
     let mut builder = FoldingRangeBuilder::new(&document, root.clone(), client_id);
-    build_folding_ranges(&mut builder, emmyrc);
+    build_folding_ranges(&mut builder, emmyrc, &cancel_token);
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     Some(builder.build())
 }
 
-fn build_folding_ranges(builder: &mut FoldingRangeBuilder, emmyrc: &Emmyrc) {
+fn build_folding_ranges(
+    builder: &mut FoldingRangeBuilder,
+    emmyrc: &Emmyrc,
+    cancel_token: &CancellationToken,
+) {
     let root = builder.get_root().clone();
     for child in root.descendants::<LuaAst>() {
+        if cancel_token.is_cancelled() {
+            return;
+        }
         match child {
             LuaAst::LuaForStat(for_stat) => {
                 build_for_stat_fold_range(builder, for_stat);

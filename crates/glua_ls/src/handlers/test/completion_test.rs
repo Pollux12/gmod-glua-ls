@@ -2772,7 +2772,10 @@ mod tests {
             .ok_or("missing SetOwner completion")
             .or_fail()?;
 
-        verify_that!(item.insert_text.as_deref(), eq(Some("SetOwner(${1:owner})")))?;
+        verify_that!(
+            item.insert_text.as_deref(),
+            eq(Some("SetOwner(${1:owner})"))
+        )?;
         verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
 
         Ok(())
@@ -2857,7 +2860,9 @@ mod tests {
         verify_that!(item.insert_text.as_deref(), eq(Some("Add(\"${1}\")")))?;
         verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
         verify_that!(
-            item.command.as_ref().map(|command| command.command.as_str()),
+            item.command
+                .as_ref()
+                .map(|command| command.command.as_str()),
             eq(Some("editor.action.triggerSuggest"))
         )?;
 
@@ -3001,7 +3006,9 @@ mod tests {
         verify_that!(item.insert_text.as_deref(), eq(Some("Receive(\"${1}\")")))?;
         verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
         verify_that!(
-            item.command.as_ref().map(|command| command.command.as_str()),
+            item.command
+                .as_ref()
+                .map(|command| command.command.as_str()),
             eq(Some("editor.action.triggerSuggest"))
         )?;
 
@@ -3026,7 +3033,10 @@ mod tests {
             net.Receive("<??>")
             "#,
         )?;
-        let file_id = ws.def_file("addons/test/lua/autorun/server/receive.lua", content.as_str());
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/server/receive.lua",
+            content.as_str(),
+        );
         let result = completion(
             &ws.analysis,
             file_id,

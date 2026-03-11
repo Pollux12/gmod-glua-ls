@@ -4,7 +4,7 @@ mod resolve_code_lens;
 use build_code_lens::build_code_lens;
 use glua_code_analysis::{LuaDeclId, LuaMemberId};
 use lsp_types::{
-    ClientCapabilities, CodeLens, CodeLensOptions, CodeLensParams, ServerCapabilities,
+    ClientCapabilities, CodeLens, CodeLensOptions, CodeLensParams, ServerCapabilities, Uri,
 };
 use resolve_code_lens::resolve_code_lens;
 use serde::{Deserialize, Serialize};
@@ -61,13 +61,20 @@ pub async fn on_resolve_code_lens_handler(
     };
     let compilation = &analysis.compilation;
 
-    resolve_code_lens(compilation, code_lens.clone(), client_id).unwrap_or(code_lens)
+    resolve_code_lens(compilation, code_lens.clone(), client_id, &cancel_token).unwrap_or(code_lens)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CodeLensData {
     Member(LuaMemberId),
     DeclId(LuaDeclId),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CodeLensResolveData {
+    #[serde(default)]
+    pub uri: Option<Uri>,
+    pub payload: CodeLensData,
 }
 
 pub struct CodeLensCapabilities;

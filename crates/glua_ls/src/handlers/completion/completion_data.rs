@@ -1,4 +1,5 @@
 use glua_code_analysis::{FileId, LuaSemanticDeclId};
+use lsp_types::Uri;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -7,6 +8,8 @@ use super::completion_builder::CompletionBuilder;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletionData {
     pub field_id: FileId,
+    #[serde(default)]
+    pub uri: Option<Uri>,
     pub typ: CompletionDataType,
     /// Total count of function overloads
     pub overload_count: Option<usize>,
@@ -21,6 +24,7 @@ impl CompletionData {
     ) -> Option<Value> {
         let data = Self {
             field_id: builder.semantic_model.get_file_id(),
+            uri: Some(builder.semantic_model.get_document().get_uri().clone()),
             typ: CompletionDataType::PropertyOwnerId(id),
             overload_count,
         };
@@ -35,6 +39,7 @@ impl CompletionData {
     ) -> Option<Value> {
         let data = Self {
             field_id: builder.semantic_model.get_file_id(),
+            uri: Some(builder.semantic_model.get_document().get_uri().clone()),
             typ: CompletionDataType::Overload((id, index)),
             overload_count,
         };
@@ -44,6 +49,7 @@ impl CompletionData {
     pub fn from_module(builder: &CompletionBuilder, module: String) -> Option<Value> {
         let data = Self {
             field_id: builder.semantic_model.get_file_id(),
+            uri: Some(builder.semantic_model.get_document().get_uri().clone()),
             typ: CompletionDataType::Module(module),
             overload_count: None,
         };

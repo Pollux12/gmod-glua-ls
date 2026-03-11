@@ -18,18 +18,25 @@ pub async fn on_implementation_handler(
     params: GotoImplementationParams,
     cancel_token: CancellationToken,
 ) -> Option<GotoDefinitionResponse> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let uri = params.text_document_position_params.text_document.uri;
     let analysis = context.read_analysis(&cancel_token).await?;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let file_id = analysis.get_file_id(&uri)?;
     let position = params.text_document_position_params.position;
 
-    implementation(&analysis, file_id, position)
+    implementation(&analysis, file_id, position, &cancel_token)
 }
 
 pub fn implementation(
     analysis: &EmmyLuaAnalysis,
     file_id: FileId,
     position: Position,
+    cancel_token: &CancellationToken,
 ) -> Option<GotoDefinitionResponse> {
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
 
@@ -49,7 +56,8 @@ pub fn implementation(
         TokenAtOffset::Between(token, _) => token,
     };
 
-    let implementations = search_implementations(&semantic_model, &analysis.compilation, token)?;
+    let implementations =
+        search_implementations(&semantic_model, &analysis.compilation, token, cancel_token)?;
 
     if implementations.is_empty() {
         return None;

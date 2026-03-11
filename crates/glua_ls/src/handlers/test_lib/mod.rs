@@ -335,7 +335,7 @@ impl ProviderVirtualWorkspace {
     ) -> Result<()> {
         let (content, position) = Self::handle_file_content(block_str)?;
         let file_id = self.def(&content);
-        let result = implementation(&self.analysis, file_id, position)
+        let result = implementation(&self.analysis, file_id, position, &CancellationToken::new())
             .ok_or("failed to get go to definition response")
             .or_fail()?;
 
@@ -657,7 +657,7 @@ impl ProviderVirtualWorkspace {
                 .map(|(file_name, content)| (file_name.as_str(), content.as_str()))
                 .collect(),
         );
-        let result = references(&self.analysis, file_id, position)
+        let result = references(&self.analysis, file_id, position, &CancellationToken::new())
             .ok_or("failed to get references")
             .or_fail()?;
         Self::assert_locations(result, expected)

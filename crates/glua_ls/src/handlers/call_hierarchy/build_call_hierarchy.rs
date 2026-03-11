@@ -11,6 +11,7 @@ use rowan::TokenAtOffset;
 use serde::{Deserialize, Serialize};
 
 use crate::handlers::references::{search_decl_references, search_member_references};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CallHierarchyItemData {
@@ -95,20 +96,36 @@ pub fn build_incoming_hierarchy(
     semantic_model: &SemanticModel,
     compilation: &LuaCompilation,
     semantic_decl: LuaSemanticDeclId,
+    cancel_token: &CancellationToken,
 ) -> Option<Vec<CallHierarchyIncomingCall>> {
     let mut result = vec![];
     let mut locations = vec![];
     match semantic_decl {
         LuaSemanticDeclId::LuaDecl(decl_id) => {
-            search_decl_references(semantic_model, compilation, decl_id, &mut locations);
+            search_decl_references(
+                semantic_model,
+                compilation,
+                decl_id,
+                &mut locations,
+                cancel_token,
+            );
         }
         LuaSemanticDeclId::Member(member_id) => {
-            search_member_references(semantic_model, compilation, member_id, &mut locations);
+            search_member_references(
+                semantic_model,
+                compilation,
+                member_id,
+                &mut locations,
+                cancel_token,
+            );
         }
         _ => return None,
     }
 
     for location in locations {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         build_incoming_hierarchy_item(compilation, &location, &mut result);
     }
 

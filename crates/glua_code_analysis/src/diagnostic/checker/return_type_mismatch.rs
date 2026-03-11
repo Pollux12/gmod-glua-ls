@@ -22,6 +22,9 @@ impl Checker for ReturnTypeMismatch {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
         for closure_expr in root.descendants::<LuaClosureExpr>() {
+            if context.is_cancelled() {
+                return;
+            }
             check_closure_expr(context, semantic_model, &closure_expr);
         }
     }
@@ -32,6 +35,10 @@ fn check_closure_expr(
     semantic_model: &SemanticModel,
     closure_expr: &LuaClosureExpr,
 ) -> Option<()> {
+    if context.is_cancelled() {
+        return Some(());
+    }
+
     let signature_id = LuaSignatureId::from_closure(semantic_model.get_file_id(), closure_expr);
     let signature = context.db.get_signature_index().get(&signature_id)?;
     if signature.resolve_return != SignatureReturnStatus::DocResolve {
@@ -40,6 +47,9 @@ fn check_closure_expr(
     let return_type = signature.get_return_type();
     let self_type = get_self_type(semantic_model, closure_expr);
     for return_stat in get_return_stats(closure_expr) {
+        if context.is_cancelled() {
+            return Some(());
+        }
         check_return_stat(
             context,
             semantic_model,
@@ -58,12 +68,16 @@ fn check_return_stat(
     return_type: &LuaType,
     return_stat: &LuaReturnStat,
 ) -> Option<()> {
+    if context.is_cancelled() {
+        return Some(());
+    }
+
     let return_exprs = return_stat.get_expr_list().collect::<Vec<_>>();
     let (return_expr_types, return_expr_ranges) = {
         let infos = semantic_model.infer_expr_list_types(&return_exprs, None);
         let mut return_expr_types = infos.iter().map(|(typ, _)| typ.clone()).collect::<Vec<_>>();
         // 解决 setmetatable 的返回值类型问题
-        let setmetatable_index = has_setmetatable(semantic_model, return_stat);
+        let setmetatable_index = has_setmetatable(context, semantic_model, return_stat);
         if let Some(setmetatable_index) = setmetatable_index {
             return_expr_types[setmetatable_index] = LuaType::Any;
         }
@@ -78,6 +92,9 @@ fn check_return_stat(
     match return_type {
         LuaType::Variadic(variadic) => {
             for (index, return_expr_type) in return_expr_types.iter().enumerate() {
+                if context.is_cancelled() {
+                    return Some(());
+                }
                 let doc_return_type = variadic.get_type(index)?;
                 let mut check_type = doc_return_type;
                 if doc_return_type.is_self_infer()
@@ -193,8 +210,15 @@ fn add_type_check_diagnostic(
     }
 }
 
-fn has_setmetatable(semantic_model: &SemanticModel, return_stat: &LuaReturnStat) -> Option<usize> {
+fn has_setmetatable(
+    context: &DiagnosticContext,
+    semantic_model: &SemanticModel,
+    return_stat: &LuaReturnStat,
+) -> Option<usize> {
     for (index, expr) in return_stat.get_expr_list().enumerate() {
+        if context.is_cancelled() {
+            return None;
+        }
         match expr {
             LuaExpr::CallExpr(call_expr) => {
                 if call_expr.is_setmetatable() {

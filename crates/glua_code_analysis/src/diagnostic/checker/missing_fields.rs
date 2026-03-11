@@ -17,6 +17,9 @@ impl Checker for MissingFieldsChecker {
 
         let mut type_cache = HashMap::new();
         for expr in root.descendants::<LuaTableExpr>() {
+            if context.is_cancelled() {
+                return;
+            }
             check_table_expr(context, semantic_model, &expr, &mut type_cache);
         }
     }
@@ -28,12 +31,19 @@ fn check_table_expr(
     expr: &LuaTableExpr,
     type_cache: &mut HashMap<LuaType, HashSet<String>>,
 ) -> Option<()> {
+    if context.is_cancelled() {
+        return Some(());
+    }
+
     let db = context.db;
 
     let table_type = match semantic_model.infer_table_should_be(expr.clone())? {
         LuaType::Union(union) => {
             let mut set = HashSet::new();
             for ty in union.into_vec().iter() {
+                if context.is_cancelled() {
+                    return Some(());
+                }
                 match ty {
                     LuaType::Ref(_)
                     | LuaType::Object(_)
@@ -102,6 +112,9 @@ fn check_table_expr(
             type_cache.entry(table_type.clone()).or_insert_with(|| {
                 let mut computed_fields = HashSet::new();
                 for intersection_component in intersections.get_types() {
+                    if context.is_cancelled() {
+                        return computed_fields;
+                    }
                     computed_fields.extend(
                         get_required_fields(context, &vec![intersection_component.clone()])
                             .unwrap_or_default(),
@@ -146,6 +159,9 @@ fn get_required_fields(
 
     let mut optional_type = HashSet::new();
     for super_type in types {
+        if context.is_cancelled() {
+            return Some(required_fields);
+        }
         match super_type {
             LuaType::Ref(type_decl_id) => process_type_decl_id(
                 context,
@@ -165,6 +181,9 @@ fn get_required_fields(
             LuaType::Object(object_type) => {
                 let fields = object_type.get_fields();
                 for (key, decl_type) in fields {
+                    if context.is_cancelled() {
+                        return Some(required_fields);
+                    }
                     let name = key.to_path();
                     record_required_fields(
                         &mut required_fields,
@@ -188,6 +207,9 @@ fn get_required_fields(
     ) -> Option<()> {
         let members = member_index.get_members(&LuaMemberOwner::Type(type_decl_id))?;
         for member in members {
+            if context.is_cancelled() {
+                return Some(());
+            }
             let name = member.get_key().to_path();
             let decl_type = context
                 .db
@@ -224,4 +246,57 @@ fn record_required_fields(
     }
 
     required_fields.insert(name);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use googletest::prelude::*;
+    use tokio_util::sync::CancellationToken;
+
+    use super::get_required_fields;
+    use crate::{
+        DiagnosticCode, Emmyrc, LuaType, diagnostic::lua_diagnostic_config::LuaDiagnosticConfig,
+        test_lib::VirtualWorkspace,
+    };
+
+    #[gtest]
+    fn get_required_fields_stops_when_cancelled() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+---@class Parent
+---@field foo number
+
+---@class Child: Parent
+local value = {} ---@type Child
+"#,
+        );
+        let child_type = ws.ty("Child");
+        let LuaType::Ref(type_decl_id) = &child_type else {
+            panic!("expected Child to resolve to a ref type");
+        };
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc
+            .diagnostics
+            .enables
+            .push(DiagnosticCode::MissingFields);
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let db = ws.analysis.compilation.get_db();
+        let mut context = super::DiagnosticContext::new(
+            file_id,
+            db,
+            Arc::new(LuaDiagnosticConfig::new(&emmyrc)),
+            cancel_token,
+        );
+        let super_types = type_decl_id.collect_super_types_with_self(db, child_type.clone());
+
+        let required_fields = get_required_fields(&mut context, &super_types)
+            .expect("cancelled traversal should still return partial results");
+
+        assert_that!(required_fields, is_empty());
+    }
 }

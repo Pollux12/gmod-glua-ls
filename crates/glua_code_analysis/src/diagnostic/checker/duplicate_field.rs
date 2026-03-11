@@ -20,9 +20,12 @@ impl Checker for DuplicateFieldChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let decl_set = get_decl_set(semantic_model);
+        let decl_set = get_decl_set(context, semantic_model);
         if let Some(decl_set) = decl_set {
             for decl_info in decl_set {
+                if context.is_cancelled() {
+                    return;
+                }
                 check_decl_duplicate_field(context, semantic_model, &decl_info);
             }
         }
@@ -35,7 +38,10 @@ struct DeclInfo {
     is_require: bool,
 }
 
-fn get_decl_set(semantic_model: &SemanticModel) -> Option<HashSet<DeclInfo>> {
+fn get_decl_set(
+    context: &DiagnosticContext,
+    semantic_model: &SemanticModel,
+) -> Option<HashSet<DeclInfo>> {
     let file_id = semantic_model.get_file_id();
     let decl_tree = semantic_model
         .get_db()
@@ -43,6 +49,9 @@ fn get_decl_set(semantic_model: &SemanticModel) -> Option<HashSet<DeclInfo>> {
         .get_decl_tree(&file_id)?;
     let mut type_decl_id_set = HashSet::new();
     for (decl_id, decl) in decl_tree.get_decls() {
+        if context.is_cancelled() {
+            return Some(type_decl_id_set);
+        }
         if matches!(
             &decl.extra,
             LuaDeclExtra::Local { .. } | LuaDeclExtra::Global { .. }
@@ -70,6 +79,9 @@ fn get_decl_set(semantic_model: &SemanticModel) -> Option<HashSet<DeclInfo>> {
 
     let root = semantic_model.get_root();
     for tag_class in root.descendants::<LuaDocTagClass>() {
+        if context.is_cancelled() {
+            return Some(type_decl_id_set);
+        }
         if let Some(class_name) = tag_class.get_name_token() {
             type_decl_id_set.insert(DeclInfo {
                 id: LuaTypeDeclId::global(class_name.get_name_text()),
@@ -99,6 +111,10 @@ fn check_decl_duplicate_field(
     semantic_model: &SemanticModel,
     decl_info: &DeclInfo,
 ) -> Option<()> {
+    if context.is_cancelled() {
+        return Some(());
+    }
+
     let type_decl = context
         .get_db()
         .get_type_index()
@@ -113,6 +129,9 @@ fn check_decl_duplicate_field(
     let mut member_map: HashMap<&LuaMemberKey, Vec<&LuaMember>> = HashMap::new();
 
     for member in members.iter() {
+        if context.is_cancelled() {
+            return Some(());
+        }
         // 过滤掉 meta 定义的 signature
         if member.get_feature() == LuaMemberFeature::MetaMethodDecl {
             continue;
@@ -125,6 +144,9 @@ fn check_decl_duplicate_field(
     }
 
     for (key, members) in member_map.iter() {
+        if context.is_cancelled() {
+            return Some(());
+        }
         if members.len() < 2 {
             // 需要特殊处理: require("a").fun = function() end
             if let Some(member) = members.first() {
@@ -135,6 +157,9 @@ fn check_decl_duplicate_field(
 
         let mut member_infos = Vec::with_capacity(members.len());
         for member in members.iter() {
+            if context.is_cancelled() {
+                return Some(());
+            }
             let typ = semantic_model.get_type(member.get_id().into());
             let feature = member.get_feature();
             member_infos.push(DiagnosticMemberInfo {
@@ -150,6 +175,9 @@ fn check_decl_duplicate_field(
             .filter(|info| matches!(info.typ, LuaType::Signature(_)));
         if signatures.clone().count() > 1 {
             for signature in signatures {
+                if context.is_cancelled() {
+                    return Some(());
+                }
                 if signature.member.get_file_id() != file_id {
                     continue;
                 }
@@ -177,6 +205,9 @@ fn check_decl_duplicate_field(
             // 如果不全是 DocFunction，则报错
             if !all_doc_functions {
                 for field_decl in &field_decls {
+                    if context.is_cancelled() {
+                        return Some(());
+                    }
                     if field_decl.member.get_file_id() == file_id {
                         context.add_diagnostic(
                             DiagnosticCode::DuplicateDocField,
@@ -201,6 +232,10 @@ fn check_one_member(
     member: &LuaMember,
     is_require: bool,
 ) -> Option<()> {
+    if context.is_cancelled() {
+        return Some(());
+    }
+
     if !is_require {
         return None;
     }
@@ -219,6 +254,9 @@ fn check_one_member(
     let property_owner = LuaSemanticDeclId::Member(member_id);
 
     for in_filed in references {
+        if context.is_cancelled() {
+            return Some(());
+        }
         // 不同文件不检查
         if in_filed.file_id != context.file_id {
             continue;

@@ -1,4 +1,7 @@
-use glua_code_analysis::{DiagnosticCode, Emmyrc, fetch_schema_urls, uri_to_file_path};
+use glua_code_analysis::{
+    DeferredVfsDrop, DiagnosticCode, Emmyrc, FileId, fetch_schema_urls, read_file_with_encoding,
+    uri_to_file_path,
+};
 use glua_parser::{LineIndex, LuaParseError, LuaParseErrorKind, LuaParser, LuaSyntaxTree};
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -14,6 +17,84 @@ struct PreparsedDocument {
     tree: LuaSyntaxTree,
     line_index: LineIndex,
     syntax_diagnostics: Vec<Diagnostic>,
+}
+
+fn spawn_deferred_drop(deferred_drop: DeferredVfsDrop) {
+    tokio::task::spawn_blocking(move || drop(deferred_drop));
+}
+
+async fn should_drop_stale_version(
+    context: &ServerContextSnapshot,
+    uri: &lsp_types::Uri,
+    version: i32,
+) -> bool {
+    context.has_newer_seen_document_version(uri, version).await
+}
+
+async fn apply_document_update_without_queuing(
+    context: &ServerContextSnapshot,
+    uri: &lsp_types::Uri,
+    text: String,
+    version: i32,
+    mut preparsed: Option<PreparsedDocument>,
+    trigger_reindex: bool,
+) -> Option<FileId> {
+    let mut pending_text = Some(text);
+    let mut retries = 0u32;
+
+    loop {
+        if should_drop_stale_version(context, uri, version).await {
+            return None;
+        }
+
+        if let Ok(mut analysis) = context.analysis().try_write() {
+            let text = pending_text
+                .take()
+                .expect("document text should still be available");
+            let (file_id, deferred_drop) = if let Some(preparsed) = preparsed.take() {
+                if trigger_reindex {
+                    (
+                        analysis.update_file_preparsed(
+                            uri.clone(),
+                            Some(text),
+                            preparsed.tree,
+                            preparsed.line_index,
+                            Some(version),
+                            true,
+                        ),
+                        None,
+                    )
+                } else {
+                    let (file_id, deferred_drop) = analysis.update_file_preparsed_deferred(
+                        uri.clone(),
+                        Some(text),
+                        preparsed.tree,
+                        preparsed.line_index,
+                        Some(version),
+                    )?;
+                    (Some(file_id), Some(deferred_drop))
+                }
+            } else if trigger_reindex {
+                (analysis.update_file_by_uri(uri, Some(text)), None)
+            } else {
+                (analysis.update_file_text_only(uri, text), None)
+            };
+            drop(analysis);
+
+            if let Some(deferred_drop) = deferred_drop {
+                spawn_deferred_drop(deferred_drop);
+            }
+
+            return file_id;
+        }
+
+        retries += 1;
+        if retries <= 20 {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
 }
 
 async fn check_schema_update(context: &ServerContextSnapshot) {
@@ -147,7 +228,12 @@ pub async fn on_did_open_text_document(
     };
 
     if !should_process {
+        context.mark_document_closed(&uri).await;
         return None;
+    }
+
+    if should_drop_stale_version(&context, &uri, version).await {
+        return Some(());
     }
 
     let emmyrc = {
@@ -156,11 +242,18 @@ pub async fn on_did_open_text_document(
     };
     let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
     let preparsed = preparse_document(text.clone(), emmyrc).await;
+    if should_drop_stale_version(&context, &uri, version).await {
+        return Some(());
+    }
 
-    if !supports_pull {
-        let diagnostics = preparsed
-            .as_ref()
-            .map_or_else(Vec::new, |parsed| parsed.syntax_diagnostics.clone());
+    let diagnostics = preparsed
+        .as_ref()
+        .map_or_else(Vec::new, |parsed| parsed.syntax_diagnostics.clone());
+
+    let file_id =
+        apply_document_update_without_queuing(&context, &uri, text, version, preparsed, true).await;
+
+    if !supports_pull && file_id.is_some() {
         context
             .client()
             .publish_diagnostics(PublishDiagnosticsParams {
@@ -170,22 +263,6 @@ pub async fn on_did_open_text_document(
             });
     }
 
-    let file_id = {
-        let mut analysis = context.analysis().write().await;
-        if let Some(preparsed) = preparsed {
-            analysis.update_file_preparsed(
-                uri.clone(),
-                Some(text),
-                preparsed.tree,
-                preparsed.line_index,
-                Some(version),
-                true,
-            )
-        } else {
-            analysis.update_file_by_uri(&uri, Some(text))
-        }
-    };
-
     // Schedule diagnostic task without holding any locks
     if !supports_pull {
         if let Some(file_id) = file_id {
@@ -194,12 +271,6 @@ pub async fn on_did_open_text_document(
                 .add_diagnostic_task(file_id, interval, Some(context.debounced_analysis_arc()))
                 .await;
         }
-    }
-
-    // Update open files list
-    {
-        let mut workspace = context.workspace_manager().write().await;
-        workspace.current_open_files.insert(uri);
     }
 
     Some(())
@@ -254,17 +325,25 @@ pub async fn on_did_change_text_document(
     let supports_pull = context.lsp_features().supports_pull_diagnostic();
 
     // Single read-lock acquisition: get file_id + emmyrc + should_process
-    let (existing_file_id, emmyrc, should_process) = {
+    let (existing_file_id, previous_text, emmyrc, should_process) = {
         let analysis = context.analysis().read().await;
         let file_id = analysis.get_file_id(&uri);
+        let previous_text = file_id.and_then(|file_id| {
+            analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_content(&file_id)
+                .cloned()
+        });
         let emmyrc = analysis.get_emmyrc();
         if file_id.is_some() {
-            (file_id, emmyrc, true)
+            (file_id, previous_text, emmyrc, true)
         } else {
             drop(analysis);
             let workspace_manager = context.workspace_manager().read().await;
             let should = workspace_manager.is_workspace_file(&uri);
-            (file_id, emmyrc, should)
+            (file_id, previous_text, emmyrc, should)
         }
     };
 
@@ -277,39 +356,66 @@ pub async fn on_did_change_text_document(
     }
 
     if !should_process {
+        context.mark_document_closed(&uri).await;
         return None;
     }
 
+    if should_drop_stale_version(&context, &uri, version).await {
+        return Some(());
+    }
+
     let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
+    context
+        .file_diagnostic()
+        .note_recent_edit(
+            &uri,
+            previous_text.as_deref(),
+            &text,
+            Duration::from_millis(interval),
+        )
+        .await;
     let preparsed = preparse_document(text.clone(), emmyrc.clone()).await;
     let syntax_diagnostics = preparsed
         .as_ref()
         .map_or_else(Vec::new, |parsed| parsed.syntax_diagnostics.clone());
+    if should_drop_stale_version(&context, &uri, version).await {
+        return Some(());
+    }
 
-    let file_id = {
-        let mut analysis = context.analysis().write().await;
-        if let Some(preparsed) = preparsed {
-            analysis.update_file_preparsed(
-                uri.clone(),
-                Some(text),
-                preparsed.tree,
-                preparsed.line_index,
-                Some(version),
-                false,
-            )
-        } else {
-            analysis.update_file_text_only(&uri, text)
-        }
-    };
+    let file_id =
+        apply_document_update_without_queuing(&context, &uri, text, version, preparsed, false)
+            .await;
+
+    if should_drop_stale_version(&context, &uri, version).await {
+        return Some(());
+    }
 
     if !supports_pull && file_id.is_some() {
-        context
-            .client()
-            .publish_diagnostics(PublishDiagnosticsParams {
-                uri: uri.clone(),
-                diagnostics: syntax_diagnostics,
-                version: Some(version),
-            });
+        if let Some(cached_diagnostics) = context
+            .file_diagnostic()
+            .cached_display_diagnostics(&uri)
+            .await
+        {
+            context
+                .client()
+                .publish_diagnostics(PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: cached_diagnostics,
+                    version: Some(version),
+                });
+        } else {
+            let syntax_diagnostics = context
+                .file_diagnostic()
+                .filter_display_diagnostics(&uri, syntax_diagnostics)
+                .await;
+            context
+                .client()
+                .publish_diagnostics(PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: syntax_diagnostics,
+                    version: Some(version),
+                });
+        }
     }
 
     // Schedule debounced reindex — rapid edits into a single reindex
@@ -341,28 +447,71 @@ pub async fn on_did_close_document(
     params: DidCloseTextDocumentParams,
 ) -> Option<()> {
     let uri = &params.text_document.uri;
-    let mut workspace = context.workspace_manager().write().await;
-    workspace
-        .current_open_files
-        .remove(&params.text_document.uri);
-    drop(workspace);
+    context.file_diagnostic().clear_recent_edit(uri).await;
+    context.editor_display_cache().remove_uri(uri).await;
     let lsp_features = context.lsp_features();
+    let (encoding, interval) = {
+        let analysis = context.analysis().read().await;
+        let emmyrc = analysis.get_emmyrc();
+        (
+            emmyrc.workspace.encoding.clone(),
+            emmyrc.diagnostics.diagnostic_interval.unwrap_or(500),
+        )
+    };
 
     // Only remove from the index when the file no longer exists on disk
     // (e.g. it was deleted while open). Files that still exist on disk —
     // including library/annotation files opened via "Go to Definition" —
-    // must stay in the index.
-    if let Some(file_path) = uri_to_file_path(uri)
-        && !file_path.exists()
-    {
-        let mut mut_analysis = context.analysis().write().await;
-        mut_analysis.remove_file_by_uri(uri);
-        drop(mut_analysis);
+    // must stay in the index, but their in-memory contents need to revert
+    // to the on-disk state once the editor buffer closes.
+    if let Some(file_path) = uri_to_file_path(uri) {
+        if file_path.exists() {
+            if let Some(text) = read_file_with_encoding(&file_path, &encoding) {
+                if !context.is_document_closed(uri).await {
+                    return Some(());
+                }
 
-        if !lsp_features.supports_pull_diagnostic() {
-            context
-                .file_diagnostic()
-                .clear_push_file_diagnostics(uri.clone());
+                let file_id = {
+                    let mut analysis = context.analysis().write().await;
+                    if !context.is_document_closed(uri).await {
+                        return Some(());
+                    }
+                    analysis.update_file_by_uri(uri, Some(text))
+                };
+
+                if !lsp_features.supports_pull_diagnostic()
+                    && let Some(file_id) = file_id
+                {
+                    if !context.is_document_closed(uri).await {
+                        return Some(());
+                    }
+                    context
+                        .file_diagnostic()
+                        .add_diagnostic_task(
+                            file_id,
+                            interval,
+                            Some(context.debounced_analysis_arc()),
+                        )
+                        .await;
+                }
+            }
+        } else {
+            if !context.is_document_closed(uri).await {
+                return Some(());
+            }
+            let mut mut_analysis = context.analysis().write().await;
+            if !context.is_document_closed(uri).await {
+                return Some(());
+            }
+            mut_analysis.remove_file_by_uri(uri);
+            drop(mut_analysis);
+
+            if !lsp_features.supports_pull_diagnostic() {
+                context
+                    .file_diagnostic()
+                    .clear_push_file_diagnostics(uri.clone())
+                    .await;
+            }
         }
     }
 

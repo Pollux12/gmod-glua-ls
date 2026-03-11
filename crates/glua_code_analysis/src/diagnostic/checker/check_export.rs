@@ -18,6 +18,9 @@ impl Checker for CheckExportChecker {
         let root = semantic_model.get_root().clone();
         let mut checked_index_expr = HashSet::new();
         for node in root.descendants::<LuaAst>() {
+            if context.is_cancelled() {
+                return;
+            }
             match node {
                 LuaAst::LuaAssignStat(assign) => {
                     let (vars, _) = assign.get_var_and_expr_list();
@@ -94,8 +97,15 @@ fn check_export_index_expr(
             }
         }
 
-        if check_field::is_valid_member(semantic_model, &prefix_typ, index_expr, &index_key, code)
-            .is_some()
+        if check_field::is_valid_member(
+            context,
+            semantic_model,
+            &prefix_typ,
+            index_expr,
+            &index_key,
+            code,
+        )
+        .is_some()
         {
             return Some(());
         }
@@ -155,8 +165,15 @@ fn check_export_index_expr(
         return Some(());
     }
 
-    if check_field::is_valid_member(semantic_model, &prefix_typ, index_expr, &index_key, code)
-        .is_some()
+    if check_field::is_valid_member(
+        context,
+        semantic_model,
+        &prefix_typ,
+        index_expr,
+        &index_key,
+        code,
+    )
+    .is_some()
     {
         return Some(());
     }

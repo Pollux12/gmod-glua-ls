@@ -1,7 +1,7 @@
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -17,6 +17,7 @@ pub struct DebouncedAnalysis {
     /// handler, before the didChange task is spawned) so that any request handler
     /// dispatched afterwards sees the flag immediately.
     has_pending_changes: AtomicBool,
+    in_flight_changes: AtomicUsize,
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -36,6 +37,7 @@ impl DebouncedAnalysis {
             pending_files: Mutex::new(HashSet::new()),
             reindexing_files: Mutex::new(HashSet::new()),
             has_pending_changes: AtomicBool::new(false),
+            in_flight_changes: AtomicUsize::new(0),
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
@@ -61,15 +63,20 @@ impl DebouncedAnalysis {
     /// spawning the didChange task) so that request handlers dispatched
     /// immediately afterward see the dirty flag and wait for reindex instead
     /// of computing on stale analysis data.
-    ///
-    /// Also wakes the debounce loop so the timer starts even if `schedule()`
-    /// is delayed by lock contention in the didChange handler.  If the timer
-    /// expires before `schedule()` adds a file, the loop clears the dirty flag
-    /// (no pending files → nothing stale) and notifies waiters so they proceed
-    /// with the best available data.
     pub fn mark_dirty(&self) {
+        self.in_flight_changes.fetch_add(1, Ordering::AcqRel);
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    pub async fn finish_in_flight_changes(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        self.in_flight_changes.fetch_sub(count, Ordering::AcqRel);
+        self.refresh_dirty_state().await;
+        self.reindex_notify.notify_waiters();
     }
 
     /// Check whether document changes are pending reindex.
@@ -129,25 +136,27 @@ impl DebouncedAnalysis {
         }
     }
 
-    /// Wait until all pending reindexes are finished.
-    pub async fn wait_for_all_reindex(&self, cancel_token: CancellationToken) {
-        loop {
-            let notified = self.reindex_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+    async fn reindex_files_without_queuing(&self, file_ids: Vec<FileId>) -> bool {
+        let mut retries = 0u32;
 
-            let is_pending = {
-                let pending = self.pending_files.lock().await;
-                let reindexing = self.reindexing_files.lock().await;
-                !pending.is_empty() || !reindexing.is_empty()
-            };
-            if !is_pending {
-                return;
+        loop {
+            if let Ok(mut analysis) = self.analysis.try_write() {
+                analysis.reindex_files(file_ids);
+                return true;
             }
+
             tokio::select! {
-                _ = notified => {}
-                _ = cancel_token.cancelled() => return,
+                _ = self.shutdown.cancelled() => return false,
+                _ = async {
+                    if retries <= 20 {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                } => {}
             }
+
+            retries += 1;
         }
     }
 
@@ -196,15 +205,18 @@ impl DebouncedAnalysis {
                     self.debounce_duration.as_millis()
                 );
 
-                let mut analysis = self.analysis.write().await;
-                analysis.reindex_files(file_ids.clone());
-                drop(analysis);
+                let reindex_completed = self.reindex_files_without_queuing(file_ids.clone()).await;
 
                 {
                     let mut reindexing = self.reindexing_files.lock().await;
                     for id in &file_ids {
                         reindexing.remove(id);
                     }
+                }
+
+                self.reindex_notify.notify_waiters();
+                if !reindex_completed {
+                    return;
                 }
 
                 // Trigger diagnostic and semantic token refresh so the client
@@ -214,17 +226,29 @@ impl DebouncedAnalysis {
                 self.client.refresh_inlay_hints();
             }
 
-            // Clear the dirty flag when no more files are queued.
-            // If new changes arrived during the reindex, the flag stays set
-            // and handlers will continue to wait for the next cycle.
-            if self.pending_files.lock().await.is_empty() {
-                self.has_pending_changes.store(false, Ordering::Release);
-            }
+            self.refresh_dirty_state().await;
 
             // Always notify waiters so they can re-check the condition.
             // Even if we didn't reindex (pending was empty), clearing the
             // dirty flag means waiters should proceed with available data.
             self.reindex_notify.notify_waiters();
         }
+    }
+
+    async fn refresh_dirty_state(&self) {
+        let has_pending_file_work = {
+            let pending = self.pending_files.lock().await;
+            if !pending.is_empty() {
+                true
+            } else {
+                let reindexing = self.reindexing_files.lock().await;
+                !reindexing.is_empty()
+            }
+        };
+        let has_in_flight_changes = self.in_flight_changes.load(Ordering::Acquire) > 0;
+        self.has_pending_changes.store(
+            has_pending_file_work || has_in_flight_changes,
+            Ordering::Release,
+        );
     }
 }

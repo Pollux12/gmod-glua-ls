@@ -65,14 +65,25 @@ pub async fn on_incoming_calls_handler(
     params: CallHierarchyIncomingCallsParams,
     cancel_token: CancellationToken,
 ) -> Option<Vec<CallHierarchyIncomingCall>> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let item = params.item;
     let data = item.data.as_ref()?;
     let data = serde_json::from_value::<CallHierarchyItemData>(data.clone()).ok()?;
     let analysis = context.read_analysis(&cancel_token).await?;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
     let semantic_model = analysis.compilation.get_semantic_model(data.file_id)?;
     let semantic_decl_id = data.semantic_decl;
 
-    build_incoming_hierarchy(&semantic_model, &analysis.compilation, semantic_decl_id)
+    build_incoming_hierarchy(
+        &semantic_model,
+        &analysis.compilation,
+        semantic_decl_id,
+        &cancel_token,
+    )
 }
 
 pub async fn on_outgoing_calls_handler(
