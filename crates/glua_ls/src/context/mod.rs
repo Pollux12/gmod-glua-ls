@@ -1,6 +1,7 @@
 mod client;
 mod client_id;
 mod debounced_analysis;
+mod did_change_coalescer;
 mod file_diagnostic;
 mod lsp_features;
 mod snapshot;
@@ -10,6 +11,7 @@ mod workspace_manager;
 pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
 pub use debounced_analysis::DebouncedAnalysis;
+pub use did_change_coalescer::DidChangeCoalescer;
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
 pub use lsp_features::LspFeatures;
@@ -106,6 +108,7 @@ pub struct ServerContext {
     cancellations: Arc<Mutex<HashMap<RequestId, CancellationToken>>>,
     debounced_shutdown: CancellationToken,
     inner: Arc<ServerContextInner>,
+    did_change_coalescer: DidChangeCoalescer,
 }
 
 impl ServerContext {
@@ -144,24 +147,35 @@ impl ServerContext {
             tokio::spawn(async move { da.run().await });
         }
 
+        let inner = Arc::new(ServerContextInner {
+            analysis,
+            client,
+            file_diagnostic,
+            workspace_manager,
+            status_bar,
+            lsp_features,
+            debounced_analysis,
+        });
+
+        // Create the didChange coalescer with a snapshot of the inner state
+        let did_change_coalescer =
+            DidChangeCoalescer::new(ServerContextSnapshot::new(inner.clone()));
+
         ServerContext {
             conn,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             debounced_shutdown,
-            inner: Arc::new(ServerContextInner {
-                analysis,
-                client,
-                file_diagnostic,
-                workspace_manager,
-                status_bar,
-                lsp_features,
-                debounced_analysis,
-            }),
+            inner,
+            did_change_coalescer,
         }
     }
 
     pub fn snapshot(&self) -> ServerContextSnapshot {
         ServerContextSnapshot::new(self.inner.clone())
+    }
+
+    pub fn did_change_coalescer(&self) -> &DidChangeCoalescer {
+        &self.did_change_coalescer
     }
 
     pub fn send(&self, response: Response) {

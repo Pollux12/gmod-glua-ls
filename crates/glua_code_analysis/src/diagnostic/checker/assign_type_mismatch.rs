@@ -197,10 +197,7 @@ fn should_skip_inferred_member_collection_index_write(
         return Some(false);
     };
 
-    is_inferred_member_collection_expr(
-        semantic_model,
-        &prefix_index_expr,
-    )
+    is_inferred_member_collection_expr(semantic_model, &prefix_index_expr)
 }
 
 fn is_collection_append_write(index_expr: &LuaIndexExpr) -> Option<bool> {

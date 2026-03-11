@@ -28,18 +28,16 @@ pub async fn on_semantic_token_handler(
         return None;
     }
 
-    let uri = params.text_document.uri;
-
-    // Wait for any pending reindex to complete before computing tokens.
-    // This prevents serving stale tokens (new parse tree + old semantic index)
-    // which causes syntax-highlighting flicker.
-    if !context
-        .debounced_analysis()
-        .wait_until_fresh(&cancel_token)
-        .await
-    {
+    // When changes are pending reindex, the syntax tree and semantic index
+    // are out of sync.  Computing tokens now would produce wrong colors
+    // (flickering).  Return None so VS Code keeps its previous tokens /
+    // falls back to TextMate grammar.  After reindex, the server sends
+    // workspace/semanticTokens/refresh to trigger a fresh request.
+    if context.debounced_analysis().is_dirty() {
         return None;
     }
+
+    let uri = params.text_document.uri;
 
     let client_id = context
         .read_workspace_manager(&cancel_token)

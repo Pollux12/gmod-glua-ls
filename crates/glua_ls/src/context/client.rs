@@ -194,4 +194,12 @@ impl ClientProxy {
     pub fn refresh_workspace_diagnostics(&self) {
         self.send_request_no_response("workspace/diagnostic/refresh", ());
     }
+
+    pub fn refresh_semantic_tokens(&self) {
+        self.send_request_no_response("workspace/semanticTokens/refresh", ());
+    }
+
+    pub fn refresh_inlay_hints(&self) {
+        self.send_request_no_response("workspace/inlayHint/refresh", ());
+    }
 }

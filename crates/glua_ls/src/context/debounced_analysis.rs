@@ -72,6 +72,15 @@ impl DebouncedAnalysis {
         self.notify.notify_waiters();
     }
 
+    /// Check whether document changes are pending reindex.
+    ///
+    /// Handlers that need consistent tree + index data (e.g. semantic tokens)
+    /// can use this to decide whether to serve stale results or return `None`
+    /// so the client keeps its previous state.
+    pub fn is_dirty(&self) -> bool {
+        self.has_pending_changes.load(Ordering::Acquire)
+    }
+
     /// Wait until all pending document changes have been reindexed.
     ///
     /// Returns `true` when the analysis is fresh, `false` if the cancel token
@@ -198,8 +207,11 @@ impl DebouncedAnalysis {
                     }
                 }
 
-                // Trigger diagnostic refresh so the client re-pulls with fresh data
+                // Trigger diagnostic and semantic token refresh so the client
+                // re-pulls with fresh data after the reindex.
                 self.client.refresh_workspace_diagnostics();
+                self.client.refresh_semantic_tokens();
+                self.client.refresh_inlay_hints();
             }
 
             // Clear the dirty flag when no more files are queued.

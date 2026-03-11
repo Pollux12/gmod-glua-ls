@@ -18,16 +18,15 @@ pub async fn on_emmy_annotator_handler(
     if cancel_token.is_cancelled() {
         return None;
     }
-    let uri = Uri::from_str(&params.uri).ok()?;
 
-    // Wait for any pending reindex so annotations use fresh semantic data.
-    if !context
-        .debounced_analysis()
-        .wait_until_fresh(&cancel_token)
-        .await
-    {
+    // When changes are pending, tree and index are out of sync.
+    // Return None to avoid stale annotations; the server re-requests
+    // after reindex via workspace/semanticTokens/refresh.
+    if context.debounced_analysis().is_dirty() {
         return None;
     }
+
+    let uri = Uri::from_str(&params.uri).ok()?;
 
     let analysis = context.read_analysis(&cancel_token).await?;
 

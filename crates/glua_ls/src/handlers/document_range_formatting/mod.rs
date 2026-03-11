@@ -26,33 +26,49 @@ pub async fn on_range_formatting_handler(
         .await?
         .client_config
         .client_id;
-    let analysis = context.read_analysis(&cancel_token).await?;
-    let file_id = analysis.get_file_id(&uri)?;
-    let syntax_tree = analysis
-        .compilation
-        .get_db()
-        .get_vfs()
-        .get_syntax_tree(&file_id)?;
 
-    if syntax_tree.has_syntax_errors() {
-        return None;
-    }
-    let emmyrc = analysis.get_emmyrc();
-    let document = analysis
-        .compilation
-        .get_db()
-        .get_vfs()
-        .get_document(&file_id)?;
-    let text = document.get_text();
-    let file_path = document.get_file_path();
-    let normalized_path = file_path.to_string_lossy().to_string().replace("\\", "/");
-    let formatting_options = FormattingOptions {
-        indent_size: params.options.tab_size,
-        use_tabs: !params.options.insert_spaces,
-        insert_final_newline: params.options.insert_final_newline.unwrap_or(true),
-        non_standard_symbol: !emmyrc.runtime.nonstandard_symbol.is_empty(),
+    // Extract data under short-lived read lock, then drop before external await
+    let (text_owned, normalized_path, formatting_options, external_tool) = {
+        let analysis = context.read_analysis(&cancel_token).await?;
+        let file_id = analysis.get_file_id(&uri)?;
+        let syntax_tree = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)?;
+
+        if syntax_tree.has_syntax_errors() {
+            return None;
+        }
+        let emmyrc = analysis.get_emmyrc();
+        let document = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_document(&file_id)?;
+        let text = document.get_text().to_owned();
+        let file_path = document.get_file_path();
+        let normalized = file_path.to_string_lossy().to_string().replace("\\", "/");
+        let opts = FormattingOptions {
+            indent_size: params.options.tab_size,
+            use_tabs: !params.options.insert_spaces,
+            insert_final_newline: params.options.insert_final_newline.unwrap_or(true),
+            non_standard_symbol: !emmyrc.runtime.nonstandard_symbol.is_empty(),
+        };
+        let ext = emmyrc.format.external_tool_range_format.clone();
+        (text, normalized, opts, ext)
     };
-    let formatted_result = if let Some(external_tool) = &emmyrc.format.external_tool_range_format {
+    // analysis read lock is now dropped
+
+    let formatted_result = if let Some(external_tool) = &external_tool {
+        // Re-acquire briefly for document access needed by external_tool_range_format
+        let analysis = context.read_analysis(&cancel_token).await?;
+        let file_id = analysis.get_file_id(&uri)?;
+        let document = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_document(&file_id)?;
         external_tool_range_format(
             external_tool,
             &document,
@@ -63,7 +79,7 @@ pub async fn on_range_formatting_handler(
         .await?
     } else {
         range_format_code(
-            text,
+            &text_owned,
             &normalized_path,
             request_range.start.line as i32,
             0,

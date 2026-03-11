@@ -17,7 +17,9 @@ pub async fn on_pull_workspace_diagnostic(
         .wait_for_all_reindex(token.clone())
         .await;
 
-    let workspace_manager = context.workspace_manager().read().await;
+    let Some(workspace_manager) = context.read_workspace_manager(&token).await else {
+        return WorkspaceDiagnosticReport { items: vec![] };
+    };
     let status = workspace_manager.get_workspace_diagnostic_level();
     if status == WorkspaceDiagnosticLevel::None {
         return WorkspaceDiagnosticReport { items: vec![] };

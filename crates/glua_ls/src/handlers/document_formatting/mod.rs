@@ -25,46 +25,57 @@ pub async fn on_formatting_handler(
         .await?
         .client_config
         .client_id;
-    let analysis = context.read_analysis(&cancel_token).await?;
-    let emmyrc = analysis.get_emmyrc();
 
-    let file_id = analysis.get_file_id(&uri)?;
-    let syntax_tree = analysis
-        .compilation
-        .get_db()
-        .get_vfs()
-        .get_syntax_tree(&file_id)?;
+    // Extract everything we need from the analysis under a short-lived read
+    // lock, then drop it BEFORE running the formatter.  This avoids blocking
+    // didChange writes (and therefore all other readers) while an external
+    // formatter process is running.
+    let (text_owned, normalized_path, formatting_options, external_config, use_diff) = {
+        let analysis = context.read_analysis(&cancel_token).await?;
+        let emmyrc = analysis.get_emmyrc();
 
-    if syntax_tree.has_syntax_errors() {
-        return None;
-    }
+        let file_id = analysis.get_file_id(&uri)?;
+        let syntax_tree = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)?;
 
-    let document = analysis
-        .compilation
-        .get_db()
-        .get_vfs()
-        .get_document(&file_id)?;
-    let text = document.get_text();
-    let file_path = document.get_file_path();
-    let normalized_path = file_path.to_string_lossy().to_string().replace("\\", "/");
-    let formatting_options = FormattingOptions {
-        indent_size: params.options.tab_size,
-        use_tabs: !params.options.insert_spaces,
-        insert_final_newline: params.options.insert_final_newline.unwrap_or(true),
-        non_standard_symbol: !emmyrc.runtime.nonstandard_symbol.is_empty(),
+        if syntax_tree.has_syntax_errors() {
+            return None;
+        }
+
+        let document = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_document(&file_id)?;
+        let text = document.get_text().to_owned();
+        let file_path = document.get_file_path();
+        let normalized = file_path.to_string_lossy().to_string().replace("\\", "/");
+        let opts = FormattingOptions {
+            indent_size: params.options.tab_size,
+            use_tabs: !params.options.insert_spaces,
+            insert_final_newline: params.options.insert_final_newline.unwrap_or(true),
+            non_standard_symbol: !emmyrc.runtime.nonstandard_symbol.is_empty(),
+        };
+        let ext = emmyrc.format.external_tool.clone();
+        let diff = emmyrc.format.use_diff;
+        (text, normalized, opts, ext, diff)
     };
+    // analysis read lock is now dropped
 
-    let mut formatted_text = if let Some(external_config) = &emmyrc.format.external_tool {
+    let mut formatted_text = if let Some(external_config) = &external_config {
         external_tool_format(
             external_config,
-            text,
+            &text_owned,
             &normalized_path,
             None,
             formatting_options,
         )
         .await?
     } else {
-        reformat_code(text, &normalized_path, formatting_options)
+        reformat_code(&text_owned, &normalized_path, formatting_options)
     };
 
     if client_id.is_intellij() || client_id.is_other() {
@@ -72,10 +83,25 @@ pub async fn on_formatting_handler(
     }
 
     let replace_all_limit = 50;
-    let text_edits = if emmyrc.format.use_diff {
-        // Use line-based diff algorithm if the diff is not too large
-        format_diff(text, &formatted_text, &document, replace_all_limit)
+    // Re-acquire read lock briefly for the diff computation which needs the document
+    let text_edits = if use_diff {
+        let analysis = context.read_analysis(&cancel_token).await?;
+        let file_id = analysis.get_file_id(&uri)?;
+        let document = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_document(&file_id)?;
+        format_diff(&text_owned, &formatted_text, &document, replace_all_limit)
     } else {
+        // For replace-all, we just need the document range
+        let analysis = context.read_analysis(&cancel_token).await?;
+        let file_id = analysis.get_file_id(&uri)?;
+        let document = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_document(&file_id)?;
         let document_range = document.get_document_lsp_range();
         vec![TextEdit {
             range: document_range,

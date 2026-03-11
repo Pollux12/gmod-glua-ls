@@ -253,12 +253,22 @@ pub async fn on_did_change_text_document(
     let version = params.text_document.version;
     let supports_pull = context.lsp_features().supports_pull_diagnostic();
 
-    // Cancel outstanding diagnostics immediately for this file so long-running
-    // tasks do not continue after a newer edit arrives.
-    let existing_file_id = {
+    // Single read-lock acquisition: get file_id + emmyrc + should_process
+    let (existing_file_id, emmyrc, should_process) = {
         let analysis = context.analysis().read().await;
-        analysis.get_file_id(&uri)
+        let file_id = analysis.get_file_id(&uri);
+        let emmyrc = analysis.get_emmyrc();
+        if file_id.is_some() {
+            (file_id, emmyrc, true)
+        } else {
+            drop(analysis);
+            let workspace_manager = context.workspace_manager().read().await;
+            let should = workspace_manager.is_workspace_file(&uri);
+            (file_id, emmyrc, should)
+        }
     };
+
+    // Cancel outstanding diagnostics immediately for this file
     if let Some(file_id) = existing_file_id {
         context
             .file_diagnostic()
@@ -266,23 +276,10 @@ pub async fn on_did_change_text_document(
             .await;
     }
 
-    // Check if file should be filtered before acquiring locks
-    // Follow lock order: workspace_manager (read) -> analysis (write)
-    let should_process = if existing_file_id.is_some() {
-        true
-    } else {
-        let workspace_manager = context.workspace_manager().read().await;
-        workspace_manager.is_workspace_file(&uri)
-    };
-
     if !should_process {
         return None;
     }
 
-    let emmyrc = {
-        let analysis = context.analysis().read().await;
-        analysis.get_emmyrc()
-    };
     let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
     let preparsed = preparse_document(text.clone(), emmyrc.clone()).await;
     let syntax_diagnostics = preparsed

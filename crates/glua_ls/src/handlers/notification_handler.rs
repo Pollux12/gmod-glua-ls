@@ -16,8 +16,8 @@ use crate::context::ServerContext;
 use super::{
     configuration::on_did_change_configuration,
     text_document::{
-        on_did_change_text_document, on_did_change_watched_files, on_did_close_document,
-        on_did_open_text_document, on_did_save_text_document, on_set_trace,
+        on_did_change_watched_files, on_did_close_document, on_did_open_text_document,
+        on_did_save_text_document, on_set_trace,
     },
     workspace::{on_did_change_workspace_folders, on_did_rename_files_handler},
 };
@@ -74,6 +74,18 @@ pub async fn on_notification_handler(
         // reindex instead of computing on stale data (which causes flickering
         // semantic tokens / inlay hints).
         server_context.snapshot().debounced_analysis().mark_dirty();
+
+        // Route through the coalescer instead of spawning a task directly.
+        // This ensures only the LATEST version per URI is processed when the
+        // user types rapidly, turning 33 write-lock acquisitions into 1–3.
+        if let Ok(params) = notification
+            .extract::<<DidChangeTextDocument as LspNotification>::Params>(
+                DidChangeTextDocument::METHOD,
+            )
+        {
+            server_context.did_change_coalescer().enqueue(params);
+        }
+        return Ok(());
     }
 
     dispatch_notification!(notification, server_context, {
@@ -81,7 +93,6 @@ pub async fn on_notification_handler(
             // Intentionally empty - async to keep the message for $/cancelRequest processing.
         }
         async: {
-            DidChangeTextDocument => on_did_change_text_document,
             DidOpenTextDocument => on_did_open_text_document,
             DidSaveTextDocument => on_did_save_text_document,
             DidCloseTextDocument => on_did_close_document,
