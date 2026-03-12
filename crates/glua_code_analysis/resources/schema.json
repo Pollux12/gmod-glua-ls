@@ -1787,6 +1787,13 @@
             ]
           }
         },
+        "templatePath": {
+          "description": "Path to a folder containing custom GLua scaffolding templates (`.lua` files).\nBuilt-in templates are used as fallback when a custom one is not found.\nAccepts an absolute path or a path relative to the workspace root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "vgui": {
           "$ref": "#/$defs/EmmyrcGmodVgui",
           "default": {

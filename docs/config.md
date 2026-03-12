@@ -341,6 +341,9 @@ These keys accept string expressions such as `"keep"`, `"fixed(n)"`, `"min(n)"`,
 | `hookMappings.methodPrefixes` | `string[]` | `[]` | Additional prefixes for hook auto-detection |
 | `vgui.codeLensEnabled` | `boolean` | `true` | Enable Code Lenses for VGUI panel definitions |
 | `vgui.inlayHintEnabled` | `boolean` | `false` | Enable Inlay Hints for VGUI panel definitions |
+| `annotationsPath` | `string \| null` | `null` | Path to GMod annotations to load as core library. When not set, uses the VSCode extension's auto-downloaded annotations (if enabled). Set to an explicit path to override. |
+| `autoLoadAnnotations` | `boolean \| null` | `null` | Disable auto-loading of annotations from VSCode or the default path. Takes precedence over extension settings. |
+| `templatePath` | `string \| null` | `null` | Path to a folder containing custom GLua scaffolding templates (`.lua` files). Built-in templates are used as fallback when a custom one is not found. Accepts an absolute path or a path relative to the workspace root. |
 
 `gmod.fileParamDefaults` is applied as an override layer on top of the built-in fallback map. When editing raw JSON directly, set a value to `""` to remove a built-in fallback for your workspace while still inheriting future upstream additions.
 

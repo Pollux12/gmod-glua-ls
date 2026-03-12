@@ -78,6 +78,11 @@ pub struct EmmyrcGmod {
     /// This takes precedence over extension settings.
     #[serde(default)]
     pub auto_load_annotations: Option<bool>,
+    /// Path to a folder containing custom GLua scaffolding templates (`.lua` files).
+    /// Built-in templates are used as fallback when a custom one is not found.
+    /// Accepts an absolute path or a path relative to the workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_path: Option<String>,
 }
 
 fn enabled_default() -> bool {
@@ -144,6 +149,7 @@ impl Default for EmmyrcGmod {
             dynamic_fields_global: dynamic_fields_global_default(),
             annotations_path: None,
             auto_load_annotations: None,
+            template_path: None,
         }
     }
 }
