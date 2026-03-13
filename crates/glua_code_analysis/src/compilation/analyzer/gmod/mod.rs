@@ -55,7 +55,7 @@ impl AnalysisPipeline for GmodAnalysisPipeline {
                         db,
                         in_filed_tree.file_id,
                         &scope_match.class_name,
-                        scope_match.global_name,
+                        &scope_match.global_name,
                         in_filed_tree.value.syntax().text_range(),
                     );
                 }
@@ -458,40 +458,11 @@ fn net_send_kind_from_method_name(method_name: &str) -> Option<NetSendKind> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct GmodScopedGlobalRule {
-    global_name: &'static str,
-    folder_segments: &'static [&'static str],
-}
-
 #[derive(Debug, Clone)]
 struct GmodScopedClassMatch {
-    global_name: &'static str,
+    global_name: String,
     class_name: String,
 }
-
-const GMOD_SCOPED_GLOBAL_RULES: &[GmodScopedGlobalRule] = &[
-    GmodScopedGlobalRule {
-        global_name: "TOOL",
-        folder_segments: &["weapons", "gmod_tool", "stools"],
-    },
-    GmodScopedGlobalRule {
-        global_name: "ENT",
-        folder_segments: &["entities"],
-    },
-    GmodScopedGlobalRule {
-        global_name: "SWEP",
-        folder_segments: &["weapons"],
-    },
-    GmodScopedGlobalRule {
-        global_name: "EFFECT",
-        folder_segments: &["effects"],
-    },
-    GmodScopedGlobalRule {
-        global_name: "PLUGIN",
-        folder_segments: &["plugins"],
-    },
-];
 
 const GMOD_ENT_BASE_TO_ENT: &[&str] = &[
     "base_gmodentity",
@@ -533,7 +504,7 @@ fn collect_scripted_scope_type_bindings(db: &mut DbIndex, file_id: FileId) {
         db,
         file_id,
         &scope_match.class_name,
-        scope_match.global_name,
+        &scope_match.global_name,
         decls[0].1,
     );
 
@@ -617,10 +588,7 @@ fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
     super_types
 }
 
-pub(crate) fn scoped_class_global_name_for_file(
-    db: &DbIndex,
-    file_id: FileId,
-) -> Option<&'static str> {
+pub(crate) fn scoped_class_global_name_for_file(db: &DbIndex, file_id: FileId) -> Option<String> {
     detect_scoped_class_from_path(db, file_id).map(|scope_match| scope_match.global_name)
 }
 
@@ -634,7 +602,7 @@ pub(crate) fn ensure_scoped_class_type_decl_for_file(
         db,
         file_id,
         &scope_match.class_name,
-        scope_match.global_name,
+        &scope_match.global_name,
         range,
     ))
 }
@@ -776,7 +744,7 @@ fn synthesize_scoped_base_assignments(db: &mut DbIndex, file_id: FileId, root: L
         db,
         file_id,
         &scope_match.class_name,
-        scope_match.global_name,
+        &scope_match.global_name,
         root.syntax().text_range(),
     );
     let expected_base_path = format!("{}.Base", scope_match.global_name);
@@ -898,7 +866,7 @@ fn synthesize_network_var_wrappers(
         let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
 
         // Step 1: Collect wrapper definitions from method definitions
-        let wrappers = collect_network_var_wrappers(root, scope_match.global_name);
+        let wrappers = collect_network_var_wrappers(root, &scope_match.global_name);
         if wrappers.is_empty() {
             continue;
         }
@@ -1804,82 +1772,14 @@ fn resolve_networkvar_type(type_name: &str) -> LuaType {
 
 fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodScopedClassMatch> {
     let file_path = db.get_vfs().get_file_path(&file_id)?;
-    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
-    let lower_normalized_path = normalized_path.to_ascii_lowercase();
-    let lower_segments = lower_normalized_path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    let original_segments = normalized_path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if lower_segments.is_empty() {
-        return None;
-    }
-
-    let mut best_match: Option<(&GmodScopedGlobalRule, usize, usize)> = None;
-
-    for rule in GMOD_SCOPED_GLOBAL_RULES {
-        let rule_len = rule.folder_segments.len();
-        if rule_len == 0 || lower_segments.len() < rule_len {
-            continue;
-        }
-
-        for start_idx in (0..=lower_segments.len() - rule_len).rev() {
-            let mut matched = true;
-            for (offset, rule_segment) in rule.folder_segments.iter().enumerate() {
-                if lower_segments[start_idx + offset] != *rule_segment {
-                    matched = false;
-                    break;
-                }
-            }
-
-            if !matched {
-                continue;
-            }
-
-            let end_idx = start_idx + rule_len - 1;
-            let replace_best = match best_match {
-                None => true,
-                Some((_, best_end_idx, best_rule_len)) => {
-                    end_idx > best_end_idx || (end_idx == best_end_idx && rule_len > best_rule_len)
-                }
-            };
-
-            if replace_best {
-                best_match = Some((rule, end_idx, rule_len));
-            }
-
-            break;
-        }
-    }
-
-    let (rule, best_end_idx, _) = best_match?;
-    let class_idx = best_end_idx + 1;
-    if class_idx >= lower_segments.len() || class_idx >= original_segments.len() {
-        return None;
-    }
-
-    let class_name = if class_idx == original_segments.len() - 1 {
-        let class_segment = original_segments[class_idx];
-        if lower_segments[class_idx].ends_with(".lua") && class_segment.len() >= 4 {
-            class_segment[..class_segment.len() - 4].to_string()
-        } else {
-            class_segment.to_string()
-        }
-    } else {
-        original_segments[class_idx].to_string()
-    };
-
-    if class_name.is_empty() {
-        return None;
-    }
-
-    Some(GmodScopedClassMatch {
-        global_name: rule.global_name,
-        class_name,
-    })
+    db.get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .detect_class_for_path(file_path)
+        .map(|scope_match| GmodScopedClassMatch {
+            global_name: scope_match.definition.class_global,
+            class_name: scope_match.class_name,
+        })
 }
 
 /// Returns the gmod scripted-class name that the given file belongs to, if any.
@@ -1892,10 +1792,7 @@ pub fn get_gmod_class_name_for_file(db: &DbIndex, file_id: FileId) -> Option<Str
 /// Returns the scripted class info `(class_name, global_name)` for a file, if it belongs to a
 /// GMod scripted class scope.  `global_name` is the well-known table name used in the file
 /// (e.g. `"ENT"`, `"SWEP"`, `"TOOL"`, `"EFFECT"`, `"PLUGIN"`).
-pub fn get_scripted_class_info_for_file(
-    db: &DbIndex,
-    file_id: FileId,
-) -> Option<(String, &'static str)> {
+pub fn get_scripted_class_info_for_file(db: &DbIndex, file_id: FileId) -> Option<(String, String)> {
     detect_scoped_class_from_path(db, file_id).map(|m| (m.class_name, m.global_name))
 }
 

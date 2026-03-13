@@ -1,8 +1,13 @@
 #[cfg(test)]
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualHoverResult, check};
+    use glua_code_analysis::EmmyrcGmodScriptedClassScopeEntry;
     use googletest::prelude::*;
     use lsp_types::HoverContents;
+
+    fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
+        EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
+    }
 
     fn dedent(input: &str) -> String {
         let lines: Vec<&str> = input.lines().collect();
@@ -599,7 +604,7 @@ mod tests {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["plugins/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
         emmyrc.gmod.hook_mappings.method_prefixes = vec!["PLUGIN".to_string()];
         ws.update_emmyrc(emmyrc);
 
@@ -667,7 +672,7 @@ mod tests {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
@@ -707,7 +712,7 @@ mod tests {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(

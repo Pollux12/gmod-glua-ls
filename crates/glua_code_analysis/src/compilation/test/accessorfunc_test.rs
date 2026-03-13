@@ -5,13 +5,18 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, FileId, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, FileId, LuaMemberOwner, LuaType,
+        LuaTypeDeclId, VirtualWorkspace,
     };
+
+    fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
+        EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
+    }
 
     fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
     }
 

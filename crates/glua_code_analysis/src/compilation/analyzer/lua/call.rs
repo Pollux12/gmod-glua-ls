@@ -397,16 +397,19 @@ pub(in crate::compilation::analyzer) fn compute_scripted_class_files(
     file_ids: &[FileId],
 ) -> HashSet<FileId> {
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-    if scopes.include.is_empty() && scopes.exclude.is_empty() {
+    let include_patterns = scopes.include_patterns();
+    let exclude_patterns = scopes.exclude_patterns();
+    if include_patterns.is_empty() && exclude_patterns.is_empty() {
         return file_ids.iter().copied().collect();
     }
 
-    // Compile glob patterns once for all files
-    let include_patterns: Vec<&str> = scopes.include.iter().map(String::as_str).collect();
-    let exclude_patterns: Vec<&str> = scopes.exclude.iter().map(String::as_str).collect();
-
     let include_glob = if !include_patterns.is_empty() {
-        match wax::any(include_patterns) {
+        match wax::any(
+            include_patterns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ) {
             Ok(g) => Some(g),
             Err(err) => {
                 log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
@@ -418,7 +421,12 @@ pub(in crate::compilation::analyzer) fn compute_scripted_class_files(
     };
 
     let exclude_glob = if !exclude_patterns.is_empty() {
-        match wax::any(exclude_patterns) {
+        match wax::any(
+            exclude_patterns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ) {
             Ok(g) => Some(g),
             Err(err) => {
                 log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");

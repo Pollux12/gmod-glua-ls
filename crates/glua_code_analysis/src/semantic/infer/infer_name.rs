@@ -83,35 +83,6 @@ fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Opt
     Some(LuaType::Ref(LuaTypeDeclId::global(base_name)))
 }
 
-#[derive(Clone, Copy)]
-struct ScopedGlobalRule {
-    global_name: &'static str,
-    folder_segments: &'static [&'static str],
-}
-
-const SCOPED_GLOBAL_RULES: &[ScopedGlobalRule] = &[
-    ScopedGlobalRule {
-        global_name: "TOOL",
-        folder_segments: &["weapons", "gmod_tool", "stools"],
-    },
-    ScopedGlobalRule {
-        global_name: "ENT",
-        folder_segments: &["entities"],
-    },
-    ScopedGlobalRule {
-        global_name: "SWEP",
-        folder_segments: &["weapons"],
-    },
-    ScopedGlobalRule {
-        global_name: "EFFECT",
-        folder_segments: &["effects"],
-    },
-    ScopedGlobalRule {
-        global_name: "PLUGIN",
-        folder_segments: &["plugins"],
-    },
-];
-
 fn infer_scoped_scripted_global_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -126,7 +97,15 @@ pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
     cache: &mut LuaInferCache,
     name: &str,
 ) -> Option<LuaTypeDeclId> {
-    if !db.get_emmyrc().gmod.enabled || !is_scoped_scripted_global_name(name) {
+    if !db.get_emmyrc().gmod.enabled
+        || !db
+            .get_emmyrc()
+            .gmod
+            .scripted_class_scopes
+            .resolved_definitions()
+            .iter()
+            .any(|definition| definition.class_global == name)
+    {
         return None;
     }
 
@@ -138,10 +117,6 @@ pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
     Some(LuaTypeDeclId::global(&class_name))
 }
 
-fn is_scoped_scripted_global_name(name: &str) -> bool {
-    matches!(name, "TOOL" | "ENT" | "SWEP" | "EFFECT" | "PLUGIN")
-}
-
 fn detect_scoped_global_from_path_cached(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -150,94 +125,36 @@ fn detect_scoped_global_from_path_cached(
         return cached.clone();
     }
 
-    let detected = detect_scoped_global_from_path(db, cache.get_file_id())
-        .map(|(global_name, class_name)| (global_name.to_string(), class_name));
+    let detected = detect_scoped_global_from_path(db, cache.get_file_id());
     cache.scoped_scripted_global_cache = Some(detected.clone());
     detected
 }
 
-fn detect_scoped_global_from_path(db: &DbIndex, file_id: FileId) -> Option<(&'static str, String)> {
+fn detect_scoped_global_from_path(db: &DbIndex, file_id: FileId) -> Option<(String, String)> {
     if !is_in_scripted_class_scope(db, file_id) {
         return None;
     }
 
     let file_path = db.get_vfs().get_file_path(&file_id)?;
-    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
-    let lower_segments = normalized_path
-        .to_ascii_lowercase()
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if lower_segments.is_empty() {
-        return None;
-    }
+    let scope_match = db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .detect_class_for_path(file_path)?;
 
-    let mut best_match: Option<(&ScopedGlobalRule, usize, usize)> = None;
-    for rule in SCOPED_GLOBAL_RULES {
-        let rule_len = rule.folder_segments.len();
-        if rule_len == 0 || lower_segments.len() < rule_len {
-            continue;
-        }
-
-        for start_idx in (0..=lower_segments.len() - rule_len).rev() {
-            let mut matched = true;
-            for (offset, rule_segment) in rule.folder_segments.iter().enumerate() {
-                if lower_segments[start_idx + offset] != *rule_segment {
-                    matched = false;
-                    break;
-                }
-            }
-
-            if !matched {
-                continue;
-            }
-
-            let end_idx = start_idx + rule_len - 1;
-            let replace_best = match best_match {
-                None => true,
-                Some((_, best_end_idx, best_rule_len)) => {
-                    end_idx > best_end_idx || (end_idx == best_end_idx && rule_len > best_rule_len)
-                }
-            };
-
-            if replace_best {
-                best_match = Some((rule, end_idx, rule_len));
-            }
-            break;
-        }
-    }
-
-    let (rule, best_end_idx, _) = best_match?;
-    let class_idx = best_end_idx + 1;
-    if class_idx >= lower_segments.len() {
-        return None;
-    }
-
-    let class_name = if class_idx == lower_segments.len() - 1 {
-        lower_segments[class_idx]
-            .strip_suffix(".lua")
-            .unwrap_or(lower_segments[class_idx].as_str())
-            .to_string()
-    } else {
-        lower_segments[class_idx].clone()
-    };
-
-    if class_name.is_empty() {
-        return None;
-    }
-
-    Some((rule.global_name, class_name))
+    Some((scope_match.definition.class_global, scope_match.class_name))
 }
 
 fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-    if scopes.include.is_empty() && scopes.exclude.is_empty() {
+    let include_patterns = scopes.include_patterns();
+    let exclude_patterns = scopes.exclude_patterns();
+    if include_patterns.is_empty() && exclude_patterns.is_empty() {
         return true;
     }
 
     let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
-        return scopes.include.is_empty();
+        return include_patterns.is_empty();
     };
 
     let normalized_path = file_path.to_string_lossy().replace('\\', "/");
@@ -255,13 +172,13 @@ fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
         push_candidate_path(&mut candidate_paths, file_name);
     }
 
-    if !scopes.include.is_empty() {
-        let include_pattern = scopes
-            .include
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let include_set = match wax::any(include_pattern) {
+    if !include_patterns.is_empty() {
+        let include_set = match wax::any(
+            include_patterns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ) {
             Ok(glob) => glob,
             Err(err) => {
                 log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
@@ -276,13 +193,13 @@ fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
         }
     }
 
-    if !scopes.exclude.is_empty() {
-        let exclude_pattern = scopes
-            .exclude
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let exclude_set = match wax::any(exclude_pattern) {
+    if !exclude_patterns.is_empty() {
+        let exclude_set = match wax::any(
+            exclude_patterns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ) {
             Ok(glob) => glob,
             Err(err) => {
                 log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");

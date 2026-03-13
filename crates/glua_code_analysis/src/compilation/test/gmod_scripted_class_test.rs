@@ -6,9 +6,20 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, GmodClassCallLiteral, LuaMemberOwner, LuaType, LuaTypeDeclId,
-        VirtualWorkspace,
+        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GmodClassCallLiteral,
+        LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
     };
+
+    fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
+        EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
+    }
+
+    fn legacy_scopes(patterns: &[&str]) -> Vec<EmmyrcGmodScriptedClassScopeEntry> {
+        patterns
+            .iter()
+            .map(|pattern| legacy_scope(pattern))
+            .collect()
+    }
 
     #[gtest]
     fn test_extracts_scripted_class_call_literals() {
@@ -106,7 +117,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["lua/entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let allowed_file_id = ws.def_file(
@@ -150,7 +161,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -171,7 +182,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["plugins/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -238,7 +249,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["plugins/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -298,7 +309,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -338,7 +349,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -371,7 +382,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -423,7 +434,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -471,7 +482,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -515,7 +526,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -575,7 +586,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -610,7 +621,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -667,7 +678,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -752,7 +763,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedGlobal);
 
@@ -819,7 +830,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -874,7 +885,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -907,7 +918,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::TypeNotFound);
 
@@ -1620,7 +1631,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -1668,7 +1679,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -1731,7 +1742,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -1770,7 +1781,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_files(vec![
@@ -1836,7 +1847,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -2079,7 +2090,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
 
@@ -2132,7 +2143,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_files(vec![
@@ -2192,7 +2203,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
 
@@ -2251,7 +2262,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -2303,7 +2314,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
 
@@ -2356,7 +2367,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
 
@@ -2492,7 +2503,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
 
@@ -2541,7 +2552,7 @@ mod test {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
 
@@ -2595,14 +2606,14 @@ mod test {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![
-            "entities/**".to_string(),
-            "weapons/**".to_string(),
-            "effects/**".to_string(),
-            "weapons/gmod_tool/stools/**".to_string(),
-            "plugins/**".to_string(),
-        ];
-        emmyrc.gmod.scripted_class_scopes.exclude = vec![
+        emmyrc.gmod.scripted_class_scopes.include = legacy_scopes(&[
+            "entities/**",
+            "weapons/**",
+            "effects/**",
+            "weapons/gmod_tool/stools/**",
+            "plugins/**",
+        ]);
+        emmyrc.gmod.scripted_class_scopes.legacy_exclude = vec![
             "**/tests/**".to_string(),
             "**/test/**".to_string(),
             "**/docs/**".to_string(),
@@ -2901,7 +2912,7 @@ mod test {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
 
@@ -3566,7 +3577,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec!["entities/**".to_string()];
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(

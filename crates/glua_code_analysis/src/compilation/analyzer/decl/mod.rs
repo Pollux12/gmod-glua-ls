@@ -176,7 +176,7 @@ pub struct DeclAnalyzer<'a> {
     db: &'a mut DbIndex,
     root: LuaChunk,
     decl: LuaDeclarationTree,
-    scoped_class_global_name: Option<&'static str>,
+    scoped_class_global_name: Option<String>,
     scopes: Vec<LuaScopeId>,
     is_meta: bool,
     context: &'a mut AnalyzeContext,
@@ -188,7 +188,7 @@ impl<'a> DeclAnalyzer<'a> {
         file_id: FileId,
         root: LuaChunk,
         context: &'a mut AnalyzeContext,
-        scoped_class_global_name: Option<&'static str>,
+        scoped_class_global_name: Option<String>,
     ) -> DeclAnalyzer<'a> {
         DeclAnalyzer {
             db,
@@ -239,7 +239,7 @@ impl<'a> DeclAnalyzer<'a> {
     }
 
     pub fn add_decl(&mut self, mut decl: LuaDecl) -> LuaDeclId {
-        if let Some(scoped_class_global_name) = self.scoped_class_global_name
+        if let Some(scoped_class_global_name) = self.scoped_class_global_name.as_ref()
             && decl.get_name() == scoped_class_global_name
             && let LuaDeclExtra::Global { kind } = decl.extra.clone()
         {
@@ -270,6 +270,7 @@ impl<'a> DeclAnalyzer<'a> {
 
     pub fn is_scoped_class_global_name(&self, name: &str) -> bool {
         self.scoped_class_global_name
+            .as_ref()
             .is_some_and(|scoped_name| scoped_name == name)
     }
 }

@@ -22,7 +22,7 @@ struct ScriptedClassInfo {
     #[allow(dead_code)]
     class_name: String,
     /// Global variable name used in the file (e.g. "ENT", "SWEP", "TOOL").
-    global_name: &'static str,
+    global_name: String,
     /// Label to show in the outline (e.g. "my_entity (Entity)").
     class_label: String,
 }
@@ -68,7 +68,7 @@ impl<'a> DocumentSymbolBuilder<'a> {
         let gmod_call_map = Self::collect_gmod_call_map(db, file_id, gmod_enabled);
         let scripted_class_info = if gmod_enabled {
             get_scripted_class_info_for_file(db, file_id).map(|(class_name, global_name)| {
-                let type_label = scripted_class_type_label(global_name);
+                let type_label = scripted_class_type_label(&global_name);
                 let class_label = format!("{class_name} ({type_label})");
                 ScriptedClassInfo {
                     class_name,
@@ -121,7 +121,7 @@ impl<'a> DocumentSymbolBuilder<'a> {
 
         // Scripted entity classes (ENT, SWEP, TOOL, EFFECT, PLUGIN).
         if let Some((class_name, global_name)) = get_scripted_class_info_for_file(db, file_id) {
-            let type_label = scripted_class_type_label(global_name);
+            let type_label = scripted_class_type_label(&global_name);
             let class_label = format!("{class_name} ({type_label})");
             let class_decl_id = decl_tree
                 .get_decls()
@@ -319,7 +319,7 @@ impl<'a> DocumentSymbolBuilder<'a> {
     pub fn scripted_class_global_name(&self) -> Option<&str> {
         self.scripted_class_info
             .as_ref()
-            .map(|info| info.global_name)
+            .map(|info| info.global_name.as_str())
     }
 
     /// Returns the syntax id of the pre-created top-level scripted class symbol, if one exists.

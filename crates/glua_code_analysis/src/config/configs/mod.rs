@@ -25,7 +25,10 @@ pub use document_color::EmmyrcDocumentColor;
 pub use gmod::{
     EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodNetwork, EmmyrcGmodNetworkCompletion,
     EmmyrcGmodNetworkDiagnostics, EmmyrcGmodOutline, EmmyrcGmodOutlineVerbosity, EmmyrcGmodRealm,
-    EmmyrcGmodScriptedClassScopes,
+    EmmyrcGmodScriptedClassDefinition, EmmyrcGmodScriptedClassScaffold,
+    EmmyrcGmodScriptedClassScaffoldFile, EmmyrcGmodScriptedClassScopeEntry,
+    EmmyrcGmodScriptedClassScopes, ResolvedGmodScriptedClassDefinition,
+    ResolvedGmodScriptedClassMatch,
 };
 pub use hover::EmmyrcHover;
 pub use inlayhint::EmmyrcInlayHint;

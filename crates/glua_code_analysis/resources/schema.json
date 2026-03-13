@@ -128,13 +128,118 @@
           "verbosity": "normal"
         },
         "scriptedClassScopes": {
-          "exclude": [],
           "include": [
-            "entities/**",
-            "weapons/**",
-            "effects/**",
-            "weapons/gmod_tool/stools/**",
-            "plugins/**"
+            {
+              "classGlobal": "ENT",
+              "icon": "folder-library",
+              "id": "entities",
+              "include": [
+                "entities/**"
+              ],
+              "label": "Entities",
+              "path": [
+                "entities"
+              ],
+              "rootDir": "lua/entities",
+              "scaffold": {
+                "files": [
+                  {
+                    "path": "{{name}}/shared.lua",
+                    "template": "ent_shared.lua"
+                  },
+                  {
+                    "path": "{{name}}/init.lua",
+                    "template": "ent_init.lua"
+                  },
+                  {
+                    "path": "{{name}}/cl_init.lua",
+                    "template": "ent_cl_init.lua"
+                  }
+                ]
+              }
+            },
+            {
+              "classGlobal": "SWEP",
+              "exclude": [
+                "weapons/gmod_tool/**"
+              ],
+              "icon": "folder-library",
+              "id": "weapons",
+              "include": [
+                "weapons/**"
+              ],
+              "label": "SWEPs",
+              "path": [
+                "weapons"
+              ],
+              "rootDir": "lua/weapons",
+              "scaffold": {
+                "files": [
+                  {
+                    "path": "{{name}}/shared.lua",
+                    "template": "swep_shared.lua"
+                  }
+                ]
+              }
+            },
+            {
+              "classGlobal": "EFFECT",
+              "icon": "folder-library",
+              "id": "effects",
+              "include": [
+                "effects/**"
+              ],
+              "label": "Effects",
+              "path": [
+                "effects"
+              ],
+              "rootDir": "lua/effects",
+              "scaffold": {
+                "files": [
+                  {
+                    "path": "{{name}}.lua",
+                    "template": "effect.lua"
+                  }
+                ]
+              }
+            },
+            {
+              "classGlobal": "TOOL",
+              "icon": "tools",
+              "id": "stools",
+              "include": [
+                "weapons/gmod_tool/stools/**"
+              ],
+              "label": "STools",
+              "parentId": "weapons",
+              "path": [
+                "weapons",
+                "gmod_tool",
+                "stools"
+              ],
+              "rootDir": "lua/weapons/gmod_tool/stools",
+              "scaffold": {
+                "files": [
+                  {
+                    "path": "{{name}}.lua",
+                    "template": "tool.lua"
+                  }
+                ]
+              }
+            },
+            {
+              "classGlobal": "PLUGIN",
+              "icon": "extensions",
+              "id": "plugins",
+              "include": [
+                "plugins/**"
+              ],
+              "label": "Plugins",
+              "path": [
+                "plugins"
+              ],
+              "rootDir": "plugins"
+            }
           ]
         },
         "vgui": {
@@ -1777,13 +1882,118 @@
         "scriptedClassScopes": {
           "$ref": "#/$defs/EmmyrcGmodScriptedClassScopes",
           "default": {
-            "exclude": [],
             "include": [
-              "entities/**",
-              "weapons/**",
-              "effects/**",
-              "weapons/gmod_tool/stools/**",
-              "plugins/**"
+              {
+                "classGlobal": "ENT",
+                "icon": "folder-library",
+                "id": "entities",
+                "include": [
+                  "entities/**"
+                ],
+                "label": "Entities",
+                "path": [
+                  "entities"
+                ],
+                "rootDir": "lua/entities",
+                "scaffold": {
+                  "files": [
+                    {
+                      "path": "{{name}}/shared.lua",
+                      "template": "ent_shared.lua"
+                    },
+                    {
+                      "path": "{{name}}/init.lua",
+                      "template": "ent_init.lua"
+                    },
+                    {
+                      "path": "{{name}}/cl_init.lua",
+                      "template": "ent_cl_init.lua"
+                    }
+                  ]
+                }
+              },
+              {
+                "classGlobal": "SWEP",
+                "exclude": [
+                  "weapons/gmod_tool/**"
+                ],
+                "icon": "folder-library",
+                "id": "weapons",
+                "include": [
+                  "weapons/**"
+                ],
+                "label": "SWEPs",
+                "path": [
+                  "weapons"
+                ],
+                "rootDir": "lua/weapons",
+                "scaffold": {
+                  "files": [
+                    {
+                      "path": "{{name}}/shared.lua",
+                      "template": "swep_shared.lua"
+                    }
+                  ]
+                }
+              },
+              {
+                "classGlobal": "EFFECT",
+                "icon": "folder-library",
+                "id": "effects",
+                "include": [
+                  "effects/**"
+                ],
+                "label": "Effects",
+                "path": [
+                  "effects"
+                ],
+                "rootDir": "lua/effects",
+                "scaffold": {
+                  "files": [
+                    {
+                      "path": "{{name}}.lua",
+                      "template": "effect.lua"
+                    }
+                  ]
+                }
+              },
+              {
+                "classGlobal": "TOOL",
+                "icon": "tools",
+                "id": "stools",
+                "include": [
+                  "weapons/gmod_tool/stools/**"
+                ],
+                "label": "STools",
+                "parentId": "weapons",
+                "path": [
+                  "weapons",
+                  "gmod_tool",
+                  "stools"
+                ],
+                "rootDir": "lua/weapons/gmod_tool/stools",
+                "scaffold": {
+                  "files": [
+                    {
+                      "path": "{{name}}.lua",
+                      "template": "tool.lua"
+                    }
+                  ]
+                }
+              },
+              {
+                "classGlobal": "PLUGIN",
+                "icon": "extensions",
+                "id": "plugins",
+                "include": [
+                  "plugins/**"
+                ],
+                "label": "Plugins",
+                "path": [
+                  "plugins"
+                ],
+                "rootDir": "plugins"
+              }
             ]
           }
         },
@@ -1921,28 +2131,249 @@
         "menu"
       ]
     },
-    "EmmyrcGmodScriptedClassScopes": {
+    "EmmyrcGmodScriptedClassDefinition": {
       "type": "object",
       "properties": {
-        "exclude": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
+        "classGlobal": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "include": {
-          "type": "array",
-          "default": [
-            "entities/**",
-            "weapons/**",
-            "effects/**",
-            "weapons/gmod_tool/stools/**",
-            "plugins/**"
+        "disabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "exclude": {
+          "type": [
+            "array",
+            "null"
           ],
           "items": {
             "type": "string"
           }
+        },
+        "icon": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "include": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parentId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "rootDir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scaffold": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmmyrcGmodScriptedClassScaffold"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "EmmyrcGmodScriptedClassScaffold": {
+      "type": "object",
+      "properties": {
+        "files": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EmmyrcGmodScriptedClassScaffoldFile"
+          }
+        }
+      }
+    },
+    "EmmyrcGmodScriptedClassScaffoldFile": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "template": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "template"
+      ]
+    },
+    "EmmyrcGmodScriptedClassScopeEntry": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/EmmyrcGmodScriptedClassDefinition"
+        }
+      ]
+    },
+    "EmmyrcGmodScriptedClassScopes": {
+      "type": "object",
+      "properties": {
+        "include": {
+          "type": "array",
+          "default": [
+            {
+              "classGlobal": "ENT",
+              "icon": "folder-library",
+              "id": "entities",
+              "include": [
+                "entities/**"
+              ],
+              "label": "Entities",
+              "path": [
+                "entities"
+              ],
+              "rootDir": "lua/entities",
+              "scaffold": {
+                "files": [
+                  {
+                    "path": "{{name}}/shared.lua",
+                    "template": "ent_shared.lua"
+                  },
+                  {
+                    "path": "{{name}}/init.lua",
+                    "template": "ent_init.lua"
+                  },
+                  {
+                    "path": "{{name}}/cl_init.lua",
+                    "template": "ent_cl_init.lua"
+                  }
+                ]
+              }
+            },
+            {
+              "classGlobal": "SWEP",
+              "exclude": [
+                "weapons/gmod_tool/**"
+              ],
+              "icon": "folder-library",
+              "id": "weapons",
+              "include": [
+                "weapons/**"
+              ],
+              "label": "SWEPs",
+              "path": [
+                "weapons"
+              ],
+              "rootDir": "lua/weapons",
+              "scaffold": {
+                "files": [
+                  {
+                    "path": "{{name}}/shared.lua",
+                    "template": "swep_shared.lua"
+                  }
+                ]
+              }
+            },
+            {
+              "classGlobal": "EFFECT",
+              "icon": "folder-library",
+              "id": "effects",
+              "include": [
+                "effects/**"
+              ],
+              "label": "Effects",
+              "path": [
+                "effects"
+              ],
+              "rootDir": "lua/effects",
+              "scaffold": {
+                "files": [
+                  {
+                    "path": "{{name}}.lua",
+                    "template": "effect.lua"
+                  }
+                ]
+              }
+            },
+            {
+              "classGlobal": "TOOL",
+              "icon": "tools",
+              "id": "stools",
+              "include": [
+                "weapons/gmod_tool/stools/**"
+              ],
+              "label": "STools",
+              "parentId": "weapons",
+              "path": [
+                "weapons",
+                "gmod_tool",
+                "stools"
+              ],
+              "rootDir": "lua/weapons/gmod_tool/stools",
+              "scaffold": {
+                "files": [
+                  {
+                    "path": "{{name}}.lua",
+                    "template": "tool.lua"
+                  }
+                ]
+              }
+            },
+            {
+              "classGlobal": "PLUGIN",
+              "icon": "extensions",
+              "id": "plugins",
+              "include": [
+                "plugins/**"
+              ],
+              "label": "Plugins",
+              "path": [
+                "plugins"
+              ],
+              "rootDir": "plugins"
+            }
+          ],
+          "items": {
+            "$ref": "#/$defs/EmmyrcGmodScriptedClassScopeEntry"
+          },
+          "x-gluals-editor": "scriptedClassTable"
         }
       }
     },

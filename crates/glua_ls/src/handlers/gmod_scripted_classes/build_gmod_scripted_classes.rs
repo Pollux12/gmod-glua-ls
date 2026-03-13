@@ -7,61 +7,29 @@ use glua_code_analysis::{
 use tokio_util::sync::CancellationToken;
 use wax::Pattern;
 
-use super::gmod_scripted_classes_request::GmodScriptedClassEntry;
-
-#[derive(Debug, Clone, Copy)]
-struct ScopedClassRule {
-    class_type: &'static str,
-    folder_segments: &'static [&'static str],
-}
-
-#[derive(Debug, Clone)]
-struct ScopedClassMatch {
-    class_type: &'static str,
-    class_name: String,
-}
-
-const SCOPED_CLASS_RULES: &[ScopedClassRule] = &[
-    ScopedClassRule {
-        class_type: "TOOL",
-        folder_segments: &["weapons", "gmod_tool", "stools"],
-    },
-    ScopedClassRule {
-        class_type: "ENT",
-        folder_segments: &["entities"],
-    },
-    ScopedClassRule {
-        class_type: "SWEP",
-        folder_segments: &["weapons"],
-    },
-    ScopedClassRule {
-        class_type: "EFFECT",
-        folder_segments: &["effects"],
-    },
-    ScopedClassRule {
-        class_type: "PLUGIN",
-        folder_segments: &["plugins"],
-    },
-];
+use super::gmod_scripted_classes_request::{GmodScriptedClassEntry, GmodScriptedClassesResult};
 
 pub fn build_gmod_scripted_classes(
     db: &DbIndex,
     cancel_token: &CancellationToken,
-) -> Option<Vec<GmodScriptedClassEntry>> {
+) -> Option<GmodScriptedClassesResult> {
     if cancel_token.is_cancelled() {
         return None;
     }
 
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-    let include_glob = if scopes.include.is_empty() {
+    let definitions = scopes.resolved_definitions();
+    let include_patterns = scopes.include_patterns();
+    let exclude_patterns = scopes.exclude_patterns();
+    let include_glob = if include_patterns.is_empty() {
         None
     } else {
-        let include_patterns = scopes
-            .include
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        match wax::any(include_patterns) {
+        match wax::any(
+            include_patterns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ) {
             Ok(glob) => Some(glob),
             Err(err) => {
                 log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
@@ -70,19 +38,22 @@ pub fn build_gmod_scripted_classes(
         }
     };
 
-    let exclude_glob = if scopes.exclude.is_empty() {
+    let exclude_glob = if exclude_patterns.is_empty() {
         None
     } else {
-        let exclude_patterns = scopes
-            .exclude
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        match wax::any(exclude_patterns) {
+        match wax::any(
+            exclude_patterns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ) {
             Ok(glob) => Some(glob),
             Err(err) => {
                 log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");
-                return Some(Vec::new());
+                return Some(GmodScriptedClassesResult {
+                    definitions,
+                    entries: Vec::new(),
+                });
             }
         }
     };
@@ -100,7 +71,7 @@ pub fn build_gmod_scripted_classes(
         let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
             continue;
         };
-        let Some(scope_match) = detect_scoped_class_from_path(file_path) else {
+        let Some(scope_match) = scopes.detect_class_for_path(file_path) else {
             continue;
         };
         let Some(uri) = file_uri_string(db, file_id) else {
@@ -109,8 +80,9 @@ pub fn build_gmod_scripted_classes(
 
         entries.push(GmodScriptedClassEntry {
             uri,
-            class_type: scope_match.class_type.to_string(),
+            class_type: scope_match.definition.class_global.clone(),
             class_name: scope_match.class_name,
+            definition_id: Some(scope_match.definition.id),
             range: None,
         });
     }
@@ -151,7 +123,10 @@ pub fn build_gmod_scripted_classes(
             && left.class_name == right.class_name
     });
 
-    Some(entries)
+    Some(GmodScriptedClassesResult {
+        definitions,
+        entries,
+    })
 }
 
 fn file_uri_string(db: &DbIndex, file_id: FileId) -> Option<String> {
@@ -181,6 +156,7 @@ fn push_vgui_panel_entries(
             uri: uri.to_string(),
             class_type: "VGUI".to_string(),
             class_name: panel_name.to_string(),
+            definition_id: None,
             range,
         });
     }
@@ -239,78 +215,6 @@ fn is_file_in_scope(
     true
 }
 
-fn detect_scoped_class_from_path(file_path: &Path) -> Option<ScopedClassMatch> {
-    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
-    let lower_segments = normalized_path
-        .to_ascii_lowercase()
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if lower_segments.is_empty() {
-        return None;
-    }
-
-    let mut best_match: Option<(&ScopedClassRule, usize, usize)> = None;
-    for rule in SCOPED_CLASS_RULES {
-        let rule_len = rule.folder_segments.len();
-        if rule_len == 0 || lower_segments.len() < rule_len {
-            continue;
-        }
-
-        for start_idx in (0..=lower_segments.len() - rule_len).rev() {
-            let mut matched = true;
-            for (offset, rule_segment) in rule.folder_segments.iter().enumerate() {
-                if lower_segments[start_idx + offset] != *rule_segment {
-                    matched = false;
-                    break;
-                }
-            }
-
-            if !matched {
-                continue;
-            }
-
-            let end_idx = start_idx + rule_len - 1;
-            let replace_best = match best_match {
-                None => true,
-                Some((_, best_end_idx, best_rule_len)) => {
-                    end_idx > best_end_idx || (end_idx == best_end_idx && rule_len > best_rule_len)
-                }
-            };
-            if replace_best {
-                best_match = Some((rule, end_idx, rule_len));
-            }
-
-            break;
-        }
-    }
-
-    let (rule, best_end_idx, _) = best_match?;
-    let class_idx = best_end_idx + 1;
-    if class_idx >= lower_segments.len() {
-        return None;
-    }
-
-    let class_name = if class_idx == lower_segments.len() - 1 {
-        lower_segments[class_idx]
-            .strip_suffix(".lua")
-            .unwrap_or(lower_segments[class_idx].as_str())
-            .to_string()
-    } else {
-        lower_segments[class_idx].clone()
-    };
-
-    if class_name.is_empty() {
-        return None;
-    }
-
-    Some(ScopedClassMatch {
-        class_type: rule.class_type,
-        class_name,
-    })
-}
-
 fn push_path_candidates(candidate_paths: &mut Vec<String>, path: &str) {
     push_candidate_path(candidate_paths, path);
 
@@ -354,8 +258,9 @@ mod tests {
         ws.def_file("lua/plugins/my_plugin/sh_init.lua", "local PLUGIN = {}");
         ws.def_file("lua/autorun/ignored.lua", "local x = 1");
 
-        let entries =
-            build_gmod_scripted_classes(ws.get_db_mut(), &CancellationToken::new()).or_fail()?;
+        let entries = build_gmod_scripted_classes(ws.get_db_mut(), &CancellationToken::new())
+            .or_fail()?
+            .entries;
 
         verify_that!(
             entries
@@ -402,8 +307,9 @@ mod tests {
         "#,
         );
 
-        let entries =
-            build_gmod_scripted_classes(ws.get_db_mut(), &CancellationToken::new()).or_fail()?;
+        let entries = build_gmod_scripted_classes(ws.get_db_mut(), &CancellationToken::new())
+            .or_fail()?
+            .entries;
 
         verify_that!(
             entries

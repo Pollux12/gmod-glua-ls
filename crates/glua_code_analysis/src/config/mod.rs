@@ -13,10 +13,12 @@ pub use configs::{
     EmmyrcExternalTool, EmmyrcFilenameConvention, EmmyrcFormatConfigPrecedence, EmmyrcFormatPreset,
     EmmyrcFormatStyleOverrides, EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodNetwork,
     EmmyrcGmodNetworkCompletion, EmmyrcGmodNetworkDiagnostics, EmmyrcGmodOutline,
-    EmmyrcGmodOutlineVerbosity, EmmyrcGmodRealm, EmmyrcGmodScriptedClassScopes, EmmyrcHover,
-    EmmyrcInlayHint, EmmyrcInlineValues, EmmyrcLuaVersion, EmmyrcReference, EmmyrcReformat,
-    EmmyrcResource, EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcStrict, EmmyrcWorkspace,
-    EmmyrcWorkspaceModuleMap,
+    EmmyrcGmodOutlineVerbosity, EmmyrcGmodRealm, EmmyrcGmodScriptedClassDefinition,
+    EmmyrcGmodScriptedClassScaffold, EmmyrcGmodScriptedClassScaffoldFile,
+    EmmyrcGmodScriptedClassScopeEntry, EmmyrcGmodScriptedClassScopes, EmmyrcHover, EmmyrcInlayHint,
+    EmmyrcInlineValues, EmmyrcLuaVersion, EmmyrcReference, EmmyrcReformat, EmmyrcResource,
+    EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcStrict, EmmyrcWorkspace, EmmyrcWorkspaceModuleMap,
+    ResolvedGmodScriptedClassDefinition, ResolvedGmodScriptedClassMatch,
 };
 use glua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig, SpecialFunction};
 use rowan::NodeCache;

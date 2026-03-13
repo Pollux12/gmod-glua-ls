@@ -334,8 +334,7 @@ These keys accept string expressions such as `"keep"`, `"fixed(n)"`, `"min(n)"`,
 | `inferDynamicFields` | `boolean` | `true` | Track dynamic fields on GMod objects |
 | `dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files (`false` keeps completion results file-scoped) |
 | `fileParamDefaults` | `object` | built-in map | Parameter-name to type-name fallback hints for otherwise unresolved params. Fully configurable per workspace, and editable in the GLua settings UI. |
-| `scriptedClassScopes.include` | `string[]` | `["entities/**", "weapons/**", "effects/**", "weapons/gmod_tool/stools/**"]` | Glob patterns for scripted class extraction |
-| `scriptedClassScopes.exclude` | `string[]` | `[]` | Patterns to exclude from scripted class extraction |
+| `scriptedClassScopes.include` | `(string \| object)[]` | built-in scripted class definitions | Scripted class definitions for analysis, Class Explorer grouping, and scaffolding. String glob entries are still accepted for backward compatibility. |
 | `hookMappings.methodToHook` | `object` | `{}` | Map methods to hook names |
 | `hookMappings.emitterToHook` | `object` | `{}` | Map custom emitters to hook names |
 | `hookMappings.methodPrefixes` | `string[]` | `[]` | Additional prefixes for hook auto-detection |
@@ -346,6 +345,81 @@ These keys accept string expressions such as `"keep"`, `"fixed(n)"`, `"min(n)"`,
 | `templatePath` | `string \| null` | `null` | Path to a folder containing custom GLua scaffolding templates (`.lua` files). Built-in templates are used as fallback when a custom one is not found. Accepts an absolute path or a path relative to the workspace root. |
 
 `gmod.fileParamDefaults` is applied as an override layer on top of the built-in fallback map. When editing raw JSON directly, set a value to `""` to remove a built-in fallback for your workspace while still inheriting future upstream additions.
+
+`gmod.scriptedClassScopes.include` now materializes the built-in Garry's Mod scripted classes (`entities`, `weapons`, `effects`, `stools`, `plugins`) as default object definitions. In the GLua Settings UI this is edited through the dedicated scripted-class table, which stores only workspace overrides/removals/custom definitions so future upstream defaults still flow through.
+
+Legacy raw JSON is still supported:
+
+- String entries inside `include` are treated as legacy include globs.
+- `scriptedClassScopes.exclude` is still accepted when reading `.gluarc.json`, but it is now a hidden compatibility layer. Its values are merged into every resolved scripted class definition's `exclude` list.
+
+Each scripted class definition can provide:
+
+- `id`: stable unique key for override/removal matching
+- `label`: explorer/settings display name
+- `classGlobal`: scripted class global such as `ENT`, `SWEP`, or a custom global name
+- `path`: folder segments used to detect the class from file paths
+- `include`: include globs for analysis and explorer discovery
+- `exclude`: optional per-definition exclude globs
+- `parentId`: optional parent definition id for nested explorer grouping
+- `icon`: optional VS Code icon id for the Class Explorer
+- `rootDir`: default root directory for scaffolding
+- `scaffold.files`: optional scaffold output list, each entry shaped like `{ "path": "{{name}}/shared.lua", "template": "ent_shared.lua" }`
+
+Definitions without `scaffold.files` remain explorable/analyzable but do not expose the `new` scaffold action.
+
+### Scripted Class Override Example
+
+```json
+{
+  "gmod": {
+    "templatePath": ".gluals/templates",
+    "scriptedClassScopes": {
+      "include": [
+        {
+          "id": "plugins",
+          "scaffold": {
+            "files": [
+              {
+                "path": "{{name}}/sh_plugin.lua",
+                "template": "plugin_sh.lua"
+              }
+            ]
+          }
+        },
+        {
+          "id": "myframework-controllers",
+          "label": "Controllers",
+          "classGlobal": "CONTROLLER",
+          "path": ["myframework", "controllers"],
+          "include": ["myframework/controllers/**"],
+          "rootDir": "lua/myframework/controllers",
+          "scaffold": {
+            "files": [
+              {
+                "path": "{{name}}.lua",
+                "template": "controller.lua"
+              }
+            ]
+          }
+        },
+        {
+          "id": "effects",
+          "disabled": true
+        },
+        "legacy/custom_scope/**"
+      ]
+    }
+  }
+}
+```
+
+In that example:
+
+- `plugins` overrides the built-in definition to add scaffolding
+- `myframework-controllers` adds a fully custom scripted class group
+- `effects` removes the built-in explorer/analysis group for the workspace
+- the trailing string keeps a legacy include glob alongside object definitions
 
 ### gmod.network
 
@@ -676,13 +750,23 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
     },
     "scriptedClassScopes": {
       "include": [
-        "entities/**",
-        "weapons/**",
-        "effects/**",
-        "weapons/gmod_tool/stools/**",
-        "plugins/**"
-      ],
-      "exclude": ["**/tests/**"]
+        {
+          "id": "entities",
+          "exclude": ["entities/tests/**"]
+        },
+        {
+          "id": "weapons",
+          "exclude": ["weapons/dev_only/**"]
+        },
+        {
+          "id": "gamemodes",
+          "label": "Gamemode Modules",
+          "classGlobal": "GM_MODULE",
+          "path": ["gamemodes", "base", "modules"],
+          "include": ["gamemodes/*/modules/**"],
+          "rootDir": "gamemodes/base/modules"
+        }
+      ]
     },
     "hookMappings": {
       "methodToHook": {
