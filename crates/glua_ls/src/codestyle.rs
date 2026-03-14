@@ -390,7 +390,7 @@ mod tests {
             rationale: "Formatter-relevant, but not selected by a CFC-specific preset key in this module.",
         },
         CfcGuidelineCoverage {
-            title: "Code should be split into managable chunks using a single new line",
+            title: "Code should be split into manageable chunks using a single new line",
             kind: CfcGuidelineCoverageKind::NonFormatterPolicy,
             rationale: "This is a readability policy with subjective chunk boundaries, not a safe formatter rewrite.",
         },
