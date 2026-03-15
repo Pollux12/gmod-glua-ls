@@ -1,5 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
+use tokio::sync::{Mutex, Notify, RwLock, RwLockReadGuard};
 use tokio_util::sync::CancellationToken;
 
 use glua_code_analysis::EmmyLuaAnalysis;
@@ -15,13 +15,16 @@ use super::{
 
 #[derive(Clone, Copy)]
 pub enum DocumentVersionState {
-    Open(i32),
+    Open {
+        seen_version: i32,
+        applied_version: Option<i32>,
+    },
     Closed,
 }
 
 fn is_stale_document_version(state: Option<DocumentVersionState>, version: i32) -> bool {
     match state {
-        Some(DocumentVersionState::Open(seen_version)) => seen_version > version,
+        Some(DocumentVersionState::Open { seen_version, .. }) => seen_version > version,
         Some(DocumentVersionState::Closed) => true,
         None => false,
     }
@@ -74,11 +77,22 @@ impl ServerContextSnapshot {
     }
 
     pub async fn note_document_seen_version(&self, uri: &Uri, version: i32) {
-        self.inner
-            .document_versions
-            .lock()
-            .await
-            .insert(uri.clone(), DocumentVersionState::Open(version));
+        let mut versions = self.inner.document_versions.lock().await;
+        let applied_version = match versions.get(uri).copied() {
+            Some(DocumentVersionState::Open {
+                applied_version, ..
+            }) => applied_version,
+            _ => None,
+        };
+        versions.insert(
+            uri.clone(),
+            DocumentVersionState::Open {
+                seen_version: version,
+                applied_version,
+            },
+        );
+        drop(versions);
+        self.inner.document_version_notify.notify_waiters();
     }
 
     pub async fn has_newer_seen_document_version(&self, uri: &Uri, version: i32) -> bool {
@@ -86,6 +100,54 @@ impl ServerContextSnapshot {
             self.inner.document_versions.lock().await.get(uri).copied(),
             version,
         )
+    }
+
+    pub async fn note_document_applied_version(&self, uri: &Uri, version: i32) {
+        let mut versions = self.inner.document_versions.lock().await;
+        let next_state = match versions.get(uri).copied() {
+            Some(DocumentVersionState::Open { seen_version, .. }) => DocumentVersionState::Open {
+                seen_version,
+                applied_version: Some(version),
+            },
+            Some(DocumentVersionState::Closed) => DocumentVersionState::Closed,
+            None => DocumentVersionState::Open {
+                seen_version: version,
+                applied_version: Some(version),
+            },
+        };
+        versions.insert(uri.clone(), next_state);
+        drop(versions);
+        self.inner.document_version_notify.notify_waiters();
+    }
+
+    pub async fn wait_until_latest_document_version_applied(
+        &self,
+        uri: &Uri,
+        cancel_token: &CancellationToken,
+    ) -> bool {
+        loop {
+            let notified = self.inner.document_version_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let is_fresh = match self.inner.document_versions.lock().await.get(uri).copied() {
+                Some(DocumentVersionState::Open {
+                    seen_version,
+                    applied_version,
+                }) => applied_version.is_some_and(|applied| applied >= seen_version),
+                Some(DocumentVersionState::Closed) => return false,
+                None => true,
+            };
+
+            if is_fresh {
+                return true;
+            }
+
+            tokio::select! {
+                _ = notified => {}
+                _ = cancel_token.cancelled() => return false,
+            }
+        }
     }
 
     pub async fn is_document_closed(&self, uri: &Uri) -> bool {
@@ -101,6 +163,7 @@ impl ServerContextSnapshot {
             .lock()
             .await
             .insert(uri.clone(), DocumentVersionState::Closed);
+        self.inner.document_version_notify.notify_waiters();
     }
 
     /// Acquire a read lock on the analysis, racing against a cancellation token.
@@ -140,11 +203,18 @@ pub struct ServerContextInner {
     pub lsp_features: Arc<LspFeatures>,
     pub debounced_analysis: Arc<DebouncedAnalysis>,
     pub document_versions: Arc<Mutex<HashMap<Uri, DocumentVersionState>>>,
+    pub document_version_notify: Arc<Notify>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DocumentVersionState, is_stale_document_version};
+    use crate::context::ServerContext;
+    use googletest::prelude::*;
+    use lsp_types::{ClientCapabilities, Uri};
+    use std::str::FromStr;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn treats_closed_documents_as_stale() {
@@ -157,12 +227,55 @@ mod tests {
     #[test]
     fn treats_newer_versions_as_stale() {
         assert!(is_stale_document_version(
-            Some(DocumentVersionState::Open(3)),
+            Some(DocumentVersionState::Open {
+                seen_version: 3,
+                applied_version: Some(2),
+            }),
             2,
         ));
         assert!(!is_stale_document_version(
-            Some(DocumentVersionState::Open(3)),
+            Some(DocumentVersionState::Open {
+                seen_version: 3,
+                applied_version: Some(3),
+            }),
             3,
         ));
+    }
+
+    #[gtest]
+    fn waits_until_latest_document_version_is_applied() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (conn, _peer) = lsp_server::Connection::memory();
+            let context = ServerContext::new(conn, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let uri = Uri::from_str("file:///format.lua").expect("uri should parse");
+
+            snapshot.note_document_seen_version(&uri, 2).await;
+            snapshot.note_document_applied_version(&uri, 1).await;
+
+            let waiter_snapshot = snapshot.clone();
+            let waiter_uri = uri.clone();
+            let waiter = tokio::spawn(async move {
+                waiter_snapshot
+                    .wait_until_latest_document_version_applied(
+                        &waiter_uri,
+                        &CancellationToken::new(),
+                    )
+                    .await
+            });
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            verify_that!(waiter.is_finished(), eq(false))?;
+
+            snapshot.note_document_applied_version(&uri, 2).await;
+
+            let completed = tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter should complete")
+                .expect("waiter should join successfully");
+            verify_that!(completed, eq(true))?;
+            Ok(())
+        })
     }
 }

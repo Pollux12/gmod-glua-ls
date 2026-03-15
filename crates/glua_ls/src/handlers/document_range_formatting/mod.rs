@@ -20,6 +20,12 @@ pub async fn on_range_formatting_handler(
     cancel_token: CancellationToken,
 ) -> Option<Vec<TextEdit>> {
     let uri = params.text_document.uri;
+    if !context
+        .wait_until_latest_document_version_applied(&uri, &cancel_token)
+        .await
+    {
+        return None;
+    }
     let request_range = params.range;
     let client_id = context
         .read_workspace_manager(&cancel_token)

@@ -23,7 +23,7 @@ pub use snapshot::ServerContextSnapshot;
 pub use status_bar::ProgressTask;
 pub use status_bar::StatusBar;
 use std::{collections::HashMap, future::Future, sync::Arc};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 pub use workspace_manager::*;
 
@@ -189,6 +189,7 @@ impl ServerContext {
             debounced_analysis,
             editor_display_cache,
             document_versions: Arc::new(Mutex::new(HashMap::new())),
+            document_version_notify: Arc::new(Notify::new()),
         });
 
         // Create the didChange coalescer with a snapshot of the inner state

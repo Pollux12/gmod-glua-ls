@@ -252,6 +252,9 @@ pub async fn on_did_open_text_document(
 
     let file_id =
         apply_document_update_without_queuing(&context, &uri, text, version, preparsed, true).await;
+    if file_id.is_some() {
+        context.note_document_applied_version(&uri, version).await;
+    }
 
     if !supports_pull && file_id.is_some() {
         context
@@ -385,6 +388,9 @@ pub async fn on_did_change_text_document(
     let file_id =
         apply_document_update_without_queuing(&context, &uri, text, version, preparsed, false)
             .await;
+    if file_id.is_some() {
+        context.note_document_applied_version(&uri, version).await;
+    }
 
     if should_drop_stale_version(&context, &uri, version).await {
         return Some(());
