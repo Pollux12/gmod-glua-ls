@@ -679,6 +679,21 @@ mod tests {
         symbols.iter().map(|symbol| symbol.name.clone()).collect()
     }
 
+    fn symbol_contains_child<'a>(
+        parent: &'a DocumentSymbol,
+        child_name: &str,
+    ) -> Option<&'a DocumentSymbol> {
+        parent
+            .children
+            .as_ref()?
+            .iter()
+            .find(|child| child.name == child_name)
+    }
+
+    fn range_contains(parent: &DocumentSymbol, child: &DocumentSymbol) -> bool {
+        parent.range.start <= child.range.start && parent.range.end >= child.range.end
+    }
+
     fn any_symbol_matches<F>(symbols: &[DocumentSymbol], predicate: &F) -> bool
     where
         F: Fn(&DocumentSymbol) -> bool,
@@ -736,8 +751,15 @@ mod tests {
             .map(|child| child.name.clone())
             .collect::<Vec<_>>();
 
+        let init_symbol = symbol_contains_child(panel_symbol, "PANEL:Init").or_fail()?;
+        let paint_symbol = symbol_contains_child(panel_symbol, "PANEL:Paint").or_fail()?;
+
         verify_that!(child_names.contains(&"PANEL:Init".to_string()), eq(true))?;
         verify_that!(child_names.contains(&"PANEL:Paint".to_string()), eq(true))?;
+        verify_that!(range_contains(panel_symbol, init_symbol), eq(true))?;
+        verify_that!(range_contains(panel_symbol, paint_symbol), eq(true))?;
+        verify_that!(panel_symbol.selection_range.start.line, eq(1))?;
+        verify_that!(panel_symbol.selection_range.end.line, eq(1))?;
 
         verify_that!(
             top_level_symbols
@@ -757,6 +779,43 @@ mod tests {
                 .any(|symbol| symbol.name == "PANEL"),
             eq(false)
         )
+    }
+
+    #[gtest]
+    fn vgui_panel_assignment_symbols_keep_selection_range_and_expand_container_range() -> Result<()>
+    {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/vgui/global_panel.lua",
+            r#"
+            PANEL = {}
+
+            function PANEL:Init()
+            end
+
+            vgui.Register("GlobalPanel", PANEL, "DPanel")
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let panel_symbol = find_top_level_symbol(top_level_symbols, "GlobalPanel (VGUI)").or_fail()?;
+        let init_symbol = symbol_contains_child(panel_symbol, "PANEL:Init").or_fail()?;
+
+        verify_that!(panel_symbol.kind, eq(SymbolKind::CLASS))?;
+        verify_that!(range_contains(panel_symbol, init_symbol), eq(true))?;
+        verify_that!(panel_symbol.selection_range.start.line, eq(1))?;
+        verify_that!(panel_symbol.selection_range.end.line, eq(1))
     }
 
     #[gtest]
@@ -896,6 +955,38 @@ mod tests {
 
         let hook_symbol = find_top_level_symbol(top_level_symbols, "hook: Think").or_fail()?;
         verify_that!(hook_symbol.kind, eq(SymbolKind::EVENT))
+    }
+
+    #[gtest]
+    fn hook_symbol_range_contains_nested_children() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.outline.verbosity = EmmyrcGmodOutlineVerbosity::Verbose;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/server/hook_symbol_range.lua",
+            r#"
+            hook.Add("Think", "MyHook", function()
+                local nested = function()
+                end
+            end)
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
+        let top_level_symbols = root.children.as_ref().or_fail()?;
+
+        let hook_symbol = find_top_level_symbol(top_level_symbols, "hook: Think").or_fail()?;
+        let nested_symbol = symbol_contains_child(hook_symbol, "nested").or_fail()?;
+
+        verify_that!(range_contains(hook_symbol, nested_symbol), eq(true))
     }
 
     #[gtest]

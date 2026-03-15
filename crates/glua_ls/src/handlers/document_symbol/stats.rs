@@ -55,17 +55,29 @@ pub fn build_local_stat_symbol(
         {
             continue;
         }
-        if let Some(panel_name) = vgui_name {
+        let symbol = if let Some(panel_name) = vgui_name {
             symbol_name = panel_name;
             symbol_kind = SymbolKind::CLASS;
-        }
-        let range = if simple_local {
-            local_stat.get_range()
+            let range = if simple_local {
+                local_stat.get_range()
+            } else {
+                decl.get_range()
+            };
+            LuaSymbol::with_selection_range(
+                symbol_name,
+                desc.1,
+                symbol_kind,
+                range,
+                decl.get_range(),
+            )
         } else {
-            decl.get_range()
+            let range = if simple_local {
+                local_stat.get_range()
+            } else {
+                decl.get_range()
+            };
+            LuaSymbol::new(symbol_name, desc.1, symbol_kind, range)
         };
-
-        let symbol = LuaSymbol::new(symbol_name, desc.1, symbol_kind, range);
         let symbol_id =
             builder.add_node_symbol(local_name.syntax().clone(), symbol, Some(parent_id));
         builder.bind_decl_symbol(decl_id, symbol_id);
@@ -123,12 +135,19 @@ pub fn build_assign_stat_symbol(
         {
             continue;
         }
-        if let Some(panel_name) = vgui_name {
+        let symbol = if let Some(panel_name) = vgui_name {
             symbol_name = panel_name;
             symbol_kind = SymbolKind::CLASS;
-        }
-
-        let symbol = LuaSymbol::new(symbol_name, desc.1, symbol_kind, range);
+            LuaSymbol::with_selection_range(
+                symbol_name,
+                desc.1,
+                symbol_kind,
+                range,
+                decl.get_range(),
+            )
+        } else {
+            LuaSymbol::new(symbol_name, desc.1, symbol_kind, range)
+        };
 
         let symbol_id = builder.add_node_symbol(var.syntax().clone(), symbol, Some(parent_id));
         builder.bind_decl_symbol(decl_id, symbol_id);

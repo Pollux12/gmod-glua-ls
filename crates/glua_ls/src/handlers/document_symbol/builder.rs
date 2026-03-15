@@ -435,8 +435,13 @@ impl<'a> DocumentSymbolBuilder<'a> {
     }
 
     fn link_parent_child(&mut self, parent: LuaSyntaxId, child: LuaSyntaxId) {
+        let child_range = self.document_symbols.get(&child).map(|symbol| symbol.range);
+
         if let Some(parent_symbol) = self.document_symbols.get_mut(&parent) {
             parent_symbol.add_child(child);
+            if let Some(child_range) = child_range {
+                parent_symbol.expand_range_to_include(child_range);
+            }
         }
     }
 
@@ -635,6 +640,10 @@ impl LuaSymbol {
 
     pub fn add_child(&mut self, child: LuaSyntaxId) {
         self.children.push(child);
+    }
+
+    pub fn expand_range_to_include(&mut self, range: TextRange) {
+        self.range = self.range.cover(range);
     }
 
     pub fn set_kind(&mut self, kind: SymbolKind) {
