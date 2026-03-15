@@ -79,6 +79,7 @@ fn check_name_expr(
         rowan::NodeOrToken::Node(name_expr.syntax().clone()),
         SemanticDeclLevel::default(),
     )?;
+    let mut source_is_inferred = false;
     let source_type = match semantic_decl.clone() {
         LuaSemanticDeclId::LuaDecl(decl_id) => {
             let decl = semantic_model
@@ -101,11 +102,7 @@ fn check_name_expr(
                         .get_db()
                         .get_type_index()
                         .get_type_cache(&decl_id.into())?;
-                    // In Lua, local variables can be reassigned to any type.
-                    // Only enforce type checks when the type was explicitly annotated.
-                    if type_cache.is_infer() {
-                        return Some(());
-                    }
+                    source_is_inferred = type_cache.is_infer();
                     Some(type_cache.as_type().clone())
                 }
                 _ => {
@@ -113,11 +110,7 @@ fn check_name_expr(
                         .get_db()
                         .get_type_index()
                         .get_type_cache(&decl_id.into())?;
-                    // Global variables (and ImplicitSelf) may also have inferred types.
-                    // Only enforce type checks when the type was explicitly annotated.
-                    if type_cache.is_infer() {
-                        return Some(());
-                    }
+                    source_is_inferred = type_cache.is_infer();
                     Some(type_cache.as_type().clone())
                 }
             }
@@ -131,6 +124,7 @@ fn check_name_expr(
         source_type.as_ref(),
         &value_type,
         false,
+        source_is_inferred,
     );
     if let Some(expr) = expr {
         check_table_expr(
@@ -163,7 +157,6 @@ fn check_index_expr(
         false,
     )
     .ok();
-
     check_assign_type_mismatch(
         context,
         semantic_model,
@@ -171,6 +164,7 @@ fn check_index_expr(
         source_type.as_ref(),
         &value_type,
         true,
+        false,
     );
     if let Some(expr) = expr {
         check_table_expr(
@@ -332,6 +326,7 @@ fn check_local_stat(
             Some(&var_type),
             &value_type,
             false,
+            false,
         );
         if let Some(expr) = value_exprs.get(idx) {
             check_table_expr(
@@ -459,6 +454,7 @@ fn check_table_expr_content(
             Some(&source_type),
             &expr_type,
             allow_nil,
+            false,
         ) {
             has_diagnostic = has_diagnostic || result;
         }
@@ -517,6 +513,7 @@ fn check_table_last_variadic_type(
                     Some(&source_type),
                     expr_type,
                     false,
+                    false,
                 ) && result
                 {
                     return Some(true);
@@ -535,10 +532,15 @@ fn check_assign_type_mismatch(
     source_type: Option<&LuaType>,
     value_type: &LuaType,
     allow_nil: bool,
+    source_is_inferred: bool,
 ) -> Option<bool> {
     let source_type = source_type.unwrap_or(&LuaType::Any);
     // 如果一致, 则不进行类型检查
     if source_type == value_type {
+        return Some(false);
+    }
+
+    if source_is_inferred && !semantic_model.get_emmyrc().strict.inferred_type_mismatch {
         return Some(false);
     }
 

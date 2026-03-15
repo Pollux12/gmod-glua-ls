@@ -678,6 +678,7 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
 | `docBaseConstMatchBaseType` | `boolean` | `true` | Allow base constants to match base types |
 | `requireExportGlobal` | `boolean` | `false` | Require `---@export global` for library visibility |
 | `allowNullableAsNonNullable` | `boolean` | `true` | Allow nullable types (`T?`) to be passed where non-nullable (`T`) is expected |
+| `inferredTypeMismatch` | `boolean` | `false` | Report mismatch diagnostics for inferred types instead of keeping inferred values lenient |
 
 ---
 
@@ -812,7 +813,8 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
   "strict": {
     "requirePath": false,
     "arrayIndex": false,
-    "metaOverrideFileDefine": true
+    "metaOverrideFileDefine": true,
+    "inferredTypeMismatch": false
   },
   "semanticTokens": {
     "enable": true

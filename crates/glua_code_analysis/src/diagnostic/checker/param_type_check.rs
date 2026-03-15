@@ -7,7 +7,7 @@ use crate::{
     diagnostic::checker::assign_type_mismatch::check_table_expr, humanize_type,
 };
 
-use super::{Checker, DiagnosticContext};
+use super::{Checker, DiagnosticContext, should_suppress_inferred_value_mismatch};
 
 pub struct ParamTypeCheckChecker;
 
@@ -149,12 +149,19 @@ fn check_call_expr(
                     }
                 }
 
+                let arg_expr = match (colon_call, colon_define) {
+                    (true, false) if idx == 0 => None,
+                    (true, false) => arg_exprs.get(idx - 1),
+                    _ => arg_exprs.get(idx),
+                };
+
                 try_add_diagnostic(
                     context,
                     semantic_model,
                     *arg_ranges.get(idx)?,
                     &param_type,
                     arg_type,
+                    arg_expr,
                     result,
                 );
             }
@@ -183,6 +190,7 @@ fn check_variadic_param_match_args(
                 *arg_range,
                 variadic_type,
                 arg_type,
+                None,
                 result,
             );
         }
@@ -195,10 +203,17 @@ fn try_add_diagnostic(
     range: TextRange,
     param_type: &LuaType,
     expr_type: &LuaType,
+    expr: Option<&LuaExpr>,
     result: TypeCheckResult,
 ) {
     if let (LuaType::Integer, LuaType::FloatConst(f)) = (param_type, expr_type)
         && f.fract() == 0.0
+    {
+        return;
+    }
+
+    if let Some(expr) = expr
+        && should_suppress_inferred_value_mismatch(semantic_model, param_type, expr_type, expr)
     {
         return;
     }

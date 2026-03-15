@@ -33,6 +33,9 @@ pub struct EmmyrcStrict {
     /// Allow nullable types (T?) to be passed where non-nullable (T) is expected.
     #[serde(default = "default_true")]
     pub allow_nullable_as_non_nullable: bool,
+    /// Keep inferred types lenient in mismatch diagnostics.
+    #[serde(default = "default_false")]
+    pub inferred_type_mismatch: bool,
 }
 
 impl Default for EmmyrcStrict {
@@ -44,6 +47,7 @@ impl Default for EmmyrcStrict {
             doc_base_const_match_base_type: true,
             require_export_global: false,
             allow_nullable_as_non_nullable: true,
+            inferred_type_mismatch: false,
         }
     }
 }
@@ -62,5 +66,6 @@ mod tests {
         assert!(strict.doc_base_const_match_base_type);
         assert!(!strict.require_export_global);
         assert!(strict.allow_nullable_as_non_nullable);
+        assert!(!strict.inferred_type_mismatch);
     }
 }

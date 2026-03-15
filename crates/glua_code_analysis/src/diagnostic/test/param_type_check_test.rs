@@ -1697,6 +1697,55 @@ mod test {
     }
 
     #[test]
+    fn test_inferred_dynamic_index_arg_is_lenient_by_default() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+                ---@class InputGroups
+                ---@field keyboard table
+
+                ---@param tbl table
+                local function SortedPairs(tbl) end
+
+                ---@type InputGroups
+                local inputGroups = { keyboard = {} }
+
+                local groupId = ...
+                local actions = inputGroups[groupId]
+                SortedPairs(actions)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_inferred_dynamic_index_arg_strict_flag_restores_warning() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.strict.inferred_type_mismatch = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+                ---@class InputGroups
+                ---@field keyboard table
+
+                ---@param tbl table
+                local function SortedPairs(tbl) end
+
+                ---@type InputGroups
+                local inputGroups = { keyboard = {} }
+
+                local groupId = ...
+                local actions = inputGroups[groupId]
+                SortedPairs(actions)
+            "#
+        ));
+    }
+
+    #[test]
     fn test_closure_param_from_function_call() {
         let mut ws = VirtualWorkspace::new();
 
@@ -1976,5 +2025,4 @@ mod test {
             "#,
         ));
     }
-
 }

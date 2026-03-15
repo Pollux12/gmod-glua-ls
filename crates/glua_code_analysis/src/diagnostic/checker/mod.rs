@@ -43,14 +43,17 @@ mod unnecessary_assert;
 mod unnecessary_if;
 mod unused;
 
-use glua_parser::{LuaAstNode, LuaClosureExpr, LuaComment, LuaReturnStat, LuaStat, LuaSyntaxKind};
+use glua_parser::{
+    LuaAstNode, LuaClosureExpr, LuaComment, LuaExpr, LuaReturnStat, LuaStat, LuaSyntaxKind,
+};
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::TextRange;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    FileId, LuaType, RenderLevel, db_index::DbIndex, humanize_type, semantic::SemanticModel,
+    FileId, LuaSemanticDeclId, LuaType, RenderLevel, SemanticDeclLevel, db_index::DbIndex,
+    humanize_type, semantic::SemanticModel,
 };
 
 use super::{
@@ -402,4 +405,105 @@ pub fn humanize_lint_type(db: &DbIndex, typ: &LuaType) -> String {
         LuaType::DocBooleanConst(_) => "boolean".to_string(),
         _ => humanize_type(db, typ, RenderLevel::Simple),
     }
+}
+
+fn decl_has_inferred_type(semantic_model: &SemanticModel, decl: LuaSemanticDeclId) -> bool {
+    let type_owner = match decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.into(),
+        LuaSemanticDeclId::Member(member_id) => member_id.into(),
+        _ => return false,
+    };
+
+    semantic_model
+        .get_db()
+        .get_type_index()
+        .get_type_cache(&type_owner)
+        .is_some_and(|cache| cache.is_infer())
+}
+
+pub fn expr_has_inferred_type(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|inner_expr| expr_has_inferred_type(semantic_model, &inner_expr)),
+        LuaExpr::UnaryExpr(unary_expr) => unary_expr
+            .get_expr()
+            .is_some_and(|inner_expr| expr_has_inferred_type(semantic_model, &inner_expr)),
+        LuaExpr::BinaryExpr(binary_expr) => binary_expr.get_exprs().is_some_and(|(left, right)| {
+            expr_has_inferred_type(semantic_model, &left)
+                || expr_has_inferred_type(semantic_model, &right)
+        }),
+        LuaExpr::NameExpr(name_expr) => semantic_model
+            .find_decl(
+                rowan::NodeOrToken::Node(name_expr.syntax().clone()),
+                SemanticDeclLevel::default(),
+            )
+            .is_some_and(|decl| decl_has_inferred_type(semantic_model, decl)),
+        LuaExpr::IndexExpr(index_expr) => semantic_model
+            .find_decl(
+                rowan::NodeOrToken::Node(index_expr.syntax().clone()),
+                SemanticDeclLevel::default(),
+            )
+            .map(|decl| decl_has_inferred_type(semantic_model, decl))
+            .unwrap_or(true),
+        LuaExpr::CallExpr(_) => false,
+        LuaExpr::TableExpr(_) | LuaExpr::LiteralExpr(_) | LuaExpr::ClosureExpr(_) => false,
+    }
+}
+
+fn strip_inferred_uncertainty(typ: &LuaType) -> LuaType {
+    match typ {
+        LuaType::Union(union) => {
+            let stripped = union
+                .into_vec()
+                .into_iter()
+                .filter_map(|member| match member {
+                    LuaType::Nil | LuaType::Never | LuaType::Unknown | LuaType::SelfInfer => None,
+                    other => Some(strip_inferred_uncertainty(&other)),
+                })
+                .collect::<Vec<_>>();
+            if stripped.is_empty() {
+                LuaType::Any
+            } else {
+                LuaType::from_vec(stripped)
+            }
+        }
+        LuaType::MultiLineUnion(multi_union) => {
+            let stripped = multi_union
+                .get_unions()
+                .iter()
+                .filter_map(|(member, _)| match member {
+                    LuaType::Nil | LuaType::Never | LuaType::Unknown | LuaType::SelfInfer => None,
+                    other => Some(strip_inferred_uncertainty(other)),
+                })
+                .collect::<Vec<_>>();
+            if stripped.is_empty() {
+                LuaType::Any
+            } else {
+                LuaType::from_vec(stripped)
+            }
+        }
+        LuaType::Nil | LuaType::Never | LuaType::Unknown | LuaType::SelfInfer => LuaType::Any,
+        LuaType::TableOf(inner) => LuaType::TableOf(Box::new(strip_inferred_uncertainty(inner))),
+        _ => typ.clone(),
+    }
+}
+
+pub fn should_suppress_inferred_value_mismatch(
+    semantic_model: &SemanticModel,
+    expected_type: &LuaType,
+    actual_type: &LuaType,
+    actual_expr: &LuaExpr,
+) -> bool {
+    if semantic_model.get_emmyrc().strict.inferred_type_mismatch
+        || !expr_has_inferred_type(semantic_model, actual_expr)
+    {
+        return false;
+    }
+
+    let stripped_type = strip_inferred_uncertainty(actual_type);
+    stripped_type != *actual_type
+        && semantic_model
+            .type_check_detail(expected_type, &stripped_type)
+            .is_ok()
 }

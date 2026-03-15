@@ -1597,6 +1597,22 @@ return t
     }
 
     #[test]
+    fn test_inferred_local_reassign_different_type_strict_flag_restores_warning() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.strict.inferred_type_mismatch = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local matchesFilter = true
+                matchesFilter = 42
+            "#
+        ));
+    }
+
+    #[test]
     fn test_annotated_local_reassign_still_errors() {
         let mut ws = VirtualWorkspace::new();
         // Explicitly annotated type SHOULD constrain reassignment
