@@ -215,11 +215,12 @@ impl Vfs {
             Some(content) => {
                 deferred_drop.old_tree = self.tree_map.insert(fid, tree);
                 deferred_drop.old_line_index = self.line_index_map.insert(fid, line_index);
-                deferred_drop.old_file_data = self.file_data[fid.id as usize].replace(FileContent {
-                    content,
-                    is_remote: false,
-                    version,
-                });
+                deferred_drop.old_file_data =
+                    self.file_data[fid.id as usize].replace(FileContent {
+                        content,
+                        is_remote: false,
+                        version,
+                    });
             }
             None => {
                 deferred_drop.old_line_index = self.line_index_map.remove(&fid);

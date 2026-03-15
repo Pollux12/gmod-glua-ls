@@ -72,6 +72,8 @@ fn build_vscode_completion_item(
     hover_builder: HoverBuilder,
     overload_index: Option<usize>,
 ) -> Option<()> {
+    let realm_badge = hover_builder.realm_badge_markdown();
+
     let type_description = overload_index
         .and_then(|index| {
             hover_builder
@@ -92,6 +94,11 @@ fn build_vscode_completion_item(
     let documentation = {
         let mut result = String::new();
         let mut first_line = true;
+
+        if let Some(realm_badge) = realm_badge {
+            result.push_str(&format!("\n{}\n", realm_badge));
+        }
+
         for description in hover_builder.annotation_description {
             match description {
                 MarkedString::String(s) => {
@@ -131,6 +138,7 @@ fn build_other_completion_item(
     overload_index: Option<usize>,
 ) -> Option<()> {
     let mut result = String::new();
+    let realm_badge = hover_builder.realm_badge_markdown();
 
     let type_description = overload_index
         .and_then(|index| {
@@ -151,6 +159,11 @@ fn build_other_completion_item(
     if let Some(MarkedString::String(s)) = hover_builder.location_path {
         result.push_str(&format!("\n{}\n", s));
     }
+
+    if let Some(realm_badge) = realm_badge {
+        result.push_str(&format!("\n{}\n", realm_badge));
+    }
+
     for marked_string in hover_builder.annotation_description {
         match marked_string {
             MarkedString::String(s) => {

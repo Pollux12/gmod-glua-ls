@@ -422,7 +422,10 @@ mod tests {
         client.refresh_semantic_tokens();
 
         let request = recv_request(&peer);
-        verify_that!(request.method.as_str(), eq("workspace/semanticTokens/refresh"))?;
+        verify_that!(
+            request.method.as_str(),
+            eq("workspace/semanticTokens/refresh")
+        )?;
         verify_that!(peer.receiver.try_recv().is_err(), eq(true))?;
 
         runtime.block_on(client.on_response(Response {
@@ -453,7 +456,11 @@ mod tests {
         let first_request = recv_request(&peer);
         let second_request = recv_request(&peer);
         let third_request = recv_request(&peer);
-        let mut methods = [first_request.method, second_request.method, third_request.method];
+        let mut methods = [
+            first_request.method,
+            second_request.method,
+            third_request.method,
+        ];
         methods.sort();
 
         assert_eq!(

@@ -241,7 +241,9 @@ impl ServerContext {
         tokio::spawn(async move {
             let res = exec(cancel_token.clone()).await;
             if cancel_token.is_cancelled() {
-                if keep_stale_editor_data_on_cancel(&request_method) && let Some(response) = res {
+                if keep_stale_editor_data_on_cancel(&request_method)
+                    && let Some(response) = res
+                {
                     let _ = sender.send(Message::Response(response));
                 } else {
                     let response = Response::new_err(

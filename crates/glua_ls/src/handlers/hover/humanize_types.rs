@@ -197,6 +197,7 @@ pub fn infer_prefix_global_name<'a>(
 pub struct DescriptionInfo {
     pub description: Option<String>,
     pub tag_content: Option<Vec<(String, String)>>,
+    pub realm: Option<GmodRealm>,
 }
 
 impl DescriptionInfo {
@@ -204,11 +205,12 @@ impl DescriptionInfo {
         Self {
             description: None,
             tag_content: None,
+            realm: None,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.description.is_none() && self.tag_content.is_none()
+        self.description.is_none() && self.tag_content.is_none() && self.realm.is_none()
     }
 }
 
@@ -224,9 +226,8 @@ pub fn extract_description_from_property_owner(
 
     let mut result = DescriptionInfo::new();
 
-    let mut description = property.description().map(|detail| detail.to_string());
-    inject_or_create_realm_badge(semantic_model, property_owner, &mut description);
-    result.description = description;
+    result.description = property.description().map(|detail| detail.to_string());
+    result.realm = infer_description_realm(semantic_model, property_owner);
 
     if let Some(tag_content) = property.tag_content() {
         for (tag_name, description) in tag_content.get_all_tags() {
@@ -246,42 +247,18 @@ pub fn extract_description_from_property_owner(
     }
 }
 
-fn inject_or_create_realm_badge(
+fn infer_description_realm(
     semantic_model: &SemanticModel,
     property_owner: &LuaSemanticDeclId,
-    description: &mut Option<String>,
-) {
-    let Some(badge_markdown) = infer_realm_badge_markdown(semantic_model, property_owner) else {
-        return;
-    };
-
-    match description {
-        Some(existing_description) => {
-            if has_realm_badge(existing_description) {
-                return;
-            }
-            *existing_description = format!(
-                "{}\n\n{}",
-                badge_markdown,
-                existing_description.trim_start()
-            );
-        }
-        None => {
-            *description = Some(badge_markdown.to_string());
-        }
-    }
-}
-
-fn infer_realm_badge_markdown(
-    semantic_model: &SemanticModel,
-    property_owner: &LuaSemanticDeclId,
-) -> Option<&'static str> {
+) -> Option<GmodRealm> {
     if !semantic_model.get_emmyrc().gmod.enabled {
         return None;
     }
 
-    let realm = infer_property_owner_realm(semantic_model, property_owner)?;
-    realm_badge_markdown(realm)
+    match infer_property_owner_realm(semantic_model, property_owner)? {
+        GmodRealm::Unknown => None,
+        realm => Some(realm),
+    }
 }
 
 pub(crate) fn infer_property_owner_realm(
@@ -365,36 +342,6 @@ fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
         "server" => Some(GmodRealm::Server),
         "shared" => Some(GmodRealm::Shared),
         _ => None,
-    }
-}
-
-fn has_realm_badge(description: &str) -> bool {
-    description.contains("---![(Shared)](")
-        || description.contains("---![(Server)](")
-        || description.contains("---![(Client)](")
-        || description.contains("![(Shared)](")
-        || description.contains("![(Server)](")
-        || description.contains("![(Client)](")
-        || description.contains("[(Shared)](")
-        || description.contains("[(Server)](")
-        || description.contains("[(Client)](")
-        || description.contains("a356f942-57d7-4915-a8cc-559870a980fc")
-        || description.contains("d8fbe13a-6305-4e16-8698-5be874721ca1")
-        || description.contains("a5f6ba64-374d-42f0-b2f4-50e5c964e808")
-}
-
-fn realm_badge_markdown(realm: GmodRealm) -> Option<&'static str> {
-    match realm {
-        GmodRealm::Shared => Some(
-            "![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)",
-        ),
-        GmodRealm::Server => Some(
-            "![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)",
-        ),
-        GmodRealm::Client => Some(
-            "![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)",
-        ),
-        GmodRealm::Unknown => None,
     }
 }
 

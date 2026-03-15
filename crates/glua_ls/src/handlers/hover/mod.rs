@@ -5,6 +5,7 @@ mod hover_builder;
 mod humanize_type_decl;
 mod humanize_types;
 mod keyword_hover;
+mod realm_badge;
 
 use super::RegisterCapabilities;
 use crate::context::ServerContextSnapshot;
