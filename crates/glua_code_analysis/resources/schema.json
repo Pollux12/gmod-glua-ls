@@ -1998,7 +1998,7 @@
           }
         },
         "templatePath": {
-          "description": "Path to a folder containing custom GLua scaffolding templates (`.lua` files).\nBuilt-in templates are used as fallback when a custom one is not found.\nAccepts an absolute path or a path relative to the workspace root.",
+          "description": "Path to a folder containing custom scaffolding templates (`.lua` files).\nThese templates are used when clicking the 'New' button in the Class Explorer\nBuilt-in templates are used as fallback when a custom one is not found.\nAccepts an absolute path or a path relative to the workspace root.",
           "type": [
             "string",
             "null"

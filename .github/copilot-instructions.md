@@ -109,5 +109,5 @@
 - For GMod realm/path-sensitive tests, use realistic addon or gamemode style paths.
 
 **IMPORTANT**
-- When using your file read tool, read entire files unless the file is extremely large - in this case, read in 1000 line chunks. Do not read files in tiny chunks, this will be slower and make you lose important context.
-- Do not use your terminal tool unless no other tool can accomplish the task. Never use terminal tools for reading, writing or searching code - use the relevant tool instead. If you get no results when you are expecting something, it may be due to ignored files being excluded - you can toggle this behaviour off and try again.
+- When using your file read tool, read entire files unless the file is extremely large - read at least 1000 lines at a time to be efficient.
+- Do not use your terminal tool unless no other tool can accomplish the same task. For example, rather than using terminal for search or reading, consider if another tool is available that can do the job more effectively. Specialised tools will always be more effective than generic terminal commands. If you get no results from your search tools, it may be due to the relevant file being git ignored - make sure you're using the correct options within your given tools.
