@@ -1811,4 +1811,170 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_localized_vector_mul_method_call_from_find_meta_table() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class VMatrix
+
+            ---@class Vector
+            local Vector = {}
+
+            ---@overload fun(multiplier: Vector)
+            ---@overload fun(matrix: VMatrix)
+            ---@param multiplier number
+            function Vector:Mul(multiplier) end
+
+            ---@generic T: table
+            ---@param metaName `T`
+            ---@return T
+            function FindMetaTable(metaName) end
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        let file_id = ws.def(
+            r#"
+            local VectorMul = FindMetaTable("Vector").Mul
+            local velUDt = 0
+            local scratchVec2 = {} ---@type Vector
+            VectorMul(scratchVec2, velUDt)
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == code)
+            .map(|diag| diag.message.clone())
+            .collect();
+
+        assert!(messages.is_empty(), "{}", messages.join(" || "));
+    }
+
+    #[test]
+    fn test_localized_vector_mul_method_call_direct_table_member() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class VMatrix
+
+            ---@class Vector
+            local Vector = {}
+
+            ---@overload fun(multiplier: Vector)
+            ---@overload fun(matrix: VMatrix)
+            ---@param multiplier number
+            function Vector:Mul(multiplier) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local VectorMul = Vector.Mul
+            local velUDt = 0
+            local scratchVec2 = {} ---@type Vector
+            VectorMul(scratchVec2, velUDt)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_localized_vector_mul_method_call_from_find_meta_table_direct_return() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class VMatrix
+
+            ---@class Vector
+            local Vector = {}
+
+            ---@overload fun(multiplier: Vector)
+            ---@overload fun(matrix: VMatrix)
+            ---@param multiplier number
+            function Vector:Mul(multiplier) end
+
+            ---@param metaName string
+            ---@return (definition) Vector|nil
+            function FindMetaTable(metaName) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local VectorMul = FindMetaTable("Vector").Mul
+            local velUDt = 0
+            local scratchVec2 = {} ---@type Vector
+            VectorMul(scratchVec2, velUDt)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_localized_vector_mul_method_call_from_definition_receiver() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class VMatrix
+
+            ---@class Vector
+            local Vector = {}
+
+            ---@overload fun(multiplier: Vector)
+            ---@overload fun(matrix: VMatrix)
+            ---@param multiplier number
+            function Vector:Mul(multiplier) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@type (definition) Vector
+            local VecMeta
+
+            local VectorMul = VecMeta.Mul
+            local velUDt = 0
+            local scratchVec2 = {} ---@type Vector
+            VectorMul(scratchVec2, velUDt)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_localized_vector_mul_method_call_from_definition_receiver_no_overload() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Vector
+            local Vector = {}
+
+            ---@param multiplier number
+            function Vector:Mul(multiplier) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@type (definition) Vector
+            local VecMeta
+
+            local VectorMul = VecMeta.Mul
+            local velUDt = 0
+            local scratchVec2 = {} ---@type Vector
+            VectorMul(scratchVec2, velUDt)
+            "#,
+        ));
+    }
+
 }

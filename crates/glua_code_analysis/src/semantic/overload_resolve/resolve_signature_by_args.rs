@@ -38,13 +38,19 @@ pub fn resolve_signature_by_args(
         .expect("Match result should exist");
     for (arg_index, expr_type) in expr_types.iter().enumerate() {
         let mut current_match_result = ParamMatchResult::Not;
+        let mut skipped_implicit_self = false;
         for opt_func in &mut need_resolve_funcs {
             let func = match opt_func.as_ref() {
                 None => continue,
                 Some(func) => func,
             };
             let param_len = func.get_params().len();
-            if param_len < arg_count && !is_func_last_param_variadic(func) {
+            let effective_arg_count = effective_arg_count(
+                arg_count,
+                func.is_colon_define(),
+                is_colon_call,
+            );
+            if param_len < effective_arg_count && !is_func_last_param_variadic(func) {
                 *opt_func = None;
                 continue;
             }
@@ -54,6 +60,7 @@ pub fn resolve_signature_by_args(
             match (colon_define, is_colon_call) {
                 (true, false) => {
                     if param_index == 0 {
+                        skipped_implicit_self = true;
                         continue;
                     }
                     param_index -= 1;
@@ -108,7 +115,7 @@ pub fn resolve_signature_by_args(
             }
         }
 
-        if current_match_result == ParamMatchResult::Not {
+        if current_match_result == ParamMatchResult::Not && !skipped_implicit_self {
             break;
         }
     }
@@ -215,6 +222,14 @@ fn is_func_last_param_variadic(func: &LuaFunctionType) -> bool {
         last_param.0 == "..."
     } else {
         false
+    }
+}
+
+fn effective_arg_count(arg_count: usize, colon_define: bool, is_colon_call: bool) -> usize {
+    match (colon_define, is_colon_call) {
+        (true, false) => arg_count.saturating_sub(1),
+        (false, true) => arg_count.saturating_add(1),
+        _ => arg_count,
     }
 }
 
