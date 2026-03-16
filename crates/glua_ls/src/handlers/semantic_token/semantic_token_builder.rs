@@ -11,6 +11,15 @@ pub struct CustomSemanticTokenType;
 impl CustomSemanticTokenType {
     // neovim supports custom semantic token types, we add a custom type for delimiter
     pub const DELIMITER: SemanticTokenType = SemanticTokenType::new("delimiter");
+    pub const FIELD: SemanticTokenType = SemanticTokenType::new("field");
+}
+
+pub struct CustomSemanticTokenModifier;
+impl CustomSemanticTokenModifier {
+    pub const GLOBAL: SemanticTokenModifier = SemanticTokenModifier::new("global");
+    pub const LOCAL: SemanticTokenModifier = SemanticTokenModifier::new("local");
+    pub const CALLABLE: SemanticTokenModifier = SemanticTokenModifier::new("callable");
+    pub const OBJECT: SemanticTokenModifier = SemanticTokenModifier::new("object");
 }
 
 pub const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
@@ -39,6 +48,7 @@ pub const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::DECORATOR,
     // Custom types
     CustomSemanticTokenType::DELIMITER,
+    CustomSemanticTokenType::FIELD,
 ];
 
 pub const SEMANTIC_TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
@@ -52,6 +62,10 @@ pub const SEMANTIC_TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
     SemanticTokenModifier::MODIFICATION,
     SemanticTokenModifier::DOCUMENTATION,
     SemanticTokenModifier::DEFAULT_LIBRARY,
+    CustomSemanticTokenModifier::GLOBAL,
+    CustomSemanticTokenModifier::LOCAL,
+    CustomSemanticTokenModifier::CALLABLE,
+    CustomSemanticTokenModifier::OBJECT,
 ];
 
 #[derive(Debug)]

@@ -13,7 +13,8 @@ use lsp_types::{
 };
 #[allow(unused)]
 pub use semantic_token_builder::{
-    CustomSemanticTokenType, SEMANTIC_TOKEN_MODIFIERS, SEMANTIC_TOKEN_TYPES,
+    CustomSemanticTokenModifier, CustomSemanticTokenType, SEMANTIC_TOKEN_MODIFIERS,
+    SEMANTIC_TOKEN_TYPES,
 };
 use tokio_util::sync::CancellationToken;
 
