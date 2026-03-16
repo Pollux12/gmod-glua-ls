@@ -181,6 +181,7 @@ pub struct GmodInferIndex {
     system_file_metadata: HashMap<FileId, GmodSystemFileMetadata>,
     system_aggregate_cache: OnceLock<GmodSystemAggregate>,
     realm_file_metadata: HashMap<FileId, GmodRealmFileMetadata>,
+    gm_method_realm_annotations: HashMap<FileId, Vec<(String, GmodRealm)>>,
 }
 
 impl GmodInferIndex {
@@ -190,6 +191,7 @@ impl GmodInferIndex {
             system_file_metadata: HashMap::new(),
             system_aggregate_cache: OnceLock::new(),
             realm_file_metadata: HashMap::new(),
+            gm_method_realm_annotations: HashMap::new(),
         }
     }
 
@@ -343,6 +345,26 @@ impl GmodInferIndex {
     ) {
         self.realm_file_metadata = metadata;
     }
+
+    pub fn set_gm_method_realm_annotations(
+        &mut self,
+        file_id: FileId,
+        method_realms: Vec<(String, GmodRealm)>,
+    ) {
+        if method_realms.is_empty() {
+            self.gm_method_realm_annotations.remove(&file_id);
+            return;
+        }
+
+        self.gm_method_realm_annotations
+            .insert(file_id, method_realms);
+    }
+
+    pub fn iter_gm_method_realm_annotations(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &Vec<(String, GmodRealm)>)> {
+        self.gm_method_realm_annotations.iter()
+    }
 }
 
 impl LuaIndex for GmodInferIndex {
@@ -351,6 +373,7 @@ impl LuaIndex for GmodInferIndex {
         self.system_file_metadata.remove(&file_id);
         self.invalidate_system_aggregate_cache();
         self.realm_file_metadata.remove(&file_id);
+        self.gm_method_realm_annotations.remove(&file_id);
     }
 
     fn clear(&mut self) {
@@ -358,6 +381,7 @@ impl LuaIndex for GmodInferIndex {
         self.system_file_metadata.clear();
         self.invalidate_system_aggregate_cache();
         self.realm_file_metadata.clear();
+        self.gm_method_realm_annotations.clear();
     }
 }
 

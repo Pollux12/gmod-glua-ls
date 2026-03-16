@@ -46,8 +46,16 @@ impl AnalysisPipeline for GmodAnalysisPipeline {
         let mut annotation_realms: HashMap<FileId, GmodRealm> = HashMap::new();
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
-            collect_hook_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone());
-            collect_network_flow_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone());
+            let (gm_method_realms, receive_flows) =
+                collect_hook_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone());
+            collect_network_flow_metadata(
+                db,
+                in_filed_tree.file_id,
+                in_filed_tree.value.clone(),
+                receive_flows,
+            );
+            db.get_gmod_infer_index_mut()
+                .set_gm_method_realm_annotations(in_filed_tree.file_id, gm_method_realms);
             if is_in_scope {
                 if let Some(scope_match) = detect_scoped_class_from_path(db, in_filed_tree.file_id)
                 {
@@ -91,32 +99,81 @@ impl AnalysisPipeline for GmodAnalysisPipeline {
     }
 }
 
-fn collect_hook_metadata(db: &mut DbIndex, file_id: FileId, root: LuaChunk) {
+fn collect_hook_metadata(
+    db: &mut DbIndex,
+    file_id: FileId,
+    root: LuaChunk,
+) -> (Vec<(String, GmodRealm)>, Vec<NetReceiveFlow>) {
+    let mut gm_method_realms = Vec::new();
+    let mut receive_flows = Vec::new();
+
     for call_expr in root.descendants::<LuaCallExpr>() {
         if let Some(site) = collect_hook_call_site(db, call_expr.clone()) {
             db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
+        }
+
+        if let Some(receive_flow) = collect_net_receive_flow(&call_expr) {
+            receive_flows.push(receive_flow);
         }
 
         collect_system_call_metadata(db, file_id, call_expr);
     }
 
     for func_stat in root.descendants::<LuaFuncStat>() {
-        if let Some(site) = collect_hook_method_site(db, func_stat) {
+        if let Some(site) = collect_hook_method_site(db, func_stat.clone()) {
             db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
         }
+
+        if let Some((method_name, realm)) = collect_gm_method_realm_annotation(&func_stat)
+            && !gm_method_realms
+                .iter()
+                .any(|(existing_name, existing_realm)| {
+                    existing_name == &method_name && *existing_realm == realm
+                })
+        {
+            gm_method_realms.push((method_name, realm));
+        }
     }
+
+    receive_flows.sort_by_key(|flow| flow.receive_range.start());
+    (gm_method_realms, receive_flows)
 }
 
-fn collect_network_flow_metadata(db: &mut DbIndex, file_id: FileId, root: LuaChunk) {
+fn collect_network_flow_metadata(
+    db: &mut DbIndex,
+    file_id: FileId,
+    root: LuaChunk,
+    receive_flows: Vec<NetReceiveFlow>,
+) {
     let mut send_flows = collect_net_send_flows(&root);
     send_flows.extend(collect_wrapped_net_send_flows(&root));
     send_flows.sort_by_key(|flow| flow.start_range.start());
 
     let data = crate::db_index::FileNetworkData {
         send_flows,
-        receive_flows: collect_net_receive_flows(&root),
+        receive_flows,
     };
     db.get_gmod_network_index_mut().add_file_data(file_id, data);
+}
+
+fn collect_gm_method_realm_annotation(func_stat: &LuaFuncStat) -> Option<(String, GmodRealm)> {
+    let LuaVarExpr::IndexExpr(function_name_expr) = func_stat.get_func_name()? else {
+        return None;
+    };
+    let LuaExpr::NameExpr(function_prefix_name) = function_name_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let function_prefix_text = function_prefix_name.get_name_text()?;
+    if !matches!(function_prefix_text.as_str(), "GM" | "GAMEMODE") {
+        return None;
+    }
+    let LuaIndexKey::Name(function_method_name) = function_name_expr.get_index_key()? else {
+        return None;
+    };
+    let comment = func_stat.get_left_comment()?;
+    let realm = realm_from_doc_comment(&comment)?;
+    let method_name = function_method_name.get_name_text().to_string();
+    Some((method_name, realm))
 }
 
 fn collect_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
@@ -338,42 +395,30 @@ fn is_block_in_nested_closure(function_block: &LuaBlock, candidate_block: &LuaBl
         .any(|node| LuaClosureExpr::can_cast(node.kind().into()))
 }
 
-fn collect_net_receive_flows(root: &LuaChunk) -> Vec<NetReceiveFlow> {
-    let mut flows = Vec::new();
-
-    for call_expr in root.descendants::<LuaCallExpr>() {
-        let Some(method_name) = get_exact_net_method_name(&call_expr) else {
-            continue;
-        };
-
-        if method_name != "Receive" {
-            continue;
-        }
-
-        let Some(message_name) = extract_static_string_arg_value(&call_expr, 0) else {
-            continue;
-        };
-
-        let mut reads = Vec::new();
-        if let Some(callback_expr) = call_expr
-            .get_args_list()
-            .and_then(|args| args.get_args().nth(1))
-            && let LuaExpr::ClosureExpr(closure_expr) = callback_expr
-            && let Some(callback_block) = closure_expr.get_block()
-        {
-            collect_net_read_ops_from_block(callback_block, &mut reads);
-        }
-
-        reads.sort_by_key(|entry| entry.range.start());
-        flows.push(NetReceiveFlow {
-            message_name,
-            receive_range: call_expr.get_range(),
-            reads,
-        });
+fn collect_net_receive_flow(call_expr: &LuaCallExpr) -> Option<NetReceiveFlow> {
+    let method_name = get_exact_net_method_name(call_expr)?;
+    if method_name != "Receive" {
+        return None;
     }
 
-    flows.sort_by_key(|flow| flow.receive_range.start());
-    flows
+    let message_name = extract_static_string_arg_value(call_expr, 0)?;
+
+    let mut reads = Vec::new();
+    if let Some(callback_expr) = call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().nth(1))
+        && let LuaExpr::ClosureExpr(closure_expr) = callback_expr
+        && let Some(callback_block) = closure_expr.get_block()
+    {
+        collect_net_read_ops_from_block(callback_block, &mut reads);
+    }
+
+    reads.sort_by_key(|entry| entry.range.start());
+    Some(NetReceiveFlow {
+        message_name,
+        receive_range: call_expr.get_range(),
+        reads,
+    })
 }
 
 fn collect_net_read_ops_from_block(block: LuaBlock, reads: &mut Vec<NetOpEntry>) {
@@ -2360,6 +2405,18 @@ fn collect_realm_annotation(root: &LuaChunk) -> Option<GmodRealm> {
             {
                 return Some(realm);
             }
+        }
+    }
+
+    None
+}
+
+fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {
+    for tag in comment.get_doc_tags() {
+        if let LuaDocTag::Realm(realm_tag) = tag
+            && let Some(realm) = realm_from_doc_tag(&realm_tag)
+        {
+            return Some(realm);
         }
     }
 

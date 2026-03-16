@@ -218,16 +218,22 @@ pub struct FileNetworkData {
 #[derive(Debug, Default)]
 pub struct GmodNetworkIndex {
     file_data: HashMap<FileId, FileNetworkData>,
+    send_flows_by_message: HashMap<String, Vec<(FileId, usize)>>,
+    receive_flows_by_message: HashMap<String, Vec<(FileId, usize)>>,
 }
 
 impl GmodNetworkIndex {
     pub fn new() -> Self {
         Self {
             file_data: HashMap::new(),
+            send_flows_by_message: HashMap::new(),
+            receive_flows_by_message: HashMap::new(),
         }
     }
 
     pub fn add_file_data(&mut self, file_id: FileId, data: FileNetworkData) {
+        self.remove_file(file_id);
+        self.index_file_data(file_id, &data);
         self.file_data.insert(file_id, data);
     }
 
@@ -254,23 +260,88 @@ impl GmodNetworkIndex {
     }
 
     pub fn get_send_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetSendFlow)> {
-        self.iter_send_flows()
-            .filter(|(_, flow)| flow.message_name == name)
+        self.send_flows_by_message
+            .get(name)
+            .into_iter()
+            .flat_map(|indexed_flows| indexed_flows.iter())
+            .filter_map(|(file_id, flow_idx)| {
+                self.file_data
+                    .get(file_id)
+                    .and_then(|file_data| file_data.send_flows.get(*flow_idx))
+                    .map(|flow| (*file_id, flow))
+            })
             .collect()
     }
 
     pub fn get_receive_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetReceiveFlow)> {
-        self.iter_receive_flows()
-            .filter(|(_, flow)| flow.message_name == name)
+        self.receive_flows_by_message
+            .get(name)
+            .into_iter()
+            .flat_map(|indexed_flows| indexed_flows.iter())
+            .filter_map(|(file_id, flow_idx)| {
+                self.file_data
+                    .get(file_id)
+                    .and_then(|file_data| file_data.receive_flows.get(*flow_idx))
+                    .map(|flow| (*file_id, flow))
+            })
             .collect()
     }
 
     pub fn remove_file(&mut self, file_id: FileId) {
-        self.file_data.remove(&file_id);
+        if let Some(data) = self.file_data.remove(&file_id) {
+            self.remove_file_data_indexes(file_id, &data);
+        }
     }
 
     pub fn clear(&mut self) {
         self.file_data.clear();
+        self.send_flows_by_message.clear();
+        self.receive_flows_by_message.clear();
+    }
+
+    fn index_file_data(&mut self, file_id: FileId, data: &FileNetworkData) {
+        for (flow_idx, send_flow) in data.send_flows.iter().enumerate() {
+            self.send_flows_by_message
+                .entry(send_flow.message_name.clone())
+                .or_default()
+                .push((file_id, flow_idx));
+        }
+
+        for (flow_idx, receive_flow) in data.receive_flows.iter().enumerate() {
+            self.receive_flows_by_message
+                .entry(receive_flow.message_name.clone())
+                .or_default()
+                .push((file_id, flow_idx));
+        }
+    }
+
+    fn remove_file_data_indexes(&mut self, file_id: FileId, data: &FileNetworkData) {
+        for send_flow in &data.send_flows {
+            let mut remove_message_entry = false;
+            if let Some(indexed_flows) = self.send_flows_by_message.get_mut(&send_flow.message_name)
+            {
+                indexed_flows.retain(|(candidate_file_id, _)| *candidate_file_id != file_id);
+                remove_message_entry = indexed_flows.is_empty();
+            }
+            if remove_message_entry {
+                self.send_flows_by_message.remove(&send_flow.message_name);
+            }
+        }
+
+        for receive_flow in &data.receive_flows {
+            let mut remove_message_entry = false;
+            if let Some(indexed_flows) = self
+                .receive_flows_by_message
+                .get_mut(&receive_flow.message_name)
+            {
+                indexed_flows.retain(|(candidate_file_id, _)| *candidate_file_id != file_id);
+                remove_message_entry = indexed_flows.is_empty();
+            }
+            if remove_message_entry {
+                self.receive_flows_by_message
+                    .remove(&receive_flow.message_name);
+            }
+        }
     }
 }
 
@@ -281,5 +352,111 @@ impl LuaIndex for GmodNetworkIndex {
 
     fn clear(&mut self) {
         GmodNetworkIndex::clear(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rowan::{TextRange, TextSize};
+
+    use super::*;
+
+    fn range(start: u32) -> TextRange {
+        TextRange::new(TextSize::new(start), TextSize::new(start + 1))
+    }
+
+    fn send_flow(message_name: &str, start: u32) -> NetSendFlow {
+        NetSendFlow {
+            message_name: message_name.to_string(),
+            start_range: range(start),
+            writes: Vec::new(),
+            send_range: range(start + 10),
+            send_kind: NetSendKind::Broadcast,
+            is_wrapped: false,
+        }
+    }
+
+    fn receive_flow(message_name: &str, start: u32) -> NetReceiveFlow {
+        NetReceiveFlow {
+            message_name: message_name.to_string(),
+            receive_range: range(start),
+            reads: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn add_file_data_replaces_previous_message_indexes_for_same_file() {
+        let file_id = FileId::new(1);
+        let mut index = GmodNetworkIndex::new();
+        index.add_file_data(
+            file_id,
+            FileNetworkData {
+                send_flows: vec![send_flow("OldMessage", 1)],
+                receive_flows: Vec::new(),
+            },
+        );
+
+        assert_eq!(index.get_send_flows_for_message("OldMessage").len(), 1);
+
+        index.add_file_data(
+            file_id,
+            FileNetworkData {
+                send_flows: vec![send_flow("NewMessage", 20)],
+                receive_flows: Vec::new(),
+            },
+        );
+
+        assert!(index.get_send_flows_for_message("OldMessage").is_empty());
+        assert_eq!(index.get_send_flows_for_message("NewMessage").len(), 1);
+    }
+
+    #[test]
+    fn remove_file_cleans_send_and_receive_indexes() {
+        let file_id = FileId::new(2);
+        let mut index = GmodNetworkIndex::new();
+        index.add_file_data(
+            file_id,
+            FileNetworkData {
+                send_flows: vec![send_flow("CleanupSend", 1)],
+                receive_flows: vec![receive_flow("CleanupReceive", 2)],
+            },
+        );
+
+        assert_eq!(index.get_send_flows_for_message("CleanupSend").len(), 1);
+        assert_eq!(
+            index.get_receive_flows_for_message("CleanupReceive").len(),
+            1
+        );
+
+        index.remove_file(file_id);
+
+        assert!(index.get_send_flows_for_message("CleanupSend").is_empty());
+        assert!(
+            index
+                .get_receive_flows_for_message("CleanupReceive")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn message_lookup_returns_flows_from_multiple_files() {
+        let mut index = GmodNetworkIndex::new();
+        index.add_file_data(
+            FileId::new(1),
+            FileNetworkData {
+                send_flows: vec![send_flow("SharedMessage", 1)],
+                receive_flows: Vec::new(),
+            },
+        );
+        index.add_file_data(
+            FileId::new(2),
+            FileNetworkData {
+                send_flows: vec![send_flow("SharedMessage", 3)],
+                receive_flows: Vec::new(),
+            },
+        );
+
+        let flows = index.get_send_flows_for_message("SharedMessage");
+        assert_eq!(flows.len(), 2);
     }
 }

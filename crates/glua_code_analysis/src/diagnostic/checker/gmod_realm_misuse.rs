@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
-    LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaVarExpr, PathTrait,
+    LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, PathTrait,
 };
 use rowan::{NodeOrToken, TextRange, TextSize};
 
@@ -438,10 +438,11 @@ fn collect_annotated_gm_method_realms(
     let db = semantic_model.get_db();
     let module_index = db.get_module_index();
     let current_workspace_id = module_index.get_workspace_id(semantic_model.get_file_id());
-    for file_id in db.get_vfs().get_all_local_file_ids() {
+    for (file_id, method_realms) in db.get_gmod_infer_index().iter_gm_method_realm_annotations() {
         if context.is_cancelled() {
             return gm_method_realms;
         }
+        let file_id = *file_id;
         if let Some(current_workspace_id) = current_workspace_id {
             let candidate_workspace_id = module_index
                 .get_workspace_id(file_id)
@@ -454,45 +455,17 @@ fn collect_annotated_gm_method_realms(
             }
         }
 
-        let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
-            continue;
-        };
-        for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
-            if context.is_cancelled() {
-                return gm_method_realms;
-            }
-            let Some(LuaVarExpr::IndexExpr(function_name_expr)) = func_stat.get_func_name() else {
-                continue;
-            };
-            let Some(LuaExpr::NameExpr(function_prefix_name)) =
-                function_name_expr.get_prefix_expr()
-            else {
-                continue;
-            };
-            let Some(function_prefix_text) = function_prefix_name.get_name_text() else {
-                continue;
-            };
-            if !matches!(function_prefix_text.as_str(), "GM" | "GAMEMODE") {
-                continue;
-            }
-            let Some(LuaIndexKey::Name(function_method_name)) = function_name_expr.get_index_key()
-            else {
-                continue;
-            };
-
-            if let Some(comment) = func_stat.get_left_comment()
-                && let Some(realm) = realm_from_doc_comment(&comment)
-            {
-                let method_name = function_method_name.get_name_text().to_string();
-                let entry = gm_method_realms.entry(method_name).or_insert_with(Vec::new);
-                push_unique_realm(
-                    entry,
-                    ResolvedRealm {
-                        realm,
-                        evidence: RealmEvidence::ExplicitAnnotation,
-                    },
-                );
-            }
+        for (method_name, realm) in method_realms {
+            let entry = gm_method_realms
+                .entry(method_name.clone())
+                .or_insert_with(Vec::new);
+            push_unique_realm(
+                entry,
+                ResolvedRealm {
+                    realm: *realm,
+                    evidence: RealmEvidence::ExplicitAnnotation,
+                },
+            );
         }
     }
 

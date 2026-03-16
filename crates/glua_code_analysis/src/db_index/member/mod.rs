@@ -19,6 +19,7 @@ pub struct LuaMemberIndex {
     in_filed: HashMap<FileId, HashSet<MemberOrOwner>>,
     owner_members: HashMap<LuaMemberOwner, LuaOwnerMembers>,
     member_current_owner: HashMap<LuaMemberId, LuaMemberOwner>,
+    member_owner_key_index: HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -40,6 +41,7 @@ impl LuaMemberIndex {
             in_filed: HashMap::new(),
             owner_members: HashMap::new(),
             member_current_owner: HashMap::new(),
+            member_owner_key_index: HashMap::new(),
         }
     }
 
@@ -51,6 +53,7 @@ impl LuaMemberIndex {
         if !owner.is_unknown() {
             self.member_current_owner.insert(id, owner.clone());
             self.add_in_file_object(file_id, MemberOrOwner::Owner(owner.clone()));
+            self.add_member_to_owner_key_index(owner.clone(), id);
             self.add_member_to_owner(owner.clone(), id);
         }
         id
@@ -126,6 +129,43 @@ impl LuaMemberIndex {
         Some(())
     }
 
+    fn add_member_to_owner_key_index(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+
+        let member_ids = self
+            .member_owner_key_index
+            .entry(owner)
+            .or_default()
+            .entry(key)
+            .or_default();
+        if !member_ids.contains(&id) {
+            member_ids.push(id);
+        }
+    }
+
+    fn remove_member_from_owner_key_index(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+
+        let mut remove_owner_entry = false;
+        if let Some(owner_items) = self.member_owner_key_index.get_mut(owner) {
+            if let Some(member_ids) = owner_items.get_mut(&key) {
+                member_ids.retain(|member_id| *member_id != id);
+                if member_ids.is_empty() {
+                    owner_items.remove(&key);
+                }
+            }
+            remove_owner_entry = owner_items.is_empty();
+        }
+
+        if remove_owner_entry {
+            self.member_owner_key_index.remove(owner);
+        }
+    }
+
     fn is_item_only_meta(&self, item: &LuaMemberIndexItem) -> bool {
         match item {
             LuaMemberIndexItem::One(id) => {
@@ -154,7 +194,14 @@ impl LuaMemberIndex {
         file_id: FileId,
         id: LuaMemberId,
     ) -> Option<()> {
-        self.member_current_owner.insert(id, owner.clone());
+        let previous_owner = self.member_current_owner.insert(id, owner.clone());
+        if let Some(previous_owner) =
+            previous_owner.filter(|previous_owner| previous_owner != &owner)
+        {
+            self.remove_member_from_owner_key_index(&previous_owner, id);
+        }
+
+        self.add_member_to_owner_key_index(owner.clone(), id);
         self.add_in_file_object(file_id, MemberOrOwner::Owner(owner));
 
         Some(())
@@ -238,14 +285,22 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Vec<&LuaMember> {
-        self.members
-            .values()
-            .filter(|member| {
-                member.get_key() == key
-                    && self
-                        .member_current_owner
-                        .get(&member.get_id())
-                        .is_some_and(|current_owner| current_owner == owner)
+        let Some(owner_items) = self.member_owner_key_index.get(owner) else {
+            return Vec::new();
+        };
+        let Some(member_ids) = owner_items.get(key) else {
+            return Vec::new();
+        };
+
+        member_ids
+            .iter()
+            .copied()
+            .into_iter()
+            .filter_map(|member_id| {
+                self.member_current_owner
+                    .get(&member_id)
+                    .filter(|current_owner| *current_owner == owner)?;
+                self.get_member(&member_id)
             })
             .collect()
     }
@@ -258,6 +313,9 @@ impl LuaIndex for LuaMemberIndex {
             for member_id_or_owner in member_ids {
                 match member_id_or_owner {
                     MemberOrOwner::Member(member_id) => {
+                        if let Some(owner) = self.member_current_owner.get(&member_id).cloned() {
+                            self.remove_member_from_owner_key_index(&owner, member_id);
+                        }
                         self.members.remove(&member_id);
                         self.member_current_owner.remove(&member_id);
                     }
@@ -307,5 +365,105 @@ impl LuaIndex for LuaMemberIndex {
         self.members.clear();
         self.in_filed.clear();
         self.owner_members.clear();
+        self.member_current_owner.clear();
+        self.member_owner_key_index.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
+    use rowan::{TextRange, TextSize};
+
+    use super::*;
+    use crate::{FileId, LuaTypeDeclId};
+
+    fn make_member(member_id: LuaMemberId, key: &str) -> LuaMember {
+        LuaMember::new(
+            member_id,
+            LuaMemberKey::Name(key.into()),
+            LuaMemberFeature::FileFieldDecl,
+            None,
+        )
+    }
+
+    fn make_member_id(file_id: FileId, start: u32) -> LuaMemberId {
+        let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
+        LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::NameExpr.into(), range),
+            file_id,
+        )
+    }
+
+    #[test]
+    fn set_member_owner_moves_member_between_owner_indexes() {
+        let file_id = FileId::new(1);
+        let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OldOwner"));
+        let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("NewOwner"));
+        let key = LuaMemberKey::Name("field".into());
+        let member_id = make_member_id(file_id, 1);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(old_owner.clone(), make_member(member_id, "field"));
+        assert!(index.get_member_item(&old_owner, &key).is_some());
+
+        index
+            .set_member_owner(new_owner.clone(), file_id, member_id)
+            .expect("owner reassignment should succeed");
+
+        assert!(index.get_member_item(&old_owner, &key).is_some());
+        assert!(index.get_member_item(&new_owner, &key).is_none());
+        assert!(index.get_members_for_owner_key(&old_owner, &key).is_empty());
+        assert_eq!(index.get_members_for_owner_key(&new_owner, &key).len(), 1);
+    }
+
+    #[test]
+    fn set_member_owner_keeps_other_old_owner_members() {
+        let file_id = FileId::new(2);
+        let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OriginalOwner"));
+        let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ReassignedOwner"));
+        let key = LuaMemberKey::Name("field".into());
+        let first_member_id = make_member_id(file_id, 1);
+        let second_member_id = make_member_id(file_id, 3);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(old_owner.clone(), make_member(first_member_id, "field"));
+        index.add_member(old_owner.clone(), make_member(second_member_id, "field"));
+
+        index
+            .set_member_owner(new_owner.clone(), file_id, first_member_id)
+            .expect("owner reassignment should succeed");
+
+        assert_eq!(index.get_members_for_owner_key(&old_owner, &key).len(), 1);
+        assert_eq!(index.get_members_for_owner_key(&new_owner, &key).len(), 1);
+
+        let old_owner_member_ids = index
+            .get_members_for_owner_key(&old_owner, &key)
+            .iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        assert_eq!(old_owner_member_ids, vec![second_member_id]);
+
+        let new_owner_member_ids = index
+            .get_members_for_owner_key(&new_owner, &key)
+            .iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        assert_eq!(new_owner_member_ids, vec![first_member_id]);
+    }
+
+    #[test]
+    fn clear_resets_member_owner_tracking() {
+        let file_id = FileId::new(3);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let member_id = make_member_id(file_id, 7);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(owner, make_member(member_id, "field"));
+        assert!(index.get_member_owner(&member_id).is_some());
+
+        index.clear();
+
+        assert!(index.get_member_owner(&member_id).is_none());
     }
 }
