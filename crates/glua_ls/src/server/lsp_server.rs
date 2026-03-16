@@ -1,3 +1,4 @@
+use lsp_server::{Message, Response};
 use lsp_types::InitializeParams;
 use std::error::Error;
 use tokio::sync::oneshot;
@@ -88,7 +89,31 @@ impl LspServer {
                             .handle_message(msg, &mut self.connection, &mut self.server_context)
                             .await?;
                     } else {
-                        self.processor.pending_messages.push(msg);
+                        match msg {
+                            Message::Request(request) => {
+                                if should_fail_fast_request_during_init(&request.method) {
+                                    // During startup, fail fast for editor data requests instead
+                                    // of queueing them behind full workspace initialization.
+                                    // Clients will re-request after initialization and avoid
+                                    // perceived 10-20s startup request stalls.
+                                    let response = Response::new_err(
+                                        request.id,
+                                        lsp_server::ErrorCode::ContentModified as i32,
+                                        "server initializing".to_owned(),
+                                    );
+                                    self.connection.send(response.into())?;
+                                } else {
+                                    // Preserve one-shot/critical request semantics by
+                                    // deferring them until initialization completes.
+                                    self.processor
+                                        .pending_messages
+                                        .push(Message::Request(request));
+                                }
+                            }
+                            other => {
+                                self.processor.pending_messages.push(other);
+                            }
+                        }
                     }
                 }
                 Ok(None) => {
@@ -103,4 +128,27 @@ impl LspServer {
         }
         Ok(())
     }
+}
+
+fn should_fail_fast_request_during_init(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/hover"
+            | "textDocument/completion"
+            | "textDocument/documentSymbol"
+            | "textDocument/foldingRange"
+            | "textDocument/documentColor"
+            | "textDocument/documentLink"
+            | "textDocument/codeLens"
+            | "textDocument/inlayHint"
+            | "textDocument/semanticTokens/full"
+            | "textDocument/diagnostic"
+            | "workspace/diagnostic"
+            | "workspace/symbol"
+            | "gluals/annotator"
+            | "gluals/gmodScriptedClasses"
+            | "gluals/gmodScriptedClassesV2"
+            | "gluals/docSearch"
+            | "emmy/annotator"
+    )
 }

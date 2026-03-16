@@ -295,7 +295,6 @@ impl LuaMemberIndex {
         member_ids
             .iter()
             .copied()
-            .into_iter()
             .filter_map(|member_id| {
                 self.member_current_owner
                     .get(&member_id)

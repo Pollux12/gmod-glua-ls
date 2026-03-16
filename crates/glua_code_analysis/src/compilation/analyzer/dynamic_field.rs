@@ -1,4 +1,6 @@
-use glua_parser::{LuaAst, LuaAstNode, LuaIndexKey, LuaVarExpr};
+use std::collections::HashMap;
+
+use glua_parser::{LuaAssignStat, LuaAstNode, LuaIndexKey, LuaVarExpr};
 use smol_str::SmolStr;
 
 use crate::{LuaType, LuaTypeDeclId, db_index::DbIndex, profile::Profile, semantic::infer_expr};
@@ -18,15 +20,13 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
             let root = in_filed_tree.value.clone();
             let file_id = in_filed_tree.file_id;
             let cache = context.infer_manager.get_infer_cache(file_id);
+            let mut prefix_type_cache: HashMap<rowan::TextRange, Option<LuaType>> = HashMap::new();
             // Pre-compute the gmod class for this file (if any) to avoid
             // repeated path lookups inside the inner loop.
             let file_class_type = get_gmod_class_name_for_file(&*db, file_id)
                 .map(|name| LuaType::Ref(LuaTypeDeclId::global(&name)));
 
-            for node in root.descendants::<LuaAst>() {
-                let LuaAst::LuaAssignStat(assign) = node else {
-                    continue;
-                };
+            for assign in root.descendants::<LuaAssignStat>() {
                 let (vars, _) = assign.get_var_and_expr_list();
                 for var in vars.iter() {
                     let LuaVarExpr::IndexExpr(index_expr) = var else {
@@ -35,9 +35,22 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                     let Some(prefix_expr) = index_expr.get_prefix_expr() else {
                         continue;
                     };
-                    let Ok(prefix_type) = infer_expr(&*db, cache, prefix_expr) else {
-                        continue;
-                    };
+
+                    let prefix_range = prefix_expr.syntax().text_range();
+                    let prefix_type =
+                        if let Some(cached_type) = prefix_type_cache.get(&prefix_range) {
+                            match cached_type {
+                                Some(prefix_type) => prefix_type.clone(),
+                                None => continue,
+                            }
+                        } else {
+                            let inferred = infer_expr(&*db, cache, prefix_expr.clone()).ok();
+                            prefix_type_cache.insert(prefix_range, inferred.clone());
+                            let Some(prefix_type) = inferred else {
+                                continue;
+                            };
+                            prefix_type
+                        };
                     let Some(field_name) = get_field_name(&index_expr) else {
                         continue;
                     };

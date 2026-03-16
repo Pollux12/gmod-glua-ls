@@ -179,13 +179,24 @@ pub async fn init_analysis(
     // load files with per-workspace configs
     let mut files = Vec::new();
     let mut loaded_paths = HashSet::new();
+    let mut canonical_path_cache: HashMap<PathBuf, PathBuf> = HashMap::new();
     for (workspace_config, workspace_group) in &workspace_collection_groups {
         for file in collect_workspace_files(workspace_group, workspace_config.as_ref(), None, None)
         {
-            let normalized_path = PathBuf::from(&file.path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&file.path));
-            if loaded_paths.insert(normalized_path) {
+            let raw_path = PathBuf::from(&file.path);
+            let dedup_key = if let Some(cached) = canonical_path_cache.get(&raw_path) {
+                cached.clone()
+            } else {
+                let canonical_path = raw_path.canonicalize().unwrap_or_else(|_| raw_path.clone());
+                let normalized = if cfg!(windows) {
+                    PathBuf::from(canonical_path.to_string_lossy().to_ascii_lowercase())
+                } else {
+                    canonical_path
+                };
+                canonical_path_cache.insert(raw_path, normalized.clone());
+                normalized
+            };
+            if loaded_paths.insert(dedup_key) {
                 files.push(file.into_tuple());
             }
         }

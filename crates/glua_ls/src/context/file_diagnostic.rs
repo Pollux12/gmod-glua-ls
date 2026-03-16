@@ -501,10 +501,17 @@ impl FileDiagnostic {
 }
 
 fn workspace_diagnostic_parallelism() -> usize {
+    if let Ok(raw) = std::env::var("GLUALS_WORKSPACE_DIAGNOSTIC_PARALLELISM")
+        && let Ok(parsed) = raw.parse::<usize>()
+        && parsed > 0
+    {
+        return parsed;
+    }
+
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1)
-        .min(8)
+        .clamp(1, 16)
 }
 
 async fn diagnose_workspace_file_off_thread(
