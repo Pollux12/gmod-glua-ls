@@ -6,7 +6,7 @@ use glua_parser::{
 use crate::{
     DbIndex, GlobalId, LuaDeclId, LuaDeclOrMemberId, LuaInferCache, LuaInstanceType,
     LuaIntersectionType, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-    LuaTypeCache, LuaTypeDeclId, LuaUnionType, TypeOps,
+    LuaTypeDeclId, LuaUnionType,
     semantic::{
         infer::{find_self_decl_or_member_id, resolve_scoped_scripted_global_type_decl_id},
         member::get_buildin_type_map_type_id,
@@ -79,23 +79,13 @@ fn infer_name_expr_semantic_decl(
         return Some(LuaSemanticDeclId::LuaDecl(decl_id));
     }
 
-    let decl_type = db
-        .get_type_index()
-        .get_type_cache(&decl_id.into())
-        .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown));
-    let remove_nil_type = TypeOps::Remove.apply(db, &decl_type, &LuaType::Nil);
-    let is_ref_object = remove_nil_type.is_function() || remove_nil_type.is_table();
-    if decl.is_local() && !is_ref_object {
-        return Some(LuaSemanticDeclId::LuaDecl(decl_id));
-    }
-
     if level.reached_limit() {
         return Some(LuaSemanticDeclId::LuaDecl(decl_id));
     }
 
     if let Some(value_expr_id) = decl.get_value_syntax_id() {
         match value_expr_id.get_kind() {
-            LuaSyntaxKind::NameExpr | LuaSyntaxKind::IndexExpr if remove_nil_type.is_function() => {
+            LuaSyntaxKind::NameExpr | LuaSyntaxKind::IndexExpr => {
                 let file_id = decl.get_file_id();
                 let tree = db.get_vfs().get_syntax_tree(&file_id)?;
                 // second infer

@@ -45,11 +45,8 @@ pub fn resolve_signature_by_args(
                 Some(func) => func,
             };
             let param_len = func.get_params().len();
-            let effective_arg_count = effective_arg_count(
-                arg_count,
-                func.is_colon_define(),
-                is_colon_call,
-            );
+            let effective_arg_count =
+                effective_arg_count(arg_count, func.is_colon_define(), is_colon_call);
             if param_len < effective_arg_count && !is_func_last_param_variadic(func) {
                 *opt_func = None;
                 continue;

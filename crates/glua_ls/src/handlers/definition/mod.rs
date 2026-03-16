@@ -84,16 +84,48 @@ pub fn definition(
         }
     };
 
-    if let Some(semantic_decl) =
-        semantic_model.find_decl(token.clone().into(), SemanticDeclLevel::default())
-    {
-        return goto_def_definition(
-            &semantic_model,
-            &analysis.compilation,
-            semantic_decl,
-            &token,
-        );
-    } else if let Some(dynamic_field_response) =
+    let decl_traced = semantic_model.find_decl(token.clone().into(), SemanticDeclLevel::default());
+    let decl_no_trace = semantic_model.find_decl(token.clone().into(), SemanticDeclLevel::NoTrace);
+
+    if decl_traced.is_some() || decl_no_trace.is_some() {
+        let mut locations = Vec::new();
+
+        let mut add_response = |resp: GotoDefinitionResponse| match resp {
+            GotoDefinitionResponse::Scalar(loc) => locations.push(loc),
+            GotoDefinitionResponse::Array(mut locs) => locations.append(&mut locs),
+            GotoDefinitionResponse::Link(_) => {}
+        };
+
+        if let Some(decl) = decl_no_trace.clone() {
+            if let Some(resp) =
+                goto_def_definition(&semantic_model, &analysis.compilation, decl.clone(), &token)
+            {
+                add_response(resp);
+            }
+        }
+
+        if let Some(decl) = decl_traced {
+            if decl_no_trace != Some(decl.clone()) {
+                if let Some(resp) =
+                    goto_def_definition(&semantic_model, &analysis.compilation, decl, &token)
+                {
+                    add_response(resp);
+                }
+            }
+        }
+
+        if !locations.is_empty() {
+            use itertools::Itertools;
+            let mut unique_locations: Vec<_> = locations.into_iter().unique().collect();
+            if unique_locations.len() == 1 {
+                return Some(GotoDefinitionResponse::Scalar(unique_locations.remove(0)));
+            } else {
+                return Some(GotoDefinitionResponse::Array(unique_locations));
+            }
+        }
+    }
+
+    if let Some(dynamic_field_response) =
         goto_inferred_dynamic_field_definition(&semantic_model, &token)
     {
         return Some(dynamic_field_response);

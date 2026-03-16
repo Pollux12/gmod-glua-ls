@@ -809,7 +809,8 @@ mod tests {
         let root = build_document_symbol(&semantic_model, &CancellationToken::new()).or_fail()?;
         let top_level_symbols = root.children.as_ref().or_fail()?;
 
-        let panel_symbol = find_top_level_symbol(top_level_symbols, "GlobalPanel (VGUI)").or_fail()?;
+        let panel_symbol =
+            find_top_level_symbol(top_level_symbols, "GlobalPanel (VGUI)").or_fail()?;
         let init_symbol = symbol_contains_child(panel_symbol, "PANEL:Init").or_fail()?;
 
         verify_that!(panel_symbol.kind, eq(SymbolKind::CLASS))?;
