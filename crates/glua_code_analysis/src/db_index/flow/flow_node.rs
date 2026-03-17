@@ -27,6 +27,18 @@ pub struct FlowNode {
     pub antecedent: Option<FlowAntecedent>,
 }
 
+/// Lightweight hint about which kinds of LHS variables appear in an assignment.
+/// Used to skip non-matching assignments in flow analysis without AST reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignVarHint {
+    /// Only simple name expressions (local variables / globals)
+    NameOnly,
+    /// Only index expressions (e.g. `self.x`, `a.b`)
+    IndexOnly,
+    /// Both name and index expressions appear on the LHS
+    Mixed,
+}
+
 /// Different types of flow nodes in the control flow graph
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowNodeKind {
@@ -42,8 +54,8 @@ pub enum FlowNodeKind {
     NamedLabel(ArcIntern<SmolStr>),
     /// Declaration position
     DeclPosition(TextSize),
-    /// Variable assignment
-    Assignment(LuaAstPtr<LuaAssignStat>),
+    /// Variable assignment with a hint about what kinds of LHS variables it contains
+    Assignment(LuaAstPtr<LuaAssignStat>, AssignVarHint),
     /// Conditional flow (type guards, existence checks)
     TrueCondition(LuaAstPtr<LuaExpr>),
     /// Conditional flow (type guards, existence checks)
@@ -79,7 +91,7 @@ impl FlowNodeKind {
     }
 
     pub fn is_assignment(&self) -> bool {
-        matches!(self, FlowNodeKind::Assignment(_))
+        matches!(self, FlowNodeKind::Assignment(_, _))
     }
 
     pub fn is_conditional(&self) -> bool {

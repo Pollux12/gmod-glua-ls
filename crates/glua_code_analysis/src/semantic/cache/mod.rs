@@ -39,6 +39,10 @@ pub struct LuaInferCache {
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
     pub scoped_scripted_global_cache: Option<Option<(String, String)>>,
     pub pending_str_tpl_type_decls: Vec<PendingStrTplTypeDecl>,
+    /// Cache for `self` type per enclosing method (keyed by LuaFuncStat syntax_id).
+    /// Avoids repeated ancestor walks and type resolution for each `self` reference
+    /// within the same method body.
+    pub self_type_cache: HashMap<LuaSyntaxId, Option<LuaType>>,
 }
 
 impl LuaInferCache {
@@ -54,6 +58,7 @@ impl LuaInferCache {
             narrow_by_literal_stop_position_cache: HashSet::new(),
             scoped_scripted_global_cache: None,
             pending_str_tpl_type_decls: Vec::new(),
+            self_type_cache: HashMap::new(),
         }
     }
 
@@ -101,5 +106,6 @@ impl LuaInferCache {
         self.expr_var_ref_id_cache.clear();
         self.scoped_scripted_global_cache = None;
         self.pending_str_tpl_type_decls.clear();
+        self.self_type_cache.clear();
     }
 }

@@ -45,5 +45,6 @@ pub async fn on_emmy_annotator_handler(
         let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
         build_annotators(&semantic_model)
     };
+
     Some(result)
 }

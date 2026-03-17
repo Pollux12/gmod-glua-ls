@@ -30,7 +30,9 @@ use member::{find_member_origin_owner, find_members};
 use reference::is_reference_to;
 use rowan::{NodeOrToken, TextRange};
 pub use semantic_info::SemanticInfo;
-pub(crate) use semantic_info::{infer_node_semantic_decl, resolve_global_decl_id};
+pub(crate) use semantic_info::{
+    SemanticDeclGuard, infer_expr_semantic_decl, infer_node_semantic_decl, resolve_global_decl_id,
+};
 use semantic_info::{
     infer_node_semantic_info, infer_token_semantic_decl, infer_token_semantic_info,
 };
@@ -39,7 +41,9 @@ use type_check::is_sub_type_of;
 pub use visibility::check_export_visibility;
 use visibility::check_visibility;
 
-pub use crate::semantic::member::find_members_with_key;
+pub use crate::semantic::member::{
+    find_members_with_key, find_members_with_key_in_workspace_for_file,
+};
 use crate::semantic::type_check::check_type_compact_detail;
 use crate::{Emmyrc, LuaDocument, LuaSemanticDeclId, ModuleInfo, db_index::LuaTypeDeclId};
 use crate::{

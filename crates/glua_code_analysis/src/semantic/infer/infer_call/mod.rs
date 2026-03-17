@@ -7,6 +7,7 @@ use super::{
     super::{InferGuard, LuaInferCache, instantiate_type_generic, resolve_signature},
     InferFailReason, InferResult,
 };
+use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
 use crate::{
     CacheEntry, DbIndex, InFiled, LuaFunctionType, LuaGenericType, LuaInstanceType,
     LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature, LuaSignatureId, LuaType, LuaTypeDeclId,
@@ -17,9 +18,13 @@ use crate::{
     semantic::{
         generic::{TypeSubstitutor, get_tpl_ref_extend_type, instantiate_doc_function},
         infer::narrow::get_type_at_call_expr_inline_cast,
+        infer_expr_semantic_decl,
     },
 };
-use crate::{build_self_type, infer_self_type, instantiate_func_generic, semantic::infer_expr};
+use crate::{
+    SemanticDeclGuard, SemanticDeclLevel, build_self_type, infer_self_type,
+    instantiate_func_generic, semantic::infer_expr,
+};
 use infer_require::infer_require_call;
 use infer_setmetatable::infer_setmetatable_call;
 
@@ -103,6 +108,30 @@ pub fn infer_call_expr_func(
         }
         _ => Err(InferFailReason::None),
     };
+    let result = match result {
+        Ok(func_ty) if wrapped_setmetatable_fallback_would_help(func_ty.as_ref()) => {
+            infer_wrapped_setmetatable_call(
+                db,
+                cache,
+                &call_expr,
+                &call_expr_type,
+                infer_guard,
+                args_count,
+            )
+            .unwrap_or(Ok(func_ty))
+        }
+        Err(reason @ InferFailReason::None)
+        | Err(reason @ InferFailReason::UnResolveOperatorCall) => infer_wrapped_setmetatable_call(
+            db,
+            cache,
+            &call_expr,
+            &call_expr_type,
+            infer_guard,
+            args_count,
+        )
+        .unwrap_or(Err(reason)),
+        other => other,
+    };
 
     let result = if let Ok(func_ty) = result {
         let func_ty = match func_ty.get_ret() {
@@ -149,6 +178,61 @@ pub fn infer_call_expr_func(
     }
 
     result
+}
+
+fn infer_wrapped_setmetatable_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    call_expr_type: &LuaType,
+    infer_guard: &InferGuardRef,
+    args_count: Option<usize>,
+) -> Option<InferCallFuncResult> {
+    match call_expr_type {
+        LuaType::TableConst(_) | LuaType::Instance(_) => {}
+        _ => return None,
+    }
+
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    let semantic_decl = infer_expr_semantic_decl(
+        db,
+        cache,
+        prefix_expr,
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    )?;
+    let target_expr = get_wrapped_callable_target_expr(db, semantic_decl)?;
+    let target_type =
+        normalize_wrapped_callable_target_type(db, infer_expr(db, cache, target_expr).ok()?);
+    Some(infer_call_expr_func(
+        db,
+        cache,
+        call_expr.clone(),
+        target_type,
+        infer_guard,
+        args_count,
+    ))
+}
+
+fn normalize_wrapped_callable_target_type(db: &DbIndex, target_type: LuaType) -> LuaType {
+    match target_type {
+        LuaType::Signature(signature_id) => db
+            .get_signature_index()
+            .get(&signature_id)
+            .map(|signature| {
+                if signature.has_special_call_params() {
+                    LuaType::Signature(signature_id)
+                } else {
+                    LuaType::DocFunction(signature.to_call_operator_func_type())
+                }
+            })
+            .unwrap_or(LuaType::Signature(signature_id)),
+        other => other,
+    }
+}
+
+fn wrapped_setmetatable_fallback_would_help(func_ty: &LuaFunctionType) -> bool {
+    matches!(func_ty.get_ret(), LuaType::Unknown | LuaType::Nil) || func_ty.get_ret().contain_tpl()
 }
 
 fn infer_tpl_ref_call(

@@ -51,7 +51,25 @@ fn analyze_metable_field(
 
     let signature_id = match field_value {
         LuaExpr::ClosureExpr(closure) => LuaSignatureId::from_closure(file_id, &closure),
-        _ => return None,
+        _ => {
+            let operator_func = match analyzer.infer_expr(&field_value).ok()? {
+                crate::LuaType::Signature(signature_id) => {
+                    OperatorFunction::Signature(signature_id)
+                }
+                crate::LuaType::DocFunction(func) => OperatorFunction::Func(func),
+                _ => return None,
+            };
+
+            let operator = LuaOperator::new(
+                operator_owner.clone(),
+                meta_method,
+                file_id,
+                field.get_range(),
+                operator_func,
+            );
+            analyzer.db.get_operator_index_mut().add_operator(operator);
+            return Some(());
+        }
     };
 
     let operator = LuaOperator::new(

@@ -4,9 +4,9 @@ use glua_parser::{
 };
 
 use crate::{
-    CacheEntry, DbIndex, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason, LuaArrayType,
-    LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType,
-    TypeOps, infer_expr,
+    AssignVarHint, CacheEntry, DbIndex, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason,
+    LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey, LuaMemberOwner,
+    LuaSignatureId, LuaType, TypeOps, infer_expr,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
         narrow::{
@@ -35,6 +35,12 @@ pub fn get_type_at_flow(
         return Ok(narrow_type.clone());
     }
 
+    // Track all flow IDs we walk through so we can cache the result for
+    // each of them, preventing redundant walks for the same var in overlapping
+    // flow chains.
+    let mut visited_flow_ids = Vec::new();
+    visited_flow_ids.push(flow_id);
+
     let result_type;
     let mut antecedent_flow_id = flow_id;
     loop {
@@ -49,6 +55,7 @@ pub fn get_type_at_flow(
             }
             FlowNodeKind::LoopLabel | FlowNodeKind::Break | FlowNodeKind::Return => {
                 antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                visited_flow_ids.push(antecedent_flow_id);
             }
             FlowNodeKind::BranchLabel | FlowNodeKind::NamedLabel(_) => {
                 let multi_antecedents = get_multi_antecedents(tree, flow_node)?;
@@ -83,9 +90,24 @@ pub fn get_type_at_flow(
                     }
                 } else {
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
                 }
             }
-            FlowNodeKind::Assignment(assign_ptr) => {
+            FlowNodeKind::Assignment(assign_ptr, assign_hint) => {
+                let can_match_assignment = matches!(
+                    (assign_hint, var_ref_id),
+                    (AssignVarHint::Mixed, _)
+                        | (AssignVarHint::NameOnly, VarRefId::VarRef(_))
+                        | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
+                        | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
+                );
+
+                if !can_match_assignment {
+                    antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
+                    continue;
+                }
+
                 let assign_stat = assign_ptr.to_node(root).ok_or(InferFailReason::None)?;
                 let result_or_continue = get_type_at_assign_stat(
                     db,
@@ -102,17 +124,20 @@ pub fn get_type_at_flow(
                     break;
                 } else {
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
                 }
             }
             FlowNodeKind::ImplFunc(func_ptr) => {
                 let func_stat = func_ptr.to_node(root).ok_or(InferFailReason::None)?;
                 let Some(func_name) = func_stat.get_func_name() else {
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
                     continue;
                 };
 
                 let Some(ref_id) = get_var_expr_var_ref_id(db, cache, func_name.to_expr()) else {
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
                     continue;
                 };
 
@@ -140,8 +165,10 @@ pub fn get_type_at_flow(
                     }
 
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
                 } else {
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
                 }
             }
             FlowNodeKind::TrueCondition(condition_ptr) => {
@@ -168,6 +195,7 @@ pub fn get_type_at_flow(
                     break;
                 } else {
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
                 }
             }
             FlowNodeKind::FalseCondition(condition_ptr) => {
@@ -192,11 +220,13 @@ pub fn get_type_at_flow(
                     break;
                 } else {
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
                 }
             }
             FlowNodeKind::ForIStat(_) => {
                 // todo check for `for i = 1, 10 do end`
                 antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                visited_flow_ids.push(antecedent_flow_id);
             }
             FlowNodeKind::TagCast(cast_ast_ptr) => {
                 let tag_cast = cast_ast_ptr.to_node(root).ok_or(InferFailReason::None)?;
@@ -208,14 +238,21 @@ pub fn get_type_at_flow(
                     break;
                 } else {
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    visited_flow_ids.push(antecedent_flow_id);
                 }
             }
         }
     }
 
-    cache
-        .flow_node_cache
-        .insert(key, CacheEntry::Cache(result_type.clone()));
+    // Cache the result for all intermediate flow IDs we walked through.
+    // Since none of the skipped nodes affected var_ref_id, the type is the
+    // same at all those points.
+    for fid in visited_flow_ids {
+        cache.flow_node_cache.insert(
+            (var_ref_id.clone(), fid),
+            CacheEntry::Cache(result_type.clone()),
+        );
+    }
     Ok(result_type)
 }
 

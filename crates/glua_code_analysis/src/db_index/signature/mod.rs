@@ -49,6 +49,10 @@ impl LuaSignatureIndex {
     pub fn get_mut(&mut self, signature_id: &LuaSignatureId) -> Option<&mut LuaSignature> {
         self.signatures.get_mut(signature_id)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&LuaSignatureId, &LuaSignature)> {
+        self.signatures.iter()
+    }
 }
 
 impl LuaIndex for LuaSignatureIndex {

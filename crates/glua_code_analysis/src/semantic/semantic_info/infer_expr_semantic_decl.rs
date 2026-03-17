@@ -194,6 +194,7 @@ fn infer_index_expr_semantic_decl(
         cache,
         &prefix_type,
         &member_key,
+        Some(index_expr.get_position()),
         semantic_guard.next_level()?,
     )
 }
@@ -231,12 +232,13 @@ fn infer_member_semantic_decl_by_member_key(
     cache: &mut LuaInferCache,
     prefix_type: &LuaType,
     member_key: &LuaMemberKey,
+    member_access_position: Option<rowan::TextSize>,
     semantic_guard: SemanticDeclGuard,
 ) -> Option<LuaSemanticDeclId> {
     match &prefix_type {
         LuaType::TableConst(id) => {
             let owner = LuaMemberOwner::Element(id.clone());
-            infer_table_member_semantic_decl(db, owner, member_key)
+            infer_table_member_semantic_decl(db, cache, owner, member_key, member_access_position)
         }
         LuaType::String | LuaType::Io | LuaType::StringConst(_) | LuaType::DocStringConst(_) => {
             let decl_id = get_buildin_type_map_type_id(prefix_type)?;
@@ -245,6 +247,7 @@ fn infer_member_semantic_decl_by_member_key(
                 cache,
                 decl_id,
                 member_key,
+                member_access_position,
                 semantic_guard.next_level()?,
             )
         }
@@ -253,6 +256,7 @@ fn infer_member_semantic_decl_by_member_key(
             cache,
             decl_id.clone(),
             member_key,
+            member_access_position,
             semantic_guard.next_level()?,
         ),
         LuaType::Def(decl_id) => infer_custom_type_member_semantic_decl(
@@ -260,6 +264,7 @@ fn infer_member_semantic_decl_by_member_key(
             cache,
             decl_id.clone(),
             member_key,
+            member_access_position,
             semantic_guard.next_level()?,
         ),
         LuaType::Union(union_type) => infer_union_member_semantic_info(
@@ -267,6 +272,7 @@ fn infer_member_semantic_decl_by_member_key(
             cache,
             union_type,
             member_key,
+            member_access_position,
             semantic_guard.next_level()?,
         ),
         LuaType::Generic(generic_type) => infer_custom_type_member_semantic_decl(
@@ -274,6 +280,7 @@ fn infer_member_semantic_decl_by_member_key(
             cache,
             generic_type.get_base_type_id(),
             member_key,
+            member_access_position,
             semantic_guard.next_level()?,
         ),
         LuaType::Instance(inst) => infer_instance_member_semantic_decl_by_member_key(
@@ -281,6 +288,7 @@ fn infer_member_semantic_decl_by_member_key(
             cache,
             inst,
             member_key,
+            member_access_position,
             semantic_guard.next_level()?,
         ),
         LuaType::Global => infer_global_member_semantic_decl_by_member_key(db, cache, member_key),
@@ -292,6 +300,7 @@ fn infer_member_semantic_decl_by_member_key(
                     cache,
                     export_type,
                     member_key,
+                    member_access_position,
                     semantic_guard.next_level()?,
                 )
             } else {
@@ -303,6 +312,7 @@ fn infer_member_semantic_decl_by_member_key(
             cache,
             intersection_type,
             member_key,
+            member_access_position,
             semantic_guard.next_level()?,
         ),
         LuaType::TableOf(inner) => infer_member_semantic_decl_by_member_key(
@@ -310,6 +320,7 @@ fn infer_member_semantic_decl_by_member_key(
             cache,
             inner,
             member_key,
+            member_access_position,
             semantic_guard.next_level()?,
         ),
         _ => None,
@@ -318,11 +329,20 @@ fn infer_member_semantic_decl_by_member_key(
 
 fn infer_table_member_semantic_decl(
     db: &DbIndex,
+    cache: &LuaInferCache,
     owner: LuaMemberOwner,
     member_key: &LuaMemberKey,
+    member_access_position: Option<rowan::TextSize>,
 ) -> Option<LuaSemanticDeclId> {
     let member_item = db.get_member_index().get_member_item(&owner, member_key)?;
-    member_item.resolve_semantic_decl(db)
+    match member_access_position {
+        Some(position) => member_item.resolve_semantic_decl_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            position,
+        ),
+        None => member_item.resolve_semantic_decl_with_realm(db, &cache.get_file_id()),
+    }
 }
 
 fn infer_custom_type_member_semantic_decl(
@@ -330,6 +350,7 @@ fn infer_custom_type_member_semantic_decl(
     cache: &mut LuaInferCache,
     prefix_type_id: LuaTypeDeclId,
     member_key: &LuaMemberKey,
+    member_access_position: Option<rowan::TextSize>,
     semantic_guard: SemanticDeclGuard,
 ) -> Option<LuaSemanticDeclId> {
     let type_index = db.get_type_index();
@@ -341,6 +362,7 @@ fn infer_custom_type_member_semantic_decl(
                 cache,
                 &origin_type,
                 member_key,
+                member_access_position,
                 semantic_guard.next_level()?,
             );
         } else {
@@ -349,6 +371,7 @@ fn infer_custom_type_member_semantic_decl(
                 cache,
                 &LuaType::String,
                 member_key,
+                member_access_position,
                 semantic_guard.next_level()?,
             );
         }
@@ -356,14 +379,28 @@ fn infer_custom_type_member_semantic_decl(
 
     let owner = LuaMemberOwner::Type(prefix_type_id.clone());
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, member_key) {
-        return member_item.resolve_semantic_decl(db);
+        return match member_access_position {
+            Some(position) => member_item.resolve_semantic_decl_with_realm_at_offset(
+                db,
+                &cache.get_file_id(),
+                position,
+            ),
+            None => member_item.resolve_semantic_decl_with_realm(db, &cache.get_file_id()),
+        };
     }
     let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
     if let Some(member_item) = db
         .get_member_index()
         .get_member_item(&global_owner, member_key)
     {
-        return member_item.resolve_semantic_decl(db);
+        return match member_access_position {
+            Some(position) => member_item.resolve_semantic_decl_with_realm_at_offset(
+                db,
+                &cache.get_file_id(),
+                position,
+            ),
+            None => member_item.resolve_semantic_decl_with_realm(db, &cache.get_file_id()),
+        };
     }
 
     if type_decl.is_class() {
@@ -374,6 +411,7 @@ fn infer_custom_type_member_semantic_decl(
                 cache,
                 &super_type,
                 member_key,
+                member_access_position,
                 semantic_guard.next_level()?,
             ) {
                 return Some(property);
@@ -389,6 +427,7 @@ fn infer_union_member_semantic_info(
     cache: &mut LuaInferCache,
     union_type: &LuaUnionType,
     member_key: &LuaMemberKey,
+    member_access_position: Option<rowan::TextSize>,
     semantic_guard: SemanticDeclGuard,
 ) -> Option<LuaSemanticDeclId> {
     for typ in union_type.into_vec() {
@@ -397,6 +436,7 @@ fn infer_union_member_semantic_info(
             cache,
             &typ,
             member_key,
+            member_access_position,
             semantic_guard.next_level()?,
         ) {
             return Some(property_owner_id);
@@ -411,6 +451,7 @@ fn infer_instance_member_semantic_decl_by_member_key(
     cache: &mut LuaInferCache,
     inst: &LuaInstanceType,
     member_key: &LuaMemberKey,
+    member_access_position: Option<rowan::TextSize>,
     semantic_guard: SemanticDeclGuard,
 ) -> Option<LuaSemanticDeclId> {
     let range = inst.get_range();
@@ -421,13 +462,14 @@ fn infer_instance_member_semantic_decl_by_member_key(
         cache,
         origin_type,
         member_key,
+        member_access_position,
         semantic_guard.next_level()?,
     ) {
         return Some(result);
     }
 
     let owner = LuaMemberOwner::Element(range.clone());
-    infer_table_member_semantic_decl(db, owner, member_key)
+    infer_table_member_semantic_decl(db, cache, owner, member_key, member_access_position)
 }
 
 fn infer_global_member_semantic_decl_by_member_key(
@@ -444,6 +486,7 @@ fn infer_intersection_member_semantic_info(
     cache: &mut LuaInferCache,
     intersection_type: &LuaIntersectionType,
     member_key: &LuaMemberKey,
+    member_access_position: Option<rowan::TextSize>,
     semantic_guard: SemanticDeclGuard,
 ) -> Option<LuaSemanticDeclId> {
     for typ in intersection_type.get_types() {
@@ -452,6 +495,7 @@ fn infer_intersection_member_semantic_info(
             cache,
             typ,
             member_key,
+            member_access_position,
             semantic_guard.next_level()?,
         ) {
             return Some(property_owner_id);

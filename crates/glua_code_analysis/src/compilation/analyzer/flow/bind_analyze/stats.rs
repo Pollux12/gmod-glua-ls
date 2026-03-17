@@ -1,11 +1,11 @@
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBlock, LuaBreakStat, LuaCallArgList,
     LuaCallExprStat, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat, LuaFuncStat, LuaGotoStat,
-    LuaIfStat, LuaLabelStat, LuaLocalStat, LuaRepeatStat, LuaReturnStat, LuaWhileStat,
+    LuaIfStat, LuaLabelStat, LuaLocalStat, LuaRepeatStat, LuaReturnStat, LuaVarExpr, LuaWhileStat,
 };
 
 use crate::{
-    AnalyzeError, DiagnosticCode, FlowId, FlowNodeKind, LuaClosureId, LuaDeclId,
+    AnalyzeError, AssignVarHint, DiagnosticCode, FlowId, FlowNodeKind, LuaClosureId, LuaDeclId,
     compilation::analyzer::flow::{
         bind_analyze::{
             bind_block, bind_each_child, bind_node,
@@ -82,13 +82,24 @@ pub fn bind_assign_stat(
         }
     }
 
+    let mut has_name = false;
+    let mut has_index = false;
     for var in &vars {
+        match var {
+            LuaVarExpr::NameExpr(_) => has_name = true,
+            LuaVarExpr::IndexExpr(_) => has_index = true,
+        }
         if let Some(ast) = LuaAst::cast(var.syntax().clone()) {
             bind_node(binder, ast, current);
         }
     }
 
-    let assignment_kind = FlowNodeKind::Assignment(assign_stat.to_ptr());
+    let hint = match (has_name, has_index) {
+        (true, false) => AssignVarHint::NameOnly,
+        (false, true) => AssignVarHint::IndexOnly,
+        _ => AssignVarHint::Mixed,
+    };
+    let assignment_kind = FlowNodeKind::Assignment(assign_stat.to_ptr(), hint);
     let flow_id = binder.create_node(assignment_kind);
     binder.add_antecedent(flow_id, current);
 

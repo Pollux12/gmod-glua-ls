@@ -63,6 +63,16 @@ impl LuaSignature {
         self.resolve_return != SignatureReturnStatus::UnResolve
     }
 
+    pub fn has_special_call_params(&self) -> bool {
+        self.param_docs.values().any(|param_info| {
+            type_contains_str_tpl_ref(&param_info.type_ref)
+                || param_info.get_attribute_by_name("constructor").is_some()
+        }) || self
+            .overloads
+            .iter()
+            .any(|overload| overload_has_special_call_params(overload.as_ref()))
+    }
+
     pub fn get_type_params(&self) -> Vec<(String, Option<LuaType>)> {
         let mut type_params = Vec::new();
         for (idx, param_name) in self.params.iter().enumerate() {
@@ -181,6 +191,32 @@ impl LuaSignature {
             LuaFunctionType::new(self.async_state, false, self.is_vararg, params, return_type);
         Arc::new(func_type)
     }
+}
+
+fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::StrTplRef(_) => true,
+        LuaType::TypeGuard(inner) => type_contains_str_tpl_ref(inner),
+        LuaType::Union(union) => union.into_vec().iter().any(type_contains_str_tpl_ref),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .any(type_contains_str_tpl_ref),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .any(|(union_type, _)| type_contains_str_tpl_ref(union_type)),
+        _ => false,
+    }
+}
+
+fn overload_has_special_call_params(func: &LuaFunctionType) -> bool {
+    func.get_params().iter().any(|(_, param_type)| {
+        param_type
+            .as_ref()
+            .map(type_contains_str_tpl_ref)
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Debug)]

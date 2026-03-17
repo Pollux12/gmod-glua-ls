@@ -92,6 +92,416 @@ mod test {
     }
 
     #[gtest]
+    fn test_str_tpl_generic_local_alias_preserves_auto_created_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                local create_entity = ents.Create
+                ent = create_entity('sent_custom')
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("ent");
+        let expected = ws.ty("sent_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_member_alias_call_auto_creates_missing_class() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                local registry = {}
+                registry.spawn = ents.Create
+                ent = registry.spawn('sent_member_custom')
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("ent");
+        let expected = ws.ty("sent_member_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_member_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_member_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_table_field_alias_call_auto_creates_missing_class() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                local registry = {
+                    spawn = ents.Create,
+                }
+                ent = registry.spawn('sent_table_member_custom')
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("ent");
+        let expected = ws.ty("sent_table_member_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_table_member_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_table_member_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_member_read_alias_call_auto_creates_missing_class() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                local registry = {}
+                registry.spawn = ents.Create
+                local alias = registry.spawn
+                ent = alias('sent_member_read_custom')
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("ent");
+        let expected = ws.ty("sent_member_read_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_member_read_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_member_read_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_wrapped_member_read_alias_call_auto_creates_missing_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+                ---@class Entity
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function meta(class)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                local registry = {}
+                registry.spawn = meta
+                local alias = registry.spawn
+                local wrapper = setmetatable({}, { __call = alias })
+                ent = wrapper('sent_wrapped_member_read_custom')
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("ent");
+        let expected = ws.ty("sent_wrapped_member_read_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_wrapped_member_read_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_wrapped_member_read_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_typed_member_call_auto_creates_missing_class() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                ---@class SpawnRegistry
+                ---@field spawn fun<T: Entity>(class: `T`): T
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@type SpawnRegistry
+                local registry
+
+                ent = registry.spawn('sent_typed_member_custom')
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("ent");
+        let expected = ws.ty("sent_typed_member_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_typed_member_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_typed_member_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_cross_file_local_alias_call_auto_creates_missing_class() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def_files(vec![
+            (
+                "a_alias.lua",
+                r#"
+                    local create_entity = ents.Create
+                    ent = create_entity('sent_cross_file_custom')
+                "#,
+            ),
+            (
+                "z_defs.lua",
+                r#"
+                    ---@class Entity
+
+                    ents = {}
+
+                    ---@generic T: Entity
+                    ---@param class `T`
+                    ---@return T
+                    function ents.Create(class)
+                    end
+                "#,
+            ),
+        ]);
+
+        let result_ty = ws.expr_ty("ent");
+        let expected = ws.ty("sent_cross_file_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_cross_file_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_cross_file_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_wrapped_call_via_metatable_call_operator() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+                ---@class Entity
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function meta(class)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                local wrapper = setmetatable({}, { __call = meta })
+                ent = wrapper('sent_wrapped_custom')
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("ent");
+        let expected = ws.ty("sent_wrapped_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_wrapped_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_wrapped_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_overload_only_signature_materializes_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+
+                ---@generic T: Entity
+                ---@overload fun(class: `T`): T
+                function meta(class)
+                end
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("meta('sent_overload_custom')");
+        let expected = ws.ty("sent_overload_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_overload_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_overload_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_overload_only_wrapped_alias_materializes_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+                ---@class Entity
+
+                ---@generic T: Entity
+                ---@overload fun(class: `T`): T
+                function meta(class)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                local alias = meta
+                local wrapper = setmetatable({}, { __call = alias })
+                ent = wrapper('sent_overload_wrapped_custom')
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("ent");
+        let expected = ws.ty("sent_overload_wrapped_custom");
+        assert_eq!(result_ty, expected);
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("sent_overload_wrapped_custom"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+            "expected `sent_overload_wrapped_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
     fn test_str_tpl_generic_undefined_and_defined_class_paths() {
         let mut ws = VirtualWorkspace::new();
 

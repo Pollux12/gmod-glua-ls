@@ -313,6 +313,10 @@ fn build_member_hover(
     let mut semantic_decls =
         find_member_origin_owners(builder.compilation, builder.semantic_model, member_id, true)
             .get_types(builder.semantic_model);
+    let should_render_as_function = is_function(&typ)
+        || semantic_decls
+            .iter()
+            .any(|(_, semantic_typ)| is_function(semantic_typ));
 
     let member_name = match member.get_key() {
         LuaMemberKey::Name(name) => name.to_string(),
@@ -320,7 +324,7 @@ fn build_member_hover(
         _ => return None,
     };
 
-    if is_function(&typ) {
+    if should_render_as_function {
         extend_gmod_hook_semantic_decls(builder, db, member, &mut semantic_decls);
 
         adjust_semantic_decls(

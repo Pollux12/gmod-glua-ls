@@ -24,7 +24,10 @@ use stats::{
 
 use crate::{
     Emmyrc, FileId, InferFailReason,
-    compilation::analyzer::{AnalysisPipeline, lua::call::analyze_call},
+    compilation::analyzer::{
+        AnalysisPipeline,
+        lua::call::{analyze_call, build_special_call_direct_matcher},
+    },
     db_index::{DbIndex, LuaType},
     profile::Profile,
     semantic::infer_expr,
@@ -43,6 +46,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
             .iter()
             .map(|x| (x.file_id, x.value.clone()))
             .collect::<HashMap<_, _>>();
+        let special_call_direct_matcher = build_special_call_direct_matcher(db, &tree_map);
 
         // Pre-compute scripted class scope for all files (compile glob patterns once)
         let gmod_enabled = db.get_emmyrc().gmod.enabled;
@@ -57,8 +61,14 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         for file_id in order {
             if let Some(root) = tree_map.get(&file_id) {
                 let is_scripted = scripted_scope_files.contains(&file_id);
-                let mut analyzer =
-                    LuaAnalyzer::new(db, file_id, context, gmod_enabled, is_scripted);
+                let mut analyzer = LuaAnalyzer::new(
+                    db,
+                    file_id,
+                    context,
+                    gmod_enabled,
+                    is_scripted,
+                    &special_call_direct_matcher,
+                );
                 for node in root.descendants::<LuaAst>() {
                     analyze_node(&mut analyzer, node);
                 }
@@ -109,6 +119,7 @@ struct LuaAnalyzer<'a> {
     context: &'a mut AnalyzeContext,
     gmod_enabled: bool,
     is_scripted_class_scope: bool,
+    special_call_direct_matcher: &'a call::SpecialCallDirectMatcher,
 }
 
 impl LuaAnalyzer<'_> {
@@ -118,6 +129,7 @@ impl LuaAnalyzer<'_> {
         context: &'a mut AnalyzeContext,
         gmod_enabled: bool,
         is_scripted_class_scope: bool,
+        special_call_direct_matcher: &'a call::SpecialCallDirectMatcher,
     ) -> LuaAnalyzer<'a> {
         LuaAnalyzer {
             file_id,
@@ -125,6 +137,7 @@ impl LuaAnalyzer<'_> {
             context,
             gmod_enabled,
             is_scripted_class_scope,
+            special_call_direct_matcher,
         }
     }
 

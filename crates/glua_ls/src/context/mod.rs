@@ -249,11 +249,8 @@ impl ServerContext {
             let res = exec(cancel_token.clone()).await;
             if cancel_token.is_cancelled() {
                 if keep_stale_editor_data_on_cancel(&request_method)
-                    && let Some(ref response) = res
-                    && response
-                        .result
-                        .as_ref()
-                        .is_some_and(|v| !v.is_null())
+                    && let Some(response) = res
+                    && response.result.as_ref().is_some_and(|v| !v.is_null())
                 {
                     // Handler completed with a non-null result before/during
                     // cancellation — send it. Per LSP spec, "the result even

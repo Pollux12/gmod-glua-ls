@@ -270,6 +270,25 @@ fn infer_scoped_implicit_self_type(
     }
 
     let func_stat = name_expr.ancestors::<LuaFuncStat>().next()?;
+    let func_syntax_id = func_stat.get_syntax_id();
+
+    // Check self type cache for this method
+    if let Some(cached) = cache.self_type_cache.get(&func_syntax_id) {
+        return cached.clone();
+    }
+
+    let result = infer_scoped_implicit_self_type_inner(db, cache, func_stat);
+
+    // Cache the result for subsequent `self` references in the same method
+    cache.self_type_cache.insert(func_syntax_id, result.clone());
+    result
+}
+
+fn infer_scoped_implicit_self_type_inner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    func_stat: LuaFuncStat,
+) -> Option<LuaType> {
     let func_name = func_stat.get_func_name()?;
     let LuaVarExpr::IndexExpr(index_expr) = func_name else {
         return None;

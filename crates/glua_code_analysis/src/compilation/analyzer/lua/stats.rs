@@ -264,6 +264,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
     let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
     let expr_count = expr_list.len();
     let var_count = var_list.len();
+
     for i in 0..expr_count {
         let var = var_list.get(i)?;
         let expr = expr_list.get(i);
@@ -271,6 +272,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             break;
         }
         let expr = expr?;
+
         let type_owner = get_var_owner(analyzer, var.clone());
         set_index_expr_owner(analyzer, var.clone());
 
@@ -327,6 +329,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 );
             }
         }
+
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
         assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0);
     }
@@ -455,11 +458,18 @@ fn widen_existing_member_collection_type(
         return Some(());
     };
 
+    let is_collection_append = is_collection_append_write(index_expr).unwrap_or(false);
+    let incoming_is_collection = normalize_infer_collection_type(analyzer.db, value_type).is_some();
+
+    if !incoming_is_collection && !is_collection_append {
+        return Some(());
+    }
+
     if let Some(member_ids) = find_related_member_ids(analyzer, index_expr.clone()) {
         widen_member_collections_with_collection_type(analyzer, &member_ids, value_type);
     }
 
-    if is_collection_append_write(index_expr)?
+    if is_collection_append
         && let Some(prefix_expr) = index_expr.get_prefix_expr()
         && let Some(prefix_index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
         && let Some(member_ids) = find_related_member_ids(analyzer, prefix_index_expr)
@@ -774,7 +784,6 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
                 return None;
             }
         };
-
         bind_type(
             analyzer.db,
             member_id.into(),
