@@ -13,7 +13,7 @@ pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
 pub use debounced_analysis::DebouncedAnalysis;
 pub use did_change_coalescer::DidChangeCoalescer;
-pub use editor_display_cache::{EditorDisplayCache, EditorDisplayCacheKind};
+pub use editor_display_cache::EditorDisplayCache;
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
 pub use lsp_features::LspFeatures;
@@ -126,6 +126,12 @@ struct InFlightRequest {
 }
 
 fn keep_stale_editor_data_on_cancel(method: &str) -> bool {
+    // When these requests are cancelled (typically because a new didChange
+    // arrived and cancel_all_requests() fired), prefer sending whatever
+    // result was already computed rather than RequestCanceled. Per the LSP
+    // spec, "the result even computed on an older state might still be
+    // useful for the client". Sending RequestCanceled for these methods
+    // causes brief visual flickering as the client clears its display.
     matches!(
         method,
         "textDocument/inlayHint" | "textDocument/semanticTokens/full" | "gluals/annotator"
@@ -243,9 +249,17 @@ impl ServerContext {
             let res = exec(cancel_token.clone()).await;
             if cancel_token.is_cancelled() {
                 if keep_stale_editor_data_on_cancel(&request_method)
-                    && let Some(response) = res
+                    && let Some(ref response) = res
+                    && response
+                        .result
+                        .as_ref()
+                        .is_some_and(|v| !v.is_null())
                 {
-                    let _ = sender.send(Message::Response(response));
+                    // Handler completed with a non-null result before/during
+                    // cancellation — send it. Per LSP spec, "the result even
+                    // computed on an older state might still be useful for the
+                    // client."
+                    let _ = sender.send(Message::Response(response.clone()));
                 } else {
                     let response = Response::new_err(
                         req_id.clone(),

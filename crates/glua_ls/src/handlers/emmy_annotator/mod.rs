@@ -8,7 +8,7 @@ pub use emmy_annotator_request::*;
 use lsp_types::Uri;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::{EditorDisplayCacheKind, ServerContextSnapshot};
+use crate::context::ServerContextSnapshot;
 
 pub async fn on_emmy_annotator_handler(
     context: ServerContextSnapshot,
@@ -21,27 +21,20 @@ pub async fn on_emmy_annotator_handler(
 
     let uri = Uri::from_str(&params.uri).ok()?;
 
-    if context.debounced_analysis().is_dirty()
-        && let Some(cached_annotators) = context
-            .editor_display_cache()
-            .get(EditorDisplayCacheKind::EmmyAnnotator, &uri)
-            .await
-    {
-        return Some(cached_annotators);
-    }
-
+    // Wait for any pending reindex to finish so we compute against
+    // consistent tree + index data. Cancel-aware: bails out when a
+    // new didChange fires cancel_all_requests().
     if !context
         .debounced_analysis()
         .wait_until_fresh(&cancel_token)
         .await
     {
-        return context
-            .editor_display_cache()
-            .get(EditorDisplayCacheKind::EmmyAnnotator, &uri)
-            .await;
+        return None;
     }
 
     let result = {
+        // While we hold this read lock, no writes (VFS updates, reindex)
+        // can proceed, so tree and index are guaranteed consistent.
         let analysis = context.read_analysis(&cancel_token).await?;
 
         if cancel_token.is_cancelled() {
@@ -52,9 +45,5 @@ pub async fn on_emmy_annotator_handler(
         let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
         build_annotators(&semantic_model)
     };
-    let _ = context
-        .editor_display_cache()
-        .insert(EditorDisplayCacheKind::EmmyAnnotator, &uri, &result)
-        .await;
     Some(result)
 }

@@ -197,9 +197,6 @@ pub async fn on_request_handler(
         DocumentDiagnosticRequest => on_pull_document_diagnostic,
         WorkspaceDiagnosticRequest => on_pull_workspace_diagnostic,
     }, content_modified_if_dirty: {
-        // Intentionally empty: editor data requests use stale-result caches
-        // while dirty instead of returning ContentModified/null, which some
-        // clients still render as a visible blank flicker.
     });
 
     Ok(())

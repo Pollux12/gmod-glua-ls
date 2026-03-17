@@ -2,7 +2,7 @@ mod build_function_hint;
 mod build_inlay_hint;
 
 use super::RegisterCapabilities;
-use crate::context::{ClientId, EditorDisplayCacheKind, ServerContextSnapshot};
+use crate::context::{ClientId, ServerContextSnapshot};
 use build_inlay_hint::build_inlay_hints;
 pub use build_inlay_hint::{get_override_lsp_location, get_super_member_id};
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
@@ -23,28 +23,18 @@ pub async fn on_inlay_hint_handler(
 
     let uri = params.text_document.uri;
 
-    if context.debounced_analysis().is_dirty()
-        && let Some(cached_hints) = context
-            .editor_display_cache()
-            .get(EditorDisplayCacheKind::InlayHints, &uri)
-            .await
-    {
-        return Some(cached_hints);
-    }
-
     // Wait for any pending reindex to finish so we serve fresh hints
-    // instead of returning null/ContentModified (which clears hints and
-    // causes visible flickering). The wait is cancel-aware: if a new
-    // didChange arrives, the cancel token fires and we bail out cheaply.
+    // computed against consistent tree + index data. The wait is
+    // cancel-aware: if a new didChange arrives, cancel_all_requests()
+    // fires the cancel token and we bail out. The task() wrapper will
+    // then send whatever result we have (keep_stale_editor_data_on_cancel)
+    // or RequestCanceled, both of which let the client keep its display.
     if !context
         .debounced_analysis()
         .wait_until_fresh(&cancel_token)
         .await
     {
-        return context
-            .editor_display_cache()
-            .get(EditorDisplayCacheKind::InlayHints, &uri)
-            .await;
+        return None;
     }
 
     let client_id = context
@@ -54,6 +44,8 @@ pub async fn on_inlay_hint_handler(
         .client_id;
 
     let result = {
+        // While we hold this read lock, no writes (VFS updates, reindex)
+        // can proceed, so tree and index are guaranteed consistent.
         let analysis = context.read_analysis(&cancel_token).await?;
 
         if cancel_token.is_cancelled() {
@@ -67,18 +59,6 @@ pub async fn on_inlay_hint_handler(
             &cancel_token,
         )
     };
-
-    if let Some(ref result) = result {
-        let _ = context
-            .editor_display_cache()
-            .insert(EditorDisplayCacheKind::InlayHints, &uri, result)
-            .await;
-    } else {
-        context
-            .editor_display_cache()
-            .remove_kind(EditorDisplayCacheKind::InlayHints, &uri)
-            .await;
-    }
 
     result
 }

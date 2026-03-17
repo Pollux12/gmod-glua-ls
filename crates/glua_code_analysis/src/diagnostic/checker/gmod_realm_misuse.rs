@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
-    LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, PathTrait,
+    LuaAstNode, LuaCallExpr, LuaCommentOwner, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
+    LuaLocalFuncStat, PathTrait,
 };
 use rowan::{NodeOrToken, TextRange, TextSize};
 
@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::{Checker, DiagnosticContext};
+use crate::compilation::analyzer::gmod::realm_from_doc_comment;
 
 pub struct GmodRealmMisuseChecker;
 
@@ -470,28 +471,6 @@ fn collect_annotated_gm_method_realms(
     }
 
     gm_method_realms
-}
-
-fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {
-    for tag in comment.get_doc_tags() {
-        if let LuaDocTag::Realm(realm_tag) = tag
-            && let Some(realm) = realm_from_doc_tag(&realm_tag)
-        {
-            return Some(realm);
-        }
-    }
-
-    None
-}
-
-fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
-    let name = tag.get_name_token()?;
-    match name.get_name_text() {
-        "client" => Some(GmodRealm::Client),
-        "server" => Some(GmodRealm::Server),
-        "shared" => Some(GmodRealm::Shared),
-        _ => None,
-    }
 }
 
 fn push_unique_realm(realms: &mut Vec<ResolvedRealm>, realm: ResolvedRealm) {

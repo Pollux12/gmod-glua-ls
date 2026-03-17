@@ -3,7 +3,7 @@ mod function_string_highlight;
 mod language_injector;
 mod semantic_token_builder;
 
-use crate::context::{ClientId, EditorDisplayCacheKind, ServerContextSnapshot};
+use crate::context::{ClientId, ServerContextSnapshot};
 use build_semantic_tokens::build_semantic_tokens;
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use lsp_types::{
@@ -31,24 +31,15 @@ pub async fn on_semantic_token_handler(
 
     let uri = params.text_document.uri;
 
-    if context.debounced_analysis().is_dirty()
-        && let Some(cached_tokens) = context
-            .editor_display_cache()
-            .get(EditorDisplayCacheKind::SemanticTokens, &uri)
-            .await
-    {
-        return Some(cached_tokens);
-    }
-
+    // Wait for any pending reindex to finish so we compute against
+    // consistent tree + index data. Cancel-aware: bails out when a
+    // new didChange fires cancel_all_requests().
     if !context
         .debounced_analysis()
         .wait_until_fresh(&cancel_token)
         .await
     {
-        return context
-            .editor_display_cache()
-            .get(EditorDisplayCacheKind::SemanticTokens, &uri)
-            .await;
+        return None;
     }
 
     let client_id = context
@@ -58,6 +49,8 @@ pub async fn on_semantic_token_handler(
         .client_id;
 
     let result = {
+        // While we hold this read lock, no writes (VFS updates, reindex)
+        // can proceed, so tree and index are guaranteed consistent.
         let analysis = context.read_analysis(&cancel_token).await?;
 
         if cancel_token.is_cancelled() {
@@ -74,18 +67,6 @@ pub async fn on_semantic_token_handler(
             &cancel_token,
         )
     };
-
-    if let Some(ref result) = result {
-        let _ = context
-            .editor_display_cache()
-            .insert(EditorDisplayCacheKind::SemanticTokens, &uri, result)
-            .await;
-    } else {
-        context
-            .editor_display_cache()
-            .remove_kind(EditorDisplayCacheKind::SemanticTokens, &uri)
-            .await;
-    }
 
     result
 }

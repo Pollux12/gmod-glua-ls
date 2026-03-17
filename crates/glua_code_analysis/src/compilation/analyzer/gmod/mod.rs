@@ -2399,19 +2399,15 @@ fn collect_realm_annotation(root: &LuaChunk) -> Option<GmodRealm> {
             continue;
         }
 
-        for tag in comment.get_doc_tags() {
-            if let LuaDocTag::Realm(realm_tag) = tag
-                && let Some(realm) = realm_from_doc_tag(&realm_tag)
-            {
-                return Some(realm);
-            }
+        if let Some(realm) = realm_from_doc_comment(&comment) {
+            return Some(realm);
         }
     }
 
     None
 }
 
-fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {
+pub(crate) fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {
     for tag in comment.get_doc_tags() {
         if let LuaDocTag::Realm(realm_tag) = tag
             && let Some(realm) = realm_from_doc_tag(&realm_tag)

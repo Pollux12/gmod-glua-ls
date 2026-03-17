@@ -967,7 +967,7 @@ fn handle_name_node(
     }
 
     // 先查找声明，如果找不到声明再检查是否是 Lua 内置全局变量
-    let semantic_decl = semantic_model.find_decl(node.clone().into(), SemanticDeclLevel::default());
+    let semantic_decl = semantic_model.find_decl(node.clone().into(), SemanticDeclLevel::NoTrace);
     if semantic_decl.is_none() {
         if is_builtin_global_function(name_text) {
             builder.push_with_modifiers(

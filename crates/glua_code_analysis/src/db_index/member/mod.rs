@@ -70,6 +70,7 @@ impl LuaMemberIndex {
         let member = self.get_member(&id)?;
         let key = member.get_key().clone();
         let feature = member.get_feature();
+        self.add_member_to_owner_key_index(owner.clone(), id);
         let member_map = self
             .owner_members
             .entry(owner.clone())
