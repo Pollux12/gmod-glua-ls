@@ -19,45 +19,32 @@
   - `crates/schema_to_glua`: schema-to-annotation conversion helpers.
   - `tools/schema_json_gen`: schema generator binary used by CI drift checks.
 - Runtime flow is parser → analysis/indexing → LS/CLI consumers.
-- Analysis pipeline order is in `crates/glua_code_analysis/src/compilation/analyzer/mod.rs`.
-  - GMod analysis is conditionally inserted via `gmod::GmodAnalysisPipeline` when `emmyrc.gmod.enabled` is true.
-- GMod inference implementation lives in `crates/glua_code_analysis/src/compilation/analyzer/gmod/mod.rs`.
-- GMod metadata persistence is in `crates/glua_code_analysis/src/db_index/` (`gmod_*` indexes).
+- Analysis pipeline (in `crates/glua_code_analysis/src/compilation/analyzer/mod.rs`):
+  `Decl → Doc → Flow → Lua → Gmod → AccessorFunc synthesis → UnResolve → [DynamicField if inferDynamicFields]`
 - Note that we've added multi-workspace support for our language server. You need to make sure that any changes you make will support workspaces with different configurations, with each being isolated.
 
-## Work Routing (Where To Implement Changes)
-- Parser/grammar/AST/CST: `crates/glua_parser/src/`.
-- Type inference, diagnostics, indexing, GMod realm/hooks/system metadata: `crates/glua_code_analysis/src/`.
-- LSP protocol behavior, workspace lifecycle, watched files, client capabilities: `crates/glua_ls/src/`.
-- CLI diagnostics behavior/output/arg parsing: `crates/glua_check/src/`.
-- Documentation generation flow/templates: `crates/glua_doc_cli/src/` + `crates/glua_doc_cli/template/`.
-
-## GMod-First Invariants (Do Not Regress)
-- Preserve defaults from `crates/glua_code_analysis/src/config/configs/gmod.rs`:
-  - `gmod.enabled = true`
-  - `gmod.defaultRealm = shared`
-  - scripted class include defaults: `entities/**`, `weapons/**`, `effects/**`, `weapons/gmod_tool/stools/**`, `plugins/**`
-- Preserve hook/realm behavior described in `docs/config.md` and `docs/annotations/hook.md`:
-  - method hooks: `GM:*`, `GAMEMODE:*`, `PLUGIN:*`, `SANDBOX:*`
-  - hook API parsing: `hook.Add`, `hook.Run`, `hook.Call`
-  - annotation hooks: `---@hook`
-  - realm inference from filename + dependency/call signals
-- Do not introduce generic-Lua fallback behavior that weakens GMod inference unless explicitly requested. Backwards compatibility with regular Lua is not required.
-- If changing GMod hook/realm logic, keep tests aligned:
-  - `crates/glua_code_analysis/src/compilation/test/gmod_realm_hook_test.rs`
-  - `crates/glua_code_analysis/src/compilation/test/gmod_scripted_class_test.rs`
-- All non-standard GMod operators should be treated as standard, with first-class support in completion/signature/diagnostics (C style operators)
+## GMod-Specific Logic
+- This is a Garry's Mod specific language server with no backwards compatibility requirements for use outside of Garry's Mod. All GMod behaviour needs to be treated as first-class, such as non-standard operators, hook/realm behavior, scripted class patterns, Garry's Mod annotation library treated same as stdlib, etc.
+- GMod inference implementation lives in `crates/glua_code_analysis/src/compilation/analyzer/gmod/mod.rs`.
+- GMod metadata persistence is in `crates/glua_code_analysis/src/db_index/`, e.g:
+  - `gmod_class/` — scripted class metadata
+  - `gmod_infer/` — GMod inference results
+  - `gmod_network/` — net.Start/net.Receive flow tracking for cross-realm diagnostics
+  - `dynamic_field/` — dynamically-assigned field tracking (when `gmod.inferDynamicFields` enabled)
+**Obscure Patterns:**
+- **Realm Inference**: `---@realm` annotation (highest priority) > filename/dir detection (`cl_`/`sv_`/`sh_` prefixes, `/lua/server/` parent dirs) > API dependency hints. Block-level narrowing via `if CLIENT`/`if SERVER` applies within files (stored as `branch_realm_ranges`).
+- **Accessor Synthesis**: `AccessorFunc()` calls synthesize `GetPropertyName()` and `SetPropertyName()` methods on the target class. The `---@accessorfunc` annotation marks a function as an accessor generator (providing metadata like custom param index).
+- **Network Profiling**: Matches `net.Start(name)` writes with `net.Receive(name)` reads across files/realms to diagnose type/order mismatches.
+- **Scripted Classes**: Automatically detects ENT/SWEP/EFFECT classes based on file path patterns (e.g., `entities/**`).
 
 ## Config and Schema Rules
 - Configuration entry points are `.gluarc.json` (exclusive priority when present), otherwise `.luarc.json` → `.emmyrc.json` → `.emmyrc.lua`.
-- LS config priority is implemented in `crates/glua_ls/src/context/workspace_manager.rs`:
-  - global home config → global config-dir (`gluals`) config → `$GLUALS_CONFIG` → local workspace config.
-  - for merged LS config, the first workspace root with local config is preferred for scalar fields; selected list-like fields are extend-unique merged from additional roots.
+- VSCode extension provides schema and custom settings menu for editing `.gluarc.json` config files.
 - For new config options, update all of these together:
   - code: `crates/glua_code_analysis/src/config/**`
   - schema: `crates/glua_code_analysis/resources/schema.json`
   - docs: `docs/config.md` (and any detailed docs under `docs/config/` if applicable)
-- Keep schema generation clean: `cargo run --bin schema_json_gen` must not leave a git diff.
+- Run schema generation after any config changes: `cargo run --bin schema_json_gen`
 - Make sure all config is documented in `docs/config.md`.
 
 ## Build, Test, and Validation Commands
@@ -70,31 +57,6 @@
 - Pre-commit checks: `pre-commit run --all --hook-stage manual`
 - Spell check in CI: `typos`
 - Cargo is installed in local system and is within path. If you get an error stating it is missing, try use direct path workaround e.g: `& "$env:USERPROFILE\.cargo\bin\cargo.exe"` but ONLY if cargo does not work by itself.
-
-## Code Style and Conventions
-- Rust edition is `2024`; `rustfmt.toml` uses `max_width = 100`, 4 spaces.
-- Follow workspace lint policy in `Cargo.toml` + thresholds in `.clippy.toml` - prehook used to enforce style
-- Match crate structure style:
-  - private `mod` declarations
-  - deliberate `pub use` re-exports from crate roots
-  - examples: `crates/glua_parser/src/lib.rs`, `crates/glua_code_analysis/src/lib.rs`
-- Keep i18n pattern consistent where present:
-  - `rust_i18n::i18n!("./locales", fallback = "en")`
-  - used by parser/analysis/ls crate roots
-- Prefer crate-local boundaries over cross-crate leaking of internals.
-
-## Integration Points
-- LSP protocol: `lsp-server` + `emmy_lsp_types` in `glua_ls`.
-- Async/runtime and IO: `tokio`, `tokio-util`, `notify`.
-- Parser tree infra: `rowan`.
-- Config/data formats: `serde`, `serde_json`, `schemars`.
-- Schema-to-annotation path: `schema_to_glua` consumed by analysis crate.
-- External formatter options are documented in `docs/config.md` (`format` section).
-
-## High-Risk Areas
-- `glua_code_analysis` denies panic/unwrap patterns in non-test builds (`clippy::panic`, `clippy::unwrap_used`, etc.).
-- `EmmyLuaAnalysis` has manual thread-safety boundaries (`unsafe impl Send/Sync`) in `crates/glua_code_analysis/src/lib.rs`; treat related changes as high risk.
-- `update_schema` fetches remote schema URLs via `reqwest`; treat network/file schema sources as untrusted input.
 
 ## Testing Patterns (How This Repo Verifies Behavior)
 - We use the standard Rust testing harness with [googletest-rust](https://github.com/google/googletest-rust/). Prefer `#[gtest]` over `#[test]` in repository test modules.
@@ -109,5 +71,6 @@
 - For GMod realm/path-sensitive tests, use realistic addon or gamemode style paths.
 
 **IMPORTANT**
-- When using your file read tool, read entire files unless the file is extremely large - read at least 1000 lines at a time to be efficient.
-- Do not use your terminal tool unless no other tool can accomplish the same task. For example, rather than using terminal for search or reading, consider if another tool is available that can do the job more effectively. Specialised tools will always be more effective than generic terminal commands. If you get no results from your search tools, it may be due to the relevant file being git ignored - make sure you're using the correct options within your given tools.
+- You shouldn't read files unless you're confident that file is relevant - use semantic search and other search tools to narrow down relevant files before any read operation. If you think you'll need to read a file multiple times, read the entire file once to save on tool calls, rather than reading small chunks of the same file. If you already have a file or relevant code in context, you don't need to read it again unless it has been modified.
+- Do not use your terminal tool unless no other tool can accomplish the same task. For example, rather than using terminal for search, writing or reading operations, consider if another specialised tool is available that can do the job more effectively. Specialised tools will always be more effective than generic terminal commands. For example, always prefer semantic search over terminal grep search.
+- All documentation, including this file, should be treated as non-comprehensive and potentially outdated. Always verify information by checking relevant code rather than assuming it is correct. This document is a guide to help you get oriented and understand the general structure and patterns of the repository.

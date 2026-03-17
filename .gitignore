@@ -3,7 +3,9 @@
 .cursor
 dhat-heap.json
 .claude
-
-# MCP, 用于为AI提供lsp上下文
+.opencode
 .serena
 .agents/skills/
+
+# CocoIndex Code (ccc)
+/.cocoindex_code/
