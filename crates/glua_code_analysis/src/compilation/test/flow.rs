@@ -2024,4 +2024,75 @@ _2 = a[1]
 
         assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
     }
+
+    /// Regression test: calling a method on an UNRELATED local variable in an early-return
+    /// guard should NOT corrupt the type of another variable (`ent` in this case).
+    /// When `parent:GetIsLocked()` cannot be inferred (e.g. method not in API), the
+    /// FieldNotFound error must not propagate and wipe out `ent`'s type.
+    #[test]
+    fn test_early_return_on_unrelated_method_call_does_not_corrupt_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class MyEntity
+            ---@field GetParent fun(self): MyEntity
+            ---@field GetAbsVelocity fun(self): void
+
+            ---@return MyEntity
+            local function Entity(idx) end
+
+            local ent = Entity(1)
+            local parent = ent:GetParent()
+
+            -- GetIsLocked is intentionally NOT defined on MyEntity,
+            -- simulating a method that is absent from the API definitions.
+            if not parent:GetIsLocked() then return end
+
+            -- 'ent' must still be MyEntity here, not unknown
+            a = ent
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_eq!(desc, "MyEntity");
+    }
+
+    /// Same pattern but wrapped in an outer conditional, matching the exact
+    /// shape reported in the bug report.
+    #[test]
+    fn test_early_return_on_unrelated_method_call_nested_does_not_corrupt_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class MyEntity
+            ---@field GetParent fun(self): MyEntity
+            ---@field GetAbsVelocity fun(self): void
+
+            ---@return MyEntity
+            local function Entity(idx) end
+
+            local SERVER = true
+
+            if SERVER then
+                local ent = Entity(1)
+                local parent = ent:GetParent()
+
+                if not parent:GetIsLocked() then return end
+
+                if not ent then return end
+
+                if ent then
+                    a = ent
+                end
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_eq!(desc, "MyEntity");
+    }
 }

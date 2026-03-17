@@ -146,7 +146,10 @@ pub fn get_type_at_flow(
             }
             FlowNodeKind::TrueCondition(condition_ptr) => {
                 let condition = condition_ptr.to_node(root).ok_or(InferFailReason::None)?;
-                let result_or_continue = get_type_at_condition_flow(
+                // Errors in condition evaluation (e.g. method not found) must not
+                // propagate and corrupt the type of unrelated variables.  Treat them
+                // as "condition cannot be used for narrowing" and fall through.
+                let result_or_continue = match get_type_at_condition_flow(
                     db,
                     tree,
                     cache,
@@ -155,7 +158,10 @@ pub fn get_type_at_flow(
                     flow_node,
                     condition,
                     InferConditionFlow::TrueCondition,
-                )?;
+                ) {
+                    Ok(r) => r,
+                    Err(_) => ResultTypeOrContinue::Continue,
+                };
 
                 if let ResultTypeOrContinue::Result(condition_type) = result_or_continue {
                     result_type = condition_type;
@@ -166,7 +172,8 @@ pub fn get_type_at_flow(
             }
             FlowNodeKind::FalseCondition(condition_ptr) => {
                 let condition = condition_ptr.to_node(root).ok_or(InferFailReason::None)?;
-                let result_or_continue = get_type_at_condition_flow(
+                // Same defensive handling as TrueCondition above.
+                let result_or_continue = match get_type_at_condition_flow(
                     db,
                     tree,
                     cache,
@@ -175,7 +182,10 @@ pub fn get_type_at_flow(
                     flow_node,
                     condition,
                     InferConditionFlow::FalseCondition,
-                )?;
+                ) {
+                    Ok(r) => r,
+                    Err(_) => ResultTypeOrContinue::Continue,
+                };
 
                 if let ResultTypeOrContinue::Result(condition_type) = result_or_continue {
                     result_type = condition_type;

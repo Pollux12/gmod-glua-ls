@@ -36,7 +36,12 @@ pub fn get_type_at_call_expr(
     let call_expr_ref = call_expr.clone();
     let prefix_expr_ref = prefix_expr.clone();
 
-    let maybe_func = infer_expr(db, cache, prefix_expr.clone())?;
+    // If we can't infer the function type (e.g. method not found on the type), we
+    // cannot narrow — return Continue instead of propagating the error, which would
+    // corrupt the inferred type of unrelated variables further up the flow chain.
+    let Ok(maybe_func) = infer_expr(db, cache, prefix_expr.clone()) else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
     let result = match maybe_func {
         LuaType::DocFunction(f) => {
             let return_type = f.get_ret();
