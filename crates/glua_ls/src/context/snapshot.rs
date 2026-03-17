@@ -8,8 +8,7 @@ use lsp_types::Uri;
 use crate::context::lsp_features::LspFeatures;
 
 use super::{
-    client::ClientProxy, debounced_analysis::DebouncedAnalysis,
-    editor_display_cache::EditorDisplayCache, file_diagnostic::FileDiagnostic,
+    client::ClientProxy, debounced_analysis::DebouncedAnalysis, file_diagnostic::FileDiagnostic,
     status_bar::StatusBar, workspace_manager::WorkspaceManager,
 };
 
@@ -50,10 +49,6 @@ impl ServerContextSnapshot {
 
     pub fn file_diagnostic(&self) -> &FileDiagnostic {
         &self.inner.file_diagnostic
-    }
-
-    pub fn editor_display_cache(&self) -> &EditorDisplayCache {
-        &self.inner.editor_display_cache
     }
 
     pub fn workspace_manager(&self) -> &RwLock<WorkspaceManager> {
@@ -197,7 +192,6 @@ pub struct ServerContextInner {
     pub analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     pub client: Arc<ClientProxy>,
     pub file_diagnostic: Arc<FileDiagnostic>,
-    pub editor_display_cache: Arc<EditorDisplayCache>,
     pub workspace_manager: Arc<RwLock<WorkspaceManager>>,
     pub status_bar: Arc<StatusBar>,
     pub lsp_features: Arc<LspFeatures>,

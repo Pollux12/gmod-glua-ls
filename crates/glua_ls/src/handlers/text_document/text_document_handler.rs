@@ -454,7 +454,6 @@ pub async fn on_did_close_document(
 ) -> Option<()> {
     let uri = &params.text_document.uri;
     context.file_diagnostic().clear_recent_edit(uri).await;
-    context.editor_display_cache().remove_uri(uri).await;
     let lsp_features = context.lsp_features();
     let (encoding, interval) = {
         let analysis = context.analysis().read().await;

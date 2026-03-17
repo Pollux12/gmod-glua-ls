@@ -98,9 +98,6 @@ pub async fn on_did_change_watched_files(
                 .await;
         }
     }
-    for uri in &deleted_lua_uris {
-        context.editor_display_cache().remove_uri(uri).await;
-    }
 
     context
         .file_diagnostic()

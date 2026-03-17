@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use super::{ClientProxy, EditorDisplayCache, FileDiagnostic, StatusBar};
+use super::{ClientProxy, FileDiagnostic, StatusBar};
 use crate::codestyle::{apply_editorconfig_file, apply_workspace_code_style};
 use crate::context::lsp_features::LspFeatures;
 use crate::handlers::{ClientConfig, init_analysis};
@@ -24,7 +24,6 @@ pub struct WorkspaceManager {
     status_bar: Arc<StatusBar>,
     update_token: Arc<Mutex<Option<Arc<ReindexToken>>>>,
     file_diagnostic: Arc<FileDiagnostic>,
-    editor_display_cache: Arc<EditorDisplayCache>,
     lsp_features: Arc<LspFeatures>,
     pub client_config: ClientConfig,
     pub workspace_folders: Vec<WorkspaceFolder>,
@@ -41,7 +40,6 @@ impl WorkspaceManager {
         client: Arc<ClientProxy>,
         status_bar: Arc<StatusBar>,
         file_diagnostic: Arc<FileDiagnostic>,
-        editor_display_cache: Arc<EditorDisplayCache>,
         lsp_features: Arc<LspFeatures>,
     ) -> Self {
         Self {
@@ -52,7 +50,6 @@ impl WorkspaceManager {
             workspace_folders: Vec::new(),
             update_token: Arc::new(Mutex::new(None)),
             file_diagnostic,
-            editor_display_cache,
             lsp_features,
             watcher: None,
             current_open_files: HashSet::new(),
@@ -94,7 +91,6 @@ impl WorkspaceManager {
         let client_config = self.client_config.clone();
         let status_bar = self.status_bar.clone();
         let file_diagnostic = self.file_diagnostic.clone();
-        let editor_display_cache = self.editor_display_cache.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
@@ -117,7 +113,6 @@ impl WorkspaceManager {
                 loaded.workspace_emmyrcs,
             )
             .await;
-            editor_display_cache.clear().await;
             client.refresh_semantic_tokens();
             client.refresh_inlay_hints();
             if lsp_features.supports_workspace_diagnostic() {
@@ -141,7 +136,6 @@ impl WorkspaceManager {
         let workspace_folders = self.workspace_folders.clone();
         let status_bar = self.status_bar.clone();
         let file_diagnostic = self.file_diagnostic.clone();
-        let editor_display_cache = self.editor_display_cache.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
         let workspace_diagnostic_status = self.workspace_diagnostic_level.clone();
@@ -162,7 +156,6 @@ impl WorkspaceManager {
 
             // Cancel diagnostics and update status without holding analysis lock
             file_diagnostic.cancel_workspace_diagnostic().await;
-            editor_display_cache.clear().await;
             workspace_diagnostic_status
                 .store(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::Release);
 
@@ -203,7 +196,6 @@ impl WorkspaceManager {
         drop(update_token);
         let analysis = self.analysis.clone();
         let file_diagnostic = self.file_diagnostic.clone();
-        let editor_display_cache = self.editor_display_cache.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
         let workspace_diagnostic_status = self.workspace_diagnostic_level.clone();
@@ -223,7 +215,6 @@ impl WorkspaceManager {
 
             // Cancel diagnostics and update status without holding analysis lock
             file_diagnostic.cancel_workspace_diagnostic().await;
-            editor_display_cache.clear().await;
             workspace_diagnostic_status
                 .store(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::Release);
 

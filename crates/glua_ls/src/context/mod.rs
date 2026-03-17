@@ -2,7 +2,6 @@ mod client;
 mod client_id;
 mod debounced_analysis;
 mod did_change_coalescer;
-mod editor_display_cache;
 mod file_diagnostic;
 mod lsp_features;
 mod snapshot;
@@ -13,7 +12,6 @@ pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
 pub use debounced_analysis::DebouncedAnalysis;
 pub use did_change_coalescer::DidChangeCoalescer;
-pub use editor_display_cache::EditorDisplayCache;
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
 pub use lsp_features::LspFeatures;
@@ -39,7 +37,7 @@ use crate::context::snapshot::ServerContextInner;
 // ## Global Lock Order (Low to High Priority):
 // 1. **diagnostic_tokens** (Mutex) - File diagnostic task tokens
 // 2. **workspace_diagnostic_token** (Mutex) - Workspace diagnostic task token
-// 3. **cached_file_diagnostics / recently_edited_lines / editor_display_cache** (Mutex) - UI state
+// 3. **cached_file_diagnostics / recently_edited_lines** (Mutex) - UI state
 // 4. **update_token** (Mutex) - Reindex/config update token
 // 5. **analysis** (RwLock - READ) - Read-only access to EmmyLuaAnalysis
 // 6. **workspace_manager** (RwLock - READ) - Read-only access to WorkspaceManager
@@ -161,14 +159,12 @@ impl ServerContext {
             status_bar.clone(),
             client.clone(),
         ));
-        let editor_display_cache = Arc::new(EditorDisplayCache::new());
         let lsp_features = Arc::new(LspFeatures::new(client_capabilities));
         let workspace_manager = Arc::new(RwLock::new(WorkspaceManager::new(
             analysis.clone(),
             client.clone(),
             status_bar.clone(),
             file_diagnostic.clone(),
-            editor_display_cache.clone(),
             lsp_features.clone(),
         )));
         let debounced_shutdown = CancellationToken::new();
@@ -193,7 +189,6 @@ impl ServerContext {
             status_bar,
             lsp_features,
             debounced_analysis,
-            editor_display_cache,
             document_versions: Arc::new(Mutex::new(HashMap::new())),
             document_version_notify: Arc::new(Notify::new()),
         });
