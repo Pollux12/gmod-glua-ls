@@ -2025,6 +2025,84 @@ _2 = a[1]
         assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
     }
 
+    #[test]
+    fn test_isfunction_simple_var_narrows_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@type function?
+            local func = function() end
+            if isfunction(func) then
+                a = func
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let expected = ws.ty("function");
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn test_local_cached_isvalid_narrows_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local IsValid = IsValid
+            ---@type string?
+            local maybe = "string"
+            if IsValid(maybe) then
+                a = maybe
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let expected = ws.ty("string");
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn test_local_cached_isfunction_narrows_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local isfunction = isfunction
+            ---@type function?
+            local func = function() end
+            if isfunction(func) then
+                a = func
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let expected = ws.ty("function");
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn test_isstring_simple_var_narrows_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@type string?
+            local maybe = "hello"
+            if isstring(maybe) then
+                a = maybe
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let expected = ws.ty("string");
+        assert_eq!(a, expected);
+    }
+
     /// Regression test: calling a method on an UNRELATED local variable in an early-return
     /// guard should NOT corrupt the type of another variable (`ent` in this case).
     /// When `parent:GetIsLocked()` cannot be inferred (e.g. method not in API), the

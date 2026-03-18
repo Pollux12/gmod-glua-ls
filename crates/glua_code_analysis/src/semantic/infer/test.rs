@@ -70,10 +70,12 @@ mod test {
     }
 
     #[test]
-    fn test_isvalid_shadowed_local_no_narrow() {
+    fn test_isvalid_local_cached_still_narrows() {
         let mut ws = VirtualWorkspace::new();
 
-        assert!(!ws.check_code_for(
+        // `local IsValid = IsValid` (or a custom implementation) should still narrow,
+        // because the name "IsValid" is GMod-specific enough to treat as a nil guard.
+        assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
             ---@class Entity

@@ -169,6 +169,20 @@ pub fn get_type_at_call_expr(
         )? {
             return Ok(ResultTypeOrContinue::Result(isvalid_type));
         }
+
+        if let Some(istype_type) = try_narrow_istype_function(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            &call_expr_ref,
+            &prefix_expr_ref,
+            condition_flow,
+        )? {
+            return Ok(ResultTypeOrContinue::Result(istype_type));
+        }
     }
 
     result
@@ -191,16 +205,6 @@ fn try_narrow_isfunction_member(
     };
 
     if name_expr.get_name_text().as_deref() != Some("isfunction") {
-        return Ok(None);
-    }
-
-    // Ignore shadowed local isfunction.
-    if let Some(isfunction_ref_id) =
-        get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr.clone()))
-        && let VarRefId::VarRef(isfunction_decl_id) = isfunction_ref_id
-        && let Some(isfunction_decl) = db.get_decl_index().get_decl(&isfunction_decl_id)
-        && isfunction_decl.is_local()
-    {
         return Ok(None);
     }
 
@@ -624,18 +628,6 @@ fn try_narrow_isvalid(
             if name_expr.get_name_text().as_deref() != Some("IsValid") {
                 return Ok(None);
             }
-            if let Some(isvalid_ref_id) =
-                get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr.clone()))
-            {
-                let VarRefId::VarRef(isvalid_decl_id) = isvalid_ref_id else {
-                    return Ok(None);
-                };
-                if let Some(isvalid_decl) = db.get_decl_index().get_decl(&isvalid_decl_id)
-                    && isvalid_decl.is_local()
-                {
-                    return Ok(None);
-                }
-            }
             let arg_list = match call_expr.get_args_list() {
                 Some(list) => list,
                 None => return Ok(None),
@@ -670,6 +662,79 @@ fn try_narrow_isvalid(
         return Ok(None);
     };
     if target_ref_id != *var_ref_id {
+        return Ok(None);
+    }
+
+    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+
+    let result_type = match condition_flow {
+        InferConditionFlow::TrueCondition => remove_false_or_nil(antecedent_type),
+        InferConditionFlow::FalseCondition => antecedent_type,
+    };
+
+    Ok(Some(result_type))
+}
+
+/// Known GMod type-checking function names and their corresponding narrowed types.
+/// When `isfunction(x)` returns true, we know `x` is not nil/false.
+/// We use `remove_false_or_nil` rather than narrowing to a specific type, because
+/// these functions are commonly used as nil guards (e.g., `---@type function?` local f; if isfunction(f) then f() end).
+/// The TypeGuard annotation path provides more precise type narrowing when annotations are available.
+const ISTYPE_FUNCTION_NAMES: &[&str] = &[
+    "isfunction",
+    "isstring",
+    "isnumber",
+    "isbool",
+    "istable",
+    "isentity",
+    "isvector",
+    "isangle",
+    "ismatrix",
+    "ispanel",
+    "IsColor",
+    "IsEntity",
+];
+
+/// Detect `isfunction(x)`, `isstring(x)`, etc. calls and narrow the argument type
+/// to remove nil/false in the true branch. This handles the simple variable argument case
+/// that `try_narrow_isfunction_member` doesn't cover (it only handles `isfunction(obj.member)`).
+#[allow(clippy::too_many_arguments)]
+fn try_narrow_istype_function(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    call_expr: &LuaCallExpr,
+    prefix_expr: &LuaExpr,
+    condition_flow: InferConditionFlow,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return Ok(None);
+    };
+
+    let Some(name) = name_expr.get_name_text() else {
+        return Ok(None);
+    };
+
+    if !ISTYPE_FUNCTION_NAMES.contains(&name.as_str()) {
+        return Ok(None);
+    }
+
+    let Some(first_arg) = call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().next())
+    else {
+        return Ok(None);
+    };
+
+    // Check if the first argument matches the variable we're narrowing
+    let Some(arg_ref_id) = get_var_expr_var_ref_id(db, cache, first_arg) else {
+        return Ok(None);
+    };
+    if arg_ref_id != *var_ref_id {
         return Ok(None);
     }
 
