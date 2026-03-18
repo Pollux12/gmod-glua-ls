@@ -26,6 +26,23 @@ pub fn get_member_map_in_workspace_for_file(
     build_member_map(members)
 }
 
+pub fn get_member_map_in_workspace_for_file_at_offset(
+    db: &DbIndex,
+    prefix_type: &LuaType,
+    workspace_id: WorkspaceId,
+    file_id: FileId,
+    caller_position: rowan::TextSize,
+) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+    let members = find_members::find_members_in_workspace_for_file_at_offset(
+        db,
+        prefix_type,
+        workspace_id,
+        file_id,
+        caller_position,
+    )?;
+    build_member_map(members)
+}
+
 fn build_member_map(
     members: Vec<LuaMemberInfo>,
 ) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {

@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use glua_code_analysis::{
-    AsyncState, FileId, InferGuard, LuaFunctionType, LuaMember, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaOperatorId, LuaOperatorMetaMethod, LuaSemanticDeclId, LuaType, LuaTypeDecl,
-    SemanticModel,
+    AsyncState, FileId, GmodRealm, InferGuard, LuaFunctionType, LuaMember, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaOperatorId, LuaOperatorMetaMethod, LuaOperatorOwner,
+    LuaSemanticDeclId, LuaType, LuaTypeDecl, SemanticModel, WorkspaceId,
 };
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
@@ -585,9 +586,13 @@ fn build_func_stat_override_hint(
             let member_key: LuaMemberKey = semantic_model.get_member_key(&index_key)?;
             let guard = InferGuard::new();
             for super_type in supers {
-                if let Some(member_id) =
-                    get_super_member_id(semantic_model, super_type, &member_key, &guard)
-                {
+                if let Some(member_id) = get_super_member_id(
+                    semantic_model,
+                    super_type,
+                    &member_key,
+                    &guard,
+                    index_expr.get_position(),
+                ) {
                     let member = semantic_model
                         .get_db()
                         .get_member_index()
@@ -634,6 +639,7 @@ pub fn get_super_member_id(
     super_type: LuaType,
     member_key: &LuaMemberKey,
     infer_guard: &InferGuard,
+    position_offset: rowan::TextSize,
 ) -> Option<LuaMemberId> {
     let super_type_id = match &super_type {
         LuaType::Ref(id) => id,
@@ -641,13 +647,15 @@ pub fn get_super_member_id(
         _ => return None,
     };
     infer_guard.check(super_type_id).ok()?;
-    let member_map = semantic_model.get_member_info_map(&super_type)?;
-
-    if let Some(member_infos) = member_map.get(member_key) {
-        let first_property = member_infos.first()?.property_owner_id.clone()?;
-        if let LuaSemanticDeclId::Member(member_id) = first_property {
-            return Some(member_id);
-        }
+    let member_infos = semantic_model.get_member_info_with_key_at_offset(
+        &super_type,
+        member_key.clone(),
+        true,
+        position_offset,
+    )?;
+    let first_property = member_infos.first()?.property_owner_id.clone()?;
+    if let LuaSemanticDeclId::Member(member_id) = first_property {
+        return Some(member_id);
     }
     None
 }
@@ -690,15 +698,16 @@ fn build_call_expr_meta_call_hint(
                 return Some(());
             }
 
-            let call_operator_ids = semantic_model
-                .get_db()
-                .get_operator_index()
-                .get_operators(&id.clone().into(), LuaOperatorMetaMethod::Call)?;
+            let call_operator_ids = get_visible_call_operator_ids(
+                semantic_model,
+                &id.clone().into(),
+                call_expr.get_position(),
+            )?;
 
             set_meta_call_part(
                 semantic_model,
                 result,
-                call_operator_ids,
+                &call_operator_ids,
                 call_expr,
                 semantic_info.typ,
             )?;
@@ -821,6 +830,78 @@ fn find_match_meta_call_operator_id(
     operator_ids.first().cloned().map(|id| (id, call_func))
 }
 
+fn get_visible_call_operator_ids(
+    semantic_model: &SemanticModel,
+    owner: &LuaOperatorOwner,
+    caller_position: rowan::TextSize,
+) -> Option<Vec<LuaOperatorId>> {
+    let operator_ids = semantic_model
+        .get_db()
+        .get_operator_index()
+        .get_operators(owner, LuaOperatorMetaMethod::Call)?;
+    let module_index = semantic_model.get_db().get_module_index();
+    let caller_file_id = semantic_model.get_file_id();
+    let caller_workspace_id = module_index.get_workspace_id(caller_file_id);
+
+    let mut priority_tiers = BTreeMap::new();
+    for operator_id in operator_ids {
+        let priority = match caller_workspace_id {
+            Some(caller_workspace_id) => {
+                let candidate_workspace_id = module_index
+                    .get_workspace_id(operator_id.file_id)
+                    .unwrap_or(WorkspaceId::MAIN);
+                let Some(priority) = module_index
+                    .workspace_resolution_priority(caller_workspace_id, candidate_workspace_id)
+                else {
+                    continue;
+                };
+                priority
+            }
+            None => 0,
+        };
+
+        priority_tiers
+            .entry(priority)
+            .or_insert_with(Vec::new)
+            .push(*operator_id);
+    }
+
+    let priority_tiers: Vec<(u8, Vec<LuaOperatorId>)> = priority_tiers.into_iter().collect();
+    let fallback_operator_ids = priority_tiers
+        .first()
+        .map(|(_, operator_ids)| operator_ids.clone())
+        .unwrap_or_default();
+
+    if !semantic_model.get_emmyrc().gmod.enabled {
+        return Some(fallback_operator_ids);
+    }
+
+    let infer_index = semantic_model.get_db().get_gmod_infer_index();
+    let caller_realm = infer_index.get_realm_at_offset(&caller_file_id, caller_position);
+    for (_, tier_operator_ids) in priority_tiers {
+        let compatible_operator_ids = tier_operator_ids
+            .into_iter()
+            .filter(|operator_id| {
+                let operator_realm =
+                    infer_index.get_realm_at_offset(&operator_id.file_id, operator_id.position);
+                is_operator_realm_compatible(caller_realm, operator_realm)
+            })
+            .collect::<Vec<_>>();
+        if !compatible_operator_ids.is_empty() {
+            return Some(compatible_operator_ids);
+        }
+    }
+
+    Some(fallback_operator_ids)
+}
+
+fn is_operator_realm_compatible(caller_realm: GmodRealm, candidate_realm: GmodRealm) -> bool {
+    !matches!(
+        (caller_realm, candidate_realm),
+        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
+    )
+}
+
 fn build_index_expr_hint(
     semantic_model: &SemanticModel,
     result: &mut Vec<InlayHint>,
@@ -841,7 +922,12 @@ fn build_index_expr_hint(
     let prefix_type = semantic_model.infer_expr(prefix_expr).ok()?;
     let member_key = semantic_model.get_member_key(&index_key)?;
 
-    let member_infos = semantic_model.get_member_info_with_key(&prefix_type, member_key, false)?;
+    let member_infos = semantic_model.get_member_info_with_key_at_offset(
+        &prefix_type,
+        member_key,
+        false,
+        index_expr.syntax().text_range().start(),
+    )?;
     let member_info = member_infos.first()?;
     // 尝试提取别名
     let alias = get_index_alias_name(semantic_model, member_info)?;

@@ -12,7 +12,9 @@ use crate::context::ServerContextSnapshot;
 use crate::util::{find_ref_at, resolve_ref_single};
 pub use build_hover::build_hover_content_for_completion;
 use build_hover::build_semantic_info_hover;
-pub use find_origin::{find_all_same_named_members, find_member_origin_owner};
+pub use find_origin::{
+    find_all_same_named_members, find_member_origin_owner, find_member_origin_owners,
+};
 use glua_code_analysis::{
     EmmyLuaAnalysis, FileId, GmodRealm, LuaMemberKey, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     WorkspaceId,
@@ -288,9 +290,12 @@ pub(crate) fn resolve_hook_property_owner(
 
     for owner_name in HOOK_OWNER_TYPES {
         let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_name));
-        let Some(member_infos) =
-            semantic_model.get_member_info_with_key(&owner_type, member_key.clone(), true)
-        else {
+        let Some(member_infos) = semantic_model.get_member_info_with_key_at_offset(
+            &owner_type,
+            member_key.clone(),
+            true,
+            position_offset,
+        ) else {
             continue;
         };
 

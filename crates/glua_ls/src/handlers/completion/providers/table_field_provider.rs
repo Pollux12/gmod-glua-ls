@@ -46,7 +46,9 @@ fn add_table_field_key_completion(builder: &mut CompletionBuilder) -> Option<()>
     let table_type = builder
         .semantic_model
         .infer_table_should_be(table_expr.clone())?;
-    let member_infos = builder.semantic_model.get_member_infos(&table_type)?;
+    let member_infos = builder
+        .semantic_model
+        .get_member_infos_at_offset(&table_type, builder.position_offset)?;
 
     let mut duplicated_set = HashSet::new();
     for field in table_expr.get_fields() {
@@ -232,7 +234,9 @@ fn add_table_field_value_completion(builder: &mut CompletionBuilder) -> Option<(
                     let key = builder
                         .semantic_model
                         .get_member_key(&field.get_field_key()?)?;
-                    let member_infos = builder.semantic_model.get_member_infos(&table_type)?;
+                    let member_infos = builder
+                        .semantic_model
+                        .get_member_infos_at_offset(&table_type, builder.position_offset)?;
                     let member_info = member_infos.iter().find(|m| m.key == key)?;
 
                     if add_field_value_completion(builder, member_info.clone()).is_some() {

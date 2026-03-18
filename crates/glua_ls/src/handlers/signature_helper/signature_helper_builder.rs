@@ -6,7 +6,7 @@ use lsp_types::{Documentation, MarkupContent, MarkupKind, ParameterInformation, 
 use rowan::NodeOrToken;
 
 use crate::handlers::hover::{
-    find_all_same_named_members, find_member_origin_owner, infer_prefix_global_name,
+    find_all_same_named_members, find_member_origin_owners, infer_prefix_global_name,
 };
 
 use super::build_signature_helper::{build_function_label, generate_param_label};
@@ -92,10 +92,17 @@ impl<'a> SignatureHelperBuilder<'a> {
         );
         // 推断为来源
         semantic_decl = match semantic_decl {
-            Some(LuaSemanticDeclId::Member(member_id)) => {
-                find_member_origin_owner(self.compilation, semantic_model, member_id)
-                    .or(semantic_decl)
-            }
+            Some(LuaSemanticDeclId::Member(member_id)) => find_member_origin_owners(
+                self.compilation,
+                semantic_model,
+                member_id,
+                false,
+                self.call_expr
+                    .as_ref()
+                    .map(|call_expr| call_expr.get_position()),
+            )
+            .get_first()
+            .or(semantic_decl),
             Some(LuaSemanticDeclId::LuaDecl(_)) => semantic_decl,
             _ => None,
         };
@@ -114,8 +121,13 @@ impl<'a> SignatureHelperBuilder<'a> {
         }
 
         if self.description.is_none()
-            && let Some(same_named_members) =
-                find_all_same_named_members(semantic_model, &Some(semantic_decl.clone()))
+            && let Some(same_named_members) = find_all_same_named_members(
+                semantic_model,
+                &Some(semantic_decl.clone()),
+                self.call_expr
+                    .as_ref()
+                    .map(|call_expr| call_expr.get_position()),
+            )
         {
             for candidate_decl in same_named_members {
                 if candidate_decl == semantic_decl {

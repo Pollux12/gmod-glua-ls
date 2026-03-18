@@ -533,6 +533,36 @@ mod test {
     }
 
     #[test]
+    fn test_constructor_special_call_works_for_colon_defined_api() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            local Factory = {}
+
+            ---@generic T
+            ---@[constructor("__init")]
+            ---@param name `T`
+            ---@return T
+            function Factory:build(name)
+            end
+
+            ---@class ColonCtorClass
+            local M = Factory:build("ColonCtorClass")
+
+            function M:__init()
+            end
+
+            A = M()
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        let expected = ws.ty("ColonCtorClass");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
     fn test_wrapped_constructor_cycle_does_not_infer_special_call() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

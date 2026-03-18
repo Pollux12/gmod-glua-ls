@@ -60,7 +60,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
 
     let mut member_info_map = builder
         .semantic_model
-        .get_member_info_map(&prefix_type)
+        .get_member_info_map_at_offset(&prefix_type, builder.position_offset)
         .unwrap_or_default();
     extend_gmod_hook_fallback_members(builder, &prefix_expr, &prefix_type, &mut member_info_map);
 
@@ -104,7 +104,10 @@ fn extend_gmod_hook_fallback_members(
 
     for owner_candidate in owner_candidates {
         let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_candidate));
-        let Some(fallback_map) = builder.semantic_model.get_member_info_map(&owner_type) else {
+        let Some(fallback_map) = builder
+            .semantic_model
+            .get_member_info_map_at_offset(&owner_type, builder.position_offset)
+        else {
             continue;
         };
 

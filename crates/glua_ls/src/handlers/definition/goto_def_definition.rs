@@ -16,7 +16,7 @@ use crate::{
         definition::goto_function::{
             find_function_call_origin, find_matching_function_definitions,
         },
-        hover::{find_all_same_named_members, find_member_origin_owner},
+        hover::{find_all_same_named_members, find_member_origin_owners},
     },
     util::{to_camel_case, to_pascal_case, to_snake_case},
 };
@@ -98,8 +98,11 @@ fn handle_member_definition(
     trigger_token: &LuaSyntaxToken,
     member_id: &LuaMemberId,
 ) -> Option<GotoDefinitionResponse> {
-    let same_named_members =
-        find_all_same_named_members(semantic_model, &Some(LuaSemanticDeclId::Member(*member_id)))?;
+    let same_named_members = find_all_same_named_members(
+        semantic_model,
+        &Some(LuaSemanticDeclId::Member(*member_id)),
+        Some(trigger_token.text_range().start()),
+    )?;
 
     let mut locations: Vec<Location> = Vec::new();
 
@@ -122,7 +125,12 @@ fn handle_member_definition(
             && let Some(location) = get_member_location(semantic_model, &member_id)
         {
             // 尝试添加访问器的位置
-            try_set_accessor_locations(semantic_model, &member, &mut locations);
+            try_set_accessor_locations(
+                semantic_model,
+                &member,
+                &mut locations,
+                trigger_token.text_range().start(),
+            );
             locations.push(location);
         }
     }
@@ -169,7 +177,15 @@ fn process_matched_members(
             LuaSemanticDeclId::Member(member_id) => {
                 if should_trace_member(semantic_model, member_id).unwrap_or(false) {
                     // 尝试搜索这个成员最原始的定义
-                    match find_member_origin_owner(compilation, semantic_model, *member_id) {
+                    match find_member_origin_owners(
+                        compilation,
+                        semantic_model,
+                        *member_id,
+                        false,
+                        None,
+                    )
+                    .get_first()
+                    {
                         Some(LuaSemanticDeclId::Member(origin_member_id)) => {
                             if let Some(location) =
                                 get_member_location(semantic_model, &origin_member_id)
@@ -340,14 +356,24 @@ pub fn find_instance_table_member(
             );
 
             if let Some(LuaSemanticDeclId::LuaDecl(decl_id)) = decl {
-                return find_member_in_table_const(semantic_model, &decl_id, member_key);
+                return find_member_in_table_const(
+                    semantic_model,
+                    &decl_id,
+                    member_key,
+                    trigger_token.text_range().start(),
+                );
             }
         }
         table_field_node if LuaTableField::can_cast(table_field_node.kind().into()) => {
             let table_field = LuaTableField::cast(table_field_node)?;
             let table_expr = table_field.get_parent::<LuaTableExpr>()?;
             let typ = semantic_model.infer_table_should_be(table_expr)?;
-            return semantic_model.get_member_info_with_key(&typ, member_key.clone(), true);
+            return semantic_model.get_member_info_with_key_at_offset(
+                &typ,
+                member_key.clone(),
+                true,
+                trigger_token.text_range().start(),
+            );
         }
         _ => {}
     }
@@ -359,6 +385,7 @@ fn find_member_in_table_const(
     semantic_model: &SemanticModel,
     decl_id: &LuaDeclId,
     member_key: &LuaMemberKey,
+    position_offset: rowan::TextSize,
 ) -> Option<Vec<LuaMemberInfo>> {
     let root = semantic_model
         .get_db()
@@ -378,7 +405,12 @@ fn find_member_in_table_const(
         .infer_expr(LuaExpr::TableExpr(table_expr))
         .ok()?;
 
-    semantic_model.get_member_info_with_key(&typ, member_key.clone(), true)
+    semantic_model.get_member_info_with_key_at_offset(
+        &typ,
+        member_key.clone(),
+        true,
+        position_offset,
+    )
 }
 
 /// 是否对 member 启动追踪
@@ -445,6 +477,7 @@ fn try_set_accessor_locations(
     semantic_model: &SemanticModel,
     semantic_decl_id: &LuaSemanticDeclId,
     locations: &mut Vec<Location>,
+    position_offset: rowan::TextSize,
 ) -> Option<()> {
     #[derive(Clone, Copy)]
     enum AccessorCaseConvention {
@@ -493,6 +526,7 @@ fn try_set_accessor_locations(
                 &prefix_type,
                 getter.as_str().into(),
                 locations,
+                position_offset,
             )
         } else {
             false
@@ -504,6 +538,7 @@ fn try_set_accessor_locations(
                 &prefix_type,
                 setter.as_str().into(),
                 locations,
+                position_offset,
             )
         } else {
             false
@@ -542,13 +577,25 @@ fn try_set_accessor_locations(
 
     if !has_getter {
         if let Some(getter_name) = convention.build_name("get", original_name) {
-            try_add_accessor_location(semantic_model, &prefix_type, getter_name, locations);
+            try_add_accessor_location(
+                semantic_model,
+                &prefix_type,
+                getter_name,
+                locations,
+                position_offset,
+            );
         }
     }
 
     if !has_setter {
         if let Some(setter_name) = convention.build_name("set", original_name) {
-            try_add_accessor_location(semantic_model, &prefix_type, setter_name, locations);
+            try_add_accessor_location(
+                semantic_model,
+                &prefix_type,
+                setter_name,
+                locations,
+                position_offset,
+            );
         }
     }
 
@@ -561,11 +608,15 @@ fn try_add_accessor_location(
     prefix_type: &LuaType,
     accessor_name: String,
     locations: &mut Vec<Location>,
+    position_offset: rowan::TextSize,
 ) -> bool {
     let accessor_key = LuaMemberKey::Name(accessor_name.as_str().into());
-    if let Some(member_infos) =
-        semantic_model.get_member_info_with_key(prefix_type, accessor_key, false)
-    {
+    if let Some(member_infos) = semantic_model.get_member_info_with_key_at_offset(
+        prefix_type,
+        accessor_key,
+        false,
+        position_offset,
+    ) {
         if let Some(member_info) = member_infos.first()
             && let Some(LuaSemanticDeclId::Member(accessor_id)) = member_info.property_owner_id
             && let Some(location) = get_member_location(semantic_model, &accessor_id)

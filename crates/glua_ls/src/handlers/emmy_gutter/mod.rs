@@ -108,9 +108,13 @@ fn build_func_override_gutter_info(
             let member_key: LuaMemberKey = semantic_model.get_member_key(&index_key)?;
             let guard = InferGuard::new();
             for super_type in supers {
-                if let Some(member_id) =
-                    get_super_member_id(semantic_model, super_type, &member_key, &guard)
-                {
+                if let Some(member_id) = get_super_member_id(
+                    semantic_model,
+                    super_type,
+                    &member_key,
+                    &guard,
+                    index_expr.get_position(),
+                ) {
                     let member = semantic_model
                         .get_db()
                         .get_member_index()

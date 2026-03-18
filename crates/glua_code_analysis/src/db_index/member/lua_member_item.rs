@@ -66,6 +66,36 @@ impl LuaMemberIndexItem {
         matches!(self, LuaMemberIndexItem::One(_))
     }
 
+    pub fn visible_member_ids_with_realm(
+        &self,
+        db: &DbIndex,
+        caller_file_id: &FileId,
+    ) -> Vec<LuaMemberId> {
+        let member_ids = self.get_member_ids();
+        let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &member_ids);
+        select_member_ids_by_workspace_and_realm(
+            db,
+            priority_tiers,
+            infer_caller_file_realm(db, caller_file_id),
+        )
+    }
+
+    pub fn visible_member_ids_with_realm_at_offset(
+        &self,
+        db: &DbIndex,
+        caller_file_id: &FileId,
+        caller_position: TextSize,
+    ) -> Vec<LuaMemberId> {
+        let member_ids = self.get_member_ids();
+        let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &member_ids);
+        select_member_ids_by_workspace_and_realm(
+            db,
+            priority_tiers,
+            db.get_gmod_infer_index()
+                .get_realm_at_offset(caller_file_id, caller_position),
+        )
+    }
+
     pub fn get_member_ids(&self) -> Vec<LuaMemberId> {
         match self {
             LuaMemberIndexItem::One(member_id) => vec![*member_id],
@@ -167,13 +197,7 @@ fn resolve_member_type_with_realm(
     member_item: &LuaMemberIndexItem,
     caller_file_id: &FileId,
 ) -> Result<LuaType, InferFailReason> {
-    let member_ids = member_item.get_member_ids();
-    let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &member_ids);
-    let visible_member_ids = select_member_ids_by_workspace_and_realm(
-        db,
-        priority_tiers,
-        infer_caller_file_realm(db, caller_file_id),
-    );
+    let visible_member_ids = member_item.visible_member_ids_with_realm(db, caller_file_id);
     if visible_member_ids.is_empty() {
         return resolve_member_type(db, &LuaMemberIndexItem::Many(vec![]));
     }
@@ -187,14 +211,8 @@ fn resolve_member_type_with_realm_at_offset(
     caller_file_id: &FileId,
     caller_position: TextSize,
 ) -> Result<LuaType, InferFailReason> {
-    let member_ids = member_item.get_member_ids();
-    let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &member_ids);
-    let visible_member_ids = select_member_ids_by_workspace_and_realm(
-        db,
-        priority_tiers,
-        db.get_gmod_infer_index()
-            .get_realm_at_offset(caller_file_id, caller_position),
-    );
+    let visible_member_ids =
+        member_item.visible_member_ids_with_realm_at_offset(db, caller_file_id, caller_position);
     if visible_member_ids.is_empty() {
         return resolve_member_type(db, &LuaMemberIndexItem::Many(vec![]));
     }
@@ -207,13 +225,7 @@ fn resolve_member_semantic_id_with_realm(
     member_item: &LuaMemberIndexItem,
     caller_file_id: &FileId,
 ) -> Option<LuaSemanticDeclId> {
-    let member_ids = member_item.get_member_ids();
-    let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &member_ids);
-    let visible_member_ids = select_member_ids_by_workspace_and_realm(
-        db,
-        priority_tiers,
-        infer_caller_file_realm(db, caller_file_id),
-    );
+    let visible_member_ids = member_item.visible_member_ids_with_realm(db, caller_file_id);
 
     resolve_member_semantic_id(db, &member_item_from_ids(visible_member_ids))
 }
@@ -224,14 +236,8 @@ fn resolve_member_semantic_id_with_realm_at_offset(
     caller_file_id: &FileId,
     caller_position: TextSize,
 ) -> Option<LuaSemanticDeclId> {
-    let member_ids = member_item.get_member_ids();
-    let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &member_ids);
-    let visible_member_ids = select_member_ids_by_workspace_and_realm(
-        db,
-        priority_tiers,
-        db.get_gmod_infer_index()
-            .get_realm_at_offset(caller_file_id, caller_position),
-    );
+    let visible_member_ids =
+        member_item.visible_member_ids_with_realm_at_offset(db, caller_file_id, caller_position);
 
     resolve_member_semantic_id(db, &member_item_from_ids(visible_member_ids))
 }

@@ -5,6 +5,7 @@ use glua_code_analysis::{
     LuaType, LuaUnionType, SemanticDeclLevel, SemanticModel,
 };
 use glua_parser::{LuaAssignStat, LuaAstNode, LuaSyntaxKind, LuaTableExpr, LuaTableField};
+use rowan::TextSize;
 
 #[derive(Debug, Clone)]
 pub enum DeclOriginResult {
@@ -78,7 +79,7 @@ pub fn find_decl_origin_owners(
         let semantic_decl = semantic_model.find_decl(node.into(), SemanticDeclLevel::default());
         match semantic_decl {
             Some(LuaSemanticDeclId::Member(member_id)) => {
-                find_member_origin_owners(compilation, semantic_model, member_id, true)
+                find_member_origin_owners(compilation, semantic_model, member_id, true, None)
             }
             Some(LuaSemanticDeclId::LuaDecl(decl_id)) => {
                 DeclOriginResult::Single(LuaSemanticDeclId::LuaDecl(decl_id))
@@ -95,6 +96,7 @@ pub fn find_member_origin_owners(
     semantic_model: &SemanticModel,
     member_id: LuaMemberId,
     find_all: bool,
+    usage_position: Option<TextSize>,
 ) -> DeclOriginResult {
     const MAX_ITERATIONS: usize = 50;
     let mut visited_members = HashSet::new();
@@ -131,7 +133,8 @@ pub fn find_member_origin_owners(
     }
 
     // 如果存在多个同名成员, 则返回多个成员
-    if let Some(same_named_members) = find_all_same_named_members(semantic_model, &final_owner)
+    if let Some(same_named_members) =
+        find_all_same_named_members(semantic_model, &final_owner, usage_position)
         && same_named_members.len() > 1
     {
         return DeclOriginResult::Multiple(same_named_members);
@@ -145,12 +148,13 @@ pub fn find_member_origin_owner(
     semantic_model: &SemanticModel,
     member_id: LuaMemberId,
 ) -> Option<LuaSemanticDeclId> {
-    find_member_origin_owners(compilation, semantic_model, member_id, false).get_first()
+    find_member_origin_owners(compilation, semantic_model, member_id, false, None).get_first()
 }
 
 pub fn find_all_same_named_members(
     semantic_model: &SemanticModel,
     final_owner: &Option<LuaSemanticDeclId>,
+    position_offset: Option<rowan::TextSize>,
 ) -> Option<Vec<LuaSemanticDeclId>> {
     let final_owner = final_owner.as_ref()?;
     let member_id = match final_owner {
@@ -179,11 +183,20 @@ pub fn find_all_same_named_members(
 
     match current_owner {
         LuaMemberOwner::Type(type_decl_id) => {
-            let members = semantic_model.get_member_info_with_key(
-                &LuaType::Def(type_decl_id.clone()),
-                target_key,
-                true,
-            )?;
+            let members = if let Some(position_offset) = position_offset {
+                semantic_model.get_member_info_with_key_at_offset(
+                    &LuaType::Def(type_decl_id.clone()),
+                    target_key,
+                    true,
+                    position_offset,
+                )?
+            } else {
+                semantic_model.get_member_info_with_key(
+                    &LuaType::Def(type_decl_id.clone()),
+                    target_key,
+                    true,
+                )?
+            };
 
             for member_info in members {
                 if let Some(LuaSemanticDeclId::Member(member_id)) = member_info.property_owner_id {
@@ -192,13 +205,39 @@ pub fn find_all_same_named_members(
             }
         }
         _ => {
-            let all_members = semantic_model
+            if let Some(member_item) = semantic_model
                 .get_db()
                 .get_member_index()
-                .get_members(current_owner)?;
-            for member in all_members {
-                if member.get_key() == &target_key {
-                    push_member(member.get_id());
+                .get_member_item(current_owner, &target_key)
+            {
+                let visible_member_ids = position_offset.map_or_else(
+                    || {
+                        member_item.visible_member_ids_with_realm(
+                            semantic_model.get_db(),
+                            &semantic_model.get_file_id(),
+                        )
+                    },
+                    |position_offset| {
+                        member_item.visible_member_ids_with_realm_at_offset(
+                            semantic_model.get_db(),
+                            &semantic_model.get_file_id(),
+                            position_offset,
+                        )
+                    },
+                );
+
+                for member_id in visible_member_ids {
+                    push_member(member_id);
+                }
+            } else {
+                let all_members = semantic_model
+                    .get_db()
+                    .get_member_index()
+                    .get_members(current_owner)?;
+                for member in all_members {
+                    if member.get_key() == &target_key {
+                        push_member(member.get_id());
+                    }
                 }
             }
         }
@@ -308,7 +347,12 @@ fn resolve_table_field_through_type_inference(
 
     let field_key = table_field.get_field_key()?;
     let key = semantic_model.get_member_key(&field_key)?;
-    let member_infos = semantic_model.get_member_info_with_key(&table_type, key, false)?;
+    let member_infos = semantic_model.get_member_info_with_key_at_offset(
+        &table_type,
+        key,
+        false,
+        table_field.syntax().text_range().start(),
+    )?;
     member_infos
         .first()
         .cloned()

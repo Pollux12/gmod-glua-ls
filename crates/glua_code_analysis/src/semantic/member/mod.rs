@@ -11,10 +11,14 @@ use crate::{
 };
 pub use find_index::find_index_operations;
 pub use find_members::{
-    find_members, find_members_in_workspace_for_file, find_members_with_key,
-    find_members_with_key_in_workspace_for_file,
+    find_members, find_members_in_workspace_for_file, find_members_in_workspace_for_file_at_offset,
+    find_members_with_key, find_members_with_key_in_workspace_for_file,
+    find_members_with_key_in_workspace_for_file_at_offset,
 };
-pub use get_member_map::{get_member_map, get_member_map_in_workspace_for_file};
+pub use get_member_map::{
+    get_member_map, get_member_map_in_workspace_for_file,
+    get_member_map_in_workspace_for_file_at_offset,
+};
 use glua_parser::{LuaAssignStat, LuaAstNode, LuaSyntaxKind, LuaTableExpr, LuaTableField};
 pub use infer_raw_member::infer_raw_member_type;
 
@@ -59,10 +63,28 @@ pub fn find_member_origin_owner(
     infer_config: &mut LuaInferCache,
     member_id: LuaMemberId,
 ) -> Option<LuaSemanticDeclId> {
+    find_member_origin_owner_inner(db, infer_config, member_id, None)
+}
+
+pub fn find_member_origin_owner_at_offset(
+    db: &DbIndex,
+    infer_config: &mut LuaInferCache,
+    member_id: LuaMemberId,
+    caller_position: rowan::TextSize,
+) -> Option<LuaSemanticDeclId> {
+    find_member_origin_owner_inner(db, infer_config, member_id, Some(caller_position))
+}
+
+fn find_member_origin_owner_inner(
+    db: &DbIndex,
+    infer_config: &mut LuaInferCache,
+    member_id: LuaMemberId,
+    caller_position: Option<rowan::TextSize>,
+) -> Option<LuaSemanticDeclId> {
     const MAX_ITERATIONS: usize = 50;
     let mut visited_members = HashSet::new();
 
-    let mut current_owner = resolve_member_owner(db, infer_config, &member_id);
+    let mut current_owner = resolve_member_owner(db, infer_config, &member_id, caller_position);
     let mut final_owner = current_owner.clone();
     let mut iteration_count = 0;
 
@@ -74,7 +96,7 @@ pub fn find_member_origin_owner(
         visited_members.insert(*current_member_id);
         iteration_count += 1;
 
-        match resolve_member_owner(db, infer_config, current_member_id) {
+        match resolve_member_owner(db, infer_config, current_member_id, caller_position) {
             Some(next_owner) => {
                 final_owner = Some(next_owner.clone());
                 current_owner = Some(next_owner);
@@ -90,6 +112,7 @@ fn resolve_member_owner(
     db: &DbIndex,
     infer_config: &mut LuaInferCache,
     member_id: &LuaMemberId,
+    caller_position: Option<rowan::TextSize>,
 ) -> Option<LuaSemanticDeclId> {
     let root = db
         .get_vfs()
@@ -101,9 +124,12 @@ fn resolve_member_owner(
             if LuaTableField::can_cast(current_node.kind().into()) {
                 let table_field = LuaTableField::cast(current_node.clone())?;
                 // 如果表是类, 那么通过类型推断获取 owner
-                if let Some(owner_id) =
-                    resolve_table_field_through_type_inference(db, infer_config, &table_field)
-                {
+                if let Some(owner_id) = resolve_table_field_through_type_inference(
+                    db,
+                    infer_config,
+                    &table_field,
+                    caller_position,
+                ) {
                     return Some(owner_id);
                 }
                 // 非类, 那么通过右值推断
@@ -140,6 +166,7 @@ fn resolve_table_field_through_type_inference(
     db: &DbIndex,
     infer_config: &mut LuaInferCache,
     table_field: &LuaTableField,
+    caller_position: Option<rowan::TextSize>,
 ) -> Option<LuaSemanticDeclId> {
     let parent = table_field.syntax().parent()?;
     let table_expr = LuaTableExpr::cast(parent)?;
@@ -151,7 +178,30 @@ fn resolve_table_field_through_type_inference(
 
     let field_key = table_field.get_field_key()?;
     let key = LuaMemberKey::from_index_key(db, infer_config, &field_key).ok()?;
-    let member_infos = find_members_with_key(db, &table_type, key, false)?;
+    let caller_file_id = infer_config.get_file_id();
+    let workspace_id = db.get_module_index().get_workspace_id(caller_file_id);
+    let member_infos = match (workspace_id, caller_position) {
+        (Some(workspace_id), Some(caller_position)) => {
+            find_members_with_key_in_workspace_for_file_at_offset(
+                db,
+                &table_type,
+                key,
+                false,
+                workspace_id,
+                caller_file_id,
+                caller_position,
+            )?
+        }
+        (Some(workspace_id), None) => find_members_with_key_in_workspace_for_file(
+            db,
+            &table_type,
+            key,
+            false,
+            workspace_id,
+            caller_file_id,
+        )?,
+        (None, _) => find_members_with_key(db, &table_type, key, false)?,
+    };
 
     member_infos
         .first()

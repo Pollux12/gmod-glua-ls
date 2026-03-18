@@ -42,7 +42,9 @@ pub use visibility::check_export_visibility;
 use visibility::check_visibility;
 
 pub use crate::semantic::member::{
-    find_members_with_key, find_members_with_key_in_workspace_for_file,
+    find_member_origin_owner_at_offset, find_members_with_key,
+    find_members_with_key_in_workspace_for_file,
+    find_members_with_key_in_workspace_for_file_at_offset,
 };
 use crate::semantic::type_check::check_type_compact_detail;
 use crate::{Emmyrc, LuaDocument, LuaSemanticDeclId, ModuleInfo, db_index::LuaTypeDeclId};
@@ -165,6 +167,25 @@ impl<'a> SemanticModel<'a> {
         find_members(self.db, prefix_type)
     }
 
+    pub fn get_member_infos_at_offset(
+        &self,
+        prefix_type: &LuaType,
+        position_offset: rowan::TextSize,
+    ) -> Option<Vec<LuaMemberInfo>> {
+        let module_index = self.db.get_module_index();
+        if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
+            return member::find_members_in_workspace_for_file_at_offset(
+                self.db,
+                prefix_type,
+                workspace_id,
+                self.file_id,
+                position_offset,
+            );
+        }
+
+        find_members(self.db, prefix_type)
+    }
+
     pub fn get_member_info_with_key(
         &self,
         prefix_type: &LuaType,
@@ -186,6 +207,29 @@ impl<'a> SemanticModel<'a> {
         find_members_with_key(self.db, prefix_type, member_key, find_all)
     }
 
+    pub fn get_member_info_with_key_at_offset(
+        &self,
+        prefix_type: &LuaType,
+        member_key: LuaMemberKey,
+        find_all: bool,
+        position_offset: rowan::TextSize,
+    ) -> Option<Vec<LuaMemberInfo>> {
+        let module_index = self.db.get_module_index();
+        if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
+            return member::find_members_with_key_in_workspace_for_file_at_offset(
+                self.db,
+                prefix_type,
+                member_key,
+                find_all,
+                workspace_id,
+                self.file_id,
+                position_offset,
+            );
+        }
+
+        find_members_with_key(self.db, prefix_type, member_key, find_all)
+    }
+
     pub fn get_member_info_map(
         &self,
         prefix_type: &LuaType,
@@ -197,6 +241,25 @@ impl<'a> SemanticModel<'a> {
                 prefix_type,
                 workspace_id,
                 self.file_id,
+            );
+        }
+
+        get_member_map(self.db, prefix_type)
+    }
+
+    pub fn get_member_info_map_at_offset(
+        &self,
+        prefix_type: &LuaType,
+        position_offset: rowan::TextSize,
+    ) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+        let module_index = self.db.get_module_index();
+        if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
+            return member::get_member_map_in_workspace_for_file_at_offset(
+                self.db,
+                prefix_type,
+                workspace_id,
+                self.file_id,
+                position_offset,
             );
         }
 
@@ -364,6 +427,19 @@ impl<'a> SemanticModel<'a> {
 
     pub fn get_member_origin_owner(&self, member_id: LuaMemberId) -> Option<LuaSemanticDeclId> {
         find_member_origin_owner(self.db, &mut self.infer_cache.borrow_mut(), member_id)
+    }
+
+    pub fn get_member_origin_owner_at_offset(
+        &self,
+        member_id: LuaMemberId,
+        position_offset: rowan::TextSize,
+    ) -> Option<LuaSemanticDeclId> {
+        find_member_origin_owner_at_offset(
+            self.db,
+            &mut self.infer_cache.borrow_mut(),
+            member_id,
+            position_offset,
+        )
     }
 
     pub fn get_index_decl_type(&self, index_expr: LuaIndexExpr) -> Option<LuaType> {

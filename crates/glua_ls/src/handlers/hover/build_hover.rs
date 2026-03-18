@@ -310,9 +310,16 @@ fn build_member_hover(
     is_completion: bool,
 ) -> Option<()> {
     let member = db.get_member_index().get_member(&member_id)?;
-    let mut semantic_decls =
-        find_member_origin_owners(builder.compilation, builder.semantic_model, member_id, true)
-            .get_types(builder.semantic_model);
+    let mut semantic_decls = find_member_origin_owners(
+        builder.compilation,
+        builder.semantic_model,
+        member_id,
+        true,
+        builder
+            .get_trigger_token()
+            .map(|token| token.text_range().start()),
+    )
+    .get_types(builder.semantic_model);
     let should_render_as_function = is_function(&typ)
         || semantic_decls
             .iter()
@@ -492,13 +499,25 @@ fn extend_gmod_hook_semantic_decls(
     }
 
     let member_key = member.get_key().clone();
+    let trigger_position = builder
+        .get_trigger_token()
+        .map(|token| token.text_range().start());
     for fallback_owner_name in fallback_owner_names {
         let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
-        let Some(member_infos) = builder.semantic_model.get_member_info_with_key(
-            &fallback_type,
-            member_key.clone(),
-            true,
-        ) else {
+        let member_infos = match trigger_position {
+            Some(trigger_position) => builder.semantic_model.get_member_info_with_key_at_offset(
+                &fallback_type,
+                member_key.clone(),
+                true,
+                trigger_position,
+            ),
+            None => builder.semantic_model.get_member_info_with_key(
+                &fallback_type,
+                member_key.clone(),
+                true,
+            ),
+        };
+        let Some(member_infos) = member_infos else {
             continue;
         };
 

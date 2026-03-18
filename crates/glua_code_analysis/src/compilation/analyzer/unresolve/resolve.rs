@@ -1,4 +1,8 @@
-use std::{collections::HashSet, ops::Deref, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Deref,
+    sync::Arc,
+};
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
@@ -392,14 +396,14 @@ fn collect_special_call_param_infos_for_prefix_inner(
         return Ok(param_infos);
     }
 
-    let operator_param_infos = collect_special_call_param_infos_from_callable_operators(
+    let operator_collection = collect_special_call_param_infos_from_callable_operators(
         db,
         caller_file_id,
         caller_position,
         &callable_type,
     );
-    if !operator_param_infos.is_empty() {
-        return Ok(operator_param_infos);
+    if operator_collection.had_operators {
+        return Ok(operator_collection.param_infos);
     }
 
     let call_func = infer_call_expr_func(
@@ -530,7 +534,7 @@ fn collect_special_call_param_infos_from_callable_operators(
     caller_file_id: FileId,
     caller_position: rowan::TextSize,
     callable_type: &LuaType,
-) -> Vec<SpecialCallParamInfo> {
+) -> SpecialCallOperatorCollection {
     match callable_type {
         LuaType::TableConst(in_file_range) => db
             .get_metatable_index()
@@ -564,43 +568,43 @@ fn collect_special_call_param_infos_from_callable_operators(
             caller_position,
             inner,
         ),
-        LuaType::Union(union) => union
-            .into_vec()
-            .iter()
-            .flat_map(|union_type| {
-                collect_special_call_param_infos_from_callable_operators(
+        LuaType::Union(union) => union.into_vec().iter().fold(
+            SpecialCallOperatorCollection::default(),
+            |mut collection, union_type| {
+                collection.extend(collect_special_call_param_infos_from_callable_operators(
                     db,
                     caller_file_id,
                     caller_position,
                     union_type,
-                )
-            })
-            .collect(),
-        LuaType::Intersection(intersection) => intersection
-            .get_types()
-            .iter()
-            .flat_map(|intersection_type| {
-                collect_special_call_param_infos_from_callable_operators(
+                ));
+                collection
+            },
+        ),
+        LuaType::Intersection(intersection) => intersection.get_types().iter().fold(
+            SpecialCallOperatorCollection::default(),
+            |mut collection, intersection_type| {
+                collection.extend(collect_special_call_param_infos_from_callable_operators(
                     db,
                     caller_file_id,
                     caller_position,
                     intersection_type,
-                )
-            })
-            .collect(),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .flat_map(|(union_type, _)| {
-                collect_special_call_param_infos_from_callable_operators(
+                ));
+                collection
+            },
+        ),
+        LuaType::MultiLineUnion(union) => union.get_unions().iter().fold(
+            SpecialCallOperatorCollection::default(),
+            |mut collection, (union_type, _)| {
+                collection.extend(collect_special_call_param_infos_from_callable_operators(
                     db,
                     caller_file_id,
                     caller_position,
                     union_type,
-                )
-            })
-            .collect(),
-        _ => Vec::new(),
+                ));
+                collection
+            },
+        ),
+        _ => SpecialCallOperatorCollection::default(),
     }
 }
 
@@ -609,23 +613,28 @@ fn collect_special_call_param_infos_from_operator_owner(
     caller_file_id: FileId,
     caller_position: rowan::TextSize,
     owner: &LuaOperatorOwner,
-) -> Vec<SpecialCallParamInfo> {
+) -> SpecialCallOperatorCollection {
     let Some(operator_ids) = db
         .get_operator_index()
         .get_operators(owner, LuaOperatorMetaMethod::Call)
     else {
-        return Vec::new();
+        return SpecialCallOperatorCollection::default();
     };
 
-    operator_ids
+    let priority_tiers = get_operator_id_priority_tiers(db, caller_file_id, operator_ids);
+    let visible_operator_ids = select_operator_ids_by_workspace_and_realm(
+        db,
+        caller_file_id,
+        caller_position,
+        priority_tiers,
+    );
+
+    let param_infos = visible_operator_ids
         .iter()
         .flat_map(|operator_id| {
             let Some(operator) = db.get_operator_index().get_operator(operator_id) else {
                 return Vec::new();
             };
-            if !is_operator_visible_to(db, caller_file_id, caller_position, operator) {
-                return Vec::new();
-            }
 
             match operator.get_operator_func(db) {
                 LuaType::Signature(signature_id) => db
@@ -645,56 +654,96 @@ fn collect_special_call_param_infos_from_operator_owner(
                 _ => Vec::new(),
             }
         })
-        .collect()
+        .collect();
+
+    SpecialCallOperatorCollection {
+        param_infos,
+        had_operators: true,
+    }
+}
+
+#[derive(Debug, Default)]
+struct SpecialCallOperatorCollection {
+    param_infos: Vec<SpecialCallParamInfo>,
+    had_operators: bool,
+}
+
+impl SpecialCallOperatorCollection {
+    fn extend(&mut self, other: SpecialCallOperatorCollection) {
+        self.had_operators |= other.had_operators;
+        self.param_infos.extend(other.param_infos);
+    }
+}
+
+fn get_operator_id_priority_tiers(
+    db: &DbIndex,
+    caller_file_id: FileId,
+    operator_ids: &[crate::LuaOperatorId],
+) -> Vec<(u8, Vec<crate::LuaOperatorId>)> {
+    let module_index = db.get_module_index();
+    let Some(caller_workspace_id) = module_index.get_workspace_id(caller_file_id) else {
+        return vec![(0, operator_ids.to_vec())];
+    };
+
+    let mut priority_tiers = BTreeMap::new();
+    for operator_id in operator_ids {
+        let candidate_workspace_id = module_index
+            .get_workspace_id(operator_id.file_id)
+            .unwrap_or(crate::WorkspaceId::MAIN);
+        let Some(priority) =
+            module_index.workspace_resolution_priority(caller_workspace_id, candidate_workspace_id)
+        else {
+            continue;
+        };
+
+        priority_tiers
+            .entry(priority)
+            .or_insert_with(Vec::new)
+            .push(*operator_id);
+    }
+
+    priority_tiers.into_iter().collect()
+}
+
+fn select_operator_ids_by_workspace_and_realm(
+    db: &DbIndex,
+    caller_file_id: FileId,
+    caller_position: rowan::TextSize,
+    priority_tiers: Vec<(u8, Vec<crate::LuaOperatorId>)>,
+) -> Vec<crate::LuaOperatorId> {
+    let fallback_operator_ids = priority_tiers
+        .first()
+        .map(|(_, operator_ids)| operator_ids.clone())
+        .unwrap_or_default();
+
+    if !db.get_emmyrc().gmod.enabled {
+        return fallback_operator_ids;
+    }
+
+    let infer_index = db.get_gmod_infer_index();
+    let caller_realm = infer_index.get_realm_at_offset(&caller_file_id, caller_position);
+    for (_, tier_operator_ids) in priority_tiers {
+        let compatible_operator_ids = tier_operator_ids
+            .into_iter()
+            .filter(|operator_id| {
+                let operator_realm =
+                    infer_index.get_realm_at_offset(&operator_id.file_id, operator_id.position);
+                is_realm_compatible(caller_realm, operator_realm)
+            })
+            .collect::<Vec<_>>();
+        if !compatible_operator_ids.is_empty() {
+            return compatible_operator_ids;
+        }
+    }
+
+    fallback_operator_ids
 }
 
 fn should_strip_first_operator_param(is_colon_define: bool, owner: &LuaOperatorOwner) -> bool {
     matches!(owner, LuaOperatorOwner::Type(_)) && !is_colon_define
 }
 
-fn is_operator_visible_to(
-    db: &DbIndex,
-    caller_file_id: FileId,
-    caller_position: rowan::TextSize,
-    operator: &LuaOperator,
-) -> bool {
-    let module_index = db.get_module_index();
-    if let Some(caller_workspace_id) = module_index.get_workspace_id(caller_file_id) {
-        let candidate_workspace_id = module_index
-            .get_workspace_id(operator.get_file_id())
-            .unwrap_or(crate::WorkspaceId::MAIN);
-        if module_index
-            .workspace_resolution_priority(caller_workspace_id, candidate_workspace_id)
-            .is_none()
-        {
-            return false;
-        }
-    }
-
-    is_realm_compatible(
-        db,
-        caller_file_id,
-        caller_position,
-        operator.get_file_id(),
-        operator.get_range().start(),
-    )
-}
-
-fn is_realm_compatible(
-    db: &DbIndex,
-    caller_file_id: FileId,
-    caller_position: rowan::TextSize,
-    candidate_file_id: FileId,
-    candidate_position: rowan::TextSize,
-) -> bool {
-    if !db.get_emmyrc().gmod.enabled {
-        return true;
-    }
-
-    let infer_index = db.get_gmod_infer_index();
-    let caller_realm = infer_index.get_realm_at_offset(&caller_file_id, caller_position);
-    let candidate_realm = infer_index.get_realm_at_offset(&candidate_file_id, candidate_position);
-
+fn is_realm_compatible(caller_realm: GmodRealm, candidate_realm: GmodRealm) -> bool {
     !matches!(
         (caller_realm, candidate_realm),
         (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
@@ -1014,16 +1063,22 @@ fn try_resolve_constructor_param(
         .get_module_index()
         .get_workspace_id(file_id)
         .and_then(|workspace_id| {
-            crate::semantic::find_members_with_key_in_workspace_for_file(
+            crate::semantic::find_members_with_key_in_workspace_for_file_at_offset(
                 db,
                 &target_type,
                 member_key.clone(),
-                false,
+                true,
                 workspace_id,
                 file_id,
+                call_expr.get_position(),
             )
         })
-        .or_else(|| find_members_with_key(db, &target_type, member_key, false))
+        .or_else(|| {
+            db.get_module_index()
+                .get_workspace_id(file_id)
+                .is_none()
+                .then(|| find_members_with_key(db, &target_type, member_key, true))?
+        })
         .ok_or(InferFailReason::FieldNotFound)?;
     let ctor_signature_member = members.first().ok_or(InferFailReason::FieldNotFound)?;
 
@@ -1129,7 +1184,8 @@ fn get_call_arg_expr(
     is_colon_call: bool,
 ) -> Option<LuaExpr> {
     let arg_idx = match (is_colon_define, is_colon_call) {
-        (true, true) => param_idx.checked_sub(1)?,
+        (true, false) => param_idx.checked_add(1)?,
+        (false, true) => param_idx.checked_sub(1)?,
         _ => param_idx,
     };
     call_expr.get_args_list()?.get_args().nth(arg_idx)
@@ -1143,5 +1199,192 @@ fn infer_string_const_arg(
     match infer_expr(db, cache, arg_expr.clone()).ok()? {
         LuaType::StringConst(s) => Some(s.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use rowan::{TextRange, TextSize};
+
+    use super::{get_operator_id_priority_tiers, select_operator_ids_by_workspace_and_realm};
+    use crate::{
+        DbIndex, FileId, GmodRealm, GmodRealmFileMetadata, InFiled, LuaOperator,
+        LuaOperatorMetaMethod, LuaOperatorOwner, LuaType, LuaTypeDeclId, WorkspaceId,
+        db_index::{AsyncState, LuaFunctionType, OperatorFunction, WorkspaceKind},
+    };
+
+    fn make_db() -> DbIndex {
+        let mut db = DbIndex::new();
+        db.get_module_index_mut()
+            .set_module_extract_patterns(["?.lua".to_string(), "?/init.lua".to_string()].to_vec());
+        db
+    }
+
+    fn add_call_operator(
+        db: &mut DbIndex,
+        owner: &LuaOperatorOwner,
+        file_id: FileId,
+        start: u32,
+    ) -> crate::LuaOperatorId {
+        let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
+        let operator = LuaOperator::new(
+            owner.clone(),
+            LuaOperatorMetaMethod::Call,
+            file_id,
+            range,
+            OperatorFunction::Func(std::sync::Arc::new(LuaFunctionType::new(
+                AsyncState::None,
+                false,
+                false,
+                vec![("arg".to_string(), Some(LuaType::String))],
+                LuaType::Boolean,
+            ))),
+        );
+        let id = operator.get_id();
+        db.get_operator_index_mut().add_operator(operator);
+        id
+    }
+
+    fn set_file_realms(db: &mut DbIndex, file_realms: &[(FileId, GmodRealm)]) {
+        db.get_gmod_infer_index_mut().set_all_realm_file_metadata(
+            file_realms
+                .iter()
+                .map(|(file_id, realm)| {
+                    (
+                        *file_id,
+                        GmodRealmFileMetadata {
+                            inferred_realm: *realm,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn operator_id_priority_tiers_keep_workspace_priority_order() {
+        let mut db = make_db();
+        let module_index = db.get_module_index_mut();
+
+        let workspace_a = WorkspaceId::MAIN;
+        let workspace_b = WorkspaceId { id: 3 };
+        let library_workspace = WorkspaceId { id: 4 };
+
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectA").into(),
+            workspace_a,
+            WorkspaceKind::Main,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectB").into(),
+            workspace_b,
+            WorkspaceKind::Main,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectA/lua/lib").into(),
+            library_workspace,
+            WorkspaceKind::Library,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/.lua/std").into(),
+            WorkspaceId::STD,
+            WorkspaceKind::Std,
+        );
+
+        let caller_file = FileId::new(1);
+        module_index.add_module_by_path(caller_file, "C:/Users/username/ProjectA/init.lua");
+
+        let library_file = FileId::new(2);
+        module_index.add_module_by_path(
+            library_file,
+            "C:/Users/username/ProjectA/lua/lib/shared.lua",
+        );
+
+        let std_file = FileId::new(3);
+        module_index.add_module_by_path(std_file, "C:/Users/username/.lua/std/math.lua");
+
+        let other_main_file = FileId::new(4);
+        module_index.add_module_by_path(other_main_file, "C:/Users/username/ProjectB/init.lua");
+
+        let owner = LuaOperatorOwner::Type(LuaTypeDeclId::global("Callable"));
+        let library_operator = add_call_operator(&mut db, &owner, library_file, 1);
+        let std_operator = add_call_operator(&mut db, &owner, std_file, 2);
+        let _other_main_operator = add_call_operator(&mut db, &owner, other_main_file, 3);
+
+        let tiers = get_operator_id_priority_tiers(
+            &db,
+            caller_file,
+            &[library_operator, std_operator, _other_main_operator],
+        );
+
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0], (1, vec![library_operator]));
+        assert_eq!(tiers[1], (2, vec![std_operator]));
+    }
+
+    #[test]
+    fn select_operator_ids_by_workspace_and_realm_uses_first_compatible_tier() {
+        let mut db = make_db();
+        let caller_file = FileId::new(1);
+        let owner = LuaOperatorOwner::Table(InFiled::new(
+            FileId::new(99),
+            TextRange::new(TextSize::new(0), TextSize::new(1)),
+        ));
+        let tier_one_operator = add_call_operator(&mut db, &owner, FileId::new(10), 1);
+        let tier_two_operator = add_call_operator(&mut db, &owner, FileId::new(11), 2);
+
+        set_file_realms(
+            &mut db,
+            &[
+                (caller_file, GmodRealm::Client),
+                (tier_one_operator.file_id, GmodRealm::Shared),
+                (tier_two_operator.file_id, GmodRealm::Server),
+            ],
+        );
+
+        let selected = select_operator_ids_by_workspace_and_realm(
+            &db,
+            caller_file,
+            TextSize::new(0),
+            vec![(0, vec![tier_one_operator]), (1, vec![tier_two_operator])],
+        );
+
+        assert_eq!(selected, vec![tier_one_operator]);
+    }
+
+    #[test]
+    fn select_operator_ids_by_workspace_and_realm_falls_back_to_best_tier_when_needed() {
+        let mut db = make_db();
+        let caller_file = FileId::new(1);
+        let owner = LuaOperatorOwner::Table(InFiled::new(
+            FileId::new(99),
+            TextRange::new(TextSize::new(0), TextSize::new(1)),
+        ));
+        let best_tier_operator = add_call_operator(&mut db, &owner, FileId::new(20), 1);
+        let lower_tier_operator = add_call_operator(&mut db, &owner, FileId::new(21), 2);
+
+        set_file_realms(
+            &mut db,
+            &[
+                (caller_file, GmodRealm::Client),
+                (best_tier_operator.file_id, GmodRealm::Server),
+                (lower_tier_operator.file_id, GmodRealm::Server),
+            ],
+        );
+
+        let selected = select_operator_ids_by_workspace_and_realm(
+            &db,
+            caller_file,
+            TextSize::new(0),
+            vec![
+                (0, vec![best_tier_operator]),
+                (1, vec![lower_tier_operator]),
+            ],
+        );
+
+        assert_eq!(selected, vec![best_tier_operator]);
     }
 }
