@@ -17,7 +17,7 @@ pub use find_origin::{
 };
 use glua_code_analysis::{
     EmmyLuaAnalysis, FileId, GmodRealm, LuaMemberKey, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
-    WorkspaceId,
+    RenderLevel, WorkspaceId, humanize_type, resolve_gmod_hook_add_callback_doc_function,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaDocDescription, LuaLiteralExpr,
@@ -87,6 +87,28 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
         TokenAtOffset::None => return None,
     };
     match token {
+        function_kw if function_kw.kind() == LuaTokenKind::TkFunction.into() => {
+            // For `function` keyword tokens, check if this is a hook.Add callback first.
+            // If so, show hook-specific hover (signature + description) instead of generic
+            // keyword docs.
+            if let Some(hook_callback_hover) = hover_gmod_hook_callback_function(
+                analysis,
+                &semantic_model,
+                file_id,
+                position_offset,
+                &function_kw,
+            ) {
+                return Some(hook_callback_hover);
+            }
+            let document = semantic_model.get_document();
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: lsp_types::MarkupKind::Markdown,
+                    value: hover_keyword(function_kw.clone()),
+                }),
+                range: document.to_lsp_range(function_kw.text_range()),
+            })
+        }
         keywords if is_keyword(keywords.clone()) => {
             let document = semantic_model.get_document();
             Some(Hover {
@@ -154,16 +176,6 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
                 &token,
             ) {
                 return Some(hook_hover);
-            }
-
-            if let Some(hook_callback_hover) = hover_gmod_hook_callback_function(
-                analysis,
-                &semantic_model,
-                file_id,
-                position_offset,
-                &token,
-            ) {
-                return Some(hook_callback_hover);
             }
 
             let semantic_info = semantic_model.get_semantic_info(token.clone().into())?;
@@ -236,9 +248,8 @@ fn hover_gmod_hook_callback_function(
         return None;
     }
 
-    if token.kind() != LuaTokenKind::TkFunction.into() {
-        return None;
-    }
+    // This function is only called from the TkFunction dispatch arm, so the
+    // token kind is already guaranteed. No redundant check needed here.
 
     let closure_expr = glua_parser::LuaClosureExpr::cast(token.parent()?)?;
     let call_arg_list = closure_expr.get_parent::<LuaCallArgList>()?;
@@ -249,15 +260,16 @@ fn hover_gmod_hook_callback_function(
         return None;
     }
 
-    let mut param_idx = 0;
-    for (idx, arg) in call_arg_list.get_args().enumerate() {
-        if arg.syntax() == closure_expr.syntax() {
-            param_idx = idx;
-            break;
-        }
-    }
+    // Use text range comparison instead of syntax node identity to robustly
+    // locate the closure's position in the argument list across traversal paths.
+    let closure_range = closure_expr.syntax().text_range();
+    let param_idx = call_arg_list
+        .get_args()
+        .enumerate()
+        .find(|(_, arg)| arg.syntax().text_range() == closure_range)
+        .map(|(idx, _)| idx);
 
-    if param_idx != 2 {
+    if param_idx != Some(2) {
         return None;
     }
 
@@ -266,12 +278,50 @@ fn hover_gmod_hook_callback_function(
         resolve_hook_property_owner(semantic_model, file_id, position_offset, &hook_name)?;
     let db = semantic_model.get_db();
     let document = semantic_model.get_document();
-    let builder = build_hover_content_for_completion(
+
+    // Build the base hover from the hook property owner (gives description, realm, param docs)
+    let mut builder = build_hover_content_for_completion(
         &analysis.compilation,
         semantic_model,
         db,
         property_owner,
     )?;
+
+    // Now override the primary type description with an anonymous callback signature,
+    // e.g. `function(ply: Player, seat: Vehicle) -> boolean`
+    // using the resolved callback doc function for this hook.
+    // param_idx == Some(2) is guaranteed by the guard above.
+    if let Some(callback_func) =
+        resolve_gmod_hook_add_callback_doc_function(db, &call_expr, 2, None, file_id)
+    {
+        let params_str = callback_func
+            .get_params()
+            .iter()
+            .map(|(name, ty)| {
+                if let Some(ty) = ty {
+                    format!("{}: {}", name, humanize_type(db, ty, RenderLevel::Simple))
+                } else {
+                    name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let ret = callback_func.get_ret();
+        // Show the return type if it is documented. Nil here means the hook signature has
+        // no @return annotation (filter_signature_type uses Nil as the default), so we
+        // suppress it to avoid a misleading "-> nil" in the hover.
+        let ret_str = if ret.is_nil() || ret.is_unknown() {
+            String::new()
+        } else {
+            format!(" -> {}", humanize_type(db, ret, RenderLevel::Simple))
+        };
+
+        builder.set_type_description(format!("function({}){}", params_str, ret_str));
+        // Clear overloads — an anonymous callback shouldn't show named overloads.
+        builder.signature_overload = None;
+    }
+
     builder.build_hover_result(document.to_lsp_range(token.text_range()))
 }
 
@@ -282,13 +332,27 @@ pub(crate) fn resolve_hook_property_owner(
     hook_name: &str,
 ) -> Option<LuaSemanticDeclId> {
     let member_key = LuaMemberKey::Name(hook_name.into());
-    let call_realm = semantic_model
-        .get_db()
+    let db = semantic_model.get_db();
+    let call_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, position_offset);
     let mut fallback = None;
 
-    for owner_name in HOOK_OWNER_TYPES {
+    // Build the full set of owner type names, matching the logic in iter_hook_owner_names()
+    // in resolve_closure.rs so that user-configured hook_mappings.method_prefixes are included.
+    let mut owner_names: Vec<String> = HOOK_OWNER_TYPES.iter().map(|s| s.to_string()).collect();
+    for prefix in &db.get_emmyrc().gmod.hook_mappings.method_prefixes {
+        let normalized = prefix.trim().trim_end_matches([':', '.']).to_string();
+        if !normalized.is_empty()
+            && !owner_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&normalized))
+        {
+            owner_names.push(normalized);
+        }
+    }
+
+    for owner_name in &owner_names {
         let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_name));
         let Some(member_infos) = semantic_model.get_member_info_with_key_at_offset(
             &owner_type,
@@ -341,7 +405,11 @@ fn is_hook_name_string_context(call_expr: &LuaCallExpr, literal_expr: LuaLiteral
 }
 
 fn matches_call_path(path: &str, target: &str) -> bool {
-    path == target || path.ends_with(&format!(".{target}")) || path.ends_with(&format!(":{target}"))
+    // All call sites pass a fully-qualified target (e.g. "hook.Add").
+    // get_access_path() also returns the full qualified path, so an exact equality check
+    // is both necessary and sufficient. A suffix check would produce false positives for
+    // paths like "mylib.hook.Add" when the target is "hook.Add".
+    path == target
 }
 
 fn is_realm_compatible(call_realm: GmodRealm, item_realm: GmodRealm) -> bool {

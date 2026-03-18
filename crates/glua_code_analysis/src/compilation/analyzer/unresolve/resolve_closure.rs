@@ -257,7 +257,7 @@ pub fn resolve_gmod_hook_add_callback_doc_function(
                 continue;
             };
             let Some(function_types) =
-                filter_signature_type(db, type_cache.as_type(), origin_signature_id.as_ref())
+                filter_signature_type(db, type_cache.as_type(), origin_signature_id.as_ref(), true)
             else {
                 continue;
             };
@@ -339,7 +339,11 @@ pub fn extract_hook_name(call_expr: &LuaCallExpr) -> Option<String> {
 }
 
 fn matches_call_path(path: &str, target: &str) -> bool {
-    path == target || path.ends_with(&format!(".{target}")) || path.ends_with(&format!(":{target}"))
+    // All call sites pass a fully-qualified target (e.g. "hook.Add").
+    // get_access_path() also returns the full qualified path, so an exact equality check
+    // is both necessary and sufficient. A suffix check would produce false positives for
+    // paths like "mylib.hook.Add" when the target is "hook.Add".
+    path == target
 }
 
 fn is_realm_compatible(call_realm: crate::GmodRealm, item_realm: crate::GmodRealm) -> bool {
@@ -657,6 +661,7 @@ fn filter_signature_type(
     db: &DbIndex,
     typ: &LuaType,
     origin_signature_id: Option<&LuaSignatureId>,
+    preserve_returns: bool,
 ) -> Option<Vec<Arc<LuaFunctionType>>> {
     let mut result: Vec<Arc<LuaFunctionType>> = Vec::new();
     let mut stack = Vec::new();
@@ -671,17 +676,31 @@ fn filter_signature_type(
                 // Skip the current closure's own signature to avoid self-reference
                 if origin_signature_id != Some(&sig_id) {
                     if let Some(sig) = db.get_signature_index().get(&sig_id) {
-                        // Convert annotated signature to DocFunction for param propagation only.
-                        // Use Nil return type so we don't force return constraints on closures
-                        // that monkey-patch existing functions (e.g. os.exit = function(...) end).
-                        if !sig.param_docs.is_empty() {
+                        // Convert annotated signature to DocFunction for param propagation.
+                        // When preserve_returns is false (monkey-patch path), only emit a
+                        // DocFunction when params are annotated — we want param propagation but
+                        // must NOT force a return constraint (could break os.exit-style patches).
+                        // When preserve_returns is true (hook hover path), emit even for return-
+                        // only hooks so that `@return`-annotated hooks with no params display
+                        // correctly as `function() -> boolean` rather than silently degrading.
+                        let has_useful_info = if preserve_returns {
+                            !sig.param_docs.is_empty() || !sig.get_return_type().is_nil()
+                        } else {
+                            !sig.param_docs.is_empty()
+                        };
+                        if has_useful_info {
                             let params = sig.get_type_params();
+                            let ret = if preserve_returns {
+                                sig.get_return_type()
+                            } else {
+                                LuaType::Nil
+                            };
                             let doc_func = LuaFunctionType::new(
                                 sig.async_state,
                                 sig.is_colon_define,
                                 sig.is_vararg,
                                 params,
-                                LuaType::Nil,
+                                ret,
                             );
                             result.push(Arc::new(doc_func));
                         }
@@ -695,8 +714,13 @@ fn filter_signature_type(
                 }
             }
             LuaType::Ref(type_ref_id) => {
-                guard.check(&type_ref_id).ok()?;
-                let type_decl = db.get_type_index().get_type_decl(&type_ref_id)?;
+                // On cycle, skip this type but continue accumulating other results.
+                if guard.check(&type_ref_id).is_err() {
+                    continue;
+                }
+                let Some(type_decl) = db.get_type_index().get_type_decl(&type_ref_id) else {
+                    continue;
+                };
                 if let Some(func) = type_decl.get_alias_origin(db, None) {
                     match func {
                         LuaType::DocFunction(f) => {
@@ -734,7 +758,9 @@ fn find_best_function_type(
     if let Ok(result) = find_decl_function_type(db, cache, prefix_type, index_member_expr) {
         if result.is_current_owner {
             // 对应当前类型下的声明, 我们需要过滤掉所有`signature`类型
-            if let Some(filtered_types) = filter_signature_type(db, &result.typ, origin_sig_id) {
+            if let Some(filtered_types) =
+                filter_signature_type(db, &result.typ, origin_sig_id, false)
+            {
                 match filtered_types.len() {
                     0 => {}
                     1 => return Some(LuaType::DocFunction(filtered_types[0].clone())),

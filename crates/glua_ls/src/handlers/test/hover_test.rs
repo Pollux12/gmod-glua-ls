@@ -1229,4 +1229,367 @@ mod tests {
 
         Ok(())
     }
+
+    /// Hovering the `function` keyword in a hook.Add callback should show the anonymous callback
+    /// signature (e.g. `function(ply: Player, seat: Vehicle) -> boolean`) and NOT the generic
+    /// "The function keyword is used to define a function..." keyword docs.
+    #[gtest]
+    fn test_hover_hook_add_callback_function_keyword_shows_hook_signature() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Player
+                ---@class Vehicle
+
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---Called when a player tries to enter a vehicle.
+                ---@param ply Player
+                ---@param veh Vehicle
+                ---@return boolean
+                function GM:CanPlayerEnterVehicle(ply, veh) end
+
+                hook = {}
+                ---@param eventName string
+                ---@param identifier any
+                ---@param func function
+                function hook.Add(eventName, identifier, func) end
+
+                hook.Add("CanPlayerEnterVehicle", "test", fu<??>nction(ply, veh) end)
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        // Must NOT show keyword docs
+        assert!(
+            !markup.value.contains("The function keyword"),
+            "hover should not show keyword docs for hook callback `function`, got: {}",
+            markup.value
+        );
+
+        // Must show an anonymous callback signature with param types
+        assert!(
+            markup.value.contains("function("),
+            "hover should show anonymous function signature, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Player"),
+            "hover should show Player param type in callback signature, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Vehicle"),
+            "hover should show Vehicle param type in callback signature, got: {}",
+            markup.value
+        );
+
+        // Must show the hook description
+        assert!(
+            markup
+                .value
+                .contains("Called when a player tries to enter a vehicle"),
+            "hover should include hook description, got: {}",
+            markup.value
+        );
+
+        // Must show the return type from the hook's @return annotation
+        assert!(
+            markup.value.contains("-> boolean"),
+            "hover should show `-> boolean` return type from hook annotation, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    /// Hovering the `function` keyword in a hook.Add callback should include the hook's return
+    /// type in the anonymous signature (e.g. `function(...) -> boolean`).
+    #[gtest]
+    fn test_hover_hook_add_callback_function_keyword_includes_return_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Player
+
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@param ply Player
+                ---@return boolean
+                function GM:PlayerConnect(ply) end
+
+                hook = {}
+                ---@param eventName string
+                ---@param identifier any
+                ---@param func function
+                function hook.Add(eventName, identifier, func) end
+
+                hook.Add("PlayerConnect", "test", fu<??>nction(ply) end)
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("-> boolean"),
+            "hover should include return type `-> boolean` in anonymous callback signature, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    /// Regression: hovering the hook-name string in hook.Add should still work correctly.
+    #[gtest]
+    fn test_hover_hook_add_string_still_works_after_callback_hover_fix() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@param ply Player
+                ---@return boolean
+                function GM:SomeHook(ply) end
+
+                hook = {}
+                ---@param eventName string
+                ---@param identifier any
+                ---@param func function
+                function hook.Add(eventName, identifier, func) end
+
+                hook.Add("SomeHo<??>ok", "test", function(ply) end)
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("SomeHook"),
+            "hook-name hover should still show hook function signature, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    /// When `gmod.enabled` is false, hovering the `function` keyword in a hook.Add call
+    /// should fall back to the generic keyword documentation.
+    #[gtest]
+    fn test_hover_hook_add_callback_function_keyword_fallback_when_gmod_disabled() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = false;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@param ply Player
+                ---@return boolean
+                function GM:SomeHook(ply) end
+
+                hook = {}
+                ---@param eventName string
+                ---@param identifier any
+                ---@param func function
+                function hook.Add(eventName, identifier, func) end
+
+                hook.Add("SomeHook", "test", fu<??>nction(ply) end)
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        // With gmod disabled, should show generic keyword hover, not hook-specific hover.
+        // The keyword docs contain the specific phrase from the locale file.
+        assert!(
+            markup
+                .value
+                .contains("The `function` keyword is used to define a function"),
+            "expected generic keyword docs when gmod is disabled, got: {}",
+            markup.value
+        );
+        // Should NOT show hook-specific anonymous signature (no param types)
+        assert!(
+            !markup.value.contains("Player"),
+            "expected no hook-specific param types when gmod is disabled, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    /// A `function` keyword that is NOT inside a hook.Add callback (e.g. a standalone named
+    /// function) should still show generic keyword docs even when `gmod.enabled = true`.
+    #[gtest]
+    fn test_hover_function_keyword_outside_hook_add_shows_keyword_docs() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                fu<??>nction standalone()
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("The `function` keyword is used to define a function"),
+            "standalone `function` keyword should show generic keyword docs, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    /// Hovering the `function` keyword in hook.Add where the hook name is not registered in any
+    /// GM/GAMEMODE table should fall back to generic keyword docs (not crash or return no hover).
+    #[gtest]
+    fn test_hover_hook_add_callback_function_keyword_unregistered_hook_falls_back_to_keyword_docs()
+    -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                hook = {}
+                function hook.Add(eventName, identifier, func) end
+
+                -- "NonExistentHook" is not defined on GM/GAMEMODE, so no hook doc is available.
+                hook.Add("NonExistentHook", "test", fu<??>nction(ply) end)
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        // When the hook is not registered, hover_gmod_hook_callback_function returns None and
+        // the dispatch falls through to the generic keyword hover — always Some(...).
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected keyword fallback hover for unregistered hook")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+        // Should show generic keyword docs, not hook-specific content.
+        assert!(
+            markup
+                .value
+                .contains("The `function` keyword is used to define a function"),
+            "unregistered hook should show generic keyword docs, got: {}",
+            markup.value
+        );
+        Ok(())
+    }
+
+    /// A hook declared with only `@return` and no `@param` annotations must still show
+    /// the return type in the anonymous callback signature (e.g. `function() -> boolean`).
+    /// Previously `filter_signature_type` would skip the signature when `param_docs` is empty,
+    /// silently degrading return-only hooks to keyword docs.
+    #[gtest]
+    fn test_hover_hook_add_callback_function_keyword_return_only_hook_shows_return_type()
+    -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@return boolean
+                function GM:ReturnOnlyHook() end
+
+                hook = {}
+                ---@param eventName string
+                ---@param identifier any
+                ---@param func function
+                function hook.Add(eventName, identifier, func) end
+
+                hook.Add("ReturnOnlyHook", "test", fu<??>nction() end)
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover for return-only hook")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+        assert!(
+            markup.value.contains("-> boolean"),
+            "return-only hook should show `-> boolean` in anonymous callback signature, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("The `function` keyword is used to define a function"),
+            "should not fall back to generic keyword docs, got: {}",
+            markup.value
+        );
+        Ok(())
+    }
 }

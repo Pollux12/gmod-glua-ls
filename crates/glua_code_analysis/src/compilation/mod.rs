@@ -3,6 +3,7 @@ mod test;
 
 pub use analyzer::gmod::get_scripted_class_info_for_file;
 pub use analyzer::unresolve::extract_hook_name;
+pub use analyzer::unresolve::resolve_gmod_hook_add_callback_doc_function;
 
 use std::sync::Arc;
 
