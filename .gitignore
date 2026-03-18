@@ -1,11 +1,10 @@
 /target
-.idea
-.cursor
+.idea/
+.cursor/
 dhat-heap.json
-.claude
-.opencode
-.serena
+.claude/
+.opencode/
+.serena/
 .agents/skills/
-
-# CocoIndex Code (ccc)
-/.cocoindex_code/
+.pommel/
+.pommelignore
