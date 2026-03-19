@@ -223,6 +223,8 @@ impl LuaTypeIndex {
             }
         }
 
+        // Sort to ensure deterministic ordering regardless of HashMap iteration order
+        sub_types.sort_by(|a, b| a.get_name().cmp(b.get_name()));
         sub_types
     }
 

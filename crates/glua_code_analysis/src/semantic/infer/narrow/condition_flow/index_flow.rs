@@ -1,7 +1,8 @@
 use glua_parser::{LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexMemberExpr};
 
 use crate::{
-    DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaInferCache, LuaType,
+    DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaInferCache, LuaMemberKey,
+    LuaMemberOwner, LuaType,
     semantic::infer::{
         VarRefId,
         infer_index::infer_member_by_member_key,
@@ -105,11 +106,20 @@ fn maybe_field_exist_narrow(
 
     match condition_flow {
         InferConditionFlow::TrueCondition => {
-            if !result.is_empty() {
-                return Ok(ResultTypeOrContinue::Result(LuaType::from_vec(result)));
+            let direct_definers =
+                find_safe_direct_field_definers(db, cache, &candidates, &result, &index);
+            let narrowed = if !direct_definers.is_empty() {
+                direct_definers
+            } else {
+                result
+            };
+            if !narrowed.is_empty() {
+                return Ok(ResultTypeOrContinue::Result(LuaType::from_vec(narrowed)));
             }
         }
         InferConditionFlow::FalseCondition => {
+            // Use the original (non-collapsed) result to determine which types to exclude,
+            // so subtypes that have the field through inheritance are correctly excluded.
             if !result.is_empty() {
                 let remaining = candidates
                     .into_iter()
@@ -151,4 +161,82 @@ fn collect_field_exist_narrow_candidates(
         }
         _ => None,
     }
+}
+
+/// From a set of candidate types that have a given field (potentially through inheritance),
+/// find only those types that DIRECTLY define the field on themselves.
+/// For example, if `base_glide` defines `IsGlideVehicle` and `base_glide_car` inherits it,
+/// this returns only `[base_glide]`.
+/// Falls back to the full candidate set if no direct definers can be identified.
+fn find_safe_direct_field_definers(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    _all_candidates: &[LuaType],
+    candidates: &[LuaType],
+    index: &LuaIndexMemberExpr,
+) -> Vec<LuaType> {
+    let index_key = match index.get_index_key() {
+        Some(key) => key,
+        None => return candidates.to_vec(),
+    };
+    let key = match LuaMemberKey::from_index_key(db, cache, &index_key) {
+        Ok(key) => key,
+        Err(_) => return candidates.to_vec(),
+    };
+
+    let member_index = db.get_member_index();
+    let direct: Vec<LuaType> = candidates
+        .iter()
+        .filter(|t| {
+            let type_id = match t {
+                LuaType::Ref(id) | LuaType::Def(id) => id,
+                _ => return true, // Keep non-Ref/Def types
+            };
+            let owner = LuaMemberOwner::Type(type_id.clone());
+            // Check if this type directly owns the member (no inheritance walk)
+            if member_index.get_member_item(&owner, &key).is_some() {
+                return true;
+            }
+            // Also check GlobalPath ownership (for patterns like ENTITY.foo)
+            let global_owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
+            member_index.get_member_item(&global_owner, &key).is_some()
+        })
+        .cloned()
+        .collect();
+
+    if direct.is_empty() {
+        // Fallback: no direct definers found (shouldn't happen normally)
+        candidates.to_vec()
+    } else {
+        let direct_snapshot = direct.clone();
+        if direct_snapshot.iter().any(|direct_type| {
+            _all_candidates.iter().any(|candidate| {
+                !candidates.contains(candidate) && is_strict_sub_type_of(db, candidate, direct_type)
+            })
+        }) {
+            return candidates.to_vec();
+        }
+
+        direct
+            .into_iter()
+            .filter(|direct_type| {
+                !direct_snapshot.iter().any(|other_direct| {
+                    other_direct != direct_type
+                        && is_strict_sub_type_of(db, other_direct, direct_type)
+                })
+            })
+            .collect()
+    }
+}
+
+fn is_strict_sub_type_of(db: &DbIndex, candidate: &LuaType, possible_base: &LuaType) -> bool {
+    let (LuaType::Ref(candidate_id) | LuaType::Def(candidate_id)) = candidate else {
+        return false;
+    };
+    let (LuaType::Ref(base_id) | LuaType::Def(base_id)) = possible_base else {
+        return false;
+    };
+
+    candidate_id != base_id
+        && crate::semantic::type_check::is_sub_type_of(db, &candidate_id.clone().into(), base_id)
 }

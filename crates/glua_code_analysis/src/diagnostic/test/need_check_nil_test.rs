@@ -198,12 +198,20 @@ mod test {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
         // Simulate the GLua annotation library defining IsValid with boolean return
-        ws.def(
-            r#"
+        let library_root = ws.virtual_url_generator.new_path("__test_library_isvalid");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
             ---@param toBeValidated any The table or object to be validated.
             ---@return boolean # True if the object is valid.
             function _G.IsValid(toBeValidated) end
-            "#,
+            "#
+                .to_string(),
+            ),
         );
 
         assert!(ws.check_code_for(
@@ -301,7 +309,11 @@ mod test {
             end
             "#,
         );
-        assert_that!(no_diag, eq(false), "Expected NeedCheckNil: GetFreeSeat returns Entity?");
+        assert_that!(
+            no_diag,
+            eq(false),
+            "Expected NeedCheckNil: GetFreeSeat returns Entity?"
+        );
     }
 
     #[gtest]
@@ -333,7 +345,11 @@ mod test {
             end
             "#,
         );
-        assert_that!(no_diag, eq(false), "Expected NeedCheckNil with AND narrowing");
+        assert_that!(
+            no_diag,
+            eq(false),
+            "Expected NeedCheckNil with AND narrowing"
+        );
     }
 
     #[gtest]
@@ -365,7 +381,105 @@ mod test {
             end
             "#,
         );
-        assert_that!(no_diag, eq(false), "Expected NeedCheckNil after field truthiness narrowing");
+        assert_that!(
+            no_diag,
+            eq(false),
+            "Expected NeedCheckNil after field truthiness narrowing"
+        );
+    }
+
+    #[gtest]
+    fn test_field_narrow_with_class_hierarchy_no_nil_on_method() {
+        // When parent is narrowed via field check, methods inherited from the base should not show nil
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetParent fun(self: Entity): Entity
+
+            ---@class BaseVehicle: Entity
+            ---@field IsSpecialVehicle boolean
+            ---@field GetLockState fun(self: BaseVehicle): boolean
+
+            ---@class CarVehicle: BaseVehicle
+
+            ---@class BoatVehicle: BaseVehicle
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param seat Entity
+            function test(seat)
+                local parent = seat:GetParent()
+                if not IsValid(parent) then return end
+                if not parent.IsSpecialVehicle then return end
+                parent:GetLockState()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_field_narrow_false_branch_no_nil() {
+        // In the false branch (field doesn't exist), variable should retain original type
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class Animal: Entity
+            ---@field IsDog boolean
+
+            ---@class Dog: Animal
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param ent Entity
+            function test(ent)
+                if not IsValid(ent) then return end
+                if ent.IsDog then return end
+                -- ent is still Entity here (false branch), NOT nil
+                ent:GetPos()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_isvalid_then_field_narrow_no_nil() {
+        // IsValid + field check combo should work without nil issues
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class SpecialEnt: Entity
+            ---@field IsSpecial boolean
+            ---@field DoSpecialThing fun(self: SpecialEnt): boolean
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param ent Entity
+            function test(ent)
+                if not IsValid(ent) then return end
+                if not ent.IsSpecial then return end
+                ent:DoSpecialThing()
+            end
+            "#,
+        ));
     }
 
     #[gtest]
@@ -396,6 +510,44 @@ mod test {
             end
             "#,
         );
-        assert_that!(no_diag, eq(true), "No NeedCheckNil expected: Entity has no GetFreeSeat");
+        assert_that!(
+            no_diag,
+            eq(true),
+            "No NeedCheckNil expected: Entity has no GetFreeSeat"
+        );
+    }
+
+    #[gtest]
+    fn test_field_narrow_direct_definer_no_nil_on_method() {
+        // After narrowing to the direct field definer, methods on that type should not trigger nil
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetParent fun(self: Entity): Entity
+
+            ---@class BaseGlide: Entity
+            ---@field IsGlideVehicle boolean
+            ---@field GetIsLocked fun(self: BaseGlide): boolean
+
+            ---@class GlideCar: BaseGlide
+
+            ---@class GlideAirboat: BaseGlide
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param seat Entity
+            function test(seat)
+                local parent = seat:GetParent()
+                if not IsValid(parent) then return end
+                if not parent.IsGlideVehicle then return end
+                parent:GetIsLocked()
+            end
+            "#,
+        ));
     }
 }

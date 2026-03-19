@@ -1,11 +1,11 @@
 use std::{ops::Deref, sync::Arc};
 
-use glua_parser::{LuaCallExpr, LuaChunk, LuaExpr, LuaIndexKey, LuaIndexMemberExpr};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexKey, LuaIndexMemberExpr};
 
 use crate::{
     DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaAliasCallKind, LuaAliasCallType,
     LuaFunctionType, LuaInferCache, LuaSignatureCast, LuaSignatureId, LuaType, TypeOps,
-    infer_call_expr_func, infer_expr,
+    infer_call_expr_func, infer_expr, resolve_global_decl_id,
     semantic::infer::{
         VarRefId,
         infer_index::infer_member_by_member_key,
@@ -36,42 +36,16 @@ pub fn get_type_at_call_expr(
     let call_expr_ref = call_expr.clone();
     let prefix_expr_ref = prefix_expr.clone();
 
-    // If we can't infer the function type (e.g. method not found on the type), we
-    // cannot narrow — return Continue instead of propagating the error, which would
-    // corrupt the inferred type of unrelated variables further up the flow chain.
-    let Ok(maybe_func) = infer_expr(db, cache, prefix_expr.clone()) else {
-        return Ok(ResultTypeOrContinue::Continue);
-    };
-    let result = match maybe_func {
-        LuaType::DocFunction(f) => {
-            let return_type = f.get_ret();
-            match return_type {
-                LuaType::TypeGuard(_) => get_type_at_call_expr_by_type_guard(
-                    db,
-                    tree,
-                    cache,
-                    root,
-                    var_ref_id,
-                    flow_node,
-                    call_expr,
-                    f,
-                    condition_flow,
-                ),
-                _ => {
-                    // If the return type is not a type guard, we cannot infer the type cast.
-                    Ok(ResultTypeOrContinue::Continue)
-                }
-            }
-        }
-        LuaType::Signature(signature_id) => {
-            let Some(signature) = db.get_signature_index().get(&signature_id) else {
-                return Ok(ResultTypeOrContinue::Continue);
-            };
-
-            let ret = signature.get_return_type();
-            match ret {
-                LuaType::TypeGuard(_) => {
-                    return get_type_at_call_expr_by_type_guard(
+    // If we can't infer the function type (e.g. undefined global like `isfunction`),
+    // skip type-based narrowing but still fall through to name-based fallbacks
+    // (IsValid, isfunction, etc.) at the end.
+    let result = match infer_expr(db, cache, prefix_expr.clone()) {
+        Err(_) => Ok(ResultTypeOrContinue::Continue),
+        Ok(maybe_func) => match maybe_func {
+            LuaType::DocFunction(f) => {
+                let return_type = f.get_ret();
+                match return_type {
+                    LuaType::TypeGuard(_) => get_type_at_call_expr_by_type_guard(
                         db,
                         tree,
                         cache,
@@ -79,64 +53,91 @@ pub fn get_type_at_call_expr(
                         var_ref_id,
                         flow_node,
                         call_expr,
-                        signature.to_doc_func_type(),
-                        condition_flow,
-                    );
-                }
-                LuaType::Call(call) => {
-                    return get_type_at_call_expr_by_call(
-                        db,
-                        tree,
-                        cache,
-                        root,
-                        var_ref_id,
-                        flow_node,
-                        call_expr,
-                        &call,
-                        condition_flow,
-                    );
-                }
-                _ => {}
-            }
-
-            if let Some(signature_cast) = db.get_flow_index().get_signature_cast(&signature_id) {
-                return match signature_cast.name.as_str() {
-                    "self" => get_type_at_call_expr_by_signature_self(
-                        db,
-                        tree,
-                        cache,
-                        root,
-                        var_ref_id,
-                        flow_node,
-                        prefix_expr,
-                        signature_cast,
-                        signature_id,
+                        f,
                         condition_flow,
                     ),
-                    name => get_type_at_call_expr_by_signature_param_name(
-                        db,
-                        tree,
-                        cache,
-                        root,
-                        var_ref_id,
-                        flow_node,
-                        call_expr,
-                        signature_cast,
-                        signature_id,
-                        name,
-                        condition_flow,
-                    ),
+                    _ => {
+                        // If the return type is not a type guard, we cannot infer the type cast.
+                        Ok(ResultTypeOrContinue::Continue)
+                    }
+                }
+            }
+            LuaType::Signature(signature_id) => {
+                let Some(signature) = db.get_signature_index().get(&signature_id) else {
+                    return Ok(ResultTypeOrContinue::Continue);
                 };
-            }
 
-            // No @cast annotation found — fall through so IsValid/isfunction
-            // name-based narrowing can still run as a fallback.
-            Ok(ResultTypeOrContinue::Continue)
-        }
-        _ => {
-            // If the prefix expression is not a function, we cannot infer the type cast.
-            Ok(ResultTypeOrContinue::Continue)
-        }
+                let ret = signature.get_return_type();
+                match ret {
+                    LuaType::TypeGuard(_) => {
+                        return get_type_at_call_expr_by_type_guard(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            var_ref_id,
+                            flow_node,
+                            call_expr,
+                            signature.to_doc_func_type(),
+                            condition_flow,
+                        );
+                    }
+                    LuaType::Call(call) => {
+                        return get_type_at_call_expr_by_call(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            var_ref_id,
+                            flow_node,
+                            call_expr,
+                            &call,
+                            condition_flow,
+                        );
+                    }
+                    _ => {}
+                }
+
+                if let Some(signature_cast) = db.get_flow_index().get_signature_cast(&signature_id)
+                {
+                    return match signature_cast.name.as_str() {
+                        "self" => get_type_at_call_expr_by_signature_self(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            var_ref_id,
+                            flow_node,
+                            prefix_expr,
+                            signature_cast,
+                            signature_id,
+                            condition_flow,
+                        ),
+                        name => get_type_at_call_expr_by_signature_param_name(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            var_ref_id,
+                            flow_node,
+                            call_expr,
+                            signature_cast,
+                            signature_id,
+                            name,
+                            condition_flow,
+                        ),
+                    };
+                }
+
+                // No @cast annotation found — fall through so IsValid/isfunction
+                // name-based narrowing can still run as a fallback.
+                Ok(ResultTypeOrContinue::Continue)
+            }
+            _ => {
+                // If the prefix expression is not a function, we cannot infer the type cast.
+                Ok(ResultTypeOrContinue::Continue)
+            }
+        },
     };
 
     // Fallback: check for IsValid pattern (Garry's Mod nil check) when normal
@@ -183,9 +184,152 @@ pub fn get_type_at_call_expr(
         )? {
             return Ok(ResultTypeOrContinue::Result(istype_type));
         }
+
+        if let Some(fallback_target_expr) =
+            resolve_builtin_name_fallback_target(db, cache, root, &prefix_expr_ref)
+        {
+            if let Some(isfunction_type) = try_narrow_isfunction_member(
+                db,
+                tree,
+                cache,
+                root,
+                var_ref_id,
+                flow_node,
+                &call_expr_ref,
+                &fallback_target_expr,
+                condition_flow,
+            )? {
+                return Ok(ResultTypeOrContinue::Result(isfunction_type));
+            }
+
+            if let Some(isvalid_type) = try_narrow_isvalid(
+                db,
+                tree,
+                cache,
+                root,
+                var_ref_id,
+                flow_node,
+                &call_expr_ref,
+                &fallback_target_expr,
+                condition_flow,
+            )? {
+                return Ok(ResultTypeOrContinue::Result(isvalid_type));
+            }
+
+            if let Some(istype_type) = try_narrow_istype_function(
+                db,
+                tree,
+                cache,
+                root,
+                var_ref_id,
+                flow_node,
+                &call_expr_ref,
+                &fallback_target_expr,
+                condition_flow,
+            )? {
+                return Ok(ResultTypeOrContinue::Result(istype_type));
+            }
+        }
     }
 
     result
+}
+
+fn resolve_builtin_name_fallback_target(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    prefix_expr: &LuaExpr,
+) -> Option<LuaExpr> {
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return None;
+    };
+
+    let references_index = db.get_reference_index();
+    let local_ref = references_index.get_local_reference(&cache.get_file_id());
+    let Some(decl_id) = local_ref.and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+    else {
+        return is_builtin_or_unresolved_global_name(db, cache, name_expr)
+            .then(|| LuaExpr::NameExpr(name_expr.clone()));
+    };
+
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return None;
+    };
+
+    if db
+        .get_reference_index()
+        .get_decl_references(&cache.get_file_id(), &decl_id)
+        .is_some_and(|decl_refs| decl_refs.mutable)
+    {
+        return None;
+    }
+
+    let Some(value_syntax_id) = decl.get_value_syntax_id() else {
+        return None;
+    };
+
+    let Some(node) = value_syntax_id.to_node_from_root(root.syntax()) else {
+        return None;
+    };
+
+    let Some(alias_expr) = LuaExpr::cast(node) else {
+        return None;
+    };
+
+    let LuaExpr::NameExpr(alias_name_expr) = alias_expr else {
+        return None;
+    };
+
+    if name_expr_has_local_binding(db, cache, &alias_name_expr) {
+        return None;
+    }
+
+    is_builtin_or_unresolved_global_name(db, cache, &alias_name_expr)
+        .then(|| LuaExpr::NameExpr(alias_name_expr))
+}
+
+fn name_expr_has_local_binding(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &glua_parser::LuaNameExpr,
+) -> bool {
+    db.get_reference_index()
+        .get_local_reference(&cache.get_file_id())
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .is_some()
+}
+
+fn is_builtin_or_unresolved_global_name(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &glua_parser::LuaNameExpr,
+) -> bool {
+    let Some(helper_name) = name_expr.get_name_text() else {
+        return false;
+    };
+
+    let helper_name = helper_name.as_str();
+    if helper_name != "IsValid" && !ISTYPE_FUNCTION_NAMES.contains(&helper_name) {
+        return false;
+    }
+
+    if name_expr_has_local_binding(db, cache, name_expr) {
+        return false;
+    }
+
+    let Some(global_decl_id) = resolve_global_decl_id(db, cache, helper_name, Some(name_expr))
+    else {
+        return true;
+    };
+
+    let Some(global_decl) = db.get_decl_index().get_decl(&global_decl_id) else {
+        return false;
+    };
+
+    let module_index = db.get_module_index();
+    module_index.is_std(&global_decl.get_file_id())
+        || module_index.is_library(&global_decl.get_file_id())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -205,6 +349,10 @@ fn try_narrow_isfunction_member(
     };
 
     if name_expr.get_name_text().as_deref() != Some("isfunction") {
+        return Ok(None);
+    }
+
+    if !is_builtin_or_unresolved_global_name(db, cache, name_expr) {
         return Ok(None);
     }
 
@@ -628,6 +776,9 @@ fn try_narrow_isvalid(
             if name_expr.get_name_text().as_deref() != Some("IsValid") {
                 return Ok(None);
             }
+            if !is_builtin_or_unresolved_global_name(db, cache, name_expr) {
+                return Ok(None);
+            }
             let arg_list = match call_expr.get_args_list() {
                 Some(list) => list,
                 None => return Ok(None),
@@ -720,6 +871,10 @@ fn try_narrow_istype_function(
     };
 
     if !ISTYPE_FUNCTION_NAMES.contains(&name.as_str()) {
+        return Ok(None);
+    }
+
+    if !is_builtin_or_unresolved_global_name(db, cache, name_expr) {
         return Ok(None);
     }
 

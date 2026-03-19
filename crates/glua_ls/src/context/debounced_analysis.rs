@@ -191,7 +191,8 @@ impl DebouncedAnalysis {
             let file_ids: Vec<FileId> = {
                 let mut pending = self.pending_files.lock().await;
                 let mut reindexing = self.reindexing_files.lock().await;
-                let ids: Vec<FileId> = pending.drain().collect();
+                let mut ids: Vec<FileId> = pending.drain().collect();
+                ids.sort();
                 for id in &ids {
                     reindexing.insert(*id);
                 }

@@ -1,6 +1,60 @@
 #[cfg(test)]
 mod test {
     use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaNameExpr};
+    use googletest::prelude::*;
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+    }
+
+    fn file_has_diagnostic(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> bool {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+    }
+
+    fn nth_name_expr_type_from_end(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth_from_end: usize,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let name_exprs = root
+            .clone()
+            .descendants::<LuaNameExpr>()
+            .filter(|expr| expr.get_name_text().as_deref() == Some(name))
+            .collect::<Vec<_>>();
+        let name_expr = name_exprs
+            .into_iter()
+            .rev()
+            .nth(nth_from_end)
+            .expect("expected matching name expression");
+        semantic_model
+            .get_semantic_info(name_expr.syntax().clone().into())
+            .expect("expected semantic info for name expression")
+            .typ
+    }
 
     #[test]
     fn test_closure_return() {
@@ -2137,6 +2191,127 @@ _2 = a[1]
         assert_eq!(desc, "MyEntity");
     }
 
+    #[gtest]
+    fn test_field_narrow_collapses_to_common_base() {
+        // Field narrowing should collapse to the base class that defines the field,
+        // not list every subtype
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ---@class BaseGlide: Entity
+            ---@field IsGlideVehicle boolean
+
+            ---@class GlideCar: BaseGlide
+
+            ---@class GlideAirboat: BaseGlide
+
+            ---@param parent Entity
+            function test(parent)
+                if not parent.IsGlideVehicle then return end
+                a = parent
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        // Should be just BaseGlide (common base), not BaseGlide | GlideCar | GlideAirboat
+        assert_eq!(desc, "BaseGlide");
+    }
+
+    #[gtest]
+    fn test_field_narrow_preserves_multiple_unrelated_bases() {
+        // When multiple unrelated types define the same field, both should be kept
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ---@class TypeA: Entity
+            ---@field HasFeature boolean
+
+            ---@class TypeB: Entity
+            ---@field HasFeature boolean
+
+            ---@param ent Entity
+            function test(ent)
+                if not ent.HasFeature then return end
+                a = ent
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        // Both TypeA and TypeB define HasFeature independently
+        assert_that!(desc, contains_substring("TypeA"));
+        assert_that!(desc, contains_substring("TypeB"));
+    }
+
+    #[gtest]
+    fn test_uninitialized_local_branch_merge_produces_nullable() {
+        // `local x; if cond then x = value end` should produce `value_type | nil`
+        // after the branch, not "unknown"
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@param cond boolean
+            local function setup(cond)
+                local testFunc
+                if cond then
+                    testFunc = function(var) print(var) end
+                end
+                a = testFunc
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        // Should remain nullable (from the uninitialized branch), not "unknown"
+        assert_that!(
+            desc,
+            contains_substring("?"),
+            "Expected nullable type: {}",
+            desc
+        );
+        assert_that!(desc, not(eq("unknown")), "Should not be unknown: {}", desc);
+    }
+
+    #[gtest]
+    fn test_uninitialized_local_table_branch_merge() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@param cond boolean
+            local function setup(cond)
+                local testTbl
+                if cond then
+                    testTbl = {}
+                end
+                a = testTbl
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        // Should remain nullable (from the uninitialized path), not "unknown" or "any"
+        assert_that!(
+            desc,
+            contains_substring("?"),
+            "Expected nullable type: {}",
+            desc
+        );
+        assert_that!(desc, not(eq("unknown")), "Should not be unknown: {}", desc);
+    }
+
     /// Same pattern but wrapped in an outer conditional, matching the exact
     /// shape reported in the bug report.
     #[test]
@@ -2172,5 +2347,1529 @@ _2 = a[1]
         let a = ws.expr_ty("a");
         let desc = ws.humanize_type(a);
         assert_eq!(desc, "MyEntity");
+    }
+
+    // ================================================================
+    // Inference regression tests — based on real production GMod code
+    // ================================================================
+
+    #[gtest]
+    fn test_type_guard_narrows_to_string() {
+        // Regression: `type(s) ~= "string"` guard with early return should narrow s to string
+        // Reproduction from Glide.FromJSON
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param s any
+            local function test(s)
+                if type(s) ~= "string" or s == "" then
+                    return {}
+                end
+                a = s
+            end
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(desc, eq("string"));
+    }
+
+    #[gtest]
+    fn test_type_guard_narrows_simple() {
+        // Simple type() guard without or operator
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param s any
+            local function test(s)
+                if type(s) ~= "string" then return end
+                a = s
+            end
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(desc, eq("string"));
+    }
+
+    #[gtest]
+    fn test_if_else_branch_merge_no_nil() {
+        // Regression: if-else with both branches assigning should NOT produce nullable type
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local str
+            if true then
+                str = "server"
+            else
+                str = "client"
+            end
+            a = str
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            not(contains_substring("nil")),
+            "if-else with both branches assigning should not produce nil: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_if_else_literal_string_accepted_as_string_param() {
+        // Regression: "server" | "client" should be assignable to string parameter
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            local function RequiresString(str) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local str
+            if true then
+                str = "server"
+            else
+                str = "client"
+            end
+            RequiresString(str)
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_server_file_if_server_branch_does_not_keep_client_literal_or_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+
+        let file_id = ws.def_file(
+            "addons/cityrp-vehicle-base/lua/glide/server/events.lua",
+            r#"
+            ---@param str string
+            local function ThisFunctionRequiresString(str) end
+
+            local str
+            if SERVER then
+                str = "server"
+            else
+                str = "client"
+            end
+
+            ThisFunctionRequiresString(str)
+            a = str
+            "#,
+        );
+
+        let typ = nth_name_expr_type_from_end(&mut ws, file_id, "str", 0);
+        let desc = ws.humanize_type(typ.clone());
+        assert_that!(desc.as_str(), not(contains_substring("client")));
+        assert_that!(desc.as_str(), not(contains_substring("nil")));
+
+        let expected = ws.ty("string");
+        assert_that!(ws.check_type(&typ, &expected), eq(true));
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_realistic_glide_mode_branch_merge_has_no_nil() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let file_id = ws.def_file(
+            "addons/cityrp-vehicle-base/lua/glide/server/events.lua",
+            r#"
+            ---@class ENT
+
+            ---@param self ENT
+            ---@return boolean
+            local function HasExternalLighting(self) end
+
+            ---@param mode string
+            local function RequiresString(mode) end
+
+            --- Sync Gear to Photon Vehicle.Transmission channel.
+            ---@param self ENT
+            ---@param name string
+            ---@param old number
+            ---@param value number
+            function OnGearChangePhoton(self, name, old, value)
+                if not HasExternalLighting(self) then return end
+
+                local mode
+                if value == -1 then
+                    mode = "REVERSE"
+                elseif value == 0 then
+                    mode = "PARK"
+                else
+                    mode = "DRIVE"
+                end
+
+                a = mode
+                RequiresString(mode)
+            end
+            "#,
+        );
+
+        let typ = nth_name_expr_type_from_end(&mut ws, file_id, "mode", 0);
+        let desc = ws.humanize_type(typ.clone());
+        assert_that!(desc.as_str(), not(contains_substring("nil")));
+
+        let expected = ws.ty("string");
+        assert_that!(ws.check_type(&typ, &expected), eq(true));
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_shared_file_later_server_guard_keeps_server_only_branch_merge() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+
+        let file_id = ws.def_file(
+            "addons/cityrp-vehicle-base/lua/glide/sh_events.lua",
+            r#"
+            ---@param str string
+            local function ThisFunctionRequiresString(str) end
+
+            local str
+            if SERVER then
+                str = "server"
+            else
+                str = "client"
+            end
+
+            if SERVER then
+                ThisFunctionRequiresString(str)
+                a = str
+            end
+            "#,
+        );
+
+        let typ = nth_name_expr_type_from_end(&mut ws, file_id, "str", 0);
+        let desc = ws.humanize_type(typ.clone());
+        assert_that!(desc.as_str(), not(contains_substring("client")));
+        assert_that!(desc.as_str(), not(contains_substring("nil")));
+
+        let expected = ws.ty("string");
+        assert_that!(ws.check_type(&typ, &expected), eq(true));
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_method_return_type_not_unknown() {
+        // Regression: seat:GetParent() should return Entity, not unknown
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetParent fun(self: Entity): Entity
+
+            ---@param seat Entity
+            function test(seat)
+                local parent = seat:GetParent()
+                a = parent
+            end
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(desc, eq("Entity"));
+    }
+
+    #[gtest]
+    fn test_uninitialized_local_with_if_true_is_nullable() {
+        // `local x; if true then x = val end` should produce `val_type | nil`
+        // because flow graph doesn't evaluate constant conditions
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local testFunc
+            if true then
+                testFunc = function(var) print(var) end
+            end
+            a = testFunc
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            contains_substring("?"),
+            "Should remain nullable since else branch has no assignment: {}",
+            desc
+        );
+        assert_that!(desc, not(eq("unknown")), "Should not be unknown: {}", desc);
+    }
+
+    #[gtest]
+    fn test_isfunction_narrows_uninitialized_local() {
+        // After isfunction(testFunc), testFunc should be non-nil (callable without need-check-nil)
+        let mut ws = VirtualWorkspace::new();
+        // need-check-nil is enabled so the diagnostic runs
+        let result = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param cond boolean
+            local function test(cond)
+                local testFunc
+                if cond then
+                    testFunc = function(var) print(var) end
+                end
+                if isfunction(testFunc) then
+                    testFunc("hi")
+                end
+            end
+            "#,
+        );
+        assert_that!(
+            result,
+            eq(true),
+            "isfunction guard should prevent need-check-nil on testFunc call"
+        );
+    }
+
+    #[gtest]
+    fn test_unresolved_initializer_branch_merge_does_not_fall_back_to_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "addons/cityrp-vehicle-base/lua/glide/server/unresolved_init.lua",
+            r#"
+            ---@param cond boolean
+            local function test(cond)
+                local mode = MissingMode()
+                if cond then
+                    mode = "DRIVE"
+                end
+
+                a = mode
+            end
+            "#,
+        );
+
+        let typ = nth_name_expr_type_from_end(&mut ws, file_id, "mode", 0);
+        let desc = ws.humanize_type(typ);
+        assert_that!(desc.as_str(), not(contains_substring("?")));
+        assert_that!(desc.as_str(), not(contains_substring("nil")));
+    }
+
+    #[gtest]
+    fn test_istable_narrows_uninitialized_local() {
+        // After istable(testTbl), testTbl should be non-nil (indexable without need-check-nil)
+        let mut ws = VirtualWorkspace::new();
+        let result = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param cond boolean
+            local function test(cond)
+                local testTbl
+                if cond then
+                    testTbl = {}
+                end
+                if istable(testTbl) then
+                    local x = testTbl.foo
+                end
+            end
+            "#,
+        );
+        assert_that!(
+            result,
+            eq(true),
+            "istable guard should prevent need-check-nil on testTbl access"
+        );
+    }
+
+    #[gtest]
+    fn test_type_narrowing_or_with_empty_string_check() {
+        // type(s) ~= "string" or s == "" returns early
+        // After this, s should be narrowed to string AND s ~= ""
+        // At minimum, s should be string (not nil)
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            local function RequiresString(str) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            function test(s)
+                if type(s) ~= "string" or s == "" then
+                    return {}
+                end
+                RequiresString(s)
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_isvalid_then_method_call_chain() {
+        // Full production pattern: IsValid check, field narrow, method call
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetParent fun(self: Entity): Entity
+            ---@field IsValid fun(self: Entity): boolean
+            ---@field GetIsLocked fun(self: Entity): boolean
+
+            ---@class BaseGlide: Entity
+            ---@field IsGlideVehicle boolean
+            ---@field GetIsLocked fun(self: BaseGlide): boolean
+
+            ---@param seat Entity
+            function test(seat)
+                local parent = seat:GetParent()
+                if not IsValid(parent) then return end
+                if not parent.IsGlideVehicle then return end
+                a = parent
+            end
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            contains_substring("BaseGlide"),
+            "After field narrow, parent should include BaseGlide: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_prevents_nil_on_method_after_field_narrow() {
+        // After IsValid(parent) + field narrow, parent:GetIsLocked() should NOT have nil diagnostic
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetParent fun(self: Entity): Entity
+            ---@field IsValid fun(self: Entity): boolean
+
+            ---@class BaseGlide: Entity
+            ---@field IsGlideVehicle boolean
+            ---@field GetIsLocked fun(self: BaseGlide): boolean
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param seat Entity
+            function test(seat)
+                local parent = seat:GetParent()
+                if not IsValid(parent) then return end
+                if not parent.IsGlideVehicle then return end
+                parent:GetIsLocked()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_param_with_conditional_body_no_nil() {
+        // Function parameter used after type() guard should not become nil
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            local function RequiresString(str) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            function test(s)
+                if type(s) ~= "string" then return end
+                RequiresString(s)
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_param_with_or_condition_guard() {
+        // type(s) ~= "string" or s == "" — param should still be string after guard
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            local function RequiresString(str) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            function test(s)
+                if type(s) ~= "string" or s == "" then return end
+                RequiresString(s)
+            end
+            "#,
+        ));
+    }
+
+    // === Comprehensive inference regression tests ===
+
+    #[gtest]
+    fn test_type_guard_with_or_condition() {
+        // type(s) ~= "string" or s == "" with return {} — s should still be string after
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            local function RequiresString(str) end
+            "#,
+        );
+        // Does `return {}` in the if body break the narrowing?
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            function test(s)
+                if type(s) ~= "string" or s == "" then
+                    return {}
+                end
+                RequiresString(s)
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_with_or_condition_and_or_return() {
+        // Full Glide.FromJSON pattern — check each variant
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param s string
+            ---@return table
+            function util_JSONToTable(s) return {} end
+            "#,
+        );
+        // Without or in return — should pass
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::ParamTypeMismatch,
+                r#"
+            function FromJSON_a(s)
+                if type(s) ~= "string" or s == "" then
+                    return {}
+                end
+                return util_JSONToTable(s)
+            end
+            "#,
+            ),
+            "util_JSONToTable(s) without or should not trigger ParamTypeMismatch"
+        );
+    }
+
+    #[gtest]
+    fn test_or_in_return_value_does_not_break_narrowing() {
+        // Test param type checking with narrowed type - same file
+        let mut ws = VirtualWorkspace::new();
+        // Define function as global in the SAME file as check
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::ParamTypeMismatch,
+                r#"
+            ---@param s string
+            ---@return table
+            function util_JSONToTable(s) return {} end
+
+            function test_a(s)
+                if type(s) ~= "string" then return end
+                util_JSONToTable(s)
+            end
+            "#,
+            ),
+            "same file: narrowed param should match"
+        );
+    }
+
+    #[gtest]
+    fn test_or_in_return_value_inline() {
+        // Test param type checking with narrowed type - separate file
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param s string
+            ---@return table
+            function util_JSONToTable(s) return {} end
+            "#,
+        );
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::ParamTypeMismatch,
+                r#"
+            function test_b(s)
+                if type(s) ~= "string" then return end
+                util_JSONToTable(s)
+            end
+            "#,
+            ),
+            "separate file: narrowed param should match"
+        );
+    }
+
+    #[gtest]
+    fn test_param_guard_with_global_function() {
+        // Check if RequiresString as GLOBAL (not local) still works
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            function RequiresStringGlobal(str) end
+            "#,
+        );
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::ParamTypeMismatch,
+                r#"
+            function test_c(s)
+                if type(s) ~= "string" then return end
+                RequiresStringGlobal(s)
+            end
+            "#,
+            ),
+            "global function: narrowed param should match"
+        );
+    }
+
+    #[gtest]
+    fn test_param_any_to_string_no_guard() {
+        // Does passing an untyped param to string param trigger diagnostic?
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            function RequiresStringGlobal(str) end
+            "#,
+        );
+        let result = ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            function test(s)
+                RequiresStringGlobal(s)
+            end
+            "#,
+        );
+        assert!(result, "untyped param should be accepted without guard");
+    }
+
+    #[gtest]
+    fn test_param_annotated_string() {
+        // Does passing an annotated string param work?
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            function RequiresStringGlobal(str) end
+            "#,
+        );
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::ParamTypeMismatch,
+                r#"
+            ---@param s string
+            function test(s)
+                RequiresStringGlobal(s)
+            end
+            "#,
+            ),
+            "annotated string param should match"
+        );
+    }
+
+    #[gtest]
+    fn test_param_annotated_string_with_guard() {
+        // Annotated string + guard - does the guard change the type?
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            function RequiresStringGlobal(str) end
+            "#,
+        );
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::ParamTypeMismatch,
+                r#"
+            ---@param s string
+            function test(s)
+                if type(s) ~= "string" then return end
+                RequiresStringGlobal(s)
+            end
+            "#,
+            ),
+            "annotated string + guard should still match"
+        );
+    }
+
+    #[gtest]
+    fn test_param_annotated_nullable_with_guard() {
+        // Annotated string? + guard narrows to string
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            function RequiresStringGlobal(str) end
+            "#,
+        );
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::ParamTypeMismatch,
+                r#"
+            ---@param s string?
+            function test(s)
+                if type(s) ~= "string" then return end
+                RequiresStringGlobal(s)
+            end
+            "#,
+            ),
+            "string? narrowed to string should match"
+        );
+    }
+
+    #[gtest]
+    fn test_or_in_condition_and_return_value() {
+        // Both or in condition and return — the full Glide.FromJSON pattern
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param s string
+            ---@return table
+            function util_JSONToTable(s) return {} end
+            "#,
+        );
+        // Variant B: or in condition + or in return
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::ParamTypeMismatch,
+                r#"
+            function test_b(s)
+                if type(s) ~= "string" or s == "" then
+                    return {}
+                end
+                return util_JSONToTable(s) or {}
+            end
+            "#,
+            ),
+            "compound guard + or return should work"
+        );
+    }
+
+    #[gtest]
+    fn test_literal_string_accepted_as_string_param() {
+        // A variable assigned a literal string should be accepted as `string` param
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            local function RequiresString(str) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local function test()
+                local str
+                if true then
+                    str = "server"
+                else
+                    str = "client"
+                end
+                RequiresString(str)
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_isvalid_early_return_narrows() {
+        // `if not IsValid(x) then return end` should narrow x to non-nil
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.new_path("__test_library_isvalid");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+            ---@param x any
+            ---@return boolean
+            function _G.IsValid(x) end
+            "#
+                .to_string(),
+            ),
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@type string?
+            local maybe = "hello"
+            if not IsValid(maybe) then return end
+            maybe:reverse()
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_isstring_guard_narrows() {
+        // isstring(x) should narrow to remove nil
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@type string?
+            local s = "hello"
+            if isstring(s) then
+                s:lower()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_isnumber_guard_narrows() {
+        // isnumber(x) should narrow to remove nil
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param cond boolean
+            local function test(cond)
+                ---@type number?
+                local n = 42
+                if isnumber(n) then
+                    local x = n + 1
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_isbool_guard_narrows() {
+        // isbool(x) should narrow to remove nil
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@type boolean?
+            local b = true
+            if isbool(b) then
+                local x = not b
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_equals_string() {
+        // type(x) == "string" positive branch narrows to string
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param str string
+            local function RequiresString(str) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param x any
+            local function test(x)
+                if type(x) == "string" then
+                    RequiresString(x)
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_not_equals_with_early_return() {
+        // type(x) ~= "number" with early return narrows x to number
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param n number
+            local function RequiresNumber(n) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param x any
+            local function test(x)
+                if type(x) ~= "number" then return end
+                RequiresNumber(x)
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_if_else_both_branches_assign_no_nil() {
+        // When both if/else branches assign, the variable should NOT be nil
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local function setup(cond)
+                local val
+                if cond then
+                    val = 42
+                else
+                    val = 0
+                end
+                a = val
+            end
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            not(contains_substring("nil")),
+            "Both branches assign, should not be nil: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_if_only_then_branch_assigns_is_nullable() {
+        // When only the then branch assigns, the variable should be nil-able
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local function setup(cond)
+                local val
+                if cond then
+                    val = 42
+                end
+                a = val
+            end
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            contains_substring("?"),
+            "Only one branch assigns, should remain nullable: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_isfunction_then_call_no_diagnostic() {
+        // Common GMod pattern: guard with isfunction before calling
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function test()
+                local callback
+                if true then
+                    callback = function() end
+                end
+                if isfunction(callback) then
+                    callback()
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_istable_then_access_no_diagnostic() {
+        // Common pattern: guard with istable before accessing
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function test()
+                local data
+                if true then
+                    data = { x = 1 }
+                end
+                if istable(data) then
+                    local x = data.x
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_local_isvalid_cache_pattern() {
+        // GMod pattern: `local IsValid = IsValid` (caching global as local)
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.new_path("__test_library_isvalid");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+            ---@param x any
+            ---@return boolean
+            function _G.IsValid(x) end
+            "#
+                .to_string(),
+            ),
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local IsValid = IsValid
+            ---@type string?
+            local maybe = "hello"
+            if IsValid(maybe) then
+                maybe:reverse()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_renamed_isvalid_alias_still_narrows() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_isvalid_alias");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+            ---@param x any
+            ---@return boolean
+            function _G.IsValid(x) end
+            "#
+                .to_string(),
+            ),
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local iv = IsValid
+            ---@type string?
+            local maybe = "hello"
+            if iv(maybe) then
+                maybe:reverse()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_renamed_isfunction_alias_still_narrows() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local is_fn = isfunction
+            ---@type function?
+            local maybe = function() end
+            if is_fn(maybe) then
+                maybe()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_shadowed_local_isvalid_alias_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function IsValid(_) return true end
+            local iv = IsValid
+            ---@type string?
+            local maybe = "hello"
+            if iv(maybe) then
+                maybe:reverse()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_shadowed_local_isfunction_alias_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function isfunction(_) return true end
+            local is_fn = isfunction
+            ---@type string?
+            local maybe = "hello"
+            if is_fn(maybe) then
+                maybe:reverse()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_reassigned_isvalid_alias_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_isvalid_reassigned");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+            ---@param x any
+            ---@return boolean
+            function _G.IsValid(x) end
+            "#
+                .to_string(),
+            ),
+        );
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local iv = IsValid
+            iv = function(_) return true end
+            ---@type string?
+            local maybe = "hello"
+            if iv(maybe) then
+                maybe:reverse()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_shadowed_local_isvalid_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local IsValid = function(_) return true end
+            ---@type string?
+            local maybe = "hello"
+            if IsValid(maybe) then
+                maybe:reverse()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_field_collapse_keeps_surviving_overrides_visible() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ---@class BaseGlide: Entity
+            ---@field IsGlideVehicle boolean
+
+            ---@class GoodGlide: BaseGlide
+
+            ---@class BrokenGlide: BaseGlide
+            ---@field IsGlideVehicle false
+
+            ---@param parent Entity
+            function test(parent)
+                if not parent.IsGlideVehicle then return end
+                a = parent
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(desc, contains_substring("GoodGlide"));
+    }
+
+    #[gtest]
+    fn test_shadowed_local_isfunction_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local isfunction = function(_) return true end
+            ---@type string?
+            local maybe = "hello"
+            if isfunction(maybe) then
+                maybe:reverse()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_user_defined_global_isvalid_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            function IsValid(_) return true end
+            ---@type string?
+            local maybe = "hello"
+            if IsValid(maybe) then
+                maybe:reverse()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_nested_type_guards_compound() {
+        // Multiple type guards in sequence should all narrow
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param s string
+            local function RequiresString(s) end
+            ---@param n number
+            local function RequiresNumber(n) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param x any
+            ---@param y any
+            local function test(x, y)
+                if type(x) ~= "string" then return end
+                if type(y) ~= "number" then return end
+                RequiresString(x)
+                RequiresNumber(y)
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_method_return_type_resolved() {
+        // Method calls should resolve to the correct return type
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetParent fun(self: Entity): Entity
+
+            ---@param ent Entity
+            local function test(ent)
+                local parent = ent:GetParent()
+                a = parent
+            end
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            eq("Entity"),
+            "GetParent should return Entity, got: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_field_narrow_selects_definer_not_all_subtypes() {
+        // Field truthiness narrowing should select the type that DEFINES the field,
+        // not list every subtype that inherits it
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+            ---@field CanBark boolean
+            ---@class Poodle: Dog
+            ---@class Labrador: Dog
+            ---@class Cat: Animal
+
+            ---@param x Animal
+            local function test(x)
+                if not x.CanBark then return end
+                a = x
+            end
+            "#,
+        );
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        // Should narrow to Dog (which defines CanBark), not Dog|Poodle|Labrador
+        assert_that!(
+            desc,
+            eq("Dog"),
+            "Field narrow should select definer only: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_if_elseif_else_all_assignments_do_not_leave_nil() {
+        // Real-world shape: if / elseif / else all assign a string value.
+        // This must not produce a nullable type at callsite.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param mode string
+            local function RequiresString(mode) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value integer
+            local function test(value)
+                local mode
+                if value == -1 then
+                    mode = "REVERSE"
+                elseif value == 0 then
+                    mode = "PARK"
+                else
+                    mode = "DRIVE"
+                end
+
+                RequiresString(mode)
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_realistic_registry_lookup_keeps_value_type_for_followup_field_access() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def_file(
+            "addons/cityrp-vehicle-base/lua/glide/sh_registry.lua",
+            r#"
+            ---@class WeaponClass
+            ---@field Base string
+
+            Glide = Glide or {}
+
+            ---@type table<string, WeaponClass>
+            Glide.WeaponRegistry = {}
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "addons/cityrp-vehicle-base/lua/glide/server/weapon_inheritance.lua",
+            r#"
+            local function RefreshInheritance(className)
+                if className == "base" then return end
+
+                local class = Glide.WeaponRegistry[className]
+                local baseClassName = class.Base
+
+                a = class
+                b = baseClassName
+            end
+            "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(false)
+        );
+
+        let class_type = ws.expr_ty("a");
+        let weapon_class = ws.ty("WeaponClass");
+        assert_that!(ws.check_type(&class_type, &weapon_class), eq(true));
+
+        let base_type = ws.expr_ty("b");
+        let string_type = ws.ty("string");
+        assert_that!(ws.check_type(&base_type, &string_type), eq(true));
+    }
+
+    #[gtest]
+    fn test_realistic_scripted_class_field_narrow_keeps_only_base_glide() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+
+        ws.def_files(vec![
+            (
+                "addons/cityrp-vehicle-base/lua/includes/entity_defs.lua",
+                r#"
+                ---@class Entity
+                ---@field GetParent fun(self: Entity): Entity
+                ---@field NetworkVar fun(self: Entity, valueType: string, name: string)
+
+                ---@class ENTITY: Entity
+                local ENTITY = {}
+
+                ---@class ENT: ENTITY
+                local ENT = {}
+
+                ---@param x any
+                ---@return boolean
+                function IsValid(x) end
+                "#,
+            ),
+            (
+                "addons/cityrp-vehicle-base/lua/entities/base_glide/shared.lua",
+                r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+                ENT.IsGlideVehicle = true
+
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Bool", "IsLocked")
+                end
+                "#,
+            ),
+        ]);
+
+        let file_id = ws.def_file(
+            "addons/cityrp-vehicle-base/lua/glide/server/events.lua",
+            r#"
+            ---@param seat Entity
+            local function test(seat)
+                local parent = seat:GetParent()
+                if not IsValid(parent) then return end
+                if not parent.IsGlideVehicle then return end
+
+                a = parent
+
+                if not parent:GetIsLocked() then return end
+            end
+            "#,
+        );
+
+        let narrowed = ws.expr_ty("a");
+        let desc = ws.humanize_type(narrowed);
+        assert_that!(desc.as_str(), eq("base_glide"));
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_field_narrow_prefers_most_specific_definer_over_parent_union() {
+        // Repro shape from GMod hierarchy (Entity <- ENT <- base_glide):
+        // after `if not parent.IsGlideVehicle then return end`, parent should
+        // narrow to base_glide only, not `base_glide|ENT`.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class ENT: Entity
+            ---@field GetParent fun(self: ENT): ENT
+
+            ---@class base_glide: ENT
+            ---@field IsGlideVehicle boolean
+            ---@field GetIsLocked fun(self: base_glide): boolean
+
+            ---@param seat ENT
+            local function test(seat)
+                local parent = seat:GetParent()
+                if not parent.IsGlideVehicle then return end
+                a = parent
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            eq("base_glide"),
+            "narrowing should keep only most specific definer: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_plus_field_narrow_keeps_method_non_nil_in_ent_hierarchy() {
+        // Ensure IsValid nil-removal survives additional field narrowing and
+        // does not regress into need-check-nil for method calls.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class ENT: Entity
+            ---@field GetParent fun(self: ENT): ENT
+
+            ---@class base_glide: ENT
+            ---@field IsGlideVehicle boolean
+            ---@field GetIsLocked fun(self: base_glide): boolean
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param x any
+            ---@return boolean
+            function IsValid(x) end
+
+            ---@param seat ENT
+            local function test(seat)
+                local parent = seat:GetParent()
+                if not IsValid(parent) then return end
+                if not parent.IsGlideVehicle then return end
+                if not parent:GetIsLocked() then return end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_table_index_read_from_typed_registry_is_not_hard_nil() {
+        // Regression guard: reading from a typed table by string key should
+        // not collapse the local value to `nil`.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class WeaponClass
+            ---@field Base string
+
+            ---@class GlideNamespace
+            ---@field WeaponRegistry table<string, WeaponClass>
+            Glide = {}
+
+            ---@type table<string, WeaponClass>
+            Glide.WeaponRegistry = {}
+
+            ---@param className string
+            local function RefreshInheritance(className)
+                local class = Glide.WeaponRegistry[className]
+                a = class
+            end
+            "#,
+        );
+
+        let typ = ws.expr_ty("a");
+        let desc = ws.humanize_type(typ);
+        assert_that!(
+            desc,
+            not(eq("nil")),
+            "table index read collapsed to nil: {}",
+            desc
+        );
     }
 }

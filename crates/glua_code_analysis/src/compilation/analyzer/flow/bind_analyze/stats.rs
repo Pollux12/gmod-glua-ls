@@ -352,13 +352,13 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
                 post_elseif_label,
             );
         }
-        else_label = finish_flow_label(binder, post_elseif_label, current);
+        else_label = finish_flow_label(binder, post_elseif_label, pre_elseif_label);
         if let Some(elseif_block) = elseif_clause.get_block() {
-            let current = finish_flow_label(binder, elseif_then_label, current);
+            let current = finish_flow_label(binder, elseif_then_label, pre_elseif_label);
             let block_id = bind_block(binder, elseif_block, current);
             binder.add_antecedent(post_if_label, block_id);
         } else {
-            let current = finish_flow_label(binder, elseif_then_label, current);
+            let current = finish_flow_label(binder, elseif_then_label, pre_elseif_label);
             binder.add_antecedent(post_if_label, current);
         }
     }

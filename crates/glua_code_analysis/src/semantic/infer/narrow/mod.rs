@@ -5,7 +5,7 @@ mod narrow_type;
 mod var_ref_id;
 
 use crate::{
-    CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowTree, InferFailReason,
+    CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason,
     LuaInferCache, LuaType, infer_param,
     semantic::infer::{
         InferResult,
@@ -33,7 +33,14 @@ pub fn infer_expr_narrow_type(
     };
 
     let root = LuaChunk::cast(expr.get_root()).ok_or(InferFailReason::None)?;
-    get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id)
+    let query_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&file_id, expr.get_position());
+    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let result =
+        get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id);
+    cache.flow_query_realm = previous_query_realm;
+    result
 }
 
 fn get_var_ref_type(db: &DbIndex, cache: &mut LuaInferCache, var_ref_id: &VarRefId) -> InferResult {
@@ -81,9 +88,20 @@ fn get_single_antecedent(tree: &FlowTree, flow: &FlowNode) -> Result<FlowId, Inf
                     .get_multi_antecedents(*multi_id)
                     .ok_or(InferFailReason::None)?;
                 if !multi_flow.is_empty() {
-                    // If there are multiple antecedents, we need to handle them separately
-                    // For now, we just return the first one
-                    Ok(multi_flow[0])
+                    if let Some(preferred) = multi_flow.iter().copied().find(|flow_id| {
+                        tree.get_flow_node(*flow_id).is_some_and(|flow_node| {
+                            !matches!(
+                                flow_node.kind,
+                                FlowNodeKind::Unreachable
+                                    | FlowNodeKind::Return
+                                    | FlowNodeKind::Break
+                            )
+                        })
+                    }) {
+                        Ok(preferred)
+                    } else {
+                        Ok(multi_flow[0])
+                    }
                 } else {
                     Err(InferFailReason::None)
                 }

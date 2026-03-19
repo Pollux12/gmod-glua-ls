@@ -72,9 +72,26 @@ mod test {
     #[test]
     fn test_isvalid_local_cached_still_narrows() {
         let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.new_path("__test_library_isvalid");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+            ---@class Entity
+            ---@field health integer
 
-        // `local IsValid = IsValid` (or a custom implementation) should still narrow,
-        // because the name "IsValid" is GMod-specific enough to treat as a nil guard.
+            ---@param obj any
+            ---@return boolean
+            function _G.IsValid(obj) end
+            "#
+                .to_string(),
+            ),
+        );
+
+        // Cached aliases of the global helper should still narrow.
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -84,9 +101,7 @@ mod test {
             ---@return Entity?
             local function get_ent() end
 
-            local IsValid = function(obj)
-                return obj ~= nil
-            end
+            local IsValid = IsValid
 
             local ent = get_ent()
             if IsValid(ent) then

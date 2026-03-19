@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    FileId, FlowId, LuaFunctionType,
+    FileId, FlowId, GmodRealm, LuaFunctionType,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::infer::VarRefId,
 };
@@ -33,7 +33,8 @@ pub struct LuaInferCache {
     pub expr_cache: HashMap<LuaSyntaxId, CacheEntry<LuaType>>,
     pub call_cache:
         HashMap<(LuaSyntaxId, Option<usize>, LuaType), CacheEntry<Arc<LuaFunctionType>>>,
-    pub flow_node_cache: HashMap<(VarRefId, FlowId), CacheEntry<LuaType>>,
+    pub flow_node_cache: HashMap<(VarRefId, FlowId, GmodRealm), CacheEntry<LuaType>>,
+    pub flow_query_realm: Option<GmodRealm>,
     pub index_ref_origin_type_cache: HashMap<VarRefId, CacheEntry<LuaType>>,
     pub expr_var_ref_id_cache: HashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
@@ -53,6 +54,7 @@ impl LuaInferCache {
             expr_cache: HashMap::new(),
             call_cache: HashMap::new(),
             flow_node_cache: HashMap::new(),
+            flow_query_realm: None,
             index_ref_origin_type_cache: HashMap::new(),
             expr_var_ref_id_cache: HashMap::new(),
             narrow_by_literal_stop_position_cache: HashSet::new(),
@@ -102,6 +104,7 @@ impl LuaInferCache {
         self.expr_cache.clear();
         self.call_cache.clear();
         self.flow_node_cache.clear();
+        self.flow_query_realm = None;
         self.index_ref_origin_type_cache.clear();
         self.expr_var_ref_id_cache.clear();
         self.scoped_scripted_global_cache = None;
