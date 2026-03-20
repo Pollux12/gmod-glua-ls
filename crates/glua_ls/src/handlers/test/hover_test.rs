@@ -1205,6 +1205,67 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_variable_with_comment_does_not_show_realm_badge() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---Variable docs should not gain realm badges.
+                local testVa<??>r = 123
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/shared.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("Variable docs should not gain realm badges"),
+            "expected hover to include variable description, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+            "did not expect SHARED badge for variable hover, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+            "did not expect SERVER badge for variable hover, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+            "did not expect CLIENT badge for variable hover, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("**SHARED**")
+                && !markup.value.contains("**SERVER**")
+                && !markup.value.contains("**CLIENT**"),
+            "did not expect realm label text for variable hover, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_dynamic_field_uses_field_style_output() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

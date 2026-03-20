@@ -155,13 +155,29 @@ impl<'a> HoverBuilder<'a> {
     }
 
     pub fn add_description(&mut self, property_owner: &LuaSemanticDeclId) -> Option<()> {
-        self.add_description_from_info(extract_description_from_property_owner(
-            self.semantic_model,
-            property_owner,
-        ))
+        self.add_description_with_realm(property_owner, false)
+    }
+
+    pub fn add_description_with_realm(
+        &mut self,
+        property_owner: &LuaSemanticDeclId,
+        include_realm: bool,
+    ) -> Option<()> {
+        self.add_description_from_info_with_realm(
+            extract_description_from_property_owner(self.semantic_model, property_owner),
+            include_realm,
+        )
     }
 
     pub fn add_description_from_info(&mut self, type_desc: Option<DescriptionInfo>) -> Option<()> {
+        self.add_description_from_info_with_realm(type_desc, false)
+    }
+
+    pub fn add_description_from_info_with_realm(
+        &mut self,
+        type_desc: Option<DescriptionInfo>,
+        include_realm: bool,
+    ) -> Option<()> {
         if let Some(desc_info) = type_desc {
             let DescriptionInfo {
                 description,
@@ -170,6 +186,7 @@ impl<'a> HoverBuilder<'a> {
             } = desc_info;
 
             if let Some(realm) = realm
+                && include_realm
                 && self.realm.is_none()
             {
                 self.realm = Some(realm);

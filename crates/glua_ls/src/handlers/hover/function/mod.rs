@@ -104,7 +104,7 @@ fn build_function_call_hover(
     )?;
     let description = get_function_description(builder, db, &match_semantic_decl);
     builder.set_type_description(contents.first()?.clone());
-    builder.add_description_from_info(description);
+    builder.add_description_from_info_with_realm(description, true);
 
     Some(())
 }
@@ -178,12 +178,13 @@ fn build_function_define_hover(
         }
         1 => {
             builder.set_type_description(function_infos[0].primary.clone());
-            builder.add_description_from_info(function_infos[0].description.clone());
+            builder
+                .add_description_from_info_with_realm(function_infos[0].description.clone(), true);
         }
         _ => {
             let main_type = function_infos.pop()?;
             builder.set_type_description(main_type.primary.clone());
-            builder.add_description_from_info(main_type.description.clone());
+            builder.add_description_from_info_with_realm(main_type.description.clone(), true);
 
             for type_desc in function_infos {
                 builder.add_signature_overload(type_desc.primary.clone());
@@ -192,7 +193,7 @@ fn build_function_define_hover(
                         builder.add_signature_overload(overload.clone());
                     }
                 }
-                builder.add_description_from_info(type_desc.description.clone());
+                builder.add_description_from_info_with_realm(type_desc.description.clone(), true);
             }
         }
     }
