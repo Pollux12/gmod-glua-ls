@@ -169,10 +169,6 @@ impl<'a> HoverBuilder<'a> {
         )
     }
 
-    pub fn add_description_from_info(&mut self, type_desc: Option<DescriptionInfo>) -> Option<()> {
-        self.add_description_from_info_with_realm(type_desc, false)
-    }
-
     pub fn add_description_from_info_with_realm(
         &mut self,
         type_desc: Option<DescriptionInfo>,

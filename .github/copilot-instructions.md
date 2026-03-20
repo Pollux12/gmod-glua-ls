@@ -11,7 +11,7 @@
   - `crates/glua_parser`: parser + CST/AST foundation (`rowan`-based).
   - `crates/glua_parser_desc`: parser descriptor metadata used by tooling/codegen.
   - `crates/glua_code_analysis`: semantic core (compilation DB, diagnostics, VFS, config, GMod inference/indexes).
-  - `crates/glua_code_style`: code-style support consumed by analysis/check flows.
+  - `crates/glua_code_style`: This is currently NOT used - formatting and style is currently done via `vendor\emmylua_codestyle` C++ Lua formatter.
   - `crates/glua_diagnostic_macro`: proc-macro crate for diagnostics definitions.
   - `crates/glua_ls`: LSP server runtime and handlers.
   - `crates/glua_check`: CLI diagnostics runner.

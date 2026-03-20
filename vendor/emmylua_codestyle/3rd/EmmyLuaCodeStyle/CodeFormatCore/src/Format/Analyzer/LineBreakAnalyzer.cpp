@@ -6,6 +6,19 @@
 
 using NodeKind = LuaSyntaxNodeKind;
 
+namespace {
+
+bool IsAnnotationCommentToken(LuaSyntaxNode node, const LuaSyntaxTree &t) {
+    if (!node.IsToken(t) || node.GetTokenKind(t) != TK_SHORT_COMMENT) {
+        return false;
+    }
+
+    auto text = node.GetText(t);
+    return text.size() >= 3 && text[0] == '-' && text[1] == '-' && text[2] == '-';
+}
+
+}
+
 LineBreakAnalyzer::LineBreakAnalyzer() {
 }
 
@@ -57,6 +70,8 @@ void LineBreakAnalyzer::ComplexAnalyze(FormatState &f, const LuaSyntaxTree &t) {
 
                     auto &style = f.GetStyle();
                     for (auto stmt: children) {
+                        const bool nextIsAnnotationComment = IsAnnotationCommentToken(stmt.GetNextSibling(t), t);
+
                         if (stmt.IsNode(t)) {
                             switch (stmt.GetSyntaxKind(t)) {
                                 case LuaSyntaxNodeKind::LocalStatement:
@@ -105,6 +120,10 @@ void LineBreakAnalyzer::ComplexAnalyze(FormatState &f, const LuaSyntaxTree &t) {
                                 }
                             }
 
+                            if (nextIsAnnotationComment) {
+                                BreakAfter(stmt, t, LineSpace(LineSpaceType::Keep));
+                            }
+
                         } else {
                             switch (stmt.GetTokenKind(t)) {
                                 case TK_LONG_COMMENT:
@@ -117,11 +136,19 @@ void LineBreakAnalyzer::ComplexAnalyze(FormatState &f, const LuaSyntaxTree &t) {
                                 }
                                 case TK_SHORT_COMMENT:
                                 case TK_SHEBANG: {
-                                    BreakAfter(stmt, t, style.line_space_after_comment);
+                                    if (IsAnnotationCommentToken(stmt, t) || nextIsAnnotationComment) {
+                                        BreakAfter(stmt, t, LineSpace(LineSpaceType::Keep));
+                                    } else {
+                                        BreakAfter(stmt, t, style.line_space_after_comment);
+                                    }
                                     break;
                                 }
                                 default: {
-                                    BreakAfter(stmt, t);
+                                    if (nextIsAnnotationComment) {
+                                        BreakAfter(stmt, t, LineSpace(LineSpaceType::Keep));
+                                    } else {
+                                        BreakAfter(stmt, t);
+                                    }
                                 }
                             }
                         }

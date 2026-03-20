@@ -132,6 +132,8 @@ void RangeFormatBuilder::CheckRange(LuaSyntaxNode &syntaxNode, const LuaSyntaxTr
                     if (tokenStartLine < _range.StartLine) {
                         _range.StartLine = tokenStartLine;
                         _range.StartCol = startNode.GetStartCol(t);
+                    } else if (tokenStartLine > _range.StartLine) {
+                        AddEndOfLine(tokenStartLine - _range.StartLine);
                     }
                 }
                 break;
