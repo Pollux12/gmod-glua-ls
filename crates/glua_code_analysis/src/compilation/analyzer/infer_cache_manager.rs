@@ -9,6 +9,8 @@ use crate::{
 pub struct InferCacheManager {
     infer_map: HashMap<FileId, LuaInferCache>,
     current_phase: LuaAnalysisPhase,
+    /// Default flow budget for newly created caches. 0 = unlimited.
+    default_flow_budget: u32,
 }
 
 impl InferCacheManager {
@@ -16,19 +18,27 @@ impl InferCacheManager {
         InferCacheManager {
             infer_map: HashMap::new(),
             current_phase: LuaAnalysisPhase::Ordered,
+            default_flow_budget: 0,
         }
+    }
+
+    pub fn set_default_flow_budget(&mut self, budget: u32) {
+        self.default_flow_budget = budget;
     }
 
     pub fn get_infer_cache(&mut self, file_id: FileId) -> &mut LuaInferCache {
         let phase = self.current_phase;
+        let budget = self.default_flow_budget;
         self.infer_map.entry(file_id).or_insert_with(|| {
-            LuaInferCache::new(
+            let mut cache = LuaInferCache::new(
                 file_id,
                 crate::CacheOptions {
                     analysis_phase: phase,
                     skip_flow_narrowing: false,
                 },
-            )
+            );
+            cache.flow_node_budget = budget;
+            cache
         })
     }
 

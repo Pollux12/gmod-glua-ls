@@ -47,6 +47,11 @@ pub fn analyze(
         run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
         run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
         run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
+
+        // Apply flow analysis budget during lua analyze to cap runaway cost
+        // on very large files (e.g. 3000+ line files with deep flow chains).
+        // Budget of 20K nodes prevents any single file from dominating.
+        context.infer_manager.set_default_flow_budget(20_000);
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
 
         if db.get_emmyrc().gmod.enabled {
