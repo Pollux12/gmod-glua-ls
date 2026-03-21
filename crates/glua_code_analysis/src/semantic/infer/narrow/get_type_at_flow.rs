@@ -29,6 +29,13 @@ pub fn get_type_at_flow(
     var_ref_id: &VarRefId,
     flow_id: FlowId,
 ) -> InferResult {
+    // If the per-file flow budget has been exhausted, skip narrowing entirely
+    // and return the declared/base type. This prevents pathologically large
+    // files from dominating analysis time.
+    if cache.flow_budget_exhausted() {
+        return get_var_ref_type(db, cache, var_ref_id);
+    }
+
     let query_realm = cache.flow_query_realm.unwrap_or_else(|| {
         db.get_gmod_infer_index()
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
@@ -56,6 +63,14 @@ pub fn get_type_at_flow(
         let intermediate_key = (var_ref_id.clone(), antecedent_flow_id, query_realm);
         if let Some(CacheEntry::Cache(cached_type)) = cache.flow_node_cache.get(&intermediate_key) {
             result_type = cached_type.clone();
+            break;
+        }
+
+        // Track total flow work for budget enforcement.
+        cache.flow_nodes_visited += 1;
+        if cache.flow_budget_exhausted() {
+            // Budget exceeded mid-walk — return base type for this variable.
+            result_type = get_var_ref_type(db, cache, var_ref_id)?;
             break;
         }
 

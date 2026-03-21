@@ -136,8 +136,15 @@ impl LuaDiagnostic {
 
         let config = self.get_config_for_file(compilation, file_id);
 
+        // Use a flow analysis budget for diagnostics. This prevents
+        // pathologically large files from dominating diagnostic time.
+        // 20K nodes is generous — normal files use a few thousand at most,
+        // but monster files (3000+ lines) can trigger millions of visits.
+        const DIAGNOSTIC_FLOW_BUDGET: u32 = 20_000;
+
         let sem_start = Instant::now();
-        let semantic_model = compilation.get_semantic_model(file_id)?;
+        let semantic_model =
+            compilation.get_semantic_model_with_flow_budget(file_id, DIAGNOSTIC_FLOW_BUDGET)?;
         let sem_elapsed = sem_start.elapsed();
         if sem_elapsed.as_millis() > 10 {
             info!("diagnose_file: get_semantic_model cost {:?} for {:?}", sem_elapsed, file_id);

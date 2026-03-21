@@ -40,6 +40,26 @@ impl LuaCompilation {
         ))
     }
 
+    /// Creates a semantic model with a flow analysis budget. When the budget
+    /// (total flow nodes visited) is exceeded, flow narrowing is skipped and
+    /// base types are returned. Use 0 for unlimited.
+    pub fn get_semantic_model_with_flow_budget(
+        &'_ self,
+        file_id: FileId,
+        flow_budget: u32,
+    ) -> Option<SemanticModel<'_>> {
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        cache.flow_node_budget = flow_budget;
+        let tree = self.db.get_vfs().get_syntax_tree(&file_id)?;
+        Some(SemanticModel::new(
+            file_id,
+            &self.db,
+            cache,
+            self.emmyrc.clone(),
+            tree.get_chunk_node(),
+        ))
+    }
+
     pub fn update_index(&mut self, file_ids: Vec<FileId>) {
         let mut need_analyzed_files = vec![];
         for file_id in file_ids {
