@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    FileId, FlowId, GmodRealm, LuaFunctionType,
+    FileId, FlowId, GmodRealm, LuaFunctionType, LuaSemanticDeclId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::infer::VarRefId,
 };
@@ -44,6 +44,9 @@ pub struct LuaInferCache {
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
     /// within the same method body.
     pub self_type_cache: HashMap<LuaSyntaxId, Option<LuaType>>,
+    /// Cache for `find_decl` results so that multiple diagnostic checkers
+    /// processing the same file don't redo the full member-resolution chain.
+    pub decl_cache: HashMap<LuaSyntaxId, Option<LuaSemanticDeclId>>,
     /// Tracks total flow nodes visited during flow analysis. When this exceeds
     /// `flow_node_budget`, subsequent flow walks return the base type without
     /// narrowing. This prevents pathologically large files from dominating
@@ -69,6 +72,7 @@ impl LuaInferCache {
             scoped_scripted_global_cache: None,
             pending_str_tpl_type_decls: Vec::new(),
             self_type_cache: HashMap::new(),
+            decl_cache: HashMap::new(),
             flow_nodes_visited: 0,
             flow_node_budget: 0,
         }
@@ -124,6 +128,7 @@ impl LuaInferCache {
         self.scoped_scripted_global_cache = None;
         self.pending_str_tpl_type_decls.clear();
         self.self_type_cache.clear();
+        self.decl_cache.clear();
         self.flow_nodes_visited = 0;
     }
 

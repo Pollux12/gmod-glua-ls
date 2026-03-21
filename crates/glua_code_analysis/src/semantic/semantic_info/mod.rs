@@ -9,7 +9,7 @@ use crate::{
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaDocNameType, LuaDocTag, LuaExpr, LuaLocalName, LuaParamName,
-    LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken, LuaTableField,
+    LuaSyntaxId, LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken, LuaTableField,
 };
 pub use infer_expr_semantic_decl::infer_expr_semantic_decl;
 pub use resolve_global_decl::resolve_global_decl_id;
@@ -187,8 +187,23 @@ pub fn infer_node_semantic_decl(
 ) -> Option<LuaSemanticDeclId> {
     match node {
         expr_node if LuaExpr::can_cast(expr_node.kind().into()) => {
+            // Only use the decl cache for the default trace level (Trace(10)).
+            // Goto-definition calls find_decl with both Trace(10) and NoTrace,
+            // which can return different results for the same node.
+            let use_cache = level == SemanticDeclLevel::default();
+            let syntax_id = LuaSyntaxId::from_node(&expr_node);
+            if use_cache {
+                if let Some(cached) = cache.decl_cache.get(&syntax_id) {
+                    return cached.clone();
+                }
+            }
             let expr = LuaExpr::cast(expr_node)?;
-            infer_expr_semantic_decl(db, cache, expr, SemanticDeclGuard::default(), level)
+            let result =
+                infer_expr_semantic_decl(db, cache, expr, SemanticDeclGuard::default(), level);
+            if use_cache {
+                cache.decl_cache.insert(syntax_id, result.clone());
+            }
+            result
         }
         table_field_node if LuaTableField::can_cast(table_field_node.kind().into()) => {
             let table_field = LuaTableField::cast(table_field_node)?;
