@@ -132,6 +132,11 @@ impl LuaInferCache {
         self.flow_nodes_visited = 0;
     }
 
+    /// Clears all caches. Used before the unresolve phase.
+    pub fn clear_for_unresolve(&mut self) {
+        self.clear();
+    }
+
     /// Returns true if the flow analysis budget has been exhausted.
     pub fn flow_budget_exhausted(&self) -> bool {
         self.flow_node_budget > 0 && self.flow_nodes_visited >= self.flow_node_budget

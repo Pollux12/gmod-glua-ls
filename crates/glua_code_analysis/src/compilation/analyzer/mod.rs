@@ -48,15 +48,22 @@ pub fn analyze(
         run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
         run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
 
+        // Gmod pre-analysis: collect realm metadata, scripted class types, hooks,
+        // and network flow BEFORE lua_analyze. This ensures flow analysis uses
+        // correct realm keys (Client/Server/Shared) from the start, avoiding the
+        // previous problem where all flow caches used realm=Unknown and had to be
+        // fully recomputed in the unresolve phase.
+        run_analysis::<gmod::GmodPreAnalysisPipeline>(db, &mut context);
+
         // Apply flow analysis budget during lua analyze to cap runaway cost
         // on very large files (e.g. 3000+ line files with deep flow chains).
         // Budget of 10K nodes prevents any single file from dominating.
         context.infer_manager.set_default_flow_budget(10_000);
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
 
-        if db.get_emmyrc().gmod.enabled {
-            run_analysis::<gmod::GmodAnalysisPipeline>(db, &mut context);
-        }
+        // Gmod post-analysis: synthesize members that depend on metadata collected
+        // during lua_analyze (AccessorFunc, NetworkVar, VGUI register calls).
+        run_analysis::<gmod::GmodPostAnalysisPipeline>(db, &mut context);
 
         synthesize_accessorfunc_members(db, &workspace_file_ids);
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);

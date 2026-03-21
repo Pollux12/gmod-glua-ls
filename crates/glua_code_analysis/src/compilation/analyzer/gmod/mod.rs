@@ -27,21 +27,29 @@ use crate::{
 };
 use rowan::TextSize;
 
-pub struct GmodAnalysisPipeline;
+/// Pre-analysis phase: runs BEFORE lua_analyze.
+/// Collects purely syntactic metadata (hooks, network, realm, scripted class
+/// type declarations) so that lua_analyze has correct realm keys and scripted
+/// class types available from the start. This avoids the previous architecture
+/// where flow analysis used `GmodRealm::Unknown` during lua_analyze and had to
+/// recompute everything in the unresolve phase with the correct realm.
+pub struct GmodPreAnalysisPipeline;
 
-impl AnalysisPipeline for GmodAnalysisPipeline {
+impl AnalysisPipeline for GmodPreAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         if !db.get_emmyrc().gmod.enabled {
             return;
         }
 
-        let _p = Profile::cond_new("gmod analyze", context.tree_list.len() > 1);
+        let _p = Profile::cond_new("gmod pre-analyze", context.tree_list.len() > 1);
         let tree_list = context.tree_list.clone();
         let file_ids: Vec<FileId> = tree_list.iter().map(|x| x.file_id).collect();
+        let do_profile = tree_list.len() > 100;
 
         // Pre-compute scripted class scope for all files (compile globs once)
         let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
 
+        let t0 = std::time::Instant::now();
         let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::new();
         let mut annotation_realms: HashMap<FileId, GmodRealm> = HashMap::new();
         for in_filed_tree in &tree_list {
@@ -82,20 +90,47 @@ impl AnalysisPipeline for GmodAnalysisPipeline {
                 annotation_realms.insert(in_filed_tree.file_id, realm);
             }
         }
+        if do_profile { log::info!("gmod pre: per-file metadata cost {:?}", t0.elapsed()); }
 
-        synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
-
-        // Detect wrapper functions that internally call NetworkVar/NetworkVarElement
-        // and synthesize members from their call sites.
+        // Network var wrappers are purely syntactic (AST pattern matching)
+        let t1 = std::time::Instant::now();
         let tree_map: HashMap<FileId, LuaChunk> = tree_list
             .iter()
             .map(|x| (x.file_id, x.value.clone()))
             .collect();
         synthesize_network_var_wrappers(db, &scripted_scope_files, &tree_map);
+        if do_profile { log::info!("gmod pre: network_var_wrappers cost {:?}", t1.elapsed()); }
 
-        synthesize_vgui_registrations(db, &file_ids);
-
+        let t2 = std::time::Instant::now();
         rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms, &file_ids);
+        if do_profile { log::info!("gmod pre: rebuild_realm_metadata cost {:?}", t2.elapsed()); }
+    }
+}
+
+/// Post-analysis phase: runs AFTER lua_analyze.
+/// Synthesizes members that depend on metadata collected during lua_analyze
+/// (gmod_class_metadata_index: AccessorFunc, NetworkVar, VGUI register calls).
+pub struct GmodPostAnalysisPipeline;
+
+impl AnalysisPipeline for GmodPostAnalysisPipeline {
+    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
+        if !db.get_emmyrc().gmod.enabled {
+            return;
+        }
+
+        let _p = Profile::cond_new("gmod post-analyze", context.tree_list.len() > 1);
+        let file_ids: Vec<FileId> = context.tree_list.iter().map(|x| x.file_id).collect();
+        let do_profile = context.tree_list.len() > 100;
+
+        let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
+
+        let t0 = std::time::Instant::now();
+        synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
+        if do_profile { log::info!("gmod post: scripted_class_members cost {:?}", t0.elapsed()); }
+
+        let t1 = std::time::Instant::now();
+        synthesize_vgui_registrations(db, &file_ids);
+        if do_profile { log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed()); }
     }
 }
 
