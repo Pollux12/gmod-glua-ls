@@ -29,6 +29,11 @@ fn setup_logger() {
         .open(&log_file)
         .expect("Failed to open log file");
 
+    let log_level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse::<log::LevelFilter>().ok())
+        .unwrap_or(log::LevelFilter::Warn);
+
     let logger = fern::Dispatch::new()
         .format(move |out, message, record| {
             out.finish(format_args!(
@@ -38,7 +43,7 @@ fn setup_logger() {
                 message
             ))
         })
-        .level(log::LevelFilter::Warn)
+        .level(log_level)
         .chain(file);
 
     if let Err(e) = logger.apply() {
@@ -186,6 +191,9 @@ async fn main() {
     let main_file_ids = db.get_module_index().get_main_workspace_file_ids();
     let diag_file_count = main_file_ids.len();
 
+    // Precompute shared diagnostic data once (avoids per-file workspace-wide scans)
+    let shared_data = analysis.precompute_diagnostic_shared_data();
+
     let parallelism = std::env::var("BENCH_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -198,15 +206,24 @@ async fn main() {
     eprintln!("Diagnostics: {} files, {} threads", diag_file_count, parallelism);
 
     let total_diagnostics = std::sync::atomic::AtomicUsize::new(0);
-    let chunk_size = (main_file_ids.len() + parallelism - 1) / parallelism;
+    let next_file = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
-        for chunk in main_file_ids.chunks(chunk_size.max(1)) {
+        for _ in 0..parallelism {
             let analysis = &analysis;
             let counter = &total_diagnostics;
+            let next = &next_file;
+            let file_ids = &main_file_ids;
+            let shared = shared_data.clone();
             s.spawn(move || {
-                for file_id in chunk {
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= file_ids.len() {
+                        break;
+                    }
                     let cancel_token = CancellationToken::new();
-                    if let Some(diagnostics) = analysis.diagnose_file(*file_id, cancel_token) {
+                    if let Some(diagnostics) =
+                        analysis.diagnose_file_with_shared(file_ids[idx], cancel_token, shared.clone())
+                    {
                         counter.fetch_add(
                             diagnostics.len(),
                             std::sync::atomic::Ordering::Relaxed,

@@ -476,6 +476,14 @@ impl LuaModuleIndex {
         self.get_workspace_kind(workspace_id) == WorkspaceKind::Main
     }
 
+    pub fn get_main_workspace_ids(&self) -> Vec<WorkspaceId> {
+        self.workspaces
+            .iter()
+            .filter(|w| self.get_workspace_kind(w.id) == WorkspaceKind::Main)
+            .map(|w| w.id)
+            .collect()
+    }
+
     pub fn is_std_workspace_id(&self, workspace_id: WorkspaceId) -> bool {
         self.get_workspace_kind(workspace_id) == WorkspaceKind::Std
     }

@@ -48,12 +48,13 @@ use glua_parser::{
 };
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::TextRange;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    FileId, LuaSemanticDeclId, LuaType, RenderLevel, SemanticDeclLevel, db_index::DbIndex,
-    humanize_type, semantic::SemanticModel,
+    FileId, LuaSemanticDeclId, LuaType, RenderLevel, SemanticDeclLevel, WorkspaceId,
+    db_index::DbIndex, humanize_type, semantic::SemanticModel,
 };
 
 use super::{
@@ -61,6 +62,9 @@ use super::{
     lua_diagnostic_code::{get_default_severity, is_code_default_enable},
     lua_diagnostic_config::LuaDiagnosticConfig,
 };
+
+pub use gmod_realm_misuse::GmMethodRealmMap;
+pub use gmod_realm_misuse::precompute_gm_method_realms;
 
 pub trait Checker {
     const CODES: &[DiagnosticCode];
@@ -206,12 +210,21 @@ pub fn check_file(
     Some(())
 }
 
+/// Precomputed data shared across all diagnostic files in a batch run.
+/// Computing this once instead of per-file saves ~60s on large workspaces.
+pub struct SharedDiagnosticData {
+    /// Maps workspace_id -> precomputed GM method realm annotations.
+    /// GmodRealmMisuseChecker uses this to avoid re-scanning all annotations per file.
+    pub gm_method_realms: HashMap<WorkspaceId, Arc<GmMethodRealmMap>>,
+}
+
 pub struct DiagnosticContext<'a> {
     file_id: FileId,
     db: &'a DbIndex,
     diagnostics: Vec<Diagnostic>,
     pub config: Arc<LuaDiagnosticConfig>,
     cancel_token: CancellationToken,
+    shared_data: Option<Arc<SharedDiagnosticData>>,
 }
 
 impl<'a> DiagnosticContext<'a> {
@@ -227,7 +240,29 @@ impl<'a> DiagnosticContext<'a> {
             diagnostics: Vec::new(),
             config,
             cancel_token,
+            shared_data: None,
         }
+    }
+
+    pub fn new_with_shared(
+        file_id: FileId,
+        db: &'a DbIndex,
+        config: Arc<LuaDiagnosticConfig>,
+        cancel_token: CancellationToken,
+        shared_data: Arc<SharedDiagnosticData>,
+    ) -> Self {
+        Self {
+            file_id,
+            db,
+            diagnostics: Vec::new(),
+            config,
+            cancel_token,
+            shared_data: Some(shared_data),
+        }
+    }
+
+    pub fn get_shared_data(&self) -> Option<&SharedDiagnosticData> {
+        self.shared_data.as_deref()
     }
 
     pub fn get_db(&self) -> &DbIndex {

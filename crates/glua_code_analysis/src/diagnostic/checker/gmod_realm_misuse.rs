@@ -30,7 +30,25 @@ impl Checker for GmodRealmMisuseChecker {
         let Some(file_realm_metadata) = infer_index.get_realm_file_metadata(&file_id) else {
             return;
         };
-        let gm_method_realms = collect_annotated_gm_method_realms(context, semantic_model);
+
+        // Use precomputed workspace data if available, otherwise compute per-file.
+        // We extract this before the main loop to avoid borrow conflicts with context.
+        let workspace_id = db
+            .get_module_index()
+            .get_workspace_id(file_id)
+            .unwrap_or(WorkspaceId::MAIN);
+        let precomputed = context
+            .get_shared_data()
+            .and_then(|s| s.gm_method_realms.get(&workspace_id).cloned());
+        let fallback;
+        let gm_method_realms: &GmMethodRealmMap = match &precomputed {
+            Some(pre) => pre.as_ref(),
+            None => {
+                fallback = collect_annotated_gm_method_realms(context, semantic_model);
+                &fallback
+            }
+        };
+
         let mut decl_annotation_cache = HashMap::new();
 
         for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
@@ -135,7 +153,7 @@ impl Checker for GmodRealmMisuseChecker {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum RealmEvidence {
+pub(crate) enum RealmEvidence {
     ExplicitBranch,
     ExplicitAnnotation,
     InferredFilename,
@@ -145,9 +163,9 @@ enum RealmEvidence {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct ResolvedRealm {
-    realm: GmodRealm,
-    evidence: RealmEvidence,
+pub struct ResolvedRealm {
+    pub(crate) realm: GmodRealm,
+    pub(crate) evidence: RealmEvidence,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -156,7 +174,7 @@ struct AnnotatedRealmRange {
     realm: GmodRealm,
 }
 
-type GmMethodRealmMap = HashMap<String, Vec<ResolvedRealm>>;
+pub type GmMethodRealmMap = HashMap<String, Vec<ResolvedRealm>>;
 type DeclAnnotationRealmCache = HashMap<FileId, Vec<AnnotatedRealmRange>>;
 
 fn resolve_callee_realms(
@@ -652,4 +670,43 @@ fn realm_label(realm: GmodRealm) -> &'static str {
         GmodRealm::Shared => "shared",
         GmodRealm::Unknown => "unknown",
     }
+}
+
+/// Precompute GM method realm annotations for a specific workspace.
+/// This is the same data that `collect_annotated_gm_method_realms` computes per-file,
+/// but extracted to be called once per workspace during batch diagnostics.
+pub fn precompute_gm_method_realms(
+    db: &crate::db_index::DbIndex,
+    workspace_id: WorkspaceId,
+) -> GmMethodRealmMap {
+    let mut gm_method_realms = HashMap::new();
+    let module_index = db.get_module_index();
+
+    for (file_id, method_realms) in db.get_gmod_infer_index().iter_gm_method_realm_annotations() {
+        let file_id = *file_id;
+        let candidate_workspace_id = module_index
+            .get_workspace_id(file_id)
+            .unwrap_or(WorkspaceId::MAIN);
+        if module_index
+            .workspace_resolution_priority(workspace_id, candidate_workspace_id)
+            .is_none()
+        {
+            continue;
+        }
+
+        for (method_name, realm) in method_realms {
+            let entry = gm_method_realms
+                .entry(method_name.clone())
+                .or_insert_with(Vec::new);
+            push_unique_realm(
+                entry,
+                ResolvedRealm {
+                    realm: *realm,
+                    evidence: RealmEvidence::ExplicitAnnotation,
+                },
+            );
+        }
+    }
+
+    gm_method_realms
 }

@@ -547,6 +547,22 @@ impl EmmyLuaAnalysis {
             .diagnose_file(&self.compilation, file_id, cancel_token)
     }
 
+    pub fn diagnose_file_with_shared(
+        &self,
+        file_id: FileId,
+        cancel_token: CancellationToken,
+        shared_data: std::sync::Arc<diagnostic::SharedDiagnosticData>,
+    ) -> Option<Vec<lsp_types::Diagnostic>> {
+        self.diagnostic
+            .diagnose_file_with_shared(&self.compilation, file_id, cancel_token, shared_data)
+    }
+
+    pub fn precompute_diagnostic_shared_data(
+        &self,
+    ) -> std::sync::Arc<diagnostic::SharedDiagnosticData> {
+        self.diagnostic.precompute_shared_data(&self.compilation)
+    }
+
     pub fn reindex(&mut self) {
         let file_ids = self.compilation.get_db().get_vfs().get_all_file_ids();
         self.compilation.clear_index();

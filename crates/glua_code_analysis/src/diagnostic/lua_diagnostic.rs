@@ -5,6 +5,8 @@ use std::time::Instant;
 use log::info;
 
 pub use super::checker::DiagnosticContext;
+use super::checker::SharedDiagnosticData;
+use super::checker::precompute_gm_method_realms;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
 use lsp_types::Diagnostic;
@@ -79,6 +81,44 @@ impl LuaDiagnostic {
         file_id: FileId,
         cancel_token: CancellationToken,
     ) -> Option<Vec<Diagnostic>> {
+        self.diagnose_file_inner(compilation, file_id, cancel_token, None)
+    }
+
+    pub fn diagnose_file_with_shared(
+        &self,
+        compilation: &LuaCompilation,
+        file_id: FileId,
+        cancel_token: CancellationToken,
+        shared_data: Arc<SharedDiagnosticData>,
+    ) -> Option<Vec<Diagnostic>> {
+        self.diagnose_file_inner(compilation, file_id, cancel_token, Some(shared_data))
+    }
+
+    /// Precompute shared diagnostic data once for use across all files.
+    /// This avoids per-file recomputation of workspace-wide annotations.
+    pub fn precompute_shared_data(
+        &self,
+        compilation: &LuaCompilation,
+    ) -> Arc<SharedDiagnosticData> {
+        let db = compilation.get_db();
+        let module_index = db.get_module_index();
+
+        let mut gm_method_realms = HashMap::new();
+        for workspace_id in module_index.get_main_workspace_ids() {
+            let realms = precompute_gm_method_realms(db, workspace_id);
+            gm_method_realms.insert(workspace_id, Arc::new(realms));
+        }
+
+        Arc::new(SharedDiagnosticData { gm_method_realms })
+    }
+
+    fn diagnose_file_inner(
+        &self,
+        compilation: &LuaCompilation,
+        file_id: FileId,
+        cancel_token: CancellationToken,
+        shared_data: Option<Arc<SharedDiagnosticData>>,
+    ) -> Option<Vec<Diagnostic>> {
         if !self.enable {
             return None;
         }
@@ -103,7 +143,11 @@ impl LuaDiagnostic {
             info!("diagnose_file: get_semantic_model cost {:?} for {:?}", sem_elapsed, file_id);
         }
 
-        let mut context = DiagnosticContext::new(file_id, db, config, cancel_token.clone());
+        let mut context = if let Some(shared) = shared_data {
+            DiagnosticContext::new_with_shared(file_id, db, config, cancel_token.clone(), shared)
+        } else {
+            DiagnosticContext::new(file_id, db, config, cancel_token.clone())
+        };
 
         let check_start = Instant::now();
         check_file(&mut context, &semantic_model, &cancel_token);
