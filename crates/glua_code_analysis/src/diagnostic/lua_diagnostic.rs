@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+
+use log::info;
 
 pub use super::checker::DiagnosticContext;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
@@ -92,10 +95,22 @@ impl LuaDiagnostic {
         }
 
         let config = self.get_config_for_file(compilation, file_id);
+
+        let sem_start = Instant::now();
         let semantic_model = compilation.get_semantic_model(file_id)?;
+        let sem_elapsed = sem_start.elapsed();
+        if sem_elapsed.as_millis() > 10 {
+            info!("diagnose_file: get_semantic_model cost {:?} for {:?}", sem_elapsed, file_id);
+        }
+
         let mut context = DiagnosticContext::new(file_id, db, config, cancel_token.clone());
 
+        let check_start = Instant::now();
         check_file(&mut context, &semantic_model, &cancel_token);
+        let check_elapsed = check_start.elapsed();
+        if check_elapsed.as_millis() > 10 {
+            info!("diagnose_file: check_file cost {:?} for {:?}", check_elapsed, file_id);
+        }
 
         if cancel_token.is_cancelled() {
             return None;

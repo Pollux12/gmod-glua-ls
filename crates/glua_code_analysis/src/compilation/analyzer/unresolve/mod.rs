@@ -40,7 +40,11 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         let _p = Profile::cond_new("resolve analyze", context.tree_list.len() > 1);
         let mut infer_manager = std::mem::take(&mut context.infer_manager);
+
+        let mat_start = std::time::Instant::now();
         materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
+        log::info!("unresolve: initial materialize_pending cost {:?}", mat_start.elapsed());
+
         infer_manager.clear();
 
         let mut reason_resolve: Vec<(InferFailReason, Vec<UnResolve>)> = Vec::new();
@@ -52,6 +56,9 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             }
         }
 
+        let total_unresolves: usize = reason_resolve.iter().map(|(_, v)| v.len()).sum();
+        log::info!("unresolve: starting with {} unresolves in {} reason groups", total_unresolves, reason_resolve.len());
+
         // Sort unresolves within each reason group by (file_id, position) to ensure
         // deterministic processing order regardless of HashMap iteration order during
         // earlier analysis phases.
@@ -61,12 +68,23 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 
         let mut loop_count = 0;
         while !reason_resolve.is_empty() {
+            let iter_start = std::time::Instant::now();
+
+            let resolve_start = std::time::Instant::now();
             try_resolve(db, &mut infer_manager, &mut reason_resolve);
+            log::info!("unresolve: loop {} try_resolve cost {:?}", loop_count, resolve_start.elapsed());
+
+            let mat_start = std::time::Instant::now();
             materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
+            log::info!("unresolve: loop {} materialize_pending cost {:?}", loop_count, mat_start.elapsed());
 
             if reason_resolve.is_empty() {
+                log::info!("unresolve: loop {} total cost {:?} (resolved all)", loop_count, iter_start.elapsed());
                 break;
             }
+
+            let remaining: usize = reason_resolve.iter().map(|(_, v)| v.len()).sum();
+            log::info!("unresolve: loop {} remaining {} unresolves", loop_count, remaining);
 
             if loop_count == 0 {
                 infer_manager.set_force();
@@ -78,7 +96,11 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                 infer_manager.clear();
             }
 
+            let reason_start = std::time::Instant::now();
             resolve_all_reason(db, &mut reason_resolve, loop_count);
+            log::info!("unresolve: loop {} resolve_all_reason cost {:?}", loop_count, reason_start.elapsed());
+
+            log::info!("unresolve: loop {} total cost {:?}", loop_count, iter_start.elapsed());
 
             if loop_count >= 5 {
                 break;

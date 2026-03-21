@@ -22,6 +22,9 @@ use stats::{
     analyze_table_field,
 };
 
+use log::info;
+use std::time::Instant;
+
 use crate::{
     Emmyrc, FileId, InferFailReason,
     compilation::analyzer::{
@@ -58,8 +61,11 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
 
         let file_dependency = db.get_file_dependencies_index().get_file_dependencies();
         let order = file_dependency.get_best_analysis_order(&file_ids, &context.metas);
+        let total_start = Instant::now();
+        let mut file_count: usize = 0;
         for file_id in order {
             if let Some(root) = tree_map.get(&file_id) {
+                let file_start = Instant::now();
                 let is_scripted = scripted_scope_files.contains(&file_id);
                 let mut analyzer = LuaAnalyzer::new(
                     db,
@@ -73,8 +79,17 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                     analyze_node(&mut analyzer, node);
                 }
                 analyze_chunk_return(&mut analyzer, root.clone());
+                file_count += 1;
+                let file_elapsed = file_start.elapsed();
+                if file_elapsed.as_millis() > 10 {
+                    let path = db.get_vfs().get_uri(&file_id)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| format!("{:?}", file_id));
+                    info!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
+                }
             }
         }
+        info!("lua analyze total: {} files in {:?}", file_count, total_start.elapsed());
     }
 }
 

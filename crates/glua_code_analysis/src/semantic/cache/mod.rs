@@ -13,7 +13,7 @@ use crate::{
     semantic::infer::VarRefId,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CacheEntry<T> {
     Ready,
     Cache(T),
@@ -26,7 +26,7 @@ pub struct PendingStrTplTypeDecl {
     pub super_type: LuaType,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaInferCache {
     file_id: FileId,
     config: CacheOptions,
@@ -66,6 +66,10 @@ impl LuaInferCache {
 
     pub fn get_config(&self) -> &CacheOptions {
         &self.config
+    }
+
+    pub fn config_mut(&mut self) -> &mut CacheOptions {
+        &mut self.config
     }
 
     pub fn get_file_id(&self) -> FileId {

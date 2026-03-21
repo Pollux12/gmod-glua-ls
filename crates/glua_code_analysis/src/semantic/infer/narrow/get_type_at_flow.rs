@@ -49,6 +49,16 @@ pub fn get_type_at_flow(
     let result_type;
     let mut antecedent_flow_id = flow_id;
     loop {
+        // Check cache for intermediate flow nodes — this is critical for
+        // performance in large files where many walks share overlapping
+        // flow chains.  Without this check, each walk re-traverses the
+        // entire chain until it hits the declaration node.
+        let intermediate_key = (var_ref_id.clone(), antecedent_flow_id, query_realm);
+        if let Some(CacheEntry::Cache(cached_type)) = cache.flow_node_cache.get(&intermediate_key) {
+            result_type = cached_type.clone();
+            break;
+        }
+
         let flow_node = tree
             .get_flow_node(antecedent_flow_id)
             .ok_or(InferFailReason::None)?;

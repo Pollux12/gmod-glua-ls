@@ -1,0 +1,22 @@
+[package]
+name = "benchmark"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+glua_code_analysis.workspace = true
+glua_parser.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+log.workspace = true
+fern.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lsp_types.workspace = true
+mimalloc.workspace = true
+chrono.workspace = true
+
+[[bin]]
+name = "benchmark"

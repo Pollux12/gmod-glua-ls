@@ -81,10 +81,23 @@ fn run_check<T: Checker>(
         .iter()
         .any(|code| context.is_checker_enable_by_code(code))
     {
-        // let name = T::CODES.iter().map(|c| c.get_name()).collect::<Vec<_>>().join(",");
-        // let show_name = format!("{}({})", std::any::type_name::<T>(), name);
-        // let _p = Profile::new(&show_name);
+        let start = std::time::Instant::now();
         T::check(context, semantic_model);
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() > 5 {
+            let name = T::CODES
+                .iter()
+                .map(|c| c.get_name())
+                .collect::<Vec<_>>()
+                .join(",");
+            log::info!(
+                "checker slow: {}({}) cost {:?} for {:?}",
+                std::any::type_name::<T>(),
+                name,
+                elapsed,
+                context.get_file_id()
+            );
+        }
     }
 }
 

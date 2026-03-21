@@ -66,6 +66,18 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
     }
 
     cache.expr_cache.insert(key, CacheEntry::Ready);
+    let infer_start = std::time::Instant::now();
+    let expr_kind = match &expr {
+        LuaExpr::CallExpr(_) => "call",
+        LuaExpr::TableExpr(_) => "table",
+        LuaExpr::LiteralExpr(_) => "literal",
+        LuaExpr::BinaryExpr(_) => "binary",
+        LuaExpr::UnaryExpr(_) => "unary",
+        LuaExpr::ClosureExpr(_) => "closure",
+        LuaExpr::ParenExpr(_) => "paren",
+        LuaExpr::NameExpr(_) => "name",
+        LuaExpr::IndexExpr(_) => "index",
+    };
     let result_type = match expr {
         LuaExpr::CallExpr(call_expr) => infer_call_expr(db, cache, call_expr),
         LuaExpr::TableExpr(table_expr) => infer_table_expr(db, cache, table_expr),
@@ -81,6 +93,10 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         LuaExpr::NameExpr(name_expr) => infer_name_expr(db, cache, name_expr),
         LuaExpr::IndexExpr(index_expr) => infer_index_expr(db, cache, index_expr, true),
     };
+    let infer_elapsed = infer_start.elapsed();
+    if infer_elapsed.as_millis() > 50 {
+        log::info!("infer_expr slow: kind={} file={:?} cost {:?}", expr_kind, file_id, infer_elapsed);
+    }
 
     match &result_type {
         Ok(result_type) => {
