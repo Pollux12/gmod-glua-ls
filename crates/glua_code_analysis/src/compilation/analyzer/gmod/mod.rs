@@ -52,19 +52,31 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let t0 = std::time::Instant::now();
         let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::new();
         let mut annotation_realms: HashMap<FileId, GmodRealm> = HashMap::new();
+        let mut t_hook = std::time::Duration::ZERO;
+        let mut t_netflow = std::time::Duration::ZERO;
+        let mut t_scoped = std::time::Duration::ZERO;
+        let mut t_realm = std::time::Duration::ZERO;
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
+
+            let s = std::time::Instant::now();
             let (gm_method_realms, receive_flows) =
                 collect_hook_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone());
+            t_hook += s.elapsed();
+
+            let s = std::time::Instant::now();
             collect_network_flow_metadata(
                 db,
                 in_filed_tree.file_id,
                 in_filed_tree.value.clone(),
                 receive_flows,
             );
+            t_netflow += s.elapsed();
+
             db.get_gmod_infer_index_mut()
                 .set_gm_method_realm_annotations(in_filed_tree.file_id, gm_method_realms);
             if is_in_scope {
+                let s = std::time::Instant::now();
                 if let Some(scope_match) = detect_scoped_class_from_path(db, in_filed_tree.file_id)
                 {
                     ensure_scoped_class_type_decl(
@@ -81,7 +93,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     in_filed_tree.file_id,
                     in_filed_tree.value.clone(),
                 );
+                t_scoped += s.elapsed();
             }
+            let s = std::time::Instant::now();
             let ranges = collect_branch_realm_ranges(&in_filed_tree.value);
             if !ranges.is_empty() {
                 branch_realm_ranges.insert(in_filed_tree.file_id, ranges);
@@ -89,8 +103,12 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             if let Some(realm) = collect_realm_annotation(&in_filed_tree.value) {
                 annotation_realms.insert(in_filed_tree.file_id, realm);
             }
+            t_realm += s.elapsed();
         }
-        if do_profile { log::info!("gmod pre: per-file metadata cost {:?}", t0.elapsed()); }
+        if do_profile {
+            log::info!("gmod pre: per-file metadata cost {:?} (hook={:?}, netflow={:?}, scoped={:?}, realm={:?})",
+                t0.elapsed(), t_hook, t_netflow, t_scoped, t_realm);
+        }
 
         // Network var wrappers are purely syntactic (AST pattern matching)
         let t1 = std::time::Instant::now();
