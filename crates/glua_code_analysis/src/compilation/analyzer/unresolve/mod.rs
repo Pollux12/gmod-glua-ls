@@ -47,24 +47,17 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 
         infer_manager.clear();
 
-        let mut reason_resolve: Vec<(InferFailReason, Vec<UnResolve>)> = Vec::new();
+        // Use HashMap for O(1) reason grouping (matching upstream)
+        let mut reason_resolve: HashMap<InferFailReason, Vec<UnResolve>> = HashMap::new();
         for (unresolve, reason) in context.unresolves.drain(..) {
-            if let Some(entry) = reason_resolve.iter_mut().find(|(r, _)| r == &reason) {
-                entry.1.push(unresolve);
-            } else {
-                reason_resolve.push((reason, vec![unresolve]));
-            }
+            reason_resolve
+                .entry(reason)
+                .or_default()
+                .push(unresolve);
         }
 
-        let total_unresolves: usize = reason_resolve.iter().map(|(_, v)| v.len()).sum();
+        let total_unresolves: usize = reason_resolve.values().map(|v| v.len()).sum();
         log::info!("unresolve: starting with {} unresolves in {} reason groups", total_unresolves, reason_resolve.len());
-
-        // Sort unresolves within each reason group by (file_id, position) to ensure
-        // deterministic processing order regardless of HashMap iteration order during
-        // earlier analysis phases.
-        for (_, unresolves) in &mut reason_resolve {
-            unresolves.sort_by_key(|u| u.sort_key());
-        }
 
         let mut loop_count = 0;
         while !reason_resolve.is_empty() {
@@ -83,17 +76,11 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                 break;
             }
 
-            let remaining: usize = reason_resolve.iter().map(|(_, v)| v.len()).sum();
+            let remaining: usize = reason_resolve.values().map(|v| v.len()).sum();
             log::info!("unresolve: loop {} remaining {} unresolves", loop_count, remaining);
 
             if loop_count == 0 {
                 infer_manager.set_force();
-                // Clear expression caches when entering force mode so that all
-                // remaining unresolves are re-evaluated from a clean state.
-                // Without this, cache entries populated during normal-mode
-                // resolution can differ between runs (due to non-deterministic
-                // processing order), causing the force-mode results to vary.
-                infer_manager.clear();
             }
 
             let reason_start = std::time::Instant::now();
@@ -150,7 +137,7 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
 #[allow(unused)]
 fn record_unresolve_info(
     time_hash_map: HashMap<usize, (u128, usize)>,
-    reason_unresolves: &[(InferFailReason, Vec<UnResolve>)],
+    reason_unresolves: &HashMap<InferFailReason, Vec<UnResolve>>,
 ) {
     let mut unresolve_info: HashMap<String, usize> = HashMap::new();
     for (check_reason, unresolves) in reason_unresolves.iter() {
@@ -244,14 +231,14 @@ fn record_unresolve_info(
 fn try_resolve(
     db: &mut DbIndex,
     infer_manager: &mut InferCacheManager,
-    reason_reasolve: &mut Vec<(InferFailReason, Vec<UnResolve>)>,
+    reason_resolve: &mut HashMap<InferFailReason, Vec<UnResolve>>,
 ) {
     loop {
         let mut changed = false;
+        let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
-        let mut to_remove_indices = Vec::new();
 
-        for (idx, (check_reason, unresolves)) in reason_reasolve.iter_mut().enumerate() {
+        for (check_reason, unresolves) in reason_resolve.iter_mut() {
             if !check_reach_reason(db, infer_manager, check_reason).unwrap_or(false) {
                 continue;
             }
@@ -320,28 +307,21 @@ fn try_resolve(
                 }
             }
 
-            to_remove_indices.push(idx);
+            to_be_remove.push(check_reason.clone());
         }
 
-        // Remove in reverse order to preserve indices
-        for idx in to_remove_indices.into_iter().rev() {
-            reason_reasolve.remove(idx);
+        for reason in to_be_remove {
+            reason_resolve.remove(&reason);
         }
 
         for (unresolve, reason) in retain_unresolve {
-            if let Some(entry) = reason_reasolve.iter_mut().find(|(r, _)| r == &reason) {
-                entry.1.push(unresolve);
-            } else {
-                reason_reasolve.push((reason, vec![unresolve]));
-            }
+            reason_resolve
+                .entry(reason)
+                .or_default()
+                .push(unresolve);
         }
 
-        // Re-sort after regrouping to maintain deterministic order
-        for (_, unresolves) in reason_reasolve.iter_mut() {
-            unresolves.sort_by_key(|u| u.sort_key());
-        }
-
-        if !changed || reason_reasolve.is_empty() {
+        if !changed || reason_resolve.is_empty() {
             break;
         }
     }

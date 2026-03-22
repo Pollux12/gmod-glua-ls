@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use glua_parser::LuaAstNode;
 
 use crate::{
@@ -55,7 +57,7 @@ pub fn check_reach_reason(
 
 pub fn resolve_all_reason(
     db: &mut DbIndex,
-    reason_unresolves: &mut [(InferFailReason, Vec<UnResolve>)],
+    reason_unresolves: &mut HashMap<InferFailReason, Vec<UnResolve>>,
     loop_count: usize,
 ) {
     for (reason, _) in reason_unresolves.iter_mut() {
