@@ -347,6 +347,15 @@ fn check_name_expr(
         return Some(());
     }
 
+    if db.get_emmyrc().gmod.enabled
+        && db
+            .get_gmod_infer_index()
+            .get_scoped_class_info(&semantic_model.get_file_id())
+            .is_some_and(|info| info.global_name == name_text.as_str())
+    {
+        return Some(());
+    }
+
     if context
         .config
         .global_disable_set
