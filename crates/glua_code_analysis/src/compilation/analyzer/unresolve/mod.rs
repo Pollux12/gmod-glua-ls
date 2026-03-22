@@ -43,21 +43,25 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 
         let mat_start = std::time::Instant::now();
         materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
-        log::info!("unresolve: initial materialize_pending cost {:?}", mat_start.elapsed());
+        log::info!(
+            "unresolve: initial materialize_pending cost {:?}",
+            mat_start.elapsed()
+        );
 
         infer_manager.clear();
 
         // Use HashMap for O(1) reason grouping (matching upstream)
         let mut reason_resolve: HashMap<InferFailReason, Vec<UnResolve>> = HashMap::new();
         for (unresolve, reason) in context.unresolves.drain(..) {
-            reason_resolve
-                .entry(reason)
-                .or_default()
-                .push(unresolve);
+            reason_resolve.entry(reason).or_default().push(unresolve);
         }
 
         let total_unresolves: usize = reason_resolve.values().map(|v| v.len()).sum();
-        log::info!("unresolve: starting with {} unresolves in {} reason groups", total_unresolves, reason_resolve.len());
+        log::info!(
+            "unresolve: starting with {} unresolves in {} reason groups",
+            total_unresolves,
+            reason_resolve.len()
+        );
 
         let mut loop_count = 0;
         while !reason_resolve.is_empty() {
@@ -65,19 +69,35 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 
             let resolve_start = std::time::Instant::now();
             try_resolve(db, &mut infer_manager, &mut reason_resolve);
-            log::info!("unresolve: loop {} try_resolve cost {:?}", loop_count, resolve_start.elapsed());
+            log::info!(
+                "unresolve: loop {} try_resolve cost {:?}",
+                loop_count,
+                resolve_start.elapsed()
+            );
 
             let mat_start = std::time::Instant::now();
             materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
-            log::info!("unresolve: loop {} materialize_pending cost {:?}", loop_count, mat_start.elapsed());
+            log::info!(
+                "unresolve: loop {} materialize_pending cost {:?}",
+                loop_count,
+                mat_start.elapsed()
+            );
 
             if reason_resolve.is_empty() {
-                log::info!("unresolve: loop {} total cost {:?} (resolved all)", loop_count, iter_start.elapsed());
+                log::info!(
+                    "unresolve: loop {} total cost {:?} (resolved all)",
+                    loop_count,
+                    iter_start.elapsed()
+                );
                 break;
             }
 
             let remaining: usize = reason_resolve.values().map(|v| v.len()).sum();
-            log::info!("unresolve: loop {} remaining {} unresolves", loop_count, remaining);
+            log::info!(
+                "unresolve: loop {} remaining {} unresolves",
+                loop_count,
+                remaining
+            );
 
             if loop_count == 0 {
                 infer_manager.set_force();
@@ -85,9 +105,17 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 
             let reason_start = std::time::Instant::now();
             resolve_all_reason(db, &mut reason_resolve, loop_count);
-            log::info!("unresolve: loop {} resolve_all_reason cost {:?}", loop_count, reason_start.elapsed());
+            log::info!(
+                "unresolve: loop {} resolve_all_reason cost {:?}",
+                loop_count,
+                reason_start.elapsed()
+            );
 
-            log::info!("unresolve: loop {} total cost {:?}", loop_count, iter_start.elapsed());
+            log::info!(
+                "unresolve: loop {} total cost {:?}",
+                loop_count,
+                iter_start.elapsed()
+            );
 
             if loop_count >= 5 {
                 break;
@@ -320,10 +348,7 @@ fn try_resolve(
         }
 
         for (unresolve, reason) in retain_unresolve {
-            reason_resolve
-                .entry(reason)
-                .or_default()
-                .push(unresolve);
+            reason_resolve.entry(reason).or_default().push(unresolve);
         }
 
         if !changed || reason_resolve.is_empty() {

@@ -64,7 +64,6 @@ use super::{
 };
 
 pub use gmod_realm_misuse::GmMethodRealmMap;
-pub use gmod_realm_misuse::ResolvedRealm;
 pub use gmod_realm_misuse::SharedCalleeRealmCache;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 

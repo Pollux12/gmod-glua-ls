@@ -23,11 +23,7 @@ use glua_parser::LuaChunk;
 use infer_cache_manager::InferCacheManager;
 use unresolve::UnResolve;
 
-pub fn analyze(
-    db: &mut DbIndex,
-    need_analyzed_files: Vec<InFiled<LuaChunk>>,
-    config: Arc<Emmyrc>,
-) {
+pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, config: Arc<Emmyrc>) {
     if need_analyzed_files.is_empty() {
         return;
     }

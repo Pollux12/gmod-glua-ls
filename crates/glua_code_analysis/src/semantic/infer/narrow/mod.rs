@@ -43,7 +43,11 @@ pub fn infer_expr_narrow_type(
     result
 }
 
-pub fn get_var_ref_type(db: &DbIndex, cache: &mut LuaInferCache, var_ref_id: &VarRefId) -> InferResult {
+pub fn get_var_ref_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    var_ref_id: &VarRefId,
+) -> InferResult {
     if let Some(decl_id) = var_ref_id.get_decl_id_ref() {
         let decl = db
             .get_decl_index()

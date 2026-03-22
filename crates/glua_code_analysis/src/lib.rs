@@ -437,9 +437,7 @@ impl EmmyLuaAnalysis {
                 // Pre-assign file IDs (sequential, fast)
                 let file_ids: Vec<FileId> = to_parse
                     .iter()
-                    .map(|(uri, _)| {
-                        self.compilation.get_db_mut().get_vfs_mut().file_id(uri)
-                    })
+                    .map(|(uri, _)| self.compilation.get_db_mut().get_vfs_mut().file_id(uri))
                     .collect();
 
                 // Parse in parallel
@@ -451,10 +449,10 @@ impl EmmyLuaAnalysis {
                 let next_idx = std::sync::atomic::AtomicUsize::new(0);
 
                 // Each slot stores the parsed result
-                let parsed: Vec<std::sync::Mutex<Option<(LuaSyntaxTree, LineIndex)>>> =
-                    (0..to_parse.len())
-                        .map(|_| std::sync::Mutex::new(None))
-                        .collect();
+                let parsed: Vec<std::sync::Mutex<Option<(LuaSyntaxTree, LineIndex)>>> = (0
+                    ..to_parse.len())
+                    .map(|_| std::sync::Mutex::new(None))
+                    .collect();
 
                 std::thread::scope(|s| {
                     for _ in 0..n_threads {
@@ -465,16 +463,12 @@ impl EmmyLuaAnalysis {
                         s.spawn(move || {
                             let mut node_cache = rowan::NodeCache::default();
                             loop {
-                                let idx = next.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                                let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if idx >= files.len() {
                                     break;
                                 }
                                 let (_, text) = &files[idx];
-                                let parse_config =
-                                    cfg.get_parse_config(&mut node_cache);
+                                let parse_config = cfg.get_parse_config(&mut node_cache);
                                 let tree = LuaParser::parse(text, parse_config);
                                 let line_index = LineIndex::parse(text);
                                 *results[idx].lock().expect("mutex poisoned") =
@@ -641,8 +635,12 @@ impl EmmyLuaAnalysis {
         cancel_token: CancellationToken,
         shared_data: std::sync::Arc<diagnostic::SharedDiagnosticData>,
     ) -> Option<Vec<lsp_types::Diagnostic>> {
-        self.diagnostic
-            .diagnose_file_with_shared(&self.compilation, file_id, cancel_token, shared_data)
+        self.diagnostic.diagnose_file_with_shared(
+            &self.compilation,
+            file_id,
+            cancel_token,
+            shared_data,
+        )
     }
 
     pub fn precompute_diagnostic_shared_data(

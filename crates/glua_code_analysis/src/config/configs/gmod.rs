@@ -102,7 +102,7 @@ pub struct EmmyrcGmodScriptedClassScopes {
 #[serde(untagged)]
 pub enum EmmyrcGmodScriptedClassScopeEntry {
     LegacyGlob(String),
-    Definition(EmmyrcGmodScriptedClassDefinition),
+    Definition(Box<EmmyrcGmodScriptedClassDefinition>),
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
@@ -380,8 +380,8 @@ fn default_scripted_class_definition(
     icon: Option<&str>,
     root_dir: Option<&str>,
     scaffold: Option<EmmyrcGmodScriptedClassScaffold>,
-) -> EmmyrcGmodScriptedClassDefinition {
-    EmmyrcGmodScriptedClassDefinition {
+) -> Box<EmmyrcGmodScriptedClassDefinition> {
+    Box::new(EmmyrcGmodScriptedClassDefinition {
         id: id.to_string(),
         label: Some(label.to_string()),
         path: Some(path.iter().map(|segment| (*segment).to_string()).collect()),
@@ -407,7 +407,7 @@ fn default_scripted_class_definition(
         root_dir: root_dir.map(str::to_string),
         scaffold,
         disabled: None,
-    }
+    })
 }
 
 fn default_scripted_class_definitions() -> Vec<ResolvedGmodScriptedClassDefinition> {

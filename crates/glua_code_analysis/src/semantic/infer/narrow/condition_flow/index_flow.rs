@@ -238,5 +238,5 @@ fn is_strict_sub_type_of(db: &DbIndex, candidate: &LuaType, possible_base: &LuaT
     };
 
     candidate_id != base_id
-        && crate::semantic::type_check::is_sub_type_of(db, &candidate_id.clone().into(), base_id)
+        && crate::semantic::type_check::is_sub_type_of(db, &candidate_id.clone(), base_id)
 }

@@ -1457,14 +1457,13 @@ fn highlight_semantic_string_literal(
 }
 
 fn is_decl_readonly(decl: &LuaDecl) -> bool {
-    match &decl.extra {
+    matches!(
+        &decl.extra,
         LuaDeclExtra::Local {
             attrib: Some(LocalAttribute::Const | LocalAttribute::IterConst),
             ..
-        } => true,
-        LuaDeclExtra::ImplicitSelf { .. } => true,
-        _ => false,
-    }
+        } | LuaDeclExtra::ImplicitSelf { .. }
+    )
 }
 
 fn render_doc_at(builder: &mut SemanticBuilder, token: &LuaSyntaxToken) {

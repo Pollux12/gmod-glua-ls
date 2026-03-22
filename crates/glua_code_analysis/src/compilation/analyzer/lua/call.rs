@@ -302,13 +302,10 @@ fn get_name_expr_special_call_reason(
 }
 
 fn local_decl_special_call_state(analyzer: &LuaAnalyzer, name_expr: &LuaNameExpr) -> Option<bool> {
-    let Some(decl_id) = analyzer
+    let decl_id = analyzer
         .db
         .get_reference_index()
-        .get_var_reference_decl(&analyzer.file_id, name_expr.get_range())
-    else {
-        return None;
-    };
+        .get_var_reference_decl(&analyzer.file_id, name_expr.get_range())?;
 
     let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
     if !decl.is_local() {

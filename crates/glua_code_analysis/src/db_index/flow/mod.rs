@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::{FileId, LuaSignatureId};
 pub use flow_node::*;
-pub use flow_tree::{FlowTree, BranchLabelInfo};
+pub use flow_tree::{BranchLabelInfo, FlowTree};
 use glua_parser::{LuaAstPtr, LuaDocOpType};
 pub use signature_cast::LuaSignatureCast;
 

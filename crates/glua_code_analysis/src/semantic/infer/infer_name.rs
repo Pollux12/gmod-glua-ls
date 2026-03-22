@@ -1,8 +1,6 @@
 use std::path::Path;
 
-use glua_parser::{
-    LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr, LuaVarExpr,
-};
+use glua_parser::{LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr, LuaVarExpr};
 use rowan::TextSize;
 use wax::Pattern;
 

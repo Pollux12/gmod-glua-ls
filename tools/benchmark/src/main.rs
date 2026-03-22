@@ -20,8 +20,8 @@ const DEFAULT_ANNOTATIONS: &str =
     r"C:\Users\Pollux\Documents\glualangserver\emmylua-rust\glua-api-snippets\output";
 
 fn setup_logger() {
-    let log_file = std::env::var("BENCH_LOG")
-        .unwrap_or_else(|_| "benchmark_profile.log".to_string());
+    let log_file =
+        std::env::var("BENCH_LOG").unwrap_or_else(|_| "benchmark_profile.log".to_string());
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -76,16 +76,19 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
 async fn main() {
     setup_logger();
 
-    let large_codebase = std::env::var("BENCH_CODEBASE")
-        .unwrap_or_else(|_| DEFAULT_LARGE_CODEBASE.to_string());
-    let annotations = std::env::var("BENCH_ANNOTATIONS")
-        .unwrap_or_else(|_| DEFAULT_ANNOTATIONS.to_string());
+    let large_codebase =
+        std::env::var("BENCH_CODEBASE").unwrap_or_else(|_| DEFAULT_LARGE_CODEBASE.to_string());
+    let annotations =
+        std::env::var("BENCH_ANNOTATIONS").unwrap_or_else(|_| DEFAULT_ANNOTATIONS.to_string());
 
     let large_path = PathBuf::from(&large_codebase);
     let annotations_path = PathBuf::from(&annotations);
 
     if !large_path.exists() {
-        eprintln!("ERROR: Large codebase path does not exist: {}", large_codebase);
+        eprintln!(
+            "ERROR: Large codebase path does not exist: {}",
+            large_codebase
+        );
         std::process::exit(1);
     }
     if !annotations_path.exists() {
@@ -192,7 +195,12 @@ async fn main() {
     let diag_file_count = main_file_ids.len();
 
     // Log file paths for debugging slow files
-    for &fid in &[FileId { id: 1747 }, FileId { id: 1857 }, FileId { id: 2017 }, FileId { id: 2044 }] {
+    for &fid in &[
+        FileId { id: 1747 },
+        FileId { id: 1857 },
+        FileId { id: 2017 },
+        FileId { id: 2044 },
+    ] {
         if let Some(path) = db.get_vfs().get_file_path(&fid) {
             log::info!("FileId {} → {}", fid.id, path.display());
         }
@@ -210,7 +218,10 @@ async fn main() {
                 .unwrap_or(1)
                 .min(16)
         });
-    eprintln!("Diagnostics: {} files, {} threads", diag_file_count, parallelism);
+    eprintln!(
+        "Diagnostics: {} files, {} threads",
+        diag_file_count, parallelism
+    );
 
     let total_diagnostics = std::sync::atomic::AtomicUsize::new(0);
     let next_file = std::sync::atomic::AtomicUsize::new(0);
@@ -228,13 +239,12 @@ async fn main() {
                         break;
                     }
                     let cancel_token = CancellationToken::new();
-                    if let Some(diagnostics) =
-                        analysis.diagnose_file_with_shared(file_ids[idx], cancel_token, shared.clone())
-                    {
-                        counter.fetch_add(
-                            diagnostics.len(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                    if let Some(diagnostics) = analysis.diagnose_file_with_shared(
+                        file_ids[idx],
+                        cancel_token,
+                        shared.clone(),
+                    ) {
+                        counter.fetch_add(diagnostics.len(), std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             });
@@ -255,10 +265,7 @@ async fn main() {
     eprintln!("========================================");
     eprintln!("BENCHMARK RESULTS");
     eprintln!("========================================");
-    eprintln!(
-        "{:<45} {:>12}",
-        "Phase", "Duration"
-    );
+    eprintln!("{:<45} {:>12}", "Phase", "Duration");
     eprintln!("{}", "-".repeat(60));
 
     let mut total = std::time::Duration::ZERO;
@@ -287,10 +294,9 @@ async fn main() {
         "❌ TARGET NOT MET"
     };
     eprintln!(
-        "{:<45} {:>10.3}s  {}",
+        "{:<45} {:>10.3}s",
         "TOTAL (all phases)",
         total.as_secs_f64(),
-        ""
     );
     eprintln!(
         "{:<45} {:>10.3}s  {}",

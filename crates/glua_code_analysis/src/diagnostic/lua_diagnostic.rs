@@ -8,8 +8,8 @@ pub use super::checker::DiagnosticContext;
 use super::checker::SharedDiagnosticData;
 use super::checker::precompute_gm_method_realms;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
-use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
 use crate::semantic::LuaAnalysisPhase;
+use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
 use lsp_types::Diagnostic;
 use tokio_util::sync::CancellationToken;
 
@@ -155,7 +155,10 @@ impl LuaDiagnostic {
         semantic_model.set_analysis_phase(LuaAnalysisPhase::Diagnostics);
         let sem_elapsed = sem_start.elapsed();
         if sem_elapsed.as_millis() > 10 {
-            info!("diagnose_file: get_semantic_model cost {:?} for {:?}", sem_elapsed, file_id);
+            info!(
+                "diagnose_file: get_semantic_model cost {:?} for {:?}",
+                sem_elapsed, file_id
+            );
         }
 
         let mut context = if let Some(shared) = shared_data {
@@ -175,10 +178,18 @@ impl LuaDiagnostic {
                 file_id,
                 cache.prof_infer_expr_calls,
                 cache.prof_infer_expr_hits,
-                if cache.prof_infer_expr_calls > 0 { cache.prof_infer_expr_hits as f64 / cache.prof_infer_expr_calls as f64 * 100.0 } else { 0.0 },
+                if cache.prof_infer_expr_calls > 0 {
+                    cache.prof_infer_expr_hits as f64 / cache.prof_infer_expr_calls as f64 * 100.0
+                } else {
+                    0.0
+                },
                 cache.prof_flow_calls,
                 cache.prof_flow_hits,
-                if cache.prof_flow_calls > 0 { cache.prof_flow_hits as f64 / cache.prof_flow_calls as f64 * 100.0 } else { 0.0 },
+                if cache.prof_flow_calls > 0 {
+                    cache.prof_flow_hits as f64 / cache.prof_flow_calls as f64 * 100.0
+                } else {
+                    0.0
+                },
                 cache.prof_flow_nodes_walked,
                 cache.expr_cache.len(),
                 cache.flow_node_cache.len(),

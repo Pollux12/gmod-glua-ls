@@ -82,14 +82,20 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 file_count += 1;
                 let file_elapsed = file_start.elapsed();
                 if file_elapsed.as_millis() > 10 {
-                    let path = db.get_vfs().get_uri(&file_id)
+                    let path = db
+                        .get_vfs()
+                        .get_uri(&file_id)
                         .map(|u| u.to_string())
                         .unwrap_or_else(|| format!("{:?}", file_id));
                     info!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
                 }
             }
         }
-        info!("lua analyze total: {} files in {:?}", file_count, total_start.elapsed());
+        info!(
+            "lua analyze total: {} files in {:?}",
+            file_count,
+            total_start.elapsed()
+        );
     }
 }
 

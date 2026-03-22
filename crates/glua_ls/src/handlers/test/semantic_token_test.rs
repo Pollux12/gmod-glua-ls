@@ -57,9 +57,7 @@ mod tests {
     ) -> bool {
         let token_type = token_type_index(token_type);
         let modifiers = modifier_bitset(modifiers);
-        tokens
-            .iter()
-            .any(|token| *token == (line, col, len, token_type, modifiers))
+        tokens.contains(&(line, col, len, token_type, modifiers))
     }
 
     #[gtest]

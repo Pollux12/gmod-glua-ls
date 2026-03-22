@@ -57,9 +57,7 @@ impl Checker for GmodRealmMisuseChecker {
 
         let mut decl_annotation_cache = HashMap::new();
         let mut callee_realm_cache: CalleeRealmCache = HashMap::new();
-        let shared_callee_cache = shared_data
-            .as_ref()
-            .map(|s| &s.shared_callee_realm_cache);
+        let shared_callee_cache = shared_data.as_ref().map(|s| &s.shared_callee_realm_cache);
 
         for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
             if context.is_cancelled() {
@@ -261,12 +259,9 @@ fn resolve_callee_realms(
             push_unique_realm(&mut realms, realm);
         }
 
-        if let Some(realm) = resolve_decl_realm(
-            context,
-            semantic_model,
-            decl,
-            decl_annotation_cache,
-        ) {
+        if let Some(realm) =
+            resolve_decl_realm(context, semantic_model, decl, decl_annotation_cache)
+        {
             push_unique_realm(&mut realms, realm);
         }
 

@@ -55,11 +55,6 @@ impl InferCacheManager {
         }
     }
 
-    /// Clears all caches before the unresolve phase.
-    pub fn clear_for_unresolve(&mut self) {
-        self.clear();
-    }
-
     pub fn drain_pending_str_tpl_type_decls(&mut self) -> Vec<PendingStrTplTypeDecl> {
         let mut pending = Vec::new();
 

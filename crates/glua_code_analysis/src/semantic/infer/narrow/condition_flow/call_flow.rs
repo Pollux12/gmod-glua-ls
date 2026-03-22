@@ -253,9 +253,7 @@ fn resolve_builtin_name_fallback_target(
             .then(|| LuaExpr::NameExpr(name_expr.clone()));
     };
 
-    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
-        return None;
-    };
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
 
     if db
         .get_reference_index()
@@ -265,17 +263,11 @@ fn resolve_builtin_name_fallback_target(
         return None;
     }
 
-    let Some(value_syntax_id) = decl.get_value_syntax_id() else {
-        return None;
-    };
+    let value_syntax_id = decl.get_value_syntax_id()?;
 
-    let Some(node) = value_syntax_id.to_node_from_root(root.syntax()) else {
-        return None;
-    };
+    let node = value_syntax_id.to_node_from_root(root.syntax())?;
 
-    let Some(alias_expr) = LuaExpr::cast(node) else {
-        return None;
-    };
+    let alias_expr = LuaExpr::cast(node)?;
 
     let LuaExpr::NameExpr(alias_name_expr) = alias_expr else {
         return None;

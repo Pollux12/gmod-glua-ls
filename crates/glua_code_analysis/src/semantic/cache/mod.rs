@@ -10,7 +10,7 @@ use std::{
 use crate::{
     FileId, FlowId, GmodRealm, LuaFunctionType, LuaSemanticDeclId,
     db_index::{LuaType, LuaTypeDeclId},
-    semantic::infer::{VarRefId, InferFailReason},
+    semantic::infer::{InferFailReason, VarRefId},
 };
 
 #[derive(Debug, Clone)]
