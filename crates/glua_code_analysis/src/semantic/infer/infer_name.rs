@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use glua_parser::{
-    LuaAstNode, LuaDocTagFileparam, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr, LuaVarExpr,
+    LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr, LuaVarExpr,
 };
 use rowan::TextSize;
 use wax::Pattern;
@@ -408,28 +408,11 @@ fn infer_param_type_from_file_hint(db: &DbIndex, decl: &LuaDecl) -> Option<LuaTy
         return None;
     }
 
-    let tree = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
     let target_name = decl.get_name().to_ascii_lowercase();
-    let chunk = tree.get_chunk_node();
-
-    for descendant in chunk.syntax().descendants() {
-        if LuaDocTagFileparam::can_cast(descendant.kind().into()) {
-            if let Some(fileparam) = LuaDocTagFileparam::cast(descendant) {
-                if let Some(name_token) = fileparam.get_name_token() {
-                    if name_token.get_name_text().to_ascii_lowercase() == target_name {
-                        if let Some(typ) = fileparam.get_type() {
-                            let type_text = typ.syntax().text().to_string();
-                            if let Some(resolved) = resolve_param_hint_type(db, &type_text) {
-                                return Some(resolved);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
+    let type_text = db
+        .get_gmod_infer_index()
+        .get_file_param_type_text(&decl.get_file_id(), &target_name)?;
+    resolve_param_hint_type(db, type_text)
 }
 
 fn resolve_param_hint_type(db: &DbIndex, hint: &str) -> Option<LuaType> {

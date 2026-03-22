@@ -6,8 +6,8 @@ use std::{
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk,
     LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag, LuaDocTagRealm,
-    LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat,
-    LuaStat, LuaVarExpr, PathTrait,
+    LuaDocTagFileparam, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
+    LuaLocalFuncStat, LuaLocalStat, LuaStat, LuaVarExpr, PathTrait,
 };
 
 use crate::{
@@ -104,6 +104,13 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 annotation_realms.insert(in_filed_tree.file_id, realm);
             }
             t_realm += s.elapsed();
+
+            // Pre-index @fileparam annotations (O(1) lookup during resolve vs O(file_size) AST walk)
+            let file_params = collect_file_params(&in_filed_tree.value);
+            if !file_params.is_empty() {
+                db.get_gmod_infer_index_mut()
+                    .set_file_params(in_filed_tree.file_id, file_params);
+            }
         }
         if do_profile {
             log::info!("gmod pre: per-file metadata cost {:?} (hook={:?}, netflow={:?}, scoped={:?}, realm={:?})",
@@ -2933,4 +2940,23 @@ fn realm_sort_key(realm: GmodRealm) -> u8 {
         GmodRealm::Shared => 2,
         GmodRealm::Unknown => 3,
     }
+}
+
+/// Collect @fileparam annotations from a chunk, returning (name_lowercase, type_text) pairs.
+fn collect_file_params(chunk: &LuaChunk) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    for descendant in chunk.syntax().descendants() {
+        if LuaDocTagFileparam::can_cast(descendant.kind().into()) {
+            if let Some(fileparam) = LuaDocTagFileparam::cast(descendant) {
+                if let Some(name_token) = fileparam.get_name_token() {
+                    if let Some(typ) = fileparam.get_type() {
+                        let name = name_token.get_name_text().to_ascii_lowercase();
+                        let type_text = typ.syntax().text().to_string();
+                        params.push((name, type_text));
+                    }
+                }
+            }
+        }
+    }
+    params
 }

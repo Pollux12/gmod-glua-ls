@@ -239,7 +239,8 @@ fn try_resolve(
         let mut retain_unresolve = Vec::new();
 
         for (check_reason, unresolves) in reason_resolve.iter_mut() {
-            if !check_reach_reason(db, infer_manager, check_reason).unwrap_or(false) {
+            let reached = check_reach_reason(db, infer_manager, check_reason).unwrap_or(false);
+            if !reached {
                 continue;
             }
 

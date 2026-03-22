@@ -182,6 +182,8 @@ pub struct GmodInferIndex {
     system_aggregate_cache: OnceLock<GmodSystemAggregate>,
     realm_file_metadata: HashMap<FileId, GmodRealmFileMetadata>,
     gm_method_realm_annotations: HashMap<FileId, Vec<(String, GmodRealm)>>,
+    /// Pre-indexed @fileparam annotations per file: (param_name_lowercase, type_text)
+    fileparam_index: HashMap<FileId, Vec<(String, String)>>,
 }
 
 impl GmodInferIndex {
@@ -192,6 +194,7 @@ impl GmodInferIndex {
             system_aggregate_cache: OnceLock::new(),
             realm_file_metadata: HashMap::new(),
             gm_method_realm_annotations: HashMap::new(),
+            fileparam_index: HashMap::new(),
         }
     }
 
@@ -365,6 +368,21 @@ impl GmodInferIndex {
     ) -> impl Iterator<Item = (&FileId, &Vec<(String, GmodRealm)>)> {
         self.gm_method_realm_annotations.iter()
     }
+
+    pub fn set_file_params(&mut self, file_id: FileId, params: Vec<(String, String)>) {
+        if !params.is_empty() {
+            self.fileparam_index.insert(file_id, params);
+        }
+    }
+
+    /// O(1) lookup for a @fileparam type text by file and parameter name.
+    pub fn get_file_param_type_text(&self, file_id: &FileId, name_lowercase: &str) -> Option<&str> {
+        let params = self.fileparam_index.get(file_id)?;
+        params
+            .iter()
+            .find(|(n, _)| n == name_lowercase)
+            .map(|(_, t)| t.as_str())
+    }
 }
 
 impl LuaIndex for GmodInferIndex {
@@ -374,6 +392,7 @@ impl LuaIndex for GmodInferIndex {
         self.invalidate_system_aggregate_cache();
         self.realm_file_metadata.remove(&file_id);
         self.gm_method_realm_annotations.remove(&file_id);
+        self.fileparam_index.remove(&file_id);
     }
 
     fn clear(&mut self) {
@@ -382,6 +401,7 @@ impl LuaIndex for GmodInferIndex {
         self.invalidate_system_aggregate_cache();
         self.realm_file_metadata.clear();
         self.gm_method_realm_annotations.clear();
+        self.fileparam_index.clear();
     }
 }
 
