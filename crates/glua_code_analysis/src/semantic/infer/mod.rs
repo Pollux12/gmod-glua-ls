@@ -43,10 +43,12 @@ pub type InferResult = Result<LuaType, InferFailReason>;
 pub use infer_call::InferCallFuncResult;
 
 pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> InferResult {
+    cache.prof_infer_expr_calls += 1;
     let syntax_id = expr.get_syntax_id();
     let key = syntax_id;
-    if let Some(cache) = cache.expr_cache.get(&key) {
-        match cache {
+    if let Some(cache_entry) = cache.expr_cache.get(&key) {
+        cache.prof_infer_expr_hits += 1;
+        match cache_entry {
             CacheEntry::Cache(ty) => return Ok(ty.clone()),
             CacheEntry::Error(reason) => return Err(reason.clone()),
             CacheEntry::Ready => return Err(InferFailReason::RecursiveInfer),

@@ -9,3 +9,6 @@ dhat-heap.json
 .pommel/
 .pommelignore
 .grepai/
+
+benchmark_*.log
+100

@@ -58,6 +58,20 @@ pub struct LuaInferCache {
     /// Maximum number of flow nodes to visit before skipping narrowing.
     /// 0 means unlimited.
     pub flow_node_budget: u32,
+    // Diagnostic profiling counters (zero-cost when not read)
+    pub prof_infer_expr_calls: u32,
+    pub prof_infer_expr_hits: u32,
+    pub prof_flow_calls: u32,
+    pub prof_flow_hits: u32,
+    pub prof_flow_nodes_walked: u32,
+    // Detailed flow profiling
+    pub prof_merge_calls: u32,
+    pub prof_merge_total_antecedents: u32,
+    pub prof_condition_errors_caught: u32,
+    pub prof_condition_errors_none: u32,
+    pub prof_condition_errors_recursive: u32,
+    pub prof_condition_errors_unresolved: u32,
+    pub prof_multi_ante_from_condition: u32,
 }
 
 impl LuaInferCache {
@@ -78,6 +92,18 @@ impl LuaInferCache {
             decl_cache: HashMap::new(),
             flow_nodes_visited: 0,
             flow_node_budget: 0,
+            prof_infer_expr_calls: 0,
+            prof_infer_expr_hits: 0,
+            prof_flow_calls: 0,
+            prof_flow_hits: 0,
+            prof_flow_nodes_walked: 0,
+            prof_merge_calls: 0,
+            prof_merge_total_antecedents: 0,
+            prof_condition_errors_caught: 0,
+            prof_condition_errors_none: 0,
+            prof_condition_errors_recursive: 0,
+            prof_condition_errors_unresolved: 0,
+            prof_multi_ante_from_condition: 0,
         }
     }
 
