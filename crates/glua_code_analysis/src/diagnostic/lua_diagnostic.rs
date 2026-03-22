@@ -9,6 +9,7 @@ use super::checker::SharedDiagnosticData;
 use super::checker::precompute_gm_method_realms;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
+use crate::semantic::LuaAnalysisPhase;
 use lsp_types::Diagnostic;
 use tokio_util::sync::CancellationToken;
 
@@ -140,11 +141,15 @@ impl LuaDiagnostic {
         // pathologically large files from dominating diagnostic time.
         // 10K nodes is sufficient — normal files use a few hundred at most,
         // but monster files (3000+ lines) can trigger millions of visits.
-        const DIAGNOSTIC_FLOW_BUDGET: u32 = 10_000;
+        const DIAGNOSTIC_FLOW_BUDGET: u32 = u32::MAX;
 
         let sem_start = Instant::now();
         let semantic_model =
             compilation.get_semantic_model_with_flow_budget(file_id, DIAGNOSTIC_FLOW_BUDGET)?;
+        // Set diagnostics phase so error results are cached (types are final,
+        // no subsequent unresolve pass will change them). This prevents expensive
+        // recomputation across diagnostic checkers.
+        semantic_model.set_analysis_phase(LuaAnalysisPhase::Diagnostics);
         let sem_elapsed = sem_start.elapsed();
         if sem_elapsed.as_millis() > 10 {
             info!("diagnose_file: get_semantic_model cost {:?} for {:?}", sem_elapsed, file_id);

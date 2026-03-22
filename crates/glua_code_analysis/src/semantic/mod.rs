@@ -112,6 +112,10 @@ impl<'a> SemanticModel<'a> {
         }
     }
 
+    pub fn set_analysis_phase(&self, phase: LuaAnalysisPhase) {
+        self.infer_cache.borrow_mut().set_phase(phase);
+    }
+
     pub fn get_document(&'_ self) -> LuaDocument<'_> {
         self.db
             .get_vfs()

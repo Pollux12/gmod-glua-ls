@@ -26,6 +26,8 @@ pub enum LuaAnalysisPhase {
     Unordered,
     // Force analysis phase
     Force,
+    // Diagnostics phase - types are final, cache everything
+    Diagnostics,
 }
 
 impl LuaAnalysisPhase {
@@ -39,5 +41,9 @@ impl LuaAnalysisPhase {
 
     pub fn is_force(&self) -> bool {
         matches!(self, LuaAnalysisPhase::Force)
+    }
+
+    pub fn is_diagnostics(&self) -> bool {
+        matches!(self, LuaAnalysisPhase::Diagnostics)
     }
 }

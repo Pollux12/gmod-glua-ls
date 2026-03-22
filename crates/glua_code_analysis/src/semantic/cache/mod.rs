@@ -10,13 +10,16 @@ use std::{
 use crate::{
     FileId, FlowId, GmodRealm, LuaFunctionType, LuaSemanticDeclId,
     db_index::{LuaType, LuaTypeDeclId},
-    semantic::infer::VarRefId,
+    semantic::infer::{VarRefId, InferFailReason},
 };
 
 #[derive(Debug, Clone)]
 pub enum CacheEntry<T> {
     Ready,
     Cache(T),
+    /// Cached error result — used during diagnostics to prevent recomputation
+    /// of expressions whose type couldn't be resolved.
+    Error(InferFailReason),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

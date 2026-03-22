@@ -48,7 +48,8 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
     if let Some(cache) = cache.expr_cache.get(&key) {
         match cache {
             CacheEntry::Cache(ty) => return Ok(ty.clone()),
-            _ => return Err(InferFailReason::RecursiveInfer),
+            CacheEntry::Error(reason) => return Err(reason.clone()),
+            CacheEntry::Ready => return Err(InferFailReason::RecursiveInfer),
         }
     }
 
@@ -66,18 +67,6 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
     }
 
     cache.expr_cache.insert(key, CacheEntry::Ready);
-    let infer_start = std::time::Instant::now();
-    let expr_kind = match &expr {
-        LuaExpr::CallExpr(_) => "call",
-        LuaExpr::TableExpr(_) => "table",
-        LuaExpr::LiteralExpr(_) => "literal",
-        LuaExpr::BinaryExpr(_) => "binary",
-        LuaExpr::UnaryExpr(_) => "unary",
-        LuaExpr::ClosureExpr(_) => "closure",
-        LuaExpr::ParenExpr(_) => "paren",
-        LuaExpr::NameExpr(_) => "name",
-        LuaExpr::IndexExpr(_) => "index",
-    };
     let result_type = match expr {
         LuaExpr::CallExpr(call_expr) => infer_call_expr(db, cache, call_expr),
         LuaExpr::TableExpr(table_expr) => infer_table_expr(db, cache, table_expr),
@@ -93,10 +82,11 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         LuaExpr::NameExpr(name_expr) => infer_name_expr(db, cache, name_expr),
         LuaExpr::IndexExpr(index_expr) => infer_index_expr(db, cache, index_expr, true),
     };
-    let infer_elapsed = infer_start.elapsed();
-    if infer_elapsed.as_millis() > 50 {
-        log::info!("infer_expr slow: kind={} file={:?} cost {:?}", expr_kind, file_id, infer_elapsed);
-    }
+
+    // During diagnostics, types are final — cache everything (including errors) to avoid
+    // recomputation across diagnostic checkers. During analysis, unresolved errors are
+    // removed so the unresolve phase can retry them.
+    let is_diagnostics = cache.get_config().analysis_phase.is_diagnostics();
 
     match &result_type {
         Ok(result_type) => {
@@ -116,12 +106,22 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                     .expr_cache
                     .insert(key, CacheEntry::Cache(LuaType::Nil));
                 return Ok(LuaType::Nil);
+            } else if is_diagnostics {
+                cache
+                    .expr_cache
+                    .insert(key, CacheEntry::Error(InferFailReason::FieldNotFound));
             } else {
                 cache.expr_cache.remove(&key);
             }
         }
-        _ => {
-            cache.expr_cache.remove(&key);
+        Err(reason) => {
+            if is_diagnostics {
+                cache
+                    .expr_cache
+                    .insert(key, CacheEntry::Error(reason.clone()));
+            } else {
+                cache.expr_cache.remove(&key);
+            }
         }
     }
 
