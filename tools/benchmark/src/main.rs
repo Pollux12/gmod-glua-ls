@@ -224,11 +224,19 @@ async fn main() {
     );
 
     let total_diagnostics = std::sync::atomic::AtomicUsize::new(0);
+    let error_count = std::sync::atomic::AtomicUsize::new(0);
+    let warning_count = std::sync::atomic::AtomicUsize::new(0);
+    let info_count = std::sync::atomic::AtomicUsize::new(0);
+    let hint_count = std::sync::atomic::AtomicUsize::new(0);
     let next_file = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..parallelism {
             let analysis = &analysis;
             let counter = &total_diagnostics;
+            let errors = &error_count;
+            let warnings = &warning_count;
+            let infos = &info_count;
+            let hints = &hint_count;
             let next = &next_file;
             let file_ids = &main_file_ids;
             let shared = shared_data.clone();
@@ -245,12 +253,33 @@ async fn main() {
                         shared.clone(),
                     ) {
                         counter.fetch_add(diagnostics.len(), std::sync::atomic::Ordering::Relaxed);
+                        for d in &diagnostics {
+                            match d.severity {
+                                Some(lsp_types::DiagnosticSeverity::ERROR) => {
+                                    errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Some(lsp_types::DiagnosticSeverity::WARNING) => {
+                                    warnings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
+                                    infos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Some(lsp_types::DiagnosticSeverity::HINT) => {
+                                    hints.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             });
         }
     });
     let total_diagnostics = total_diagnostics.load(std::sync::atomic::Ordering::Relaxed);
+    let errors = error_count.load(std::sync::atomic::Ordering::Relaxed);
+    let warnings = warning_count.load(std::sync::atomic::Ordering::Relaxed);
+    let infos = info_count.load(std::sync::atomic::Ordering::Relaxed);
+    let hints = hint_count.load(std::sync::atomic::Ordering::Relaxed);
     let diagnostics_duration = t.elapsed();
     results.push(BenchmarkResult {
         phase: format!(
@@ -259,6 +288,12 @@ async fn main() {
         ),
         duration: diagnostics_duration,
     });
+
+    eprintln!();
+    eprintln!(
+        "Diagnostic breakdown: {} errors, {} warnings, {} info, {} hints",
+        errors, warnings, infos, hints
+    );
 
     // Output results
     eprintln!();
