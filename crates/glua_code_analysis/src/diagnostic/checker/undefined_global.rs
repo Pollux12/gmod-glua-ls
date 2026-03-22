@@ -117,12 +117,14 @@ fn collect_truthy_guarded_names(
                 return HashSet::new();
             };
 
-            let inner_names = collect_truthy_guarded_names(&inner_expr, condition_guard_ranges);
-
             let is_not = unary_expr
                 .get_op_token()
                 .is_some_and(|op| op.get_op() == UnaryOperator::OpNot);
-            if is_not { HashSet::new() } else { inner_names }
+            if is_not {
+                return collect_truthy_guarded_names_with_not_chain(expr, condition_guard_ranges);
+            }
+
+            collect_truthy_guarded_names(&inner_expr, condition_guard_ranges)
         }
         LuaExpr::BinaryExpr(binary_expr) => {
             let Some((left_expr, right_expr)) = binary_expr.get_exprs() else {
@@ -210,7 +212,7 @@ fn guarded_call_target_name(call_expr: &LuaCallExpr) -> Option<LuaNameExpr> {
     match prefix_expr {
         LuaExpr::NameExpr(name_expr) => {
             let helper_name = name_expr.get_name_text()?;
-            if !VALIDITY_HELPER_NAMES.contains(&helper_name.as_str()) {
+            if !is_validity_helper_name(&helper_name) {
                 return None;
             }
 
@@ -234,6 +236,67 @@ fn guarded_call_target_name(call_expr: &LuaCallExpr) -> Option<LuaNameExpr> {
         }
         _ => None,
     }
+}
+
+fn collect_truthy_guarded_names_with_not_chain(
+    expr: &LuaExpr,
+    condition_guard_ranges: &mut HashSet<TextRange>,
+) -> HashSet<String> {
+    let mut current_expr = expr.clone();
+    let mut not_count = 0usize;
+
+    loop {
+        match &current_expr {
+            LuaExpr::ParenExpr(paren_expr) => {
+                let Some(inner_expr) = paren_expr.get_expr() else {
+                    return HashSet::new();
+                };
+                current_expr = inner_expr;
+            }
+            LuaExpr::UnaryExpr(unary_expr) => {
+                let is_not = unary_expr
+                    .get_op_token()
+                    .is_some_and(|op| op.get_op() == UnaryOperator::OpNot);
+                if !is_not {
+                    break;
+                }
+
+                not_count += 1;
+                let Some(inner_expr) = unary_expr.get_expr() else {
+                    return HashSet::new();
+                };
+                current_expr = inner_expr;
+            }
+            _ => break,
+        }
+    }
+
+    let names = collect_truthy_guarded_names(&current_expr, condition_guard_ranges);
+    if not_count % 2 == 0 {
+        names
+    } else {
+        HashSet::new()
+    }
+}
+
+fn is_validity_helper_name(helper_name: &str) -> bool {
+    VALIDITY_HELPER_NAMES.contains(&helper_name) || looks_like_validity_helper(helper_name)
+}
+
+fn looks_like_validity_helper(name: &str) -> bool {
+    starts_with_boolean_helper_prefix(name, "is") || starts_with_boolean_helper_prefix(name, "has")
+}
+
+fn starts_with_boolean_helper_prefix(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+
+    let Some(first_char) = rest.chars().next() else {
+        return false;
+    };
+
+    first_char == '_' || first_char.is_ascii_uppercase()
 }
 
 fn calc_name_expr_ref(
