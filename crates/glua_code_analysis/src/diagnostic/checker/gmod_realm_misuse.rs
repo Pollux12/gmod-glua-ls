@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaCommentOwner, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
@@ -13,6 +14,9 @@ use crate::{
 
 use super::{Checker, DiagnosticContext};
 use crate::compilation::analyzer::gmod::realm_from_doc_comment;
+
+/// Cross-file callee realm cache type (thread-safe).
+pub type SharedCalleeRealmCache = RwLock<HashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>>;
 
 pub struct GmodRealmMisuseChecker;
 
@@ -31,14 +35,16 @@ impl Checker for GmodRealmMisuseChecker {
             return;
         };
 
+        // Clone Arc to shared data upfront to avoid borrow conflicts with context
+        let shared_data = context.get_shared_data_arc();
+
         // Use precomputed workspace data if available, otherwise compute per-file.
-        // We extract this before the main loop to avoid borrow conflicts with context.
         let workspace_id = db
             .get_module_index()
             .get_workspace_id(file_id)
             .unwrap_or(WorkspaceId::MAIN);
-        let precomputed = context
-            .get_shared_data()
+        let precomputed = shared_data
+            .as_ref()
             .and_then(|s| s.gm_method_realms.get(&workspace_id).cloned());
         let fallback;
         let gm_method_realms: &GmMethodRealmMap = match &precomputed {
@@ -51,6 +57,9 @@ impl Checker for GmodRealmMisuseChecker {
 
         let mut decl_annotation_cache = HashMap::new();
         let mut callee_realm_cache: CalleeRealmCache = HashMap::new();
+        let shared_callee_cache = shared_data
+            .as_ref()
+            .map(|s| &s.shared_callee_realm_cache);
 
         for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
             if context.is_cancelled() {
@@ -70,6 +79,7 @@ impl Checker for GmodRealmMisuseChecker {
                 &gm_method_realms,
                 &mut decl_annotation_cache,
                 &mut callee_realm_cache,
+                shared_callee_cache,
             );
             if callee_realms.is_empty() {
                 continue;
@@ -187,6 +197,7 @@ fn resolve_callee_realms(
     gm_method_realms: &GmMethodRealmMap,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
     callee_realm_cache: &mut CalleeRealmCache,
+    shared_callee_cache: Option<&SharedCalleeRealmCache>,
 ) -> Vec<ResolvedRealm> {
     // Fast path: GM method annotations (O(1) HashMap lookup, no inference needed)
     if let Some(prefix_expr) = call_expr.get_prefix_expr()
@@ -207,12 +218,20 @@ fn resolve_callee_realms(
         SemanticDeclLevel::default(),
     );
 
-    // Check callee realm cache — same declaration always resolves to same realm.
-    // This now covers ALL call types (member and non-member) unlike before where
-    // member calls via resolve_member_candidate_realms() bypassed caching entirely.
+    // Check caches — local first (no lock), then shared cross-file cache
     if let Some(ref decl) = semantic_decl {
         if let Some(cached) = callee_realm_cache.get(decl) {
             return cached.clone();
+        }
+        if let Some(shared) = shared_callee_cache {
+            if let Ok(guard) = shared.read() {
+                if let Some(cached) = guard.get(decl) {
+                    let result = cached.clone();
+                    // Promote to local cache to avoid future lock acquisitions
+                    callee_realm_cache.insert(decl.clone(), result.clone());
+                    return result;
+                }
+            }
         }
     }
 
@@ -264,9 +283,14 @@ fn resolve_callee_realms(
         }
     }
 
-    // Cache result for ALL paths (member and non-member)
+    // Cache result in both local and shared caches
     if let Some(decl) = semantic_decl {
-        callee_realm_cache.insert(decl, realms.clone());
+        callee_realm_cache.insert(decl.clone(), realms.clone());
+        if let Some(shared) = shared_callee_cache {
+            if let Ok(mut guard) = shared.write() {
+                guard.insert(decl, realms.clone());
+            }
+        }
     }
     realms
 }

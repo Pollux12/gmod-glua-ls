@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use log::info;
@@ -110,7 +110,10 @@ impl LuaDiagnostic {
             gm_method_realms.insert(workspace_id, Arc::new(realms));
         }
 
-        Arc::new(SharedDiagnosticData { gm_method_realms })
+        Arc::new(SharedDiagnosticData {
+            gm_method_realms,
+            shared_callee_realm_cache: RwLock::new(HashMap::new()),
+        })
     }
 
     fn diagnose_file_inner(
