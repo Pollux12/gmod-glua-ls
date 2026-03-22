@@ -77,16 +77,23 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 .set_gm_method_realm_annotations(in_filed_tree.file_id, gm_method_realms);
             if is_in_scope {
                 let s = std::time::Instant::now();
-                if let Some(scope_match) = detect_scoped_class_from_path(db, in_filed_tree.file_id)
-                {
-                    // Store for later reuse by collect_scripted_scope_type_bindings,
-                    // synthesize_scoped_base_assignments, etc.
-                    db.get_gmod_infer_index_mut()
-                        .set_scoped_class_info(in_filed_tree.file_id, GmodScopedClassInfo {
-                            class_name: scope_match.class_name.clone(),
-                            global_name: scope_match.global_name.clone(),
-                        });
-
+                // Use cached scoped class info from decl phase, or detect if not cached
+                let scope_match = db.get_gmod_infer_index()
+                    .get_scoped_class_info(&in_filed_tree.file_id)
+                    .map(|info| GmodScopedClassMatch {
+                        class_name: info.class_name.clone(),
+                        global_name: info.global_name.clone(),
+                    })
+                    .or_else(|| {
+                        let m = detect_scoped_class_from_path(db, in_filed_tree.file_id)?;
+                        db.get_gmod_infer_index_mut()
+                            .set_scoped_class_info(in_filed_tree.file_id, GmodScopedClassInfo {
+                                class_name: m.class_name.clone(),
+                                global_name: m.global_name.clone(),
+                            });
+                        Some(m)
+                    });
+                if let Some(scope_match) = scope_match {
                     ensure_scoped_class_type_decl(
                         db,
                         in_filed_tree.file_id,
@@ -716,12 +723,19 @@ pub(crate) fn ensure_scoped_class_type_decl_for_file(
     file_id: FileId,
     range: rowan::TextRange,
 ) -> Option<LuaTypeDeclId> {
-    let scope_match = detect_scoped_class_from_path(db, file_id)?;
+    // Use cached info if available, otherwise detect from path
+    let (class_name, global_name) =
+        if let Some(info) = db.get_gmod_infer_index().get_scoped_class_info(&file_id) {
+            (info.class_name.clone(), info.global_name.clone())
+        } else {
+            let scope_match = detect_scoped_class_from_path(db, file_id)?;
+            (scope_match.class_name, scope_match.global_name)
+        };
     Some(ensure_scoped_class_type_decl(
         db,
         file_id,
-        &scope_match.class_name,
-        &scope_match.global_name,
+        &class_name,
+        &global_name,
         range,
     ))
 }

@@ -11,8 +11,9 @@ use crate::{
 
 use super::{
     AnalyzeContext,
-    gmod::{ensure_scoped_class_type_decl_for_file, scoped_class_global_name_for_file},
+    gmod::ensure_scoped_class_type_decl_for_file,
 };
+use crate::db_index::GmodScopedClassInfo;
 use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaSyntaxKind, LuaVarExpr};
 use rowan::{TextRange, TextSize, WalkEvent};
 
@@ -33,11 +34,23 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
             None
         };
         for in_filed_tree in tree_list.iter() {
+            // Detect scoped class once here and cache in GmodInferIndex for gmod_pre reuse.
             let scoped_class_global_name = if let Some(scripted_scope_files) =
                 scripted_scope_files.as_ref()
                 && scripted_scope_files.contains(&in_filed_tree.file_id)
             {
-                scoped_class_global_name_for_file(db, in_filed_tree.file_id)
+                if let Some((class_name, global_name)) =
+                    super::gmod::get_scripted_class_info_for_file(db, in_filed_tree.file_id)
+                {
+                    db.get_gmod_infer_index_mut()
+                        .set_scoped_class_info(in_filed_tree.file_id, GmodScopedClassInfo {
+                            class_name,
+                            global_name: global_name.clone(),
+                        });
+                    Some(global_name)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -52,6 +65,7 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
             );
             analyzer.analyze();
             let decl_tree = analyzer.get_decl_tree();
+            // Register the scoped class type (must happen during decl, before doc/flow phases)
             if let Some(scripted_scope_files) = scripted_scope_files.as_ref()
                 && scripted_scope_files.contains(&in_filed_tree.file_id)
             {
