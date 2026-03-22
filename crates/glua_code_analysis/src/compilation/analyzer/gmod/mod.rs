@@ -27,6 +27,55 @@ use crate::{
 };
 use rowan::TextSize;
 
+/// Pre-scanned keyword flags for fast gmod_pre skip decisions.
+/// Each flag indicates the file source contains the corresponding keyword pattern.
+#[derive(Default)]
+struct GmodKeywords {
+    /// "hook" — hook.Add/Run/Remove call sites, hook method sites
+    has_hook: bool,
+    /// "net." — net.Start/Receive/Send flows, system call metadata
+    has_net: bool,
+    /// timer/concommand/ConVar/AddNetworkString — system call metadata
+    has_system_call: bool,
+    /// "GM:" or "GAMEMODE:" — GM/GAMEMODE method sites
+    has_gm_func: bool,
+    /// "CLIENT" or "SERVER" — branch realm ranges (if CLIENT/if SERVER)
+    has_realm_branch: bool,
+    /// "@realm" — file-level realm annotation
+    has_realm_anno: bool,
+}
+
+impl GmodKeywords {
+    /// Whether the LuaCallExpr walk in collect_hook_metadata is needed
+    fn needs_call_walk(&self) -> bool {
+        self.has_hook || self.has_net || self.has_system_call
+    }
+
+    /// Whether the LuaFuncStat walk in collect_hook_metadata is needed
+    fn needs_func_walk(&self) -> bool {
+        self.has_gm_func || self.has_realm_anno
+    }
+
+    /// Whether any hook/net metadata collection is needed at all
+    fn needs_hook_metadata(&self) -> bool {
+        self.needs_call_walk() || self.needs_func_walk()
+    }
+}
+
+fn scan_gmod_keywords(content: &str, hook_method_prefixes: &[String]) -> GmodKeywords {
+    let has_gm_func = content.contains("GM:") || content.contains("GAMEMODE:")
+        || hook_method_prefixes.iter().any(|p| content.contains(&format!("{p}:")));
+    GmodKeywords {
+        has_hook: content.contains("hook"),
+        has_net: content.contains("net."),
+        has_system_call: content.contains("timer.") || content.contains("concommand")
+            || content.contains("ConVar") || content.contains("AddNetworkString"),
+        has_gm_func,
+        has_realm_branch: content.contains("CLIENT") || content.contains("SERVER"),
+        has_realm_anno: content.contains("@realm"),
+    }
+}
+
 /// Pre-analysis phase: runs BEFORE lua_analyze.
 /// Collects purely syntactic metadata (hooks, network, realm, scripted class
 /// type declarations) so that lua_analyze has correct realm keys and scripted
@@ -59,22 +108,35 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
 
+            // Pre-scan file source for gmod-relevant keywords to skip unnecessary AST walks
+            let method_prefixes = &db.get_emmyrc().gmod.hook_mappings.method_prefixes;
+            let keywords = db.get_vfs().get_file_content(&in_filed_tree.file_id)
+                .map(|c| scan_gmod_keywords(c, method_prefixes))
+                .unwrap_or_default();
+
             let s = std::time::Instant::now();
-            let (gm_method_realms, receive_flows) =
-                collect_hook_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone());
+            let (gm_method_realms, receive_flows) = if keywords.needs_hook_metadata() {
+                collect_hook_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone())
+            } else {
+                (Vec::new(), Vec::new())
+            };
             t_hook += s.elapsed();
 
             let s = std::time::Instant::now();
-            collect_network_flow_metadata(
-                db,
-                in_filed_tree.file_id,
-                in_filed_tree.value.clone(),
-                receive_flows,
-            );
+            if keywords.has_net || !receive_flows.is_empty() {
+                collect_network_flow_metadata(
+                    db,
+                    in_filed_tree.file_id,
+                    in_filed_tree.value.clone(),
+                    receive_flows,
+                );
+            }
             t_netflow += s.elapsed();
 
-            db.get_gmod_infer_index_mut()
-                .set_gm_method_realm_annotations(in_filed_tree.file_id, gm_method_realms);
+            if !gm_method_realms.is_empty() {
+                db.get_gmod_infer_index_mut()
+                    .set_gm_method_realm_annotations(in_filed_tree.file_id, gm_method_realms);
+            }
             if is_in_scope {
                 let s = std::time::Instant::now();
                 // Use cached scoped class info from decl phase, or detect if not cached
@@ -113,20 +175,29 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 t_scoped += s.elapsed();
             }
             let s = std::time::Instant::now();
-            let ranges = collect_branch_realm_ranges(&in_filed_tree.value);
-            if !ranges.is_empty() {
-                branch_realm_ranges.insert(in_filed_tree.file_id, ranges);
+            if keywords.has_realm_branch {
+                let ranges = collect_branch_realm_ranges(&in_filed_tree.value);
+                if !ranges.is_empty() {
+                    branch_realm_ranges.insert(in_filed_tree.file_id, ranges);
+                }
             }
-            if let Some(realm) = collect_realm_annotation(&in_filed_tree.value) {
-                annotation_realms.insert(in_filed_tree.file_id, realm);
+            if keywords.has_realm_anno {
+                if let Some(realm) = collect_realm_annotation(&in_filed_tree.value) {
+                    annotation_realms.insert(in_filed_tree.file_id, realm);
+                }
             }
             t_realm += s.elapsed();
 
             // Pre-index @fileparam annotations (O(1) lookup during resolve vs O(file_size) AST walk)
-            let file_params = collect_file_params(&in_filed_tree.value);
-            if !file_params.is_empty() {
-                db.get_gmod_infer_index_mut()
-                    .set_file_params(in_filed_tree.file_id, file_params);
+            // @fileparam is extremely rare; only scan if file content contains it
+            if db.get_vfs().get_file_content(&in_filed_tree.file_id)
+                .is_some_and(|c| c.contains("@fileparam"))
+            {
+                let file_params = collect_file_params(&in_filed_tree.value);
+                if !file_params.is_empty() {
+                    db.get_gmod_infer_index_mut()
+                        .set_file_params(in_filed_tree.file_id, file_params);
+                }
             }
         }
         if do_profile {
