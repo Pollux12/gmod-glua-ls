@@ -188,70 +188,86 @@ fn resolve_callee_realms(
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
     callee_realm_cache: &mut CalleeRealmCache,
 ) -> Vec<ResolvedRealm> {
-    if let Some(realms) = resolve_member_candidate_realms(
-        context,
-        semantic_model,
-        call_expr,
-        gm_method_realms,
-        decl_annotation_cache,
-    ) && !realms.is_empty()
+    // Fast path: GM method annotations (O(1) HashMap lookup, no inference needed)
+    if let Some(prefix_expr) = call_expr.get_prefix_expr()
+        && let Some(index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
     {
-        return realms;
+        let gm_realms = resolve_annotated_gm_method_realms(&index_expr, gm_method_realms);
+        if !gm_realms.is_empty() {
+            return gm_realms;
+        }
     }
 
-    let mut realms = Vec::new();
+    // Resolve declaration — needed both as cache key and for non-member resolution paths
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
-        return realms;
+        return Vec::new();
     };
     let semantic_decl = semantic_model.find_decl(
         NodeOrToken::Node(prefix_expr.syntax().clone()),
         SemanticDeclLevel::default(),
     );
 
-    let Some(semantic_decl) = semantic_decl else {
-        return realms;
-    };
-
-    // Check callee realm cache — same declaration always resolves to same realm
-    if let Some(cached) = callee_realm_cache.get(&semantic_decl) {
-        return cached.clone();
-    }
-
-    for realm in resolve_global_name_candidate_realms(
-        context,
-        semantic_model,
-        &prefix_expr,
-        &semantic_decl,
-        decl_annotation_cache,
-    ) {
-        if context.is_cancelled() {
-            return realms;
+    // Check callee realm cache — same declaration always resolves to same realm.
+    // This now covers ALL call types (member and non-member) unlike before where
+    // member calls via resolve_member_candidate_realms() bypassed caching entirely.
+    if let Some(ref decl) = semantic_decl {
+        if let Some(cached) = callee_realm_cache.get(decl) {
+            return cached.clone();
         }
-        push_unique_realm(&mut realms, realm);
     }
 
-    if let Some(realm) = resolve_decl_realm(
+    // Resolve realms: try member candidate path first, then fallback paths
+    let mut realms = Vec::new();
+
+    if let Some(member_realms) = resolve_member_candidate_realms(
         context,
         semantic_model,
-        &semantic_decl,
+        call_expr,
+        gm_method_realms,
         decl_annotation_cache,
-    ) {
-        push_unique_realm(&mut realms, realm);
-    }
-
-    if let LuaSemanticDeclId::Member(member_id) = semantic_decl.clone()
-        && let Some(origin_owner) = semantic_model.get_member_origin_owner(member_id)
-        && let Some(realm) = resolve_decl_realm(
+    ) && !member_realms.is_empty()
+    {
+        realms = member_realms;
+    } else if let Some(ref decl) = semantic_decl {
+        for realm in resolve_global_name_candidate_realms(
             context,
             semantic_model,
-            &origin_owner,
+            &prefix_expr,
+            decl,
             decl_annotation_cache,
-        )
-    {
-        push_unique_realm(&mut realms, realm);
+        ) {
+            if context.is_cancelled() {
+                return realms;
+            }
+            push_unique_realm(&mut realms, realm);
+        }
+
+        if let Some(realm) = resolve_decl_realm(
+            context,
+            semantic_model,
+            decl,
+            decl_annotation_cache,
+        ) {
+            push_unique_realm(&mut realms, realm);
+        }
+
+        if let LuaSemanticDeclId::Member(member_id) = decl.clone()
+            && let Some(origin_owner) = semantic_model.get_member_origin_owner(member_id)
+            && let Some(realm) = resolve_decl_realm(
+                context,
+                semantic_model,
+                &origin_owner,
+                decl_annotation_cache,
+            )
+        {
+            push_unique_realm(&mut realms, realm);
+        }
     }
 
-    callee_realm_cache.insert(semantic_decl, realms.clone());
+    // Cache result for ALL paths (member and non-member)
+    if let Some(decl) = semantic_decl {
+        callee_realm_cache.insert(decl, realms.clone());
+    }
     realms
 }
 
