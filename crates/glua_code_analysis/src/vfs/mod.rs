@@ -178,6 +178,24 @@ impl Vfs {
         Some(fid)
     }
 
+    /// Insert pre-parsed content for a file whose FileId was already assigned via `file_id()`.
+    /// Used by parallel parsing to avoid re-assigning IDs.
+    pub fn insert_preparsed(
+        &mut self,
+        fid: FileId,
+        content: String,
+        tree: LuaSyntaxTree,
+        line_index: LineIndex,
+    ) {
+        self.tree_map.insert(fid, tree);
+        self.line_index_map.insert(fid, line_index);
+        self.file_data[fid.id as usize] = Some(FileContent {
+            content,
+            is_remote: false,
+            version: None,
+        });
+    }
+
     pub fn set_file_content_preparsed_deferred(
         &mut self,
         uri: &Uri,

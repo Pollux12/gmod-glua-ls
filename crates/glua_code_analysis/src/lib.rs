@@ -24,7 +24,7 @@ pub use config::*;
 pub use db_index::*;
 pub use diagnostic::*;
 pub use glua_codestyle::*;
-use glua_parser::{LineIndex, LuaSyntaxTree};
+use glua_parser::{LineIndex, LuaParser, LuaSyntaxTree};
 pub use locale::get_locale_code;
 use lsp_types::Uri;
 pub use profile::Profile;
@@ -390,8 +390,11 @@ impl EmmyLuaAnalysis {
     pub fn update_files_by_uri(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
         let mut removed_files = HashSet::new();
         let mut updated_files = HashSet::new();
+
+        // Separate files into: unchanged (skip), to-remove, and to-parse
+        let mut to_parse: Vec<(Uri, String)> = Vec::new();
         {
-            let _p = Profile::new("update files");
+            let _p = Profile::new("update files: classify");
             for (uri, text) in files {
                 let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
                 if let Some(file_id) = existing_file_id {
@@ -412,18 +415,103 @@ impl EmmyLuaAnalysis {
                     continue;
                 }
 
-                let is_new_text = text.is_some();
-                let file_id = self
-                    .compilation
-                    .get_db_mut()
-                    .get_vfs_mut()
-                    .set_file_content(&uri, text);
-                removed_files.insert(file_id);
-                if is_new_text {
+                if let Some(text) = text {
+                    to_parse.push((uri, text));
+                } else {
+                    // File removal: assign ID and mark for removal
+                    let file_id = self
+                        .compilation
+                        .get_db_mut()
+                        .get_vfs_mut()
+                        .set_file_content(&uri, None);
+                    removed_files.insert(file_id);
+                }
+            }
+        }
+
+        // Parse files — parallel when enough files to benefit
+        const PARALLEL_THRESHOLD: usize = 50;
+        {
+            let _p = Profile::new("update files: parse");
+            if to_parse.len() >= PARALLEL_THRESHOLD {
+                // Pre-assign file IDs (sequential, fast)
+                let file_ids: Vec<FileId> = to_parse
+                    .iter()
+                    .map(|(uri, _)| {
+                        self.compilation.get_db_mut().get_vfs_mut().file_id(uri)
+                    })
+                    .collect();
+
+                // Parse in parallel
+                let config = self.emmyrc.clone();
+                let n_threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(16);
+                let next_idx = std::sync::atomic::AtomicUsize::new(0);
+
+                // Each slot stores the parsed result
+                let parsed: Vec<std::sync::Mutex<Option<(LuaSyntaxTree, LineIndex)>>> =
+                    (0..to_parse.len())
+                        .map(|_| std::sync::Mutex::new(None))
+                        .collect();
+
+                std::thread::scope(|s| {
+                    for _ in 0..n_threads {
+                        let next = &next_idx;
+                        let files = &to_parse;
+                        let results = &parsed;
+                        let cfg = &config;
+                        s.spawn(move || {
+                            let mut node_cache = rowan::NodeCache::default();
+                            loop {
+                                let idx = next.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if idx >= files.len() {
+                                    break;
+                                }
+                                let (_, text) = &files[idx];
+                                let parse_config =
+                                    cfg.get_parse_config(&mut node_cache);
+                                let tree = LuaParser::parse(text, parse_config);
+                                let line_index = LineIndex::parse(text);
+                                *results[idx].lock().expect("mutex poisoned") =
+                                    Some((tree, line_index));
+                            }
+                        });
+                    }
+                });
+
+                // Insert pre-parsed results (sequential, fast HashMap inserts)
+                let vfs = self.compilation.get_db_mut().get_vfs_mut();
+                for (i, ((_uri, text), file_id)) in
+                    to_parse.into_iter().zip(file_ids.iter()).enumerate()
+                {
+                    let (tree, line_index) = parsed[i]
+                        .lock()
+                        .expect("mutex poisoned")
+                        .take()
+                        .expect("parsed result missing");
+                    vfs.insert_preparsed(*file_id, text, tree, line_index);
+                    removed_files.insert(*file_id);
+                    updated_files.insert(*file_id);
+                }
+            } else {
+                // Small batch: parse sequentially (avoids thread spawn overhead)
+                for (uri, text) in to_parse {
+                    let file_id = self
+                        .compilation
+                        .get_db_mut()
+                        .get_vfs_mut()
+                        .set_file_content(&uri, Some(text));
+                    removed_files.insert(file_id);
                     updated_files.insert(file_id);
                 }
             }
         }
+
         if removed_files.is_empty() {
             return Vec::new();
         }
