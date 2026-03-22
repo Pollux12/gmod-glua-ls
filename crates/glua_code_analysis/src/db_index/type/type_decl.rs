@@ -288,8 +288,10 @@ impl LuaTypeDeclId {
     }
 
     pub fn collect_super_types(&self, db: &DbIndex, collected_types: &mut Vec<LuaType>) {
-        // 必须广度优先
+        // BFS with HashSet for O(1) visited check instead of Vec::contains O(n).
         let mut queue = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(self.clone());
         queue.push(self.clone());
 
         while let Some(current_id) = queue.pop() {
@@ -298,12 +300,13 @@ impl LuaTypeDeclId {
                 for super_type in super_types {
                     match &super_type {
                         LuaType::Ref(super_type_id) => {
-                            if !collected_types.contains(&super_type) {
+                            if visited.insert(super_type_id.clone()) {
                                 collected_types.push(super_type.clone());
                                 queue.push(super_type_id.clone());
                             }
                         }
                         _ => {
+                            // For non-Ref types, use Vec position check (rare path)
                             if !collected_types.contains(&super_type) {
                                 collected_types.push(super_type.clone());
                             }

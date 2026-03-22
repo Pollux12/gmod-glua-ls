@@ -94,6 +94,10 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             }
             loop_count += 1;
         }
+
+        // Return the infer_manager so later phases (e.g. dynamic field) can
+        // reuse cached inference results rather than recomputing from scratch.
+        context.infer_manager = infer_manager;
     }
 }
 

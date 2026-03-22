@@ -69,7 +69,6 @@ pub fn analyze(
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
 
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
-            context.infer_manager.clear();
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
         }
     }
