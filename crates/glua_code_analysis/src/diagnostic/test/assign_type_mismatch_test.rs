@@ -1724,6 +1724,56 @@ return t
     }
 
     #[test]
+    fn test_cross_file_mapstyle_inferred_tuple_collections_do_not_conflict() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::AssignTypeMismatch);
+
+        let file_a = ws.def(
+            r#"
+                property = property or {}
+                property.doors = property.doors or {}
+
+                property.doors[1] = { 1325, 1326, 1330, 1329, 1327, 1328, 1337, 1338 }
+                property.doors[2] = { 1825, 1826, 2360, 2359, 1258, 1259, 1827, 1479 }
+                property.doors[6] = { 1894 }
+            "#,
+        );
+
+        let file_b = ws.def(
+            r#"
+                property = property or {}
+                property.doors = property.doors or {}
+
+                property.doors[1] = { 3268, 3267, 3266, 2837, 3542, 3545, 3548, 3549, 3550 }
+                property.doors[2] = { 4301, 4302, 4304, 4303, 4305, 4306, 4310, 4309, 4308 }
+                property.doors[6] = { 3204, 3203, 3202, 3246 }
+            "#,
+        );
+
+        for file_id in [file_a, file_b] {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .expect("diagnostics should be available");
+            let code_string = Some(NumberOrString::String(
+                DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
+            ));
+            let assign_diags = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == code_string)
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>();
+            assert!(
+                assign_diags.is_empty(),
+                "unexpected assign-type-mismatch diagnostics: {:?}",
+                assign_diags
+            );
+        }
+    }
+
+    #[test]
     fn test_inferred_member_collection_keeps_tuple_slot_precision() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(

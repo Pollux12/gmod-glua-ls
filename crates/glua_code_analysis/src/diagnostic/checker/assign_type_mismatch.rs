@@ -146,7 +146,9 @@ fn check_index_expr(
     expr: Option<LuaExpr>,
     value_type: LuaType,
 ) -> Option<()> {
-    if should_skip_inferred_member_collection_index_write(semantic_model, index_expr)? {
+    let inferred_append_collection_target =
+        is_inferred_member_collection_append_target(semantic_model, index_expr).unwrap_or(false);
+    if inferred_append_collection_target {
         return Some(());
     }
 
@@ -157,6 +159,11 @@ fn check_index_expr(
         false,
     )
     .ok();
+    let source_is_inferred_collection = matches!(
+        source_type.as_ref(),
+        Some(LuaType::Tuple(tuple)) if tuple.is_infer_resolve()
+    );
+
     check_assign_type_mismatch(
         context,
         semantic_model,
@@ -164,7 +171,7 @@ fn check_index_expr(
         source_type.as_ref(),
         &value_type,
         true,
-        false,
+        source_is_inferred_collection,
     );
     if let Some(expr) = expr {
         check_table_expr(
@@ -178,7 +185,7 @@ fn check_index_expr(
     Some(())
 }
 
-fn should_skip_inferred_member_collection_index_write(
+fn is_inferred_member_collection_append_target(
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
 ) -> Option<bool> {
