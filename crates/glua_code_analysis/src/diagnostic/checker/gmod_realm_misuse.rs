@@ -50,6 +50,7 @@ impl Checker for GmodRealmMisuseChecker {
         };
 
         let mut decl_annotation_cache = HashMap::new();
+        let mut callee_realm_cache: CalleeRealmCache = HashMap::new();
 
         for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
             if context.is_cancelled() {
@@ -68,6 +69,7 @@ impl Checker for GmodRealmMisuseChecker {
                 &call_expr,
                 &gm_method_realms,
                 &mut decl_annotation_cache,
+                &mut callee_realm_cache,
             );
             if callee_realms.is_empty() {
                 continue;
@@ -176,6 +178,7 @@ struct AnnotatedRealmRange {
 
 pub type GmMethodRealmMap = HashMap<String, Vec<ResolvedRealm>>;
 type DeclAnnotationRealmCache = HashMap<FileId, Vec<AnnotatedRealmRange>>;
+type CalleeRealmCache = HashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
 
 fn resolve_callee_realms(
     context: &DiagnosticContext,
@@ -183,6 +186,7 @@ fn resolve_callee_realms(
     call_expr: &LuaCallExpr,
     gm_method_realms: &GmMethodRealmMap,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
+    callee_realm_cache: &mut CalleeRealmCache,
 ) -> Vec<ResolvedRealm> {
     if let Some(realms) = resolve_member_candidate_realms(
         context,
@@ -208,6 +212,11 @@ fn resolve_callee_realms(
         return realms;
     };
 
+    // Check callee realm cache — same declaration always resolves to same realm
+    if let Some(cached) = callee_realm_cache.get(&semantic_decl) {
+        return cached.clone();
+    }
+
     for realm in resolve_global_name_candidate_realms(
         context,
         semantic_model,
@@ -230,7 +239,7 @@ fn resolve_callee_realms(
         push_unique_realm(&mut realms, realm);
     }
 
-    if let LuaSemanticDeclId::Member(member_id) = semantic_decl
+    if let LuaSemanticDeclId::Member(member_id) = semantic_decl.clone()
         && let Some(origin_owner) = semantic_model.get_member_origin_owner(member_id)
         && let Some(realm) = resolve_decl_realm(
             context,
@@ -242,6 +251,7 @@ fn resolve_callee_realms(
         push_unique_realm(&mut realms, realm);
     }
 
+    callee_realm_cache.insert(semantic_decl, realms.clone());
     realms
 }
 
@@ -305,6 +315,12 @@ fn resolve_member_candidate_realms(
     let prefix_expr = call_expr.get_prefix_expr()?;
     let index_expr = LuaIndexExpr::cast(prefix_expr.syntax().clone())?;
     let mut realms = resolve_annotated_gm_method_realms(&index_expr, gm_method_realms);
+
+    // If we already have explicit GM method realm annotations, skip expensive inference.
+    // The precomputed annotations are authoritative for GM.*/GAMEMODE.* calls.
+    if !realms.is_empty() {
+        return Some(realms);
+    }
 
     if let Some(index_key) = index_expr.get_index_key()
         && let Some(member_key) = semantic_model.get_member_key(&index_key)
