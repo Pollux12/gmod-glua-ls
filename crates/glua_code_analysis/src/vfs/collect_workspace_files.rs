@@ -2,6 +2,22 @@ use std::{collections::HashSet, path::PathBuf};
 
 use crate::{EmmyLibraryItem, Emmyrc, LuaFileInfo, load_workspace_files};
 
+/// Normalize a path for deduplication without filesystem access.
+/// Uses case-insensitive comparison on Windows, forward slashes, and trailing slash removal.
+fn normalize_path_for_dedup(path: &str) -> String {
+    let mut normalized = path.replace('\\', "/");
+    // Remove trailing slash
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    // Case-insensitive on Windows (filesystem is case-insensitive)
+    #[cfg(target_os = "windows")]
+    {
+        normalized = normalized.to_lowercase();
+    }
+    normalized
+}
+
 #[derive(Clone, Debug)]
 pub enum WorkspaceImport {
     All,
@@ -40,7 +56,7 @@ pub fn collect_workspace_files(
     extra_exclude: Option<Vec<String>>,
 ) -> Vec<LuaFileInfo> {
     let mut files = Vec::new();
-    let mut loaded_paths = HashSet::new(); // Track loaded file paths to avoid duplicates
+    let mut loaded_paths = HashSet::new(); // Track loaded file paths (normalized strings) to avoid duplicates
     let (mut match_pattern, mut exclude, exclude_dir) = calculate_include_and_exclude(emmyrc);
     if let Some(extra_include) = extra_include {
         match_pattern.extend_from_slice(&extra_include);
@@ -118,10 +134,7 @@ pub fn collect_workspace_files(
                 };
                 if let Some(loaded) = loaded {
                     for file in loaded {
-                        // Normalize path and check for duplicates
-                        let normalized_path = PathBuf::from(&file.path)
-                            .canonicalize()
-                            .unwrap_or_else(|_| PathBuf::from(&file.path));
+                        let normalized_path = normalize_path_for_dedup(&file.path);
 
                         if loaded_paths.insert(normalized_path) {
                             files.push(file);
@@ -166,10 +179,7 @@ pub fn collect_workspace_files(
                     };
                     if let Some(loaded) = loaded {
                         for file in loaded {
-                            // Normalize path and check for duplicates
-                            let normalized_path = PathBuf::from(&file.path)
-                                .canonicalize()
-                                .unwrap_or_else(|_| PathBuf::from(&file.path));
+                            let normalized_path = normalize_path_for_dedup(&file.path);
 
                             if loaded_paths.insert(normalized_path) {
                                 files.push(file);
