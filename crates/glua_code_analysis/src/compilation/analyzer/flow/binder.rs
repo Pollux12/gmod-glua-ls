@@ -6,9 +6,19 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    AnalyzeError, DbIndex, FileId, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
-    LuaClosureId, LuaDeclId,
+    AnalyzeError, AssignVarHint, BranchLabelInfo, DbIndex, FileId, FlowAntecedent, FlowId,
+    FlowNode, FlowNodeKind, FlowTree, LuaClosureId, LuaDeclId,
 };
+
+/// Snapshot of the modification counters, used to detect what was created
+/// between two points during flow-graph construction.
+#[derive(Debug, Clone, Copy)]
+pub struct ModificationSnapshot {
+    pub name_assign_count: u32,
+    pub index_assign_count: u32,
+    pub cast_or_implfunc_count: u32,
+    pub condition_count: u32,
+}
 
 #[derive(Debug)]
 pub struct FlowBinder<'a> {
@@ -26,6 +36,12 @@ pub struct FlowBinder<'a> {
     labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
     goto_stats: Vec<GotoCache>,
     bindings: HashMap<LuaSyntaxId, FlowId>,
+    branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+    // Counters for tracking modifications inside branch blocks.
+    name_assign_count: u32,
+    index_assign_count: u32,
+    cast_or_implfunc_count: u32,
+    condition_count: u32,
 }
 
 impl<'a> FlowBinder<'a> {
@@ -45,6 +61,11 @@ impl<'a> FlowBinder<'a> {
             loop_label: FlowId::default(),
             true_target: FlowId::default(),
             false_target: FlowId::default(),
+            branch_label_info: HashMap::new(),
+            name_assign_count: 0,
+            index_assign_count: 0,
+            cast_or_implfunc_count: 0,
+            condition_count: 0,
         };
 
         binder.start = binder.create_start();
@@ -58,6 +79,25 @@ impl<'a> FlowBinder<'a> {
     }
 
     pub fn create_node(&mut self, kind: FlowNodeKind) -> FlowId {
+        // Track modifications for the BranchLabel merge-skip optimisation.
+        match &kind {
+            FlowNodeKind::Assignment(_, hint) => match hint {
+                AssignVarHint::NameOnly => self.name_assign_count += 1,
+                AssignVarHint::IndexOnly => self.index_assign_count += 1,
+                AssignVarHint::Mixed => {
+                    self.name_assign_count += 1;
+                    self.index_assign_count += 1;
+                }
+            },
+            FlowNodeKind::ImplFunc(_) | FlowNodeKind::TagCast(_) => {
+                self.cast_or_implfunc_count += 1;
+            }
+            FlowNodeKind::TrueCondition(_) | FlowNodeKind::FalseCondition(_) => {
+                self.condition_count += 1;
+            }
+            _ => {}
+        }
+
         let id = FlowId(self.flow_nodes.len() as u32);
         let flow_node = FlowNode {
             id,
@@ -180,6 +220,33 @@ impl<'a> FlowBinder<'a> {
         self.flow_nodes.get(flow_id.0 as usize)
     }
 
+    /// Snapshot the current modification counters so we can later detect what
+    /// Assignment / ImplFunc / TagCast nodes were added during a block binding.
+    pub fn save_modification_counts(&self) -> ModificationSnapshot {
+        ModificationSnapshot {
+            name_assign_count: self.name_assign_count,
+            index_assign_count: self.index_assign_count,
+            cast_or_implfunc_count: self.cast_or_implfunc_count,
+            condition_count: self.condition_count,
+        }
+    }
+
+    /// Compare the current counters against a previous snapshot and return
+    /// (has_name_assigns, has_index_assigns, has_casts_or_implfunc, has_conditions).
+    pub fn check_new_modifications(&self, snap: ModificationSnapshot) -> (bool, bool, bool, bool) {
+        (
+            self.name_assign_count > snap.name_assign_count,
+            self.index_assign_count > snap.index_assign_count,
+            self.cast_or_implfunc_count > snap.cast_or_implfunc_count,
+            self.condition_count > snap.condition_count,
+        )
+    }
+
+    /// Record merge-skip metadata for a BranchLabel created by an if/elseif/else.
+    pub fn set_branch_label_info(&mut self, label_id: FlowId, info: BranchLabelInfo) {
+        self.branch_label_info.insert(label_id, info);
+    }
+
     pub fn report_error(&mut self, error: AnalyzeError) {
         self.db
             .get_diagnostic_index_mut()
@@ -193,6 +260,7 @@ impl<'a> FlowBinder<'a> {
             self.multiple_antecedents,
             // self.labels,
             self.bindings,
+            self.branch_label_info,
         )
     }
 }

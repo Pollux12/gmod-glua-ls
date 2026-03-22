@@ -5,8 +5,8 @@ use glua_parser::{
 use rowan::TextSize;
 
 use crate::{
-    AssignVarHint, CacheEntry, DbIndex, FlowId, FlowNode, FlowNodeKind, FlowTree, GmodRealm,
-    InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
+    AssignVarHint, CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
+    GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
     LuaMemberOwner, LuaSignatureId, LuaType, TypeOps, infer_expr,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
@@ -94,6 +94,36 @@ pub fn get_type_at_flow(
                 visited_flow_ids.push(antecedent_flow_id);
             }
             FlowNodeKind::BranchLabel | FlowNodeKind::NamedLabel(_) => {
+                // Try the merge-skip optimisation for if/else BranchLabels.
+                // If the variable was not modified in any branch AND all
+                // antecedents are alive (no Return / Break / Unreachable),
+                // the merged type is identical to the type at the common
+                // predecessor — skip the merge and continue the linear walk.
+                if matches!(flow_node.kind, FlowNodeKind::BranchLabel) {
+                    if let Some(info) = tree.get_branch_label_info(antecedent_flow_id) {
+                        let can_skip = match var_ref_id {
+                            VarRefId::VarRef(_) | VarRefId::SelfRef(_) => {
+                                !info.has_name_assigns
+                                    && !info.has_casts_or_implfunc
+                                    && !info.has_inner_conditions
+                            }
+                            VarRefId::IndexRef(_, _) => {
+                                !info.has_index_assigns
+                                    && !info.has_casts_or_implfunc
+                                    && !info.has_inner_conditions
+                            }
+                        };
+
+                        if can_skip
+                            && all_branch_antecedents_alive(tree, flow_node)
+                        {
+                            antecedent_flow_id = info.common_predecessor;
+                            visited_flow_ids.push(antecedent_flow_id);
+                            continue;
+                        }
+                    }
+                }
+
                 result_type = merge_antecedent_types(db, tree, cache, root, var_ref_id, flow_node)?;
                 break;
             }
@@ -537,6 +567,32 @@ fn realms_can_reach(target: GmodRealm, source: GmodRealm) -> bool {
             source,
             GmodRealm::Client | GmodRealm::Shared | GmodRealm::Unknown
         ),
+    }
+}
+
+/// Returns `true` when every direct antecedent of a `BranchLabel` / `NamedLabel`
+/// is an alive flow node (not `Unreachable`, `Return`, or `Break`).
+///
+/// When all antecedents are alive, condition narrowing is guaranteed to cancel
+/// out at the merge point, so variables that are not otherwise modified in any
+/// branch keep the same type as at the common predecessor.
+fn all_branch_antecedents_alive(tree: &FlowTree, flow_node: &FlowNode) -> bool {
+    match &flow_node.antecedent {
+        Some(FlowAntecedent::Multiple(idx)) => {
+            if let Some(antecedents) = tree.get_multi_antecedents(*idx) {
+                antecedents.iter().all(|&fid| {
+                    tree.get_flow_node(fid).is_some_and(|n| {
+                        !matches!(
+                            n.kind,
+                            FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break
+                        )
+                    })
+                })
+            } else {
+                false
+            }
+        }
+        _ => false,
     }
 }
 

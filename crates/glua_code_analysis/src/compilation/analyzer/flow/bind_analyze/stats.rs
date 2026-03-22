@@ -5,7 +5,8 @@ use glua_parser::{
 };
 
 use crate::{
-    AnalyzeError, AssignVarHint, DiagnosticCode, FlowId, FlowNodeKind, LuaClosureId, LuaDeclId,
+    AnalyzeError, AssignVarHint, BranchLabelInfo, DiagnosticCode, FlowId, FlowNodeKind,
+    LuaClosureId, LuaDeclId,
     compilation::analyzer::flow::{
         bind_analyze::{
             bind_block, bind_each_child, bind_node,
@@ -329,9 +330,21 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
         bind_condition_expr(binder, condition_expr, current, then_label, else_label);
     }
 
+    // Snapshot modification counters before binding any branch blocks.
+    // Note: the outer if's condition was already bound above (before this
+    // save), so its TrueCondition/FalseCondition are NOT counted.
+    let saved = binder.save_modification_counts();
+
+    // We track inner conditions per-block to avoid counting elseif
+    // condition expressions (which are structural, not in-block modifications).
+    let mut blocks_have_inner_conditions = false;
+
     if let Some(then_block) = if_stat.get_block() {
         let then_label = finish_flow_label(binder, then_label, current);
+        let pre_block = binder.save_modification_counts();
         let block_id = bind_block(binder, then_block, then_label);
+        let (_, _, _, blk_cond) = binder.check_new_modifications(pre_block);
+        blocks_have_inner_conditions |= blk_cond;
         binder.add_antecedent(post_if_label, block_id);
     } else {
         let then_label = finish_flow_label(binder, then_label, current);
@@ -355,7 +368,10 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
         else_label = finish_flow_label(binder, post_elseif_label, pre_elseif_label);
         if let Some(elseif_block) = elseif_clause.get_block() {
             let current = finish_flow_label(binder, elseif_then_label, pre_elseif_label);
+            let pre_block = binder.save_modification_counts();
             let block_id = bind_block(binder, elseif_block, current);
+            let (_, _, _, blk_cond) = binder.check_new_modifications(pre_block);
+            blocks_have_inner_conditions |= blk_cond;
             binder.add_antecedent(post_if_label, block_id);
         } else {
             let current = finish_flow_label(binder, elseif_then_label, pre_elseif_label);
@@ -366,12 +382,29 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
     if let Some(else_clause) = if_stat.get_else_clause() {
         let else_block = else_clause.get_block();
         if let Some(else_block) = else_block {
+            let pre_block = binder.save_modification_counts();
             let block_id = bind_block(binder, else_block, else_label);
+            let (_, _, _, blk_cond) = binder.check_new_modifications(pre_block);
+            blocks_have_inner_conditions |= blk_cond;
             binder.add_antecedent(post_if_label, block_id);
         }
     } else {
         binder.add_antecedent(post_if_label, else_label);
     }
+
+    // Record BranchLabel metadata so the flow walk can skip merges for
+    // variables that were not modified inside any branch.
+    let (has_name, has_index, has_casts, _) = binder.check_new_modifications(saved);
+    binder.set_branch_label_info(
+        post_if_label,
+        BranchLabelInfo {
+            common_predecessor: current,
+            has_name_assigns: has_name,
+            has_index_assigns: has_index,
+            has_casts_or_implfunc: has_casts,
+            has_inner_conditions: blocks_have_inner_conditions,
+        },
+    );
 
     if let Some(flow_node) = binder.get_flow(post_if_label)
         && flow_node.antecedent.is_none()
