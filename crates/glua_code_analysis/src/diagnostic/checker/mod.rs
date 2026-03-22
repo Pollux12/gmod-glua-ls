@@ -113,7 +113,6 @@ pub fn check_file(
     run_check::<syntax_error::SyntaxErrorChecker>(context, semantic_model, cancel_token);
     run_check::<analyze_error::AnalyzeErrorChecker>(context, semantic_model, cancel_token);
     run_check::<unused::UnusedChecker>(context, semantic_model, cancel_token);
-    run_check::<deprecated::DeprecatedChecker>(context, semantic_model, cancel_token);
     run_check::<undefined_global::UndefinedGlobalChecker>(context, semantic_model, cancel_token);
     run_check::<unnecessary_assert::UnnecessaryAssertChecker>(
         context,
@@ -154,6 +153,9 @@ pub fn check_file(
         semantic_model,
         cancel_token,
     );
+    // DeprecatedChecker runs after heavy inference checkers (CheckFieldChecker,
+    // ParamTypeCheckChecker, etc.) so find_decl() calls benefit from cached results.
+    run_check::<deprecated::DeprecatedChecker>(context, semantic_model, cancel_token);
     run_check::<duplicate_require::DuplicateRequireChecker>(context, semantic_model, cancel_token);
     run_check::<duplicate_type::DuplicateTypeChecker>(context, semantic_model, cancel_token);
     run_check::<check_return_count::CheckReturnCount>(context, semantic_model, cancel_token);
