@@ -20,8 +20,8 @@ use crate::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
         GmodConcommandSiteMetadata, GmodHookKind, GmodHookNameIssue, GmodHookSiteMetadata,
         GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata, GmodRealm, GmodRealmFileMetadata,
-        GmodRealmRange, GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind, LuaMemberOwner,
-        NetOpEntry, NetOpKind, NetReceiveFlow, NetSendFlow, NetSendKind,
+        GmodRealmRange, GmodScopedClassInfo, GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind,
+        LuaMemberOwner, NetOpEntry, NetOpKind, NetReceiveFlow, NetSendFlow, NetSendKind,
     },
     profile::Profile,
 };
@@ -79,6 +79,14 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 let s = std::time::Instant::now();
                 if let Some(scope_match) = detect_scoped_class_from_path(db, in_filed_tree.file_id)
                 {
+                    // Store for later reuse by collect_scripted_scope_type_bindings,
+                    // synthesize_scoped_base_assignments, etc.
+                    db.get_gmod_infer_index_mut()
+                        .set_scoped_class_info(in_filed_tree.file_id, GmodScopedClassInfo {
+                            class_name: scope_match.class_name.clone(),
+                            global_name: scope_match.global_name.clone(),
+                        });
+
                     ensure_scoped_class_type_decl(
                         db,
                         in_filed_tree.file_id,
@@ -86,13 +94,15 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                         &scope_match.global_name,
                         in_filed_tree.value.syntax().text_range(),
                     );
+
+                    collect_scripted_scope_type_bindings_with(db, in_filed_tree.file_id, &scope_match);
+                    synthesize_scoped_base_assignments_with(
+                        db,
+                        in_filed_tree.file_id,
+                        in_filed_tree.value.clone(),
+                        &scope_match,
+                    );
                 }
-                collect_scripted_scope_type_bindings(db, in_filed_tree.file_id);
-                synthesize_scoped_base_assignments(
-                    db,
-                    in_filed_tree.file_id,
-                    in_filed_tree.value.clone(),
-                );
                 t_scoped += s.elapsed();
             }
             let s = std::time::Instant::now();
@@ -564,9 +574,9 @@ fn net_send_kind_from_method_name(method_name: &str) -> Option<NetSendKind> {
 }
 
 #[derive(Debug, Clone)]
-struct GmodScopedClassMatch {
-    global_name: String,
-    class_name: String,
+pub(crate) struct GmodScopedClassMatch {
+    pub global_name: String,
+    pub class_name: String,
 }
 
 const GMOD_ENT_BASE_TO_ENT: &[&str] = &[
@@ -583,6 +593,10 @@ fn collect_scripted_scope_type_bindings(db: &mut DbIndex, file_id: FileId) {
     let Some(scope_match) = detect_scoped_class_from_path(db, file_id) else {
         return;
     };
+    collect_scripted_scope_type_bindings_with(db, file_id, &scope_match);
+}
+
+fn collect_scripted_scope_type_bindings_with(db: &mut DbIndex, file_id: FileId, scope_match: &GmodScopedClassMatch) {
 
     let mut decls = Vec::new();
     {
@@ -720,8 +734,9 @@ fn synthesize_scripted_class_members(
     file_ids: &[FileId],
 ) {
     for file_id in file_ids.iter().copied() {
+        // Use cached scoped class info (computed during gmod_pre phase)
         let scope_match = if scripted_scope_files.contains(&file_id) {
-            detect_scoped_class_from_path(db, file_id)
+            db.get_gmod_infer_index().get_scoped_class_info(&file_id).cloned()
         } else {
             None
         };
@@ -844,7 +859,10 @@ fn synthesize_scoped_base_assignments(db: &mut DbIndex, file_id: FileId, root: L
     let Some(scope_match) = detect_scoped_class_from_path(db, file_id) else {
         return;
     };
+    synthesize_scoped_base_assignments_with(db, file_id, root, &scope_match);
+}
 
+fn synthesize_scoped_base_assignments_with(db: &mut DbIndex, file_id: FileId, root: LuaChunk, scope_match: &GmodScopedClassMatch) {
     let class_decl_id = ensure_scoped_class_type_decl(
         db,
         file_id,
@@ -964,7 +982,8 @@ fn synthesize_network_var_wrappers(
             continue;
         }
 
-        let Some(scope_match) = detect_scoped_class_from_path(db, *file_id) else {
+        // Use cached scoped class info (computed earlier in gmod_pre per-file loop)
+        let Some(scope_match) = db.get_gmod_infer_index().get_scoped_class_info(file_id).cloned() else {
             continue;
         };
 
@@ -1890,14 +1909,23 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
 /// Returns the gmod scripted-class name that the given file belongs to, if any.
 /// For example, a file at `lua/entities/base_glide_car/sv_braking.lua` returns
 /// `Some("base_glide_car")`.
+/// Uses cached scoped class info when available (populated during gmod_pre phase),
+/// falling back to path detection.
 pub fn get_gmod_class_name_for_file(db: &DbIndex, file_id: FileId) -> Option<String> {
+    if let Some(info) = db.get_gmod_infer_index().get_scoped_class_info(&file_id) {
+        return Some(info.class_name.clone());
+    }
     detect_scoped_class_from_path(db, file_id).map(|m| m.class_name)
 }
 
 /// Returns the scripted class info `(class_name, global_name)` for a file, if it belongs to a
 /// GMod scripted class scope.  `global_name` is the well-known table name used in the file
 /// (e.g. `"ENT"`, `"SWEP"`, `"TOOL"`, `"EFFECT"`, `"PLUGIN"`).
+/// Uses cached scoped class info when available, falling back to path detection.
 pub fn get_scripted_class_info_for_file(db: &DbIndex, file_id: FileId) -> Option<(String, String)> {
+    if let Some(info) = db.get_gmod_infer_index().get_scoped_class_info(&file_id) {
+        return Some((info.class_name.clone(), info.global_name.clone()));
+    }
     detect_scoped_class_from_path(db, file_id).map(|m| (m.class_name, m.global_name))
 }
 

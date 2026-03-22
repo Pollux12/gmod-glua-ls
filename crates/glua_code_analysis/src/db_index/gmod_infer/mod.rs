@@ -175,6 +175,13 @@ impl Default for GmodRealmFileMetadata {
     }
 }
 
+/// Cached scoped class detection result: (class_name, global_name).
+#[derive(Debug, Clone)]
+pub struct GmodScopedClassInfo {
+    pub class_name: String,
+    pub global_name: String,
+}
+
 #[derive(Debug, Default)]
 pub struct GmodInferIndex {
     hook_file_metadata: HashMap<FileId, GmodHookFileMetadata>,
@@ -184,6 +191,8 @@ pub struct GmodInferIndex {
     gm_method_realm_annotations: HashMap<FileId, Vec<(String, GmodRealm)>>,
     /// Pre-indexed @fileparam annotations per file: (param_name_lowercase, type_text)
     fileparam_index: HashMap<FileId, Vec<(String, String)>>,
+    /// Cached scoped class detection results, computed once during gmod_pre.
+    scoped_class_info: HashMap<FileId, GmodScopedClassInfo>,
 }
 
 impl GmodInferIndex {
@@ -195,6 +204,7 @@ impl GmodInferIndex {
             realm_file_metadata: HashMap::new(),
             gm_method_realm_annotations: HashMap::new(),
             fileparam_index: HashMap::new(),
+            scoped_class_info: HashMap::new(),
         }
     }
 
@@ -383,6 +393,14 @@ impl GmodInferIndex {
             .find(|(n, _)| n == name_lowercase)
             .map(|(_, t)| t.as_str())
     }
+
+    pub fn set_scoped_class_info(&mut self, file_id: FileId, info: GmodScopedClassInfo) {
+        self.scoped_class_info.insert(file_id, info);
+    }
+
+    pub fn get_scoped_class_info(&self, file_id: &FileId) -> Option<&GmodScopedClassInfo> {
+        self.scoped_class_info.get(file_id)
+    }
 }
 
 impl LuaIndex for GmodInferIndex {
@@ -393,6 +411,7 @@ impl LuaIndex for GmodInferIndex {
         self.realm_file_metadata.remove(&file_id);
         self.gm_method_realm_annotations.remove(&file_id);
         self.fileparam_index.remove(&file_id);
+        self.scoped_class_info.remove(&file_id);
     }
 
     fn clear(&mut self) {
@@ -402,6 +421,7 @@ impl LuaIndex for GmodInferIndex {
         self.realm_file_metadata.clear();
         self.gm_method_realm_annotations.clear();
         self.fileparam_index.clear();
+        self.scoped_class_info.clear();
     }
 }
 
