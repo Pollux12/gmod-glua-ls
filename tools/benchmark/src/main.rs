@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, WorkspaceFolder, collect_workspace_files, load_configs,
+    EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files, load_configs,
     update_code_style,
 };
 use tokio_util::sync::CancellationToken;
@@ -190,6 +190,13 @@ async fn main() {
     let db = analysis.compilation.get_db();
     let main_file_ids = db.get_module_index().get_main_workspace_file_ids();
     let diag_file_count = main_file_ids.len();
+
+    // Log file paths for debugging slow files
+    for &fid in &[FileId { id: 1747 }, FileId { id: 1857 }, FileId { id: 2017 }, FileId { id: 2044 }] {
+        if let Some(path) = db.get_vfs().get_file_path(&fid) {
+            log::info!("FileId {} → {}", fid.id, path.display());
+        }
+    }
 
     // Precompute shared diagnostic data once (avoids per-file workspace-wide scans)
     let shared_data = analysis.precompute_diagnostic_shared_data();

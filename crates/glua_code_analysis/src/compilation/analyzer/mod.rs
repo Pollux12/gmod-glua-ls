@@ -58,7 +58,7 @@ pub fn analyze(
         // Apply flow analysis budget during lua analyze to cap runaway cost
         // on very large files (e.g. 3000+ line files with deep flow chains).
         // Budget of 10K nodes prevents any single file from dominating.
-        context.infer_manager.set_default_flow_budget(10_000);
+        context.infer_manager.set_default_flow_budget(u32::MAX);
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
 
         // Gmod post-analysis: synthesize members that depend on metadata collected
