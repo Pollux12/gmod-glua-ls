@@ -325,35 +325,8 @@ pub(super) fn is_valid_member(
         _ => {}
     }
 
-    // nil-safe 上下文(条件表达式、and/or/not)中, 允许宽泛检查
-    if matches!(code, DiagnosticCode::UndefinedField) && is_nil_safe_expr_context(index_expr) {
-        if is_non_enum_custom_type(semantic_model, prefix_typ) {
-            return Some(());
-        }
-
-        for child in index_expr.syntax().children_with_tokens() {
-            if child.kind() == LuaTokenKind::TkLeftBracket.into() {
-                // 此时为 [] 访问, 大部分类型都可以直接通行
-                match prefix_typ {
-                    LuaType::Ref(id) | LuaType::Def(id) => {
-                        if let Some(decl) =
-                            semantic_model.get_db().get_type_index().get_type_decl(id)
-                        {
-                            // enum 仍然需要检查
-                            if decl.is_enum() {
-                                break;
-                            } else {
-                                return Some(());
-                            }
-                        }
-                    }
-                    _ => return Some(()),
-                }
-            }
-        }
-    }
-
-    // 检查 member_info
+    // Check flow-based semantic info FIRST (cheap cached lookup) before
+    // expensive AST walks like is_nil_safe_expr_context.
     let need_add_diagnostic =
         match semantic_model.get_semantic_info(index_expr.syntax().clone().into()) {
             Some(info) => {
@@ -383,6 +356,35 @@ pub(super) fn is_valid_member(
 
     if !need_add_diagnostic {
         return Some(());
+    }
+
+    // nil-safe context check (ancestor walk) — only needed when flow analysis
+    // didn't already resolve the field above.
+    if matches!(code, DiagnosticCode::UndefinedField) && is_nil_safe_expr_context(index_expr) {
+        if is_non_enum_custom_type(semantic_model, prefix_typ) {
+            return Some(());
+        }
+
+        for child in index_expr.syntax().children_with_tokens() {
+            if child.kind() == LuaTokenKind::TkLeftBracket.into() {
+                // 此时为 [] 访问, 大部分类型都可以直接通行
+                match prefix_typ {
+                    LuaType::Ref(id) | LuaType::Def(id) => {
+                        if let Some(decl) =
+                            semantic_model.get_db().get_type_index().get_type_decl(id)
+                        {
+                            // enum 仍然需要检查
+                            if decl.is_enum() {
+                                break;
+                            } else {
+                                return Some(());
+                            }
+                        }
+                    }
+                    _ => return Some(()),
+                }
+            }
+        }
     }
 
     let key_type = if let LuaIndexKey::Expr(expr) = index_key {
