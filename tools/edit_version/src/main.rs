@@ -3,12 +3,10 @@ use toml_edit::{value, DocumentMut};
 
 const CARGOS: &[&str] = &[
     "crates/glua_code_analysis/Cargo.toml",
-    "crates/glua_code_style/Cargo.toml",
     "crates/glua_diagnostic_macro/Cargo.toml",
     "crates/glua_parser_desc/Cargo.toml",
     "crates/glua_parser/Cargo.toml",
     "crates/schema_to_glua/Cargo.toml",
-    "crates/glua_doc_cli/Cargo.toml",
     "crates/glua_ls/Cargo.toml",
     "crates/glua_check/Cargo.toml",
 ];

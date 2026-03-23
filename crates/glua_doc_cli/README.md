@@ -108,7 +108,7 @@ Arguments:
   [WORKSPACE]...  Path to the workspace directory
 
 Options:
-  -c, --config <CONFIG>                        Configuration file paths. If not provided, both ".emmyrc.json" and ".luarc.json" will be searched in the workspace directory
+  -c, --config <CONFIG>                        Configuration file paths. If not provided, ".gluarc.json" takes priority; otherwise ".luarc.json" and legacy Emmy config files are searched in the workspace directory
       --include <INCLUDE>                      Comma separated list of include patterns. Patterns must follow glob syntax. It will override the default include patterns.
       --ignore <EXCLUDE>                       Comma separated list of exclude patterns. Patterns must follow glob syntax(deprecated, use --exclude instead)
       --exclude <EXCLUDE>                      Comma separated list of exclude patterns. Patterns must follow glob syntax. Exclude patterns take precedence over include patterns
@@ -121,3 +121,5 @@ Options:
   -h, --help                                   Print help
   -V, --version                                Print version
 ```
+
+*Footnote: Forked from [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust).*

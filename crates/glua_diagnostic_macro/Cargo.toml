@@ -2,12 +2,12 @@
 name = "glua_diagnostic_macro"
 version = "0.5.0"
 edition = "2024"
-authors = ["CppCXY"]
-description = "A proc-macro for generating diagnostic code for emmylua-analyzer-rust"
+authors = ["Pollux12", "CppCXY"]
+description = "Proc-macro crate for generating diagnostics in gmod-glua-ls."
 license = "MIT"
-repository = "https://github.com/CppCXY/emmylua-analyzer-rust"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
 readme = "README.md"
-keywords = ["emmylua", "lua"]
+keywords = ["gmod", "glua", "lua", "proc-macro"]
 categories = ["development-tools"]
 
 [lib]

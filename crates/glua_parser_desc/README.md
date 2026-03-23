@@ -33,3 +33,5 @@ for desc in chunk.descendants::<LuaDocDescription>() {
     println!("{:?}", doc_items);
 }
 ```
+
+*Forked from [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust).*

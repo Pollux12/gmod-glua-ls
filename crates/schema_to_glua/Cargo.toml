@@ -2,12 +2,12 @@
 name = "schema_to_glua"
 version = "0.1.0"
 edition = "2024"
-authors = ["CppCXY"]
-description = "A tool to convert JSON schema to EmmyLua annotations."
+authors = ["Pollux12", "CppCXY"]
+description = "Tooling for converting JSON Schema into GLua annotations."
 license = "MIT"
-repository = "https://github.com/CppCXY/emmylua-analyzer-rust"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
 readme = "README.md"
-keywords = ["emmylua", "doc", "lua"]
+keywords = ["gmod", "glua", "lua", "schema"]
 categories = ["development-tools"]
 
 [dependencies]

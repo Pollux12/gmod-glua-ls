@@ -2,12 +2,12 @@
 name = "glua_parser_desc"
 version = "0.23.0"
 edition = "2024"
-authors = ["CppCXY", "taminomara"]
+authors = ["Pollux12", "CppCXY", "taminomara"]
 description = "A parser for markup within Lua comments"
 license = "MIT"
-repository = "https://github.com/CppCXY/emmylua-analyzer-rust"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
 readme = "README.md"
-keywords = ["emmylua", "luals", "parser", "lua"]
+keywords = ["gmod", "glua", "parser", "lua"]
 categories = ["development-tools", "parsing"]
 
 # Inherit workspace lints configuration

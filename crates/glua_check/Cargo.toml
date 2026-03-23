@@ -2,12 +2,12 @@
 name = "glua_check"
 version = "0.20.0"
 edition = "2024"
-authors = ["CppCXY"]
-description = "A command-line tool for checking lua code."
+authors = ["Pollux12", "CppCXY"]
+description = "Command-line diagnostics runner for Garry's Mod Lua (GLua)."
 license = "MIT"
-repository = "https://github.com/CppCXY/emmylua-analyzer-rust"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
 readme = "README.md"
-keywords = ["emmylua", "doc", "lua", "cli"]
+keywords = ["gmod", "glua", "lua", "cli"]
 categories = ["development-tools"]
 
 [dependencies]

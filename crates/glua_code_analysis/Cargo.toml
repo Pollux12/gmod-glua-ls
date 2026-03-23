@@ -2,12 +2,12 @@
 name = "glua_code_analysis"
 version = "0.20.0"
 edition = "2024"
-authors = ["CppCXY"]
-description = "A library for analyzing lua code."
+authors = ["Pollux12", "CppCXY"]
+description = "Static analysis engine for Garry's Mod Lua tooling."
 license = "MIT"
-repository = "https://github.com/CppCXY/emmylua-analyzer-rust"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
 readme = "README.md"
-keywords = ["emmylua", "doc", "lua", "code_analysis"]
+keywords = ["gmod", "glua", "lua", "analysis"]
 categories = ["development-tools"]
 include = [
     "Cargo.toml",

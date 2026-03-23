@@ -2,12 +2,12 @@
 name = "glua_ls"
 version = "0.20.0"
 edition = "2024"
-authors = ["CppCXY"]
-description = "A language server for emmylua."
+authors = ["Pollux12", "CppCXY"]
+description = "Language server for Garry's Mod Lua (GLua)."
 license = "MIT"
-repository = "https://github.com/CppCXY/emmylua-analyzer-rust"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
 readme = "README.md"
-keywords = ["emmylua", "doc", "lua"]
+keywords = ["gmod", "glua", "lua", "language-server"]
 categories = ["development-tools"]
 
 # Inherit workspace lints configuration

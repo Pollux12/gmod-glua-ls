@@ -29,3 +29,5 @@ for node in chunk.descendants::<LuaAst>() {
     println!("{:?}", node);
 }
 ```
+
+*Based on [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust).*

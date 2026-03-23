@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(version)]
 pub struct CmdArgs {
     /// Configuration file paths.
-    /// If not provided, both ".emmyrc.json" and ".luarc.json" will be searched in the workspace
+    /// If not provided, ".gluarc.json" takes priority; otherwise ".luarc.json" and legacy Emmy config files will be searched in the workspace
     /// directory
     #[arg(short, long, value_delimiter = ',')]
     pub config: Option<Vec<PathBuf>>,

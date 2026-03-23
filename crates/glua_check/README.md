@@ -21,7 +21,7 @@
   - Unused code
   - Code style issues
   - ...and more!
-- **⚙️ Highly Configurable**: Fine-grained control over each diagnostic via `.emmyrc.json` or `.luarc.json` files, including enabling/disabling and severity levels.
+- **⚙️ Highly Configurable**: Fine-grained control over each diagnostic via `.gluarc.json` or `.luarc.json` files, including enabling/disabling and severity levels.
 - **💻 Cross-Platform**: Supports Windows, macOS, and Linux.
 - **CI/CD Friendly**: Easily integrates into continuous integration workflows to ensure team code quality.
 
@@ -54,9 +54,9 @@ glua_check ./src
 
 #### Specify Configuration File
 
-Use a specific `.emmyrc.json` configuration file:
+Use a specific `.gluarc.json` configuration file:
 ```shell
-glua_check . -c ./config/.emmyrc.json
+glua_check . -c ./config/.gluarc.json
 ```
 
 #### Ignore Specific Files or Directories
@@ -79,7 +79,7 @@ glua_check . -f json --output ./diag.json
 
 `glua_check` shares the same configuration system as the GLua Language Server. You can create a `.gluarc.json` file in your project root to configure diagnostic rules.
 
-**Example `.emmyrc.json`:**
+**Example `.gluarc.json`:**
 ```json
 {
   "diagnostics": {
@@ -128,7 +128,7 @@ Arguments:
   [WORKSPACE]...  Path(s) to workspace directory
 
 Options:
-  -c, --config <CONFIG>                Path to configuration file. If not provided, ".emmyrc.json" and ".luarc.json" will be searched in the workspace directory
+  -c, --config <CONFIG>                Path to configuration file. If not provided, ".gluarc.json" takes priority; otherwise ".luarc.json" and legacy Emmy and LuaLS config files are searched in the workspace directory
   -i, --ignore <IGNORE>                Comma-separated list of ignore patterns. Patterns must follow glob syntax
   -f, --output-format <OUTPUT_FORMAT>  Specify output format [default: text] [possible values: json, text]
       --output <OUTPUT>                Specify output target (stdout or file path, only used when output_format is json) [default: stdout]
@@ -137,3 +137,5 @@ Options:
   -h, --help                           Print help information
   -V, --version                        Print version information
 ```
+
+*Based on [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust).*

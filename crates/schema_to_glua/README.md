@@ -69,3 +69,5 @@ let emmylua = converter.convert_from_str(&schema);
 
 ## License
 MIT License
+
+*Forked from [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust).*
