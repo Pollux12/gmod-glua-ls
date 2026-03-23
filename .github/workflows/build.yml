@@ -33,11 +33,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: dev-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
         run: |
           rustup target add ${{ matrix.target }}
-          cargo build --release --target ${{ matrix.target }} -p glua_ls
-          cargo build --release --target ${{ matrix.target }} -p glua_check
+          cargo build --release --target ${{ matrix.target }} -p glua_ls -p glua_check
       - name: Copy binary (Linux)
         if: ${{ matrix.os != 'windows-latest' }}
         run: |
@@ -158,6 +158,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          repo="${{ github.repository }}"
           tag="${{ github.ref_name }}"
           title="gmod-glua-ls ${tag}"
           assets=(
@@ -170,14 +171,14 @@ jobs:
             "glua_doc_cli-linux-x64.tar.gz"
           )
 
-          if draft_state="$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+          if draft_state="$(gh release view "$tag" --repo "$repo" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
             if [ "$draft_state" = "true" ]; then
-              gh release upload "$tag" "${assets[@]}" --clobber
-              gh release edit "$tag" --draft=false --title "$title" --prerelease
+              gh release upload "$tag" --repo "$repo" "${assets[@]}" --clobber
+              gh release edit "$tag" --repo "$repo" --draft=false --title "$title" --prerelease
             else
               echo "Release '$tag' already exists and is published. Immutable releases cannot be modified; publish a new tag instead." >&2
               exit 1
             fi
           else
-            gh release create "$tag" "${assets[@]}" --verify-tag --title "$title" --prerelease --generate-notes
+            gh release create "$tag" --repo "$repo" "${assets[@]}" --verify-tag --title "$title" --prerelease --generate-notes
           fi
