@@ -1,17 +1,17 @@
 # Garry's Mod GLua Language Server
 
-A fast, feature-rich language server for Garry's Mod Lua (GLua), written in Rust, based on [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust).
-
-You likely want the VSCode extension here: https://github.com/Pollux12/vscode-gmod-glua-ls
-
 > [!IMPORTANT]
 > This is an early release, there may be some bugs or unexpected issues, such as some diagnostics being annoying with false positives or similar. You can turn any annoying diagnostics off or change their severity level in the config.
 
+A fast, feature-rich language server for Garry's Mod Lua (GLua), written in Rust
+
+You likely want the VSCode extension here: https://github.com/Pollux12/vscode-gmod-glua-ls
+
 ## Installation
 
-### VS Code
+### VSCode
 
-The recommended way is to use the GLua extension (coming soon). You can also configure the [EmmyLua extension](https://marketplace.visualstudio.com/items?itemName=tangzx.emmylua) to use this language server binary - change the language server path in VSCode setting under the EmmyLua category.
+The recommended way is to use the GLua extension: https://github.com/Pollux12/vscode-gmod-glua-ls
 
 ### Other Editors
 

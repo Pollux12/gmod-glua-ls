@@ -13,7 +13,6 @@ on:
 
 jobs:
   # Lightweight dev builds for every push/PR — Linux x64 and Windows x64 only.
-  # Verifies compilation stays green without burning macOS/cross-compile minutes.
   build-dev:
     name: Dev Build (${{ matrix.platform }})
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -129,6 +128,8 @@ jobs:
     needs: build-release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -152,18 +153,31 @@ jobs:
           cd ../glua_doc_cli-win32-x64
           7z a glua_doc_cli-win32-x64.zip glua_doc_cli.exe
       - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: gmod-glua-ls ${{ github.ref_name }}
-          draft: false
-          prerelease: true
-          generate_release_notes: true
-          files: |
-            glua_ls-win32-x64/glua_ls-win32-x64.zip
-            glua_check-win32-x64/glua_check-win32-x64.zip
-            glua_doc_cli-win32-x64/glua_doc_cli-win32-x64.zip
-            glua_ls-linux-x64.tar.gz
-            glua_ls-linux-x64-glibc.2.17.tar.gz
-            glua_check-linux-x64.tar.gz
-            glua_doc_cli-linux-x64.tar.gz
-          token: ${{ secrets.RELEASE }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${{ github.ref_name }}"
+          title="gmod-glua-ls ${tag}"
+          assets=(
+            "glua_ls-win32-x64/glua_ls-win32-x64.zip"
+            "glua_check-win32-x64/glua_check-win32-x64.zip"
+            "glua_doc_cli-win32-x64/glua_doc_cli-win32-x64.zip"
+            "glua_ls-linux-x64.tar.gz"
+            "glua_ls-linux-x64-glibc.2.17.tar.gz"
+            "glua_check-linux-x64.tar.gz"
+            "glua_doc_cli-linux-x64.tar.gz"
+          )
+
+          if draft_state="$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [ "$draft_state" = "true" ]; then
+              gh release upload "$tag" "${assets[@]}" --clobber
+              gh release edit "$tag" --draft=false --title "$title" --prerelease
+            else
+              echo "Release '$tag' already exists and is published. Immutable releases cannot be modified; publish a new tag instead." >&2
+              exit 1
+            fi
+          else
+            gh release create "$tag" "${assets[@]}" --verify-tag --title "$title" --prerelease --generate-notes
+          fi
