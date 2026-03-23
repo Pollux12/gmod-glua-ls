@@ -1,0 +1,172 @@
+---
+title: "Formatting Settings"
+description: Configure the built-in Lua formatter with presets, style overrides, and external formatter support.
+---
+
+## Overview
+
+The `format` section controls how the language server formats Lua files. You can use a built-in preset, customise individual style rules, or delegate entirely to an external tool like StyLua.
+
+---
+
+## Top-level options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `format.preset` | `string` | `"default"` | Built-in style preset: `"default"`, `"cfc"`, `"custom"` |
+| `format.configPrecedence` | `string` | `"preferEditorconfig"` | How to resolve conflicts between `.gluarc.json` style settings and `.editorconfig`. Options: `"preferEditorconfig"`, `"preferGluarc"` |
+| `format.styleOverrides` | `object \| null` | `null` | Fine-grained overrides applied on top of the selected preset |
+| `format.externalTool` | `object \| null` | `null` | Delegate formatting of entire files to an external formatter |
+| `format.externalToolRangeFormat` | `object \| null` | `null` | External formatter for range (selection) formatting |
+| `format.useDiff` | `boolean` | `false` | Apply changes using a diff algorithm to minimise edits |
+
+---
+
+## Presets
+
+| Preset | Description |
+|---|---|
+| `"default"` | Standard style matching the EmmyLua Analyzer defaults |
+| `"cfc"` | CFC Labs style (common in community GMod development) |
+| `"custom"` | Starts from a clean slate — all rules must be set in `styleOverrides` |
+
+---
+
+## External formatter
+
+Delegate all formatting to an external tool:
+
+```json .gluarc.json
+{
+  "format": {
+    "externalTool": {
+      "program": "stylua",
+      "args": ["--stdin-filepath", "$FILENAME", "-"],
+      "timeout": 5000
+    }
+  }
+}
+```
+
+The file contents are passed via stdin and the formatter writes to stdout.
+
+---
+
+## Style overrides
+
+`styleOverrides` keys use `snake_case` matching the EmmyLuaCodeStyle style. They are applied on top of the selected `preset`.
+
+### Basic
+
+| Key | Type | Description |
+|---|---|---|
+| `indent_style` | `string` | `"tab"` or `"space"` |
+| `indent_size` | `integer` | Spaces per indent level |
+| `tab_width` | `integer` | Visual display width of a tab character |
+| `quote_style` | `string` | `"none"`, `"single"`, `"double"` |
+| `max_line_length` | `integer \| string` | Column limit. Use `"unset"` to disable |
+| `end_of_line` | `string` | `"crlf"`, `"lf"`, `"cr"`, `"auto"`, `"unset"` |
+| `table_separator_style` | `string` | `"none"`, `"comma"`, `"semicolon"`, `"only_kv_colon"` |
+| `trailing_table_separator` | `string` | `"keep"`, `"never"`, `"always"`, `"smart"` |
+| `call_arg_parentheses` | `string` | `"keep"`, `"remove"`, `"remove_table_only"`, `"remove_string_only"`, `"always"` |
+| `detect_end_of_line` | `boolean` | Detect line ending from file content |
+| `insert_final_newline` | `boolean` | Ensure file ends with a newline |
+| `end_statement_with_semicolon` | `string` | `"keep"`, `"always"`, `"same_line"`, `"replace_with_newline"`, `"never"` |
+| `continuation_indent` | `integer` | Extra spaces for continuation lines |
+
+### Space
+
+| Key | Type | Description |
+|---|---|---|
+| `space_around_table_field_list` | `boolean` | Spaces inside table braces: `{ x = 1 }` |
+| `space_before_function_open_parenthesis` | `boolean` | Space before `(` in function declarations |
+| `space_before_function_call_open_parenthesis` | `boolean` | Space before `(` in calls |
+| `space_inside_function_call_parentheses` | `boolean` | Spaces inside call parentheses |
+| `space_inside_function_param_list_parentheses` | `boolean` | Spaces inside param list parentheses |
+| `space_inside_square_brackets` | `boolean` | Spaces inside `[]` |
+| `space_before_open_square_bracket` | `boolean` | Space before `[` |
+| `space_before_inline_comment` | `integer \| string` | Spaces before `--` inline comment, or `"keep"` |
+| `space_after_comment_dash` | `boolean` | Space after `--` in comments |
+| `ignore_spaces_inside_function_call` | `boolean` | Preserve existing spacing in call args |
+
+### Operator space
+
+| Key | Type | Description |
+|---|---|---|
+| `space_around_math_operator` | `boolean` | Spaces around `+`, `-`, `*`, `/`, etc. |
+| `space_after_comma` | `boolean` | Space after `,` |
+| `space_around_concat_operator` | `boolean \| string` | Spaces around `..`. Also accepts `"none"`, `"always"`, `"no_space_asym"` |
+| `space_around_logical_operator` | `boolean` | Spaces around `and`, `or`, `not` |
+| `space_around_assign_operator` | `boolean \| string` | Spaces around `=`. Also accepts `"none"`, `"always"`, `"no_space_asym"` |
+
+### Alignment
+
+| Key | Type | Description |
+|---|---|---|
+| `align_call_args` | `boolean` | Align multiline call arguments |
+| `align_function_params` | `boolean` | Align multiline function parameters |
+| `align_continuous_assign_statement` | `string` | `"true"`, `"false"`, `"always"` |
+| `align_continuous_rect_table_field` | `string` | `"true"`, `"false"`, `"always"` |
+| `align_continuous_line_space` | `integer` | Max blank-line gap for an aligned block |
+| `align_if_branch` | `boolean` | Align `if`/`elseif`/`else` branches |
+| `align_array_table` | `string` | `"none"`, `"always"`, `"contain_curly"` |
+| `align_continuous_inline_comment` | `boolean` | Align consecutive inline comments |
+| `align_chain_expr` | `string` | `"none"`, `"always"`, `"only_call_stmt"` |
+
+### Indent
+
+| Key | Type | Description |
+|---|---|---|
+| `never_indent_before_if_condition` | `boolean` | Don't indent before `if` conditions |
+| `keep_indents_on_empty_lines` | `boolean` | Preserve indentation on empty lines |
+| `allow_non_indented_comments` | `boolean` | Allow comments to remain non-indented |
+
+### Line spacing
+
+These keys accept string expressions: `"keep"`, `"fixed(n)"`, `"min(n)"`, `"max(n)"`.
+
+| Key | Description |
+|---|---|
+| `line_space_after_if_statement` | Lines after `if` blocks |
+| `line_space_after_do_statement` | Lines after `do` blocks |
+| `line_space_after_while_statement` | Lines after `while` blocks |
+| `line_space_after_for_statement` | Lines after `for` blocks |
+| `line_space_after_function_statement` | Lines after function statements |
+| `line_space_after_local_or_assign_statement` | Lines after local/assignment statements |
+| `line_space_after_expression_statement` | Lines after expression statements |
+| `line_space_after_comment` | Lines after comments |
+| `line_space_around_block` | Lines around blocks |
+
+### Line break
+
+| Key | Type | Description |
+|---|---|---|
+| `break_all_list_when_line_exceed` | `boolean` | Break all list items once line exceeds max length |
+| `auto_collapse_lines` | `boolean` | Auto-collapse short multiline expressions |
+| `break_before_braces` | `boolean` | Opening braces on new line |
+| `break_multiline_call_expression_list` | `boolean` | Each arg on its own line for already-multiline calls |
+
+### Preference
+
+| Key | Type | Description |
+|---|---|---|
+| `remove_call_expression_list_finish_comma` | `boolean` | Remove trailing comma in call arg lists |
+| `remove_redundant_condition_parentheses` | `boolean` | Remove redundant parentheses around single-line conditions |
+
+---
+
+## Example
+
+```json .gluarc.json
+{
+  "format": {
+    "preset": "cfc",
+    "configPrecedence": "preferGluarc",
+    "styleOverrides": {
+      "max_line_length": 110,
+      "indent_style": "tab",
+      "trailing_table_separator": "smart"
+    }
+  }
+}
+```

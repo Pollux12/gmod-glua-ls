@@ -1,0 +1,159 @@
+---
+title: "GMod Settings"
+description: GMod-specific language server settings for realm analysis, scripted classes, networking, and more.
+---
+
+## Overview
+
+All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These control realm detection, network message analysis, scripted class behaviour, VGUI support, and more.
+
+---
+
+## Top-level options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `gmod.enabled` | `boolean` | `true` | Enable all GMod-specific analysis. Set `false` to use as a generic Lua LS |
+| `gmod.defaultRealm` | `string` | `"shared"` | Realm assumed for files with no realm signal. Values: `"client"`, `"server"`, `"shared"`, `"menu"` |
+| `gmod.detectRealmFromFilename` | `boolean` | `true` | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
+| `gmod.detectRealmFromCalls` | `boolean` | `true` | Infer realm from API usage (e.g. calling a server-only API signals server realm) |
+| `gmod.inferDynamicFields` | `boolean` | `true` | Track fields dynamically assigned to GMod objects |
+| `gmod.dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files. Set `false` to scope them per-file |
+| `gmod.fileParamDefaults` | `object` | built-in map | Parameter-name → type fallback, applied to params without explicit `@param`. Editable in the Settings UI. Set a value to `""` to remove a built-in default |
+
+---
+
+## Annotations
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `gmod.annotationsPath` | `string \| null` | `null` | Custom path to GMod annotation `.lua` files. When `null`, the VSCode extension's auto-downloaded annotations are used |
+| `gmod.autoLoadAnnotations` | `boolean \| null` | `null` | Override the extension's auto-load setting. Set `false` to disable even if the extension has it enabled |
+
+---
+
+## Scaffolding
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `gmod.templatePath` | `string \| null` | `null` | Path to a folder of custom scaffolding templates (`.lua` files). Relative to workspace root. Built-in templates are used as fallback |
+
+---
+
+## Scripted classes
+
+`gmod.scriptedClassScopes.include` defines the scripted class groups used for class analysis, the Class Explorer, and scaffolding.
+
+Built-in groups: `entities`, `weapons`, `effects`, `stools`, `plugins`.
+
+Each definition supports:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `string` | Stable key for overrides or removal |
+| `label` | `string` | Display name in Class Explorer and Settings UI |
+| `classGlobal` | `string` | Global variable the class uses (`ENT`, `SWEP`, etc.) |
+| `path` | `string[]` | Path segments to detect class from file path |
+| `include` | `string[]` | Glob patterns for files to analyse |
+| `exclude` | `string[]` | Optional per-definition exclude globs |
+| `parentId` | `string` | Parent definition ID for nested grouping in Explorer |
+| `icon` | `string` | VS Code icon ID for Class Explorer display |
+| `rootDir` | `string` | Default root used by the scaffold action |
+| `scaffold.files` | `array` | Scaffold output entries: `{ path, template }` with `{{name}}` variable |
+
+To **override** a built-in definition, add an entry with its `id` and only the fields to change. To **disable** a built-in group, set `{ "id": "effects", "disabled": true }`.
+
+### Example
+
+```json .gluarc.json
+{
+  "gmod": {
+    "scriptedClassScopes": {
+      "include": [
+        {
+          "id": "plugins",
+          "scaffold": {
+            "files": [{ "path": "{{name}}/sh_plugin.lua", "template": "plugin_sh.lua" }]
+          }
+        },
+        {
+          "id": "effects",
+          "disabled": true
+        },
+        {
+          "id": "my-controllers",
+          "label": "Controllers",
+          "classGlobal": "CTRL",
+          "path": ["lua", "controllers"],
+          "include": ["lua/controllers/**"],
+          "rootDir": "lua/controllers",
+          "scaffold": {
+            "files": [{ "path": "{{name}}.lua", "template": "controller.lua" }]
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+---
+
+## Hooks
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `gmod.hookMappings.methodToHook` | `object` | `{}` | Map method names to hook names (e.g. `{ "Think": "Think" }`) |
+| `gmod.hookMappings.emitterToHook` | `object` | `{}` | Map custom emitter functions to hook names |
+| `gmod.hookMappings.methodPrefixes` | `string[]` | `[]` | Additional method name prefixes for auto hook detection |
+
+---
+
+## Network analysis
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `gmod.network.enabled` | `boolean` | `true` | Enable all network flow analysis |
+| `gmod.network.diagnostics.typeMismatch` | `boolean` | `true` | Warn when read type doesn't match write type across realms |
+| `gmod.network.diagnostics.orderMismatch` | `boolean` | `true` | Warn when net.Read order doesn't match net.Write order |
+| `gmod.network.diagnostics.missingCounterpart` | `boolean` | `true` | Warn when a send block has no receive (or vice versa) |
+| `gmod.network.completion.smartReadSuggestions` | `boolean` | `true` | Suggest net.Read* calls in expected order inside receive callbacks |
+| `gmod.network.completion.mismatchHints` | `boolean` | `true` | Annotate suggestions with hints when expected read doesn't match current |
+
+### Example
+
+```json .gluarc.json
+{
+  "gmod": {
+    "network": {
+      "enabled": true,
+      "diagnostics": {
+        "typeMismatch": true,
+        "orderMismatch": true,
+        "missingCounterpart": true
+      }
+    }
+  }
+}
+```
+
+---
+
+## VGUI
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `gmod.vgui.codeLensEnabled` | `boolean` | `true` | Show code lens actions on `vgui.Register()` calls |
+| `gmod.vgui.inlayHintEnabled` | `boolean` | `false` | Show inlay hints for VGUI panel types |
+
+---
+
+## Outline verbosity
+
+`gmod.outline.verbosity` controls what appears in the **Outline** view for Lua files:
+
+| Value | Behavior |
+|---|---|
+| `"minimal"` | Functions, classes, hooks, net receivers, timers, concommands only |
+| `"normal"` (default) | Same as minimal, plus typed non-primitive tables and variables |
+| `"verbose"` | Full legacy view — all locals, assignments, and control-flow blocks |

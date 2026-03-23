@@ -1,0 +1,99 @@
+---
+title: Quickstart
+description: Start analyzing your first GLua project in under five minutes.
+---
+
+## Before you start
+
+- Install the [GLua Language Server VSCode extension](/getting-started/installation)
+- Have a Garry's Mod addon or gamemode folder ready
+
+---
+
+## Step 1: Open your project
+
+Open your addon or gamemode root folder in VS Code (**File → Open Folder**). For multiple addons, use **File → Open Workspace from File** to add each as a separate folder.
+
+The extension detects your project structure automatically. You should see the GLuaLS status indicator in the bottom-left status bar once the server starts.
+
+---
+
+## Step 2: Create a configuration file
+
+Open the **GLua Settings** panel to create and configure your `.gluarc.json`:
+
+1. Open the Command Palette (`Ctrl+Shift+P`)
+2. Run **GLua: Open Settings**
+
+The settings panel opens as a webview. Any change you make here is saved to `.gluarc.json` in your workspace root.
+
+Alternatively, create `.gluarc.json` manually with this recommended starting configuration:
+
+```json .gluarc.json
+{
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/refs/heads/main/crates/glua_code_analysis/resources/schema.json",
+  "diagnostics": {
+    "enable": true,
+    "diagnosticInterval": 500,
+    "severity": {
+      "unused": "hint",
+      "undefined-field": "information",
+      "redundant-return": "hint",
+      "param-type-mismatch": "information",
+      "missing-fields": "information",
+      "assign-type-mismatch": "information",
+      "return-type-mismatch": "information",
+      "missing-parameter": "information",
+      "cast-type-mismatch": "information",
+      "need-check-nil": "hint"
+    }
+  }
+}
+```
+
+---
+
+## Step 3: Verify everything is working
+
+Open any `.lua` file in your project. You should immediately see:
+
+- **Syntax highlighting** with semantic token coloring
+- **Autocomplete** as you type (press `Ctrl+Space` to trigger manually)
+- **Hover documentation** when you hover over GMod API functions
+- **Realm badges** next to functions showing their client/server/shared status
+- **Diagnostics** as squiggly underlines for potential issues
+
+<Tip>
+If you are not seeing any diagnostics but expected to, open the **Problems** panel (`Ctrl+Shift+M`) to check for any language server errors.
+</Tip>
+
+---
+
+## Step 4: Explore GMod-specific features
+
+Try these features to get a feel for what GLuaLS can do:
+
+**Realm awareness:** Create a file named `sv_test.lua` and type `draw.SimpleText(...)`. You should see a warning that this is a clientside function being called in a serverside file.
+
+**Hook autocomplete:** Type `hook.Add("` and press `Ctrl+Space`. You'll see a list of every GMod hook name with documentation.
+
+**Network validation:** In a server file, write a `net.Start()` / `net.WriteString()` block. In a client file with the same message name, write `net.Receive()`. GLuaLS tracks the send/receive flow and warns you if types or order doesn't match.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Set up the debugger" icon="bug" href="/debugger/setup">
+    Connect the runtime debugger to your local SRCDS instance.
+  </Card>
+  <Card title="Settings UI" icon="sliders" href="/vscode/settings-ui">
+    Learn how to use the interactive settings panel.
+  </Card>
+  <Card title="Annotations" icon="tag" href="/annotations/index">
+    Improve type accuracy with EmmyLua/LuaCATS annotations.
+  </Card>
+  <Card title="Configuration reference" icon="file-code" href="/configuration/overview">
+    Full reference for every `.gluarc.json` option.
+  </Card>
+</CardGroup>

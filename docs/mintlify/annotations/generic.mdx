@@ -1,0 +1,96 @@
+---
+title: "@generic"
+description: Add generic type parameters to functions for type-safe reuse.
+---
+
+## Overview
+
+`@generic` adds type parameters to a function, allowing GLuaLS to infer and propagate types through generic operations like `filter`, `map`, or wrapper functions.
+
+---
+
+## Syntax
+
+```lua
+---@generic T
+---@generic T : ConstraintType
+---@generic T, U, V
+```
+
+---
+
+## Basic generic function
+
+```lua
+---@generic T
+---@param value T
+---@return T
+function identity(value)
+    return value
+end
+
+local x = identity("hello")  -- x is inferred as string
+local y = identity(42)       -- y is inferred as number
+```
+
+---
+
+## Multiple type parameters
+
+```lua
+---@generic K, V
+---@param map table<K, V>
+---@return K[]
+function getKeys(map)
+    local keys = {}
+    for k in pairs(map) do keys[#keys+1] = k end
+    return keys
+end
+```
+
+---
+
+## Generic with constraint
+
+Use `: ConstraintType` to restrict what types `T` can be:
+
+```lua
+---@generic T : Entity
+---@param ent T
+---@return T
+function CloneEntity(ent)
+    -- T must be Entity or a subtype (Player, NPC, etc.)
+end
+```
+
+---
+
+## Generic arrays
+
+```lua
+---@generic T
+---@param items T[]
+---@param predicate fun(item: T): boolean
+---@return T[]
+function filter(items, predicate)
+    local result = {}
+    for _, item in ipairs(items) do
+        if predicate(item) then result[#result+1] = item end
+    end
+    return result
+end
+
+local players = filter(player.GetAll(), function(ply) return ply:IsAdmin() end)
+-- players is typed as Player[]
+```
+
+---
+
+## When to use generics
+
+Generics are most useful when:
+- A function transforms a value but preserves its type (e.g., `clone`, `wrap`)
+- A function filters or maps over a typed collection
+- A function takes a callback and returns its result type
+
+For simpler cases, union types or `any` are often more practical.

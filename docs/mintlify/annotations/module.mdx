@@ -1,0 +1,50 @@
+---
+title: "@module"
+description: Declare a file as a named module for documentation and namespace organization.
+---
+
+## Overview
+
+`@module` declares a file as a named module. It provides a module identity for documentation generation, namespace organization, and tooling that processes annotation files.
+
+---
+
+## Syntax
+
+```lua
+---@module module_name
+```
+
+---
+
+## Usage
+
+```lua
+---@module utils
+
+local utils = {}
+
+---@param str string
+---@return string
+function utils.reverse(str)
+    return string.reverse(str)
+end
+
+return utils
+```
+
+---
+
+## When to use
+
+- In library files that are consumed via `require()`
+- In generated stubs and meta declaration files
+- When you want documentation tools to identify the module by name
+
+For most addon development, `@module` is optional — the language server resolves modules by file path regardless. It is most useful when generating documentation or building definition files for distribution.
+
+---
+
+## See also
+
+- [@meta](/annotations/meta) — Mark a file as a type-only declaration file (not runtime code)

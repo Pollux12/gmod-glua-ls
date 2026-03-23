@@ -1,0 +1,81 @@
+---
+title: "@hook"
+description: Register a method as a GMod hook handler with named lookup and type inference.
+---
+
+## Overview
+
+`@hook` marks a method as implementing a GMod hook. This enables hook name validation, parameter type inference from the hook's definition, and hook name autocomplete in `hook.Add`/`hook.Run`.
+
+---
+
+## Syntax
+
+```lua
+---@hook
+---@hook HookName
+```
+
+- Without an argument: the method name itself is used as the hook name
+- With an argument: the specified hook name is registered regardless of the method name
+
+---
+
+## Basic usage
+
+```lua
+local PLUGIN = {}
+
+---@hook
+function PLUGIN:PlayerSpawn(ply)
+    -- ply is typed as Player from the hook definition ✅
+end
+
+---@hook PlayerInitialSpawn
+function PLUGIN:OnPlayerFirstJoin(ply)
+    -- maps to PlayerInitialSpawn hook
+    -- ply typed as Player ✅
+end
+```
+
+---
+
+## `GM:` overrides
+
+Methods defined on the gamemode table (`GM`) are automatically treated as hook overrides — you generally don't need `@hook` for them:
+
+```lua
+function GM:PlayerSpawn(ply)
+    self.BaseClass.PlayerSpawn(self, ply)
+end
+```
+
+The parameters are inferred from the GMod hook definition.
+
+---
+
+## Custom prefixes
+
+If your framework uses a custom table instead of `GM` or `PLUGIN`, configure GLuaLS to recognize it:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "hookMappings": [
+      { "prefix": "COMPONENT", "method": "Run" }
+    ]
+  }
+}
+```
+
+---
+
+## Hook autocomplete
+
+When calling `hook.Add("|", ...)`, `hook.Run("|", ...)`, or `hook.Call("|", ...)`, GLuaLS autocompletes from all known hook names — both GMod built-ins and custom hooks you've registered with `@hook` or `hook.Run` calls elsewhere in the workspace.
+
+---
+
+## See also
+
+- [Hook intelligence](/language/hook-intelligence) — how hooks are analyzed end-to-end

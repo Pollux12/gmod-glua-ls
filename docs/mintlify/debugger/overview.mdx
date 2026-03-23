@@ -1,0 +1,70 @@
+---
+title: Debugger overview
+description: The GLuaLS debugger lets you set breakpoints, inspect variables, and execute Lua directly inside a running SRCDS server.
+---
+
+## Overview
+
+GLuaLS includes a full **source-level debugger** for Garry's Mod servers. Set breakpoints, step through code, inspect locals and globals, modify entity properties, and execute arbitrary Lua — all from within VS Code, while the game is running.
+
+<Warning>
+The debugger only works with **SRCDS** (dedicated server). It does not work with a listen server or the client. You can debug clientside behavior via the client's Lua console, but full breakpoint debugging requires SRCDS.
+</Warning>
+
+---
+
+## How it works
+
+The debugger uses the **LRDB** (Lua Remote Debugger) protocol over TCP:
+
+1. **`gm_rdb`** — a Garry's Mod binary module loaded by the SRCDS process. It exposes the Lua debug hooks over a TCP socket.
+2. **GLuaLS debugger client** — the VS Code extension connects to that socket and translates LRDB protocol to VS Code DAP (Debug Adapter Protocol).
+
+Your Lua files are served from their source locations in your workspace, so breakpoints set on local files map to the exact running code.
+
+---
+
+## Requirements
+
+- SRCDS (dedicated server) running on Windows or Linux
+- `gm_rdb` binary module installed in your server's `garrysmod/lua/bin/` (or `garrysmod/autorun/`)
+- VS Code with the GLuaLS extension
+- Network access from your machine to the server (for remote debugging)
+
+---
+
+## Feature summary
+
+| Feature | Details |
+|---|---|
+| **Breakpoints** | Line breakpoints in any `.lua` file in your workspace |
+| **Conditional breakpoints** | Break only when a Lua expression is true |
+| **Step over / into / out** | Standard stepping controls |
+| **Call stack** | Full call stack with source locations |
+| **Variable inspection** | Locals, globals, and upvalues at each stack frame |
+| **Variable editing** | Modify variable values while paused |
+| **Expression evaluation** | Evaluate Lua expressions in the Debug Console |
+| **Stop on error** | Pause automatically when a Lua error is thrown |
+| **Stop on entry** | Pause at the first line when connecting |
+| **Lua execution** | Run Lua code, files, or commands from the debug toolbar |
+| **Entity explorer** | Browse entity properties and NetworkVars in a tree view |
+| **Realm targeting** | Send code to the client or server realm independently |
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Setup & installation" icon="wrench" href="/debugger/setup">
+    Install gm_rdb and configure launch.json
+  </Card>
+  <Card title="Breakpoints & stepping" icon="bug" href="/debugger/breakpoints-and-stepping">
+    Set breakpoints and control execution flow
+  </Card>
+  <Card title="Inspecting variables" icon="magnifying-glass" href="/debugger/inspecting-variables">
+    Examine locals, globals, and upvalues
+  </Card>
+  <Card title="Entity explorer" icon="list-tree" href="/debugger/entity-explorer">
+    Browse entities and their properties
+  </Card>
+</CardGroup>

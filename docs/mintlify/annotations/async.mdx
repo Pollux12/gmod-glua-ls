@@ -1,0 +1,54 @@
+---
+title: "@async"
+description: Mark a function as coroutine-based or asynchronous.
+---
+
+## Overview
+
+`@async` marks a function as asynchronous — typically meaning it uses `coroutine.yield` internally and should be called within a running coroutine. It serves as documentation and enables future async-aware diagnostics.
+
+---
+
+## Syntax
+
+```lua
+---@async
+```
+
+---
+
+## Usage
+
+```lua
+---@async
+---@param url string The URL to fetch
+---@return string response The response body
+function fetch(url)
+    -- internally yields waiting for I/O
+    local response = http.Fetch(url)
+    coroutine.yield()
+    return response
+end
+```
+
+---
+
+## What it does
+
+- Marks the function in hover documentation as async
+- Allows tools and linters to warn when an `@async` function is called outside a coroutine context (if that diagnostic is enabled)
+- Has no runtime effect
+
+---
+
+## Common GMod patterns
+
+In GMod, async-style patterns are used with `coroutine.wrap` and `timer.Simple`:
+
+```lua
+---@async
+function PLUGIN:FetchPlayerData(steamId)
+    local data = await(http.Fetch("https://api.example.com/player/" .. steamId))
+    return data
+end
+```

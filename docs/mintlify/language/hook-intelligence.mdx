@@ -1,0 +1,105 @@
+---
+title: Hook intelligence
+description: GLuaLS validates hook names, infers parameter types, and autocompletes hook callbacks.
+---
+
+## Overview
+
+GMod's hook system is central to almost every addon. GLuaLS understands `hook.Add`, `hook.Remove`, `hook.Run`, `hook.Call`, and `GM:` overrides — providing completions, type inference, and validation for all of them.
+
+---
+
+## Hook name validation
+
+Unrecognized hook names in `hook.Add` and `hook.Remove` trigger a diagnostic:
+
+```lua
+hook.Add("PlayerSpan", "MyAddon", function(ply) -- ❌ did you mean PlayerSpawn?
+    -- ...
+end)
+```
+
+All ~200 core GMod hooks are recognized. Custom hooks defined elsewhere in your workspace via `hook.Run("MyCustomHook", ...)` are also tracked.
+
+---
+
+## Parameter type inference
+
+When GLuaLS knows the hook name, it automatically types the callback parameters:
+
+```lua
+hook.Add("PlayerSpawn", "MyAddon", function(ply)
+    --                                       ^^^
+    --                                       typed as Player automatically
+    local hp = ply:Health() -- ✅ typed, Player method
+end)
+
+hook.Add("EntityTakeDamage", "MyDamageHook", function(target, dmg)
+    -- target: Entity
+    -- dmg: CTakeDamageInfo
+    -- All typed from the GMod wiki annotations
+end)
+```
+
+---
+
+## Callback snippet completion
+
+When you type `hook.Add("HookName",` and trigger completion on the callback argument, GLuaLS inserts a fully typed function snippet:
+
+```lua
+-- Accepting completion for hook.Add("PlayerSpawn") inserts:
+hook.Add("PlayerSpawn", "MyAddon", function(ply)
+    -- YOUR CODE
+end)
+```
+
+The snippet includes the correct number of parameters with their names.
+
+---
+
+## GM: overrides
+
+Files in a gamemode context (e.g., `gamemodes/*/gamemode/`) define `GM` as the gamemode table. GLuaLS recognizes `function GM:HookName()` as a hook override:
+
+```lua
+function GM:PlayerSpawn(ply)
+    -- ply is typed as Player ✅
+    self.BaseClass.PlayerSpawn(self, ply)
+end
+```
+
+---
+
+## hook.Run and hook.Call completions
+
+When typing the first argument to `hook.Run` or `hook.Call`, GLuaLS autocompletes from known hook names:
+
+```lua
+hook.Run("PlayerSpawn", ply)  -- "PlayerSpawn" autocompletes
+```
+
+---
+
+## Custom hooks
+
+Hooks created by your code (or your library) are also tracked:
+
+```lua
+-- Somewhere in your code:
+hook.Run("MyAddon.OnPlayerAction", ply, action)
+
+-- Elsewhere:
+hook.Add("MyAddon.OnPlayerAction", "handler", function(ply, action)
+    -- ply and action types are inferred from call sites
+end)
+```
+
+---
+
+## Configuration
+
+| Setting | Default | Description |
+|---|---|---|
+| `gmod.hooks.diagnosticInvalidHookName` | `true` | Warn on unrecognized hook names |
+| `gmod.hooks.diagnosticEnabled` | `true` | Enable all hook diagnostics |

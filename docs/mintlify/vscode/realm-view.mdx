@@ -1,0 +1,70 @@
+---
+title: Realm view
+description: View realm assignments across your project files at a glance.
+---
+
+## Overview
+
+The Realm View is a panel in the GLuaLS sidebar that shows the inferred realm assignment for every file in your workspace. This helps you quickly identify which files will run on the client, server, or both.
+
+{/* TODO: Add screenshot of realm view */}
+
+---
+
+## Realm indicators
+
+Each file appears in the view with a color-coded realm badge:
+
+| Indicator | Meaning |
+|---|---|
+| **Client** | File is clientside only (`CLIENT` realm) |
+| **Server** | File is serverside only (`SERVER` realm) |
+| **Shared** | File runs on both realms |
+| **Menu** | File runs in the main menu context |
+| **Unknown** | Realm could not be determined |
+
+---
+
+## How realm is detected
+
+GLuaLS determines file realm using multiple signals, in priority order:
+
+1. **`---@realm` annotation** at the top of the file (highest priority)
+2. **Filename prefix**: `cl_` → client, `sv_` → server, `sh_` → shared
+3. **Directory name**: `client/`, `server/`, `shared/` parent folders
+4. **API calls**: Using `AddCSLuaFile()`, server-only APIs, or client-only APIs provides evidence
+5. **`gmod.defaultRealm`** setting (lowest priority, fallback)
+
+---
+
+## Per-function realm
+
+Within a **shared** file, functions inside `if CLIENT then ... end` or `if SERVER then ... end` blocks are narrowed to their respective realm. The realm view shows this at the function level when you expand a file.
+
+Similarly, you can use `---@realm` on individual functions to override the file-level default:
+
+```lua
+-- sh_example.lua (shared file)
+
+---@realm server
+function CreateProp(pos)
+    return ents.Create("prop_physics")
+end
+
+---@realm client
+function DrawHUD()
+    draw.SimpleText("Hello", "DermaDefault", 0, 0, color_white)
+end
+```
+
+---
+
+## Realm mismatch diagnostics
+
+When GLuaLS detects a cross-realm call (calling a server-only function from a client context, or vice versa), it reports a diagnostic:
+
+- `gmod-realm-mismatch` — strict mismatch based on definite realm information
+- `gmod-realm-mismatch-heuristic` — likely mismatch based on inferred evidence
+- `gmod-unknown-realm` — realm could not be resolved for a realm-aware call (hint)
+
+See [Realm awareness](/language/realm-awareness) for the full details on how realm analysis works and how to configure it.

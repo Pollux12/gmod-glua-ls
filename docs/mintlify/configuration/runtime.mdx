@@ -1,0 +1,155 @@
+---
+title: "Runtime & Strict Settings"
+description: Configure non-standard Lua symbols, strict type checking, special functions, and documentation format.
+---
+
+## Overview
+
+The `runtime`, `strict`, `doc`, and `references` sections control how the language server interprets Lua syntax and enforces type checking strictness.
+
+---
+
+## Runtime (`runtime.*`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `runtime.extensions` | `string[]` | `[]` | Additional file extensions to treat as Lua (e.g., `".lua.txt"`) |
+| `runtime.requireLikeFunction` | `string[]` | `[]` | Functions that behave like `require` for module resolution |
+| `runtime.requirePattern` | `string[]` | `[]` | Require path resolution patterns (e.g., `"?.lua"`, `"?/init.lua"`) |
+| `runtime.nonstandardSymbol` | `string[]` | see below | Non-standard Lua syntax tokens to accept |
+| `runtime.frameworkVersions` | `string[]` | `[]` | Framework version identifiers |
+| `runtime.special` | `object` | `{}` | Map function names to special behaviours |
+
+### Default non-standard symbols
+
+The following non-standard symbols are enabled by default to match GLua syntax:
+
+```
+["//", "/***/", "continue", "!=", "||", "&&", "!"]
+```
+
+All available non-standard symbols:
+
+| Symbol | Description |
+|---|---|
+| `//` | Integer division operator |
+| `/**/` | Block comments (C-style) |
+| `` ` `` | Backtick strings |
+| `+=`, `-=`, `*=`, `/=`, `%=`, `^=`, `//=` | Compound assignment operators |
+| `\|=`, `&=`, `<<=`, `>>=` | Bitwise compound assignment |
+| `\|\|`, `&&`, `!`, `!=` | C-style logical operators |
+| `continue` | `continue` statement (not in standard Lua 5.1) |
+
+### Special functions
+
+Map custom function names to built-in semantic behaviours:
+
+```json .gluarc.json
+{
+  "runtime": {
+    "special": {
+      "include": "require",
+      "my_assert": "assert",
+      "my_type": "type"
+    }
+  }
+}
+```
+
+Available behaviours: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"`, `"setmetatable"`
+
+---
+
+## Strict mode (`strict.*`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `strict.requirePath` | `boolean` | `false` | Enforce strict `require()` path validation |
+| `strict.arrayIndex` | `boolean` | `false` | Enforce strict array index usage |
+| `strict.metaOverrideFileDefine` | `boolean` | `true` | Allow meta (annotation) file definitions to override file-level definitions |
+| `strict.docBaseConstMatchBaseType` | `boolean` | `true` | Allow base constants (e.g., `0`, `""`) to match their base type |
+| `strict.requireExportGlobal` | `boolean` | `false` | Require explicit `---@export global` annotation for globals to be visible outside their file |
+| `strict.allowNullableAsNonNullable` | `boolean` | `true` | Allow optional types (`T?`) to be passed where non-optional (`T`) is expected (lenient nil-safety) |
+| `strict.inferredTypeMismatch` | `boolean` | `false` | Report type mismatch diagnostics for inferred types (more strict, may produce false positives) |
+
+### Enabling stricter nil checking
+
+```json .gluarc.json
+{
+  "strict": {
+    "allowNullableAsNonNullable": false,
+    "inferredTypeMismatch": true
+  }
+}
+```
+
+---
+
+## Documentation format (`doc.*`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `doc.syntax` | `string` | `"md"` | Documentation syntax: `"md"`, `"myst"`, `"rst"`, `"none"` |
+| `doc.knownTags` | `string[]` | `[]` | Custom annotation tags to suppress `unknown-doc-tag` warnings for |
+| `doc.privateName` | `string[]` | `[]` | Field name patterns to treat as private (e.g., `["m_*", "_*"]`) |
+
+### Custom tag suppression
+
+```json .gluarc.json
+{
+  "doc": {
+    "knownTags": ["realm", "hook", "accessorfunc"]
+  }
+}
+```
+
+### Private field naming patterns
+
+```json .gluarc.json
+{
+  "doc": {
+    "privateName": ["m_*", "_*", "__*"]
+  }
+}
+```
+
+---
+
+## References (`references.*`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `references.enable` | `boolean` | `true` | Enable find references |
+| `references.fuzzySearch` | `boolean` | `true` | Fall back to fuzzy matching if exact search finds nothing |
+| `references.shortStringSearch` | `boolean` | `false` | Search for variable/function name references inside strings |
+
+---
+
+## Document color (`documentColor.*`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `documentColor.enable` | `boolean` | `true` | Show color pickers for `Color(r, g, b)` and similar calls |
+
+---
+
+## Full example
+
+```json .gluarc.json
+{
+  "runtime": {
+    "nonstandardSymbol": ["//", "/***/", "continue", "!=", "||", "&&", "!"],
+    "requireLikeFunction": ["include"],
+    "special": {
+      "include": "require"
+    }
+  },
+  "strict": {
+    "allowNullableAsNonNullable": true,
+    "inferredTypeMismatch": false
+  },
+  "doc": {
+    "privateName": ["m_*", "_*"]
+  }
+}
+```

@@ -1,0 +1,150 @@
+---
+title: Setup & installation
+description: Install gm_rdb on your SRCDS server and configure VS Code to connect for debugging.
+---
+
+## Step 1: Install gm_rdb
+
+`gm_rdb` is a binary module that runs inside SRCDS and exposes Lua state for debugging.
+
+### Using the setup wizard (recommended)
+
+The easiest way is through the built-in setup wizard:
+
+1. Open the Command Palette (`Ctrl+Shift+P`)
+2. Run **GLua: Setup Debugger**
+3. Follow the wizard steps — it will download the correct `gm_rdb` binary for your server's OS/architecture and guide you through placing the files
+
+### Manual installation
+
+Download the correct binary for your server from the [GitHub releases page](https://github.com/Pollux12/gmod-glua-ls/releases):
+
+| Platform | File |
+|---|---|
+| Windows 64-bit | `gmsv_rdb_win64.dll` |
+| Windows 32-bit | `gmsv_rdb_win32.dll` |
+| Linux 64-bit | `gmsv_rdb_linux64.dll` |
+| Linux 32-bit | `gmsv_rdb_linux.dll` |
+
+Place the binary in `garrysmod/lua/bin/` on your server.
+
+Create a loader script at `garrysmod/autorun/rdb_loader.lua`:
+
+```lua garrysmod/autorun/rdb_loader.lua
+if not SERVER then return end
+
+require("rdb")
+```
+
+<Note>
+The loader script ensures `gm_rdb` only loads on the server realm and starts automatically when the server loads.
+</Note>
+
+---
+
+## Step 2: Configure VS Code
+
+Create a `launch.json` in your `.vscode/` folder (or use the VS Code **Run & Debug** panel → **Create a launch.json file**):
+
+### Attach to a running server
+
+Use **attach** when the server is already running (most common for development):
+
+```json .vscode/launch.json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "gluals_gmod",
+      "request": "attach",
+      "name": "Attach to SRCDS",
+      "host": "localhost",
+      "port": 21111,
+      "sourceRoot": "${workspaceFolder}",
+      "stopOnEntry": false,
+      "stopOnError": false
+    }
+  ]
+}
+```
+
+### Launch a server
+
+Use **launch** to start SRCDS directly from VS Code:
+
+```json .vscode/launch.json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "gluals_gmod",
+      "request": "launch",
+      "name": "Launch SRCDS",
+      "program": "C:/srcds/srcds.exe",
+      "args": ["-game garrysmod -console -port 27015"],
+      "cwd": "C:/srcds",
+      "port": 21111,
+      "sourceRoot": "${workspaceFolder}"
+    }
+  ]
+}
+```
+
+---
+
+## Step 3: Start debugging
+
+1. Start your SRCDS server
+2. In VS Code, open the **Run & Debug** panel (`Ctrl+Shift+D`)
+3. Select your launch configuration from the dropdown
+4. Press **F5** (or click the green play button)
+
+The debug toolbar appears at the top of the screen when connected.
+
+---
+
+## Configuration reference
+
+### Attach configuration
+
+| Property | Type | Description |
+|---|---|---|
+| `host` | `string` | Server hostname or IP. Default: `"localhost"` |
+| `port` | `number` | Port `gm_rdb` is listening on. Default: `21111` |
+| `sourceRoot` | `string` | Workspace path to map server files to. Default: `${workspaceFolder}` |
+| `sourceFileMap` | `object` | Map server paths to workspace paths manually |
+| `stopOnEntry` | `boolean` | Pause at first line when connecting. Default: `false` |
+| `stopOnError` | `boolean` | Pause when a Lua error is thrown. Default: `false` |
+| `realm` | `string` | Default realm for code execution (`"server"` or `"client"`) |
+
+### Launch configuration (server process)
+
+Includes the above, plus:
+
+| Property | Type | Description |
+|---|---|---|
+| `program` | `string` | Path to `srcds.exe` or `srcds_run` |
+| `args` | `string[]` | Additional server command-line arguments |
+| `cwd` | `string` | Working directory for the server process |
+
+---
+
+## Changing the default port
+
+You can configure `gm_rdb` to listen on a different port by adding a `CreateConVar` in your loader:
+
+```lua garrysmod/autorun/rdb_loader.lua
+if not SERVER then return end
+
+-- Change default port to 21200
+CreateConVar("rdb_port", "21200", FCVAR_NONE, "Debug port for gm_rdb")
+require("rdb")
+```
+
+Make sure to update `"port"` in your `launch.json` to match.
+
+---
+
+## Firewall configuration
+
+If debugging a remote server, open the `gm_rdb` port (default `21111`) in your server's firewall. The debug connection contains no built-in authentication, so only expose this port on a trusted network.

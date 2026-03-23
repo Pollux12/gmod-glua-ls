@@ -1,0 +1,86 @@
+---
+title: "@accessorfunc"
+description: Mark a function as an accessor generator that synthesizes Get/Set pairs.
+---
+
+## Overview
+
+`@accessorfunc` marks a function as an *accessor generator* — when called, it synthesizes `GetPropertyName()` and `SetPropertyName()` methods on the target class. This mirrors GMod's `AccessorFunc()` built-in.
+
+---
+
+## Syntax
+
+```lua
+---@accessorfunc
+---@accessorfunc N
+```
+
+- Without `N`: the first argument of the call is treated as the accessor name
+- `N`: a 1-indexed position specifying which argument provides the accessor name
+
+---
+
+## How it works
+
+When GLuaLS sees a call to a function marked with `@accessorfunc`, it generates typed getter and setter methods on the object:
+
+```lua
+-- Built-in AccessorFunc is annotated with @accessorfunc 3
+AccessorFunc(ENT, "m_bOrient", "Orient", FORCE_BOOL)
+
+-- GLuaLS synthesizes:
+-- ENT:GetOrient() -> boolean
+-- ENT:SetOrient(value: boolean) -> nil
+```
+
+The getter/setter types are inferred from the type of the backing field (here `m_bOrient`).
+
+---
+
+## Custom accessor generators
+
+If you write your own accessor generator, annotate it with `@accessorfunc`:
+
+```lua
+---@accessorfunc
+function ENT:RegisterProperty(name)
+    -- internally sets up getter and setter
+end
+
+function ENT:SetupDataTables()
+    self:RegisterProperty("Health")   -- synthesizes GetHealth(), SetHealth()
+    self:RegisterProperty("Armor")    -- synthesizes GetArmor(), SetArmor()
+end
+```
+
+---
+
+## Specifying name argument position
+
+If the name is not the first argument:
+
+```lua
+---@accessorfunc 3
+function ENT:RegisterTypedProperty(varType, slot, name)
+    -- varType = "Int", slot = 0, name = "Health"
+end
+
+function ENT:SetupDataTables()
+    self:RegisterTypedProperty("Int", 0, "Health")  -- synthesizes GetHealth(), SetHealth()
+end
+```
+
+---
+
+## Current limitations
+
+- Synthesized getters return `any` and setters accept `any` — the types are not inferred from the field name or var type yet
+- Works on any class, not just GMod scripted entities
+- Not gated by `gmod.enabled`
+
+---
+
+## See also
+
+- [NetworkVar synthesis](/language/scripted-classes#networkvar-synthesis) — how `self:NetworkVar(...)` generates typed accessors automatically

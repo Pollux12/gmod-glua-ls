@@ -1,0 +1,83 @@
+---
+title: Annotations management
+description: GLuaLS automatically downloads and keeps GMod wiki annotations up to date.
+---
+
+## Overview
+
+GLuaLS ships without bundled GMod API definitions — instead, the VSCode extension automatically downloads the latest annotations generated from the Garry's Mod wiki. This means your API definitions stay current without waiting for extension updates.
+
+---
+
+## How it works
+
+On first launch and periodically thereafter, the extension:
+
+1. Checks the remote metadata for the [gluals-annotations](https://github.com/Pollux12/gmod-luals-addon/tree/gluals-annotations) branch
+2. If the annotations are outdated or missing, downloads and extracts the latest ZIP
+3. Points the language server at the annotations path automatically
+
+Annotations are stored in VS Code's global extension storage (separate from your project), so they are shared across all workspaces.
+
+---
+
+## Manual update
+
+To force an annotations update:
+
+1. Open the Command Palette (`Ctrl+Shift+P`)
+2. Run **GLua: Update Annotations**
+
+---
+
+## Disabling auto-download
+
+If you need to use a custom annotations build or are in an environment without internet access:
+
+```json VS Code settings
+{
+  "gluals.gmod.autoLoadAnnotations": false
+}
+```
+
+Or in `.gluarc.json` to override per-workspace:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "autoLoadAnnotations": false
+  }
+}
+```
+
+---
+
+## Using a custom annotations path
+
+Point GLuaLS at your own annotations folder instead of the auto-downloaded ones:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "annotationsPath": "./my-custom-annotations"
+  }
+}
+```
+
+The path can be absolute or relative to the workspace root. When `annotationsPath` is set, the auto-downloaded annotations are not used for that workspace.
+
+<Note>
+`gmod.annotationsPath` takes precedence over the extension's auto-download setting on a per-workspace basis. Set `gmod.autoLoadAnnotations: false` in `.gluarc.json` to fully disable auto-loading for that workspace regardless of extension settings.
+</Note>
+
+---
+
+## What the annotations contain
+
+The annotations are generated from the official Garry's Mod wiki and include:
+
+- All GMod global functions with parameter types, return types, and descriptions
+- All class methods (Entity, Player, Weapon, etc.)
+- All enumerations
+- All hooks with parameter types
+- Realm badges indicating where each function is available

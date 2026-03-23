@@ -1,0 +1,159 @@
+---
+title: Inlay hints
+description: Contextual labels shown inline in the editor for parameter names, types, and more.
+---
+
+## Overview
+
+Inlay hints are small labels that appear **inside your code** without modifying it, providing extra context like parameter names for positional arguments, inferred types for untyped locals, and index keys in large tables.
+
+{/* TODO: Add screenshot of inlay hints */}
+
+---
+
+## Types of hints
+
+### Parameter name hints
+
+When calling a function, GLuaLS can show the parameter names next to each argument:
+
+```lua
+ents.Create(/*classname:*/ "prop_physics")
+SetGlobalString(/*index:*/ "CurrentMap", /*val:*/ "gm_flatgrass")
+```
+
+Enable with `hint.paramHint`:
+
+```json .gluarc.json
+{
+  "hint": {
+    "paramHint": true
+  }
+}
+```
+
+### Local type hints
+
+Show the inferred type of untyped `local` declarations:
+
+```lua
+local ent /*: Entity*/ = ents.Create("base_gmodentity")
+local name /*: string*/ = ent:GetName()
+```
+
+Enable with `hint.localHint`:
+
+```json .gluarc.json
+{
+  "hint": {
+    "localHint": true
+  }
+}
+```
+
+### Array/table index hints
+
+Show implicit numeric keys in table literals:
+
+```lua
+local t = {
+    /*[1]:*/ "first",
+    /*[2]:*/ "second",
+    /*[3]:*/ "third",
+}
+```
+
+Enable with `hint.indexHint`:
+
+```json .gluarc.json
+{
+  "hint": {
+    "indexHint": true
+  }
+}
+```
+
+### Override hints
+
+Show when a method overrides a parent class method:
+
+```lua
+function ENT:Think() --[[ override ]]
+    -- ...
+end
+```
+
+Enable with `hint.overrideHint`.
+
+### Closing end hints
+
+Show what a `do...end` or `function...end` block belongs to, useful for deeply nested code:
+
+```lua
+function MyAddon.LongFunction()
+    for i = 1, 100 do
+        if condition then
+            -- ...
+        end --[[ if condition ]]
+    end --[[ for i = 1, 100 ]]
+end --[[ function MyAddon.LongFunction ]]
+```
+
+Enable with `hint.closingEndHint`.
+
+---
+
+## Global configuration
+
+All hint types can be toggled individually. A full example:
+
+```json .gluarc.json
+{
+  "hint": {
+    "paramHint": true,
+    "localHint": false,
+    "indexHint": false,
+    "overrideHint": true,
+    "closingEndHint": false,
+    "paramName": "all",
+    "arrayIndex": "enable"
+  }
+}
+```
+
+### `paramName` values
+
+| Value | Behavior |
+|---|---|
+| `"all"` | Show hint for all arguments |
+| `"literal"` | Only show for literal values (strings, numbers, booleans) |
+| `"disable"` | Don't show parameter hints |
+
+### `arrayIndex` values
+
+| Value | Behavior |
+|---|---|
+| `"enable"` | Show index hints for all implicit array entries |
+| `"auto"` | Only show when the table has both keyed and sequential entries |
+| `"disable"` | Never show index hints |
+
+---
+
+## Inline values
+
+During a debug session, GLuaLS can show the current values of local variables alongside the code (similar to a debugger's variable inspector but inline):
+
+```lua
+local hp = ply:Health()  -- 75
+local pos = ply:GetPos() -- Vector(512, 248, 64)
+```
+
+Enable with:
+
+```json .gluarc.json
+{
+  "inlineValues": {
+    "enable": true
+  }
+}
+```

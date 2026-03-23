@@ -1,0 +1,120 @@
+---
+title: Formatting
+description: GLuaLS formats your GLua files with built-in presets or an external formatter.
+---
+
+## Overview
+
+GLuaLS includes an opinionated Lua formatter. Format the current file with `Shift+Alt+F` (or right-click → **Format Document**).
+
+---
+
+## Built-in presets
+
+Three built-in presets cover common style choices across the GMod community:
+
+| Preset | Description |
+|---|---|
+| `default` | Standard, widely-used Lua style (2-space indent, LF) |
+| `cfc` | CFC community style (tabs, opening brace on same line) |
+| `custom` | Fall through to `styleOverrides` entirely |
+
+Set the preset in `.gluarc.json`:
+
+```json .gluarc.json
+{
+  "format": {
+    "preset": "default"
+  }
+}
+```
+
+---
+
+## Style overrides
+
+Override individual rules within a preset using `styleOverrides`:
+
+```json .gluarc.json
+{
+  "format": {
+    "preset": "default",
+    "styleOverrides": {
+      "indent_type": "Tabs",
+      "tab_width": 4,
+      "max_line_length": 120,
+      "trailing_table_separator": "SepForceMultiLine",
+      "call_arg_parentheses": "Always"
+    }
+  }
+}
+```
+
+### Key style options
+
+| Option | Values | Description |
+|---|---|---|
+| `indent_type` | `"Tabs"`, `"Spaces"` | Indentation character |
+| `indent_width` | `1`–`8` | Spaces per indent level (when using spaces) |
+| `tab_width` | `1`–`8` | Visual tab width |
+| `quote_style` | `"AutoPreferDouble"`, `"AutoPreferSingle"`, `"ForceDouble"`, `"ForceSingle"` | Quote character for string literals |
+| `call_arg_parentheses` | `"Always"`, `"Omit"`, `"Remove"` | How to handle parentheses around single-string/table call args |
+| `max_line_length` | integer | Line wrap threshold |
+| `trailing_table_separator` | `"Never"`, `"Always"`, `"SepForceMultiLine"` | Trailing comma in tables |
+
+See [Configuration: Formatting](/configuration/formatting) for the full list.
+
+---
+
+## External formatter
+
+Use an external formatting tool (e.g., `stylua`) instead of the built-in formatter:
+
+```json .gluarc.json
+{
+  "format": {
+    "externalFormatter": {
+      "command": "stylua",
+      "args": ["-"],
+      "standaloneFlags": ["--check"]
+    }
+  }
+}
+```
+
+The external formatter receives file content over stdin and must write the formatted result to stdout.
+
+---
+
+## EditorConfig
+
+GLuaLS reads `.editorconfig` files for indent settings. EditorConfig values override corresponding `styleOverrides` entries.
+
+---
+
+## Format on save
+
+Enable format-on-save in VS Code:
+
+```json VS Code settings
+{
+  "editor.formatOnSave": true,
+  "[lua]": {
+    "editor.defaultFormatter": "pollux.gmod-glua-ls"
+  }
+}
+```
+
+---
+
+## Disabling formatting
+
+Disable the formatter entirely:
+
+```json .gluarc.json
+{
+  "format": {
+    "enable": false
+  }
+}
+```

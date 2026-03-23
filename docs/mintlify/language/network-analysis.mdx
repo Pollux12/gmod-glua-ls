@@ -1,0 +1,112 @@
+---
+title: Network analysis
+description: GLuaLS tracks net.Start / net.Receive pairs and validates message types and order across realms.
+---
+
+## Overview
+
+GLua networking requires manually matching `net.Start(name)` + `net.Write*` calls on one realm with `net.Receive(name)` + `net.Read*` calls on the other. GLuaLS tracks these matches statically across your entire workspace and reports mismatches before you run the game.
+
+---
+
+## What is validated
+
+### Message registration
+
+Every `net.Start(name)` call must have a corresponding `util.AddNetworkString(name)` on the server.
+
+```lua
+-- ❌ Error: "PlayerData" not registered with util.AddNetworkString
+net.Start("PlayerData")
+net.WriteString("test")
+net.Broadcast()
+```
+
+```lua
+-- ✅ OK
+util.AddNetworkString("PlayerData")  -- in a sv_ file or SERVER block
+
+-- In a shared or cl_ file:
+net.Start("PlayerData")
+net.WriteString("test")
+net.Broadcast()
+```
+
+### Missing counterpart
+
+Every `net.Start(name)` (sender) should have a `net.Receive(name)` (receiver) in the opposite realm:
+
+```lua
+-- sv_comms.lua: sends "PlayerInfo" to client
+net.Start("PlayerInfo")
+net.WriteString(ply:Nick())
+net.Send(ply)
+
+-- cl_comms.lua: ❌ Warning — no net.Receive("PlayerInfo") found on client
+```
+
+### Read/write type mismatch
+
+The sequence of `net.Read*` calls must match the sequence of `net.Write*` calls for the same message:
+
+```lua
+-- Server writes:
+net.Start("EntityData")
+net.WriteEntity(ent)   -- WriteEntity first
+net.WriteString(name)  -- WriteString second
+
+-- Client reads:
+net.Receive("EntityData", function()
+    local name = net.ReadString()  -- ❌ reads string where entity was written
+    local ent  = net.ReadEntity()  -- ❌ reads entity where string was written
+end)
+```
+
+### Read/write order mismatch
+
+The order in which reads occur must match the write order. GLuaLS analyzes the sequence of read calls and compares it against the write sequence.
+
+---
+
+## Diagnostic codes
+
+| Code | Description |
+|---|---|
+| `gmod-unknown-net-message` | `net.Start(name)` uses a name not registered with `util.AddNetworkString` |
+| `gmod-net-missing-network-counterpart` | Sender exists but no matching receiver found in the expected realm |
+| `gmod-net-read-write-type-mismatch` | `net.Read*` type doesn't match the `net.Write*` type for the same sequence position |
+| `gmod-net-read-write-order-mismatch` | The order of reads doesn't match the order of writes |
+
+---
+
+## Smart completions
+
+When typing the name argument to `net.Start()` or `net.Receive()`, GLuaLS autocompletes with the known registered message names in your workspace.
+
+---
+
+## Cross-file tracking
+
+Network analysis works across files. Messages registered in one file, sent in a second, and received in a third are all tracked together.
+
+---
+
+## Configuration
+
+```json .gluarc.json
+{
+  "gmod": {
+    "networkDiagnostics": true
+  }
+}
+```
+
+Disable network diagnostics by setting `"networkDiagnostics": false`.
+
+---
+
+## Limitations
+
+- Dynamic message names computed at runtime (e.g., `net.Start("msg" .. id)`) cannot be statically verified and are skipped
+- Very complex conditional logic around `net.Write*` calls may not be fully modeled
+- Only files included in workspace analysis are considered; files outside `workspace.library` paths are not checked for counterparts

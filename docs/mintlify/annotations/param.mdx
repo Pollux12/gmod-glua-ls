@@ -1,0 +1,108 @@
+---
+title: "@param"
+description: Document function parameter types and descriptions.
+---
+
+## Overview
+
+`@param` declares the type and optional description of each function parameter. Place one `@param` per parameter, directly above the function definition.
+
+---
+
+## Syntax
+
+```lua
+---@param paramName type [description]
+---@param paramName? type [description]
+```
+
+---
+
+## Basic usage
+
+```lua
+---@param name string The player's display name
+---@param age number The player's age
+function createUser(name, age) end
+```
+
+---
+
+## Optional parameters
+
+Add `?` after the name to mark the parameter as potentially `nil`:
+
+```lua
+---@param damage number Base damage to deal
+---@param attacker? Entity The attacking entity (may be nil)
+function TakeDamage(victim, damage, attacker) end
+```
+
+---
+
+## Union types
+
+```lua
+---@param id string | number User ID (string or numeric)
+function GetUser(id) end
+```
+
+---
+
+## Variadic parameters
+
+Use `...` as the parameter name for variadic arguments:
+
+```lua
+---@param format string Format string
+---@param ... any Additional arguments
+function printf(format, ...) end
+```
+
+---
+
+## Function-type parameters
+
+```lua
+---@param callback fun(ply: Player, data: table): boolean
+function RegisterCallback(callback) end
+```
+
+---
+
+## Table-type parameters
+
+```lua
+---@param options { maxHealth: number, armor?: number, speed: number }
+function SpawnWithOptions(options) end
+```
+
+---
+
+## Generic parameters
+
+```lua
+---@generic T
+---@param items T[]
+---@param predicate fun(item: T): boolean
+---@return T[]
+function filter(items, predicate) end
+```
+
+---
+
+## `self` parameter
+
+For methods, `self` is automatically typed as the owning class — you don't need to annotate it. However, you can if you want to be explicit:
+
+```lua
+---@param self Player
+---@param amount number
+function Player:GiveMoney(amount) end
+```
+
+---
+
+## Interplay with @fileparam
+
+If you don't add `@param` for every parameter, GLuaLS falls back to file-level defaults set with `@fileparam`, then workspace defaults from `gmod.fileParamDefaults`. Explicit `@param` always takes highest priority.

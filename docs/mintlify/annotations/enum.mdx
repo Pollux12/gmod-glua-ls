@@ -1,0 +1,97 @@
+---
+title: "@enum"
+description: Mark a Lua table as an enumeration with named values.
+---
+
+## Overview
+
+`@enum` marks a local table as an enumeration type. All values in the table become valid members of the enum, and GLuaLS enforces that only valid enum values are used where the enum type is expected.
+
+---
+
+## Syntax
+
+```lua
+---@enum EnumName
+---@enum (key) EnumName
+```
+
+---
+
+## Basic enum
+
+```lua
+---@enum HTTPStatus
+local HTTPStatus = {
+    OK = 200,
+    NOT_FOUND = 404,
+    INTERNAL_ERROR = 500,
+    BAD_REQUEST = 400,
+    UNAUTHORIZED = 401,
+}
+
+---@param status HTTPStatus
+function HandleResponse(status)
+    if status == HTTPStatus.OK then
+        -- ...
+    end
+end
+```
+
+---
+
+## String enums
+
+```lua
+---@enum GameState
+local GameState = {
+    WAITING = "waiting",
+    ACTIVE = "active",
+    ENDED = "ended",
+}
+```
+
+---
+
+## `(key)` modifier
+
+Using `(key)` treats the **keys** of the table as the enum values (rather than the values):
+
+```lua
+---@enum (key) Direction
+local Direction = {
+    north = true,
+    south = true,
+    east = true,
+    west = true,
+}
+
+---@type Direction
+local d = "north" -- ✅
+local d2 = "up"   -- ❌ not a Direction
+```
+
+---
+
+## Enum vs. @alias
+
+Both `@enum` and `@alias` with `---|` can model a fixed set of values. Use:
+- `@enum` when you have an actual Lua table with named constants that you reference at runtime
+- `@alias` with `---|` when you just want to document that a string parameter must be one of a specific set
+
+---
+
+## Common patterns in GMod
+
+```lua
+---@enum DAMAGE
+local DAMAGE = {
+    GENERIC = 1,
+    CRUSH = 2,
+    BULLET = 4,
+    SLASH = 8,
+    BURN = 16,
+}
+```
+
+In practice, GMod's built-in enums (like `DAMAGE`, `TEAM`, `MOVETYPE`) come from the auto-downloaded annotations and don't need to be redeclared.

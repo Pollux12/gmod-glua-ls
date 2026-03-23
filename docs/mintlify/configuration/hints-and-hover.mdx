@@ -1,0 +1,138 @@
+---
+title: "Hints & Hover Settings"
+description: Configure inlay hints, inline values, hover documentation, semantic tokens, and signature help.
+---
+
+## Overview
+
+These settings control the visual editor hints overlaid on code, the documentation shown on hover, and the appearance of semantic syntax highlighting.
+
+---
+
+## Inlay hints (`hint.*`)
+
+Inlay hints are inline type/name annotations shown inside the editor alongside code.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `hint.enable` | `boolean` | `true` | Enable all inlay hints |
+| `hint.paramHint` | `boolean` | `true` | Show parameter names next to call arguments |
+| `hint.localHint` | `boolean` | `true` | Show inferred types next to local variable declarations |
+| `hint.indexHint` | `boolean` | `true` | Show named indexes for array table entries |
+| `hint.overrideHint` | `boolean` | `true` | Show which base-class method a function overrides |
+| `hint.metaCallHint` | `boolean` | `true` | Show `__call` metamethod hints |
+| `hint.enumParamHint` | `boolean` | `false` | Show enum member names next to literal integer arguments |
+| `hint.closingEndHint` | `boolean` | `true` | Show `-- end FunctionName` hints after closing `end` keywords |
+| `hint.closingEndHintControlFlow` | `boolean` | `false` | Also show closing end hints for `if`, `while`, `do`, `for` blocks |
+| `hint.closingEndHintMinLines` | `integer` | `10` | Minimum number of lines a block must span before a closing hint appears |
+
+### Inlay hint examples
+
+**Parameter hints:**
+```lua
+Entity:SetPos(vec3(0, 0, 0))
+--           ^ pos: Vector
+```
+
+**Local hints:**
+```lua
+local ply = game.GetWorld()
+--    ^ : Entity
+```
+
+**Closing end hints:**
+```lua
+function GAMEMODE:PlayerSpawn(ply)
+    -- ... 15 lines of code ...
+end -- PlayerSpawn
+```
+
+---
+
+## Inline values (`inlineValues.*`)
+
+Inline values show variable contents during a debug session, overlaid on the source code.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `inlineValues.enable` | `boolean` | `true` | Show variable values inline during debugging |
+
+---
+
+## Hover (`hover.*`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `hover.enable` | `boolean` | `true` | Enable hover documentation |
+| `hover.customDetail` | `integer \| null` | `null` | Detail level (0–255). `null` uses the default level |
+
+Hover documentation shows:
+- Type signatures and docs for functions, fields, and classes
+- Realm badge (client/server/shared) for GMod API symbols
+- `@deprecated` messages for deprecated symbols
+- `@see` cross-references
+
+---
+
+## Semantic tokens (`semanticTokens.*`)
+
+Semantic tokens provide richer syntax highlighting based on type analysis — variables are coloured by role (local, global, field, method, etc.) rather than lexical category.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `semanticTokens.enable` | `boolean` | `true` | Enable semantic syntax highlighting |
+| `semanticTokens.renderDocumentationMarkup` | `boolean` | `true` | Render Markdown in annotation documentation (e.g., in hover popups) |
+
+---
+
+## Signature help (`signature.*`)
+
+Signature help shows the function signature and active parameter as you type an argument.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `signature.detailSignatureHelper` | `boolean` | `true` | Enable signature help popup while typing function arguments |
+
+---
+
+## Code lens (`codeLens.*`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `codeLens.enable` | `boolean` | `true` | Enable code lens actions (references, override links, VGUI parent links) |
+
+---
+
+## Code action (`codeAction.*`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `codeAction.insertSpace` | `boolean` | `false` | Add a space after `---` when inserting `@diagnostic disable-next-line` via a code action |
+
+---
+
+## Full example
+
+```json .gluarc.json
+{
+  "hint": {
+    "enable": true,
+    "paramHint": true,
+    "localHint": false,
+    "closingEndHint": true,
+    "closingEndHintMinLines": 15
+  },
+  "hover": {
+    "enable": true
+  },
+  "semanticTokens": {
+    "enable": true
+  },
+  "signature": {
+    "detailSignatureHelper": true
+  },
+  "codeLens": {
+    "enable": true
+  }
+}
+```

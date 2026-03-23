@@ -1,0 +1,80 @@
+---
+title: Annotations overview
+description: EmmyLua/LuaCATS type annotations supported by GLuaLS.
+---
+
+## What are annotations?
+
+Annotations are special comments prefixed with `---@` that provide type information to the language server. They appear above functions, variables, and class definitions to let GLuaLS understand your code's structure and provide accurate completions, type checking, and hover documentation.
+
+```lua
+---@param ply Player The player who joined
+---@return boolean success Whether the operation succeeded
+function OnPlayerJoin(ply)
+    return true
+end
+```
+
+Annotations are not executed at runtime — they are purely for the language server and have no effect on performance or behavior.
+
+---
+
+## Type system annotations
+
+| Annotation | Description | Example |
+|---|---|---|
+| [`@class`](/annotations/class) | Define a class with optional inheritance | `---@class Animal` |
+| [`@field`](/annotations/field) | Add a typed field to a class | `---@field health number` |
+| [`@type`](/annotations/type) | Declare the type of a variable | `---@type Player` |
+| [`@alias`](/annotations/alias) | Create a new type alias | `---@alias ID string \| number` |
+| [`@enum`](/annotations/enum) | Mark a table as an enumeration | `---@enum TEAM` |
+| [`@generic`](/annotations/generic) | Add generic type parameters to a function | `---@generic T` |
+
+## Function annotations
+
+| Annotation | Description | Example |
+|---|---|---|
+| [`@param`](/annotations/param) | Document a parameter's type | `---@param ply Player` |
+| [`@return`](/annotations/return) | Document a return value's type | `---@return boolean` |
+| [`@overload`](/annotations/overload) | Define an alternate function signature | `---@overload fun(x: number): number` |
+| [`@async`](/annotations/async) | Mark a function as async/coroutine-based | `---@async` |
+| [`@nodiscard`](/annotations/nodiscard) | Warn if the return value is unused | `---@nodiscard` |
+
+## GMod-specific annotations
+
+| Annotation | Description | Example |
+|---|---|---|
+| [`@realm`](/annotations/realm) | Declare which realm code runs in | `---@realm server` |
+| [`@hook`](/annotations/hook) | Register method as a hook handler | `---@hook PlayerSpawn` |
+| [`@fileparam`](/annotations/fileparam) | Set a file-wide parameter type default | `---@fileparam ply Player` |
+| [`@accessorfunc`](/annotations/accessorfunc) | Mark a function as an accessor generator | `---@accessorfunc` |
+
+## Control and metadata annotations
+
+| Annotation | Description | Example |
+|---|---|---|
+| [`@diagnostic`](/annotations/diagnostic) | Enable or disable specific diagnostics | `---@diagnostic disable-next-line` |
+| [`@cast`](/annotations/cast) | Cast a variable to a different type | `---@cast ply Player` |
+| [`@deprecated`](/annotations/deprecated) | Mark a symbol as deprecated | `---@deprecated Use NewFunc()` |
+| [`@meta`](/annotations/meta) | Mark a file as type-only (not runtime) | `---@meta` |
+| [`@see`](/annotations/see) | Add a cross-reference to another symbol | `---@see AnotherClass` |
+
+---
+
+## Type expression syntax
+
+Annotations use a common type expression syntax across all `@` tags:
+
+| Syntax | Meaning |
+|---|---|
+| `string` | A string value |
+| `number` | A number value |
+| `boolean` | A boolean value |
+| `table` | Any table |
+| `Entity` | A class by name |
+| `string \| number` | Union type (string or number) |
+| `string?` | Shorthand for `string \| nil` |
+| `string[]` | An array of strings |
+| `table<string, number>` | A table mapping strings to numbers |
+| `fun(x: number): string` | A function type |
+| `any` | Any value (no type checking) |

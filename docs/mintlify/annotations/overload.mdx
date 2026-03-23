@@ -1,0 +1,85 @@
+---
+title: "@overload"
+description: Define multiple signatures for a single function.
+---
+
+## Overview
+
+`@overload` allows a single function to have multiple type signatures. GLuaLS uses overloads to type-check calls and infer return types based on which overload matches.
+
+---
+
+## Syntax
+
+```lua
+---@overload fun(params): ReturnType
+```
+
+---
+
+## Basic overloads
+
+```lua
+---@overload fun(x: number): number
+---@overload fun(x: number, y: number): number
+---@overload fun(x: number, y: number, z: number): number
+function add(x, y, z)
+    return x + (y or 0) + (z or 0)
+end
+```
+
+---
+
+## Overloads with different return types
+
+```lua
+---@overload fun(value: string): string
+---@overload fun(value: number): string
+---@overload fun(value: boolean): string
+---@param value any
+---@return string
+function toString(value)
+    return tostring(value)
+end
+```
+
+---
+
+## Optional parameters via overloads
+
+Overloads are an alternative to optional `?` parameters when different parameter combinations have meaningfully different types:
+
+```lua
+---@overload fun(name: string): Player | nil
+---@overload fun(index: number): Player | nil
+---@overload fun(): Player[]
+function getPlayers(query)
+    if type(query) == "string" then
+        return player.GetByName(query)
+    elseif type(query) == "number" then
+        return Entity(query)
+    else
+        return player.GetAll()
+    end
+end
+```
+
+---
+
+## Method overloads
+
+Use `fun(self: ClassName, ...)` to add overloads to methods:
+
+```lua
+---@overload fun(self: Player, target: Player): boolean
+---@overload fun(self: Player, steamId: string): boolean
+function Player:IsFriendsWith(target) end
+```
+
+---
+
+## Tips
+
+- The primary `@param`/`@return` annotations define the most general signature
+- `@overload` provides the specific, narrower signatures
+- Overloads are matched in order — put more specific overloads first

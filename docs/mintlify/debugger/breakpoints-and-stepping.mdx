@@ -1,0 +1,84 @@
+---
+title: Breakpoints and stepping
+description: Set breakpoints, control execution flow, and navigate your running GLua code line by line.
+---
+
+## Setting breakpoints
+
+Click in the **gutter** (left margin) of any `.lua` file to set a breakpoint. A red dot appears where execution will pause.
+
+{/* TODO: Add screenshot */}
+
+You can also set breakpoints from the **Run & Debug** panel's **Breakpoints** section.
+
+### Conditional breakpoints
+
+Right-click in the gutter (or on an existing breakpoint) and choose **Edit Breakpoint** to add a condition:
+
+```lua
+-- Only break when this is true:
+ply:Health() < 10
+```
+
+The condition is evaluated as a Lua expression in the context of the paused stack frame. Execution only pauses when the expression returns a truthy value.
+
+### Logpoints
+
+Instead of pausing, a logpoint prints a message to the Debug Console when execution reaches that line. Right-click in the gutter and choose **Add Logpoint**:
+
+```
+Player {ply:Nick()} took damage: {dmg:GetDamage()}
+```
+
+Curly braces `{}` evaluate Lua expressions.
+
+---
+
+## Stepping controls
+
+When execution is paused at a breakpoint, use the debug toolbar or keyboard shortcuts:
+
+| Action | Shortcut | Description |
+|---|---|---|
+| **Continue** | `F5` | Resume execution until the next breakpoint |
+| **Step Over** | `F10` | Execute the current line and pause on the next |
+| **Step Into** | `F11` | Step into the function call on the current line |
+| **Step Out** | `Shift+F11` | Continue until the current function returns, then pause |
+| **Pause** | `F6` | Pause execution at the current Lua instruction |
+| **Stop** | `Shift+F5` | Disconnect the debugger |
+
+---
+
+## Call stack
+
+When paused, the **Call Stack** panel shows the full active call stack from the current Lua execution context. Each frame shows:
+
+- The function name (or `(anonymous)` for unnamed functions)
+- The source file and line number
+
+Click any frame to navigate to that file and inspect the variables at that level.
+
+---
+
+## Stop on entry
+
+Set `"stopOnEntry": true` in `launch.json` to pause at the first Lua instruction after connecting. Useful when debugging server startup behavior.
+
+---
+
+## Stop on error
+
+Set `"stopOnError": true` in `launch.json` to pause when a Lua error is thrown anywhere on the server, including unhandled errors in hook callbacks.
+
+The call stack at the moment of the error is preserved so you can inspect the full execution context.
+
+---
+
+## Break here (manual pause)
+
+To pause at an arbitrary point without a file breakpoint, use the **Break Here** command:
+
+1. Open the Command Palette (`Ctrl+Shift+P`)
+2. Run **GLua: Break Here**
+
+This inserts a debug break at the current Lua execution point.

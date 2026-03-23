@@ -1,0 +1,95 @@
+---
+title: Lua execution
+description: Run Lua code, files, and commands on your server directly from VS Code while debugging.
+---
+
+## Overview
+
+While the debugger is connected (not necessarily paused), you can execute Lua code on the server from VS Code in several ways — without switching to the server console.
+
+---
+
+## Run selected Lua
+
+1. Select any Lua code in the editor
+2. Right-click → **GLua: Run Selected**
+   (or use the Command Palette: **GLua: Run Selected Lua on Server**)
+
+The selected code is sent to the server and executed. Output appears in the **Debug Console**.
+
+---
+
+## Run current file
+
+Send the entire current file's content to the server for execution:
+
+1. Open the Command Palette (`Ctrl+Shift+P`)
+2. Run **GLua: Run Current File**
+
+<Warning>
+This runs the file content, not the saved-on-disk file path. The server does not need to have the file — it receives the raw source text.
+</Warning>
+
+---
+
+## Run a server command
+
+Execute a SRCDS console command:
+
+1. Open the Command Palette
+2. Run **GLua: Run Command**
+3. Type the command (e.g., `lua_run print("Hello")`)
+
+Output is shown in the Debug Console.
+
+---
+
+## Realm targeting
+
+By default, code runs on the **server** realm. You can specify a target realm in the `launch.json`:
+
+```json .vscode/launch.json
+{
+  "type": "gluals_gmod",
+  "request": "attach",
+  "name": "Attach to SRCDS",
+  "realm": "client"
+}
+```
+
+Or use the **Set Realm** command at runtime:
+
+1. Command Palette → **GLua: Set Realm**
+2. Choose `server` or `client`
+
+When targeting `client`, code runs in the client Lua state (same as `lua_run_cl`) on all connected players.
+
+---
+
+## Hot reload
+
+Refresh a file on the server without restarting:
+
+1. Make your changes in the editor and save
+2. Right-click in the editor → **GLua: Refresh File on Server**
+
+This re-`include`s the file in the server Lua state. Behavior depends on the file — if your addon uses `hook.Add` at the top level, refreshing re-registers all hooks.
+
+---
+
+## Debug Console
+
+The **Debug Console** (`Ctrl+Shift+Y`) is the most direct way to interact. Any input is evaluated as a Lua expression on the server (or the targeted realm):
+
+```lua
+> print(game.GetMap())
+gm_flatgrass
+
+> for k, v in pairs(ents.GetAll()) do print(v:GetClass()) end
+prop_physics
+prop_physics
+player
+-- ...
+```
+
+This is equivalent to using `lua_run` in the server console, but with output returned to VS Code.

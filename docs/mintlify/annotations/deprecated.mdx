@@ -1,0 +1,79 @@
+---
+title: "@deprecated"
+description: Mark functions or fields as deprecated to warn about usages.
+---
+
+## Overview
+
+`@deprecated` marks a function, field, or class as deprecated. Any use of a deprecated symbol triggers a `deprecated` diagnostic (hint severity by default) and shows a strikethrough in completions.
+
+---
+
+## Syntax
+
+```lua
+---@deprecated
+---@deprecated Alternative or explanation
+```
+
+---
+
+## Basic deprecation
+
+```lua
+---@deprecated
+function OldPlayerJoin(ply)
+    -- ...
+end
+```
+
+Any call to `OldPlayerJoin` will show a deprecation hint.
+
+---
+
+## With a migration message
+
+The message appears in the diagnostic and in hover documentation:
+
+```lua
+---@deprecated Use PLUGIN:OnPlayerSpawn(ply) instead
+function OldSpawnHandler(ply)
+    -- ...
+end
+```
+
+---
+
+## Deprecated fields
+
+```lua
+---@class GameConfig
+---@field maxPlayers number Max players allowed
+---@field playerLimit number @deprecated Use maxPlayers instead
+```
+
+---
+
+## Deprecated class
+
+```lua
+---@deprecated Use NewPlayerManager instead
+---@class OldPlayerManager
+local OldPlayerManager = {}
+```
+
+---
+
+## Severity
+
+The `deprecated` diagnostic defaults to `hint` severity (subtle underline). You can change it:
+
+```json .gluarc.json
+{
+  "diagnostics": {
+    "severity": {
+      "deprecated": "warning"
+    }
+  }
+}
+```

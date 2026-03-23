@@ -1,0 +1,77 @@
+---
+title: Error tracking
+description: Capture and navigate runtime Lua errors from your SRCDS server directly in VS Code.
+---
+
+## Overview
+
+When the debugger is connected to your SRCDS server, GLuaLS captures runtime Lua errors and displays them in the **GLua Errors** panel in the sidebar. Each error includes a clickable stack trace that jumps directly to the offending line in your source files.
+
+{/* TODO: Add screenshot of error tracking panel */}
+
+---
+
+## How it works
+
+The `gm_rdb` binary module (installed as part of [debugger setup](/debugger/setup)) intercepts Lua errors at the SRCDS runtime level and streams them to the extension over the debug connection.
+
+You do not need a breakpoint set — errors are captured passively whenever the debugger is connected.
+
+---
+
+## The Errors panel
+
+Open the Errors panel from the GLuaLS sidebar, or via **View → GLua Errors**.
+
+Each entry shows:
+
+- **Error message** — the Lua error string
+- **Source** — whether it came from a Lua error or the console
+- **Count** — how many times this error occurred (deduplicated by fingerprint)
+- **First / last seen** — timestamps
+- **Stack trace** — click any frame to jump to that file and line
+
+---
+
+## Navigating to errors
+
+Click any stack frame in the error entry to open the file and jump to the exact line. GLuaLS resolves the short Garry's Mod file paths (e.g., `addons/my-addon/lua/my_file.lua:42`) to absolute paths in your workspace automatically.
+
+---
+
+## Error sources
+
+| Source | Description |
+|---|---|
+| **Lua** | Runtime Lua errors caught by the GMod error system |
+| **Console** | Error-level messages from the SRCDS console output |
+
+---
+
+## Clearing errors
+
+Click the **Clear** button at the top of the panel to clear all current errors. Errors persist until cleared or until the debug session ends.
+
+---
+
+## Stop on error
+
+You can configure the debugger to automatically pause execution when a Lua error is thrown, letting you inspect the full call stack at the moment the error occurred.
+
+Set `stopOnError: true` in your `launch.json`:
+
+```json launch.json
+{
+  "type": "gluals_gmod",
+  "request": "attach",
+  "name": "Attach to SRCDS",
+  "host": "localhost",
+  "port": 21111,
+  "sourceRoot": "${workspaceFolder}",
+  "stopOnError": true
+}
+```
+
+<Warning>
+`stopOnError` pauses the game when any Lua error occurs, including those in addons you didn't write. Use it selectively during focused debugging sessions rather than leaving it on permanently.
+</Warning>

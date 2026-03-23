@@ -1,0 +1,92 @@
+---
+title: "Completion Settings"
+description: Configure autocomplete behavior, call snippets, postfix triggers, and auto-require.
+---
+
+## Overview
+
+The `completion` section controls how the language server generates autocomplete suggestions. Options here adjust snippet expansion, require insertion, and the postfix trigger character.
+
+---
+
+## Options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `completion.enable` | `boolean` | `true` | Enable autocomplete entirely |
+| `completion.callSnippet` | `boolean` | `true` | Insert function calls as snippets with parameter placeholders |
+| `completion.stagedCallSnippets` | `boolean` | `true` | Use staged snippets for known GMod APIs (`hook.Add`, `net.Receive`, `net.Start`, etc.) |
+| `completion.postfix` | `string` | `"@"` | Trigger character for postfix completions. Options: `"@"`, `"."`, `":"` |
+| `completion.autoRequire` | `boolean` | `true` | Insert a `require()` statement when completing a symbol from another module |
+| `completion.autoRequireFunction` | `string` | `"require"` | Function name used when auto-inserting a require |
+| `completion.autoRequireNamingConvention` | `string` | `"keep"` | Convention for the local alias when auto-requiring. Options: `"keep"`, `"snake-case"`, `"pascal-case"`, `"camel-case"`, `"keep-class"` |
+| `completion.autoRequireSeparator` | `string` | `"."` | Separator used in the auto-generated require path |
+| `completion.baseFunctionIncludesName` | `boolean` | `true` | Include the function name in completions for base class functions |
+
+---
+
+## Call snippets
+
+When `callSnippet` is enabled, selecting a function in autocomplete inserts it with parameter placeholders:
+
+```lua
+-- Typing: hook.Add(
+-- Inserts:
+hook.Add("${1:HookName}", "${2:Identifier}", function(${3})
+    ${4}
+end)
+```
+
+### Staged snippets
+
+`stagedCallSnippets` enables split-stage completion for known GMod callbacks. After accepting a hook name, the system knows the expected hook signature and populates parameter names automatically. Set `false` to always use a generic placeholder.
+
+---
+
+## Postfix completions
+
+Postfix completions let you write a value and then trigger a structural completion after it:
+
+```lua
+tab@           -- triggers postfix menu on `tab`
+-- Postfix options: pairs, ipairs, #, etc.
+```
+
+Change the trigger character if `@` conflicts with your code style.
+
+---
+
+## Auto-require
+
+When you accept a completion from an imported module, `autoRequire` inserts a `require()` at the top of the file automatically:
+
+```lua
+-- Accepting `mylib.doThing` inserts:
+local mylib = require("mylib")
+```
+
+Set `autoRequireFunction` to your project's custom loader if you use one:
+
+```json .gluarc.json
+{
+  "completion": {
+    "autoRequireFunction": "include"
+  }
+}
+```
+
+---
+
+## Example
+
+```json .gluarc.json
+{
+  "completion": {
+    "enable": true,
+    "callSnippet": true,
+    "stagedCallSnippets": true,
+    "postfix": "@",
+    "autoRequire": false
+  }
+}
+```

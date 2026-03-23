@@ -1,0 +1,75 @@
+---
+title: VSCode extension overview
+description: Everything the GLuaLS VSCode extension provides above and beyond the language server.
+---
+
+## What the extension adds
+
+The language server delivers core code intelligence (completions, diagnostics, hover, etc.) to any LSP-compatible editor. The VSCode extension builds on top of that with a full suite of GMod-specific tooling:
+
+<CardGroup cols={2}>
+  <Card title="Interactive settings UI" icon="sliders" href="/vscode/settings-ui">
+    A dedicated webview panel for editing `.gluarc.json` without touching JSON directly.
+  </Card>
+  <Card title="Class Explorer" icon="folder-tree" href="/vscode/class-explorer">
+    Browse all scripted classes, VGUI panels, and workspace resources from a side panel.
+  </Card>
+  <Card title="Realm view" icon="globe" href="/vscode/realm-view">
+    See realm assignments for files and functions at a glance.
+  </Card>
+  <Card title="Error tracking" icon="circle-exclamation" href="/vscode/error-tracking">
+    Capture runtime Lua errors from your server and click through to their source.
+  </Card>
+  <Card title="Scaffolding" icon="wand-magic-sparkles" href="/vscode/scaffolding">
+    Generate new entities, weapons, effects, and custom class files from templates.
+  </Card>
+  <Card title="Annotations management" icon="arrows-rotate" href="/vscode/annotations-management">
+    Automatically download and update GMod wiki annotations.
+  </Card>
+  <Card title="AI integration" icon="robot" href="/vscode/ai-integration">
+    MCP server lets GitHub Copilot run Lua, read errors, and query your server directly.
+  </Card>
+</CardGroup>
+
+---
+
+## Commands
+
+Access all extension commands through the Command Palette (`Ctrl+Shift+P`):
+
+| Command | Description |
+|---|---|
+| **GLua: Open Settings** | Open the interactive `.gluarc.json` settings panel |
+| **GLua: Restart Language Server** | Restart the language server without reloading the window |
+| **GLua: Setup Debugger** | Run the debugger setup wizard |
+| **GLua: Run File** | Execute the current file on the connected SRCDS server |
+| **GLua: Run Selected Lua** | Execute the current selection on the connected server |
+| **GLua: Run Console Command** | Send a console command to the server |
+| **GLua: Update Annotations** | Manually trigger an annotations update |
+
+---
+
+## Status bar
+
+The status bar at the bottom of the VS Code window shows the current language server state:
+
+- **GLuaLS: Ready** — the server is running and analysis is up to date
+- **GLuaLS: Indexing** — the server is scanning your workspace files
+- **GLuaLS: Error** — the server encountered a problem (click for details)
+
+When the debugger is connected, the status bar also shows the current realm and connection state.
+
+---
+
+## Extension settings
+
+Extension-level settings (as opposed to workspace `.gluarc.json` settings) are under `gluals.*` in VS Code settings:
+
+| Setting | Default | Description |
+|---|---|---|
+| `gluals.gmod.autoLoadAnnotations` | `true` | Automatically download and load GMod wiki annotations |
+| `gluals.gmod.settingsAutoSave` | `true` | Auto-save changes made in the settings panel to `.gluarc.json` |
+
+<Note>
+Most configuration lives in `.gluarc.json`. VS Code extension settings only control extension-level behavior like annotation downloads and UI preferences.
+</Note>

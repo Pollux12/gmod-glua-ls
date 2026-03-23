@@ -1,0 +1,108 @@
+---
+title: "@diagnostic"
+description: Suppress or enable specific diagnostics for lines or blocks of code.
+---
+
+## Overview
+
+`@diagnostic` controls which warnings are active for a specific line, the next line, or a block of code. Use it to suppress false positives without disabling diagnostics globally.
+
+---
+
+## Syntax
+
+```lua
+---@diagnostic disable-next-line: code1, code2
+---@diagnostic disable-line: code1
+---@diagnostic disable: code1
+---@diagnostic enable: code1
+```
+
+---
+
+## disable-next-line
+
+Suppress diagnostics on the **next line** only:
+
+```lua
+---@diagnostic disable-next-line: undefined-global
+print(someExternalGlobal)  -- suppressed
+print(anotherGlobal)       -- NOT suppressed
+```
+
+---
+
+## disable-line
+
+Suppress diagnostics on the **current line** (can be placed inline):
+
+```lua
+print(someGlobal) ---@diagnostic disable-line: undefined-global
+```
+
+---
+
+## Block disable/enable
+
+Disable diagnostics for an entire section, then re-enable them:
+
+```lua
+---@diagnostic disable: undefined-global
+GLOBAL_A = "value"
+GLOBAL_B = 42
+GLOBAL_C = true
+---@diagnostic enable: undefined-global
+```
+
+---
+
+## File-wide disable
+
+A `---@diagnostic disable` with no matching `enable` suppresses for the rest of the file:
+
+```lua
+---@diagnostic disable: lowercase-global
+-- All lowercase global assignments in this file are suppressed
+```
+
+---
+
+## Multiple codes
+
+Suppress multiple diagnostics at once:
+
+```lua
+---@diagnostic disable-next-line: undefined-global, param-type-mismatch
+legacyFunction(someGlobal)
+```
+
+---
+
+## Common codes to suppress
+
+| Code | When to suppress |
+|---|---|
+| `undefined-global` | Global used that's defined externally (e.g., from another file loaded at runtime) |
+| `param-type-mismatch` | Intentional duck-typing or known false positive |
+| `unused` | Variable used as documentation or placeholder |
+| `lowercase-global` | Global intentionally named in lowercase |
+| `inject-field` | Adding fields to a type outside its definition intentionally |
+
+---
+
+## Alternative: configure globally
+
+If you find yourself suppressing the same diagnostic frequently, disable or change its severity in `.gluarc.json` instead:
+
+```json .gluarc.json
+{
+  "diagnostics": {
+    "disable": ["undefined-global"],
+    "severity": {
+      "param-type-mismatch": "hint"
+    }
+  }
+}
+```
+
+See [Diagnostics configuration](/configuration/diagnostics) for the full reference.

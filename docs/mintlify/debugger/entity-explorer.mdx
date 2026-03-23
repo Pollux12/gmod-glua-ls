@@ -1,0 +1,79 @@
+---
+title: Entity explorer
+description: Browse all entities, their NetworkVars, and table properties in a live tree view.
+---
+
+## Overview
+
+The **Entity Explorer** panel (in the GLuaLS sidebar) shows all entities currently in the server world. You can browse their properties, NetworkVars, and arbitrary table fields in a tree view — without writing any `print` calls.
+
+{/* TODO: Add screenshot */}
+
+---
+
+## Opening the explorer
+
+The Entity Explorer is available at any time when the debugger is connected:
+
+1. Click the **GLuaLS** icon in the sidebar
+2. Open the **Entity Explorer** section
+
+The list refreshes automatically every second while connected.
+
+---
+
+## Entity list
+
+The top level shows all entities grouped or listed by class. Each entity shows:
+
+- **Entity index** (e.g., `[42]`)
+- **Class name** (e.g., `prop_physics`)
+- **Map model or description** if available
+
+Entities are updated live — spawning or removing an entity in-game reflects in the explorer.
+
+---
+
+## Expanding entity properties
+
+Click any entity to expand it and see its properties:
+
+| Property section | Description |
+|---|---|
+| **NetworkVars** | Dynamically typed NetworkVar values (from `SetupDataTables`) |
+| **Table fields** | Key-value pairs assigned to the entity table via Lua |
+| **Inherited fields** | Accessible inherited fields (from the class definitions) |
+
+---
+
+## Editing properties
+
+When the debugger is **paused** (at a breakpoint), you can edit entity properties directly in the tree:
+
+1. Expand the entity in the explorer
+2. Click the value next to a property
+3. Type a new value (evaluated as a Lua expression)
+4. Press Enter
+
+<Note>
+Editing is only available while paused. When running, the explorer is read-only to avoid race conditions.
+</Note>
+
+---
+
+## Page size and polling
+
+The explorer loads entities in pages of 50. Scroll to the bottom to load the next page.
+
+The auto-refresh polls every 1 second and stops after 30 seconds of inactivity to reduce server load during idle periods. Click **Refresh** to resume polling.
+
+---
+
+## Filtering entities
+
+Type in the filter box above the entity list to show only entities whose class name matches. Filtering is case-insensitive.
+
+```
+Filter: prop_physics
+-- Shows only prop_physics entities
+```

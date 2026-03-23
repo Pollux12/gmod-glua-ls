@@ -1,0 +1,158 @@
+---
+title: Diagnostics
+description: GLuaLS checks your code for errors, type mismatches, unused variables, and GMod-specific problems.
+---
+
+## Overview
+
+Diagnostics appear as squiggly underlines in the editor and in the **Problems** panel (`Ctrl+Shift+M`). Each diagnostic has a severity level and a code identifier you can use for configuration.
+
+---
+
+## Severity levels
+
+| Severity | Appearance | When to use |
+|---|---|---|
+| `error` | Red underline | Hard errors that will likely break your code |
+| `warning` | Yellow underline | Probable bugs or type mismatches |
+| `information` | Blue underline | Stylistic or best-practice suggestions |
+| `hint` | Subtle underline | Minor suggestions, safe to ignore |
+
+---
+
+## Configuring diagnostic severity
+
+Change the severity of any diagnostic code, or disable it entirely:
+
+```json .gluarc.json
+{
+  "diagnostics": {
+    "severity": {
+      "unused": "hint",
+      "undefined-field": "information",
+      "param-type-mismatch": "warning"
+    },
+    "disable": ["redundant-return-value"],
+    "enables": ["missing-return", "return-type-mismatch"]
+  }
+}
+```
+
+<Tip>
+Use the [Interactive Settings UI](/vscode/settings-ui) to toggle diagnostics and change severity with checkboxes and dropdowns — no JSON editing required.
+</Tip>
+
+---
+
+## Diagnostic reference
+
+### Type checking
+
+| Code | Default | Description |
+|---|---|---|
+| `param-type-mismatch` | Warning | Argument type doesn't match the expected parameter type |
+| `missing-parameter` | Warning | Required parameter not provided |
+| `redundant-parameter` | Warning | Extra argument passed beyond what the function accepts |
+| `assign-type-mismatch` | Warning | Assigned value type doesn't match the variable type |
+| `return-type-mismatch` | Off | Return type doesn't match the declared return type |
+| `missing-return-value` | Warning | Function declared to return a value but doesn't in all paths |
+| `redundant-return-value` | Off | Extra return value beyond what the function declares |
+| `missing-return` | Off | Function should return a value but doesn't |
+| `cast-type-mismatch` | Warning | Cast type is incompatible with the actual type |
+| `need-check-nil` | Hint | Value may be nil; you should check before using it |
+| `undefined-field` | Warning | Field doesn't exist on the type |
+| `missing-fields` | Warning | Table literal is missing required fields |
+| `undefined-global` | Error | Referenced variable is not defined globally or locally |
+| `type-not-found` | Warning | A referenced type name doesn't exist |
+| `generic-constraint-mismatch` | Information | Generic type argument violates a constraint |
+| `enum-value-mismatch` | Warning | Value doesn't match a known enum entry |
+
+### Code quality
+
+| Code | Default | Description |
+|---|---|---|
+| `unused` | Hint | Local variable or function is never used |
+| `unused-self` | Off | `self` parameter is never used in a method |
+| `unreachable-code` | Hint | Code after a `return` or `error()` that can never execute |
+| `deprecated` | Hint | Using a deprecated function or field |
+| `duplicate-require` | Hint | Module is `require()`d more than once in the same scope |
+| `redefined-local` | Hint | Local variable shadows an outer local with the same name |
+| `redefined-label` | Warning | Goto label is defined more than once |
+| `duplicate-index` | Warning | Table literal has the same key more than once |
+| `duplicate-set-field` | Off | A field is assigned more than once |
+| `duplicate-type` | Off | Same type name declared in multiple places |
+| `unbalanced-assignments` | Warning | Left-hand and right-hand sides of an assignment have different counts |
+| `local-const-reassign` | Error | Reassigning a `<const>` local |
+| `read-only` | Warning | Writing to a value declared as read-only |
+
+### Documentation
+
+| Code | Default | Description |
+|---|---|---|
+| `annotation-usage-error` | Error | Annotation used incorrectly (wrong syntax, wrong context) |
+| `doc-syntax-error` | Error | Annotation comment has a syntax error |
+| `undefined-doc-param` | Warning | Documented parameter doesn't exist on the function |
+| `duplicate-doc-field` | Warning | Same field documented more than once in `@class` |
+| `incomplete-signature-doc` | Off | Function is missing parameter or return documentation |
+| `missing-global-doc` | Off | Global function or variable is missing documentation |
+| `unknown-doc-tag` | Off | Unknown `@tag` in an annotation comment |
+| `inject-field` | Off | Field added to a type outside its class definition |
+
+### Access control
+
+| Code | Default | Description |
+|---|---|---|
+| `access-invisible` | Warning | Accessing a `private` or `protected` member outside its class |
+| `discard-returns` | Warning | Return value from a `@nodiscard` function is not used |
+
+### GMod-specific
+
+| Code | Default | Description |
+|---|---|---|
+| `gmod-realm-mismatch` | Warning | Calling a realm-specific function from the wrong realm |
+| `gmod-realm-mismatch-heuristic` | Warning | Likely realm mismatch based on inferred evidence |
+| `gmod-unknown-realm` | Hint | Realm could not be resolved for a realm-aware call |
+| `gmod-invalid-hook-name` | Warning | Hook name is not a recognized GMod hook |
+| `gmod-unknown-net-message` | Warning | `net.Start(name)` uses an unregistered message name |
+| `gmod-net-missing-network-counterpart` | Warning | `net.Start` has no `net.Receive` in the expected opposite realm |
+| `gmod-net-read-write-order-mismatch` | Warning | `net.Read*` calls don't match the order of `net.Write*` calls |
+| `gmod-net-read-write-type-mismatch` | Warning | `net.Read*` type doesn't match the corresponding `net.Write*` |
+| `gmod-duplicate-system-registration` | Hint | Duplicate registration (concommand, net, timer, etc.) |
+
+---
+
+## Suppressing individual diagnostics
+
+Use `---@diagnostic` annotations to suppress warnings for specific lines or blocks:
+
+```lua
+-- Suppress for the next line only
+---@diagnostic disable-next-line: undefined-global
+print(someExternalGlobal)
+
+-- Suppress for the current line
+print(x) ---@diagnostic disable-line: undefined-global
+
+-- Suppress for an entire block
+---@diagnostic disable: undefined-global
+SOME_GLOBAL = "value"
+ANOTHER_GLOBAL = 42
+---@diagnostic enable: undefined-global
+```
+
+See the [`@diagnostic` annotation reference](/annotations/diagnostic) for full details.
+
+---
+
+## Global whitelist
+
+Add globals that your code uses but GLuaLS doesn't know about (e.g., from another module that's loaded separately):
+
+```json .gluarc.json
+{
+  "diagnostics": {
+    "globals": ["MyFramework", "PLUGIN_REGISTRY"],
+    "globalsRegex": ["^LIB_.*"]
+  }
+}
+```

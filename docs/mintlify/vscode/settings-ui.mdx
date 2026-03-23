@@ -1,0 +1,95 @@
+---
+title: Interactive settings UI
+description: Use the built-in settings panel to configure your workspace without editing JSON manually.
+---
+
+## Opening the settings panel
+
+There are three ways to open the GLua Settings panel:
+
+1. **Command Palette** (`Ctrl+Shift+P`) → **GLua: Open Settings**
+2. Click the **GLuaLS** item in the status bar
+3. Right-click any `.gluarc.json` file in the Explorer → **Open GLua Settings**
+
+The panel opens as a tab in your editor. In a multi-root workspace, you'll be prompted to choose which workspace folder to configure.
+
+{/* TODO: Add screenshot of settings panel */}
+
+---
+
+## Panel layout
+
+The settings panel is organized into collapsible sections matching the `.gluarc.json` structure:
+
+| Section | What it configures |
+|---|---|
+| **GMod** | Realm detection, scripted classes, network analysis, VGUI hints |
+| **Diagnostics** | Enable/disable individual diagnostic codes, set severity levels |
+| **Completion** | Autocomplete behavior, call snippets, postfix triggers |
+| **Formatting** | Formatter preset, style overrides |
+| **Hints** | Inlay hint types and thresholds |
+| **Workspace** | Library paths, ignore patterns, module maps |
+| **Runtime** | Non-standard Lua symbols, require-like functions |
+
+---
+
+## Editing settings
+
+Every control maps directly to a `.gluarc.json` property:
+
+- **Toggles** — boolean options
+- **Dropdowns** — enum options (e.g., severity levels)
+- **Text fields** — string and number options
+- **Tables** — array and map options (e.g., file param defaults, scripted class definitions)
+
+Changes are saved to `.gluarc.json` automatically after a short debounce (5 seconds by default). You can also click **Save now** at any time.
+
+<Tip>
+If you want to inspect the raw JSON being generated, open `.gluarc.json` directly. You can edit both the settings panel and the JSON file — they stay in sync.
+</Tip>
+
+---
+
+## File param defaults
+
+The **File param defaults** table (under the GMod section) lets you set workspace-wide type hints for common parameter names like `ply`, `ent`, and `vehicle`.
+
+When a function uses one of these parameter names without an explicit `---@param` annotation, GLuaLS assumes the configured type.
+
+| Parameter | Default type | Description |
+|---|---|---|
+| `ply` | `Player` | Player entity |
+| `ent` | `Entity` | Generic entity |
+| `vehicle` | `Vehicle` | Vehicle entity |
+
+To add a custom mapping, click **Add** and enter the parameter name and type. To remove a built-in mapping for your workspace, set its value to an empty string.
+
+---
+
+## Scripted class definitions
+
+The **Scripted classes** table lets you:
+
+- **Override** built-in class definitions (entities, weapons, effects, etc.) to add custom scaffold templates or exclude patterns
+- **Add** fully custom class groups with their own glob patterns, class globals, and scaffold files
+- **Disable** built-in groups you don't use
+
+Each definition includes these fields:
+
+| Field | Description |
+|---|---|
+| `id` | Stable unique key (set to a built-in id like `"entities"` to override it) |
+| `label` | Display name in the Class Explorer |
+| `classGlobal` | The global table name (`ENT`, `SWEP`, or custom) |
+| `path` | Folder segments used to detect files for this class |
+| `include` | Glob patterns for which files belong to this class |
+| `rootDir` | Default folder for scaffolding new files |
+| `scaffold.files` | Template files to generate when creating a new class |
+
+---
+
+## Auto-save behavior
+
+The panel saves changes after a 5-second debounce. If you close the panel with unsaved changes, you'll be prompted to save or discard.
+
+To change auto-save behavior, toggle **Auto-save settings** in the panel header or set `gluals.gmod.settingsAutoSave` in your VS Code settings.

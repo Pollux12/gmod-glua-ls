@@ -1,0 +1,62 @@
+---
+title: "@see"
+description: Add cross-references to related symbols or documentation.
+---
+
+## Overview
+
+`@see` creates a cross-reference link to another symbol, class, or function. The reference appears in hover documentation, helping readers navigate to related APIs.
+
+---
+
+## Syntax
+
+```lua
+---@see SymbolName
+---@see SymbolName Description
+```
+
+---
+
+## Referencing another function
+
+```lua
+---@see ValidateData For input validation
+---@see FormatOutput For result formatting
+function ProcessData(data)
+    local validated = ValidateData(data)
+    return FormatOutput(validated)
+end
+```
+
+---
+
+## Referencing a class
+
+```lua
+---@class User
+---@field id number
+---@field name string
+---@see UserManager
+---@see UserValidator
+local User = {}
+```
+
+---
+
+## Multiple references
+
+```lua
+---@see Entity:GetPos Returns entity position
+---@see Entity:SetPos Sets entity position
+---@see Entity:GetAngles Related angle accessor
+function Entity:GetTransform() end
+```
+
+---
+
+## When to use @see
+
+- Link related functions that are commonly used together
+- Point to the replacement for a deprecated function
+- Reference documentation or GMod Wiki pages (use full URL or descriptor)

@@ -1,0 +1,123 @@
+---
+title: "Workspace Settings"
+description: Configure library paths, ignore patterns, module maps, and file encoding.
+---
+
+## Overview
+
+The `workspace` section tells the language server what files to analyse, what to ignore, and where to find external libraries. It also controls module resolution and file encoding.
+
+---
+
+## Options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `workspace.library` | `array` | `[]` | External library paths to include in analysis (strings or objects) |
+| `workspace.workspaceRoots` | `string[]` | `[]` | Additional workspace root directories for multi-root setups |
+| `workspace.ignoreDir` | `string[]` | `[]` | Directory names to exclude from analysis |
+| `workspace.ignoreGlobs` | `string[]` | `[]` | Glob patterns of files to exclude from analysis |
+| `workspace.moduleMap` | `array` | `[]` | Module path rewrite rules (regex patterns) |
+| `workspace.encoding` | `string` | `"utf-8"` | File encoding for all Lua files in the workspace |
+| `workspace.enableReindex` | `boolean` | `false` | Trigger a full workspace reindex when files change |
+| `workspace.reindexDuration` | `integer` | `5000` | Delay in ms before a reindex fires after a file change |
+| `workspace.preloadFileSize` | `integer` | `0` | Maximum file size in bytes to preload. `0` = unlimited |
+| `workspace.packageDirs` | `string[]` | `[]` | Partial library load — only load package declarations from these dirs, not full analysis |
+
+---
+
+## Library paths
+
+`workspace.library` includes additional directories in analysis without treating them as project source. Use this for shared annotation files, third-party stubs, or GMod module stubs.
+
+Each entry is either a path string or an object with per-library ignore options:
+
+```json .gluarc.json
+{
+  "workspace": {
+    "library": [
+      "./types",
+      {
+        "path": "./vendor/stubs",
+        "ignoreDir": ["test"],
+        "ignoreGlobs": ["**/*.spec.lua"]
+      }
+    ]
+  }
+}
+```
+
+---
+
+## Ignore patterns
+
+Exclude directories or files from analysis:
+
+```json .gluarc.json
+{
+  "workspace": {
+    "ignoreDir": ["node_modules", ".git", "tests"],
+    "ignoreGlobs": [
+      "**/*.min.lua",
+      "legacy/**"
+    ]
+  }
+}
+```
+
+Common directories to ignore for GMod projects:
+- `garrysmod` (Steam engine files)
+- `addons` (other addons' source, if not relevant to your project)
+- `.git`
+- `out`, `build`, `dist`
+
+---
+
+## Module map
+
+`moduleMap` rewrites require paths to file paths using regex replacement. Useful when your project uses non-standard require patterns.
+
+```json .gluarc.json
+{
+  "workspace": {
+    "moduleMap": [
+      {
+        "pattern": "^libs/(.*)",
+        "target": "lua/libs/$1"
+      }
+    ]
+  }
+}
+```
+
+---
+
+## Workspace roots
+
+For projects where Lua files aren't at the repository root, specify the actual Lua root:
+
+```json .gluarc.json
+{
+  "workspace": {
+    "workspaceRoots": ["lua"]
+  }
+}
+```
+
+This affects require path resolution — `require("mymodule")` will be resolved relative to `lua/mymodule.lua`.
+
+---
+
+## File encoding
+
+Most Lua files use UTF-8, but older addons may use a legacy encoding:
+
+```json .gluarc.json
+{
+  "workspace": {
+    "encoding": "utf-8"
+  }
+}
+```
+
+Available values: `"utf-8"`, `"utf-16"`, `"gbk"`, `"latin1"`, `"ascii"`.

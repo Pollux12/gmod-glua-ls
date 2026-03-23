@@ -1,0 +1,98 @@
+---
+title: "@cast"
+description: Narrow or change a variable's type at a specific point in the code.
+---
+
+## Overview
+
+`@cast` forces GLuaLS to treat a variable as a specific type from that point forward in the code flow. Use it to narrow union types, assert non-nil values, or override inferred types in complex dynamic scenarios.
+
+---
+
+## Syntax
+
+```lua
+---@cast varName TypeExpression
+---@cast varName +TypeExpression   -- add type to union
+---@cast varName -TypeExpression   -- remove type from union
+```
+
+---
+
+## Basic type assertion
+
+```lua
+---@type string | number
+local value = getValue()
+
+if type(value) == "string" then
+    ---@cast value string
+    print("Length:", #value)  -- ✅ narrowed to string
+end
+```
+
+---
+
+## Non-nil assertion
+
+```lua
+---@type Player | nil
+local ply = findPlayer(id)
+
+---@cast ply Player  -- assert not nil (removes nil from the union)
+ply:ChatPrint("Found!")  -- ✅ no need-check-nil warning
+```
+
+---
+
+## Casting to a more specific type
+
+```lua
+---@type Entity
+local ent = ents.GetByIndex(1)
+
+---@cast ent Player  -- assert that ent is actually a Player
+ent:GetFriends()     -- ✅ Player method available
+```
+
+---
+
+## Adding to a union
+
+```lua
+---@type string
+local val = "hello"
+
+---@cast val +number  -- val is now string | number
+```
+
+---
+
+## Removing from a union
+
+```lua
+---@type string | number | nil
+local val = getVal()
+
+---@cast val -nil  -- removes nil, val is now string | number
+```
+
+---
+
+## Inline table casting
+
+```lua
+---@type table
+local data = getData()
+
+---@cast data { id: number, name: string }
+print(data.id)    -- ✅
+print(data.name)  -- ✅
+```
+
+---
+
+## When to use @cast vs @type
+
+- Use `@type` to annotate fresh variable declarations where the type isn't inferred
+- Use `@cast` mid-flow to override or narrow a type at a specific point, without re-declaring the variable

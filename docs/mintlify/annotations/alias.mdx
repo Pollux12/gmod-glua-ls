@@ -1,0 +1,87 @@
+---
+title: "@alias"
+description: Create named type aliases for use across your codebase.
+---
+
+## Overview
+
+`@alias` creates a named alias for a type expression, letting you give meaningful names to complex or frequently-used types.
+
+---
+
+## Syntax
+
+```lua
+---@alias AliasName TypeExpression
+
+---@alias AliasName
+---| "value1" # description
+---| "value2" # description
+```
+
+---
+
+## Simple aliases
+
+```lua
+---@alias ID number
+---@alias PlayerName string
+---@alias Callback fun(result: any): nil
+```
+
+Once defined, use the alias name anywhere a type expression is expected:
+
+```lua
+---@param id ID
+---@return PlayerName
+function GetPlayerName(id) end
+```
+
+---
+
+## Union aliases
+
+```lua
+---@alias StringOrNumber string | number
+---@alias MaybePlayer Player | nil
+```
+
+---
+
+## String literal enumerations
+
+Use the `---|` syntax to define a set of allowed string values:
+
+```lua
+---@alias Realm
+---| "client" # Runs on clients only
+---| "server" # Runs on the server only
+---| "shared" # Runs on both server and clients
+---| "menu"   # Runs in the GMod menu state
+
+---@param realm Realm
+function SetDefaultRealm(realm) end
+```
+
+When this alias is used as a parameter type, completions will suggest only the defined string values.
+
+---
+
+## Generic aliases
+
+```lua
+---@alias Callback<T> fun(result: T, err: string?): nil
+---@alias Pair<K, V> { key: K, value: V }
+```
+
+---
+
+## Common GMod patterns
+
+```lua
+---@alias HookName string  -- or a union of known hook name literals
+
+---@alias NetMessageName string
+
+---@alias ConVarCallback fun(cv: ConVar, oldVal: string, newVal: string): nil
+```

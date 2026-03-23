@@ -1,0 +1,147 @@
+---
+title: Code intelligence
+description: Completions, hover documentation, signature help, semantic highlighting, and more.
+---
+
+## Autocomplete
+
+GLuaLS provides context-aware completions for GMod API functions, local variables, class members, hook names, net message names, and more.
+
+**Triggers automatically** as you type. Press `Ctrl+Space` to trigger manually.
+
+### Call snippets
+
+When completing a function call, GLuaLS inserts a snippet with tab stops for each parameter:
+
+```lua
+hook.Add("PlayerSpawn", "MyAddon", function(|ply|) -- cursor placed on first param
+    -- ...
+end)
+```
+
+Disable call snippets if you prefer plain completions:
+
+```json .gluarc.json
+{
+  "completion": {
+    "callSnippet": false
+  }
+}
+```
+
+### Staged snippets
+
+For well-known GMod functions with complex signatures (`hook.Add`, `net.Receive`, `timer.Create`, etc.), GLuaLS generates a more complete snippet with the full expected body:
+
+```lua
+-- Typing net.Receive and accepting the staged snippet generates:
+net.Receive("MessageName", function(len, ply)
+    local value = net.ReadString()
+end)
+```
+
+### Postfix completions
+
+Type a postfix trigger after an expression to insert a completion template:
+
+```lua
+-- Type: ply@ then select "IsValid"
+if IsValid(ply) then
+    -- ...
+end
+```
+
+The default postfix trigger is `@`. Change it in `.gluarc.json` with `completion.postfix`.
+
+### Auto-require
+
+When completing an identifier from another module, GLuaLS can insert a `require()` at the top of the file automatically:
+
+```json .gluarc.json
+{
+  "completion": {
+    "autoRequire": true,
+    "autoRequireFunction": "require",
+    "autoRequireSeparator": "."
+  }
+}
+```
+
+---
+
+## Hover documentation
+
+Hover over any GMod API function, variable, or annotated symbol to see its documentation:
+
+- **Function signature** with parameter names and types
+- **Return type**
+- **Description** (from wiki or `---` comment)
+- **Realm badge** — client ![Client](..) / server ![Server](..) / shared ![Shared](..) indicator
+- **Deprecation notice** if applicable
+
+{/* TODO: Add screenshot of hover tooltip */}
+
+---
+
+## Signature help
+
+As you type function arguments, GLuaLS shows the parameter signature above the cursor, highlighting the current parameter:
+
+```lua
+ents.Create(|classname|)
+--          ^^^^^^^^^^^^ currently filling this parameter
+```
+
+---
+
+## Go to definition
+
+Press `F12` or right-click → **Go to Definition** to jump to where a function or variable is defined. Works for:
+
+- GMod API functions (opens the annotations file)
+- Your own functions and classes
+- `require()`d modules
+
+**Go to references** (`Shift+F12`) finds every use of a symbol across your workspace.
+
+---
+
+## Symbol renaming
+
+Press `F2` to rename a variable, function, or field. GLuaLS applies the rename across all files in your workspace, including string-based accesses when `references.fuzzySearch` is enabled.
+
+---
+
+## Document outline
+
+The outline view (`Ctrl+Shift+O`) shows the structure of the current file. With GMod analysis enabled, outline verbosity is controlled by `gmod.outline.verbosity`:
+
+| Level | What is shown |
+|---|---|
+| `minimal` | Functions, hooks, net receivers, timers, concommands only |
+| `normal` (default) | Same as minimal, plus non-primitive variables and typed tables |
+| `verbose` | All locals, assignments, and control-flow blocks |
+
+---
+
+## Semantic highlighting
+
+GLuaLS provides semantic token coloring that extends your theme's base Lua syntax highlighting with additional information:
+
+- **Parameters** are colored differently from locals
+- **Class members** are highlighted based on their owning class
+- **Deprecated symbols** appear with a strikethrough
+- **Globals** are distinguishable from locals
+
+Enable or disable with `semanticTokens.enable` in `.gluarc.json`.
+
+---
+
+## Code lens
+
+Code lens annotations appear above functions and class definitions:
+
+- **References count** — how many places call this function
+- **VGUI panel indicator** — links to the panel definition for VGUI components
+
+Configure with `codeLens.enable` and `gmod.vgui.codeLensEnabled` in `.gluarc.json`.

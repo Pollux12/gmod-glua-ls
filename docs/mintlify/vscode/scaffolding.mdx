@@ -1,0 +1,104 @@
+---
+title: Scaffolding
+description: Generate new entity, weapon, effect, and custom class files from built-in or custom templates.
+---
+
+## Overview
+
+GLuaLS can generate the boilerplate files for new scripted classes from templates. When you create a new entity or weapon, all the required files are created with the correct structure and your class name substituted in.
+
+{/* TODO: Add screenshot of scaffolding prompt */}
+
+---
+
+## Creating a new class
+
+1. Open the **Class Explorer** in the sidebar
+2. Find the class group you want to create in (e.g., **Entities**)
+3. Click the **+** (New) icon next to the group header
+4. Enter the class name when prompted
+5. The files are generated and the main file opens automatically
+
+---
+
+## Built-in templates
+
+GLuaLS ships with templates for all standard GMod scripted class types:
+
+| Class type | Generated files |
+|---|---|
+| **Entity** | `shared.lua`, `cl_init.lua`, `init.lua` |
+| **Weapon (SWEP)** | `shared.lua`, `cl_init.lua`, `init.lua` |
+| **Effect** | `init.lua` |
+| **Scripted Tool (STOOL)** | `shared.lua` |
+
+---
+
+## Custom templates
+
+You can override any built-in template or add templates for custom class types.
+
+### Setting up a template directory
+
+Create a folder for your templates and configure its path:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "templatePath": ".gluals/templates"
+  }
+}
+```
+
+### Template file format
+
+Templates are `.lua` files with `{{name}}` placeholders:
+
+```lua .gluals/templates/ent_shared.lua
+ENT.Type = "anim"
+ENT.Base = "base_gmodentity"
+ENT.PrintName = "{{name}}"
+ENT.Author = ""
+ENT.Spawnable = false
+ENT.AdminSpawnable = false
+
+AccessorFunc(ENT, "m_bExampleVar", "ExampleVar", FORCE_BOOL)
+
+function ENT:SetupDataTables()
+    self:NetworkVar("Bool", 0, "ExampleVar")
+end
+```
+
+Placeholders:
+
+| Placeholder | Value |
+|---|---|
+| `{{name}}` | The class name entered when scaffolding |
+
+### Wiring templates to class definitions
+
+Add scaffold configuration to your scripted class definition to tell GLuaLS which template files to generate:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "templatePath": ".gluals/templates",
+    "scriptedClassScopes": {
+      "include": [
+        {
+          "id": "entities",
+          "scaffold": {
+            "files": [
+              { "path": "{{name}}/shared.lua", "template": "ent_shared.lua" },
+              { "path": "{{name}}/cl_init.lua", "template": "ent_cl.lua" },
+              { "path": "{{name}}/init.lua", "template": "ent_sv.lua" }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+The `path` value is relative to the class `rootDir` (e.g., `lua/entities/`), and `template` refers to the filename inside your `templatePath` folder. Built-in templates are used as fallback if the custom template file is not found.

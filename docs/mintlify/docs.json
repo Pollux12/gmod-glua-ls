@@ -1,68 +1,163 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "GLua Language Server",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#4A9EFF",
+    "light": "#6DB8FF",
+    "dark": "#2B7DD9"
   },
   "favicon": "/favicon.svg",
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Getting Started",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Introduction",
             "pages": [
               "index",
-              "quickstart",
-              "development"
-            ]
-          },
-          {
-            "group": "Customization",
-            "pages": [
-              "essentials/settings",
-              "essentials/navigation"
-            ]
-          },
-          {
-            "group": "Writing content",
-            "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
-            ]
-          },
-          {
-            "group": "AI tools",
-            "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "getting-started/installation",
+              "getting-started/quickstart",
+              "getting-started/workspace-setup"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "VSCode Extension",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Overview",
             "pages": [
-              "api-reference/introduction"
+              "vscode/overview"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Features",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "vscode/settings-ui",
+              "vscode/class-explorer",
+              "vscode/realm-view",
+              "vscode/error-tracking",
+              "vscode/scaffolding",
+              "vscode/annotations-management",
+              "vscode/ai-integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Language Features",
+        "groups": [
+          {
+            "group": "Code Intelligence",
+            "pages": [
+              "language/code-intelligence",
+              "language/diagnostics",
+              "language/formatting",
+              "language/inlay-hints"
+            ]
+          },
+          {
+            "group": "GMod-Specific",
+            "pages": [
+              "language/realm-awareness",
+              "language/network-analysis",
+              "language/scripted-classes",
+              "language/vgui-support",
+              "language/hook-intelligence"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Debugger",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "debugger/overview",
+              "debugger/setup"
+            ]
+          },
+          {
+            "group": "Usage",
+            "pages": [
+              "debugger/breakpoints-and-stepping",
+              "debugger/inspecting-variables",
+              "debugger/lua-execution",
+              "debugger/entity-explorer"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Annotations",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "annotations/index"
+            ]
+          },
+          {
+            "group": "Type System",
+            "pages": [
+              "annotations/class",
+              "annotations/type",
+              "annotations/field",
+              "annotations/alias",
+              "annotations/enum",
+              "annotations/generic"
+            ]
+          },
+          {
+            "group": "Functions",
+            "pages": [
+              "annotations/param",
+              "annotations/return",
+              "annotations/overload",
+              "annotations/async",
+              "annotations/nodiscard"
+            ]
+          },
+          {
+            "group": "GMod-Specific",
+            "pages": [
+              "annotations/realm",
+              "annotations/hook",
+              "annotations/fileparam",
+              "annotations/accessorfunc"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "annotations/diagnostic",
+              "annotations/cast",
+              "annotations/deprecated",
+              "annotations/meta",
+              "annotations/module",
+              "annotations/see"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Configuration",
+        "groups": [
+          {
+            "group": "Reference",
+            "pages": [
+              "configuration/overview",
+              "configuration/gmod",
+              "configuration/diagnostics",
+              "configuration/completion",
+              "configuration/formatting",
+              "configuration/workspace",
+              "configuration/hints-and-hover",
+              "configuration/runtime"
             ]
           }
         ]
@@ -71,14 +166,14 @@
     "global": {
       "anchors": [
         {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
+          "anchor": "GitHub",
+          "href": "https://github.com/Pollux12/gmod-glua-ls",
+          "icon": "github"
         },
         {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
+          "anchor": "Issues",
+          "href": "https://github.com/Pollux12/gmod-glua-ls/issues",
+          "icon": "circle-exclamation"
         }
       ]
     }
@@ -90,33 +185,30 @@
   "navbar": {
     "links": [
       {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
+        "label": "GitHub",
+        "href": "https://github.com/Pollux12/gmod-glua-ls"
       }
     ],
     "primary": {
       "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
+      "label": "Install Extension",
+      "href": "https://marketplace.visualstudio.com/items?itemName=Pollux.gmod-glua-ls"
     }
   },
   "contextual": {
     "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "cursor",
+      "vscode"
+    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/Pollux12/gmod-glua-ls"
     }
   }
 }

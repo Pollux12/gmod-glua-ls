@@ -1,0 +1,121 @@
+---
+title: "@type"
+description: Declare the type of a variable or expression.
+---
+
+## Overview
+
+`@type` annotates a local variable, global, or table field with a specific type. Use it when GLuaLS cannot infer the type automatically (e.g., external data, dynamic construction).
+
+---
+
+## Syntax
+
+```lua
+---@type TypeExpression
+---@type (instance) TypeExpression
+---@type (definition) TypeExpression
+```
+
+---
+
+## Basic usage
+
+```lua
+---@type string
+local userName = "Player1"
+
+---@type number
+local score = 0
+
+---@type Player
+local ply = GetSomePlayer()
+```
+
+---
+
+## Union types
+
+```lua
+---@type string | number
+local id = getUserId()  -- could be either
+```
+
+---
+
+## Optionals (nil-able)
+
+```lua
+---@type Player | nil
+local maybePly = ents.GetByIndex(1)
+```
+
+or using the shorthand `?`:
+
+```lua
+---@type Player?
+local maybePly = ents.GetByIndex(1)
+```
+
+---
+
+## Table types
+
+```lua
+---@type table<string, number>
+local scores = {}
+
+---@type { name: string, health: number }
+local data = GetPlayerData()
+```
+
+---
+
+## Array types
+
+```lua
+---@type Entity[]
+local allEnts = ents.GetAll()
+```
+
+---
+
+## Function types
+
+```lua
+---@type fun(ply: Player): boolean
+local predicate = IsAdmin
+```
+
+---
+
+## `(instance)` modifier
+
+When `(instance)` is used, fields added to the variable after this annotation are scoped to *only that variable* — they don't modify the global class definition:
+
+```lua
+---@type (instance) Panel
+local myPanel = vgui.Create("DPanel")
+
+function myPanel:Refresh() end  -- Only exists on myPanel, not all Panels
+```
+
+---
+
+## `(definition)` modifier
+
+When `(definition)` is used, fields added to the variable are treated as global additions to the class:
+
+```lua
+---@type (definition) Entity
+local EntityDef = Entity
+
+EntityDef.MyCustomMethod = function(self) end  -- Added to Entity globally
+```
+
+---
+
+## When to use @type vs @class
+
+- Use `@class` when defining a new reusable class that other code will reference by name
+- Use `@type` when annotating the type of a specific local variable

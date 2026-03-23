@@ -1,0 +1,94 @@
+---
+title: "@fileparam"
+description: Set default parameter types for the entire file.
+---
+
+## Overview
+
+`@fileparam` sets a default type for any parameter with a matching name across all functions in the current file. Functions that don't have an explicit `@param` for that name fall back to the file-level default.
+
+---
+
+## Syntax
+
+```lua
+---@fileparam paramName type
+```
+
+---
+
+## Usage
+
+```lua
+---@fileparam ply Player
+---@fileparam vehicle Vehicle
+
+-- No @param needed for these functions — they inherit from @fileparam
+local function enter(vehicle, ply)
+    local seat = vehicle:GetFreeSeat()  -- vehicle is typed as Vehicle ✅
+    ply:EnterVehicle(seat)              -- ply is typed as Player ✅
+end
+
+local function exit(vehicle, ply)
+    ply:ExitVehicle()  -- ✅
+end
+```
+
+---
+
+## Precedence
+
+Type resolution for parameters follows this order (highest to lowest):
+
+1. **Explicit `@param`** annotation on the function itself — always wins
+2. **`@fileparam`** for the current file
+3. **`gmod.fileParamDefaults`** in `.gluarc.json` — workspace-wide defaults
+
+---
+
+## Override with @param
+
+If one function in the file needs a different type for the same parameter name, add an explicit `@param`:
+
+```lua
+---@fileparam vehicle Vehicle
+
+local function enter(vehicle, ply)
+    -- vehicle: Vehicle (from @fileparam)
+end
+
+---@param vehicle Entity  -- overrides @fileparam for this function only
+local function inspectGeneric(vehicle)
+    -- vehicle: Entity
+end
+```
+
+---
+
+## Workspace defaults
+
+Configure defaults that apply to all files in the workspace:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "fileParamDefaults": {
+      "ply": "Player",
+      "target": "Entity",
+      "dmginfo": "CTakeDamageInfo"
+    }
+  }
+}
+```
+
+---
+
+## Common patterns
+
+In GMod addon development, certain parameter names are almost universally the same type. Using `@fileparam` (or workspace defaults) reduces annotation boilerplate significantly:
+
+```lua
+---@fileparam ply Player
+---@fileparam attacker Player
+---@fileparam victim Entity
+```

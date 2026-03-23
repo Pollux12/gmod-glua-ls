@@ -1,0 +1,145 @@
+---
+title: Realm awareness
+description: GLuaLS understands where code runs — client, server, or shared — and warns about cross-realm API usage.
+---
+
+## Overview
+
+Garry's Mod Lua runs in three **realms**: clientside (`CLIENT`), serverside (`SERVER`), and shared code accessible on both. Many GMod API functions are only available in one realm (e.g., `LocalPlayer()` is client-only, `game.GetWorld():GetGravity()` is server-only).
+
+GLuaLS automatically detects which realm each file runs in and issues diagnostics when you call realm-restricted functions from the wrong realm.
+
+---
+
+## Realm detection
+
+GLuaLS infers realm through a **5-level priority** system, from highest to lowest:
+
+### 1. `@realm` annotation (highest priority)
+
+Put `---@realm` at the top of a file or on a function:
+
+```lua
+---@realm client
+-- Everything in this file is clientside
+```
+
+See the [`@realm` annotation reference](/annotations/realm) for the full syntax.
+
+### 2. Filename prefix detection
+
+Files beginning with `cl_`, `sv_`, or `sh_` are assigned their realm automatically:
+
+| Prefix | Realm |
+|---|---|
+| `cl_` | Client |
+| `sv_` | Server |
+| `sh_` | Shared |
+
+### 3. Directory-based detection
+
+Files in well-known directories are assigned a realm:
+
+| Path pattern | Realm |
+|---|---|
+| `lua/autorun/client/` | Client |
+| `lua/autorun/server/` | Server |
+| `lua/autorun/` | Shared |
+| `lua/client/` or `lua/vgui/` | Client |
+| Other recognized GMod paths | Shared or unresolved |
+
+### 4. Block-level narrowing
+
+GLuaLS narrows realm within `if CLIENT` / `if SERVER` blocks:
+
+```lua
+if CLIENT then
+    -- GLuaLS treats this block as client-only
+    surface.DrawRect(0, 0, 100, 100) -- OK here
+end
+
+if SERVER then
+    -- This block is server-only
+    ply:SetHealth(100) -- OK here
+end
+```
+
+### 5. API dependency hints
+
+If none of the above apply, GLuaLS may infer realm from the API you call (e.g., calling a server-only function implies server realm).
+
+---
+
+## Realm diagnostics
+
+| Code | Description |
+|---|---|
+| `gmod-realm-mismatch` | Hard realm mismatch — calling a function known to be realm-restricted from the wrong realm |
+| `gmod-realm-mismatch-heuristic` | Probable realm mismatch based on inference |
+| `gmod-unknown-realm` | Realm could not be determined; cross-realm risk is present |
+
+---
+
+## Disabling realm checks
+
+Disable realm diagnostics workspace-wide:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "realmDiagnostics": false
+  }
+}
+```
+
+Or suppress for a specific file:
+
+```lua
+---@realm shared
+-- This file intentionally has mixed realm code
+```
+
+---
+
+## Per-function realm overrides
+
+Override realm detection for an individual function:
+
+```lua
+---@realm server
+function MyAddon.ServerAction()
+    -- This function is always treated as server-side,
+    -- even if the surrounding file is shared
+end
+```
+
+---
+
+## Realm badges in hover
+
+Every hover tooltip for a GMod API function includes a realm badge showing where it runs:
+
+- **Client** badge — function is clientside only
+- **Server** badge — function is serverside only
+- **Shared** badge — function is available on both realms
+- **Menu** badge — function is available in the menu state only
+
+The badge appears in completions as well, so you can check a function's realm before inserting it.
+
+---
+
+## Custom realm patterns
+
+Override the directory and filename detection patterns:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "realmPatterns": {
+      "client": ["**/client/**", "cl_*.lua"],
+      "server": ["**/server/**", "sv_*.lua"],
+      "shared": ["**/shared/**", "sh_*.lua"]
+    }
+  }
+}
+```

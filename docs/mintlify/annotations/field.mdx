@@ -1,0 +1,100 @@
+---
+title: "@field"
+description: Add typed fields to a class definition.
+---
+
+## Overview
+
+`@field` declares a property of a class, with optional access control, optionality marker, and description.
+
+---
+
+## Syntax
+
+```lua
+---@field [access] fieldName type [description]
+---@field [access] fieldName? type [description]
+---@field [access] [keyType] valueType [description]
+```
+
+---
+
+## Basic fields
+
+Place `@field` annotations immediately after a `@class` line:
+
+```lua
+---@class User
+---@field id number User ID
+---@field name string Display name
+---@field email string Email address
+---@field createdAt string ISO timestamp
+```
+
+---
+
+## Optional fields
+
+Add `?` after the field name to mark it as potentially `nil`:
+
+```lua
+---@class Player
+---@field steamId string
+---@field nickname? string Optional display name
+---@field clan? string Optional clan tag
+```
+
+Accessing an optional field without a nil check will trigger `need-check-nil` when strict nil checking is enabled.
+
+---
+
+## Access control
+
+| Modifier | Description |
+|---|---|
+| `public` | Accessible everywhere (default) |
+| `private` | Only accessible within class methods |
+| `protected` | Only accessible in the class and subclasses |
+| `package` | Only accessible within the same file/package |
+
+```lua
+---@class MyClass
+---@field public name string
+---@field private m_count number
+---@field protected m_parent MyClass?
+```
+
+---
+
+## Index-type fields
+
+Define all keys of a type at once using `[keyType]` syntax:
+
+```lua
+---@class Config
+---@field [string] any Any string key maps to any value
+
+---@class NumberIndex
+---@field [number] Entity Array-style numeric indexing
+```
+
+---
+
+## Function fields
+
+Fields can be function types:
+
+```lua
+---@class EventEmitter
+---@field on fun(event: string, callback: fun(data: any)): nil
+---@field emit fun(event: string, data: any): nil
+---@field off fun(event: string): nil
+```
+
+---
+
+## Where to use @field
+
+- Always place `@field` annotations directly after their `@class` declaration
+- Fields defined elsewhere in the file may use `@field` as an injection with `(partial)` class or `inject-field` diagnostic rules
+- For `(exact)` classes, all fields must be declared in the class block

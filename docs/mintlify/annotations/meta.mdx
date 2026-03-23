@@ -1,0 +1,72 @@
+---
+title: "@meta"
+description: Mark a file as containing only type definitions, not runtime code.
+---
+
+## Overview
+
+`@meta` marks a file as a **type-only declaration file**. GLuaLS treats the file as pure annotation — it contributes type information to the analysis but its contents are never included in runtime code.
+
+---
+
+## Syntax
+
+```lua
+---@meta
+---@meta library_name
+```
+
+---
+
+## Usage
+
+Meta files are used to define types for external libraries, built-in APIs, or any code you want to type without having the actual implementation available:
+
+```lua
+---@meta
+
+---@class JSONLib
+local json = {}
+
+---@param str string
+---@return table
+function json.decode(str) end
+
+---@param value table
+---@return string
+function json.encode(value) end
+
+return json
+```
+
+---
+
+## Named meta files
+
+Providing a name after `@meta` associates the file with a specific library name, used for documentation and tooling:
+
+```lua
+---@meta mylib
+```
+
+---
+
+## Common uses
+
+- **Bundled GMod annotations** — the auto-downloaded annotations for GMod's API are all meta files
+- **Third-party library stubs** — declare types for libraries loaded at runtime
+- **Custom type files** — define extra types used across your workspace
+
+---
+
+## Meta files in workspace configuration
+
+Add meta files or directories to `workspace.library` to include them in analysis without treating them as project code:
+
+```json .gluarc.json
+{
+  "workspace": {
+    "library": ["./types", "./vendor/stubs"]
+  }
+}
+```

@@ -1,97 +1,82 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: GLua Language Server
+description: A fast, feature-rich language server and debugger for Garry's Mod Lua (GLua), built in Rust with a full-featured VSCode extension.
+mode: wide
 ---
 
-## Setting up
+## What is GLuaLS?
 
-Get your documentation site up and running in minutes.
+GLua Language Server (GLuaLS) is a dedicated language server and development environment for **Garry's Mod Lua (GLua)**. Built from the ground up in Rust, it delivers near-instant performance on large projects while providing GMod-specific intelligence that generic Lua tools cannot offer.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+The VSCode extension bundles everything you need: the language server, an integrated SRCDS debugger, a Class Explorer, realm-aware diagnostics, network validation, and AI integration — all working together out of the box.
 
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={3}>
+  <Card title="Install the extension" icon="download" href="/getting-started/installation">
+    Get up and running with the VSCode extension in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="bolt" href="/getting-started/quickstart">
+    Set up your first workspace with full analysis and diagnostics.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Configuration reference" icon="sliders" href="/configuration/overview">
+    Customize diagnostics, formatting, and GMod-specific behavior.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
-  </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+---
 
-Everything you need to create world-class documentation.
+## Core features
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Realm awareness" icon="globe" href="/language/realm-awareness">
+    Detects client/server/shared realms from filenames, includes, and API usage. Warns about cross-realm mistakes in real time.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Network validation" icon="network-wired" href="/language/network-analysis">
+    Validates `net.Start`/`net.Receive` payloads, catches mismatched write/read types, and delivers smart completion.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Scripted class support" icon="cube" href="/language/scripted-classes">
+    Automatic detection of ENT, SWEP, TOOL, and custom classes. Synthesizes NetworkVar getters/setters and AccessorFuncs automatically.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Hook intelligence" icon="link" href="/language/hook-intelligence">
+    Intelligent autocomplete for `hook.Add`, `hook.Run`, and `GM:` overrides. Registers custom hooks automatically.
   </Card>
-</Columns>
+  <Card title="Integrated debugger" icon="bug" href="/debugger/overview">
+    Full SRCDS debugger with breakpoints, variable inspection, live entity explorer, and Lua execution straight from the editor.
+  </Card>
+  <Card title="AI integration" icon="wand-magic-sparkles" href="/vscode/ai-integration">
+    Supercharge GitHub Copilot with MCP tools — run Lua, read console output, and fetch errors directly from the server.
+  </Card>
+</CardGroup>
 
-## Need inspiration?
+---
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Example: what GLuaLS catches
+
+GLuaLS catches GMod-specific mistakes that generic Lua tools miss entirely:
+
+<CodeGroup>
+```lua Realm mismatch
+-- sv_example.lua (server-side file)
+
+-- Warning: draw.SimpleText is a clientside-only function
+draw.SimpleText("Hello", "DermaDefault", 0, 0, Color(255, 255, 255))
+```
+
+```lua Network type mismatch
+-- sv_send.lua
+net.Start("PlayerData")
+net.WriteString(ply:Nick())
+net.WriteInt(ply:Frags(), 32)
+net.Send(ply)
+
+-- cl_receive.lua
+net.Receive("PlayerData", function()
+    local name = net.ReadString()
+    local frags = net.ReadFloat() -- Warning: expected ReadInt, not ReadFloat
+end)
+```
+
+```lua Invalid hook name
+-- Warning: "PlayerSpawne" is not a known GMod hook name
+hook.Add("PlayerSpawne", "MyAddon", function(ply) end)
+```
+</CodeGroup>

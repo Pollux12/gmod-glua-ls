@@ -1,0 +1,64 @@
+---
+title: "@nodiscard"
+description: Warn when a function's return value is discarded.
+---
+
+## Overview
+
+`@nodiscard` marks a function whose return value should always be used. Calling the function and ignoring the return value triggers a `discard-returns` diagnostic.
+
+---
+
+## Syntax
+
+```lua
+---@nodiscard
+---@nodiscard "Reason or alternative"
+```
+
+---
+
+## Usage
+
+```lua
+---@nodiscard
+---@return string
+function GetPlayerToken(ply)
+    return ply:SteamID64()
+end
+
+-- This will trigger a warning:
+GetPlayerToken(ply)  -- ❌ discard-returns: return value is unused
+
+-- This is fine:
+local token = GetPlayerToken(ply)  -- ✅
+```
+
+---
+
+## With a custom message
+
+Provide a string to explain why the return value matters:
+
+```lua
+---@nodiscard "Use the returned handle to cancel the timer"
+---@return TimerHandle
+function StartBackgroundTimer(callback)
+    -- ...
+end
+```
+
+The message appears in the diagnostic.
+
+---
+
+## When to use
+
+Use `@nodiscard` on functions where:
+- Silently ignoring the return value is almost always a bug (e.g., getting a handle, getting a result that must be checked)
+- The return value performs a side-effect or cleanup that callers must manage
+
+Common candidates in GMod:
+- Functions returning an `Entity` that the caller is expected to configure
+- Functions returning a success boolean
+- Token or handle-returning functions

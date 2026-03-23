@@ -1,0 +1,142 @@
+---
+title: Scripted classes
+description: GLuaLS automatically understands ENT, SWEP, EFFECT, and other scripted class patterns.
+---
+
+## Overview
+
+Garry's Mod uses a "scripted class" pattern where you define a global table (`ENT`, `SWEP`, etc.) in a specific file location and GMod registers it as a class. GLuaLS detects these classes automatically and provides:
+
+- Full method type inference for the class
+- Automatic synthesis of `NetworkVar` getter/setter pairs
+- Detection of `AccessorFunc`-generated methods
+- Type checking for required fields
+
+---
+
+## Automatic detection
+
+GLuaLS detects scripted classes by their **file path**. Any file under a recognized directory is treated as defining the appropriate table:
+
+| Directory pattern | Class table | Base class |
+|---|---|---|
+| `lua/entities/**/` | `ENT` | `base_entity` |
+| `lua/weapons/**/` | `SWEP` | `base_weapon` |
+| `lua/effects/**/` | `EFFECT` | (none) |
+| `lua/entities/**/` (npc prefix) | `ENT` | `base_ai` |
+
+The detected class table is automatically typed with the base class's methods and fields, so you get completions and type-checking without any annotation.
+
+---
+
+## NetworkVar synthesis
+
+When you call `self:NetworkVar(...)` inside a scripted class `SetupDataTables` function, GLuaLS automatically synthesizes the corresponding getter and setter methods:
+
+```lua
+function ENT:SetupDataTables()
+    self:NetworkVar("Int", 0, "Health")   -- synthesizes GetHealth() and SetHealth()
+    self:NetworkVar("Bool", 0, "Active")  -- synthesizes GetActive() and SetActive()
+    self:NetworkVar("String", 0, "Name")  -- synthesizes GetName() and SetName()
+end
+
+function ENT:Think()
+    local hp = self:GetHealth()  -- ✅ typed as number
+    self:SetActive(true)          -- ✅ typed, argument must be boolean
+    print(self:GetName())         -- ✅ typed as string
+end
+```
+
+### Supported NetworkVar types
+
+| NetworkVar type | Getter/setter types |
+|---|---|
+| `"Int"` | `number` |
+| `"Float"` | `number` |
+| `"Bool"` | `boolean` |
+| `"String"` | `string` |
+| `"Entity"` | `Entity` |
+| `"Vector"` | `Vector` |
+| `"Angle"` | `Angle` |
+
+---
+
+## AccessorFunc synthesis
+
+`AccessorFunc(table, member, name, ...)` generates getter and setter methods. GLuaLS detects these calls and synthesizes the methods:
+
+```lua
+AccessorFunc(ENT, "m_bOrient", "Orient", FORCE_BOOL)
+
+-- GLuaLS synthesizes:
+-- ENT:GetOrient() -> boolean
+-- ENT:SetOrient(value: boolean) -> nil
+```
+
+---
+
+## Base class inheritance
+
+Scripted classes in GMod inherit from base classes (like `base_gmodentity`). GLuaLS understands this chain and provides completions for all inherited methods.
+
+```lua
+function ENT:Use(ply)
+    self:EmitSound("...")    -- inherited from base_entity ✅
+    ply:ChatPrint("Hello")   -- Player method ✅
+end
+```
+
+---
+
+## Hook overrides in scripted classes
+
+GLuaLS understands that functions defined in a scripted class table override the engine hooks for that class:
+
+```lua
+function ENT:Think()    -- override of ENTITY:Think hook
+function ENT:Draw()     -- override of ENTITY:Draw hook
+function ENT:OnRemove() -- override of ENTITY:OnRemove hook
+```
+
+Completions suggest the correct signature for each override.
+
+---
+
+## Custom class scopes
+
+If you use a non-standard directory structure or custom class types, configure GLuaLS to recognize them:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "scriptedClassScopes": {
+      "include": [
+        {
+          "id": "my_panels",
+          "baseClass": "Panel",
+          "globalName": "PANEL",
+          "rootDir": "lua/panels",
+          "filePattern": "**/init.lua",
+          "scaffold": {
+            "files": [
+              { "path": "{{name}}/init.lua", "template": "panel_init.lua" }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+---
+
+## Disabling scripted class inference
+
+```json .gluarc.json
+{
+  "gmod": {
+    "scriptedClassEnabled": false
+  }
+}
+```

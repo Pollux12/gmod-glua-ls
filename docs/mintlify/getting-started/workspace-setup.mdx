@@ -1,0 +1,109 @@
+---
+title: Workspace setup
+description: Configure your workspace for addon and gamemode development with multi-root workspace support.
+---
+
+## Single addon or gamemode
+
+Open the addon or gamemode folder directly in VS Code. The extension auto-detects the structure based on whether the folder lives under `garrysmod/addons/` or `garrysmod/gamemodes/`.
+
+```
+my-addon/         ← open as workspace root
+├── lua/
+│   ├── autorun/
+│   └── my-addon/
+├── addon.json
+└── .gluarc.json  ← created automatically or via Settings UI
+```
+
+---
+
+## Multi-root workspaces
+
+When working on a gamemode alongside multiple addons, a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces) lets you add each as a separate folder while keeping their configurations isolated.
+
+Create a `.code-workspace` file:
+
+```json my-project.code-workspace
+{
+  "folders": [
+    { "path": "C:/srcds/garrysmod/gamemodes/my-gamemode" },
+    { "path": "C:/srcds/garrysmod/addons/my-addon-1" },
+    { "path": "C:/srcds/garrysmod/addons/my-addon-2" }
+  ]
+}
+```
+
+Each folder gets its own `.gluarc.json` and the language server runs a separate analysis context for each one. Settings, diagnostics, and file param defaults are all workspace-scoped.
+
+<Note>
+Do not open the entire `garrysmod/` folder as your workspace root. GLuaLS expects each root to be an individual addon or gamemode, not the entire game directory.
+</Note>
+
+---
+
+## Library paths
+
+If your project references shared utility files from outside the workspace root, add them as library paths:
+
+```json .gluarc.json
+{
+  "workspace": {
+    "library": [
+      "/path/to/shared-utils",
+      {
+        "path": "./external/mylibrary",
+        "ignoreDir": ["tests"],
+        "ignoreGlobs": ["**/*.spec.lua"]
+      }
+    ]
+  }
+}
+```
+
+Library files are analyzed and their types flow into your workspace, but diagnostics are not reported for them.
+
+---
+
+## Ignoring files and folders
+
+```json .gluarc.json
+{
+  "workspace": {
+    "ignoreDir": ["build", "dist", ".git"],
+    "ignoreGlobs": ["**/*.min.lua", "tests/**"]
+  }
+}
+```
+
+---
+
+## Custom require patterns
+
+If your project uses a custom module loader, map it to `require` behavior:
+
+```json .gluarc.json
+{
+  "runtime": {
+    "requireLikeFunction": ["include", "MYADDON.Require"],
+    "requirePattern": ["?.lua", "?/init.lua"]
+  }
+}
+```
+
+---
+
+## Annotations path
+
+By default, the VSCode extension automatically downloads and keeps GMod wiki annotations up to date. If you need to use a custom annotations build or disable auto-download:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "annotationsPath": "./my-custom-annotations",
+    "autoLoadAnnotations": false
+  }
+}
+```
+
+See [Annotations management](/vscode/annotations-management) for details on how auto-download works.

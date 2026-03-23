@@ -1,0 +1,86 @@
+---
+title: AI & Copilot integration
+description: Use the built-in MCP server to let GitHub Copilot interact directly with your running SRCDS server.
+---
+
+## Overview
+
+GLuaLS includes a built-in **MCP (Model Context Protocol) server** that exposes your connected SRCDS instance as tools for AI agents. When the debugger is connected, GitHub Copilot Chat (and other AI tools supporting MCP) can run Lua code, fetch console output, check errors, and query debug state — all without leaving the chat interface.
+
+<Note>
+AI features have been tested primarily with GitHub Copilot Chat. Other AI providers supporting MCP may work but are not officially supported.
+</Note>
+
+---
+
+## Available MCP tools
+
+When the debugger is connected, the following tools are available to AI agents:
+
+| Tool | Description |
+|---|---|
+| `run_lua` | Execute a Lua string on the server and return the output |
+| `run_command` | Send a console command and return the result |
+| `run_file` | Run a specific Lua file on the server |
+| `get_output` | Fetch recent console output from the server |
+| `get_errors` | Get recent Lua errors from the error tracking panel |
+| `get_debug_state` | Get the current debugger state (paused, running, realm, etc.) |
+| `list_realms` | List available realms (server, client, shared) |
+
+---
+
+## Setting up
+
+The MCP server starts automatically when the extension loads. To connect Copilot:
+
+<Steps>
+  <Step title="Connect the debugger">
+    The MCP tools only work when a debug session is active. [Set up and connect the debugger](/debugger/setup) to your SRCDS server first.
+  </Step>
+  <Step title="Configure Copilot to use the MCP server">
+    Add the GLuaLS MCP server to your Copilot configuration. See [Copilot MCP documentation](https://docs.github.com/en/copilot/how-tos/context/use-mcp) for instructions.
+
+    The MCP server runs locally at `http://localhost:<port>` — the port is shown in the extension output when the server starts.
+  </Step>
+  <Step title="Use Copilot Chat">
+    Once connected, Copilot can answer questions like:
+    - "What Lua errors are currently on the server?"
+    - "Run `print(LocalPlayer():Nick())` on the server"
+    - "What does the current console output show?"
+  </Step>
+</Steps>
+
+---
+
+## Example interactions
+
+```
+You: What Lua errors have occurred since I last checked?
+
+Copilot: [calls get_errors] I found 2 errors:
+1. addons/my-addon/lua/init.lua:42 - attempt to index nil value 'ply'
+   (occurred 3 times, last seen 2 minutes ago)
+2. addons/my-addon/lua/cl_hud.lua:18 - attempt to call nil value
+   (occurred 1 time, last seen 5 minutes ago)
+```
+
+```
+You: Run print(game.GetMap()) on the server
+
+Copilot: [calls run_lua] Output: gm_flatgrass
+```
+
+---
+
+## Security
+
+The MCP server includes several security controls:
+
+- **Local-only by default** — the server only accepts connections from `localhost`. Remote access is blocked unless explicitly configured.
+- **Auth token** — each session uses a cryptographically random token that must be included in requests
+- **Rate limiting** — requests are rate-limited to prevent abuse
+- **Tool allowlist** — you can restrict which tools are available to AI agents
+
+<Warning>
+The MCP server provides direct access to execute Lua on your game server. Only use this feature with trusted AI tools on a local development server. Never expose the MCP endpoint publicly.
+</Warning>

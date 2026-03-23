@@ -1,0 +1,115 @@
+---
+title: "@return"
+description: Document function return value types and descriptions.
+---
+
+## Overview
+
+`@return` declares the type(s) a function returns. Lua functions can return multiple values — add one `@return` per return value.
+
+---
+
+## Syntax
+
+```lua
+---@return type [name] [description]
+---@return (instance) type [name] [description]
+---@return (definition) type [name] [description]
+```
+
+---
+
+## Basic usage
+
+```lua
+---@return string name The player's name
+function GetPlayerName() return "Player" end
+```
+
+---
+
+## Multiple return values
+
+```lua
+---@return boolean success Whether the operation succeeded
+---@return string message Status message
+function DoOperation()
+    return true, "OK"
+end
+
+local ok, msg = DoOperation()
+-- ok: boolean, msg: string ✅
+```
+
+---
+
+## Optional return values
+
+```lua
+---@return Player | nil player The player, or nil if not found
+function FindPlayer(name) end
+```
+
+Or with `?` shorthand:
+
+```lua
+---@return Player? player
+function FindPlayer(name) end
+```
+
+---
+
+## Generic return values
+
+```lua
+---@generic T
+---@param value T
+---@return T
+function clone(value) return deepCopy(value) end
+```
+
+---
+
+## Function return values
+
+```lua
+---@return fun(x: number): string formatter
+function GetFormatter() end
+```
+
+---
+
+## `(instance)` modifier
+
+When a function returns `(instance)`, fields and methods assigned to the returned variable are scoped to that specific variable only — they do not pollute the global class:
+
+```lua
+---@return (instance) Panel
+function CreateMyPanel()
+    return vgui.Create("DPanel")
+end
+
+local panel = CreateMyPanel()
+function panel:Refresh() end  -- Only on this panel instance
+
+local other = CreateMyPanel()
+other:Refresh()  -- ❌ Error: Refresh doesn't exist here
+```
+
+This is useful for factory functions that return panels or entities with custom methods attached.
+
+---
+
+## `(definition)` modifier
+
+When a function returns `(definition)`, fields added to the returned variable are registered globally on the class:
+
+```lua
+---@return (definition) Entity
+function GetEntityBase()
+    return Entity
+end
+
+local base = GetEntityBase()
+base.MyNewMethod = function(self) end -- Added to all Entity instances globally
+```

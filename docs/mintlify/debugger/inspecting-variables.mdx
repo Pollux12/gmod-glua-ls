@@ -1,0 +1,88 @@
+---
+title: Inspecting variables
+description: Examine locals, globals, upvalues, and table contents while paused at a breakpoint.
+---
+
+## Overview
+
+When the debugger is paused, the **Variables** panel in the Run & Debug sidebar shows the current values of all accessible variables at the selected stack frame.
+
+---
+
+## Variable scopes
+
+Variables are organized into scopes:
+
+| Scope | Description |
+|---|---|
+| **Locals** | Variables defined in the current function |
+| **Upvalues** | Variables captured from enclosing scopes |
+| **Globals** | The global `_G` table (expandable) |
+
+---
+
+## Navigating nested values
+
+Tables and objects are expandable. Click the arrow next to a table variable to reveal its keys and values. There is no depth limit — you can drill down as deep as needed.
+
+```
+▼ ent (Entity)
+  ├ EntIndex: 42
+  ├ Class: prop_physics
+  ▼ GetNetworkVars (table)
+    ├ Health: 100
+    └ Active: true
+```
+
+---
+
+## Editing variable values
+
+When paused, you can modify variable values directly in the Variables panel:
+
+1. Click on the value in the **Variables** panel
+2. Type the new Lua expression to evaluate as the value
+3. Press Enter
+
+Changes take effect immediately in the running Lua state.
+
+<Warning>
+Editing variables only changes the value in the current Lua execution context. Side effects (like calling setters or updating networked values) require manual code execution.
+</Warning>
+
+---
+
+## Watch expressions
+
+Add expressions to the **Watch** panel to evaluate them every time execution pauses:
+
+1. Click the `+` button in the **Watch** panel
+2. Enter a Lua expression (e.g., `ply:Health()`, `#ents.GetAll()`)
+
+The expression is re-evaluated in the context of the currently selected stack frame each time you pause.
+
+---
+
+## Debug Console
+
+Open the **Debug Console** (`Ctrl+Shift+Y`) to evaluate arbitrary Lua expressions:
+
+```lua
+> ply:Nick()
+"PlayerName"
+
+> ents.FindByClass("prop_physics")
+{ [1] = (Entity: prop_physics), [2] = (Entity: prop_physics) }
+
+> ply:SetHealth(100)
+-- (no output, but health is set)
+```
+
+Expressions are evaluated in the context of the currently selected stack frame.
+
+---
+
+## Stop on entry and error
+
+- **`stopOnEntry`** — pause before any user Lua runs; useful for capturing startup variable state
+- **`stopOnError`** — pause when any `error()` or uncaught Lua exception occurs; the Variables panel shows state at the moment of the error

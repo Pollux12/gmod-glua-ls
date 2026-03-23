@@ -1,0 +1,83 @@
+---
+title: "@realm"
+description: Declare which GMod realm (client, server, or shared) a file or function belongs to.
+---
+
+## Overview
+
+`@realm` explicitly declares the realm context of a file or function. This is the highest-priority realm hint — it overrides filename prefix detection, directory-based detection, and `if CLIENT/SERVER` inference.
+
+---
+
+## Syntax
+
+```lua
+---@realm client
+---@realm server
+---@realm shared
+---@realm menu
+```
+
+---
+
+## File-level realm
+
+Place `@realm` at the very top of a file to mark the entire file:
+
+```lua
+---@realm client
+
+-- Everything in this file is treated as client-side
+surface.DrawRect(0, 0, 100, 100)  -- ✅ no realm mismatch warning
+
+ply:SetHealth(100)  -- ❌ server-only function in a client file
+```
+
+---
+
+## Function-level realm
+
+Override realm for a specific function within a shared file:
+
+```lua
+-- This is a shared file (no top-level @realm)
+
+---@realm server
+function MyAddon.KickPlayer(ply, reason)
+    ply:Kick(reason)
+end
+
+---@realm client
+function MyAddon.ShowNotification(msg)
+    notification.AddLegacy(msg, NOTIFY_GENERIC, 5)
+end
+```
+
+---
+
+## Realm values
+
+| Value | Description |
+|---|---|
+| `client` | Clientside (runs in the `CLIENT` state) |
+| `server` | Serverside (runs in the `SERVER` state) |
+| `shared` | Both client and server |
+| `menu` | Menu state (the GMod main menu) |
+
+---
+
+## When `@realm` is optional
+
+GLuaLS auto-detects realm from:
+- Filename prefix (`cl_*`, `sv_*`, `sh_*`)
+- Directory (`lua/client/`, `lua/server/`, `autorun/client/`, etc.)
+- `if CLIENT` / `if SERVER` blocks
+
+You only need `@realm` when auto-detection is wrong or you want to be explicit.
+
+---
+
+## See also
+
+- [Realm awareness](/language/realm-awareness) — how realm detection works end-to-end
+- [`gmod.realmPatterns`](/configuration/gmod) — configure custom detection patterns

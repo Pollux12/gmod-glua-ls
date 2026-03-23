@@ -1,0 +1,175 @@
+---
+title: "Diagnostics Configuration"
+description: Enable, disable, and tune the severity of every diagnostic code.
+---
+
+## Overview
+
+The `diagnostics` section controls which checks are active and how severe they appear. Every diagnostic code can be individually enabled, disabled, or re-levelled.
+
+---
+
+## Top-level options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `diagnostics.enable` | `boolean` | `true` | Enable diagnostics globally |
+| `diagnostics.disable` | `string[]` | `[]` | Codes to disable entirely |
+| `diagnostics.enables` | `string[]` | `[]` | Codes to explicitly enable (for codes that are Off by default) |
+| `diagnostics.globals` | `string[]` | `[]` | Global variable names to whitelist (suppress `undefined-global`) |
+| `diagnostics.globalsRegex` | `string[]` | `[]` | Regex patterns matching global names to whitelist |
+| `diagnostics.severity` | `object` | `{}` | Map of code → severity level |
+| `diagnostics.diagnosticInterval` | `integer` | `500` | Delay in milliseconds between a file change and diagnostics scan |
+
+---
+
+## Severity levels
+
+| Level | Appearance |
+|---|---|
+| `"error"` | Red error indicator, blocks type resolution display |
+| `"warning"` | Yellow warning indicator |
+| `"information"` | Blue information indicator |
+| `"hint"` | Subtle underline hint |
+
+---
+
+## Full diagnostic reference
+
+Codes marked **Off** are disabled by default and require `enables` to activate.
+
+### Syntax & annotations
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `syntax-error` | On | Error | Lua syntax errors |
+| `doc-syntax-error` | On | Error | Annotation syntax errors |
+| `annotation-usage-error` | On | Error | Incorrect annotation usage (e.g. `@class` inside a function) |
+| `unknown-doc-tag` | **Off** | Warning | Unrecognised annotation tag |
+| `incomplete-signature-doc` | **Off** | Warning | Function missing `@param` or `@return` documentation |
+| `missing-global-doc` | **Off** | Warning | Global function/class with no documentation |
+
+### Type checking
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `type-not-found` | On | Warning | Referenced type not found in scope |
+| `param-type-mismatch` | On | Warning | Argument type doesn't match declared `@param` type |
+| `missing-parameter` | On | Warning | Required parameter not passed |
+| `redundant-parameter` | On | Warning | Extra argument passed beyond declared parameters |
+| `assign-type-mismatch` | On | Warning | Assignment value type doesn't match declared type |
+| `return-type-mismatch` | **Off** | Warning | Returned type doesn't match declared `@return` type |
+| `missing-return` | **Off** | Warning | Function with `@return` annotation missing a return statement |
+| `missing-return-value` | On | Warning | `return` statement missing a required value |
+| `redundant-return-value` | **Off** | Warning | `return` statement has extra value(s) |
+| `cast-type-mismatch` | On | Warning | `@cast` target type is incompatible |
+| `generic-constraint-mismatch` | On | Information | Generic type argument violates constraint |
+| `enum-value-mismatch` | On | Warning | Value not part of the declared enum |
+| `need-check-nil` | On | Hint | Potential nil dereference (try `if x then ... end`) |
+
+### Fields & access
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `undefined-field` | On | Warning | Field doesn't exist on the type |
+| `missing-fields` | On | Warning | Required fields not initialised in a table literal |
+| `inject-field` | **Off** | Warning | Field assigned to a type outside its definition |
+| `duplicate-doc-field` | On | Warning | Same field documented multiple times in a class |
+| `undefined-doc-param` | On | Warning | `@param` names a parameter that doesn't exist in the function signature |
+| `access-invisible` | On | Warning | Accessing a `private` or `protected` member from outside its class |
+| `read-only` | On | Warning | Writing to a read-only value |
+
+### Variables & scoping
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `undefined-global` | On | Error | Global variable not defined or whitelisted |
+| `unused` | On | Hint | Variable or function is declared but never used |
+| `unused-self` | **Off** | Hint | `self` parameter is never used |
+| `redefined-local` | On | Hint | Local variable redefined in the same scope |
+| `redefined-label` | On | Warning | `::label::` defined multiple times |
+| `local-const-reassign` | On | Error | Reassigning a `<const>`-attributed local |
+
+### Control flow
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `unreachable-code` | On | Hint | Code after a `return`, `break`, or `error()` call |
+| `unnecessary-assert` | **Off** | Warning | `assert` that can never fail |
+| `unnecessary-if` | **Off** | Warning | `if` condition that is always true or false |
+| `invert-if` | **Off** | Warning | `if` block that could be simplified by inverting the condition |
+
+### Modules & requires
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `duplicate-require` | On | Hint | Module required more than once in the same file |
+| `require-module-not-visible` | On | Warning | `require()` path target is not visible in the workspace |
+
+### Documentation
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `deprecated` | On | Hint | Using a function, field, or class marked `@deprecated` |
+| `discard-returns` | On | Warning | Return value of a `@nodiscard` function is discarded |
+| `circle-doc-class` | On | Warning | Circular class inheritance detected |
+
+### Code style
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `code-style-check` | **Off** | Warning | Code style violations |
+| `duplicate-index` | On | Warning | Same table key used more than once |
+| `duplicate-set-field` | **Off** | Warning | Same field set multiple times |
+| `non-literal-expressions-in-assert` | **Off** | Warning | Non-literal values inside `assert()` |
+| `unbalanced-assignments` | On | Warning | Different number of values and variables in a multi-assignment |
+| `preferred-local-alias` | On | Hint | Suggest caching a global in a local variable |
+| `await-in-sync` | On | Warning | Using `---@async` function result in a synchronous context |
+
+### Type definitions
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `duplicate-type` | **Off** | Warning | Type defined more than once |
+| `global-in-non-module` | **Off** | Warning | Global defined in a non-module file scope |
+| `attribute-param-type-mismatch` | On | Warning | Attribute parameter type mismatch |
+| `attribute-missing-parameter` | On | Warning | Required attribute parameter missing |
+| `attribute-redundant-parameter` | On | Warning | Extra attribute parameter |
+| `call-non-callable` | **Off** | Warning | Calling a value that is not callable |
+
+### GMod-specific
+
+| Code | Default | Severity | Description |
+|---|---|---|---|
+| `gmod-invalid-hook-name` | On | Warning | Invalid or unknown GMod hook name |
+| `gmod-realm-mismatch` | On | Warning | Definite realm mismatch: client API in server realm (or vice versa) |
+| `gmod-realm-mismatch-heuristic` | On | Warning | Probable realm mismatch based on inferred evidence |
+| `gmod-unknown-realm` | On | Hint | Realm could not be determined for a realm-sensitive call |
+| `gmod-net-missing-network-counterpart` | On | Warning | `net.Start` block with no `net.Receive` in the opposite realm (or vice versa) |
+| `gmod-net-read-write-order-mismatch` | On | Warning | `net.Read*` order doesn't match `net.Write*` order |
+| `gmod-net-read-write-type-mismatch` | On | Warning | `net.Read*` type doesn't match corresponding `net.Write*` type |
+| `gmod-unknown-net-message` | On | Warning | Unregistered net message identifier |
+| `gmod-duplicate-system-registration` | On | Hint | Duplicate registration for `net.Receive`, `concommand.Add`, `timer.Create`, etc. |
+
+---
+
+## Example configuration
+
+```json .gluarc.json
+{
+  "diagnostics": {
+    "enable": true,
+    "diagnosticInterval": 500,
+    "globals": ["GAMEMODE", "PLUGIN", "GM"],
+    "globalsRegex": ["^PLUGIN_"],
+    "enables": ["missing-return", "return-type-mismatch"],
+    "disable": ["call-non-callable"],
+    "severity": {
+      "unused": "hint",
+      "param-type-mismatch": "information",
+      "need-check-nil": "hint",
+      "undefined-field": "information"
+    }
+  }
+}
+```

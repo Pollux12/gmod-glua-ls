@@ -1,0 +1,89 @@
+---
+title: VGUI support
+description: GLuaLS understands VGUI panel hierarchies and provides code lens and inlay hints.
+---
+
+## Overview
+
+GLuaLS has built-in support for VGUI (GMod's panel GUI system). It understands `vgui.Create()` calls, the panel inheritance hierarchy, and provides rich IDE features for VGUI development.
+
+---
+
+## Panel type inference
+
+When you call `vgui.Create("Type")`, GLuaLS automatically types the returned value as the corresponding panel class:
+
+```lua
+local frame = vgui.Create("DFrame")   -- typed as DFrame
+frame:SetTitle("My Window")            -- DFrame method ✅
+
+local btn = frame:Add("DButton")       -- typed as DButton
+btn:SetText("Click me")                -- DButton method ✅
+btn.DoClick = function(self)
+    -- self is typed as DButton ✅
+end
+```
+
+---
+
+## Code lens
+
+When `gmod.vgui.codeLensEnabled` is true, GLuaLS shows code lens annotations above panel creations and definitions:
+
+- A **"Panel definition"** link above `vgui.Create()` calls, clicking which navigates to the panel class definition in the annotations
+- A **references** count above panel class definitions
+
+Enable in `.gluarc.json`:
+
+```json .gluarc.json
+{
+  "gmod": {
+    "vgui": {
+      "codeLensEnabled": true
+    }
+  }
+}
+```
+
+---
+
+## Inlay hints for `:Add()`
+
+When using `panel:Add("Type")`, GLuaLS shows the panel type in an inlay hint:
+
+```lua
+local btn = frame:Add("DButton")  -- DButton
+```
+
+---
+
+## Custom panels
+
+GLuaLS understands the standard VGUI inheritance pattern used to define custom panels:
+
+```lua
+local PANEL = {}
+
+function PANEL:Init()
+    self.label = self:Add("DLabel")
+end
+
+function PANEL:Paint(w, h)
+    draw.RoundedBox(4, 0, 0, w, h, color_black)
+end
+
+vgui.Register("MyPanel", PANEL, "DPanel")
+-- Now MyPanel is recognized as a panel type
+-- that inherits from DPanel
+```
+
+After `vgui.Register(name, PANEL, base)`, the name `"MyPanel"` is recognized in subsequent `vgui.Create("MyPanel")` calls with all methods from `PANEL` table plus inherited `DPanel` methods.
+
+---
+
+## Configuration
+
+| Setting | Default | Description |
+|---|---|---|
+| `gmod.vgui.codeLensEnabled` | `false` | Show code lens on panel creations/definitions |
+| `gmod.vgui.enabled` | `true` | Enable VGUI type inference entirely |

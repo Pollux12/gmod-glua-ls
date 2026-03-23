@@ -1,0 +1,145 @@
+---
+title: "@class"
+description: Define classes with inheritance, generics, and field access control.
+---
+
+## Overview
+
+`@class` defines a named type that other annotations can reference. Classes support single and multiple inheritance, generic type parameters, access control, and field definitions.
+
+---
+
+## Syntax
+
+```lua
+---@class ClassName
+---@class ClassName : ParentClass
+---@class ClassName : Parent1, Parent2
+---@class (exact) ClassName
+---@class (partial) ClassName
+---@class ClassName<T>
+```
+
+---
+
+## Basic class
+
+```lua
+---@class Animal
+---@field name string Animal name
+---@field species string Species
+local Animal = {}
+
+function Animal:Speak()
+    print(self.name .. " makes a sound")
+end
+```
+
+---
+
+## Inheritance
+
+Use `: ParentClass` to extend another class. The child class inherits all fields and methods from the parent.
+
+```lua
+---@class Dog : Animal
+---@field breed string Dog breed
+local Dog = setmetatable({}, { __index = Animal })
+
+function Dog:Fetch(item)
+    -- inherits Animal fields: self.name, self.species ✅
+end
+```
+
+### Multiple inheritance
+
+```lua
+---@class Flyable
+---@field maxAltitude number
+
+---@class Swimmable
+---@field maxDepth number
+
+---@class Duck : Animal, Flyable, Swimmable
+---@field featherColor string
+```
+
+---
+
+## Exact classes
+
+Mark a class as `(exact)` to prevent dynamic field additions. Any field assigned outside the class definition causes a diagnostic:
+
+```lua
+---@class (exact) Point
+---@field x number
+---@field y number
+
+local p = Point.new(1, 2)
+p.z = 3 -- ❌ Error: cannot add field 'z' to exact type Point
+```
+
+---
+
+## Partial classes
+
+Use `(partial)` to extend an existing class without redeclaring all its fields:
+
+```lua
+-- In one file:
+---@class Animal
+---@field name string
+
+-- In another file:
+---@class (partial) Animal
+---@field weight number  -- adds weight to Animal without losing name
+```
+
+---
+
+## Generic classes
+
+Add type parameters with angle brackets. Type parameters can be used in field types:
+
+```lua
+---@class Container<T>
+---@field items T[]
+---@field capacity number
+
+---@type Container<string>
+local stringContainer = { items = {}, capacity = 10 }
+stringContainer.items[1] = "hello" -- ✅ typed as string
+```
+
+---
+
+## Field access control
+
+Use access modifiers in `@field`:
+
+```lua
+---@class MyClass
+---@field public name string Accessible everywhere
+---@field private m_id number Only accessible in class methods
+---@field protected m_parent MyClass Accessible in subclasses
+```
+
+---
+
+## Attaching a class to a local variable
+
+The class annotation immediately above a `local` statement attaches to that variable. The type becomes an instance of the class:
+
+```lua
+---@class Player
+local Player = {}
+-- Player is now typed as "instance of Player class"
+```
+
+To type as a *constructor* table instead, use `@type`:
+
+```lua
+local Player = {}
+---@type Player
+local ply = Player.new()
+```
