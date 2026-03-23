@@ -272,7 +272,7 @@ fn collect_truthy_guarded_names_with_not_chain(
     }
 
     let names = collect_truthy_guarded_names(&current_expr, condition_guard_ranges);
-    if not_count % 2 == 0 {
+    if not_count.is_multiple_of(2) {
         names
     } else {
         HashSet::new()
