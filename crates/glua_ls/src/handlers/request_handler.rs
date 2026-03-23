@@ -20,6 +20,7 @@ use serde::Serialize;
 use crate::{
     context::{RequestTaskMetadata, ServerContext},
     handlers::{
+        auto_insert_end::{AutoInsertEndRequest, on_auto_insert_end_handler},
         diagnostic::{on_pull_document_diagnostic, on_pull_workspace_diagnostic},
         document_type_format::on_type_formatting_handler,
         emmy_gutter::{
@@ -165,6 +166,7 @@ pub async fn on_request_handler(
         EmmyGutterRequest => on_emmy_gutter_handler,
         EmmyGutterDetailRequest => on_emmy_gutter_detail_handler,
         EmmySyntaxTreeRequest => on_emmy_syntax_tree_handler,
+        AutoInsertEndRequest => on_auto_insert_end_handler,
         EmmyAnnotatorRequest => on_emmy_annotator_handler,
         SelectionRangeRequest => on_document_selection_range_handle,
         Completion => on_completion_handler,

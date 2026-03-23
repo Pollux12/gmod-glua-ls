@@ -1,4 +1,5 @@
 mod code_actions_test;
+mod auto_insert_end_test;
 mod completion_resolve_test;
 mod completion_test;
 mod definition_test;

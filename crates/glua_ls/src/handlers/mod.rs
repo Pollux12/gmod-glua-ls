@@ -1,4 +1,5 @@
 mod call_hierarchy;
+pub(crate) mod auto_insert_end;
 mod code_actions;
 mod code_lens;
 mod command;
