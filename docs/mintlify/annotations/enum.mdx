@@ -5,7 +5,7 @@ description: Mark a Lua table as an enumeration with named values.
 
 ## Overview
 
-`@enum` marks a local table as an enumeration type. All values in the table become valid members of the enum, and GLuaLS enforces that only valid enum values are used where the enum type is expected.
+`@enum` marks a local table as an enumeration type. All values in the table become valid members of the enum. GLuaLS can report invalid enum usage via the `enum-value-mismatch` diagnostic when enabled.
 
 ---
 

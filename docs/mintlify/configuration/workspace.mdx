@@ -21,7 +21,6 @@ The `workspace` section tells the language server what files to analyse, what to
 | `workspace.encoding` | `string` | `"utf-8"` | File encoding for all Lua files in the workspace |
 | `workspace.enableReindex` | `boolean` | `false` | Trigger a full workspace reindex when files change |
 | `workspace.reindexDuration` | `integer` | `5000` | Delay in ms before a reindex fires after a file change |
-| `workspace.preloadFileSize` | `integer` | `0` | Maximum file size in bytes to preload. `0` = unlimited |
 | `workspace.packageDirs` | `string[]` | `[]` | Partial library load — only load package declarations from these dirs, not full analysis |
 
 ---
@@ -83,7 +82,7 @@ Common directories to ignore for GMod projects:
     "moduleMap": [
       {
         "pattern": "^libs/(.*)",
-        "target": "lua/libs/$1"
+        "replace": "lua/libs/$1"
       }
     ]
   }
@@ -132,4 +131,4 @@ These settings can also be configured via VS Code's settings (`gluals.*` prefix)
 |---|---|---|---|---|
 | `gluals.workspace.enableReindex` | `workspace.enableReindex` | `boolean` | `false` | Enable reindex after file changes |
 | `gluals.workspace.reindexDuration` | `workspace.reindexDuration` | `integer` | `5000` | Delay before reindex (ms) |
-| `gluals.source.roots` | `source.roots` | `array` | `[]` | Additional source roots |
+| `gluals.workspace.workspaceRoots` | `workspace.workspaceRoots` | `array` | `[]` | Additional workspace roots |

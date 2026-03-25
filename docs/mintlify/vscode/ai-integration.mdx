@@ -25,7 +25,6 @@ When the debugger is connected, the following tools are available to AI agents:
 | `get_output` | Fetch recent console output from the server |
 | `get_errors` | Get recent Lua errors from the error tracking panel |
 | `get_debug_state` | Get the current debugger state (paused, running, realm, etc.) |
-| `list_realms` | List available realms (server, client, shared) |
 
 ---
 
@@ -33,12 +32,11 @@ When the debugger is connected, the following tools are available to AI agents:
 
 The MCP server starts automatically when the extension loads. The extension will also automatically register tools with GitHub Copilot.
 
-
 To connect Copilot:
 
 <Steps>
   <Step title="Connect the debugger">
-    The MCP tools only work when a debug session is active. [Set up and connect the debugger](/debugger/setup) to your SRCDS server first.
+    Code execution tools (`run_lua`, `run_command`, `run_file`) require an active debug session. `get_output`, `get_errors`, and `get_debug_state` can work whenever the MCP server is running.
   </Step>
   <Step title="Configure Copilot to use the MCP server">
     This should now be automatically done by the VSCode Extension. Make sure the "Garry's Mod Language Server" toolset is enabled.

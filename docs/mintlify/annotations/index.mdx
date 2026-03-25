@@ -5,7 +5,7 @@ description: EmmyLua/LuaCATS type annotations supported by GLuaLS.
 
 ## What are annotations?
 
-Annotations are special comments prefixed with `---@` that provide type information to the language server. They appear above functions, variables, and class definitions to let GLuaLS understand your code's structure and provide accurate completions, type checking, and hover documentation.
+Annotations are special comments prefixed with `---@` that provide type and other key information to the language server. They appear above functions, variables, and class definitions to let GLuaLS understand your code's structure and provide accurate completions, type checking, and hover documentation
 
 ```lua
 ---@param ply Player The player who joined
@@ -15,7 +15,7 @@ function OnPlayerJoin(ply)
 end
 ```
 
-Annotations have no impact on runtime and are seen as regular comments by Garry's Mod — they are purely for the language server and documentation. Annotations help the language server understand your code better by giving it accurate data, saving it from expensive calculations and guesswork to infer types on its own, and allowing for richer editor features.
+Annotations have no impact on runtime and are seen as regular comments by Garry's Mod — they are purely for the language server and documentation. They are based on the EmmyLua annotation style, with some extensions and changes for GMod-specific concepts. Full backwards compatibility with EmmyLua and LuaLS is maintained where possible.
 
 ---
 

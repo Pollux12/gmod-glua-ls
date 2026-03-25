@@ -5,7 +5,7 @@ description: Add typed fields to a class definition.
 
 ## Overview
 
-`@field` declares a property of a class, with optional access control, optionality marker, and description.
+`@field` declares a property of a class, with optional access control, optionality marker, and description. Field annotations help enable accurate types and autocomplete for a class, far more accurate than the language server's inference system can achieve on its own. It is recommended to annotate any variable fields that will need to be regularly accessed.
 
 ---
 
@@ -51,7 +51,7 @@ Accessing an optional field without a nil check will trigger `need-check-nil` wh
 ## Access control
 
 <Info>
-This annotation does not do anything in GLuaLS, nor is it too relevant for Garry's Mod - it has been kept for compatibility with EmmyLua. Marking fields as private or protected has no impact on runtime behavior, but the language server will still recognize the modifiers and can provide diagnostics if you try to access private/protected fields from outside the class or subclass
+Access modifiers do not have any impact on runtime behaviour and are not required. The language server will still recognize the modifiers and can provide diagnostics if you try to access private/protected fields from outside the class or subclass. This is more for style enforcement and documentation purposes, rather than actually controlling access.
 </Info>
 
 | Modifier | Description |
@@ -95,11 +95,13 @@ Fields can be function types:
 ---@field off fun(event: string): nil
 ```
 
+<Tip>
+This is intended for cases where a function for a class is not defined within the file, such as when it's added by C++ code. If the function is defined in Lua, it is better to annotate the function itself rather than adding it as a field, otherwise you may end up with duplicate definitions.
+</Tip>
+
 ---
 
 ## Tips and best practices
 
-- Field annotations help enable accurate types and autocomplete for a class, far more accurate than the language server's inference engine can achieve on its own.
-- Can be used to document the shape of tables that are not explicitly constructed in code, such as configuration tables or objects created by C++ code.
-- It is recommended to always place `@field` annotations directly after their `@class` declaration.
-- In GLuaLS, the `inject-field` diagnostic is disabled by default, with all classes acting as `(partial)` and allowing fields to be defined anywhere in the file. This means fields are not strictly required.
+- You should always place `@field` annotations directly after their `@class` declaration.
+- In GLuaLS, the `inject-field` diagnostic is disabled by default, with all classes acting as `(partial)` and allowing fields to be defined anywhere in the file. This means fields are not strictly required, however, they are useful to provide better type and autocomplete for the class.

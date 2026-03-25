@@ -5,7 +5,7 @@ description: Configure your workspace for addon and gamemode development with mu
 
 import ConfigTip from "/snippets/config-tip.mdx"
 
-## Single addon or gamemode
+## Single addon or gamemode <a id="single-addon-or-gamemode" />
 
 Open the addon or gamemode folder directly in VS Code. The extension auto-detects the structure based on whether the folder lives under `garrysmod/addons/` or `garrysmod/gamemodes/`.
 
@@ -33,7 +33,7 @@ Open the addon or gamemode folder directly in VS Code. The extension auto-detect
 
 ---
 
-## Multi-root workspaces
+## Multi-root workspaces <a id="multi-root-workspaces" />
 
 When working on a gamemode alongside multiple addons, a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces) lets you add each as a separate folder while keeping their configurations isolated.
 
@@ -45,7 +45,7 @@ Do not open the entire `garrysmod/` folder as your workspace root. GLuaLS expect
 
 ---
 
-## Library paths
+## Library paths <a id="library-paths" />
 
 If your project references shared utility files from outside the workspace root, add them as library paths:
 
@@ -69,7 +69,7 @@ Library files are analyzed and their types flow into your workspace, but diagnos
 
 ---
 
-## Ignoring files and folders
+## Ignoring files and folders <a id="ignoring-files-and-folders" />
 
 <ConfigTip />
 
@@ -85,7 +85,7 @@ Library files are analyzed and their types flow into your workspace, but diagnos
 
 ---
 
-## Custom require patterns
+## Custom require patterns <a id="custom-require-patterns" />
 
 If your project uses a custom module loader, map it to `require` behavior:
 
@@ -102,7 +102,7 @@ If your project uses a custom module loader, map it to `require` behavior:
 
 ---
 
-## Annotations path
+## Annotations path <a id="annotations-path" />
 
 By default, the VSCode extension automatically downloads and keeps GMod wiki annotations up to date. If you need to use a custom annotations build or disable auto-download:
 

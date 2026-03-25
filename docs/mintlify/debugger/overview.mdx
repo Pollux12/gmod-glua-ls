@@ -15,8 +15,8 @@ The VSCode extension includes an automatic setup and install process for this de
 
 The debugger uses the **LRDB** (Lua Remote Debugger) protocol over TCP:
 
-1. **gm_rdb** — a Garry's Mod binary module loaded by the SRCDS process. This is used to interact with the game engine and exposes a websocket for the extension.
-2. **GLuaLS Extension** — the VS Code extension connects to the websocket started by the binary module. It sends commands and receives data.
+1. **gm_rdb** — a Garry's Mod binary module loaded by the SRCDS process. This is used to interact with the game engine and exposes a TCP debug endpoint for the extension.
+2. **GLuaLS Extension** — the VS Code extension connects to the TCP endpoint started by the binary module. It sends commands and receives data.
 
 Your Lua files are served from their source locations in your workspace, so breakpoints set on local files map to the exact running code. The extension should be able to set this up for you.
 

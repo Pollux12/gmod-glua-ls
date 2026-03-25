@@ -63,8 +63,8 @@ GLOBAL_C = true
 A `---@diagnostic disable` with no matching `enable` suppresses for the rest of the file:
 
 ```lua
----@diagnostic disable: lowercase-global
--- All lowercase global assignments in this file are suppressed
+---@diagnostic disable: undefined-global
+-- All undefined-global diagnostics in this file are suppressed
 ```
 
 ---
@@ -87,7 +87,6 @@ legacyFunction(someGlobal)
 | `undefined-global` | Global used that's defined externally (e.g., from another file loaded at runtime) |
 | `param-type-mismatch` | Intentional duck-typing or known false positive |
 | `unused` | Variable used as documentation or placeholder |
-| `lowercase-global` | Global intentionally named in lowercase |
 | `inject-field` | Adding fields to a type outside its definition intentionally |
 
 ---

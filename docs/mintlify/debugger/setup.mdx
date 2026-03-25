@@ -71,10 +71,10 @@ Use **attach** when the server is already running (most common for development):
       "type": "gluals_gmod",
       "request": "attach",
       "name": "Attach to SRCDS",
-      "host": "localhost",
+      "host": "127.0.0.1",
       "port": 21111,
       "sourceRoot": "${workspaceFolder}",
-      "stopOnEntry": false,
+      "stopOnEntry": true,
       "stopOnError": false
     }
   ]
@@ -125,11 +125,11 @@ The debug toolbar appears at the top of the screen when connected.
 
 | Property | Type | Description |
 |---|---|---|
-| `host` | `string` | Server hostname or IP. Default: `"localhost"` |
+| `host` | `string` | Server hostname or IP. Default: `"127.0.0.1"` |
 | `port` | `number` | Port `gm_rdb` is listening on. Default: `21111` |
 | `sourceRoot` | `string` | Workspace path to map server files to. Default: `${workspaceFolder}` |
 | `sourceFileMap` | `object` | Map server paths to workspace paths manually |
-| `stopOnEntry` | `boolean` | Pause at first line when connecting. Default: `false` |
+| `stopOnEntry` | `boolean` | Pause at first line when connecting. Default: `true` |
 | `stopOnError` | `boolean` | Pause when a Lua error is thrown. Default: `false` |
 | `realm` | `string` | Default realm for code execution (`"server"` or `"client"`) |
 

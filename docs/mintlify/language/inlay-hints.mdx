@@ -8,8 +8,6 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 Inlay hints are small labels that appear **inside your code** without modifying it, providing extra context like parameter names for positional arguments, inferred types for untyped locals, and index keys in large tables.
 
-{/* TODO: Add screenshot of inlay hints */}
-
 
 ## Types of hints
 
@@ -118,27 +116,34 @@ All hint types can be toggled individually. A full example:
     "indexHint": false,
     "overrideHint": true,
     "closingEndHint": false,
-    "paramName": "all",
-    "arrayIndex": "enable"
+    "closingEndHintControlFlow": false,
+    "closingEndHintMinLines": 15,
+    "enumParamHint": true,
+    "metaCallHint": true
   }
 }
 ```
 
-### `paramName` values
+### Additional hint settings
 
-| Value | Behavior |
-|---|---|
-| `"all"` | Show hint for all arguments |
-| `"literal"` | Only show for literal values (strings, numbers, booleans) |
-| `"disable"` | Don't show parameter hints |
+| Setting | Default | Description |
+|---|---|---|
+| `hint.enumParamHint` | `false` | Show named enum values for numeric arguments matching enum types |
+| `hint.metaCallHint` | `true` | Show call hints for `__call` metamethod invocations |
+| `hint.closingEndHintControlFlow` | `false` | Include control flow constructs in closing-end hints |
+| `hint.closingEndHintMinLines` | `15` | Minimum number of lines before closing-end hints are shown |
 
-### `arrayIndex` values
+### Strict mode array index hints
 
-| Value | Behavior |
-|---|---|
-| `"enable"` | Show index hints for all implicit array entries |
-| `"auto"` | Only show when the table has both keyed and sequential entries |
-| `"disable"` | Never show index hints |
+`strict.arrayIndex` controls whether implicit numeric table keys are treated as strict index hints and diagnostics.
+
+```json .gluarc.json
+{
+  "strict": {
+    "arrayIndex": true
+  }
+}
+```
 
 
 ## Inline values

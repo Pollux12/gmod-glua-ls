@@ -15,12 +15,15 @@ description: Declare which GMod realm (client, server, or shared) a file or func
 ---@realm client
 ---@realm server
 ---@realm shared
----@realm menu
 ```
 
 ---
 
-## File-level realm
+## File-level realm <a id="file-level-realm" />
+
+<Warning>
+File level realm annotations are experimental and are intended for cases where the entire file is being inferred as the wrong realm. See #function-level-realm annotations for the recommended way to annotate realms.
+</Warning>
 
 Place `@realm` at the very top of a file to mark the entire file:
 
@@ -35,7 +38,7 @@ ply:SetHealth(100)  -- ❌ server-only function in a client file
 
 ---
 
-## Function-level realm
+## Function-level realm <a id="function-level-realm" />
 
 Override realm for a specific function within a shared file:
 
@@ -62,22 +65,21 @@ end
 | `client` | Clientside (runs in the `CLIENT` state) |
 | `server` | Serverside (runs in the `SERVER` state) |
 | `shared` | Both client and server |
-| `menu` | Menu state (the GMod main menu) |
 
 ---
 
-## When `@realm` is optional
+## When `@realm` is missing
 
 GLuaLS auto-detects realm from:
 - Filename prefix (`cl_*`, `sv_*`, `sh_*`)
 - Directory (`lua/client/`, `lua/server/`, `autorun/client/`, etc.)
 - `if CLIENT` / `if SERVER` blocks
 
-You only need `@realm` when auto-detection is wrong or you want to be explicit.
+This system is not perfect and can lead to incorrect realm inference, especially in complex files.
 
 ---
 
 ## See also
 
 - [Realm awareness](/language/realm-awareness) — how realm detection works end-to-end
-- [`gmod.realmPatterns`](/configuration/gmod) — configure custom detection patterns
+

@@ -43,12 +43,19 @@ end
 
 ## Common GMod patterns
 
-In GMod, async-style patterns are used with `coroutine.wrap` and `timer.Simple`:
+GLuaLS supports async-style workflows using coroutines and callback-based APIs. GMod does not include a built-in `await()` function, but many addons use helper wrappers to mimic this behavior.
 
 ```lua
 ---@async
 function PLUGIN:FetchPlayerData(steamId)
-    local data = await(http.Fetch("https://api.example.com/player/" .. steamId))
-    return data
+    local response
+    http.Fetch("https://api.example.com/player/" .. steamId, function(body)
+        response = body
+    end)
+
+    coroutine.yield() -- wait for the callback to set `response`
+    return response
 end
 ```
+
+`await-in-sync` support is available in GLuaLS for equivalent coroutine helper patterns, so this model can be checked by the server-side analysis.

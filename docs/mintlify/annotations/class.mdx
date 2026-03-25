@@ -22,7 +22,7 @@ description: Define classes with inheritance, generics, and field access control
 
 ---
 
-## Basic class
+## Basic class <a id="basic-class" />
 
 ```lua
 ---@class Animal
@@ -37,7 +37,7 @@ end
 
 ---
 
-## Inheritance
+## Inheritance <a id="inheritance" />
 
 Use `: ParentClass` to extend another class. The child class inherits all fields and methods from the parent.
 
@@ -51,7 +51,7 @@ function Dog:Fetch(item)
 end
 ```
 
-### Multiple inheritance
+### Multiple inheritance <a id="multiple-inheritance" />
 
 ```lua
 ---@class Flyable
@@ -66,12 +66,12 @@ end
 
 ---
 
-## Exact classes
+## Exact classes <a id="exact-classes" />
 
 Mark a class as `(exact)` to prevent dynamic field additions. Any field assigned outside the class definition causes a diagnostic:
 
 <Info>
-This annotation does not do anything in GLuaLS - all classes are effectively partial by default. It has been kept for compatibility with EmmyLua.
+This annotation does not do anything in GLuaLS, due to all classes being partial by default, and the related diagnostics being disabled. It has been kept for compatibility with EmmyLua.
 </Info>
 
 ```lua
@@ -85,12 +85,12 @@ p.z = 3 -- ❌ Error: cannot add field 'z' to exact type Point
 
 ---
 
-## Partial classes
+## Partial classes <a id="partial-classes" />
 
 Use `(partial)` to extend an existing class without redeclaring all its fields:
 
 <Info>
-This annotation does not do anything in GLuaLS - all classes are effectively partial by default. It has been kept for compatibility with EmmyLua.
+This annotation does not do anything in GLuaLS, due to all classes being partial by default, and the related diagnostics being disabled. It has been kept for compatibility with EmmyLua.
 </Info>
 
 
@@ -105,7 +105,7 @@ This annotation does not do anything in GLuaLS - all classes are effectively par
 ```
 ---
 
-## Generic classes
+## Generic classes <a id="generic-classes" />
 
 Add type parameters with angle brackets. Type parameters can be used in field types:
 
@@ -121,12 +121,12 @@ stringContainer.items[1] = "hello" -- ✅ typed as string
 
 ---
 
-## Field access control
+## Field access control <a id="field-access-control" />
 
 Use access modifiers in `@field`:
 
 <Info>
-This annotation does not do anything in GLuaLS, nor is it too relevant for Garry's Mod - it has been kept for compatibility with EmmyLua. Marking fields as private or protected has no impact on runtime behavior, but the language server will still recognize the modifiers and can provide diagnostics if you try to access private/protected fields from outside the class or subclass
+Access modifiers do not have any impact on runtime behaviour and are not required. The language server will still recognize the modifiers and can provide diagnostics if you try to access private/protected fields from outside the class or subclass. This is more for style enforcement and documentation purposes, rather than actually controlling access.
 </Info>
 
 ```lua
@@ -136,9 +136,11 @@ This annotation does not do anything in GLuaLS, nor is it too relevant for Garry
 ---@field protected m_parent MyClass Accessible in subclasses
 ```
 
+See [@field](/annotations/field) for more information.
+
 ---
 
-## Attaching a class to a local variable
+## Attaching a class to a local variable <a id="attaching-a-class-to-a-local-variable" />
 
 The class annotation immediately above a `local` statement attaches to that variable. The type becomes an instance of the class:
 

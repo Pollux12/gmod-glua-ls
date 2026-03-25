@@ -148,7 +148,6 @@ If you use a non-standard directory structure or custom class types, configure G
 | `id` | Unique identifier for this class scope |
 | `label` | Display name in the Class Explorer sidebar |
 | `classGlobal` | The global table name used in scripts (e.g., `ENT`, `SWEP`, `PANEL`) |
-| `baseClass` | The base class to inherit methods from |
 | `path` | Path segments used for display grouping in the Class Explorer |
 | `include` | Glob patterns matching files that belong to this class type |
 | `rootDir` | Root directory for scaffolded files |
@@ -306,12 +305,4 @@ The `path` value is relative to the class `rootDir` (e.g., `lua/entities/`), and
 
 ## Disabling scripted class inference
 
-<ConfigTip />
-
-```json .gluarc.json
-{
-  "gmod": {
-    "scriptedClassEnabled": false
-  }
-}
-```
+Individual scripted class scopes can be disabled by removing them from the `scriptedClassScopes` configuration.

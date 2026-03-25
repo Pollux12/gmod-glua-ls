@@ -96,12 +96,19 @@ Network analysis works across files. Messages registered in one file, sent in a 
 ```json .gluarc.json
 {
   "gmod": {
-    "networkDiagnostics": true
+    "network": {
+      "enabled": true,
+      "diagnostics": {
+        "missingCounterpart": true,
+        "orderMismatch": true,
+        "typeMismatch": true
+      }
+    }
   }
 }
 ```
 
-Disable network diagnostics by setting `"networkDiagnostics": false`.
+Disable network diagnostics by setting `"gmod.network.enabled": false`, or adjust individual checks under `gmod.network.diagnostics`.
 
 ---
 

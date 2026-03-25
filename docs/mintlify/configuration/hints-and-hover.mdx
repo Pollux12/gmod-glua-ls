@@ -17,7 +17,6 @@ Inlay hints are inline type/name annotations shown inside the editor alongside c
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `hint.enable` | `boolean` | `true` | Enable all inlay hints |
 | `hint.paramHint` | `boolean` | `true` | Show parameter names next to call arguments |
 | `hint.localHint` | `boolean` | `true` | Show inferred types next to local variable declarations |
 | `hint.indexHint` | `boolean` | `true` | Show named indexes for array table entries |
@@ -87,15 +86,7 @@ Semantic tokens provide richer syntax highlighting based on type analysis — va
 
 ---
 
-## Signature help (`signature.*`)
 
-Signature help shows the function signature and active parameter as you type an argument.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `signature.detailSignatureHelper` | `boolean` | `true` | Enable signature help popup while typing function arguments |
-
----
 
 ## Code lens (`codeLens.*`)
 
@@ -119,7 +110,6 @@ These settings can also be configured via VS Code's settings (`gluals.*` prefix)
 
 | VSCode Setting | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|---|
-| `gluals.hint.enable` | `hint.enable` | `boolean` | `true` | Enable inlay hints |
 | `gluals.hint.paramHint` | `hint.paramHint` | `boolean` | `true` | Parameter name hints |
 | `gluals.hint.localHint` | `hint.localHint` | `boolean` | `true` | Local variable type hints |
 | `gluals.hint.indexHint` | `hint.indexHint` | `boolean` | `true` | Named array index hints |
@@ -143,7 +133,6 @@ These settings can also be configured via VS Code's settings (`gluals.*` prefix)
 ```json .gluarc.json
 {
   "hint": {
-    "enable": true,
     "paramHint": true,
     "localHint": false,
     "closingEndHint": true,
@@ -154,9 +143,6 @@ These settings can also be configured via VS Code's settings (`gluals.*` prefix)
   },
   "semanticTokens": {
     "enable": true
-  },
-  "signature": {
-    "detailSignatureHelper": true
   },
   "codeLens": {
     "enable": true

@@ -23,18 +23,18 @@ description: Mark a function as an accessor generator that synthesizes Get/Set p
 
 ## How it works
 
-When GLuaLS sees a call to a function marked with `@accessorfunc`, it generates typed getter and setter methods on the object:
+When GLuaLS sees a call to a function marked with `@accessorfunc`, it generates accessor methods on the object:
 
 ```lua
 -- Built-in AccessorFunc is annotated with @accessorfunc 3
 AccessorFunc(ENT, "m_bOrient", "Orient", FORCE_BOOL)
 
 -- GLuaLS synthesizes:
--- ENT:GetOrient() -> boolean
--- ENT:SetOrient(value: boolean) -> nil
+-- ENT:GetOrient() -> any
+-- ENT:SetOrient(value: any) -> nil
 ```
 
-The getter/setter types are inferred from the type of the backing field (here `m_bOrient`).
+At present, getter/setter values are typed as `any` in the implementation; stronger inference from the backing field is planned.
 
 ---
 

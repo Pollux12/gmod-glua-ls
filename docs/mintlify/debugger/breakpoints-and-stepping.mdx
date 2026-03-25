@@ -62,7 +62,7 @@ Click any frame to navigate to that file and inspect the variables at that level
 
 ## Stop on entry
 
-Set `"stopOnEntry": true` in `launch.json` to pause at the first Lua instruction after connecting. Useful when debugging server startup behavior.
+Set `"stopOnEntry": true` in `launch.json` (default: `true`) to pause at the first Lua instruction after connecting. Useful when debugging server startup behavior.
 
 ---
 
@@ -79,6 +79,6 @@ The call stack at the moment of the error is preserved so you can inspect the fu
 To pause at an arbitrary point without a file breakpoint, use the **Break Here** command:
 
 1. Open the Command Palette (`Ctrl+Shift+P`)
-2. Run **GLua: Break Here**
+2. Run **Debug: Break Here**
 
 This inserts a debug break at the current Lua execution point.

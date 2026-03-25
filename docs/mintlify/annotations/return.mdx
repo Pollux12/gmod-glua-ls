@@ -81,6 +81,10 @@ function GetFormatter() end
 
 ## `(instance)` modifier
 
+<Danger>
+This annotation is intended for internal use only. It is very likely that you do not need to use this modifier.
+</Danger>
+
 When a function returns `(instance)`, fields and methods assigned to the returned variable are scoped to that specific variable only — they do not pollute the global class:
 
 ```lua
@@ -101,6 +105,10 @@ This is useful for factory functions that return panels or entities with custom 
 ---
 
 ## `(definition)` modifier
+
+<Danger>
+This annotation is intended for internal use only. It is very likely that you do not need to use this modifier.
+</Danger>
 
 When a function returns `(definition)`, fields added to the returned variable are registered globally on the class:
 

@@ -113,7 +113,12 @@ Hook intelligence works automatically when you use `hook.Add`, `hook.Run`, or de
 
 ## Configuration
 
+Hook validation and mappings are now controlled through the `gmod` section in `.gluarc.json`, in particular `gmod.hookMappings` and the global diagnostics settings.
+
 | Setting | Default | Description |
 |---|---|---|
-| `gmod.hooks.diagnosticInvalidHookName` | `true` | Warn on unrecognized hook names |
-| `gmod.hooks.diagnosticEnabled` | `true` | Enable all hook diagnostics |
+| `gmod.hookMappings.methodToHook` | `{}` | Map method names to hook names (e.g. `"Think": "Think"`) |
+| `gmod.hookMappings.emitterToHook` | `{}` | Map custom emitter functions to hook names |
+| `gmod.hookMappings.methodPrefixes` | `[]` | Custom method prefixes for inferred `GM:` hook methods |
+| `diagnostics.disable` | `[]` | Disable individual diagnostics (e.g., `"gmod-invalid-hook-name"`) |
+

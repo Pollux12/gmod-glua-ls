@@ -16,7 +16,8 @@ The `runtime`, `strict`, `doc`, and `references` sections control how the langua
 | `runtime.extensions` | `string[]` | `[]` | Additional file extensions to treat as Lua (e.g., `".lua.txt"`) |
 | `runtime.requireLikeFunction` | `string[]` | `[]` | Functions that behave like `require` for module resolution |
 | `runtime.requirePattern` | `string[]` | `[]` | Require path resolution patterns (e.g., `"?.lua"`, `"?/init.lua"`) |
-| `runtime.nonstandardSymbol` | `string[]` | see below | Non-standard Lua syntax tokens to accept |
+| `runtime.version` | `string` | `LuaJIT` | Lua version for runtime behavior (not used in GLuaLS) |
+| `runtime.nonstandardSymbol` | `string[]` | see below | Non-standard Lua syntax tokens to accept (not used in GLuaLS) |
 | `runtime.frameworkVersions` | `string[]` | `[]` | Framework version identifiers |
 | `runtime.special` | `object` | `{}` | Map function names to special behaviours |
 
@@ -25,7 +26,7 @@ The `runtime`, `strict`, `doc`, and `references` sections control how the langua
 The following non-standard symbols are enabled by default to match GLua syntax:
 
 ```
-["//", "/***/", "continue", "!=", "||", "&&", "!"]
+["//", "/**/", "continue", "!=", "||", "&&", "!"]
 ```
 
 All available non-standard symbols:

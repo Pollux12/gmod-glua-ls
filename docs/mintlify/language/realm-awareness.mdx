@@ -83,9 +83,9 @@ If none of the above apply, GLuaLS may infer realm from the code within a file (
 
 | Code | Description |
 |---|---|
-| `gmod-realm-mismatch` | Hard realm mismatch — calling a function known to be realm-restricted from the wrong realm |
+| `gmod-realm-mismatch` | Confident realm mismatch based on annotations |
 | `gmod-realm-mismatch-heuristic` | Probable realm mismatch based on inference |
-| `gmod-unknown-realm` | Realm could not be determined; cross-realm risk is present |
+| `gmod-unknown-realm` | Realm could not be determined |
 
 ---
 
@@ -101,8 +101,8 @@ Disable realm diagnostics workspace-wide:
 
 ```json .gluarc.json
 {
-  "gmod": {
-    "realmDiagnostics": false
+  "diagnostics": {
+    "disable": ["gmod-realm-mismatch", "gmod-realm-mismatch-heuristic", "gmod-unknown-realm"]
   }
 }
 ```
@@ -139,45 +139,7 @@ Every hover tooltip for a GMod API function includes a realm badge showing where
 - **Client** badge — function is clientside only
 - **Server** badge — function is serverside only
 - **Shared** badge — function is available on both realms
-- **Menu** badge — function is available in the menu state only (not used in GLuaLS)
 
 The badge appears in completions as well, so you can check a function's realm before inserting it.
 
 The realm is used to filter autocomplete suggestions to reduce noise and prevent invalid code from being suggested. For example, if you're editing a clientside file, server-only functions will be hidden from autocomplete and vice versa. If it seems like some functions are missing from autocomplete, check the realm!
-
----
-
-## VSCode integration
-
-The GLuaLS VSCode extension includes a **Realm View** panel in the sidebar that shows the inferred realm assignment for every file in your workspace. This gives you a quick overview of which files run on the client, server, or both.
-
-Each file appears with a color-coded realm badge:
-
-| Indicator | Meaning |
-|---|---|
-| **Client** | File is clientside only (`CLIENT` realm) |
-| **Server** | File is serverside only (`SERVER` realm) |
-| **Shared** | File runs on both realms |
-| **Menu** | File runs in the main menu context |
-| **Unknown** | Realm could not be determined |
-
-Expanding a file in the panel reveals per-function realm assignments, so you can see at a glance how block-level narrowing and `---@realm` annotations affect individual functions. Clicking an entry navigates directly to that file or function in the editor.
-
----
-
-## Custom realm patterns
-
-Override the directory and filename detection patterns:
-<ConfigTip />
-
-```json .gluarc.json
-{
-  "gmod": {
-    "realmPatterns": {
-      "client": ["**/client/**", "cl_*.lua"],
-      "server": ["**/server/**", "sv_*.lua"],
-      "shared": ["**/shared/**", "sh_*.lua"]
-    }
-  }
-}
-```

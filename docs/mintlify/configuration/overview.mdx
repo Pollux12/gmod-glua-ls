@@ -182,8 +182,12 @@ Some settings are specific to the VSCode extension and are not part of `.gluarc.
 | `gluals.ls.startParameters` | `array` | `[]` | Additional language server arguments |
 | `gluals.ls.globalConfigPath` | `string` | `""` | Path to global `.emmyrc.json` |
 | `gluals.language.completeAnnotation` | `boolean` | `true` | Auto-insert `---` on line break after comment |
-| `gluals.decorations.*` | `boolean` | `false` | Underline decorations for globals, mutable locals/params, readonly locals/params |
-| `gluals.source.roots` | `array` | `[]` | Additional source roots for the debugger |
+| `gluals.decorations.globals` | `boolean` | `false` | Underline global variables |
+| `gluals.decorations.mutableLocals` | `boolean` | `false` | Underline mutable local variables |
+| `gluals.decorations.mutableParams` | `boolean` | `false` | Underline mutable function parameters |
+| `gluals.decorations.readonlyLocals` | `boolean` | `false` | Underline readonly local variables |
+| `gluals.decorations.readonlyParams` | `boolean` | `false` | Underline readonly function parameters |
+| `gluals.workspace.workspaceRoots` | `array` | `[]` | Additional workspace roots for file resolution |
 | `gluals.inlineValues.enable` | `boolean` | `null` | Show inline values during debug |
 | `gluals.semanticTokens.enable` | `boolean` | `null` | Enable semantic tokens |
 

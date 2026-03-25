@@ -64,9 +64,15 @@ If your framework uses a custom table instead of `GM` or `PLUGIN`, configure GLu
 ```json .gluarc.json
 {
   "gmod": {
-    "hookMappings": [
-      { "prefix": "COMPONENT", "method": "Run" }
-    ]
+    "hookMappings": {
+      "methodToHook": {
+        "Run": "PlayerSpawn"
+      },
+      "emitterToHook": {
+        "COMPONENT": "CustomHook"
+      },
+      "methodPrefixes": ["COMPONENT"]
+    }
   }
 }
 ```
