@@ -2,6 +2,7 @@
 title: Annotations management
 description: GLuaLS automatically downloads and keeps GMod wiki annotations up to date.
 ---
+import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
@@ -34,14 +35,21 @@ To force an annotations update:
 
 If you need to use a custom annotations build or are in an environment without internet access:
 
+| VSCode Setting | .gluarc.json Key | Default | Description |
+|---|---|---|---|
+| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `true` | Auto-download and load GMod wiki annotations |
+
+### Via VSCode settings
+
 ```json VS Code settings
 {
   "gluals.gmod.autoLoadAnnotations": false
 }
 ```
 
-Or in `.gluarc.json` to override per-workspace:
+### Via .gluarc.json (per-workspace)
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "gmod": {
@@ -55,6 +63,10 @@ Or in `.gluarc.json` to override per-workspace:
 ## Using a custom annotations path
 
 Point GLuaLS at your own annotations folder instead of the auto-downloaded ones:
+
+| .gluarc.json Key | Type | Default | Description |
+|---|---|---|---|
+| `gmod.annotationsPath` | `string` | `null` | Path to custom annotations folder |
 
 ```json .gluarc.json
 {

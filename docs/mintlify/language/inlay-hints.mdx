@@ -2,6 +2,7 @@
 title: Inlay hints
 description: Contextual labels shown inline in the editor for parameter names, types, and more.
 ---
+import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
@@ -9,7 +10,6 @@ Inlay hints are small labels that appear **inside your code** without modifying 
 
 {/* TODO: Add screenshot of inlay hints */}
 
----
 
 ## Types of hints
 
@@ -24,6 +24,7 @@ SetGlobalString(/*index:*/ "CurrentMap", /*val:*/ "gm_flatgrass")
 
 Enable with `hint.paramHint`:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "hint": {
@@ -43,6 +44,7 @@ local name /*: string*/ = ent:GetName()
 
 Enable with `hint.localHint`:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "hint": {
@@ -65,6 +67,7 @@ local t = {
 
 Enable with `hint.indexHint`:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "hint": {
@@ -101,12 +104,12 @@ end --[[ function MyAddon.LongFunction ]]
 
 Enable with `hint.closingEndHint`.
 
----
 
 ## Global configuration
 
 All hint types can be toggled individually. A full example:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "hint": {
@@ -137,7 +140,6 @@ All hint types can be toggled individually. A full example:
 | `"auto"` | Only show when the table has both keyed and sequential entries |
 | `"disable"` | Never show index hints |
 
----
 
 ## Inline values
 
@@ -150,6 +152,7 @@ local pos = ply:GetPos() -- Vector(512, 248, 64)
 
 Enable with:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "inlineValues": {
@@ -157,3 +160,7 @@ Enable with:
   }
 }
 ```
+
+## VSCode integration
+
+Inlay hints are shown inline in the editor when enabled. Configure which hint types to display in the [settings panel](/configuration/overview#settings-panel-recommended) — see [Hints & Hover settings](/configuration/hints-and-hover) for the full reference.

@@ -2,12 +2,12 @@
 title: Formatting
 description: GLuaLS formats your GLua files with built-in presets or an external formatter.
 ---
+import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
 GLuaLS includes an opinionated Lua formatter. Format the current file with `Shift+Alt+F` (or right-click → **Format Document**).
 
----
 
 ## Built-in presets
 
@@ -21,6 +21,7 @@ Three built-in presets cover common style choices across the GMod community:
 
 Set the preset in `.gluarc.json`:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "format": {
@@ -29,12 +30,12 @@ Set the preset in `.gluarc.json`:
 }
 ```
 
----
 
 ## Style overrides
 
 Override individual rules within a preset using `styleOverrides`:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "format": {
@@ -64,19 +65,19 @@ Override individual rules within a preset using `styleOverrides`:
 
 See [Configuration: Formatting](/configuration/formatting) for the full list.
 
----
 
 ## External formatter
 
 Use an external formatting tool (e.g., `stylua`) instead of the built-in formatter:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "format": {
-    "externalFormatter": {
-      "command": "stylua",
+    "externalTool": {
+      "program": "stylua",
       "args": ["-"],
-      "standaloneFlags": ["--check"]
+      "timeout": 10
     }
   }
 }
@@ -84,13 +85,11 @@ Use an external formatting tool (e.g., `stylua`) instead of the built-in formatt
 
 The external formatter receives file content over stdin and must write the formatted result to stdout.
 
----
 
 ## EditorConfig
 
 GLuaLS reads `.editorconfig` files for indent settings. EditorConfig values override corresponding `styleOverrides` entries.
 
----
 
 ## Format on save
 
@@ -100,17 +99,16 @@ Enable format-on-save in VS Code:
 {
   "editor.formatOnSave": true,
   "[lua]": {
-    "editor.defaultFormatter": "pollux.gmod-glua-ls"
+    "editor.defaultFormatter": "Pollux.gmod-glua-ls"
   }
 }
 ```
-
----
 
 ## Disabling formatting
 
 Disable the formatter entirely:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "format": {

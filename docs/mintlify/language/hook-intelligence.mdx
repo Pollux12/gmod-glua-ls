@@ -5,7 +5,7 @@ description: GLuaLS validates hook names, infers parameter types, and autocomple
 
 ## Overview
 
-GMod's hook system is central to almost every addon. GLuaLS understands `hook.Add`, `hook.Remove`, `hook.Run`, `hook.Call`, and `GM:` overrides — providing completions, type inference, and validation for all of them.
+GMod's hook system is central to almost every addon and gamemode. GLuaLS understands `hook.Add`, `hook.Remove`, `hook.Run`, `hook.Call`, and `GM:` definitions — providing completions, type inference, and validation for all of them.
 
 ---
 
@@ -19,7 +19,11 @@ hook.Add("PlayerSpan", "MyAddon", function(ply) -- ❌ did you mean PlayerSpawn?
 end)
 ```
 
-All ~200 core GMod hooks are recognized. Custom hooks defined elsewhere in your workspace via `hook.Run("MyCustomHook", ...)` are also tracked.
+All base gmod hooks are recognised via the base gmod hook definitions. Custom hooks defined elsewhere in your workspace via `hook.Run("MyCustomHook", ...)` are also tracked.
+
+<Info>
+For custom hooks, while autocomplete will work as long as it has been used once, it will lack any "Goto" definition, parameter type inference, or other advanced hook features unless a `GM:` function has been defined for that hook.
+</Info>
 
 ---
 
@@ -58,7 +62,7 @@ The snippet includes the correct number of parameters with their names.
 
 ---
 
-## GM: overrides
+## GM: hook definitions
 
 Files in a gamemode context (e.g., `gamemodes/*/gamemode/`) define `GM` as the gamemode table. GLuaLS recognizes `function GM:HookName()` as a hook override:
 
@@ -68,6 +72,8 @@ function GM:PlayerSpawn(ply)
     self.BaseClass.PlayerSpawn(self, ply)
 end
 ```
+
+A `GM:` hook definition is required for advanced features to work on custom hooks.
 
 ---
 
@@ -95,7 +101,15 @@ hook.Add("MyAddon.OnPlayerAction", "handler", function(ply, action)
 end)
 ```
 
+<Info>
+Advanced features such as parameter type inference, hover descriptions, function validation, usages and view definitions will only work for custom hooks if a `GM:` definition has been created for that hook.
+</Info>
+
 ---
+
+## VSCode integration
+
+Hook intelligence works automatically when you use `hook.Add`, `hook.Run`, or define `GM:` methods. Configure validation behavior in the [settings panel](/configuration/overview#settings-panel-recommended) — see [GMod settings](/configuration/gmod#hooks) for the full reference.
 
 ## Configuration
 

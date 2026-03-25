@@ -77,6 +77,21 @@ Set `autoRequireFunction` to your project's custom loader if you use one:
 
 ---
 
+## VSCode extension settings
+
+These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+
+| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+|---|---|---|---|---|
+| `gluals.completion.enable` | `completion.enable` | `boolean` | `true` | Enable autocompletion |
+| `gluals.completion.callSnippet` | `completion.callSnippet` | `boolean` | `true` | Show call snippets |
+| `gluals.completion.stagedCallSnippets` | `completion.stagedCallSnippets` | `boolean` | `true` | Stage API call snippets |
+| `gluals.completion.postfix` | `completion.postfix` | `string` | `"@"` | Postfix trigger character |
+| `gluals.completion.autoRequire` | `completion.autoRequire` | `boolean` | `true` | Auto-insert require statements |
+| `gluals.completion.baseFunctionIncludesName` | `completion.baseFunctionIncludesName` | `boolean` | `true` | Include name in base function |
+
+---
+
 ## Example
 
 ```json .gluarc.json

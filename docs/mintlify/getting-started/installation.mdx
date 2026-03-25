@@ -3,6 +3,8 @@ title: Installation
 description: Install the GLua Language Server VSCode extension and get set up in minutes.
 ---
 
+---
+
 ## VSCode extension (recommended)
 
 The VSCode extension is the recommended way to use GLuaLS. It handles everything automatically: downloading the language server binary, GMod wiki annotations, the debugger module, and keeping them all up to date.
@@ -30,11 +32,148 @@ The VSCode extension is the recommended way to use GLuaLS. It handles everything
 Do not install other Lua language server extensions alongside GLuaLS. Extensions such as EmmyLua, LuaLS, and GLua Enhanced will conflict. Create a dedicated VS Code profile for GMod development if you need other Lua tools for unrelated projects.
 </Warning>
 
+## Workspace structure
+
+GLuaLS works best when each workspace folder represents a single addon or gamemode. The extension auto-detects the structure and configures itself accordingly.
+
+<Tip>
+If you are working on a gamemode alongside multiple addons, add each as a separate folder in a multi-root workspace rather than opening the entire `garrysmod/` folder.
+</Tip>
+
+
+**Expected structure:**
+
+<Tree>
+  <Tree.Folder name="garrysmod" openable="false" defaultOpen>
+    <Tree.Folder name="addons" openable="false" defaultOpen>
+      <Tree.Folder name="my-addon <- Workspace Root" defaultOpen>
+        <Tree.File name="lua" />
+        <Tree.File name="addon.json" />
+        <Tree.File name="..." />
+      </Tree.Folder>
+    </Tree.Folder>
+    <Tree.Folder name="gamemodes" openable="false" defaultOpen>
+      <Tree.Folder name="my-gamemode <- Workspace Root" defaultOpen>
+        <Tree.File name="gamemode" />
+        <Tree.File name="..." />
+      </Tree.Folder>
+    </Tree.Folder>
+  </Tree.Folder>
+</Tree>
+
+The root folder for each opened workspace within VSCode should be as labelled above. Essentially, you can have the gamemode folder as a workspace and each individual addon as a workspace. If you need multiple addons, add each as a separate folder in a multi-root workspace rather than opening the entire `garrysmod/` folder for best results.
+
+<Warning>
+All folders within the multi-root workspace must be from the same game directory. Do not mix some folders from client and some from SRCDS.
+</Warning>
+
+For example, if you are working on a gamemode with two addons, you would open each individually into VSCode as separate workspaces.
+
+This would be a multi-root workspace with three folders added:
+- `garrysmod/addons/my-addon-1/`
+- `garrysmod/addons/my-addon-2/`
+- `garrysmod/gamemodes/my-gamemode/`
+
+With this setup, your VSCode explorer should look similar to this:
+
+<Tree>
+  <Tree.Folder name="my-addon-1" defaultOpen>
+    <Tree.File name="lua" />
+    <Tree.File name="addon.json" />
+    <Tree.File name="..." />
+  </Tree.Folder>
+  <Tree.Folder name="my-addon-2" defaultOpen>
+    <Tree.File name="lua" />
+    <Tree.File name="addon.json" />
+    <Tree.File name="..." />
+  </Tree.Folder>
+  <Tree.Folder name="my-gamemode" defaultOpen>
+    <Tree.File name="gamemode" />
+    <Tree.File name="..." />
+  </Tree.Folder>
+</Tree>
+
+<Tip>
+If you're using a multi-root workspace, you only need to set the debugger up for one of the folders. The same configuration will be valid for anything within the same Garry's Mod directory.
+</Tip>
+
+---
+
+## Verify everything is working
+
+Open any `.lua` file in your project. You should immediately see:
+
+- **Syntax highlighting** with semantic token coloring
+- **Autocomplete** as you type (press `Ctrl+Space` to trigger manually)
+- **Hover documentation** when you hover over GMod API functions
+- **Realm badges** next to functions showing their client/server/shared status
+- **Diagnostics** as squiggly underlines for potential issues
+
+It should only take a couple of seconds to index and load your workspace after the extension is done loading. The extension is extremely quick, even on the most complex of workspaces.
+
+<Tip>
+If you are not seeing any diagnostics but expected to, check the Garry's Mod Language Server section in the output panel for any errors.
+</Tip>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Get started" icon="rocket" href="/getting-started/workspace-setup">
+    Configure your workspace for the best GLuaLS experience.
+  </Card>
+  <Card title="Settings UI" icon="sliders" href="/configuration/overview">
+    Configure `.gluarc.json` with the interactive settings panel.
+  </Card>
+  <Card title="Annotations" icon="tag" href="/annotations">
+    Improve type accuracy with EmmyLua/LuaCATS.
+  </Card>
+  <Card title="Configuration reference" icon="file-code" href="/configuration/overview">
+    Reference all GLuaLS configuration options.
+  </Card>
+</CardGroup>
+
+---
+
+## Explore features
+
+<CardGroup cols={2}>
+  <Card title="Class Explorer" icon="cube" href="/language/scripted-classes">
+    Browse scripted classes and jump to members.
+  </Card>
+  <Card title="Debugger" icon="bug" href="/debugger/overview">
+    Attach, set breakpoints, and inspect live state.
+  </Card>
+  <Card title="AI integration" icon="wand-magic-sparkles" href="/vscode/ai-integration">
+    Runtime-aware Copilot/MCP enhancements.
+  </Card>
+  <Card title="Realm awareness" icon="globe" href="/language/realm-awareness">
+    Detect client/server/shared code issues.
+  </Card>
+  <Card title="Network validation" icon="network-wired" href="/language/network-analysis">
+    Validate `net.*` send/receive flows.
+  </Card>
+  <Card title="Hook intelligence" icon="link" href="/language/hook-intelligence">
+    Hook autocomplete and docs.
+  </Card>
+  <Card title="Scripted class support" icon="cube" href="/language/scripted-classes">
+    Tools and generated helpers for ENT/SWEP/TOOL.
+  </Card>
+  <Card title="Code intelligence" icon="search" href="/language/code-intelligence">
+    Smart completion, jump-to-definition, and diagnostics for Lua & GMod APIs.
+  </Card>
+</CardGroup>
+
 ---
 
 ## Other editors
 
 GLuaLS can work with any LSP-compatible editor, but many advanced features (debugger, Class Explorer, settings UI, etc.) are exclusive to the VSCode extension.
+
+<Note>
+Zed support is planned. It will have fewer features than the VSCode extension due to Zed's more limited extension API. Other editors are not currently planned.
+</Note>
 
 ### Install the binary
 
@@ -54,33 +193,4 @@ cargo build --release
 
 The binary is at `target/release/glua_ls` (or `glua_ls.exe` on Windows).
 
-<Note>
-Zed support is in progress. It will have fewer features than the VSCode extension due to Zed's more limited extension API.
-</Note>
-
 ---
-
-## Workspace structure
-
-GLuaLS works best when each workspace folder represents a single addon or gamemode. The extension auto-detects the structure and configures itself accordingly.
-
-**Supported structures:**
-
-```
-garrysmod/
-└── addons/
-    └── my-addon/     ← open this as a workspace folder
-        ├── lua/
-        ├── addon.json
-        └── ...
-
-garrysmod/
-└── gamemodes/
-    └── my-gamemode/  ← open this as a workspace folder
-        ├── gamemodes/
-        └── ...
-```
-
-<Tip>
-If you are working on a gamemode alongside multiple addons, add each as a separate folder in a multi-root workspace rather than opening the entire `garrysmod/` folder.
-</Tip>

@@ -3,6 +3,8 @@ title: "Hints & Hover Settings"
 description: Configure inlay hints, inline values, hover documentation, semantic tokens, and signature help.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Overview
 
 These settings control the visual editor hints overlaid on code, the documentation shown on hover, and the appearance of semantic syntax highlighting.
@@ -24,7 +26,7 @@ Inlay hints are inline type/name annotations shown inside the editor alongside c
 | `hint.enumParamHint` | `boolean` | `false` | Show enum member names next to literal integer arguments |
 | `hint.closingEndHint` | `boolean` | `true` | Show `-- end FunctionName` hints after closing `end` keywords |
 | `hint.closingEndHintControlFlow` | `boolean` | `false` | Also show closing end hints for `if`, `while`, `do`, `for` blocks |
-| `hint.closingEndHintMinLines` | `integer` | `10` | Minimum number of lines a block must span before a closing hint appears |
+| `hint.closingEndHintMinLines` | `integer` | `15` | Minimum number of lines a block must span before a closing hint appears |
 
 ### Inlay hint examples
 
@@ -111,8 +113,33 @@ Signature help shows the function signature and active parameter as you type an 
 
 ---
 
+## VSCode extension settings
+
+These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+
+| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+|---|---|---|---|---|
+| `gluals.hint.enable` | `hint.enable` | `boolean` | `true` | Enable inlay hints |
+| `gluals.hint.paramHint` | `hint.paramHint` | `boolean` | `true` | Parameter name hints |
+| `gluals.hint.localHint` | `hint.localHint` | `boolean` | `true` | Local variable type hints |
+| `gluals.hint.indexHint` | `hint.indexHint` | `boolean` | `true` | Named array index hints |
+| `gluals.hint.overrideHint` | `hint.overrideHint` | `boolean` | `true` | Override hints for base class methods |
+| `gluals.hint.metaCallHint` | `hint.metaCallHint` | `boolean` | `true` | `__call` meta method hints |
+| `gluals.hint.enumParamHint` | `hint.enumParamHint` | `boolean` | `false` | Enum parameter name hints |
+| `gluals.hint.closingEndHint` | `hint.closingEndHint` | `boolean` | `true` | Block end labels |
+| `gluals.hint.closingEndHintControlFlow` | `hint.closingEndHintControlFlow` | `boolean` | `false` | Control flow end labels |
+| `gluals.hint.closingEndHintMinLines` | `hint.closingEndHintMinLines` | `integer` | `15` | Minimum lines for end hints |
+| `gluals.inlineValues.enable` | `inlineValues.enable` | `boolean` | `true` | Inline debug values |
+| `gluals.hover.enable` | `hover.enable` | `boolean` | `true` | Enable hover documentation |
+| `gluals.semanticTokens.enable` | `semanticTokens.enable` | `boolean` | `true` | Enable semantic tokens |
+| `gluals.codeLens.enable` | `codeLens.enable` | `boolean` | `true` | Enable code lens |
+| `gluals.documentColor.enable` | `documentColor.enable` | `boolean` | `true` | Color picker for color strings |
+
+---
+
 ## Full example
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "hint": {

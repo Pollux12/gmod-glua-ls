@@ -50,6 +50,10 @@ Accessing an optional field without a nil check will trigger `need-check-nil` wh
 
 ## Access control
 
+<Info>
+This annotation does not do anything in GLuaLS, nor is it too relevant for Garry's Mod - it has been kept for compatibility with EmmyLua. Marking fields as private or protected has no impact on runtime behavior, but the language server will still recognize the modifiers and can provide diagnostics if you try to access private/protected fields from outside the class or subclass
+</Info>
+
 | Modifier | Description |
 |---|---|
 | `public` | Accessible everywhere (default) |
@@ -93,8 +97,9 @@ Fields can be function types:
 
 ---
 
-## Where to use @field
+## Tips and best practices
 
-- Always place `@field` annotations directly after their `@class` declaration
-- Fields defined elsewhere in the file may use `@field` as an injection with `(partial)` class or `inject-field` diagnostic rules
-- For `(exact)` classes, all fields must be declared in the class block
+- Field annotations help enable accurate types and autocomplete for a class, far more accurate than the language server's inference engine can achieve on its own.
+- Can be used to document the shape of tables that are not explicitly constructed in code, such as configuration tables or objects created by C++ code.
+- It is recommended to always place `@field` annotations directly after their `@class` declaration.
+- In GLuaLS, the `inject-field` diagnostic is disabled by default, with all classes acting as `(partial)` and allowing fields to be defined anywhere in the file. This means fields are not strictly required.

@@ -9,6 +9,7 @@ dhat-heap.json
 .pommel/
 .pommelignore
 .grepai/
+.context-engine/
 
 benchmark_*.log
 100

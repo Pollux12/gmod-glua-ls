@@ -3,19 +3,31 @@ title: Setup & installation
 description: Install gm_rdb on your SRCDS server and configure VS Code to connect for debugging.
 ---
 
-## Step 1: Install gm_rdb
+import ConfigTip from "/snippets/config-tip.mdx"
+
+## Automatic Setup
 
 `gm_rdb` is a binary module that runs inside SRCDS and exposes Lua state for debugging.
 
 ### Using the setup wizard (recommended)
 
-The easiest way is through the built-in setup wizard:
+The easiest way is through the built-in setup wizard. The walkthrough should appear when you install the extension for the first time. You can also trigger it manually:
 
 1. Open the Command Palette (`Ctrl+Shift+P`)
 2. Run **GLua: Setup Debugger**
 3. Follow the wizard steps — it will download the correct `gm_rdb` binary for your server's OS/architecture and guide you through placing the files
 
-### Manual installation
+The setup wizard can also be triggered by clicking on "GLuaLS" on the status bar.
+
+## Manual installation
+
+<Warning>
+The VSCode extension can handle automatic setup of the debugger for you. This is only intended for manual setup if the extension fails.
+</Warning>
+
+### Step 1: Download and install gm_rdb
+
+`gm_rdb` is a binary module that runs inside SRCDS and exposes Lua state for debugging.
 
 Download the correct binary for your server from the [GitHub releases page](https://github.com/Pollux12/gmod-glua-ls/releases):
 
@@ -50,6 +62,7 @@ Create a `launch.json` in your `.vscode/` folder (or use the VS Code **Run & Deb
 
 Use **attach** when the server is already running (most common for development):
 
+<ConfigTip />
 ```json .vscode/launch.json
 {
   "version": "0.2.0",
@@ -70,8 +83,11 @@ Use **attach** when the server is already running (most common for development):
 
 ### Launch a server
 
+<Warning>The launch option is unsupported and may not work on all systems. It is recommended that you use attach instead.</Warning>
+
 Use **launch** to start SRCDS directly from VS Code:
 
+<ConfigTip />
 ```json .vscode/launch.json
 {
   "version": "0.2.0",
@@ -145,6 +161,8 @@ Make sure to update `"port"` in your `launch.json` to match.
 
 ---
 
-## Firewall configuration
+## Remote debugging
 
-If debugging a remote server, open the `gm_rdb` port (default `21111`) in your server's firewall. The debug connection contains no built-in authentication, so only expose this port on a trusted network.
+<Danger>It is not recommended to use the debugger to connect to remote systems or on untrusted networks. Do so at your own risk! </Danger>
+
+If debugging a remote server, open the `gm_rdb` port (default `21111`) in your server's firewall.

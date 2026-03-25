@@ -3,6 +3,8 @@ title: Code intelligence
 description: Completions, hover documentation, signature help, semantic highlighting, and more.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Autocomplete
 
 GLuaLS provides context-aware completions for GMod API functions, local variables, class members, hook names, net message names, and more.
@@ -21,6 +23,7 @@ end)
 
 Disable call snippets if you prefer plain completions:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "completion": {
@@ -57,6 +60,7 @@ The default postfix trigger is `@`. Change it in `.gluarc.json` with `completion
 
 When completing an identifier from another module, GLuaLS can insert a `require()` at the top of the file automatically:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "completion": {
@@ -76,7 +80,7 @@ Hover over any GMod API function, variable, or annotated symbol to see its docum
 - **Function signature** with parameter names and types
 - **Return type**
 - **Description** (from wiki or `---` comment)
-- **Realm badge** — client ![Client](..) / server ![Server](..) / shared ![Shared](..) indicator
+- **Realm badge** — **Client** / **Server** / **Shared** indicator
 - **Deprecation notice** if applicable
 
 {/* TODO: Add screenshot of hover tooltip */}
@@ -145,3 +149,7 @@ Code lens annotations appear above functions and class definitions:
 - **VGUI panel indicator** — links to the panel definition for VGUI components
 
 Configure with `codeLens.enable` and `gmod.vgui.codeLensEnabled` in `.gluarc.json`.
+
+## VSCode integration
+
+Code intelligence features work automatically in VS Code. Autocomplete, hover documentation, and go-to-definition are available as soon as the extension initializes. Use the [settings panel](/configuration/overview#settings-panel-recommended) or `.gluarc.json` to configure behavior — see [Completion settings](/configuration/completion) and [Hints & Hover settings](/configuration/hints-and-hover) for the full reference.

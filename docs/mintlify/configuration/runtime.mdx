@@ -133,6 +133,18 @@ Available behaviours: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"`, `"
 
 ---
 
+## VSCode extension settings
+
+These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+
+| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+|---|---|---|---|---|
+| `gluals.references.enable` | `references.enable` | `boolean` | `true` | Find all references |
+| `gluals.references.fuzzySearch` | `references.fuzzySearch` | `boolean` | `true` | Fuzzy search for references |
+| `gluals.references.shortStringSearch` | `references.shortStringSearch` | `boolean` | `false` | Search strings for references |
+
+---
+
 ## Full example
 
 ```json .gluarc.json

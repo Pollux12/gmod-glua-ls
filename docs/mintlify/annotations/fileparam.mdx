@@ -3,6 +3,8 @@ title: "@fileparam"
 description: Set default parameter types for the entire file.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Overview
 
 `@fileparam` sets a default type for any parameter with a matching name across all functions in the current file. Functions that don't have an explicit `@param` for that name fall back to the file-level default.
@@ -69,6 +71,7 @@ end
 
 Configure defaults that apply to all files in the workspace:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "gmod": {

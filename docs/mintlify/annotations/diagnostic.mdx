@@ -3,6 +3,8 @@ title: "@diagnostic"
 description: Suppress or enable specific diagnostics for lines or blocks of code.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Overview
 
 `@diagnostic` controls which warnings are active for a specific line, the next line, or a block of code. Use it to suppress false positives without disabling diagnostics globally.
@@ -94,6 +96,7 @@ legacyFunction(someGlobal)
 
 If you find yourself suppressing the same diagnostic frequently, disable or change its severity in `.gluarc.json` instead:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "diagnostics": {

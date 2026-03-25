@@ -3,36 +3,39 @@ title: Workspace setup
 description: Configure your workspace for addon and gamemode development with multi-root workspace support.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Single addon or gamemode
 
 Open the addon or gamemode folder directly in VS Code. The extension auto-detects the structure based on whether the folder lives under `garrysmod/addons/` or `garrysmod/gamemodes/`.
 
-```
-my-addon/         ← open as workspace root
-├── lua/
-│   ├── autorun/
-│   └── my-addon/
-├── addon.json
-└── .gluarc.json  ← created automatically or via Settings UI
-```
+
+<Tree>
+  <Tree.Folder name="garrysmod" openable="false" defaultOpen>
+    <Tree.Folder name="addons" openable="false" defaultOpen>
+      <Tree.Folder name="my-addon <- Workspace Root" defaultOpen>
+        <Tree.File name="lua" />
+        <Tree.File name="addon.json" />
+        <Tree.File name=".gluarc.json" />
+        <Tree.File name="..." />
+      </Tree.Folder>
+    </Tree.Folder>
+    <Tree.Folder name="gamemodes" openable="false" defaultOpen>
+      <Tree.Folder name="my-gamemode <- Workspace Root" defaultOpen>
+        <Tree.File name="gamemode" />
+        <Tree.File name=".gluarc.json" />
+        <Tree.File name="gamemode.txt" />
+        <Tree.File name="..." />
+      </Tree.Folder>
+    </Tree.Folder>
+  </Tree.Folder>
+</Tree>
 
 ---
 
 ## Multi-root workspaces
 
 When working on a gamemode alongside multiple addons, a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces) lets you add each as a separate folder while keeping their configurations isolated.
-
-Create a `.code-workspace` file:
-
-```json my-project.code-workspace
-{
-  "folders": [
-    { "path": "C:/srcds/garrysmod/gamemodes/my-gamemode" },
-    { "path": "C:/srcds/garrysmod/addons/my-addon-1" },
-    { "path": "C:/srcds/garrysmod/addons/my-addon-2" }
-  ]
-}
-```
 
 Each folder gets its own `.gluarc.json` and the language server runs a separate analysis context for each one. Settings, diagnostics, and file param defaults are all workspace-scoped.
 
@@ -46,6 +49,7 @@ Do not open the entire `garrysmod/` folder as your workspace root. GLuaLS expect
 
 If your project references shared utility files from outside the workspace root, add them as library paths:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "workspace": {
@@ -67,6 +71,8 @@ Library files are analyzed and their types flow into your workspace, but diagnos
 
 ## Ignoring files and folders
 
+<ConfigTip />
+
 ```json .gluarc.json
 {
   "workspace": {
@@ -76,11 +82,14 @@ Library files are analyzed and their types flow into your workspace, but diagnos
 }
 ```
 
+
 ---
 
 ## Custom require patterns
 
 If your project uses a custom module loader, map it to `require` behavior:
+
+<ConfigTip />
 
 ```json .gluarc.json
 {
@@ -97,6 +106,8 @@ If your project uses a custom module loader, map it to `require` behavior:
 
 By default, the VSCode extension automatically downloads and keeps GMod wiki annotations up to date. If you need to use a custom annotations build or disable auto-download:
 
+<ConfigTip />
+
 ```json .gluarc.json
 {
   "gmod": {
@@ -106,4 +117,4 @@ By default, the VSCode extension automatically downloads and keeps GMod wiki ann
 }
 ```
 
-See [Annotations management](/vscode/annotations-management) for details on how auto-download works.
+See [Annotations management](/configuration/annotations-management) for details on how auto-download works.

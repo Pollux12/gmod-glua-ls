@@ -3,6 +3,8 @@ title: "@hook"
 description: Register a method as a GMod hook handler with named lookup and type inference.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Overview
 
 `@hook` marks a method as implementing a GMod hook. This enables hook name validation, parameter type inference from the hook's definition, and hook name autocomplete in `hook.Add`/`hook.Run`.
@@ -58,6 +60,7 @@ The parameters are inferred from the GMod hook definition.
 
 If your framework uses a custom table instead of `GM` or `PLUGIN`, configure GLuaLS to recognize it:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "gmod": {

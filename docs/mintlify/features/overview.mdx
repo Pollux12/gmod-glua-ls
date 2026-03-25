@@ -1,0 +1,111 @@
+---
+title: Features overview
+description: Everything GLuaLS provides — code intelligence, GMod-specific analysis, debugging, and more.
+---
+
+## What GLuaLS provides
+
+GLuaLS combines a language server with a full-featured VSCode extension for Garry's Mod Lua development. The language server delivers core code intelligence to any LSP-compatible editor, while the VSCode extension adds GMod-specific tooling, an interactive settings panel, and an integrated debugger.
+
+## Code intelligence
+
+<Note>
+These features work in any LSP-compatible editor, not just VS Code.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Code intelligence" icon="brain" href="/language/code-intelligence">
+    Autocomplete, hover docs, go-to-definition, renaming, code lens, semantic highlighting
+  </Card>
+  <Card title="Diagnostics" icon="triangle-alert" href="/language/diagnostics">
+    Error checking, type mismatch warnings, unused variables, GMod-specific diagnostics
+  </Card>
+  <Card title="Formatting" icon="align-left" href="/language/formatting">
+    Built-in formatter with presets, style overrides, and external tool support
+  </Card>
+  <Card title="Inlay hints" icon="lightbulb" href="/language/inlay-hints">
+    Parameter names, variable types, block-end labels, inline debug values
+  </Card>
+</CardGroup>
+
+## GMod-specific features
+
+<CardGroup cols={2}>
+  <Card title="Realm awareness" icon="globe" href="/language/realm-awareness">
+    Client/server/shared detection, cross-realm warnings, Realm View panel
+  </Card>
+  <Card title="Network validation" icon="network-wired" href="/language/network-analysis">
+    Validates `net.Start`/`net.Receive` payloads, catches type and order mismatches
+  </Card>
+  <Card title="Hook intelligence" icon="link" href="/language/hook-intelligence">
+    Autocomplete for `hook.Add`, `hook.Run`, parameter inference, custom hook tracking
+  </Card>
+  <Card title="VGUI support" icon="window-restore" href="/language/vgui-support">
+    Panel type inference, code lens, custom panel registration
+  </Card>
+</CardGroup>
+
+## Classes
+
+<Card title="Scripted classes" icon="cube" href="/language/scripted-classes">
+  Automatic ENT/SWEP/EFFECT detection, NetworkVar synthesis, Class Explorer, scaffolding, custom class scopes
+</Card>
+
+## Debugger
+
+<CardGroup cols={2}>
+  <Card title="Debugger overview" icon="bug" href="/debugger/overview">
+    Full SRCDS debugger with breakpoints, stepping, and variable inspection
+  </Card>
+  <Card title="Entity explorer" icon="list-tree" href="/debugger/entity-explorer">
+    Browse server entities and edit properties while paused
+  </Card>
+  <Card title="Lua execution" icon="terminal" href="/debugger/lua-execution">
+    Run Lua on the server directly from VS Code
+  </Card>
+  <Card title="Error tracking" icon="circle-exclamation" href="/debugger/error-tracking">
+    Capture runtime Lua errors from SRCDS with clickable stack traces
+  </Card>
+</CardGroup>
+
+## AI integration
+
+<Card title="AI integration" icon="robot" href="/vscode/ai-integration">
+  MCP server lets GitHub Copilot run Lua, read errors, and query your server
+</Card>
+
+---
+
+## VSCode extension commands
+
+Access all extension commands through the Command Palette (`Ctrl+Shift+P`):
+
+| Command | Description |
+|---|---|
+| **GLua: Open Settings** | Open the interactive `.gluarc.json` settings panel |
+| **GLua: Restart Language Server** | Restart the language server without reloading the window |
+| **GLua: Setup Debugger** | Run the debugger setup wizard |
+| **GLua: Run File** | Execute the current file on the connected SRCDS server |
+| **GLua: Run Selected Lua** | Execute the current selection on the connected server |
+| **GLua: Run Console Command** | Send a console command to the server |
+| **GLua: Update Annotations** | Manually trigger an annotations update |
+
+---
+
+## Status bar
+
+The status bar at the bottom of VS Code shows the current language server state:
+
+- **GLuaLS: Ready** — the server is running and analysis is up to date
+- **GLuaLS: Indexing** — the server is scanning your workspace files
+- **GLuaLS: Error** — the server encountered a problem (click for details)
+
+When the debugger is connected, the status bar also shows the current realm and connection state.
+
+---
+
+## Configuration
+
+Most settings are configured through `.gluarc.json` in your workspace root. Use the interactive settings panel (**GLua: Open Settings**) or edit the JSON directly. See the [Configuration](/configuration/overview) section for the full reference.
+
+Extension-level settings (annotation downloads, UI preferences) are under `gluals.*` in VS Code settings. See [Configuration overview](/configuration/overview#vscode-extension-settings) for the full list.

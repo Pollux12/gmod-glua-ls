@@ -157,3 +157,16 @@ To **override** a built-in definition, add an entry with its `id` and only the f
 | `"minimal"` | Functions, classes, hooks, net receivers, timers, concommands only |
 | `"normal"` (default) | Same as minimal, plus typed non-primitive tables and variables |
 | `"verbose"` | Full legacy view — all locals, assignments, and control-flow blocks |
+
+---
+
+## VSCode extension settings
+
+These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+
+| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+|---|---|---|---|---|
+| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `boolean` | `true` | Auto-download GMod annotations |
+| `gluals.gmod.templatePath` | `gmod.templatePath` | `string` | `null` | Custom scaffolding template path |
+| `gluals.gmod.vgui.codeLensEnabled` | `gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI code lens |
+| `gluals.gmod.vgui.inlayHintEnabled` | `gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI inlay hints |

@@ -110,3 +110,7 @@ Disable network diagnostics by setting `"networkDiagnostics": false`.
 - Dynamic message names computed at runtime (e.g., `net.Start("msg" .. id)`) cannot be statically verified and are skipped
 - Very complex conditional logic around `net.Write*` calls may not be fully modeled
 - Only files included in workspace analysis are considered; files outside `workspace.library` paths are not checked for counterparts
+
+## VSCode integration
+
+Network diagnostics run automatically in the background. Diagnostics appear as squiggly underlines and in the Problems panel. Configure in the [settings panel](/configuration/overview#settings-panel-recommended) — see [GMod settings](/configuration/gmod) for the full network configuration reference.

@@ -155,6 +155,17 @@ These keys accept string expressions: `"keep"`, `"fixed(n)"`, `"min(n)"`, `"max(
 
 ---
 
+## VSCode extension settings
+
+There are no `gluals.format.*` VSCode settings — formatting is configured entirely through `.gluarc.json`. You can enable format-on-save with these built-in VS Code settings:
+
+| VSCode Setting | Description |
+|---|---|
+| `editor.formatOnSave` | Enable format on save (built-in VS Code setting) |
+| `[lua].editor.defaultFormatter` | Set to `Pollux.gmod-glua-ls` |
+
+---
+
 ## Example
 
 ```json .gluarc.json

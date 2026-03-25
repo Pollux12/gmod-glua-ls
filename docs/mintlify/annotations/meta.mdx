@@ -3,6 +3,8 @@ title: "@meta"
 description: Mark a file as containing only type definitions, not runtime code.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Overview
 
 `@meta` marks a file as a **type-only declaration file**. GLuaLS treats the file as pure annotation — it contributes type information to the analysis but its contents are never included in runtime code.
@@ -63,6 +65,7 @@ Providing a name after `@meta` associates the file with a specific library name,
 
 Add meta files or directories to `workspace.library` to include them in analysis without treating them as project code:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "workspace": {

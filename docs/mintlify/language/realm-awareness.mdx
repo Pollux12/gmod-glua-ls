@@ -3,9 +3,11 @@ title: Realm awareness
 description: GLuaLS understands where code runs — client, server, or shared — and warns about cross-realm API usage.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Overview
 
-Garry's Mod Lua runs in three **realms**: clientside (`CLIENT`), serverside (`SERVER`), and shared code accessible on both. Many GMod API functions are only available in one realm (e.g., `LocalPlayer()` is client-only, `game.GetWorld():GetGravity()` is server-only).
+Garry's Mod Lua runs in two **realms**: clientside (`CLIENT`) and serverside (`SERVER`), with code accessible on both being referred to as "shared". Many GMod API functions are only available in one realm (e.g., `LocalPlayer()` is client-only), with cross-realm mistakes being a common source of bugs for GMod developers. GLuaLS is fully realm aware to help resolve this.
 
 GLuaLS automatically detects which realm each file runs in and issues diagnostics when you call realm-restricted functions from the wrong realm.
 
@@ -13,18 +15,25 @@ GLuaLS automatically detects which realm each file runs in and issues diagnostic
 
 ## Realm detection
 
+GLuaLS contains an advanced realm detection system that uses multiple detection methods to determine the realm of each file or even within each file. This system is designed to "just work" and requires little to no configuration for almost all projects.
+
 GLuaLS infers realm through a **5-level priority** system, from highest to lowest:
 
 ### 1. `@realm` annotation (highest priority)
 
+<Warning>
+**It is not recommended to add file level realm overrides where the realm is already correctly inferred**, as this can mask potential cross-realm issues. Use function-level overrides instead where possible.
+</Warning>
+
 Put `---@realm` at the top of a file or on a function:
+
 
 ```lua
 ---@realm client
 -- Everything in this file is clientside
 ```
 
-See the [`@realm` annotation reference](/annotations/realm) for the full syntax.
+See the [`@realm` annotation reference](/annotations/realm) for the full syntax. Annotations override all other systems, with function level annotations taking precedence over file-level annotations.
 
 ### 2. Filename prefix detection
 
@@ -50,7 +59,7 @@ Files in well-known directories are assigned a realm:
 
 ### 4. Block-level narrowing
 
-GLuaLS narrows realm within `if CLIENT` / `if SERVER` blocks:
+Within shared files, GLuaLS narrows realm within `if CLIENT` / `if SERVER` blocks:
 
 ```lua
 if CLIENT then
@@ -64,9 +73,9 @@ if SERVER then
 end
 ```
 
-### 5. API dependency hints
+### 5. Heuristic inference (lowest priority)
 
-If none of the above apply, GLuaLS may infer realm from the API you call (e.g., calling a server-only function implies server realm).
+If none of the above apply, GLuaLS may infer realm from the code within a file (e.g., calling a server-only function implies server realm). This is a best-effort heuristic and may not always be accurate, but it can catch cases where realm is not explicitly defined.
 
 ---
 
@@ -82,7 +91,13 @@ If none of the above apply, GLuaLS may infer realm from the API you call (e.g., 
 
 ## Disabling realm checks
 
+<Warning>
+It is not recommended to disable the realm checks, as this will significantly degrade the quality of other features which depend on it. It is instead recommended to suppress specific diagnostics via the settings menu - heuristic diagnostics have a separate setting for exactly this reason.
+</Warning>
+
 Disable realm diagnostics workspace-wide:
+
+<ConfigTip />
 
 ```json .gluarc.json
 {
@@ -103,7 +118,7 @@ Or suppress for a specific file:
 
 ## Per-function realm overrides
 
-Override realm detection for an individual function:
+Override or set realm detection for an individual function:
 
 ```lua
 ---@realm server
@@ -113,24 +128,47 @@ function MyAddon.ServerAction()
 end
 ```
 
+It is recommended to use function-level overrides where possible, since this helps speed up performance of the language server, as it does not have to perform expensive inference when annotations are present.
+
 ---
 
-## Realm badges in hover
+## Realm in hover and autocomplete
 
 Every hover tooltip for a GMod API function includes a realm badge showing where it runs:
 
 - **Client** badge — function is clientside only
 - **Server** badge — function is serverside only
 - **Shared** badge — function is available on both realms
-- **Menu** badge — function is available in the menu state only
+- **Menu** badge — function is available in the menu state only (not used in GLuaLS)
 
 The badge appears in completions as well, so you can check a function's realm before inserting it.
+
+The realm is used to filter autocomplete suggestions to reduce noise and prevent invalid code from being suggested. For example, if you're editing a clientside file, server-only functions will be hidden from autocomplete and vice versa. If it seems like some functions are missing from autocomplete, check the realm!
+
+---
+
+## VSCode integration
+
+The GLuaLS VSCode extension includes a **Realm View** panel in the sidebar that shows the inferred realm assignment for every file in your workspace. This gives you a quick overview of which files run on the client, server, or both.
+
+Each file appears with a color-coded realm badge:
+
+| Indicator | Meaning |
+|---|---|
+| **Client** | File is clientside only (`CLIENT` realm) |
+| **Server** | File is serverside only (`SERVER` realm) |
+| **Shared** | File runs on both realms |
+| **Menu** | File runs in the main menu context |
+| **Unknown** | Realm could not be determined |
+
+Expanding a file in the panel reveals per-function realm assignments, so you can see at a glance how block-level narrowing and `---@realm` annotations affect individual functions. Clicking an entry navigates directly to that file or function in the editor.
 
 ---
 
 ## Custom realm patterns
 
 Override the directory and filename detection patterns:
+<ConfigTip />
 
 ```json .gluarc.json
 {

@@ -7,9 +7,7 @@ description: The GLuaLS debugger lets you set breakpoints, inspect variables, an
 
 GLuaLS includes a full **source-level debugger** for Garry's Mod servers. Set breakpoints, step through code, inspect locals and globals, modify entity properties, and execute arbitrary Lua — all from within VS Code, while the game is running.
 
-<Warning>
-The debugger only works with **SRCDS** (dedicated server). It does not work with a listen server or the client. You can debug clientside behavior via the client's Lua console, but full breakpoint debugging requires SRCDS.
-</Warning>
+The VSCode extension includes an automatic setup and install process for this debugger.
 
 ---
 
@@ -17,14 +15,18 @@ The debugger only works with **SRCDS** (dedicated server). It does not work with
 
 The debugger uses the **LRDB** (Lua Remote Debugger) protocol over TCP:
 
-1. **`gm_rdb`** — a Garry's Mod binary module loaded by the SRCDS process. It exposes the Lua debug hooks over a TCP socket.
-2. **GLuaLS debugger client** — the VS Code extension connects to that socket and translates LRDB protocol to VS Code DAP (Debug Adapter Protocol).
+1. **gm_rdb** — a Garry's Mod binary module loaded by the SRCDS process. This is used to interact with the game engine and exposes a websocket for the extension.
+2. **GLuaLS Extension** — the VS Code extension connects to the websocket started by the binary module. It sends commands and receives data.
 
-Your Lua files are served from their source locations in your workspace, so breakpoints set on local files map to the exact running code.
+Your Lua files are served from their source locations in your workspace, so breakpoints set on local files map to the exact running code. The extension should be able to set this up for you.
 
 ---
 
 ## Requirements
+
+<Warning>
+The debugger is only fully supported with **SRCDS** (dedicated server). Clientside support is in progress but limited to basic debugging features such as breakpoints and depends on the server debugger for advanced features. Listen server is not supported.
+</Warning>
 
 - SRCDS (dedicated server) running on Windows or Linux
 - `gm_rdb` binary module installed in your server's `garrysmod/lua/bin/` (or `garrysmod/autorun/`)

@@ -3,6 +3,8 @@ title: VGUI support
 description: GLuaLS understands VGUI panel hierarchies and provides code lens and inlay hints.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Overview
 
 GLuaLS has built-in support for VGUI (GMod's panel GUI system). It understands `vgui.Create()` calls, the panel inheritance hierarchy, and provides rich IDE features for VGUI development.
@@ -35,6 +37,7 @@ When `gmod.vgui.codeLensEnabled` is true, GLuaLS shows code lens annotations abo
 
 Enable in `.gluarc.json`:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "gmod": {
@@ -81,9 +84,17 @@ After `vgui.Register(name, PANEL, base)`, the name `"MyPanel"` is recognized in 
 
 ---
 
+## Scripted Entity Explorer
+
+VGUI Panels are registered within the Scripted Class Explorer for easy navigation. Clicking on a panel class in the explorer will navigate to its definition.
+
+## VSCode integration
+
+VGUI features work automatically. The Class Explorer sidebar shows registered panel types under the Classes section. Configure in the [settings panel](/configuration/overview#settings-panel-recommended) — see [GMod settings](/configuration/gmod#vgui) for the full reference.
+
 ## Configuration
 
 | Setting | Default | Description |
 |---|---|---|
-| `gmod.vgui.codeLensEnabled` | `false` | Show code lens on panel creations/definitions |
+| `gmod.vgui.codeLensEnabled` | `true` | Show code lens on panel creations/definitions |
 | `gmod.vgui.enabled` | `true` | Enable VGUI type inference entirely |

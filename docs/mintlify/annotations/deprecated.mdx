@@ -2,6 +2,7 @@
 title: "@deprecated"
 description: Mark functions or fields as deprecated to warn about usages.
 ---
+import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
@@ -67,6 +68,8 @@ local OldPlayerManager = {}
 ## Severity
 
 The `deprecated` diagnostic defaults to `hint` severity (subtle underline). You can change it:
+
+<ConfigTip />
 
 ```json .gluarc.json
 {

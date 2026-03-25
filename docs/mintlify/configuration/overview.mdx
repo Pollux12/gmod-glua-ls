@@ -1,37 +1,98 @@
 ---
-title: "Configuration Overview"
-description: Configure gmod-glua-ls via .gluarc.json in your workspace root.
+title: Configuration overview
+description: Configure GLuaLS via the interactive settings panel or manual .gluarc.json editing.
 ---
+
+import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
 All language server behavior is configured through a `.gluarc.json` file placed in your workspace root. The file has full JSON schema support, so your editor will validate settings and provide completions as you type.
 
+GLuaLS provides two ways to manage configuration:
+- **Settings panel** (recommended) — an interactive VSCode UI that edits `.gluarc.json` for you
+- **Manual editing** — directly editing `.gluarc.json` with full IDE validation
+
+Both methods write to the same file and stay in sync automatically.
+
 ---
 
-## Creating your config
+## Settings panel (recommended)
+
+The GLua Settings panel lets you configure GLuaLS without touching JSON. Changes write directly to `.gluarc.json`.
+
+### Opening the panel
+
+There are three ways to open the settings panel:
+
+1. **Command Palette** (`Ctrl+Shift+P`) → **GLua: Open Settings**
+2. Click the **GLuaLS** item in the status bar
+3. Right-click any `.gluarc.json` file in the Explorer → **Open GLua Settings**
+
+The panel opens as a tab in your editor. In a multi-root workspace, you'll be prompted to choose which workspace folder to configure.
+
+### Panel layout
+
+The settings panel is organized into collapsible sections matching the `.gluarc.json` structure:
+
+| Section | What it configures |
+|---|---|
+| **GMod** | Realm detection, scripted classes, network analysis, VGUI hints |
+| **Diagnostics** | Enable/disable individual diagnostic codes, set severity levels |
+| **Completion** | Autocomplete behavior, call snippets, postfix triggers |
+| **Formatting** | Formatter preset, style overrides |
+| **Hints** | Inlay hint types and thresholds |
+| **Workspace** | Library paths, ignore patterns, module maps |
+| **Runtime** | Non-standard Lua symbols, require-like functions |
+
+### Editing settings
+
+Every control maps directly to a `.gluarc.json` property:
+
+- **Toggles** — boolean options
+- **Dropdowns** — enum options (e.g., severity levels)
+- **Text fields** — string and number options
+- **Tables** — array and map options (e.g., file param defaults, scripted class definitions)
+
+Changes are saved to `.gluarc.json` after a short debounce (5 seconds by default). You can also click **Save now** at any time.
+
+<Tip>
+If you want to inspect the raw JSON being generated, open `.gluarc.json` directly. You can edit both the settings panel and the JSON file — they stay in sync.
+</Tip>
+
+### Auto-save behavior
+
+By default, auto-save is disabled, to prevent you from accidentally overwriting settings. To save, click the **Save** button in the bottom left after making changes. This allows you to review multiple changes before saving.
+
+To change auto-save behavior, toggle **Auto-save settings** in the panel header or set `gluals.gmod.settingsAutoSave` in your VS Code settings.
+
+---
+
+## Manual configuration (.gluarc.json)
+
+### Creating your config
 
 Create a `.gluarc.json` file at the root of your workspace:
 
+<ConfigTip />
+
 ```json .gluarc.json
 {
-  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/refs/heads/main/crates/glua_code_analysis/resources/schema.json"
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/crates/glua_code_analysis/resources/schema.json"
 }
 ```
 
 The `$schema` property enables IDE validation and autocomplete for the file itself.
 
-Alternatively, the VSCode extension can generate a starter configuration for you — open the command palette and run **GLua: Open Settings UI**, then click the **Edit in JSON** button at the bottom of the panel.
+Alternatively, the settings panel can generate a starter configuration — open **GLua: Open Settings**, then click **Edit in JSON** at the bottom of the panel.
 
----
-
-## Recommended starter config
+### Recommended starter config
 
 This configuration is suitable for most GMod addon projects:
 
 ```json .gluarc.json
 {
-  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/refs/heads/main/crates/glua_code_analysis/resources/schema.json",
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/crates/glua_code_analysis/resources/schema.json",
   "diagnostics": {
     "enable": true,
     "diagnosticInterval": 500,
@@ -52,14 +113,25 @@ This configuration is suitable for most GMod addon projects:
 }
 ```
 
+### Config file priority
+
+When multiple config files are present, GLuaLS follows this priority order (highest first):
+
+1. `.gluarc.json`
+2. `.luarc.json`
+3. `.emmyrc.json`
+4. `.emmyrc.lua`
+
+`.gluarc.json` is exclusive — if present, all other config files are ignored.
+
 ---
 
-## Configuration sections
+## Configuration reference
 
-The config file is split into top-level sections. Refer to each section's page for the full option reference:
+The config file is split into top-level sections. Refer to each section's page for the full option reference, including both VSCode and `.gluarc.json` equivalents:
 
 <CardGroup cols={2}>
-  <Card title="GMod Settings" icon="gamepad-2" href="/configuration/gmod">
+  <Card title="GMod settings" icon="gamepad-2" href="/configuration/gmod">
     GMod-specific analysis: realms, network, scripted classes, hooks, VGUI
   </Card>
   <Card title="Diagnostics" icon="triangle-alert" href="/configuration/diagnostics">
@@ -80,32 +152,39 @@ The config file is split into top-level sections. Refer to each section's page f
   <Card title="Runtime & Strict" icon="settings" href="/configuration/runtime">
     Non-standard symbols, strict type checking, special functions
   </Card>
+  <Card title="Annotations management" icon="arrows-rotate" href="/configuration/annotations-management">
+    Auto-download GMod wiki annotations, custom annotation paths
+  </Card>
 </CardGroup>
 
 ---
 
-## Config file priority
+## VSCode extension settings
 
-When multiple config files are present, GLuaLS follows this priority order (highest first):
+Some settings are specific to the VSCode extension and are not part of `.gluarc.json`. These control extension-level behavior like the debugger, MCP server, UI preferences, and annotation downloads.
 
-1. `.gluarc.json`
-2. `.luarc.json`
-3. `.emmyrc.json`
-4. `.emmyrc.lua`
-
-`.gluarc.json` is exclusive — if present, all other config files are ignored.
-
----
-
-## VS Code settings
-
-Some behaviors can be configured directly in VS Code settings (`settings.json` or the **Settings UI**) under the `gluals.*` prefix. These include:
-
-| Setting | Description |
-|---|---|
-| `gluals.gmod.autoLoadAnnotations` | Auto-download and load GMod annotations |
-| `gluals.gmod.annotationsPath` | Custom path to annotations to load |
-| `gluals.debugger.stopOnEntry` | Break on first line when debugger attaches |
-| `gluals.debugger.stopOnError` | Pause on Lua errors during debug |
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `gluals.gmod.autoLoadAnnotations` | `boolean` | `true` | Auto-download and load GMod wiki annotations |
+| `gluals.gmod.settingsAutoSave` | `boolean` | `false` | Auto-save settings panel changes to `.gluarc.json` |
+| `gluals.gmod.debugRealm` | `string` | `"server"` | Default realm for debug execution (`server`, `client`, `shared`) |
+| `gluals.gmod.debugger.autoUpdateRdb` | `boolean` | `true` | Prompt to update `gm_rdb` on version mismatch |
+| `gluals.gmod.debugger.autoUpdateClientRdb` | `boolean` | `true` | Prompt to update client debug module on mismatch |
+| `gluals.gmod.mcp.enabled` | `boolean` | `true` | Enable MCP server for AI integration |
+| `gluals.gmod.mcp.authToken` | `string` | `""` | MCP auth token (empty = auto-generate local token) |
+| `gluals.gmod.mcp.port` | `integer` | `0` | MCP server port (0 = random ephemeral) |
+| `gluals.gmod.mcp.rateLimitPerMinute` | `integer` | `60` | Max MCP requests per minute per client |
+| `gluals.gmod.templatePath` | `string` | `null` | Path to custom scaffolding templates |
+| `gluals.gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI panel code lens |
+| `gluals.gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI panel inlay hints |
+| `gluals.ls.executablePath` | `string` | `""` | Override language server binary path |
+| `gluals.ls.debugPort` | `integer` | `null` | Connect to existing language server on this port |
+| `gluals.ls.startParameters` | `array` | `[]` | Additional language server arguments |
+| `gluals.ls.globalConfigPath` | `string` | `""` | Path to global `.emmyrc.json` |
+| `gluals.language.completeAnnotation` | `boolean` | `true` | Auto-insert `---` on line break after comment |
+| `gluals.decorations.*` | `boolean` | `false` | Underline decorations for globals, mutable locals/params, readonly locals/params |
+| `gluals.source.roots` | `array` | `[]` | Additional source roots for the debugger |
+| `gluals.inlineValues.enable` | `boolean` | `null` | Show inline values during debug |
+| `gluals.semanticTokens.enable` | `boolean` | `null` | Enable semantic tokens |
 
 Settings in `.gluarc.json` always take precedence over VS Code workspace settings for analysis behavior.

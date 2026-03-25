@@ -3,11 +3,13 @@ title: Scripted classes
 description: GLuaLS automatically understands ENT, SWEP, EFFECT, and other scripted class patterns.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Overview
 
-Garry's Mod uses a "scripted class" pattern where you define a global table (`ENT`, `SWEP`, etc.) in a specific file location and GMod registers it as a class. GLuaLS detects these classes automatically and provides:
+Garry's Mod uses a "scripted class" pattern where you use a global table (`ENT`, `SWEP`, etc.) in a specific file location and GMod registers it as a class. GLuaLS detects these classes automatically and provides:
 
-- Full method type inference for the class
+- Automatic class registration including inheritance
 - Automatic synthesis of `NetworkVar` getter/setter pairs
 - Detection of `AccessorFunc`-generated methods
 - Type checking for required fields
@@ -16,7 +18,7 @@ Garry's Mod uses a "scripted class" pattern where you define a global table (`EN
 
 ## Automatic detection
 
-GLuaLS detects scripted classes by their **file path**. Any file under a recognized directory is treated as defining the appropriate table:
+GLuaLS detects scripted classes by their **file path**. Any file under a recognized directory is treated as defining the appropriate table. For example:
 
 | Directory pattern | Class table | Base class |
 |---|---|---|
@@ -26,6 +28,8 @@ GLuaLS detects scripted classes by their **file path**. Any file under a recogni
 | `lua/entities/**/` (npc prefix) | `ENT` | `base_ai` |
 
 The detected class table is automatically typed with the base class's methods and fields, so you get completions and type-checking without any annotation.
+
+This table can be adjusted in settings.
 
 ---
 
@@ -73,11 +77,13 @@ AccessorFunc(ENT, "m_bOrient", "Orient", FORCE_BOOL)
 -- ENT:SetOrient(value: boolean) -> nil
 ```
 
+This can be done via the annotation `---@accessorfunc` for custom getters/setters, see [@accessorfunc](/annotations/accessorfunc) for more details.
+
 ---
 
 ## Base class inheritance
 
-Scripted classes in GMod inherit from base classes (like `base_gmodentity`). GLuaLS understands this chain and provides completions for all inherited methods.
+Scripted classes in GMod inherit from base classes (like `base_gmodentity`). GLuaLS understands this chain and provides completions for all inherited methods. `ENT.Base` will be used to determine the base class, with `BaseClass` being valid that file scope.
 
 ```lua
 function ENT:Use(ply)
@@ -106,6 +112,8 @@ Completions suggest the correct signature for each override.
 
 If you use a non-standard directory structure or custom class types, configure GLuaLS to recognize them:
 
+<ConfigTip />
+
 ```json .gluarc.json
 {
   "gmod": {
@@ -113,9 +121,13 @@ If you use a non-standard directory structure or custom class types, configure G
       "include": [
         {
           "id": "my_panels",
+          "label": "Panels",
+          "classGlobal": "PANEL",
           "baseClass": "Panel",
-          "globalName": "PANEL",
+          "path": ["panels"],
+          "include": ["lua/panels/**"],
           "rootDir": "lua/panels",
+          "icon": "symbol-class",
           "filePattern": "**/init.lua",
           "scaffold": {
             "files": [
@@ -129,9 +141,172 @@ If you use a non-standard directory structure or custom class types, configure G
 }
 ```
 
+### Fields
+
+| Field | Description |
+|---|---|
+| `id` | Unique identifier for this class scope |
+| `label` | Display name in the Class Explorer sidebar |
+| `classGlobal` | The global table name used in scripts (e.g., `ENT`, `SWEP`, `PANEL`) |
+| `baseClass` | The base class to inherit methods from |
+| `path` | Path segments used for display grouping in the Class Explorer |
+| `include` | Glob patterns matching files that belong to this class type |
+| `rootDir` | Root directory for scaffolded files |
+| `icon` | VS Code icon ID shown in the Class Explorer (e.g., `symbol-class`) |
+| `filePattern` | Glob pattern restricting which files define the class table |
+| `scaffold` | File generation configuration (see [Scaffolding](#scaffolding) below) |
+
+---
+
+## Class Explorer
+
+The Class Explorer is a tree view in the VS Code Activity Bar that lets you browse all scripted classes and workspace resources at a glance. Click any class or file to jump directly to its definition.
+
+### Classes section
+
+The Classes section groups your scripted classes by type:
+
+| Group | Detected from |
+|---|---|
+| **Entities** | Files under `lua/entities/` or custom `path` config |
+| **Weapons** | Files under `lua/weapons/` |
+| **Effects** | Files under `lua/effects/` |
+| **Scripted Tools** | Files under `lua/weapons/gmod_tool/stools/` |
+| **Gamemodes/Plugins** | Files under configured plugin paths |
+
+Each group shows the detected class name alongside its class global (`ENT`, `SWEP`, etc.). Expand a class to navigate to its definition. These are the same classes described in [Automatic detection](#automatic-detection) and [Custom class scopes](#custom-class-scopes).
+
+When a scripted class definition has scaffold files configured, a **+** (New) button appears next to the class group. See [Scaffolding](#scaffolding) below for details.
+
+### Resources section
+
+The Resources section shows workspace assets organized by type:
+
+| Category | Contents |
+|---|---|
+| **Materials** | `.vmt` and `materials/` references found in Lua files |
+| **Models** | `models/` path references |
+| **Sounds** | `sounds/` and `sound/` references |
+
+Click any resource to open the file it was referenced from.
+
+### Filtering
+
+Use the search box at the top of the Class Explorer to filter classes by name. The filter matches against the class name, its global (`ENT`, `SWEP`, etc.), and file path.
+
+### Custom class groups
+
+You can define custom class groups for frameworks that use their own class patterns. The `label`, `icon`, `path`, and `include` fields from [Custom class scopes](#custom-class-scopes) control how the group appears in the Explorer:
+
+<ConfigTip />
+```json .gluarc.json
+{
+  "gmod": {
+    "scriptedClassScopes": {
+      "include": [
+        {
+          "id": "my-controllers",
+          "label": "Controllers",
+          "classGlobal": "CONTROLLER",
+          "path": ["myframework", "controllers"],
+          "include": ["lua/myframework/controllers/**"],
+          "rootDir": "lua/myframework/controllers",
+          "icon": "symbol-class"
+        }
+      ]
+    }
+  }
+}
+```
+
+---
+
+## Scaffolding
+
+GLuaLS can generate boilerplate files for new scripted classes from templates. When you create a new entity or weapon, all the required files are created in the correct location with your class name substituted in.
+
+### Creating a new class
+
+1. Open the **Class Explorer** in the sidebar
+2. Find the class group you want to create in (e.g., **Entities**)
+3. Click the **+** (New) icon next to the group header
+4. Enter the class name when prompted
+5. The files are generated and the main file opens automatically
+
+### Built-in templates
+
+GLuaLS ships with templates for all standard GMod scripted class types:
+
+| Class type | Generated files |
+|---|---|
+| **Entity** | `shared.lua`, `cl_init.lua`, `init.lua` |
+| **Weapon (SWEP)** | `shared.lua`, `cl_init.lua`, `init.lua` |
+| **Effect** | `init.lua` |
+| **Scripted Tool (STOOL)** | `shared.lua` |
+
+### Custom templates
+
+You can override any built-in template or add templates for custom class types by setting a template directory:
+
+<ConfigTip />
+```json .gluarc.json
+{
+  "gmod": {
+    "templatePath": ".gluals/templates"
+  }
+}
+```
+
+Templates are `.lua` files with `{{name}}` placeholders:
+
+```lua .gluals/templates/ent_shared.lua
+ENT.Type = "anim"
+ENT.Base = "base_gmodentity"
+ENT.PrintName = "{{name}}"
+ENT.Author = ""
+ENT.Spawnable = false
+ENT.AdminSpawnable = false
+```
+
+| Placeholder | Value |
+|---|---|
+| `{{name}}` | The class name entered when scaffolding |
+
+### Wiring templates to class definitions
+
+Add scaffold configuration to your [custom class scope](#custom-class-scopes) to tell GLuaLS which template files to generate:
+
+<ConfigTip />
+```json .gluarc.json
+{
+  "gmod": {
+    "templatePath": ".gluals/templates",
+    "scriptedClassScopes": {
+      "include": [
+        {
+          "id": "entities",
+          "rootDir": "lua/entities",
+          "scaffold": {
+            "files": [
+              { "path": "{{name}}/shared.lua", "template": "ent_shared.lua" },
+              { "path": "{{name}}/cl_init.lua", "template": "ent_cl.lua" },
+              { "path": "{{name}}/init.lua", "template": "ent_sv.lua" }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+The `path` value is relative to the class `rootDir` (e.g., `lua/entities/`), and `template` refers to the filename inside your `templatePath` folder. Built-in templates are used as fallback if the custom template file is not found.
+
 ---
 
 ## Disabling scripted class inference
+
+<ConfigTip />
 
 ```json .gluarc.json
 {

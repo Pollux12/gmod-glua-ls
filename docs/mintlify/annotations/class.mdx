@@ -70,6 +70,10 @@ end
 
 Mark a class as `(exact)` to prevent dynamic field additions. Any field assigned outside the class definition causes a diagnostic:
 
+<Info>
+This annotation does not do anything in GLuaLS - all classes are effectively partial by default. It has been kept for compatibility with EmmyLua.
+</Info>
+
 ```lua
 ---@class (exact) Point
 ---@field x number
@@ -85,6 +89,11 @@ p.z = 3 -- ❌ Error: cannot add field 'z' to exact type Point
 
 Use `(partial)` to extend an existing class without redeclaring all its fields:
 
+<Info>
+This annotation does not do anything in GLuaLS - all classes are effectively partial by default. It has been kept for compatibility with EmmyLua.
+</Info>
+
+
 ```lua
 -- In one file:
 ---@class Animal
@@ -94,7 +103,6 @@ Use `(partial)` to extend an existing class without redeclaring all its fields:
 ---@class (partial) Animal
 ---@field weight number  -- adds weight to Animal without losing name
 ```
-
 ---
 
 ## Generic classes
@@ -116,6 +124,10 @@ stringContainer.items[1] = "hello" -- ✅ typed as string
 ## Field access control
 
 Use access modifiers in `@field`:
+
+<Info>
+This annotation does not do anything in GLuaLS, nor is it too relevant for Garry's Mod - it has been kept for compatibility with EmmyLua. Marking fields as private or protected has no impact on runtime behavior, but the language server will still recognize the modifiers and can provide diagnostics if you try to access private/protected fields from outside the class or subclass
+</Info>
 
 ```lua
 ---@class MyClass

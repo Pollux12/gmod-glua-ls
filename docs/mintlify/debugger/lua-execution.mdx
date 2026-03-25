@@ -5,7 +5,20 @@ description: Run Lua code, files, and commands on your server directly from VS C
 
 ## Overview
 
-While the debugger is connected (not necessarily paused), you can execute Lua code on the server from VS Code in several ways — without switching to the server console.
+While the debugger is connected (not necessarily paused), you can execute Lua code on the server from VS Code in several ways.
+
+All options below (apart from refresh) require the execution realm to be selected. This determines what realm it will run on.
+
+---
+
+## Realm targeting
+
+By default, code runs on the **server** realm. You can change the selected realm via the extension via either:
+
+1. Command Palette → **GLua: Set Realm**
+2. Realm selector on bottom status bar
+
+When targeting `client`, code runs on all connected players. This works by sending a net message to all clients with the code to execute. This code can be found within the `debug.lua` file in autorun - this is automatically generated on install.
 
 ---
 
@@ -13,22 +26,21 @@ While the debugger is connected (not necessarily paused), you can execute Lua co
 
 1. Select any Lua code in the editor
 2. Right-click → **GLua: Run Selected**
-   (or use the Command Palette: **GLua: Run Selected Lua on Server**)
 
-The selected code is sent to the server and executed. Output appears in the **Debug Console**.
+The selected code is sent to the specified realm and executed. Output appears in the **Debug Console**.
 
 ---
 
 ## Run current file
 
-Send the entire current file's content to the server for execution:
+<Info>
+This runs the current file content as saved within the workspace. The server will be sent this file path to then execute.
+</Info>
+
+Send the entire current file's content for execution:
 
 1. Open the Command Palette (`Ctrl+Shift+P`)
 2. Run **GLua: Run Current File**
-
-<Warning>
-This runs the file content, not the saved-on-disk file path. The server does not need to have the file — it receives the raw source text.
-</Warning>
 
 ---
 
@@ -44,36 +56,14 @@ Output is shown in the Debug Console.
 
 ---
 
-## Realm targeting
+## Refresh File (Lua Refresh / Hot Reload)
 
-By default, code runs on the **server** realm. You can specify a target realm in the `launch.json`:
-
-```json .vscode/launch.json
-{
-  "type": "gluals_gmod",
-  "request": "attach",
-  "name": "Attach to SRCDS",
-  "realm": "client"
-}
-```
-
-Or use the **Set Realm** command at runtime:
-
-1. Command Palette → **GLua: Set Realm**
-2. Choose `server` or `client`
-
-When targeting `client`, code runs in the client Lua state (same as `lua_run_cl`) on all connected players.
-
----
-
-## Hot reload
-
-Refresh a file on the server without restarting:
+Refresh a file on the server without restarting. This is useful if you have lua refresh disabled.
 
 1. Make your changes in the editor and save
 2. Right-click in the editor → **GLua: Refresh File on Server**
 
-This re-`include`s the file in the server Lua state. Behavior depends on the file — if your addon uses `hook.Add` at the top level, refreshing re-registers all hooks.
+This is the same as triggering lua refresh on the specified file.
 
 ---
 

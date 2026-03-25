@@ -31,21 +31,22 @@ When the debugger is connected, the following tools are available to AI agents:
 
 ## Setting up
 
-The MCP server starts automatically when the extension loads. To connect Copilot:
+The MCP server starts automatically when the extension loads. The extension will also automatically register tools with GitHub Copilot.
+
+
+To connect Copilot:
 
 <Steps>
   <Step title="Connect the debugger">
     The MCP tools only work when a debug session is active. [Set up and connect the debugger](/debugger/setup) to your SRCDS server first.
   </Step>
   <Step title="Configure Copilot to use the MCP server">
-    Add the GLuaLS MCP server to your Copilot configuration. See [Copilot MCP documentation](https://docs.github.com/en/copilot/how-tos/context/use-mcp) for instructions.
-
-    The MCP server runs locally at `http://localhost:<port>` — the port is shown in the extension output when the server starts.
+    This should now be automatically done by the VSCode Extension. Make sure the "Garry's Mod Language Server" toolset is enabled.
   </Step>
   <Step title="Use Copilot Chat">
-    Once connected, Copilot can answer questions like:
-    - "What Lua errors are currently on the server?"
-    - "Run `print(LocalPlayer():Nick())` on the server"
+    Once connected, Copilot can do things like:
+    - "Investigate all recent lua errors on the server."
+    - "Run `print("hello world")` on the server"
     - "What does the current console output show?"
   </Step>
 </Steps>
@@ -55,7 +56,7 @@ The MCP server starts automatically when the extension loads. To connect Copilot
 ## Example interactions
 
 ```
-You: What Lua errors have occurred since I last checked?
+You: What recent Lua errors have occurred?
 
 Copilot: [calls get_errors] I found 2 errors:
 1. addons/my-addon/lua/init.lua:42 - attempt to index nil value 'ply'
@@ -77,10 +78,10 @@ Copilot: [calls run_lua] Output: gm_flatgrass
 The MCP server includes several security controls:
 
 - **Local-only by default** — the server only accepts connections from `localhost`. Remote access is blocked unless explicitly configured.
-- **Auth token** — each session uses a cryptographically random token that must be included in requests
-- **Rate limiting** — requests are rate-limited to prevent abuse
+- **Auth token** — each session uses a random token that must be included in requests
+- **Rate limiting** — requests are rate-limited to prevent excessive calls.
 - **Tool allowlist** — you can restrict which tools are available to AI agents
 
 <Warning>
-The MCP server provides direct access to execute Lua on your game server. Only use this feature with trusted AI tools on a local development server. Never expose the MCP endpoint publicly.
+The MCP server provides direct access to execute Lua on your game server. Only use this feature with trusted AI tools on a local development server. Never expose the MCP endpoint publicly. Never use this or any other debugger features on production servers.
 </Warning>

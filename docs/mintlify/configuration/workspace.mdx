@@ -121,3 +121,15 @@ Most Lua files use UTF-8, but older addons may use a legacy encoding:
 ```
 
 Available values: `"utf-8"`, `"utf-16"`, `"gbk"`, `"latin1"`, `"ascii"`.
+
+---
+
+## VSCode extension settings
+
+These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+
+| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+|---|---|---|---|---|
+| `gluals.workspace.enableReindex` | `workspace.enableReindex` | `boolean` | `false` | Enable reindex after file changes |
+| `gluals.workspace.reindexDuration` | `workspace.reindexDuration` | `integer` | `5000` | Delay before reindex (ms) |
+| `gluals.source.roots` | `source.roots` | `array` | `[]` | Additional source roots |

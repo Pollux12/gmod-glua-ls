@@ -11,47 +11,29 @@
   "navigation": {
     "tabs": [
       {
-        "tab": "Getting Started",
+        "tab": "Get Started",
         "groups": [
           {
             "group": "Introduction",
             "pages": [
               "index",
               "getting-started/installation",
-              "getting-started/quickstart",
               "getting-started/workspace-setup"
             ]
           }
         ]
       },
       {
-        "tab": "VSCode Extension",
+        "tab": "Features",
         "groups": [
           {
             "group": "Overview",
             "pages": [
-              "vscode/overview"
+              "features/overview"
             ]
           },
           {
-            "group": "Features",
-            "pages": [
-              "vscode/settings-ui",
-              "vscode/class-explorer",
-              "vscode/realm-view",
-              "vscode/error-tracking",
-              "vscode/scaffolding",
-              "vscode/annotations-management",
-              "vscode/ai-integration"
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "Language Features",
-        "groups": [
-          {
-            "group": "Code Intelligence",
+            "group": "Code intelligence",
             "pages": [
               "language/code-intelligence",
               "language/diagnostics",
@@ -60,34 +42,36 @@
             ]
           },
           {
-            "group": "GMod-Specific",
+            "group": "GMod",
             "pages": [
               "language/realm-awareness",
               "language/network-analysis",
-              "language/scripted-classes",
-              "language/vgui-support",
-              "language/hook-intelligence"
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "Debugger",
-        "groups": [
-          {
-            "group": "Getting Started",
-            "pages": [
-              "debugger/overview",
-              "debugger/setup"
+              "language/hook-intelligence",
+              "language/vgui-support"
             ]
           },
           {
-            "group": "Usage",
+            "group": "Classes",
             "pages": [
+              "language/scripted-classes"
+            ]
+          },
+          {
+            "group": "Debugger",
+            "pages": [
+              "debugger/overview",
+              "debugger/setup",
               "debugger/breakpoints-and-stepping",
               "debugger/inspecting-variables",
+              "debugger/entity-explorer",
               "debugger/lua-execution",
-              "debugger/entity-explorer"
+              "debugger/error-tracking"
+            ]
+          },
+          {
+            "group": "AI integration",
+            "pages": [
+              "vscode/ai-integration"
             ]
           }
         ]
@@ -102,7 +86,7 @@
             ]
           },
           {
-            "group": "Type System",
+            "group": "Type system",
             "pages": [
               "annotations/class",
               "annotations/type",
@@ -123,7 +107,7 @@
             ]
           },
           {
-            "group": "GMod-Specific",
+            "group": "GMod-specific",
             "pages": [
               "annotations/realm",
               "annotations/hook",
@@ -155,9 +139,10 @@
               "configuration/diagnostics",
               "configuration/completion",
               "configuration/formatting",
-              "configuration/workspace",
               "configuration/hints-and-hover",
-              "configuration/runtime"
+              "configuration/workspace",
+              "configuration/runtime",
+              "configuration/annotations-management"
             ]
           }
         ]

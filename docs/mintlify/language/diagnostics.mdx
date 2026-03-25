@@ -3,6 +3,8 @@ title: Diagnostics
 description: GLuaLS checks your code for errors, type mismatches, unused variables, and GMod-specific problems.
 ---
 
+import ConfigTip from "/snippets/config-tip.mdx"
+
 ## Overview
 
 Diagnostics appear as squiggly underlines in the editor and in the **Problems** panel (`Ctrl+Shift+M`). Each diagnostic has a severity level and a code identifier you can use for configuration.
@@ -24,6 +26,7 @@ Diagnostics appear as squiggly underlines in the editor and in the **Problems** 
 
 Change the severity of any diagnostic code, or disable it entirely:
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "diagnostics": {
@@ -39,7 +42,7 @@ Change the severity of any diagnostic code, or disable it entirely:
 ```
 
 <Tip>
-Use the [Interactive Settings UI](/vscode/settings-ui) to toggle diagnostics and change severity with checkboxes and dropdowns — no JSON editing required.
+Use the [interactive settings panel](/configuration/overview#settings-panel-recommended) to toggle diagnostics and change severity with checkboxes and dropdowns — no JSON editing required.
 </Tip>
 
 ---
@@ -148,6 +151,7 @@ See the [`@diagnostic` annotation reference](/annotations/diagnostic) for full d
 
 Add globals that your code uses but GLuaLS doesn't know about (e.g., from another module that's loaded separately):
 
+<ConfigTip />
 ```json .gluarc.json
 {
   "diagnostics": {
