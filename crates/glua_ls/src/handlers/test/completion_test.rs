@@ -3208,6 +3208,142 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_member_completion_in_server_consumer_includes_shared_members_for_class_alias_pattern()
+    -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "lua/glide/sh_fuel.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.Fuel = Glide.Fuel or {}
+
+            ---@class Fuel
+            local Fuel = Glide.Fuel
+
+            function Fuel.GetProfile(id)
+                return id
+            end
+
+            if SERVER then
+                function Fuel.ServerOnly(id)
+                    return id
+                end
+            end
+
+            Glide.Fuel = Fuel
+            "#,
+        );
+
+        let (consumer_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            local FuelModule = Glide.Fuel
+            FuelModule.<??>
+            "#,
+        )?;
+        let consumer_file = ws.def_file(
+            "lua/entities/base_glide_car/init.lua",
+            consumer_content.as_str(),
+        );
+
+        let completion_result = completion(
+            &ws.analysis,
+            consumer_file,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+
+        let completion_items = match completion_result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let completion_labels = completion_items
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+
+        verify_that!(&completion_labels, contains(eq("GetProfile")))?;
+        verify_that!(&completion_labels, contains(eq("ServerOnly")))?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_member_completion_in_client_consumer_includes_shared_but_excludes_server_members_for_class_alias_pattern()
+    -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "lua/glide/sh_fuel.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.Fuel = Glide.Fuel or {}
+
+            ---@class Fuel
+            local Fuel = Glide.Fuel
+
+            function Fuel.GetProfile(id)
+                return id
+            end
+
+            if SERVER then
+                function Fuel.ServerOnly(id)
+                    return id
+                end
+            end
+
+            Glide.Fuel = Fuel
+            "#,
+        );
+
+        let (consumer_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            if CLIENT then
+                local FuelModule = Glide.Fuel
+                FuelModule.<??>
+            end
+            "#,
+        )?;
+        let consumer_file = ws.def_file(
+            "lua/entities/base_glide_car/cl_init.lua",
+            consumer_content.as_str(),
+        );
+
+        let completion_result = completion(
+            &ws.analysis,
+            consumer_file,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+
+        let completion_items = match completion_result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let completion_labels = completion_items
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+
+        verify_that!(&completion_labels, contains(eq("GetProfile")))?;
+        verify_that!(&completion_labels, not(contains(eq("ServerOnly"))))?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_dynamic_field_completion_global_per_type() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

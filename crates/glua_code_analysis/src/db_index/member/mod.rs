@@ -94,14 +94,21 @@ impl LuaMemberIndex {
                 member_map.add_member(key.clone(), LuaMemberIndexItem::One(id));
             }
         } else {
-            if !member_map.contains_member(&key) {
-                member_map.add_member(key, LuaMemberIndexItem::One(id));
+            if !self
+                .owner_members
+                .get(&owner)
+                .is_some_and(|owner_members| owner_members.contains_member(&key))
+            {
+                self.owner_members
+                    .entry(owner.clone())
+                    .or_insert_with(LuaOwnerMembers::new)
+                    .add_member(key, LuaMemberIndexItem::One(id));
                 return Some(());
             }
 
-            let item = member_map.get_member(&key)?.clone();
-            let new_items = if self.is_item_only_meta(&item) {
-                match item {
+            let item = self.owner_members.get(&owner)?.get_member(&key)?.clone();
+            let (new_items, removed_member_ids) = if self.is_item_only_meta(&item) {
+                let new_items = match item {
                     LuaMemberIndexItem::One(old_id) => {
                         if old_id == id {
                             return Some(());
@@ -116,10 +123,27 @@ impl LuaMemberIndex {
                         ids.push(id);
                         LuaMemberIndexItem::Many(ids)
                     }
+                };
+                (new_items, Vec::new())
+            } else if self.is_item_only_file_define(&item) {
+                let old_member_ids = member_ids_from_item(&item);
+                match item {
+                    LuaMemberIndexItem::One(old_id) if old_id == id => return Some(()),
+                    _ => (
+                        LuaMemberIndexItem::One(id),
+                        old_member_ids
+                            .into_iter()
+                            .filter(|old_id| *old_id != id)
+                            .collect(),
+                    ),
                 }
             } else {
                 return Some(());
             };
+
+            for old_member_id in removed_member_ids {
+                self.remove_member_from_owner_key_index(&owner, old_member_id);
+            }
 
             self.owner_members
                 .entry(owner.clone())
@@ -187,6 +211,18 @@ impl LuaMemberIndex {
         }
 
         false
+    }
+
+    fn is_item_only_file_define(&self, item: &LuaMemberIndexItem) -> bool {
+        match item {
+            LuaMemberIndexItem::One(id) => self
+                .get_member(id)
+                .is_some_and(|member| member.get_feature().is_file_define()),
+            LuaMemberIndexItem::Many(ids) => ids.iter().all(|id| {
+                self.get_member(id)
+                    .is_some_and(|member| member.get_feature().is_file_define())
+            }),
+        }
     }
 
     pub fn set_member_owner(
@@ -367,6 +403,13 @@ impl LuaIndex for LuaMemberIndex {
         self.owner_members.clear();
         self.member_current_owner.clear();
         self.member_owner_key_index.clear();
+    }
+}
+
+fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<LuaMemberId> {
+    match item {
+        LuaMemberIndexItem::One(id) => vec![*id],
+        LuaMemberIndexItem::Many(ids) => ids.clone(),
     }
 }
 

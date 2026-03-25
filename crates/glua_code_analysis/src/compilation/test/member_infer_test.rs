@@ -4,7 +4,7 @@ mod test {
     use googletest::prelude::*;
     use smol_str::SmolStr;
 
-    use crate::{DiagnosticCode, LuaType, LuaUnionType, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaType, LuaUnionType, VirtualWorkspace};
 
     #[test]
     fn test_issue_318() {
@@ -315,6 +315,129 @@ mod test {
             );
             assert_that!(ws.check_type(&typ, &LuaType::Boolean), eq(true));
         }
+    }
+
+    #[test]
+    fn test_class_annotated_local_alias_propagates_members_to_global_alias_in_server_consumer() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/glide/sh_fuel.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.Fuel = Glide.Fuel or {}
+
+            ---@class Fuel
+            local Fuel = Glide.Fuel
+
+            function Fuel.GetProfile(id)
+                return id
+            end
+
+            if SERVER then
+                function Fuel.ServerOnly()
+                    return true
+                end
+            end
+
+            Glide.Fuel = Fuel
+            "#,
+        );
+
+        let consumer_file = ws.def_file(
+            "lua/entities/base_glide_car/init.lua",
+            r#"
+            local FuelModule = Glide.Fuel
+            local getter = FuelModule.GetProfile
+            "#,
+        );
+
+        let client_consumer_file = ws.def_file(
+            "lua/entities/base_glide_car/cl_init.lua",
+            r#"
+            local FuelModule = Glide.Fuel
+            local getter = FuelModule.GetProfile
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(consumer_file)
+            .expect("expected semantic model");
+
+        let get_profile_type = semantic_model
+            .get_root()
+            .clone()
+            .descendants::<LuaAst>()
+            .filter_map(|node| match node {
+                LuaAst::LuaIndexExpr(index_expr)
+                    if index_expr.syntax().text().to_string() == "FuelModule.GetProfile" =>
+                {
+                    semantic_model
+                        .get_semantic_info(index_expr.syntax().clone().into())
+                        .map(|info| info.typ)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("expected semantic info for FuelModule.GetProfile");
+
+        let fuel_module_type = semantic_model
+            .get_root()
+            .clone()
+            .descendants::<LuaAst>()
+            .filter_map(|node| match node {
+                LuaAst::LuaNameExpr(name_expr)
+                    if name_expr.syntax().text().to_string() == "FuelModule" =>
+                {
+                    semantic_model
+                        .get_semantic_info(name_expr.syntax().clone().into())
+                        .map(|info| info.typ)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("expected semantic info for FuelModule");
+
+        assert!(
+            !fuel_module_type.is_unknown(),
+            "FuelModule should not infer as unknown, got {fuel_module_type:?}"
+        );
+
+        assert!(
+            !get_profile_type.is_unknown(),
+            "FuelModule.GetProfile should not infer as unknown, got {get_profile_type:?}"
+        );
+
+        let client_semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(client_consumer_file)
+            .expect("expected semantic model");
+        let client_get_profile_type = client_semantic_model
+            .get_root()
+            .clone()
+            .descendants::<LuaAst>()
+            .filter_map(|node| match node {
+                LuaAst::LuaIndexExpr(index_expr)
+                    if index_expr.syntax().text().to_string() == "FuelModule.GetProfile" =>
+                {
+                    client_semantic_model
+                        .get_semantic_info(index_expr.syntax().clone().into())
+                        .map(|info| info.typ)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("expected semantic info for client FuelModule.GetProfile");
+        assert!(
+            !client_get_profile_type.is_unknown(),
+            "client FuelModule.GetProfile should not infer as unknown, got {client_get_profile_type:?}"
+        );
     }
 
     #[test]
