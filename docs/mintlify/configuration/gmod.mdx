@@ -114,9 +114,6 @@ To **override** a built-in definition, add an entry with its `id` and only the f
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `gmod.network.enabled` | `boolean` | `true` | Enable all network flow analysis |
-| `gmod.network.diagnostics.typeMismatch` | `boolean` | `true` | Warn when read type doesn't match write type across realms |
-| `gmod.network.diagnostics.orderMismatch` | `boolean` | `true` | Warn when net.Read order doesn't match net.Write order |
-| `gmod.network.diagnostics.missingCounterpart` | `boolean` | `true` | Warn when a send block has no receive (or vice versa) |
 | `gmod.network.completion.smartReadSuggestions` | `boolean` | `true` | Suggest net.Read* calls in expected order inside receive callbacks |
 | `gmod.network.completion.mismatchHints` | `boolean` | `true` | Annotate suggestions with hints when expected read doesn't match current |
 

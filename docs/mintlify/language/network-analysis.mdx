@@ -93,22 +93,9 @@ Network analysis works across files. Messages registered in one file, sent in a 
 
 ## Configuration
 
-```json .gluarc.json
-{
-  "gmod": {
-    "network": {
-      "enabled": true,
-      "diagnostics": {
-        "missingCounterpart": true,
-        "orderMismatch": true,
-        "typeMismatch": true
-      }
-    }
-  }
-}
-```
+Network diagnostics are controlled via the central `diagnostics` section (e.g. `diagnostics.disable`/`diagnostics.enables`).
 
-Disable network diagnostics by setting `"gmod.network.enabled": false`, or adjust individual checks under `gmod.network.diagnostics`.
+See the [GMod settings](/configuration/gmod#network) for the full reference on network-related configuration options.
 
 ---
 
