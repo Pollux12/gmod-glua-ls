@@ -151,7 +151,12 @@
     "global": {
       "anchors": [
         {
-          "anchor": "GitHub",
+          "anchor": "GitHub - VSCode",
+          "href": "https://github.com/Pollux12/vscode-gmod-glua-ls",
+          "icon": "github"
+        },
+        {
+          "anchor": "GitHub - LS",
           "href": "https://github.com/Pollux12/gmod-glua-ls",
           "icon": "github"
         },
@@ -171,7 +176,7 @@
     "links": [
       {
         "label": "GitHub",
-        "href": "https://github.com/Pollux12/gmod-glua-ls"
+        "href": "https://github.com/Pollux12/vscode-gmod-glua-ls"
       }
     ],
     "primary": {
@@ -193,7 +198,7 @@
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/Pollux12/gmod-glua-ls"
+      "github": "https://github.com/Pollux12/vscode-gmod-glua-ls"
     }
   }
 }
