@@ -126,6 +126,17 @@ fn resolve_member_type(
                     return Err(InferFailReason::None);
                 }
             }
+            let all_file_defines = members
+                .iter()
+                .all(|member| member.get_feature().is_file_define());
+            let should_prefer_doc_file_defines = all_file_defines
+                && members.iter().any(|member| {
+                    db.get_type_index()
+                        .get_type_cache(&member.get_id().into())
+                        .is_some_and(|cache| cache.is_doc())
+                });
+            let should_widen_file_defines =
+                !should_prefer_doc_file_defines && members.len() > 1 && all_file_defines;
             if db.get_emmyrc().strict.meta_override_file_define {
                 for member in &members {
                     let feature = member.get_feature();
@@ -142,14 +153,21 @@ fn resolve_member_type(
                 MemberTypeResolveState::All => {
                     let mut typ = LuaType::Unknown;
                     for member in members {
-                        typ = TypeOps::Union.apply(
-                            db,
-                            &typ,
-                            db.get_type_index()
-                                .get_type_cache(&member.get_id().into())
-                                .ok_or(InferFailReason::UnResolveMemberType(member.get_id()))?
-                                .as_type(),
-                        );
+                        let member_type_cache = db
+                            .get_type_index()
+                            .get_type_cache(&member.get_id().into())
+                            .ok_or(InferFailReason::UnResolveMemberType(member.get_id()))?;
+                        if should_prefer_doc_file_defines && !member_type_cache.is_doc() {
+                            continue;
+                        }
+
+                        let member_type = member_type_cache.as_type();
+                        let member_type = if should_widen_file_defines {
+                            crate::widen_literal_type_for_assignment(member_type)
+                        } else {
+                            member_type.clone()
+                        };
+                        typ = TypeOps::Union.apply(db, &typ, &member_type);
                     }
                     Ok(typ)
                 }

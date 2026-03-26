@@ -392,7 +392,26 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = widened_type;
     }
 
-    bind_type(analyzer.db, type_owner, LuaTypeCache::InferType(expr_type));
+    if let Some(widened_type) =
+        get_widened_member_assignment_type(analyzer, &type_owner, &expr_type)
+    {
+        expr_type = widened_type;
+    }
+
+    bind_type(
+        analyzer.db,
+        type_owner.clone(),
+        LuaTypeCache::InferType(expr_type),
+    );
+
+    if let LuaTypeOwner::Member(member_id) = type_owner
+        && is_assignment_file_define_member(analyzer.db, member_id)
+    {
+        analyzer
+            .db
+            .get_member_index_mut()
+            .retain_only_member_for_owner_key(member_id);
+    }
 
     Some(())
 }
@@ -447,6 +466,70 @@ fn get_widened_member_assignment_collection_type(
     Some(LuaType::Array(
         LuaArrayType::from_base_type(widened_base).into(),
     ))
+}
+
+fn get_widened_member_assignment_type(
+    analyzer: &mut LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+    incoming_type: &LuaType,
+) -> Option<LuaType> {
+    let LuaTypeOwner::Member(member_id) = type_owner else {
+        return None;
+    };
+    if !is_assignment_file_define_member(analyzer.db, *member_id) {
+        return None;
+    }
+
+    let member_index = analyzer.db.get_member_index();
+    let owner = member_index.get_member_owner(member_id)?.clone();
+    let key = member_index.get_member(member_id)?.get_key().clone();
+    let related_members = member_index.get_members_for_owner_key(&owner, &key);
+    if related_members.len() < 2 {
+        return None;
+    }
+
+    let mut doc_type: Option<LuaType> = None;
+    let mut widened_type = crate::widen_literal_type_for_assignment(incoming_type);
+    let mut saw_previous_assignment = false;
+
+    for related_member in related_members {
+        let related_member_id = related_member.get_id();
+        if related_member_id == *member_id {
+            continue;
+        }
+        saw_previous_assignment = true;
+
+        if !is_assignment_file_define_member(analyzer.db, related_member_id) {
+            return None;
+        }
+
+        let Some(existing_cache) = analyzer
+            .db
+            .get_type_index()
+            .get_type_cache(&related_member_id.into())
+            .cloned()
+        else {
+            continue;
+        };
+
+        if existing_cache.is_doc() {
+            let existing_type = existing_cache.as_type().clone();
+            doc_type = Some(match doc_type {
+                Some(current) => TypeOps::Union.apply(analyzer.db, &current, &existing_type),
+                None => existing_type,
+            });
+            continue;
+        }
+
+        let existing_type = crate::widen_literal_type_for_assignment(existing_cache.as_type());
+        widened_type = TypeOps::Union.apply(analyzer.db, &widened_type, &existing_type);
+    }
+
+    if !saw_previous_assignment {
+        return None;
+    }
+
+    Some(doc_type.unwrap_or(widened_type))
 }
 
 fn widen_existing_member_collection_type(
@@ -643,6 +726,15 @@ fn normalize_infer_collection_type(db: &crate::DbIndex, typ: &LuaType) -> Option
         }
         _ => None,
     }
+}
+
+fn is_assignment_file_define_member(db: &crate::DbIndex, member_id: LuaMemberId) -> bool {
+    db.get_member_index()
+        .get_member(&member_id)
+        .is_some_and(|member| {
+            member.get_feature() == LuaMemberFeature::FileDefine
+                && member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr.into()
+        })
 }
 
 fn merge_type_owner_and_unresolve_expr(

@@ -4,6 +4,7 @@ mod lua_member_item;
 mod lua_member_owner;
 mod lua_owner_members;
 
+use glua_parser::LuaSyntaxKind;
 use std::collections::{HashMap, HashSet};
 
 use super::traits::LuaIndex;
@@ -127,15 +128,28 @@ impl LuaMemberIndex {
                 (new_items, Vec::new())
             } else if self.is_item_only_file_define(&item) {
                 let old_member_ids = member_ids_from_item(&item);
-                match item {
-                    LuaMemberIndexItem::One(old_id) if old_id == id => return Some(()),
-                    _ => (
-                        LuaMemberIndexItem::One(id),
-                        old_member_ids
-                            .into_iter()
-                            .filter(|old_id| *old_id != id)
-                            .collect(),
-                    ),
+                let should_accumulate_assignments = self.is_assignment_file_define_member(id)
+                    && old_member_ids
+                        .iter()
+                        .all(|old_id| self.is_assignment_file_define_member(*old_id));
+
+                if should_accumulate_assignments {
+                    match item {
+                        LuaMemberIndexItem::One(old_id) if old_id == id => return Some(()),
+                        LuaMemberIndexItem::Many(ids) if ids.contains(&id) => return Some(()),
+                        _ => (LuaMemberIndexItem::One(id), Vec::new()),
+                    }
+                } else {
+                    match item {
+                        LuaMemberIndexItem::One(old_id) if old_id == id => return Some(()),
+                        _ => (
+                            LuaMemberIndexItem::One(id),
+                            old_member_ids
+                                .into_iter()
+                                .filter(|old_id| *old_id != id)
+                                .collect(),
+                        ),
+                    }
                 }
             } else {
                 return Some(());
@@ -223,6 +237,13 @@ impl LuaMemberIndex {
                     .is_some_and(|member| member.get_feature().is_file_define())
             }),
         }
+    }
+
+    fn is_assignment_file_define_member(&self, id: LuaMemberId) -> bool {
+        self.get_member(&id).is_some_and(|member| {
+            member.get_feature().is_file_define()
+                && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr.into()
+        })
     }
 
     pub fn set_member_owner(
@@ -339,6 +360,23 @@ impl LuaMemberIndex {
                 self.get_member(&member_id)
             })
             .collect()
+    }
+
+    pub fn retain_only_member_for_owner_key(&mut self, member_id: LuaMemberId) -> Option<()> {
+        let owner = self.member_current_owner.get(&member_id)?.clone();
+        let key = self.get_member(&member_id)?.get_key().clone();
+        let member_ids = self.member_owner_key_index.get(&owner)?.get(&key)?;
+        if !member_ids
+            .iter()
+            .copied()
+            .all(|id| self.is_assignment_file_define_member(id))
+        {
+            return Some(());
+        }
+
+        let member_ids = self.member_owner_key_index.get_mut(&owner)?.get_mut(&key)?;
+        member_ids.retain(|id| *id == member_id);
+        Some(())
     }
 }
 

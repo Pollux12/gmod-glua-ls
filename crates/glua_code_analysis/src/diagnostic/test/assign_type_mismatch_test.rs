@@ -1906,3 +1906,29 @@ fn test_strict_inferred_table_assignment() {
         "#
     ));
 }
+
+#[test]
+fn test_reassigned_inferred_member_does_not_lock_to_last_literal() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class TestClass
+        local TestClass = {}
+
+        ---@type TestClass
+        local obj
+
+        function TestClass:SetFalse()
+            self._testVar = false
+        end
+
+        function TestClass:Reset()
+            self._testVar = nil
+        end
+
+        obj._testVar = true
+        "#
+    ));
+}

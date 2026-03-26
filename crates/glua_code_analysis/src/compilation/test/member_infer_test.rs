@@ -193,6 +193,67 @@ mod test {
     }
 
     #[gtest]
+    fn test_class_field_reassignment_across_methods_is_optional_boolean() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@class TestClass
+        local TestClass = {}
+
+        ---@type TestClass
+        local obj
+
+        function TestClass:MethodOne()
+            self._testVar = true
+        end
+
+        function TestClass:MethodTwo()
+            self._testVar = nil
+        end
+
+        A = obj._testVar
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(ty), "boolean?");
+    }
+
+    #[gtest]
+    fn test_annotated_class_field_overrides_repeated_inferred_writes() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@class TestClass
+        ---@field _testVar integer
+        local TestClass = {}
+
+        ---@type TestClass
+        local obj
+
+        function TestClass:SetValue()
+            self._testVar = 1
+        end
+
+        function TestClass:ResetWrong()
+            self._testVar = nil
+        end
+
+        function TestClass:SetWrong()
+            self._testVar = true
+        end
+
+        A = obj._testVar
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(ty), "integer");
+    }
+
+    #[gtest]
     fn test_assignment_side_dynamic_field_type_for_class_typed_variables() {
         let mut ws = VirtualWorkspace::new();
 

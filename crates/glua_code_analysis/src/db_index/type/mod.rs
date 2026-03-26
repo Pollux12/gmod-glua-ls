@@ -18,6 +18,30 @@ pub use type_owner::{LuaTypeCache, LuaTypeOwner};
 pub use type_visit_trait::TypeVisitTrait;
 pub use types::*;
 
+pub(crate) fn widen_literal_type_for_assignment(typ: &LuaType) -> LuaType {
+    match typ {
+        LuaType::IntegerConst(_) => LuaType::Integer,
+        LuaType::FloatConst(_) => LuaType::Number,
+        LuaType::StringConst(_) => LuaType::String,
+        LuaType::BooleanConst(_) => LuaType::Boolean,
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .into_vec()
+                .into_iter()
+                .map(|sub_type| widen_literal_type_for_assignment(&sub_type))
+                .collect(),
+        ),
+        LuaType::MultiLineUnion(multi_union) => LuaType::from_vec(
+            multi_union
+                .get_unions()
+                .iter()
+                .map(|(sub_type, _)| widen_literal_type_for_assignment(sub_type))
+                .collect(),
+        ),
+        _ => typ.clone(),
+    }
+}
+
 #[derive(Debug)]
 pub struct LuaTypeIndex {
     file_namespace: HashMap<FileId, String>,
