@@ -1888,3 +1888,21 @@ return t
         );
     }
 }
+
+#[test]
+fn test_strict_inferred_table_assignment() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    let mut emmyrc = ws.get_emmyrc();
+    emmyrc.strict.inferred_type_mismatch = true;
+    ws.update_emmyrc(emmyrc);
+
+    // check_code_for returns FALSE if it FINDS the diagnostic.
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        local strict = { x = 1 }
+        -- This should error because strict mode enforces mismatched types on inferred variables
+        strict = { x = "hello" }
+        "#
+    ));
+}

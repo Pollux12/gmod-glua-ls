@@ -126,14 +126,17 @@ fn check_name_expr(
         false,
         source_is_inferred,
     );
+    let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
-        check_table_expr(
-            context,
-            semantic_model,
-            rowan::NodeOrToken::Node(name_expr.syntax().clone()),
-            &expr,
-            source_type.as_ref(),
-        );
+        if !source_is_inferred || strict_inferred_mismatch {
+            check_table_expr(
+                context,
+                semantic_model,
+                rowan::NodeOrToken::Node(name_expr.syntax().clone()),
+                &expr,
+                source_type.as_ref(),
+            );
+        }
     }
 
     Some(())
@@ -152,6 +155,10 @@ fn check_index_expr(
         return Some(());
     }
 
+    let source_is_inferred = inferred_member_flags(semantic_model, index_expr)
+        .map(|(is_inferred, _)| is_inferred)
+        .unwrap_or(false);
+
     let source_type = infer_index_expr(
         semantic_model.get_db(),
         &mut semantic_model.get_cache().borrow_mut(),
@@ -159,10 +166,6 @@ fn check_index_expr(
         false,
     )
     .ok();
-    let source_is_inferred_collection = matches!(
-        source_type.as_ref(),
-        Some(LuaType::Tuple(tuple)) if tuple.is_infer_resolve()
-    );
 
     check_assign_type_mismatch(
         context,
@@ -171,16 +174,19 @@ fn check_index_expr(
         source_type.as_ref(),
         &value_type,
         true,
-        source_is_inferred_collection,
+        source_is_inferred,
     );
+    let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
-        check_table_expr(
-            context,
-            semantic_model,
-            rowan::NodeOrToken::Node(index_expr.syntax().clone()),
-            &expr,
-            source_type.as_ref(),
-        );
+        if !source_is_inferred || strict_inferred_mismatch {
+            check_table_expr(
+                context,
+                semantic_model,
+                rowan::NodeOrToken::Node(index_expr.syntax().clone()),
+                &expr,
+                source_type.as_ref(),
+            );
+        }
     }
     Some(())
 }
@@ -253,14 +259,30 @@ fn is_inferred_member_collection_expr(
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
 ) -> Option<bool> {
-    let prefix_expr = index_expr.get_prefix_expr()?;
-    let prefix_type = semantic_model.infer_expr(prefix_expr).ok()?;
-    let owner = match prefix_type {
-        LuaType::TableConst(in_file_range) => crate::LuaMemberOwner::Element(in_file_range),
-        LuaType::Def(def_id) | LuaType::Ref(def_id) => crate::LuaMemberOwner::Type(def_id),
-        LuaType::Instance(instance) => crate::LuaMemberOwner::Element(instance.get_range().clone()),
-        _ => return Some(false),
-    };
+    let owner = member_owner_from_prefix_type(semantic_model, index_expr.get_prefix_expr()?)?;
+    let index_key = index_expr.get_index_key()?;
+    let member_key = LuaMemberKey::from_index_key(
+        semantic_model.get_db(),
+        &mut semantic_model.get_cache().borrow_mut(),
+        &index_key,
+    )
+    .ok()?;
+
+    member_flags_before_position(
+        semantic_model,
+        &owner,
+        &member_key,
+        index_expr.get_range().start(),
+        false,
+    )
+    .map(|(_, is_collection)| is_collection)
+}
+
+fn inferred_member_flags(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> Option<(bool, bool)> {
+    let owner = member_owner_from_prefix_type(semantic_model, index_expr.get_prefix_expr()?)?;
 
     let index_key = index_expr.get_index_key()?;
     let member_key = LuaMemberKey::from_index_key(
@@ -269,38 +291,138 @@ fn is_inferred_member_collection_expr(
         &index_key,
     )
     .ok()?;
-    let members = semantic_model
-        .get_db()
-        .get_member_index()
-        .get_members_for_owner_key(&owner, &member_key);
-    if members.is_empty() {
-        return Some(false);
+
+    let flags = member_flags_before_position(
+        semantic_model,
+        &owner,
+        &member_key,
+        index_expr.get_range().start(),
+        false,
+    )?;
+    if flags != (false, false) {
+        return Some(flags);
     }
 
-    let mut saw_collection = false;
-    for member in members {
+    member_flags_for_member_ids(
+        semantic_model,
+        vec![crate::LuaMemberId::new(
+            index_expr.get_syntax_id(),
+            semantic_model.get_file_id(),
+        )],
+    )
+}
+
+fn inferred_table_member_flags(
+    semantic_model: &SemanticModel,
+    table_type: &LuaType,
+    member_key: &LuaMemberKey,
+    position: rowan::TextSize,
+    current_member_id: crate::LuaMemberId,
+) -> Option<(bool, bool)> {
+    let owner = member_owner_from_type(table_type)?;
+    let flags = member_flags_before_position(semantic_model, &owner, member_key, position, true)?;
+    if flags != (false, false) {
+        return Some(flags);
+    }
+
+    member_flags_for_member_ids(semantic_model, vec![current_member_id])
+}
+
+fn member_owner_from_prefix_type(
+    semantic_model: &SemanticModel,
+    prefix_expr: LuaExpr,
+) -> Option<crate::LuaMemberOwner> {
+    let prefix_type = semantic_model.infer_expr(prefix_expr).ok()?;
+    member_owner_from_type(&prefix_type)
+}
+
+fn member_owner_from_type(prefix_type: &LuaType) -> Option<crate::LuaMemberOwner> {
+    match prefix_type {
+        LuaType::TableConst(in_file_range) => Some(crate::LuaMemberOwner::Element(in_file_range.clone())),
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(crate::LuaMemberOwner::Type(def_id.clone())),
+        LuaType::Instance(instance) => Some(crate::LuaMemberOwner::Element(instance.get_range().clone())),
+        _ => None,
+    }
+}
+
+fn member_flags_before_position(
+    semantic_model: &SemanticModel,
+    owner: &crate::LuaMemberOwner,
+    member_key: &LuaMemberKey,
+    position: rowan::TextSize,
+    include_current_position: bool,
+) -> Option<(bool, bool)> {
+    member_flags_for_member_ids(
+        semantic_model,
+        semantic_model
+            .get_db()
+            .get_member_index()
+            .get_members_for_owner_key(owner, member_key)
+            .into_iter()
+            .filter(|member| {
+                if member.get_id().file_id != semantic_model.get_file_id() {
+                    return true;
+                }
+                if include_current_position {
+                    member.get_id().get_position() <= position
+                } else {
+                    member.get_id().get_position() < position
+                }
+            })
+            .map(|member| member.get_id()),
+    )
+}
+
+fn member_flags_for_member_ids<I>(
+    semantic_model: &SemanticModel,
+    member_ids: I,
+) -> Option<(bool, bool)>
+where
+    I: IntoIterator<Item = crate::LuaMemberId>,
+{
+    let mut member_ids = member_ids.into_iter().peekable();
+    if member_ids.peek().is_none() {
+        return Some((false, false));
+    }
+
+    let mut all_lenient = true;
+    let mut all_collection = true;
+    for member_id in member_ids {
+        if !all_lenient && !all_collection {
+            return Some((false, false));
+        }
+
         let Some(type_cache) = semantic_model
             .get_db()
             .get_type_index()
-            .get_type_cache(&member.get_id().into())
+            .get_type_cache(&member_id.into())
         else {
-            continue;
+            return Some((false, false));
         };
         if !type_cache.is_infer() {
-            return Some(false);
+            return Some((false, false));
         }
+
+        if !is_lenient_inferred_member_type(type_cache.as_type()) {
+            all_lenient = false;
+        }
+
         let is_collection = match type_cache.as_type() {
             LuaType::Array(_) => true,
             LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
             _ => false,
         };
         if !is_collection {
-            return Some(false);
+            all_collection = false;
         }
-        saw_collection = true;
     }
 
-    Some(saw_collection)
+    Some((all_lenient, all_collection))
+}
+
+fn is_lenient_inferred_member_type(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_))
+        || matches!(typ, LuaType::Tuple(tuple) if tuple.is_infer_resolve())
 }
 
 fn check_local_stat(
@@ -439,8 +561,19 @@ fn check_table_expr_content(
                 continue;
             }
         };
+        let source_is_inferred = inferred_table_member_flags(
+            semantic_model,
+            table_type,
+            &member_key,
+            field.get_range().start(),
+            crate::LuaMemberId::new(field.get_syntax_id(), semantic_model.get_file_id()),
+        )
+        .map(|(is_inferred, _)| is_inferred)
+        .unwrap_or(false);
+        let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
 
-        if should_check_nested_table_fields(&source_type)
+        if (!source_is_inferred || strict_inferred_mismatch)
+            && should_check_nested_table_fields(&source_type)
             && let Some(table_expr) = LuaTableExpr::cast(value_expr.syntax().clone())
         {
             // 检查子表
@@ -461,7 +594,7 @@ fn check_table_expr_content(
             Some(&source_type),
             &expr_type,
             allow_nil,
-            false,
+            source_is_inferred,
         ) {
             has_diagnostic = has_diagnostic || result;
         }
