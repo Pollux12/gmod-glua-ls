@@ -733,7 +733,7 @@ fn is_assignment_file_define_member(db: &crate::DbIndex, member_id: LuaMemberId)
         .get_member(&member_id)
         .is_some_and(|member| {
             member.get_feature() == LuaMemberFeature::FileDefine
-                && member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr.into()
+                && member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
         })
 }
 

@@ -228,7 +228,7 @@ fn check_decl_duplicate_field(
 
 fn is_assignment_file_define_member(member: &LuaMember) -> bool {
     member.get_feature() == LuaMemberFeature::FileDefine
-        && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr.into()
+        && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
 }
 
 /// 特殊处理: require("a").fun = function() end

@@ -432,11 +432,10 @@ mod test {
 
         let get_profile_type = semantic_model
             .get_root()
-            .clone()
             .descendants::<LuaAst>()
             .filter_map(|node| match node {
                 LuaAst::LuaIndexExpr(index_expr)
-                    if index_expr.syntax().text().to_string() == "FuelModule.GetProfile" =>
+                    if index_expr.syntax().text() == "FuelModule.GetProfile" =>
                 {
                     semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())
@@ -449,12 +448,9 @@ mod test {
 
         let fuel_module_type = semantic_model
             .get_root()
-            .clone()
             .descendants::<LuaAst>()
             .filter_map(|node| match node {
-                LuaAst::LuaNameExpr(name_expr)
-                    if name_expr.syntax().text().to_string() == "FuelModule" =>
-                {
+                LuaAst::LuaNameExpr(name_expr) if name_expr.syntax().text() == "FuelModule" => {
                     semantic_model
                         .get_semantic_info(name_expr.syntax().clone().into())
                         .map(|info| info.typ)
@@ -481,11 +477,10 @@ mod test {
             .expect("expected semantic model");
         let client_get_profile_type = client_semantic_model
             .get_root()
-            .clone()
             .descendants::<LuaAst>()
             .filter_map(|node| match node {
                 LuaAst::LuaIndexExpr(index_expr)
-                    if index_expr.syntax().text().to_string() == "FuelModule.GetProfile" =>
+                    if index_expr.syntax().text() == "FuelModule.GetProfile" =>
                 {
                     client_semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())

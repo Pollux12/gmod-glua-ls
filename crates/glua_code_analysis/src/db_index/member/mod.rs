@@ -242,7 +242,7 @@ impl LuaMemberIndex {
     fn is_assignment_file_define_member(&self, id: LuaMemberId) -> bool {
         self.get_member(&id).is_some_and(|member| {
             member.get_feature().is_file_define()
-                && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr.into()
+                && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
         })
     }
 
