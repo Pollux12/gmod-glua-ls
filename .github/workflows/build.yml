@@ -150,21 +150,29 @@ jobs:
 
   publish-crates:
     name: Publish Cargo crates
+    needs: [build-release]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    env:
+      CARGO_TOKEN: ${{ secrets.CARGO_TOKEN }}
     steps:
+      - name: Skip publish when CARGO_TOKEN is not configured
+        if: env.CARGO_TOKEN == ''
+        run: echo "CARGO_TOKEN is not set; skipping crates publish."
       - uses: actions/checkout@v4
+        if: env.CARGO_TOKEN != ''
         with:
           submodules: recursive
       - name: Install Rust toolchain
+        if: env.CARGO_TOKEN != ''
         uses: dtolnay/rust-toolchain@stable
       - name: Set version
+        if: env.CARGO_TOKEN != ''
         run: |
           echo "current ref ${{ github.ref }}"
           cargo run -p edit_version -- ${{ github.ref }}
       - name: Publish crates
-        env:
-          CARGO_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        if: env.CARGO_TOKEN != ''
         run: |
           set -euo pipefail
 
@@ -212,7 +220,7 @@ jobs:
           publish_with_retry crates/glua_check/Cargo.toml
 
   release:
-    needs: [build-release, publish-crates]
+    needs: [build-release]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
