@@ -7,7 +7,9 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-Garry's Mod Lua runs in two **realms**: clientside (`CLIENT`) and serverside (`SERVER`), with code accessible on both being referred to as "shared". Many GMod API functions are only available in one realm (e.g., `LocalPlayer()` is client-only), with cross-realm mistakes being a common source of bugs for GMod developers. GLuaLS is fully realm aware to help resolve this.
+Garry's Mod Lua runs in two **realms**: client (`CLIENT`) and server (`SERVER`). Code that runs in both is called shared.
+
+Many GMod API functions only exist in one realm (for example, `LocalPlayer()` is client-only). Calling them in the wrong realm is a common bug.
 
 GLuaLS automatically detects which realm each file runs in and issues diagnostics when you call realm-restricted functions from the wrong realm.
 
@@ -15,14 +17,14 @@ GLuaLS automatically detects which realm each file runs in and issues diagnostic
 
 ## Realm detection
 
-GLuaLS contains an advanced realm detection system that uses multiple detection methods to determine the realm of each file or even within each file. This system is designed to "just work" and requires little to no configuration for almost all projects.
+GLuaLS detects realm using multiple signals. It usually works without extra setup.
 
-GLuaLS infers realm through a **5-level priority** system, from highest to lowest:
+GLuaLS infers realm with this **5-level priority** system (highest to lowest):
 
 ### 1. `@realm` annotation (highest priority)
 
 <Warning>
-**It is not recommended to add file level realm overrides where the realm is already correctly inferred**, as this can mask potential cross-realm issues. Use function-level overrides instead where possible.
+Do not add file-level realm overrides if inference is already correct. It can hide real cross-realm mistakes. Prefer function-level overrides.
 </Warning>
 
 Put `---@realm` at the top of a file or on a function:
@@ -33,7 +35,7 @@ Put `---@realm` at the top of a file or on a function:
 -- Everything in this file is clientside
 ```
 
-See the [`@realm` annotation reference](/annotations/realm) for the full syntax. Annotations override all other systems, with function level annotations taking precedence over file-level annotations.
+See the [`@realm` annotation reference](/annotations/realm) for full syntax. `@realm` overrides all other detection methods, and function-level annotations override file-level ones.
 
 ### 2. Filename prefix detection
 
@@ -75,7 +77,7 @@ end
 
 ### 5. Heuristic inference (lowest priority)
 
-If none of the above apply, GLuaLS may infer realm from the code within a file (e.g., calling a server-only function implies server realm). This is a best-effort heuristic and may not always be accurate, but it can catch cases where realm is not explicitly defined.
+If none of the above apply, GLuaLS can infer realm from code usage (for example, calling a server-only API suggests server realm). This heuristic may be wrong in some cases.
 
 ---
 
@@ -92,7 +94,7 @@ If none of the above apply, GLuaLS may infer realm from the code within a file (
 ## Disabling realm checks
 
 <Warning>
-It is not recommended to disable the realm checks, as this will significantly degrade the quality of other features which depend on it. It is instead recommended to suppress specific diagnostics via the settings menu - heuristic diagnostics have a separate setting for exactly this reason.
+Do not disable realm checks unless you really need to. Other features depend on them. In most cases, disable only specific diagnostics from settings.
 </Warning>
 
 Disable realm diagnostics workspace-wide:
@@ -128,7 +130,7 @@ function MyAddon.ServerAction()
 end
 ```
 
-It is recommended to use function-level overrides where possible, since this helps speed up performance of the language server, as it does not have to perform expensive inference when annotations are present.
+Use function-level overrides when possible. This is faster because the language server can skip expensive inference when annotations are present.
 
 ---
 
@@ -142,4 +144,4 @@ Every hover tooltip for a GMod API function includes a realm badge showing where
 
 The badge appears in completions as well, so you can check a function's realm before inserting it.
 
-The realm is used to filter autocomplete suggestions to reduce noise and prevent invalid code from being suggested. For example, if you're editing a clientside file, server-only functions will be hidden from autocomplete and vice versa. If it seems like some functions are missing from autocomplete, check the realm!
+Realm also filters autocomplete. In client files, server-only functions are hidden (and vice versa). If a function seems missing, check inferred realm first.

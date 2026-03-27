@@ -5,7 +5,9 @@ description: Everything GLuaLS provides — code intelligence, GMod-specific ana
 
 ## What GLuaLS provides
 
-GLuaLS combines a language server with a full-featured VSCode extension for Garry's Mod Lua development. The language server delivers core code intelligence to any LSP-compatible editor, while the VSCode extension adds GMod-specific tooling, an interactive settings panel, and an integrated debugger.
+GLuaLS has two parts:
+- a language server that works in LSP-compatible editors
+- a VS Code extension with extra GMod tools, settings UI, and debugger
 
 ## Code intelligence
 
@@ -106,6 +108,6 @@ When the debugger is connected, the status bar also shows the current realm and 
 
 ## Configuration
 
-Most settings are configured through `.gluarc.json` in your workspace root. Use the interactive settings panel (**GLua: Open Settings**) or edit the JSON directly. See the [Configuration](/configuration/overview) section for the full reference.
+Most settings live in `.gluarc.json` at your workspace root. You can use the settings panel (**GLua: Open Settings**) or edit JSON directly.
 
-Extension-level settings (annotation downloads, UI preferences) are under `gluals.*` in VS Code settings. See [Configuration overview](/configuration/overview#vscode-extension-settings) for the full list.
+Extension-level settings (annotation downloads, UI preferences) are under `gluals.*` in VS Code settings. See [Configuration overview](/configuration/overview#vscode-extension-settings) for details.

@@ -70,6 +70,27 @@ function clone(value) return deepCopy(value) end
 
 ---
 
+## Return from string-template generic capture
+
+```lua
+---@generic T : Entity
+---@param class `T`
+---@return T
+function ents.Create(class) end
+
+---@generic T : Entity
+---@param class `T`
+---@return T[]
+function ents.FindByClass(class) end
+```
+
+Use `` `T` `` for string-literal class names. Plain `T` captures value type (`string`), not class type.
+Quick rule:
+- `T` returns value-based types (`"x"` -> `string`)
+- `` `T` `` returns class/type names from string literals (`"sent_npc"` -> `sent_npc`)
+
+---
+
 ## Function return values
 
 ```lua
@@ -82,7 +103,7 @@ function GetFormatter() end
 ## `(instance)` modifier
 
 <Danger>
-This annotation is intended for internal use only. It is very likely that you do not need to use this modifier.
+This annotation is mainly for internal use. Most projects do not need this modifier.
 </Danger>
 
 When a function returns `(instance)`, fields and methods assigned to the returned variable are scoped to that specific variable only — they do not pollute the global class:
@@ -107,7 +128,7 @@ This is useful for factory functions that return panels or entities with custom 
 ## `(definition)` modifier
 
 <Danger>
-This annotation is intended for internal use only. It is very likely that you do not need to use this modifier.
+This annotation is mainly for internal use. Most projects do not need this modifier.
 </Danger>
 
 When a function returns `(definition)`, fields added to the returned variable are registered globally on the class:
@@ -121,3 +142,4 @@ end
 local base = GetEntityBase()
 base.MyNewMethod = function(self) end -- Added to all Entity instances globally
 ```
+

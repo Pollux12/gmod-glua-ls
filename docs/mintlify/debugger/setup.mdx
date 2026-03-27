@@ -83,7 +83,7 @@ Use **attach** when the server is already running (most common for development):
 
 ### Launch a server
 
-<Warning>The launch option is unsupported and may not work on all systems. It is recommended that you use attach instead.</Warning>
+<Warning>The `launch` option is unsupported and may not work on all systems. Use `attach` instead.</Warning>
 
 Use **launch** to start SRCDS directly from VS Code:
 
@@ -163,6 +163,6 @@ Make sure to update `"port"` in your `launch.json` to match.
 
 ## Remote debugging
 
-<Danger>It is not recommended to use the debugger to connect to remote systems or on untrusted networks. Do so at your own risk! </Danger>
+<Danger>Do not use the debugger on untrusted or public networks. Use remote debugging only if you understand and accept the risk.</Danger>
 
 If debugging a remote server, open the `gm_rdb` port (default `21111`) in your server's firewall.

@@ -1,6 +1,6 @@
 # @fileparam - File-Level Parameter Hint
 
-Declares a file-level parameter type hint. Any parameter with the specified name in the current file will default to this type if it lacks an explicit `@param` annotation.
+Declares a file-level parameter type hint. If a parameter name matches and has no explicit `@param`, this type is used.
 
 ## Syntax
 
@@ -10,7 +10,7 @@ Declares a file-level parameter type hint. Any parameter with the specified name
 
 ## Description
 
-The `@fileparam` annotation allows you to establish a convention for parameter naming within a specific file, saving you from repeating `@param` annotations for common parameter names like `ply`, `ent`, or `vehicle`.
+`@fileparam` sets a file-wide naming rule so you do not need to repeat `@param` for common names like `ply`, `ent`, or `vehicle`.
 
 When a function defines a parameter that matches `<paramName>` but does not have a specific `@param` annotation for it, the language server will automatically assume it is of type `<type>`.
 
@@ -47,3 +47,4 @@ The GLua settings editor also exposes `gmod.fileParamDefaults` as an editable ma
 ## See Also
 
 - [Configuration](../config.md) — For project-wide `gmod.fileParamDefaults`
+

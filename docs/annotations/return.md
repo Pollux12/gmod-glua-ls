@@ -88,6 +88,19 @@ function clone(value)
     return deepCopy(value)
 end
 
+-- Return type captured from string-template generic parameter
+---@class Entity
+---@class sent_npc : Entity
+---@generic T : Entity
+---@param class `T`
+---@return T
+function ents.Create(class) end
+
+---@generic T : Entity
+---@param class `T`
+---@return T[]
+function ents.FindByClass(class) end
+
 -- Variadic return values
 ---@return string ... All usernames
 function getAllUserNames()
@@ -179,6 +192,11 @@ for id, userName in iterateUsers() do
     print(id, userName)
 end
 ```
+
+For this pattern, the parameter must use a string-template generic (for example `` `T` ``).
+Quick rule:
+- `T` returns value-based types (`"x"` -> `string`)
+- `` `T` `` returns class/type names from string literals (`"sent_npc"` -> `sent_npc`)
 
 ## Features
 

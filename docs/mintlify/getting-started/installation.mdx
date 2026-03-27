@@ -7,7 +7,11 @@ description: Install the GLua Language Server VSCode extension and get set up in
 
 ## VSCode extension (recommended)
 
-The VSCode extension is the recommended way to use GLuaLS. It handles everything automatically: downloading the language server binary, GMod wiki annotations, the debugger module, and keeping them all up to date.
+The VS Code extension is the recommended way to use GLuaLS. It handles setup automatically:
+- downloads the language server binary
+- downloads GMod wiki annotations
+- installs debugger pieces
+- keeps these updated
 
 <Steps>
   <Step title="Install from the marketplace">
@@ -37,7 +41,7 @@ Do not install other Lua language server extensions alongside GLuaLS. Extensions
 GLuaLS works best when each workspace folder represents a single addon or gamemode. The extension auto-detects the structure and configures itself accordingly.
 
 <Tip>
-If you are working on a gamemode alongside multiple addons, add each as a separate folder in a multi-root workspace rather than opening the entire `garrysmod/` folder.
+If you are working on a gamemode with multiple addons, add each addon as its own folder in a multi-root workspace instead of opening the whole `garrysmod/` folder.
 </Tip>
 
 
@@ -61,7 +65,7 @@ If you are working on a gamemode alongside multiple addons, add each as a separa
   </Tree.Folder>
 </Tree>
 
-The root folder for each opened workspace within VSCode should be as labelled above. Essentially, you can have the gamemode folder as a workspace and each individual addon as a workspace. If you need multiple addons, add each as a separate folder in a multi-root workspace rather than opening the entire `garrysmod/` folder for best results.
+Each VS Code workspace root should match one folder shown above. Use one root for the gamemode and one root per addon. For multiple addons, use a multi-root workspace instead of opening the whole `garrysmod/` folder.
 
 <Warning>
 All folders within the multi-root workspace must be from the same game directory. Do not mix some folders from client and some from SRCDS.
@@ -109,7 +113,7 @@ Open any `.lua` file in your project. You should immediately see:
 - **Realm badges** next to functions showing their client/server/shared status
 - **Diagnostics** as squiggly underlines for potential issues
 
-It should only take a couple of seconds to index and load your workspace after the extension is done loading. The extension is extremely quick, even on the most complex of workspaces.
+Workspace indexing usually finishes in a few seconds after extension startup, even on larger projects.
 
 <Tip>
 If you are not seeing any diagnostics but expected to, check the Garry's Mod Language Server section in the output panel for any errors.
@@ -169,7 +173,7 @@ If you are not seeing any diagnostics but expected to, check the Garry's Mod Lan
 
 ## Other editors
 
-GLuaLS can work with any LSP-compatible editor, but many advanced features (debugger, Class Explorer, settings UI, etc.) are exclusive to the VSCode extension.
+GLuaLS works with any LSP-compatible editor, but many advanced features (debugger, Class Explorer, settings UI, and more) are VS Code extension features.
 
 <Note>
 Zed support is planned. It will have fewer features than the VSCode extension due to Zed's more limited extension API. Other editors are not currently planned.

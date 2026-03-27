@@ -5,7 +5,7 @@ description: Mark a function as an accessor generator that synthesizes Get/Set p
 
 ## Overview
 
-`@accessorfunc` marks a function as an *accessor generator* — when called, it synthesizes `GetPropertyName()` and `SetPropertyName()` methods on the target class. This mirrors GMod's `AccessorFunc()` built-in.
+`@accessorfunc` marks a function as an accessor generator. When it is called, GLuaLS creates `GetPropertyName()` and `SetPropertyName()` methods on the target class. This matches GMod's built-in `AccessorFunc()`.
 
 ---
 

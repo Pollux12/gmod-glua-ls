@@ -89,7 +89,7 @@ The external formatter receives file content over stdin and must write the forma
 
 ## EditorConfig
 
-GLuaLS can read `.editorconfig` files for indent settings. EditorConfig values override corresponding `styleOverrides` entries. Priority can be set within the configuration for `.editorconfig` vs `.gluarc.json` settings.
+GLuaLS can read `.editorconfig` indent settings. Those values can override matching `styleOverrides` entries, depending on your configured priority between `.editorconfig` and `.gluarc.json`.
 
 
 ## Format on save
@@ -117,3 +117,4 @@ Disable the formatter entirely:
   }
 }
 ```
+

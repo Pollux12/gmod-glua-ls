@@ -16,6 +16,9 @@ fn main() {
     if version.starts_with("refs/tags/") {
         version = version.replace("refs/tags/", "");
     }
+    if version.starts_with('v') {
+        version = version.trim_start_matches('v').to_string();
+    }
 
     let current_dir = std::env::current_dir().unwrap();
     // 向上查找到有crates的目录

@@ -7,7 +7,7 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Single addon or gamemode <a id="single-addon-or-gamemode" />
 
-Open the addon or gamemode folder directly in VS Code. The extension auto-detects the structure based on whether the folder lives under `garrysmod/addons/` or `garrysmod/gamemodes/`.
+Open the addon or gamemode folder directly in VS Code. The extension detects the structure from its path (`garrysmod/addons/` or `garrysmod/gamemodes/`).
 
 
 <Tree>
@@ -35,9 +35,9 @@ Open the addon or gamemode folder directly in VS Code. The extension auto-detect
 
 ## Multi-root workspaces <a id="multi-root-workspaces" />
 
-When working on a gamemode alongside multiple addons, a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces) lets you add each as a separate folder while keeping their configurations isolated.
+If you work on a gamemode and multiple addons, use a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces) and add each as its own folder.
 
-Each folder gets its own `.gluarc.json` and the language server runs a separate analysis context for each one. Settings, diagnostics, and file param defaults are all workspace-scoped.
+Each folder has its own `.gluarc.json`, and the language server analyzes each one separately. Settings, diagnostics, and file param defaults stay scoped to that folder.
 
 <Note>
 Do not open the entire `garrysmod/` folder as your workspace root. GLuaLS expects each root to be an individual addon or gamemode, not the entire game directory.
@@ -47,7 +47,7 @@ Do not open the entire `garrysmod/` folder as your workspace root. GLuaLS expect
 
 ## Library paths <a id="library-paths" />
 
-If your project references shared utility files from outside the workspace root, add them as library paths:
+If your project uses shared utility files outside the workspace root, add them as library paths:
 
 <ConfigTip />
 ```json .gluarc.json
@@ -65,7 +65,7 @@ If your project references shared utility files from outside the workspace root,
 }
 ```
 
-Library files are analyzed and their types flow into your workspace, but diagnostics are not reported for them.
+Library files are analyzed, and their types are available in your workspace. Diagnostics are not reported for library files.
 
 ---
 
@@ -104,7 +104,7 @@ If your project uses a custom module loader, map it to `require` behavior:
 
 ## Annotations path <a id="annotations-path" />
 
-By default, the VSCode extension automatically downloads and keeps GMod wiki annotations up to date. If you need to use a custom annotations build or disable auto-download:
+By default, the VS Code extension downloads and updates GMod wiki annotations. If you need a custom annotations build or want auto-download off:
 
 <ConfigTip />
 

@@ -5,7 +5,7 @@ description: Add typed fields to a class definition.
 
 ## Overview
 
-`@field` declares a property of a class, with optional access control, optionality marker, and description. Field annotations help enable accurate types and autocomplete for a class, far more accurate than the language server's inference system can achieve on its own. It is recommended to annotate any variable fields that will need to be regularly accessed.
+`@field` declares a class property, with optional access level, optional `?`, and description. It gives more accurate types and autocomplete than inference alone. You should annotate fields you use often.
 
 ---
 
@@ -51,7 +51,7 @@ Accessing an optional field without a nil check will trigger `need-check-nil` wh
 ## Access control
 
 <Info>
-Access modifiers do not have any impact on runtime behaviour and are not required. The language server will still recognize the modifiers and can provide diagnostics if you try to access private/protected fields from outside the class or subclass. This is more for style enforcement and documentation purposes, rather than actually controlling access.
+Access modifiers do not change runtime behavior and are optional. The language server still checks them and can report diagnostics when private/protected fields are used from the wrong place. Treat them as type/style rules, not runtime access control.
 </Info>
 
 | Modifier | Description |
@@ -96,7 +96,7 @@ Fields can be function types:
 ```
 
 <Tip>
-This is intended for cases where a function for a class is not defined within the file, such as when it's added by C++ code. If the function is defined in Lua, it is better to annotate the function itself rather than adding it as a field, otherwise you may end up with duplicate definitions.
+Use this when the function is added outside the Lua file (for example, by C++). If the function is defined in Lua, annotate the function directly to avoid duplicate definitions.
 </Tip>
 
 ---
@@ -104,4 +104,5 @@ This is intended for cases where a function for a class is not defined within th
 ## Tips and best practices
 
 - You should always place `@field` annotations directly after their `@class` declaration.
-- In GLuaLS, the `inject-field` diagnostic is disabled by default, with all classes acting as `(partial)` and allowing fields to be defined anywhere in the file. This means fields are not strictly required, however, they are useful to provide better type and autocomplete for the class.
+- In GLuaLS, the `inject-field` diagnostic is disabled by default, with all classes acting as `(partial)` and allowing fields to be defined anywhere in the file. Fields are not required, but they improve type checking and autocomplete for the class.
+

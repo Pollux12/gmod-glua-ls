@@ -138,3 +138,78 @@ local lengths = map(names, function(name) return #name end)
 3. **Generic classes**
 4. **Multiple generic parameters**
 5. **Type inference**
+
+## String-Template Generic Capture
+
+Use backticks around a generic name when a string argument should choose a class/type.
+
+Use this pattern when a function takes a class name as text and returns that class type:
+
+```lua
+---@class Entity
+---@class sent_npc : Entity
+
+---@generic T : Entity
+---@param class `T`
+---@return T
+function ents.Create(class) end
+
+local ent = ents.Create("sent_npc") -- inferred as sent_npc
+```
+
+For list-returning APIs, use the same pattern with `T[]`:
+
+```lua
+---@generic T : Entity
+---@param class `T`
+---@return T[]
+function ents.FindByClass(class) end
+```
+
+`T` and `` `T` `` mean different things:
+
+- `T` uses the normal Lua value type (`"x"` -> `string`)
+- `` `T` `` uses the string text as a class/type name (`"sent_npc"` -> `sent_npc`)
+
+Common string-template forms:
+
+```lua
+---@generic T
+---@class aaa.`T`.bbb
+---@class aaa.`T`
+---@class `T`.bbb
+---@class `T`
+```
+
+## Constructor Capture Pattern
+
+For constructor-style helpers that may accept either:
+- a class value, or
+- a class name string
+
+```lua
+---@alias ConstructorParameters<T> T extends new (fun(...: infer P): any) and P or never
+
+---@generic T
+---@param name `T`|T
+---@param ... ConstructorParameters<T>...
+---@return T
+function make(name, ...) end
+```
+
+In `` `T`|T ``, the `T` part handles class values and the `` `T` `` part handles class-name strings.
+
+## Explicit Generic Call Arguments
+
+You can set generic arguments explicitly at the call site:
+
+```lua
+---@overload fun<T>(value: T): T
+local function callGeneric(value)
+    return value
+end
+
+local forced = callGeneric--[[@<number | string>]](1)
+```
+
+Use this when type inference is unclear or when you want to be explicit in examples.

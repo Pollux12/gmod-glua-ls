@@ -152,6 +152,34 @@ httpRequest({
 })
 ```
 
+## String-Template Generic Parameters
+
+Use backticks around a generic name when the parameter is a class name string:
+
+```lua
+---@class Entity
+---@class sent_npc : Entity
+
+---@generic T : Entity
+---@param class `T`
+---@return T
+function ents.Create(class) end
+
+local ent = ents.Create("sent_npc") -- sent_npc
+```
+
+If an API accepts either a class value or class-name string, use a union:
+
+```lua
+---@generic T
+---@param name `T`|T
+function useClass(name) end
+```
+
+Quick rule:
+- `T` treats `"some_text"` as `string`
+- `` `T` `` treats `"some_text"` as a class/type name
+
 ## Features
 
 1. **Optional parameter support**

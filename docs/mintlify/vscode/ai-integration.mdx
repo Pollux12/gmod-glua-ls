@@ -5,7 +5,9 @@ description: Use the built-in MCP server to let GitHub Copilot interact directly
 
 ## Overview
 
-GLuaLS includes a built-in **MCP (Model Context Protocol) server** that exposes your connected SRCDS instance as tools for AI agents. When the debugger is connected, GitHub Copilot Chat (and other AI tools supporting MCP) can run Lua code, fetch console output, check errors, and query debug state — all without leaving the chat interface.
+GLuaLS includes a built-in **MCP (Model Context Protocol) server**. It exposes your connected SRCDS instance as tools for AI agents.
+
+When the debugger is connected, GitHub Copilot Chat (and other MCP-capable tools) can run Lua code, fetch console output, read errors, and check debug state without leaving chat.
 
 <Note>
 AI features have been tested primarily with GitHub Copilot Chat. Other AI providers supporting MCP may work but are not officially supported.
@@ -30,7 +32,7 @@ When the debugger is connected, the following tools are available to AI agents:
 
 ## Setting up
 
-The MCP server starts automatically when the extension loads. The extension will also automatically register tools with GitHub Copilot.
+The MCP server starts automatically when the extension loads. The extension also registers tools with GitHub Copilot automatically.
 
 To connect Copilot:
 
@@ -39,7 +41,7 @@ To connect Copilot:
     Code execution tools (`run_lua`, `run_command`, `run_file`) require an active debug session. `get_output`, `get_errors`, and `get_debug_state` can work whenever the MCP server is running.
   </Step>
   <Step title="Configure Copilot to use the MCP server">
-    This should now be automatically done by the VSCode Extension. Make sure the "Garry's Mod Language Server" toolset is enabled.
+    This is usually done automatically by the VS Code extension. Check that the "Garry's Mod Language Server" toolset is enabled.
   </Step>
   <Step title="Use Copilot Chat">
     Once connected, Copilot can do things like:
@@ -73,7 +75,7 @@ Copilot: [calls run_lua] Output: gm_flatgrass
 
 ## Security
 
-The MCP server includes several security controls:
+The MCP server includes these security controls:
 
 - **Local-only by default** — the server only accepts connections from `localhost`. Remote access is blocked unless explicitly configured.
 - **Auth token** — each session uses a random token that must be included in requests

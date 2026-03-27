@@ -5,7 +5,7 @@ description: Declare which GMod realm (client, server, or shared) a file or func
 
 ## Overview
 
-`@realm` explicitly declares the realm context of a file or function. This is the highest-priority realm hint — it overrides filename prefix detection, directory-based detection, and `if CLIENT/SERVER` inference.
+`@realm` sets the realm for a file or function explicitly. It has the highest priority and overrides filename, folder, and `if CLIENT/SERVER` inference.
 
 ---
 
@@ -22,7 +22,7 @@ description: Declare which GMod realm (client, server, or shared) a file or func
 ## File-level realm <a id="file-level-realm" />
 
 <Warning>
-File level realm annotations are experimental and are intended for cases where the entire file is being inferred as the wrong realm. See #function-level-realm annotations for the recommended way to annotate realms.
+File-level realm annotations are experimental. Use them only when the whole file is inferred as the wrong realm. In most cases, function-level annotations are better.
 </Warning>
 
 Place `@realm` at the very top of a file to mark the entire file:
@@ -75,11 +75,10 @@ GLuaLS auto-detects realm from:
 - Directory (`lua/client/`, `lua/server/`, `autorun/client/`, etc.)
 - `if CLIENT` / `if SERVER` blocks
 
-This system is not perfect and can lead to incorrect realm inference, especially in complex files.
+Auto-detection is not perfect and can infer the wrong realm in complex files.
 
 ---
 
 ## See also
 
 - [Realm awareness](/language/realm-awareness) — how realm detection works end-to-end
-

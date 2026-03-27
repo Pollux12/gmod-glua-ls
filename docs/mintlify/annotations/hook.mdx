@@ -7,7 +7,7 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-`@hook` marks a method as implementing a GMod hook. This enables hook name validation, parameter type inference from the hook's definition, and hook name autocomplete in `hook.Add`/`hook.Run`.
+`@hook` marks a method as a GMod hook implementation. It enables hook-name validation, parameter inference from hook definitions, and hook-name autocomplete in `hook.Add`/`hook.Run`.
 
 ---
 
@@ -81,7 +81,7 @@ If your framework uses a custom table instead of `GM` or `PLUGIN`, configure GLu
 
 ## Hook autocomplete
 
-When calling `hook.Add("|", ...)`, `hook.Run("|", ...)`, or `hook.Call("|", ...)`, GLuaLS autocompletes from all known hook names — both GMod built-ins and custom hooks you've registered with `@hook` or `hook.Run` calls elsewhere in the workspace.
+When calling `hook.Add("|", ...)`, `hook.Run("|", ...)`, or `hook.Call("|", ...)`, GLuaLS autocompletes from known hook names, including GMod built-ins and your custom hooks.
 
 ---
 

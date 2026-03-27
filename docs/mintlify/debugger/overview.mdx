@@ -5,9 +5,9 @@ description: The GLuaLS debugger lets you set breakpoints, inspect variables, an
 
 ## Overview
 
-GLuaLS includes a full **source-level debugger** for Garry's Mod servers. Set breakpoints, step through code, inspect locals and globals, modify entity properties, and execute arbitrary Lua — all from within VS Code, while the game is running.
+GLuaLS includes a full **source-level debugger** for Garry's Mod servers. You can set breakpoints, step code, inspect variables, edit values, and run Lua from VS Code while the game is running.
 
-The VSCode extension includes an automatic setup and install process for this debugger.
+The VS Code extension includes an automatic setup flow for this debugger.
 
 ---
 
@@ -15,17 +15,17 @@ The VSCode extension includes an automatic setup and install process for this de
 
 The debugger uses the **LRDB** (Lua Remote Debugger) protocol over TCP:
 
-1. **gm_rdb** — a Garry's Mod binary module loaded by the SRCDS process. This is used to interact with the game engine and exposes a TCP debug endpoint for the extension.
+1. **gm_rdb** — a Garry's Mod binary module loaded by SRCDS. It talks to the game engine and exposes a TCP debug endpoint.
 2. **GLuaLS Extension** — the VS Code extension connects to the TCP endpoint started by the binary module. It sends commands and receives data.
 
-Your Lua files are served from their source locations in your workspace, so breakpoints set on local files map to the exact running code. The extension should be able to set this up for you.
+Your Lua files are served from source paths in your workspace, so local breakpoints map to the running code.
 
 ---
 
 ## Requirements
 
 <Warning>
-The debugger is only fully supported with **SRCDS** (dedicated server). Clientside support is in progress but limited to basic debugging features such as breakpoints and depends on the server debugger for advanced features. Listen server is not supported.
+The debugger is fully supported only on **SRCDS** (dedicated server). Clientside support is still limited. Listen servers are not supported.
 </Warning>
 
 - SRCDS (dedicated server) running on Windows or Linux

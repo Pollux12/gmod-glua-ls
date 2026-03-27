@@ -91,6 +91,31 @@ function filter(items, predicate) end
 
 ---
 
+## String-template generic parameters
+
+Use backticks when the parameter is a class-name string:
+
+```lua
+---@generic T : Entity
+---@param class `T`
+---@return T
+function ents.Create(class) end
+```
+
+If your function accepts either a class object or a class-name string:
+
+```lua
+---@generic T
+---@param name `T`|T
+function useClass(name) end
+```
+
+Quick rule:
+- `T` treats `"some_text"` as `string`
+- `` `T` `` treats `"some_text"` as a class/type name
+
+---
+
 ## `self` parameter
 
 For methods, `self` is automatically typed as the owning class — you don't need to annotate it. However, you can if you want to be explicit:

@@ -5,7 +5,8 @@ on:
     branches:
      - main
     tags:
-     - "*"
+     - "*.*.*"
+     - "v*.*.*"
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
@@ -151,7 +152,7 @@ jobs:
   publish-crates:
     name: Publish Cargo crates
     needs: [build-release]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && endsWith(github.ref_name, '.0')
     runs-on: ubuntu-latest
     env:
       CARGO_TOKEN: ${{ secrets.CARGO_TOKEN }}
@@ -250,8 +251,24 @@ jobs:
           set -euo pipefail
 
           repo="${{ github.repository }}"
-          tag="${{ github.ref_name }}"
-          title="gmod-glua-ls ${tag}"
+          tag_ref="${{ github.ref_name }}"
+          tag="${tag_ref#v}"
+          if ! [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag '${tag_ref}' must be semver (examples: 1.0.4, v1.1.0)." >&2
+            exit 1
+          fi
+
+          IFS='.' read -r _ _ patch <<< "$tag"
+          release_flags=()
+          release_kind="stable"
+          if (( patch != 0 )); then
+            release_flags+=(--prerelease)
+            release_kind="prerelease"
+          fi
+
+          echo "Publishing ${release_kind} release for tag ${tag_ref}"
+
+          title="gmod-glua-ls ${tag_ref}"
           assets=(
             "glua_ls-win32-x64/glua_ls-win32-x64.zip"
             "glua_check-win32-x64/glua_check-win32-x64.zip"
@@ -260,14 +277,14 @@ jobs:
             "glua_check-linux-x64.tar.gz"
           )
 
-          if draft_state="$(gh release view "$tag" --repo "$repo" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+          if draft_state="$(gh release view "$tag_ref" --repo "$repo" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
             if [ "$draft_state" = "true" ]; then
-              gh release upload "$tag" --repo "$repo" "${assets[@]}" --clobber
-              gh release edit "$tag" --repo "$repo" --draft=false --title "$title" --prerelease
+              gh release upload "$tag_ref" --repo "$repo" "${assets[@]}" --clobber
+              gh release edit "$tag_ref" --repo "$repo" --draft=false --title "$title" "${release_flags[@]}"
             else
-              echo "Release '$tag' already exists and is published. Immutable releases cannot be modified; publish a new tag instead." >&2
+              echo "Release '$tag_ref' already exists and is published. Immutable releases cannot be modified; publish a new tag instead." >&2
               exit 1
             fi
           else
-            gh release create "$tag" --repo "$repo" "${assets[@]}" --verify-tag --title "$title" --prerelease --generate-notes
+            gh release create "$tag_ref" --repo "$repo" "${assets[@]}" --verify-tag --title "$title" "${release_flags[@]}" --generate-notes
           fi
