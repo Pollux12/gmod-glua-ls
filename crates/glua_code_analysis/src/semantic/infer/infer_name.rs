@@ -32,10 +32,9 @@ pub fn infer_name_expr(
     let file_id = cache.get_file_id();
     let references_index = db.get_reference_index();
     let range = name_expr.get_range();
-    let file_ref = references_index
+    let decl_id = references_index
         .get_local_reference(&file_id)
-        .ok_or(InferFailReason::None)?;
-    let decl_id = file_ref.get_decl_id(&range);
+        .and_then(|file_ref| file_ref.get_decl_id(&range));
     let result = if let Some(decl_id) = decl_id {
         infer_expr_narrow_type(
             db,
@@ -52,7 +51,23 @@ pub fn infer_name_expr(
             return Ok(scoped_type);
         }
 
-        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+        match get_name_expr_var_ref_id(db, cache, &name_expr) {
+            Some(VarRefId::GlobalName(_, _)) => infer_expr_narrow_type(
+                db,
+                cache,
+                LuaExpr::NameExpr(name_expr.clone()),
+                VarRefId::GlobalName(
+                    internment::ArcIntern::new(smol_str::SmolStr::new(name)),
+                    name_expr.get_position(),
+                ),
+            )
+            .or_else(|_| {
+                infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+            }),
+            Some(_) | None => {
+                infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+            }
+        }
     };
 
     // When the inferred type contains unresolved SelfInfer (e.g. from
@@ -319,13 +334,21 @@ pub fn get_name_expr_var_ref_id(
             let file_id = cache.get_file_id();
             let references_index = db.get_reference_index();
             let range = name_expr.get_range();
-            let file_ref = references_index.get_local_reference(&file_id)?;
-            if let Some(decl_id) = file_ref.get_decl_id(&range) {
+            if let Some(decl_id) = references_index
+                .get_local_reference(&file_id)
+                .and_then(|file_ref| file_ref.get_decl_id(&range))
+            {
                 return Some(VarRefId::VarRef(decl_id));
             }
 
-            let global_decl_id = resolve_global_decl_id(db, cache, name, Some(name_expr))?;
-            Some(VarRefId::VarRef(global_decl_id))
+            if let Some(global_decl_id) = resolve_global_decl_id(db, cache, name, Some(name_expr)) {
+                return Some(VarRefId::VarRef(global_decl_id));
+            }
+
+            Some(VarRefId::GlobalName(
+                internment::ArcIntern::new(smol_str::SmolStr::new(name)),
+                name_expr.get_position(),
+            ))
         }
     }
 }

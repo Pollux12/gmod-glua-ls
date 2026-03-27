@@ -163,7 +163,9 @@ fn get_type_at_flow_walk(
                 if matches!(flow_node.kind, FlowNodeKind::BranchLabel) {
                     if let Some(info) = tree.get_branch_label_info(antecedent_flow_id) {
                         let can_skip = match var_ref_id {
-                            VarRefId::VarRef(_) | VarRefId::SelfRef(_) => {
+                            VarRefId::VarRef(_)
+                            | VarRefId::SelfRef(_)
+                            | VarRefId::GlobalName(_, _) => {
                                 !info.has_name_assigns
                                     && !info.has_casts_or_implfunc
                                     && !info.has_inner_conditions
@@ -216,6 +218,7 @@ fn get_type_at_flow_walk(
                     (assign_hint, var_ref_id),
                     (AssignVarHint::Mixed, _)
                         | (AssignVarHint::NameOnly, VarRefId::VarRef(_))
+                        | (AssignVarHint::NameOnly, VarRefId::GlobalName(_, _))
                         | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
                         | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
                 );

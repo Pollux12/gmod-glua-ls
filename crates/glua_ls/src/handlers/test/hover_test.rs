@@ -283,6 +283,44 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_undefined_global_isstring_guard_narrows_to_string() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                if isstring(testVar2) then ---@diagnostic disable-line: undefined-global
+                    print(<??>testVar2) ---@diagnostic disable-line: undefined-global
+                end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("string"),
+            "expected hover to narrow to string, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("any"),
+            "expected hover to avoid any after narrowing, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("unknown"),
+            "expected hover to avoid unknown after narrowing, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_decl_desc() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(

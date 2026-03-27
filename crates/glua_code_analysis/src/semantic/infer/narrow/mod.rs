@@ -72,6 +72,11 @@ pub fn get_var_ref_type(
         Err(InferFailReason::UnResolveDeclType(decl.get_id()))
     } else if let Some(member_id) = var_ref_id.get_member_id_ref() {
         find_decl_member_type(db, member_id)
+    } else if let VarRefId::GlobalName(name, _) = var_ref_id {
+        Ok(
+            infer_global_type(db, Some(cache.get_file_id()), None, name.as_str())
+                .unwrap_or(LuaType::Unknown),
+        )
     } else {
         if let Some(type_cache) = cache.index_ref_origin_type_cache.get(var_ref_id)
             && let CacheEntry::Cache(ty) = type_cache

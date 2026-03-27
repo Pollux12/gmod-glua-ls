@@ -1,6 +1,31 @@
 #[cfg(test)]
 mod test {
     use crate::{DiagnosticCode, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaExpr, LuaNameExpr};
+
+    fn infer_last_name_expr_type(
+        ws: &mut VirtualWorkspace,
+        code: &str,
+        name: &str,
+    ) -> crate::LuaType {
+        let file_id = ws.def(code);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let target = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|expr| expr.get_name_text().as_deref() == Some(name))
+            .collect::<Vec<_>>()
+            .pop()
+            .expect("Target name expr must exist");
+
+        semantic_model
+            .infer_expr(LuaExpr::NameExpr(target))
+            .unwrap_or(crate::LuaType::Unknown)
+    }
 
     #[test]
     fn test_custom_binary() {
@@ -167,5 +192,92 @@ mod test {
         );
 
         assert_eq!(ws.expr_ty("R"), ws.ty("nil"));
+    }
+
+    #[test]
+    fn test_isstring_guard_narrows_undefined_global_expr_to_string() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            if isstring(testVar2) then ---@diagnostic disable-line: undefined-global
+                print(testVar2) ---@diagnostic disable-line: undefined-global
+            end
+        "#,
+            "testVar2",
+        );
+
+        assert_eq!(ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_istable_guard_preserves_annotated_specific_table_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class MyData
+            ---@field value integer
+        "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@type MyData?
+            local data
+
+            if istable(data) then
+                print(data)
+            end
+        "#,
+            "data",
+        );
+
+        assert_eq!(ty, ws.ty("MyData"));
+    }
+
+    #[test]
+    fn test_isstring_guard_preserves_annotated_string_subtype() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class UserId: string
+        "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@type UserId?
+            local value
+
+            if isstring(value) then
+                print(value)
+            end
+        "#,
+            "value",
+        );
+
+        assert_eq!(ty, ws.ty("UserId"));
+    }
+
+    #[test]
+    fn test_istable_guard_does_not_broaden_incompatible_known_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@type string
+            local value = "x"
+
+            if istable(value) then
+                print(value)
+            end
+        "#,
+            "value",
+        );
+
+        assert_eq!(ty, ws.ty("string"));
     }
 }

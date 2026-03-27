@@ -1,4 +1,7 @@
-use std::ops::Deref;
+use std::{
+    hash::{Hash, Hasher},
+    ops::Deref,
+};
 
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaLiteralToken, PathTrait};
 use internment::ArcIntern;
@@ -14,11 +17,46 @@ use crate::{
 };
 
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum VarRefId {
     VarRef(LuaDeclId),
     SelfRef(LuaDeclOrMemberId),
     IndexRef(LuaDeclOrMemberId, ArcIntern<SmolStr>),
+    GlobalName(ArcIntern<SmolStr>, TextSize),
+}
+
+impl PartialEq for VarRefId {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (VarRefId::VarRef(left), VarRefId::VarRef(right)) => left == right,
+            (VarRefId::SelfRef(left), VarRefId::SelfRef(right)) => left == right,
+            (
+                VarRefId::IndexRef(left_owner, left_path),
+                VarRefId::IndexRef(right_owner, right_path),
+            ) => left_owner == right_owner && left_path == right_path,
+            (VarRefId::GlobalName(left_name, _), VarRefId::GlobalName(right_name, _)) => {
+                left_name == right_name
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for VarRefId {}
+
+impl Hash for VarRefId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            VarRefId::VarRef(decl_id) => decl_id.hash(state),
+            VarRefId::SelfRef(decl_or_member_id) => decl_or_member_id.hash(state),
+            VarRefId::IndexRef(decl_or_member_id, path) => {
+                decl_or_member_id.hash(state);
+                path.hash(state);
+            }
+            VarRefId::GlobalName(name, _) => name.hash(state),
+        }
+    }
 }
 
 impl VarRefId {
@@ -42,6 +80,7 @@ impl VarRefId {
             VarRefId::VarRef(decl_id) => decl_id.position,
             VarRefId::SelfRef(decl_or_member_id) => decl_or_member_id.get_position(),
             VarRefId::IndexRef(decl_or_member_id, _) => decl_or_member_id.get_position(),
+            VarRefId::GlobalName(_, position) => *position,
         }
     }
 
@@ -60,6 +99,7 @@ impl VarRefId {
                 *ref_decl_or_member_id == decl_or_member_id
                     && path.starts_with(prefix_path.deref().as_str())
             }
+            VarRefId::GlobalName(_, _) => false,
         }
     }
 

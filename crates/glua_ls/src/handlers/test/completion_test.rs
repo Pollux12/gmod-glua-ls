@@ -203,6 +203,44 @@ mod tests {
     }
 
     #[gtest]
+    fn test_completion_undefined_global_isstring_guard_offers_string_methods() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                if isstring(testVar2) then ---@diagnostic disable-line: undefined-global
+                    testVar2:ch<??>() ---@diagnostic disable-line: undefined-global
+                end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        assert!(
+            items.iter().any(|item| item.label == "char"),
+            "expected string method completion to include 'char', got: {:?}",
+            items
+                .iter()
+                .map(|item| item.label.clone())
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_5() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
         check!(ws.check_completion(
