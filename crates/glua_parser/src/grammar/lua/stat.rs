@@ -172,6 +172,10 @@ pub fn parse_stats(p: &mut LuaParser) {
                 let mut can_continue = false;
                 // error recover
                 while p.current_token() != LuaTokenKind::TkEof {
+                    if block_follow(p) {
+                        break;
+                    }
+
                     if is_statement_start_token(p.current_token()) {
                         can_continue = true;
                         break;
@@ -774,7 +778,7 @@ fn parse_assign_or_expr_or_global_stat(p: &mut LuaParser) -> ParseResult {
     } else {
         p.push_error(LuaParseError::syntax_error_from(
             &t!("expected '=' for assignment or this is an incomplete statement"),
-            p.current_token_range(),
+            p.previous_token_range(),
         ));
 
         return Err(ParseFailReason::UnexpectedToken);
