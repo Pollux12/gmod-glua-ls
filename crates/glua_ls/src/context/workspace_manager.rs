@@ -561,28 +561,32 @@ fn merge_client_config(client_config: &ClientConfig, emmyrc: &mut Emmyrc) -> Opt
 
 /// Inject GMod annotations path into workspace library if appropriate
 fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
-    // Check if explicitly disabled in .emmyrc
+    // Check if explicitly disabled in .emmyrc (auto_load_annotations: false)
     if let Some(false) = emmyrc.gmod.auto_load_annotations {
         log::info!("GMod annotations auto-load explicitly disabled in .emmyrc");
         return;
     }
 
-    // Determine which path to use
+    // Determine which path to use (precedence: .gluarc.json > CLI > VSCode extension)
     let annotations_path = if let Some(explicit_path) = &emmyrc.gmod.annotations_path {
-        // User specified explicit path in .emmyrc - use that
+        // User specified explicit path in .gluarc.json/.emmyrc - use that (highest priority)
         if explicit_path.is_empty() {
             log::info!("GMod annotations_path is explicitly set to empty string - skipping");
             return;
         }
-        log::info!("Using GMod annotations from .emmyrc: {}", explicit_path);
+        log::info!("Using GMod annotations from config: {}", explicit_path);
         explicit_path.clone()
-    } else if let Some(vscode_path) = &client_config.gmod_annotations_path {
-        // VSCode extension provided path
+    } else if let Some(cli_path) = &client_config.gmod_annotations_path {
+        // Client-provided path (CLI flag or client init options)
+        if cli_path.is_empty() {
+            log::info!("GMod annotations explicitly disabled by client/CLI");
+            return;
+        }
         log::info!(
-            "Using GMod annotations from VSCode extension: {}",
-            vscode_path
+            "Using GMod annotations from client configuration: {}",
+            cli_path
         );
-        vscode_path.clone()
+        cli_path.clone()
     } else {
         // No path available
         log::info!("No GMod annotations path available");
@@ -1194,5 +1198,160 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_cli_gmod_annotations_path_is_injected_into_library() {
+        let workspace = create_temp_dir();
+        let annotations_dir = create_temp_dir();
+        touch(&workspace.join(".emmyrc.json"));
+
+        let mut client_config = ClientConfig::default();
+        client_config.gmod_annotations_path = Some(annotations_dir.to_string_lossy().to_string());
+
+        let loaded = load_emmy_config(vec![workspace.clone()], client_config);
+
+        let library_paths: Vec<PathBuf> = loaded
+            .emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|item| PathBuf::from(item.get_path()))
+            .collect();
+
+        assert!(
+            library_paths.iter().any(|p| {
+                p.canonicalize().unwrap_or_else(|_| p.clone())
+                    == annotations_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| annotations_dir.clone())
+            }),
+            "CLI annotations path should be in library: {:?}",
+            library_paths
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(annotations_dir);
+    }
+
+    #[test]
+    fn test_config_annotations_path_overrides_cli_path() {
+        let workspace = create_temp_dir();
+        let config_annotations_dir = create_temp_dir();
+        let cli_annotations_dir = create_temp_dir();
+        touch(&workspace.join(".emmyrc.json"));
+
+        // Write explicit annotations path to config
+        fs::write(
+            workspace.join(".emmyrc.json"),
+            format!(
+                r#"{{ "gmod": {{ "annotationsPath": "{}" }} }}"#,
+                config_annotations_dir.to_string_lossy().replace("\\", "/")
+            ),
+        )
+        .expect("failed to write config");
+
+        // CLI provides a different path
+        let mut client_config = ClientConfig::default();
+        client_config.gmod_annotations_path =
+            Some(cli_annotations_dir.to_string_lossy().to_string());
+
+        let loaded = load_emmy_config(vec![workspace.clone()], client_config);
+
+        let library_paths: Vec<PathBuf> = loaded
+            .emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|item| PathBuf::from(item.get_path()))
+            .collect();
+
+        // Config path should win over CLI path
+        assert!(
+            library_paths.iter().any(|p| {
+                p.canonicalize().unwrap_or_else(|_| p.clone())
+                    == config_annotations_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| config_annotations_dir.clone())
+            }),
+            "Config annotations path should be in library: {:?}",
+            library_paths
+        );
+        assert!(
+            !library_paths.iter().any(|p| {
+                p.canonicalize().unwrap_or_else(|_| p.clone())
+                    == cli_annotations_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| cli_annotations_dir.clone())
+            }),
+            "CLI annotations path should NOT be in library when config overrides: {:?}",
+            library_paths
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_annotations_dir);
+        let _ = fs::remove_dir_all(cli_annotations_dir);
+    }
+
+    #[test]
+    fn test_auto_load_annotations_false_disables_both_cli_and_config() {
+        let workspace = create_temp_dir();
+        let cli_annotations_dir = create_temp_dir();
+        touch(&workspace.join(".emmyrc.json"));
+
+        // Disable auto-loading in config
+        fs::write(
+            workspace.join(".emmyrc.json"),
+            r#"{ "gmod": { "autoLoadAnnotations": false } }"#,
+        )
+        .expect("failed to write config");
+
+        // CLI provides a path, but should be ignored due to auto_load_annotations: false
+        let mut client_config = ClientConfig::default();
+        client_config.gmod_annotations_path =
+            Some(cli_annotations_dir.to_string_lossy().to_string());
+
+        let loaded = load_emmy_config(vec![workspace.clone()], client_config);
+
+        let library_paths: Vec<PathBuf> = loaded
+            .emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|item| PathBuf::from(item.get_path()))
+            .collect();
+
+        assert!(
+            !library_paths.iter().any(|p| {
+                p.canonicalize().unwrap_or_else(|_| p.clone())
+                    == cli_annotations_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| cli_annotations_dir.clone())
+            }),
+            "CLI annotations path should NOT be injected when auto_load_annotations is false: {:?}",
+            library_paths
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cli_annotations_dir);
+    }
+
+    #[test]
+    fn test_empty_client_annotations_path_disables_injection() {
+        let workspace = create_temp_dir();
+        touch(&workspace.join(".emmyrc.json"));
+
+        let mut client_config = ClientConfig::default();
+        client_config.gmod_annotations_path = Some(String::new());
+
+        let loaded = load_emmy_config(vec![workspace.clone()], client_config);
+
+        assert!(
+            loaded.emmyrc.workspace.library.is_empty(),
+            "No annotations path should be injected when client path is empty: {:?}",
+            loaded.emmyrc.workspace.library
+        );
+
+        let _ = fs::remove_dir_all(workspace);
     }
 }

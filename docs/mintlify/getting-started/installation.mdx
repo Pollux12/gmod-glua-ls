@@ -197,4 +197,30 @@ cargo build --release
 
 The binary is at `target/release/glua_ls` (or `glua_ls.exe` on Windows).
 
+### Standalone LSP Server Configuration
+
+When running `glua_ls` outside of the VSCode extension, you can specify the path to GMod annotations using the `--gmod-annotations-path` flag:
+
+```bash
+glua_ls --gmod-annotations-path /path/to/gmod/annotations
+```
+
+<Note>
+  The `--gmod-annotations-path` flag accepts a path to the folder containing the GMod API annotations (typically downloaded by the VSCode extension). Use `none` to explicitly disable annotations loading.
+</Note>
+
+**Precedence for annotations path:**
+1. `gmod.annotationsPath` in `.gluarc.json` (highest priority)
+2. `--gmod-annotations-path` CLI flag
+3. VSCode extension provided path (if running via VSCode)
+
+**Example LSP client configuration (OpenCode/Neovim):**
+
+```json
+{
+  "command": ["glua_ls", "--gmod-annotations-path", "/path/to/gmod/annotations"],
+  "filetypes": ["lua"]
+}
+```
+
 ---

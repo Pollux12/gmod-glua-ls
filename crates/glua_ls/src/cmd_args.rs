@@ -39,6 +39,10 @@ pub struct CmdArgs {
     /// Force editor mode. Options: vscode, intellij, neovim
     #[cfg_attr(feature = "cli", structopt(long))]
     pub editor: Option<Editor>,
+
+    /// Path to GMod annotations folder. Use 'none' to disable. When not provided, falls back to VSCode extension path if available.
+    #[cfg_attr(feature = "cli", structopt(long))]
+    pub gmod_annotations_path: Option<NoneableString>,
 }
 
 /// Logging level enum

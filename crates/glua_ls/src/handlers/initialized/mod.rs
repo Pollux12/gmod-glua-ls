@@ -69,13 +69,28 @@ pub async fn initialized_handler(
     let client_config = get_client_config(&context, client_id, supports_config_request).await;
 
     // Extract gmodAnnotationsPath from initialization options if provided
+    // CLI argument takes precedence over VSCode extension-provided path
     let mut client_config = client_config;
     if let Some(ref init_options) = params.initialization_options {
         if let Some(gmod_path) = init_options.get("gmodAnnotationsPath") {
             if let Some(path_str) = gmod_path.as_str() {
                 log::info!("Received gmodAnnotationsPath from VSCode: {}", path_str);
-                client_config.gmod_annotations_path = Some(path_str.to_string());
+                // Only use VSCode path if CLI didn't provide one
+                if client_config.gmod_annotations_path.is_none() {
+                    client_config.gmod_annotations_path = Some(path_str.to_string());
+                }
             }
+        }
+    }
+
+    // Apply CLI-provided annotations path (highest precedence after .gluarc.json)
+    if let Some(cli_arg) = &cmd_args.gmod_annotations_path {
+        if let Some(cli_path) = cli_arg.as_deref() {
+            log::info!("Using GMod annotations path from CLI: {}", cli_path);
+            client_config.gmod_annotations_path = Some(cli_path.to_string());
+        } else {
+            log::info!("GMod annotations explicitly disabled via CLI");
+            client_config.gmod_annotations_path = Some(String::new());
         }
     }
 
