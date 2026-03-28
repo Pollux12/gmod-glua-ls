@@ -1,6 +1,6 @@
 [package]
 name = "schema_to_glua"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2024"
 authors = ["Pollux12", "CppCXY"]
 description = "Tooling for converting JSON Schema into GLua annotations."

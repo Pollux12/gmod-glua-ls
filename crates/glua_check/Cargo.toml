@@ -1,6 +1,6 @@
 [package]
 name = "glua_check"
-version = "0.20.0"
+version = "0.1.5"
 edition = "2024"
 authors = ["Pollux12", "CppCXY"]
 description = "Command-line diagnostics runner for Garry's Mod Lua (GLua)."

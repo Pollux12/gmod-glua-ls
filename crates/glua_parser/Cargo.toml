@@ -1,6 +1,6 @@
 [package]
 name = "glua_parser"
-version = "0.23.0"
+version = "0.1.5"
 edition = "2024"
 authors = ["Pollux12", "CppCXY"]
 description = "Parser for Garry's Mod Lua, Lua 5.x, and LuaJIT source files."

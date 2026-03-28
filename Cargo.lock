@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "glua_check"
-version = "0.20.0"
+version = "0.1.5"
 dependencies = [
  "ansi_term",
  "clap",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "glua_code_analysis"
-version = "0.20.0"
+version = "0.1.5"
 dependencies = [
  "dirs",
  "emmy_lsp_types",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "glua_code_style"
-version = "0.1.0"
+version = "0.1.5"
 dependencies = [
  "clap",
  "glua_parser",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "glua_diagnostic_macro"
-version = "0.5.0"
+version = "0.1.5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "glua_doc_cli"
-version = "0.20.0"
+version = "0.1.5"
 dependencies = [
  "clap",
  "emmy_lsp_types",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "glua_ls"
-version = "0.20.0"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "clap",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "glua_parser"
-version = "0.23.0"
+version = "0.1.5"
 dependencies = [
  "rowan",
  "rust-i18n",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "glua_parser_desc"
-version = "0.23.0"
+version = "0.1.5"
 dependencies = [
  "glua_parser",
  "googletest",
@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "schema_to_glua"
-version = "0.1.0"
+version = "0.1.5"
 dependencies = [
  "serde_json",
 ]
