@@ -217,26 +217,15 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
         Ok(prefix_type) => {
             index_expr.get_index_key()?;
             let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
-            let member_owner = match prefix_type {
-                LuaType::TableConst(in_file_range) => LuaMemberOwner::Element(in_file_range),
-                LuaType::Def(def_id) => LuaMemberOwner::Type(def_id),
-                LuaType::Instance(instance) => {
-                    LuaMemberOwner::Element(instance.get_range().clone())
-                }
-                LuaType::Ref(ref_id) => {
-                    let member_owner = LuaMemberOwner::Type(ref_id);
-                    analyzer.db.get_member_index_mut().set_member_owner(
-                        member_owner,
-                        member_id.file_id,
-                        member_id,
-                    );
-                    return Some(());
-                }
-                // is ref need extend field?
-                _ => {
-                    return None;
-                }
-            };
+            let (member_owner, set_owner_only) = resolve_index_expr_member_owner(&prefix_type)?;
+            if set_owner_only {
+                analyzer.db.get_member_index_mut().set_member_owner(
+                    member_owner,
+                    member_id.file_id,
+                    member_id,
+                );
+                return Some(());
+            }
 
             add_member(analyzer.db, member_owner, member_id);
         }
@@ -488,6 +477,47 @@ fn get_widened_member_assignment_type(
         return None;
     }
 
+    if let Some(class_type) = prefer_class_assignment_type(incoming_type) {
+        let mut saw_previous_assignment = false;
+        let mut class_bootstrap_compatible = true;
+
+        for related_member in &related_members {
+            let related_member_id = related_member.get_id();
+            if related_member_id == *member_id {
+                continue;
+            }
+            saw_previous_assignment = true;
+
+            if !is_assignment_file_define_member(analyzer.db, related_member_id) {
+                class_bootstrap_compatible = false;
+                break;
+            }
+
+            let Some(existing_cache) = analyzer
+                .db
+                .get_type_index()
+                .get_type_cache(&related_member_id.into())
+                .cloned()
+            else {
+                continue;
+            };
+
+            if existing_cache.is_doc() {
+                class_bootstrap_compatible = false;
+                break;
+            }
+
+            if !is_class_bootstrap_compatible_type(existing_cache.as_type(), &class_type) {
+                class_bootstrap_compatible = false;
+                break;
+            }
+        }
+
+        if saw_previous_assignment && class_bootstrap_compatible {
+            return Some(class_type);
+        }
+    }
+
     let mut doc_type: Option<LuaType> = None;
     let mut widened_type = crate::widen_literal_type_for_assignment(incoming_type);
     let mut saw_previous_assignment = false;
@@ -530,6 +560,85 @@ fn get_widened_member_assignment_type(
     }
 
     Some(doc_type.unwrap_or(widened_type))
+}
+
+fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
+    match typ {
+        LuaType::Def(def_id) => Some(LuaType::Def(def_id.clone())),
+        LuaType::Ref(ref_id) => Some(LuaType::Ref(ref_id.clone())),
+        LuaType::Instance(instance) => prefer_class_assignment_type(instance.get_base()),
+        LuaType::TypeGuard(inner) => prefer_class_assignment_type(inner),
+        LuaType::Union(union) => prefer_class_assignment_type_from_iter(union.into_vec().iter()),
+        LuaType::Intersection(intersection) => {
+            prefer_class_assignment_type_from_iter(intersection.get_types().iter())
+        }
+        LuaType::MultiLineUnion(union) => {
+            prefer_class_assignment_type_from_iter(union.get_unions().iter().map(|(typ, _)| typ))
+        }
+        _ => None,
+    }
+}
+
+fn prefer_class_assignment_type_from_iter<'a>(
+    types: impl Iterator<Item = &'a LuaType>,
+) -> Option<LuaType> {
+    for typ in types {
+        if let Some(class_type) = prefer_class_assignment_type(typ) {
+            return Some(class_type);
+        }
+    }
+
+    None
+}
+
+fn is_class_bootstrap_compatible_type(typ: &LuaType, class_type: &LuaType) -> bool {
+    if is_same_class_type(typ, class_type) {
+        return true;
+    }
+
+    match typ {
+        LuaType::TypeGuard(inner) => is_class_bootstrap_compatible_type(inner, class_type),
+        LuaType::Instance(instance) => {
+            is_class_bootstrap_compatible_type(instance.get_base(), class_type)
+                || is_table_bootstrap_type(typ)
+        }
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(sub_type, _)| is_class_bootstrap_compatible_type(sub_type, class_type)),
+        _ => is_table_bootstrap_type(typ),
+    }
+}
+
+fn is_same_class_type(left: &LuaType, right: &LuaType) -> bool {
+    match (
+        class_decl_id_from_type(left),
+        class_decl_id_from_type(right),
+    ) {
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        _ => false,
+    }
+}
+
+fn class_decl_id_from_type(typ: &LuaType) -> Option<crate::LuaTypeDeclId> {
+    match typ {
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(def_id.clone()),
+        LuaType::Instance(instance) => class_decl_id_from_type(instance.get_base()),
+        LuaType::TypeGuard(inner) => class_decl_id_from_type(inner),
+        _ => None,
+    }
+}
+
+fn is_table_bootstrap_type(typ: &LuaType) -> bool {
+    typ.is_table() || matches!(typ, LuaType::Unknown | LuaType::Nil | LuaType::Never)
 }
 
 fn widen_existing_member_collection_type(
@@ -589,12 +698,50 @@ fn find_related_member_ids(
 }
 
 fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwner> {
+    resolve_index_expr_member_owner(&prefix_type).map(|(owner, _)| owner)
+}
+
+fn resolve_index_expr_member_owner(prefix_type: &LuaType) -> Option<(LuaMemberOwner, bool)> {
     match prefix_type {
-        LuaType::TableConst(in_file_range) => Some(LuaMemberOwner::Element(in_file_range)),
-        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(LuaMemberOwner::Type(def_id)),
-        LuaType::Instance(instance) => Some(LuaMemberOwner::Element(instance.get_range().clone())),
+        LuaType::TableConst(in_file_range) => {
+            Some((LuaMemberOwner::Element(in_file_range.clone()), false))
+        }
+        LuaType::Def(def_id) => Some((LuaMemberOwner::Type(def_id.clone()), false)),
+        LuaType::Ref(ref_id) => Some((LuaMemberOwner::Type(ref_id.clone()), true)),
+        LuaType::Instance(instance) => {
+            Some((LuaMemberOwner::Element(instance.get_range().clone()), false))
+        }
+        LuaType::TypeGuard(inner) => resolve_index_expr_member_owner(inner),
+        LuaType::Union(union) => pick_preferred_index_expr_member_owner(union.into_vec().iter()),
+        LuaType::Intersection(intersection) => {
+            pick_preferred_index_expr_member_owner(intersection.get_types().iter())
+        }
+        LuaType::MultiLineUnion(union) => {
+            pick_preferred_index_expr_member_owner(union.get_unions().iter().map(|(typ, _)| typ))
+        }
         _ => None,
     }
+}
+
+fn pick_preferred_index_expr_member_owner<'a>(
+    types: impl Iterator<Item = &'a LuaType>,
+) -> Option<(LuaMemberOwner, bool)> {
+    let mut fallback_owner = None;
+    for typ in types {
+        let Some(owner_info) = resolve_index_expr_member_owner(typ) else {
+            continue;
+        };
+
+        if matches!(&owner_info.0, LuaMemberOwner::Type(_)) && !owner_info.1 {
+            return Some(owner_info);
+        }
+
+        if fallback_owner.is_none() {
+            fallback_owner = Some(owner_info);
+        }
+    }
+
+    fallback_owner
 }
 
 fn is_collection_append_write(index_expr: &LuaIndexExpr) -> Option<bool> {

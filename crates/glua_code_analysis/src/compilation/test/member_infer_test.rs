@@ -1,10 +1,54 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAst, LuaAstNode, LuaIndexKey, LuaVarExpr};
+    use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaIndexKey, LuaLocalName, LuaVarExpr};
     use googletest::prelude::*;
+    use lsp_types::NumberOrString;
     use smol_str::SmolStr;
+    use tokio_util::sync::CancellationToken;
 
     use crate::{DiagnosticCode, Emmyrc, LuaType, LuaUnionType, VirtualWorkspace};
+
+    fn file_has_diagnostic(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> bool {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+    }
+
+    fn local_name_type(ws: &mut VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("expected local name");
+        let token = local_name
+            .get_name_token()
+            .expect("expected local name token");
+
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .map(|info| info.typ)
+            .expect("expected semantic info for local name")
+    }
 
     #[test]
     fn test_issue_318() {
@@ -464,6 +508,11 @@ mod test {
             !fuel_module_type.is_unknown(),
             "FuelModule should not infer as unknown, got {fuel_module_type:?}"
         );
+        let fuel_module_humanized = ws.humanize_type(fuel_module_type.clone());
+        assert_that!(
+            fuel_module_humanized.as_str(),
+            not(contains_substring("table"))
+        );
 
         assert!(
             !get_profile_type.is_unknown(),
@@ -493,6 +542,76 @@ mod test {
         assert!(
             !client_get_profile_type.is_unknown(),
             "client FuelModule.GetProfile should not infer as unknown, got {client_get_profile_type:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_incremental_edit_in_server_fuel_file_keeps_global_alias_member_visible() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let sh_fuel_path = "lua/glide/sh_fuel.lua";
+        let fuel_server_path = "lua/glide/server/fuel.lua";
+
+        let sh_fuel_source = r#"
+        Glide = Glide or {}
+
+        ---@class Fuel
+        local Fuel = Glide.Fuel or {}
+
+        function Fuel.GetProfile(id)
+            return id
+        end
+
+        Glide.Fuel = Fuel
+        "#;
+
+        let fuel_server_source = r#"
+        Glide.Fuel = Glide.Fuel or {}
+
+        --- @param nozzle Entity
+        --- @param reason number?
+        function Glide.Fuel.EndSessionByNozzle(nozzle, reason)
+        end
+        "#;
+
+        ws.def_file(fuel_server_path, fuel_server_source);
+        ws.def_file(sh_fuel_path, sh_fuel_source);
+
+        let consumer_file = ws.def_file(
+            "lua/entities/glide_fuel_nozzle/init.lua",
+            r#"
+            local fuelModule = Glide.Fuel
+            local endSession = Glide.Fuel.EndSessionByNozzle
+            "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+            eq(false),
+            "baseline analysis should resolve Glide.Fuel.EndSessionByNozzle"
+        );
+        let baseline_fuel_module_type = local_name_type(&mut ws, consumer_file, "fuelModule");
+        assert_that!(
+            ws.humanize_type(baseline_fuel_module_type).as_str(),
+            not(contains_substring("table"))
+        );
+
+        let fuel_server_uri = ws.virtual_url_generator.new_uri(fuel_server_path);
+        ws.analysis
+            .update_file_by_uri(&fuel_server_uri, Some(format!("{fuel_server_source}\n")));
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+            eq(false),
+            "editing fuel.lua should not hide EndSessionByNozzle from Glide.Fuel"
+        );
+        let post_edit_fuel_module_type = local_name_type(&mut ws, consumer_file, "fuelModule");
+        assert_that!(
+            ws.humanize_type(post_edit_fuel_module_type).as_str(),
+            not(contains_substring("table"))
         );
     }
 

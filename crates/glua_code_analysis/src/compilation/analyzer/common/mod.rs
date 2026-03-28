@@ -93,10 +93,46 @@ pub fn add_member(db: &mut DbIndex, owner: LuaMemberOwner, member_id: LuaMemberI
 
 fn get_owner_id(db: &DbIndex, type_owner: &LuaTypeOwner) -> Option<LuaMemberOwner> {
     let type_cache = db.get_type_index().get_type_cache(type_owner)?;
-    match type_cache.as_type() {
-        LuaType::Ref(type_id) => Some(LuaMemberOwner::Type(type_id.clone())),
+    member_owner_from_type(type_cache.as_type())
+}
+
+fn member_owner_from_type(typ: &LuaType) -> Option<LuaMemberOwner> {
+    match typ {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            Some(LuaMemberOwner::Type(type_id.clone()))
+        }
         LuaType::TableConst(id) => Some(LuaMemberOwner::Element(id.clone())),
-        LuaType::Instance(inst) => Some(LuaMemberOwner::Element(inst.get_range().clone())),
+        LuaType::Instance(inst) => member_owner_from_type(inst.get_base())
+            .or_else(|| Some(LuaMemberOwner::Element(inst.get_range().clone()))),
+        LuaType::TypeGuard(inner) => member_owner_from_type(inner),
+        LuaType::Union(union) => preferred_owner_from_types(union.into_vec().iter()),
+        LuaType::Intersection(intersection) => {
+            preferred_owner_from_types(intersection.get_types().iter())
+        }
+        LuaType::MultiLineUnion(union) => {
+            preferred_owner_from_types(union.get_unions().iter().map(|(typ, _)| typ))
+        }
         _ => None,
     }
+}
+
+fn preferred_owner_from_types<'a>(
+    types: impl Iterator<Item = &'a LuaType>,
+) -> Option<LuaMemberOwner> {
+    let mut fallback_owner = None;
+    for typ in types {
+        let Some(owner) = member_owner_from_type(typ) else {
+            continue;
+        };
+
+        if matches!(owner, LuaMemberOwner::Type(_)) {
+            return Some(owner);
+        }
+
+        if fallback_owner.is_none() {
+            fallback_owner = Some(owner);
+        }
+    }
+
+    fallback_owner
 }
