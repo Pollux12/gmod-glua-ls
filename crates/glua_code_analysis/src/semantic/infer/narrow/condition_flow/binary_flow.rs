@@ -2,6 +2,7 @@ use glua_parser::{
     BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexMemberExpr,
     LuaLiteralToken, UnaryOperator,
 };
+use rowan::TextSize;
 
 use crate::{
     DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaArrayLen, LuaArrayType,
@@ -305,7 +306,17 @@ fn maybe_type_guard_binary(
     };
 
     if maybe_var_ref_id != *var_ref_id {
-        return Ok(ResultTypeOrContinue::Continue);
+        let guard_position = type_guard_expr.get_range().start();
+        if !can_narrow_type_guard_through_decl_alias(
+            db,
+            cache,
+            root,
+            var_ref_id,
+            &maybe_var_ref_id,
+            guard_position,
+        ) {
+            return Ok(ResultTypeOrContinue::Continue);
+        }
     }
 
     let anatecedent_flow_id = get_single_antecedent(tree, flow_node)?;
@@ -334,6 +345,100 @@ fn maybe_type_guard_binary(
     };
 
     Ok(ResultTypeOrContinue::Result(result_type))
+}
+
+fn can_narrow_type_guard_through_decl_alias(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    alias_var_ref_id: &VarRefId,
+    guarded_var_ref_id: &VarRefId,
+    guard_position: TextSize,
+) -> bool {
+    let (VarRefId::VarRef(alias_decl_id), VarRefId::VarRef(guarded_decl_id)) =
+        (alias_var_ref_id, guarded_var_ref_id)
+    else {
+        return false;
+    };
+
+    let file_id = cache.get_file_id();
+    if alias_decl_id.file_id != file_id || guarded_decl_id.file_id != file_id {
+        return false;
+    }
+
+    let Some(alias_decl) = db.get_decl_index().get_decl(alias_decl_id) else {
+        return false;
+    };
+    if !matches!(alias_decl.extra, crate::LuaDeclExtra::Local { .. }) {
+        return false;
+    }
+
+    if alias_decl_id.position >= guard_position {
+        return false;
+    }
+
+    let Some(value_syntax_id) = alias_decl.get_value_syntax_id() else {
+        return false;
+    };
+    let Some(alias_expr_node) = value_syntax_id.to_node_from_root(root.syntax()) else {
+        return false;
+    };
+    let Some(alias_expr) = LuaExpr::cast(alias_expr_node) else {
+        return false;
+    };
+    if !matches!(alias_expr, LuaExpr::NameExpr(_)) {
+        return false;
+    }
+
+    let Some(alias_source_var_ref_id) = get_var_expr_var_ref_id(db, cache, alias_expr) else {
+        return false;
+    };
+    if alias_source_var_ref_id != *guarded_var_ref_id {
+        return false;
+    }
+
+    if has_decl_write_in_open_interval(
+        db,
+        file_id,
+        *alias_decl_id,
+        alias_decl_id.position,
+        guard_position,
+    ) {
+        return false;
+    }
+
+    if has_decl_write_in_open_interval(
+        db,
+        file_id,
+        *guarded_decl_id,
+        alias_decl_id.position,
+        guard_position,
+    ) {
+        return false;
+    }
+
+    true
+}
+
+fn has_decl_write_in_open_interval(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: crate::LuaDeclId,
+    start: TextSize,
+    end: TextSize,
+) -> bool {
+    if start >= end {
+        return false;
+    }
+
+    db.get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .is_some_and(|decl_refs| {
+            decl_refs
+                .cells
+                .iter()
+                .any(|cell| cell.is_write && cell.range.start() > start && cell.range.start() < end)
+        })
 }
 
 #[allow(clippy::too_many_arguments)]

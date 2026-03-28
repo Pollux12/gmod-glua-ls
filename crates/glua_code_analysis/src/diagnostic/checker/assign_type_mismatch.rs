@@ -338,9 +338,15 @@ fn member_owner_from_prefix_type(
 
 fn member_owner_from_type(prefix_type: &LuaType) -> Option<crate::LuaMemberOwner> {
     match prefix_type {
-        LuaType::TableConst(in_file_range) => Some(crate::LuaMemberOwner::Element(in_file_range.clone())),
-        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(crate::LuaMemberOwner::Type(def_id.clone())),
-        LuaType::Instance(instance) => Some(crate::LuaMemberOwner::Element(instance.get_range().clone())),
+        LuaType::TableConst(in_file_range) => {
+            Some(crate::LuaMemberOwner::Element(in_file_range.clone()))
+        }
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => {
+            Some(crate::LuaMemberOwner::Type(def_id.clone()))
+        }
+        LuaType::Instance(instance) => {
+            Some(crate::LuaMemberOwner::Element(instance.get_range().clone()))
+        }
         _ => None,
     }
 }
@@ -421,8 +427,10 @@ where
 }
 
 fn is_lenient_inferred_member_type(typ: &LuaType) -> bool {
-    matches!(typ, LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_))
-        || matches!(typ, LuaType::Tuple(tuple) if tuple.is_infer_resolve())
+    matches!(
+        typ,
+        LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_)
+    ) || matches!(typ, LuaType::Tuple(tuple) if tuple.is_infer_resolve())
 }
 
 fn check_local_stat(

@@ -200,7 +200,9 @@ fn has_export_member(
     let owner = match export_type {
         LuaType::TableConst(table_id) => Some(LuaMemberOwner::Element(table_id.clone())),
         LuaType::Instance(instance) => Some(LuaMemberOwner::Element(instance.get_range().clone())),
-        LuaType::Ref(type_id) | LuaType::Def(type_id) => Some(LuaMemberOwner::Type(type_id.clone())),
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            Some(LuaMemberOwner::Type(type_id.clone()))
+        }
         _ => None,
     };
 
