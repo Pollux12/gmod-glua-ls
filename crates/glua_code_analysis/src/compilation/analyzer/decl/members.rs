@@ -78,7 +78,7 @@ fn is_in_global_member(analyzer: &DeclAnalyzer, index_expr: &LuaIndexExpr) -> Op
             }
 
             let decl = analyzer.find_decl(&name_text, name.get_position());
-            return Some(decl.is_none());
+            return Some(decl.is_none_or(|decl| decl.is_global()));
         }
         _ => {}
     }

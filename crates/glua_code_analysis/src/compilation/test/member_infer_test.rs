@@ -50,6 +50,31 @@ mod test {
             .expect("expected semantic info for local name")
     }
 
+    fn index_expr_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        semantic_model
+            .get_root()
+            .descendants::<LuaAst>()
+            .find_map(|node| match node {
+                LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
+                    semantic_model
+                        .get_semantic_info(index_expr.syntax().clone().into())
+                        .map(|info| info.typ)
+                }
+                _ => None,
+            })
+            .expect("expected semantic info for index expr")
+    }
+
     #[test]
     fn test_issue_318() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -612,6 +637,273 @@ mod test {
         assert_that!(
             ws.humanize_type(post_edit_fuel_module_type).as_str(),
             not(contains_substring("table"))
+        );
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_allows_cross_file_extension_without_reedit() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let sh_repair_path = "lua/glide/sh_repair.lua";
+        let sv_repair_path = "lua/glide/server/repair.lua";
+
+        let sh_repair_source = r#"
+        Glide = Glide or {}
+
+        --- @class Repair
+        Glide.Repair = Glide.Repair or {}
+        "#;
+
+        let sv_repair_source = r#"
+        Glide.Repair = Glide.Repair or {}
+
+        --- @param nozzle Entity
+        --- @param reason number?
+        function Glide.Repair.EndSessionByNozzle(nozzle, reason)
+        end
+        "#;
+
+        ws.def_file(sh_repair_path, sh_repair_source);
+        ws.def_file(sv_repair_path, sv_repair_source);
+
+        let consumer_file = ws.def_file(
+            "lua/entities/glide_repair_tool/init.lua",
+            r#"
+            local repairModule = Glide.Repair
+            local endSession = Glide.Repair.EndSessionByNozzle
+            "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+            eq(false),
+            "cross-file Repair extensions should be visible without editing repair.lua after startup"
+        );
+        let repair_module_type = local_name_type(&mut ws, consumer_file, "repairModule");
+        assert_that!(
+            ws.humanize_type(repair_module_type).as_str(),
+            not(contains_substring("table"))
+        );
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_cross_file_extension_survives_batch_startup_index() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let sh_repair_path = ws.virtual_url_generator.new_path("lua/glide/sh_repair.lua");
+        let sv_repair_path = ws
+            .virtual_url_generator
+            .new_path("lua/glide/server/repair.lua");
+        let consumer_path = ws
+            .virtual_url_generator
+            .new_path("lua/entities/glide_repair_tool/init.lua");
+
+        let sh_repair_source = r#"
+        Glide = Glide or {}
+
+        --- @class Repair
+        Glide.Repair = Glide.Repair or {}
+        "#;
+
+        let sv_repair_source = r#"
+        Glide.Repair = Glide.Repair or {}
+
+        --- @param nozzle Entity
+        --- @param reason number?
+        function Glide.Repair.EndSessionByNozzle(nozzle, reason)
+        end
+        "#;
+
+        let consumer_source = r#"
+            local repairModule = Glide.Repair
+            local endSession = Glide.Repair.EndSessionByNozzle
+            "#;
+
+        ws.analysis.update_files_by_path(vec![
+            (sh_repair_path.clone(), Some(sh_repair_source.to_string())),
+            (sv_repair_path.clone(), Some(sv_repair_source.to_string())),
+            (consumer_path.clone(), Some(consumer_source.to_string())),
+        ]);
+
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/entities/glide_repair_tool/init.lua");
+        let consumer_file = ws
+            .analysis
+            .get_file_id(&consumer_uri)
+            .expect("expected consumer file id");
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+            eq(false),
+            "batch startup index should preserve cross-file class extension members"
+        );
+        let repair_module_type = local_name_type(&mut ws, consumer_file, "repairModule");
+        assert_that!(
+            ws.humanize_type(repair_module_type).as_str(),
+            not(contains_substring("table"))
+        );
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_keeps_server_local_alias_methods_visible() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let sh_repair_path = "lua/glide/sh_repair.lua";
+        let sv_repair_path = "lua/glide/server/repair.lua";
+
+        let sh_repair_source = r#"
+        Glide = Glide or {}
+
+        --- @class Repair
+        Glide.Repair = Glide.Repair or {}
+        "#;
+
+        let sv_repair_source = r#"
+        Glide.Repair = Glide.Repair or {}
+        local Repair = Glide.Repair
+
+        --- @param nozzle Entity
+        --- @param reason number?
+        function Repair.EndSessionByNozzle(nozzle, reason)
+        end
+
+        Glide.Repair = Repair
+        "#;
+
+        ws.def_file(sh_repair_path, sh_repair_source);
+        ws.def_file(sv_repair_path, sv_repair_source);
+
+        let consumer_file = ws.def_file(
+            "lua/entities/glide_repair_tool/init.lua",
+            r#"
+            local repairModule = Glide.Repair
+            local endSession = Glide.Repair.EndSessionByNozzle
+            "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+            eq(false),
+            "server local alias methods should remain visible on class-annotated Glide.Repair"
+        );
+        let repair_module_type = local_name_type(&mut ws, consumer_file, "repairModule");
+        assert_that!(
+            ws.humanize_type(repair_module_type).as_str(),
+            not(contains_substring("table"))
+        );
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_cross_file_extensions_are_stable_across_load_orders() {
+        let sh_repair_path = "lua/glide/sh_repair.lua";
+        let sv_repair_path = "lua/glide/server/repair.lua";
+        let consumer_path = "lua/entities/glide_repair_tool/init.lua";
+
+        let sh_repair_source = r#"
+        Glide = Glide or {}
+
+        --- @class Repair
+        Glide.Repair = Glide.Repair or {}
+        "#;
+
+        let sv_repair_source = r#"
+        Glide.Repair = Glide.Repair or {}
+
+        --- @param nozzle Entity
+        --- @param reason number?
+        function Glide.Repair.EndSessionByNozzle(nozzle, reason)
+        end
+        "#;
+
+        let consumer_source = r#"
+            local repairModule = Glide.Repair
+            local endSession = Glide.Repair.EndSessionByNozzle
+            "#;
+
+        let mut failures = Vec::new();
+
+        for scenario in [
+            "sequential_sh_then_sv",
+            "sequential_sv_then_sh",
+            "batch_startup",
+            "batch_then_full_reindex",
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+
+            let server_file_id = match scenario {
+                "sequential_sh_then_sv" => {
+                    ws.def_file(sh_repair_path, sh_repair_source);
+                    ws.def_file(sv_repair_path, sv_repair_source)
+                }
+                "sequential_sv_then_sh" => {
+                    let server_file_id = ws.def_file(sv_repair_path, sv_repair_source);
+                    ws.def_file(sh_repair_path, sh_repair_source);
+                    server_file_id
+                }
+                "batch_startup" | "batch_then_full_reindex" => {
+                    let sh_path = ws.virtual_url_generator.new_path(sh_repair_path);
+                    let sv_path = ws.virtual_url_generator.new_path(sv_repair_path);
+                    let consumer_batch_path = ws.virtual_url_generator.new_path(consumer_path);
+                    ws.analysis.update_files_by_path(vec![
+                        (sh_path, Some(sh_repair_source.to_string())),
+                        (sv_path, Some(sv_repair_source.to_string())),
+                        (consumer_batch_path, Some(consumer_source.to_string())),
+                    ]);
+
+                    let server_uri = ws.virtual_url_generator.new_uri(sv_repair_path);
+                    ws.analysis
+                        .get_file_id(&server_uri)
+                        .expect("expected server file id")
+                }
+                _ => unreachable!(),
+            };
+
+            let consumer_file_id =
+                if matches!(scenario, "batch_startup" | "batch_then_full_reindex") {
+                    let consumer_uri = ws.virtual_url_generator.new_uri(consumer_path);
+                    ws.analysis
+                        .get_file_id(&consumer_uri)
+                        .expect("expected consumer file id")
+                } else {
+                    ws.def_file(consumer_path, consumer_source)
+                };
+
+            if scenario == "batch_then_full_reindex" {
+                ws.analysis.reindex();
+            }
+
+            let method_type =
+                index_expr_type(&mut ws, server_file_id, "Glide.Repair.EndSessionByNozzle");
+            if method_type.is_unknown() {
+                failures.push(format!(
+                    "{scenario}: server definition type resolved as unknown"
+                ));
+            }
+
+            if file_has_diagnostic(&mut ws, consumer_file_id, DiagnosticCode::UndefinedField) {
+                failures.push(format!(
+                    "{scenario}: consumer has UndefinedField for Glide.Repair.EndSessionByNozzle"
+                ));
+            }
+        }
+
+        assert_that!(
+            failures,
+            is_empty(),
+            "cross-file Repair extension should be stable across load orders: {failures:?}"
         );
     }
 
