@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a problem with the language server or VSCode extension.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Use this form for issues affecting either the language server or the VSCode extension.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Where are you seeing the problem?
+      options:
+        - VSCode extension
+        - Language server
+        - Debugger
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Briefly describe the bug and what you expected instead.
+      placeholder: The extension showed...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How can it be reproduced?
+      description: Include a minimal example, steps, or sample code if relevant.
+      placeholder: |
+        1. Open...
+        2. Run...
+        3. See...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Share versions and setup details that might matter.
+      placeholder: |
+        VSCode version:
+        Extension version:
+        GLuaLS version:
+        OS:
+        Project structure/details:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste any relevant logs, errors, or screenshots.
+      render: shell
+    validations:
+      required: false

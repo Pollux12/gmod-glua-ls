@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: VSCode extension source repository
+    url: https://github.com/Pollux12/vscode-gmod-glua-ls
+    about: Source code for the VSCode extension. Bug reports and feature suggestions should still be opened in this repository.
