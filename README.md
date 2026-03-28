@@ -11,13 +11,13 @@
 
 <p align="center">
   <a href="https://marketplace.visualstudio.com/items?itemName=Pollux.gmod-glua-ls">
-    <img src="https://img.shields.io/visual-studio-marketplace/v/Pollux.gmod-glua-ls.png?style=flat-square&label=VSCode" alt="VSCode version">
+    <img src="https://img.shields.io/visual-studio-marketplace/v/Pollux.gmod-glua-ls?style=flat-square&label=VSCode" alt="VSCode version">
   </a>
   <a href="https://github.com/Pollux12/gmod-glua-ls/releases">
-    <img src="https://img.shields.io/github/v/release/Pollux12/gmod-glua-ls.png?style=flat-square&label=gLuaLS" alt="Language server version">
+    <img src="https://img.shields.io/github/v/release/Pollux12/gmod-glua-ls?style=flat-square&label=gLuaLS" alt="Language server version">
   </a>
   <a href="https://github.com/Pollux12/gmod-luals-addon/tree/gluals-annotations">
-    <img src="https://img.shields.io/github/last-commit/Pollux12/gmod-luals-addon/gluals-annotations.png?style=flat-square&label=Annotations%20Updated" alt="Annotations updated">
+    <img src="https://img.shields.io/github/last-commit/Pollux12/gmod-luals-addon/gluals-annotations?style=flat-square&label=Annotations%20Updated" alt="Annotations updated">
   </a>
 </p>
 
