@@ -33,31 +33,25 @@ body:
     id: reproduction
     attributes:
       label: How can it be reproduced?
-      description: Include a minimal example, steps, or sample code if relevant.
+      description: Optional. Share steps, a minimal example, or sample code if you have it.
       placeholder: |
         1. Open...
         2. Run...
         3. See...
     validations:
-      required: true
+      required: false
   - type: textarea
-    id: environment
+    id: additional_info
     attributes:
-      label: Environment
-      description: Share versions and setup details that might matter.
+      label: Additional info
+      description: Optional. Share environment details, logs, errors, or screenshots that help explain the issue.
       placeholder: |
         VSCode version:
         Extension version:
         GLuaLS version:
         OS:
         Project structure/details:
-    validations:
-      required: true
-  - type: textarea
-    id: logs
-    attributes:
-      label: Logs or screenshots
-      description: Paste any relevant logs, errors, or screenshots.
-      render: shell
+        Logs:
+        Screenshots:
     validations:
       required: false

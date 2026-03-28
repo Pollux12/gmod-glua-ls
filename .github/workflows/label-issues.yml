@@ -1,0 +1,67 @@
+name: Label issue areas
+
+on:
+  issues:
+    types:
+      - opened
+      - edited
+      - reopened
+
+permissions:
+  issues: write
+
+jobs:
+  label-area:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply area label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body ?? '';
+            const match = body.match(/### Area[\s\S]*?\n\n([^\n]+)/);
+            if (!match) {
+              core.info('No area field found.');
+              return;
+            }
+
+            const area = match[1].trim();
+            const areaLabels = new Map([
+              ['VSCode extension', 'vscode'],
+              ['Language server', 'language-server'],
+              ['Debugger', 'debugger'],
+              ['Documentation', 'documentation'],
+              ['Other', 'other'],
+            ]);
+
+            const desiredLabel = areaLabels.get(area);
+            if (!desiredLabel) {
+              core.info(`No label mapping for area: ${area}`);
+              return;
+            }
+
+            const knownAreaLabels = [...areaLabels.values()];
+            const existingLabels = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+
+            for (const label of existingLabels) {
+              if (knownAreaLabels.includes(label.name) && label.name !== desiredLabel) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  name: label.name,
+                });
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: [desiredLabel],
+            });

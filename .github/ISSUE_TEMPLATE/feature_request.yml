@@ -2,12 +2,13 @@ name: Feature request
 description: Suggest an improvement for the language server or VSCode extension.
 title: "[Suggestion]: "
 labels:
-  - suggestion
+  - enhancement
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for the suggestion. Use this form for ideas affecting either the language server or the VSCode extension.
+        You can keep it brief: describe the current issue, what you want to change, and anything that helps explain the idea.
   - type: dropdown
     id: area
     attributes:
@@ -22,25 +23,17 @@ body:
     validations:
       required: true
   - type: textarea
-    id: problem
+    id: idea
     attributes:
-      label: What problem are you trying to solve?
-      description: Describe the current pain point or limitation.
-      placeholder: It is difficult to...
-    validations:
-      required: true
-  - type: textarea
-    id: proposal
-    attributes:
-      label: What would you like to happen?
-      description: Keep it simple and concrete.
-      placeholder: I would like...
+      label: What would you like to suggest?
+      description: Describe the current issue, limitation, or improvement you want to see.
+      placeholder: It would help if...
     validations:
       required: true
   - type: textarea
     id: context
     attributes:
       label: Extra context
-      description: Examples, mockups, related tools, or anything else helpful.
+      description: Optional. Add examples, mockups, related tools, or anything else helpful.
     validations:
       required: false
