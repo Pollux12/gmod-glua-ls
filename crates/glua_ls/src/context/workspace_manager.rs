@@ -1206,8 +1206,10 @@ mod tests {
         let annotations_dir = create_temp_dir();
         touch(&workspace.join(".emmyrc.json"));
 
-        let mut client_config = ClientConfig::default();
-        client_config.gmod_annotations_path = Some(annotations_dir.to_string_lossy().to_string());
+        let client_config = ClientConfig {
+            gmod_annotations_path: Some(annotations_dir.to_string_lossy().to_string()),
+            ..Default::default()
+        };
 
         let loaded = load_emmy_config(vec![workspace.clone()], client_config);
 
@@ -1252,9 +1254,10 @@ mod tests {
         .expect("failed to write config");
 
         // CLI provides a different path
-        let mut client_config = ClientConfig::default();
-        client_config.gmod_annotations_path =
-            Some(cli_annotations_dir.to_string_lossy().to_string());
+        let client_config = ClientConfig {
+            gmod_annotations_path: Some(cli_annotations_dir.to_string_lossy().to_string()),
+            ..Default::default()
+        };
 
         let loaded = load_emmy_config(vec![workspace.clone()], client_config);
 
@@ -1307,9 +1310,10 @@ mod tests {
         .expect("failed to write config");
 
         // CLI provides a path, but should be ignored due to auto_load_annotations: false
-        let mut client_config = ClientConfig::default();
-        client_config.gmod_annotations_path =
-            Some(cli_annotations_dir.to_string_lossy().to_string());
+        let client_config = ClientConfig {
+            gmod_annotations_path: Some(cli_annotations_dir.to_string_lossy().to_string()),
+            ..Default::default()
+        };
 
         let loaded = load_emmy_config(vec![workspace.clone()], client_config);
 
@@ -1341,8 +1345,10 @@ mod tests {
         let workspace = create_temp_dir();
         touch(&workspace.join(".emmyrc.json"));
 
-        let mut client_config = ClientConfig::default();
-        client_config.gmod_annotations_path = Some(String::new());
+        let client_config = ClientConfig {
+            gmod_annotations_path: Some(String::new()),
+            ..Default::default()
+        };
 
         let loaded = load_emmy_config(vec![workspace.clone()], client_config);
 
