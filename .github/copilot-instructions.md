@@ -18,6 +18,7 @@
   - `crates/glua_doc_cli`: annotation-to-docs generator.
   - `crates/schema_to_glua`: schema-to-annotation conversion helpers.
   - `tools/schema_json_gen`: schema generator binary used by CI drift checks.
+  - `tools/benchmark`: performance benchmarking tool that measures indexing and diagnostics on real codebases.
 - Runtime flow is parser → analysis/indexing → LS/CLI consumers.
 - Analysis pipeline (in `crates/glua_code_analysis/src/compilation/analyzer/mod.rs`):
   `Decl → Doc → Flow → Lua → Gmod → AccessorFunc synthesis → UnResolve → [DynamicField if inferDynamicFields]`
@@ -50,6 +51,7 @@
 ## Build, Test, and Validation Commands
 - Build all: `cargo build --release`
 - Build one crate: `cargo build --release -p glua_ls` (or `glua_check`, `glua_doc_cli`)
+- Run benchmark: `cargo run --release -p benchmark` (requires `BENCH_CODEBASE` and `BENCH_ANNOTATIONS` env vars)
 - Test all: `cargo test`
 - Focused loop (common): `cargo test -p glua_code_analysis`
 - Lint (CI-equivalent): `cargo clippy --workspace --all-targets --all-features -- -D warnings`
