@@ -146,6 +146,36 @@ mod test {
     }
 
     #[test]
+    fn test_top_level_guard_clause_not_global_suppresses_later_direct_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if not MR then return end
+
+            print(MR)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_top_level_guard_clause_not_global_suppresses_later_function_body_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if not MR then return end
+
+            local function later_use()
+                print(MR)
+            end
+
+            later_use()
+            "#
+        ));
+    }
+
+    #[test]
     fn test_guard_clause_istable_global_suppresses_following_uses() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!has_undefined_global_name(
@@ -164,6 +194,21 @@ mod test {
     }
 
     #[test]
+    fn test_helper_continuation_guard_not_isstring_suppresses_later_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            function _G.isstring(_) end
+
+            if not isstring(testVar) then return end
+
+            print(testVar)
+            "#
+        ));
+    }
+
+    #[test]
     fn test_guard_clause_that_implies_falsy_still_reports_undefined_global() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
@@ -175,6 +220,185 @@ mod test {
 
             print(invalidVar)
             "#
+        ));
+    }
+
+    #[test]
+    fn test_top_level_guard_clause_with_elseif_suppresses_later_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if not MR then
+                return
+            elseif true then
+            end
+
+            print(MR)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_top_level_guard_clause_with_else_suppresses_later_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if not MR then
+                return
+            else
+                local _ = true
+            end
+
+            print(MR)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_top_level_not_guard_without_early_return_does_not_suppress_later_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if not MR then
+                local _ = true
+            elseif true then
+            end
+
+            print(MR)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_truthy_if_guard_does_not_apply_to_else_scope() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let content = r#"
+            if testVarThen then
+                print(testVarThen)
+            else
+                print(testVarElse)
+            end
+        "#;
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            content,
+            "testVarThen",
+        ));
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            content,
+            "testVarElse",
+        ));
+    }
+
+    #[test]
+    fn test_top_level_guard_clause_not_equal_nil_does_not_suppress_later_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if MR ~= nil then
+                return
+            end
+
+            print(MR)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_top_level_guard_clause_equal_nil_suppresses_later_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if MR == nil then
+                return
+            end
+
+            print(MR)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_top_level_guard_clause_nil_equal_name_suppresses_later_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if nil == MR then
+                return
+            end
+
+            print(MR)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_top_level_guard_suppresses_undefined_global_only_not_other_diagnostics() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let content = r#"
+            ---@class MRPlyType
+            ---@field GetFirstSpawn integer
+
+            ---@class MRType
+            ---@field Ply MRPlyType
+
+            if not MR then return end
+            ---@cast MR MRType
+
+            MR.Ply:GetFirstSpawn(1)
+        "#;
+
+        assert!(!has_undefined_global_name(
+            &mut ws, "test.lua", content, "MR"
+        ));
+        assert!(has_diagnostic(
+            &mut ws,
+            "test.lua",
+            content,
+            DiagnosticCode::CallNonCallable,
+        ));
+    }
+
+    #[test]
+    fn test_continuation_guard_scope_before_and_after_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let content = r#"
+            function OtherTestFunction()
+                print(testVarBefore)
+            end
+
+            print(testVarBefore)
+
+            if not testVarAfter then return end
+
+            print(testVarAfter)
+
+            function FinalTestFunction()
+                print(testVarAfter)
+            end
+        "#;
+
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            content,
+            "testVarBefore",
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            content,
+            "testVarAfter",
         ));
     }
 

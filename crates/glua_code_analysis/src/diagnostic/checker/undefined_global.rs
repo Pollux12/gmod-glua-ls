@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIfStat, LuaIndexKey,
-    LuaLiteralToken, LuaNameExpr, UnaryOperator,
+    BinaryOperator, LuaAstNode, LuaBlock, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIfStat,
+    LuaIndexKey, LuaLiteralToken, LuaNameExpr, LuaStat, UnaryOperator,
 };
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 use crate::{DiagnosticCode, LuaSignatureId, SemanticModel};
 
@@ -68,7 +68,134 @@ fn calc_guarded_name_expr_ranges(semantic_model: &SemanticModel) -> HashSet<Text
         }
     }
 
+    guarded_ranges.extend(calc_continuation_guarded_name_expr_ranges(root));
+
     guarded_ranges
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContinuationGuardRule {
+    block_range: TextRange,
+    guard_start: TextSize,
+}
+
+fn calc_continuation_guarded_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<TextRange> {
+    let mut guarded_ranges = HashSet::new();
+    let mut guard_rules_by_name = HashMap::<String, Vec<ContinuationGuardRule>>::new();
+
+    for block in root.descendants::<LuaBlock>() {
+        let block_range = block.get_range();
+        for stat in block.get_stats() {
+            let LuaStat::IfStat(if_stat) = stat else {
+                continue;
+            };
+
+            let Some(guarded_name) = continuation_guard_name(&if_stat) else {
+                continue;
+            };
+
+            guard_rules_by_name
+                .entry(guarded_name)
+                .or_default()
+                .push(ContinuationGuardRule {
+                    block_range,
+                    guard_start: if_stat.get_range().end(),
+                });
+        }
+    }
+
+    if guard_rules_by_name.is_empty() {
+        return guarded_ranges;
+    }
+
+    for name_expr in root.descendants::<LuaNameExpr>() {
+        let expr_range = name_expr.get_range();
+        let Some(name_text) = name_expr.get_name_text() else {
+            continue;
+        };
+
+        let Some(guard_rules) = guard_rules_by_name.get(name_text.as_str()) else {
+            continue;
+        };
+
+        if guard_rules.iter().any(|rule| {
+            expr_range.start() >= rule.guard_start
+                && expr_range.start() >= rule.block_range.start()
+                && expr_range.end() <= rule.block_range.end()
+        }) {
+            guarded_ranges.insert(expr_range);
+        }
+    }
+
+    guarded_ranges
+}
+
+fn continuation_guard_name(if_stat: &LuaIfStat) -> Option<String> {
+    let block = if_stat.get_block()?;
+    if !is_return_only_block(&block) {
+        return None;
+    }
+
+    extract_continuation_guarded_name(&if_stat.get_condition_expr()?)
+}
+
+fn is_return_only_block(block: &LuaBlock) -> bool {
+    let mut has_return_stat = false;
+    for stat in block.get_stats() {
+        match stat {
+            LuaStat::EmptyStat(_) => {}
+            LuaStat::ReturnStat(_) => {
+                if has_return_stat {
+                    return false;
+                }
+                has_return_stat = true;
+            }
+            _ => return false,
+        }
+    }
+
+    has_return_stat
+}
+
+fn extract_continuation_guarded_name(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => {
+            extract_continuation_guarded_name(&paren_expr.get_expr()?)
+        }
+        LuaExpr::UnaryExpr(unary_expr) => {
+            let is_not = unary_expr
+                .get_op_token()
+                .is_some_and(|op| op.get_op() == UnaryOperator::OpNot);
+            if !is_not {
+                return None;
+            }
+
+            extract_truthy_guarded_name(&unary_expr.get_expr()?)
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let is_eq = binary_expr
+                .get_op_token()
+                .is_some_and(|op| op.get_op() == BinaryOperator::OpEq);
+            if !is_eq {
+                return None;
+            }
+
+            let (left_expr, right_expr) = binary_expr.get_exprs()?;
+            name_compared_with_nil(&left_expr, &right_expr)
+                .and_then(|name_expr| name_expr.get_name_text().map(|text| text.to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn extract_truthy_guarded_name(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => extract_truthy_guarded_name(&paren_expr.get_expr()?),
+        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text().map(|text| text.to_string()),
+        LuaExpr::CallExpr(call_expr) => guarded_call_target_name(call_expr)
+            .and_then(|name_expr| name_expr.get_name_text().map(|text| text.to_string())),
+        _ => None,
+    }
 }
 
 fn collect_clause_guarded_name_ranges(
@@ -160,6 +287,12 @@ fn collect_truthy_guarded_names(
                         names.insert(name_text.to_string());
                     }
                     names
+                }
+                BinaryOperator::OpEq => {
+                    if let Some(name_expr) = name_compared_with_nil(&left_expr, &right_expr) {
+                        condition_guard_ranges.insert(name_expr.get_range());
+                    }
+                    HashSet::new()
                 }
                 _ => HashSet::new(),
             }
