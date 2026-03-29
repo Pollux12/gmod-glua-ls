@@ -29,6 +29,30 @@ mod test {
         diagnostics.iter().any(|diagnostic| diagnostic.code == code)
     }
 
+    fn has_undefined_global_name(
+        ws: &mut VirtualWorkspace,
+        file_path: &str,
+        content: &str,
+        name: &str,
+    ) -> bool {
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedGlobal);
+        let file_id = ws.def_file(file_path, content);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedGlobal.get_name().to_string(),
+        ));
+        let message_needled = format!("undefined global variable: {name}");
+
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == code && diagnostic.message.contains(&message_needled)
+        })
+    }
+
     #[test]
     fn test_issue_250() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -101,6 +125,55 @@ mod test {
             if is_valid(entMaybe) then
                 print(entMaybe)
             end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_guard_clause_not_global_suppresses_following_uses() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            local function ShouldAlwaysSit(ply)
+                if not ms then return end
+                if not ms.GetTheaterPlayers then return end
+
+                print(ms.GetTheaterPlayers)
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_guard_clause_istable_global_suppresses_following_uses() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            local function ShouldAlwaysSit2()
+                if not istable(ms) then return end
+                if not ms.GetTheaterPlayers then return end
+
+                print(ms.GetTheaterPlayers)
+            end
+            "#,
+            "ms",
+        ));
+    }
+
+    #[test]
+    fn test_guard_clause_that_implies_falsy_still_reports_undefined_global() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if invalidVar then
+                return
+            end
+
+            print(invalidVar)
             "#
         ));
     }

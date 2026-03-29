@@ -373,7 +373,7 @@ fn check_name_expr(
         return Some(());
     }
 
-    if name_text == "self" && check_self_name(semantic_model, name_expr).is_some() {
+    if name_text == "self" && check_self_name(semantic_model, name_expr.clone()).is_some() {
         return Some(());
     }
 
@@ -384,6 +384,10 @@ fn check_name_expr(
             .get_define_baseclass_name(&semantic_model.get_file_id())
             .is_some()
     {
+        return Some(());
+    }
+
+    if is_narrowed_unresolved_global_valid(semantic_model, &name_expr) {
         return Some(());
     }
 
@@ -411,4 +415,15 @@ fn check_self_name(semantic_model: &SemanticModel, name_expr: LuaNameExpr) -> Op
         }
     }
     None
+}
+
+fn is_narrowed_unresolved_global_valid(
+    semantic_model: &SemanticModel,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    let Ok(inferred_type) = semantic_model.infer_expr(LuaExpr::NameExpr(name_expr.clone())) else {
+        return false;
+    };
+
+    !inferred_type.is_unknown() && !inferred_type.is_never() && !inferred_type.is_always_falsy()
 }

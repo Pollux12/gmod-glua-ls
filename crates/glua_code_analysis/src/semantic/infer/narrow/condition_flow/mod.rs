@@ -5,7 +5,7 @@ mod index_flow;
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaNameExpr, LuaUnaryExpr, UnaryOperator};
 
 use crate::{
-    DbIndex, FlowNode, FlowTree, InferFailReason, LuaInferCache,
+    DbIndex, FlowNode, FlowTree, InferFailReason, LuaInferCache, LuaType,
     semantic::infer::{
         VarRefId,
         narrow::{
@@ -167,6 +167,13 @@ fn get_type_at_name_expr(
         InferConditionFlow::FalseCondition => narrow_false_or_nil(db, antecedent_type),
         InferConditionFlow::TrueCondition => remove_false_or_nil(antecedent_type),
     };
+
+    if matches!(condition_flow, InferConditionFlow::TrueCondition)
+        && matches!(name_var_ref_id, VarRefId::GlobalName(_, _))
+        && result_type.is_unknown()
+    {
+        return Ok(ResultTypeOrContinue::Result(LuaType::Any));
+    }
 
     Ok(ResultTypeOrContinue::Result(result_type))
 }
