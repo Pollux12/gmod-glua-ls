@@ -38,18 +38,155 @@ Download the correct binary for your server from the [GitHub releases page](http
 | Linux 64-bit | `gmsv_rdb_linux64.dll` |
 | Linux 32-bit | `gmsv_rdb_linux.dll` |
 
-Place the binary in `garrysmod/lua/bin/` on your server.
+Place the binary in `garrysmod/lua/bin/` on your server - you may have to create the `bin` folder if it doesn't exist. The final path should be `garrysmod/lua/bin/gmsv_rdb_*.dll`.
 
-Create a loader script at `garrysmod/autorun/rdb_loader.lua`:
+Place this loader script at `garrysmod/lua/autorun/debug.lua`:
 
-```lua garrysmod/autorun/rdb_loader.lua
-if not SERVER then return end
+```lua garrysmod/lua/autorun/debug.lua
+-- [GLuaLS] Auto-managed by GLuaLS extension. Do not edit.
+_GLUALS = _GLUALS or {}
 
-require("rdb")
+if SERVER then
+    require("rdb")
+    rdb.activate(21111)
+    util.AddNetworkString("gm_rdb_exec")
+
+    local function normalizeRealm(realm)
+        realm = string.lower(tostring(realm or "server"))
+        if realm ~= "server" and realm ~= "client" and realm ~= "shared" then
+            realm = "server"
+        end
+        return realm
+    end
+
+    local function sendClientExec(kind, payload)
+        net.Start("gm_rdb_exec")
+        net.WriteString(kind)
+        net.WriteString(payload)
+        net.Broadcast()
+    end
+
+    local function runServerChunk(code, chunkName)
+        local fn, compileErr = CompileString(code, chunkName or "gluals_run_lua", false)
+        if not isfunction(fn) then
+            return false, tostring(compileErr)
+        end
+        local ok, runtimeErr = xpcall(fn, debug.traceback)
+        if not ok then
+            return false, tostring(runtimeErr)
+        end
+        return true
+    end
+
+    local function includeServerFile(filePath)
+        local ok, includeErr = pcall(include, filePath)
+        if not ok then
+            return false, tostring(includeErr)
+        end
+        return true
+    end
+
+    local function readServerFileForClient(filePath)
+        local content = file.Read(filePath, "LUA")
+        if isstring(content) then
+            return content
+        end
+
+        content = file.Read("lua/" .. filePath, "GAME")
+        if isstring(content) then
+            return content
+        end
+
+        return nil, "unable to read file for client execution: " .. filePath
+    end
+
+    function _GLUALS.runLua(realm, code)
+        realm = normalizeRealm(realm)
+        if type(code) ~= "string" then
+            return false, "lua chunk must be a string"
+        end
+
+        if realm == "server" or realm == "shared" then
+            local ok, err = runServerChunk(code, "gluals_run_lua")
+            if not ok then
+                return false, err
+            end
+        end
+
+        if realm == "client" or realm == "shared" then
+            sendClientExec("lua", code)
+        end
+
+        return true
+    end
+
+    function _GLUALS.runFile(realm, filePath)
+        realm = normalizeRealm(realm)
+        filePath = tostring(filePath or "")
+        if filePath == "" then
+            return false, "file path is required"
+        end
+
+        if realm == "server" or realm == "shared" then
+            local ok, err = includeServerFile(filePath)
+            if not ok then
+                return false, err
+            end
+        end
+
+        if realm == "client" or realm == "shared" then
+            local clientCode, readErr = readServerFileForClient(filePath)
+            if not isstring(clientCode) then
+                return false, tostring(readErr)
+            end
+            sendClientExec("lua", clientCode)
+        end
+
+        return true
+    end
+
+    function _GLUALS.refreshFile(filePath)
+        filePath = tostring(filePath or "")
+        if filePath == "" then
+            return false, "file path is required"
+        end
+
+        if not game or not game.ConsoleCommand then
+            return false, "game.ConsoleCommand is unavailable"
+        end
+
+        local quotedPath = string.format("%q", filePath)
+        game.ConsoleCommand("lua_refresh_file " .. quotedPath .. "\n")
+        return true
+    end
+end
+
+if CLIENT then
+    net.Receive("gm_rdb_exec", function()
+        local kind = net.ReadString()
+        local payload = net.ReadString()
+        if kind == "lua" then
+            local func, err = CompileString(payload, "gluals_client_exec", false)
+            if not isfunction(func) then
+                ErrorNoHalt("[GLuaLS] Client exec compile error: " .. tostring(err) .. "\n")
+                return
+            end
+
+            local ok, runtimeErr = xpcall(func, debug.traceback)
+            if not ok then
+                ErrorNoHalt("[GLuaLS] Client exec runtime error: " .. tostring(runtimeErr) .. "\n")
+            end
+            return
+        end
+
+        ErrorNoHalt("[GLuaLS] Unknown exec kind: " .. tostring(kind) .. "\n")
+    end)
+end
+
 ```
 
 <Note>
-The loader script ensures `gm_rdb` only loads on the server realm and starts automatically when the server loads.
+This script is copy-pasted from version 1.0.6 and may be outdated if you are using a newer version of the extension. It is always recommended to use the setup wizard for the latest version of the loader script.
 </Note>
 
 ---
@@ -65,46 +202,49 @@ Use **attach** when the server is already running (most common for development):
 <ConfigTip />
 ```json .vscode/launch.json
 {
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "gluals_gmod",
-      "request": "attach",
-      "name": "Attach to SRCDS",
-      "host": "127.0.0.1",
-      "port": 21111,
-      "sourceRoot": "${workspaceFolder}",
-      "stopOnEntry": true,
-      "stopOnError": false
-    }
-  ]
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "gluals_gmod",
+            "request": "attach",
+            "name": "GMod Attach (SRCDS)",
+            "host": "127.0.0.1",
+            "port": 21111,
+            "sourceRoot": "${workspaceFolder}/../..",
+            "sourceFileMap": {
+                "${workspaceFolder}/../../addons": "addons",
+                "${workspaceFolder}/../../lua": "lua",
+                "${workspaceFolder}/../../gamemodes/base": "gamemodes/base",
+                "${workspaceFolder}/../../gamemodes/sandbox": "gamemodes/sandbox"
+            },
+            "stopOnEntry": false,
+            "stopOnError": false,
+            "realm": "server"
+        }
+    ]
 }
 ```
+-  "sourceRoot": should point to your garrysmod folder (one level up from scrds)
+-  "sourceFileMap" should map workspace folders to their corresponding paths, going from the sourceRoot folder.
+
+You will need to edit the above configuration to match your workspace structure. This is likely to just require a new line within sourceFileMap.
+
+Addon example:
+```
+"${workspaceFolder}": "addons/your-addon-folder"
+```
+
+Gamemode example:
+```
+"${workspaceFolder}": "gamemodes/your-addon-folder"
+```
+
+The reason for it looking so complicated is due to it trying to be a generic example that will work for everyone - you can also use hardcoded direct paths if you want, but this means others won't be able to use your config without editing it.
+
 
 ### Launch a server
 
 <Warning>The `launch` option is unsupported and may not work on all systems. Use `attach` instead.</Warning>
-
-Use **launch** to start SRCDS directly from VS Code:
-
-<ConfigTip />
-```json .vscode/launch.json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "gluals_gmod",
-      "request": "launch",
-      "name": "Launch SRCDS",
-      "program": "C:/srcds/srcds.exe",
-      "args": ["-game garrysmod -console -port 27015"],
-      "cwd": "C:/srcds",
-      "port": 21111,
-      "sourceRoot": "${workspaceFolder}"
-    }
-  ]
-}
-```
 
 ---
 
@@ -115,7 +255,7 @@ Use **launch** to start SRCDS directly from VS Code:
 3. Select your launch configuration from the dropdown
 4. Press **F5** (or click the green play button)
 
-The debug toolbar appears at the top of the screen when connected.
+The debug toolbar appears at the top of the screen when connected. You should see the debug console output pop up in the bottom panel.
 
 ---
 
@@ -135,6 +275,8 @@ The debug toolbar appears at the top of the screen when connected.
 
 ### Launch configuration (server process)
 
+<Warning>The `launch` option is unsupported and may not work on all systems. Use `attach` instead.</Warning>
+
 Includes the above, plus:
 
 | Property | Type | Description |
@@ -147,14 +289,10 @@ Includes the above, plus:
 
 ## Changing the default port
 
-You can configure `gm_rdb` to listen on a different port by adding a `CreateConVar` in your loader:
+You can configure `gm_rdb` to listen on a different port by changing the following line within `debug.lua`:
 
-```lua garrysmod/autorun/rdb_loader.lua
-if not SERVER then return end
-
--- Change default port to 21200
-CreateConVar("rdb_port", "21200", FCVAR_NONE, "Debug port for gm_rdb")
-require("rdb")
+```lua garrysmod/lua/autorun/debug.lua
+rdb.activate(<PORT_NUMBER>)
 ```
 
 Make sure to update `"port"` in your `launch.json` to match.
