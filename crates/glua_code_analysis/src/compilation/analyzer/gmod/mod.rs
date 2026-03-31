@@ -7,14 +7,14 @@ use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk,
     LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
     LuaDocTagFileparam, LuaDocTagRealm, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexKey,
-    LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaStat, LuaVarExpr, PathTrait,
+    LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaStat, LuaSyntaxNode, LuaVarExpr, PathTrait,
 };
 
 use crate::{
     EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodScriptedClassCallKind,
-    GmodScriptedClassCallMetadata, LuaDeclId, LuaDeclTypeKind, LuaFunctionType, LuaMember,
-    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId,
-    LuaTypeFlag,
+    GmodScriptedClassCallMetadata, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclTypeKind,
+    LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache,
+    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -26,7 +26,7 @@ use crate::{
     },
     profile::Profile,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 
 /// Pre-scanned keyword flags for fast gmod_pre skip decisions.
 /// Each flag indicates the file source contains the corresponding keyword pattern.
@@ -1797,6 +1797,50 @@ fn synthesize_derma_define_control(
         call,
         original_decl_table_types,
     );
+
+    // Register the control name as a global variable with the panel type
+    register_global_panel(db, file_id, &control_name, call);
+}
+
+/// Register a panel name as a global variable with the panel class type.
+fn register_global_panel(
+    db: &mut DbIndex,
+    file_id: FileId,
+    panel_name: &str,
+    call: &GmodScriptedClassCallMetadata,
+) {
+    use glua_parser::LuaSyntaxKind;
+
+    let class_decl_id = LuaTypeDeclId::global(panel_name);
+    let call_range = call.syntax_id.get_range();
+
+    // Create a global declaration for the panel name
+    let global_decl = LuaDecl::new(
+        panel_name,
+        file_id,
+        call_range,
+        LuaDeclExtra::Global {
+            kind: LuaSyntaxKind::NameExpr.into(),
+        },
+        None,
+    );
+
+    let decl_id = global_decl.get_id();
+
+    // Add the declaration to the declaration tree
+    if let Some(decl_tree) = db.get_decl_index_mut().get_decl_tree_mut(&file_id) {
+        decl_tree.add_decl(global_decl);
+    }
+
+    // Register the global in the global index
+    db.get_global_index_mut()
+        .add_global_decl(panel_name, decl_id);
+
+    // Bind the panel class type to the global declaration
+    db.get_type_index_mut().force_bind_type(
+        decl_id.into(),
+        LuaTypeCache::InferType(LuaType::Def(class_decl_id)),
+    );
 }
 
 fn find_table_type_for_register(
@@ -2630,6 +2674,8 @@ fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
 }
 
 /// Extract realm narrowing from a single if-statement, handling if/elseif/else clauses.
+/// Also handles early-return guards like `if not CLIENT then return end` which narrows
+/// the realm of code after the if-statement to the complementary realm.
 fn collect_if_realm_ranges(if_stat: &LuaIfStat, ranges: &mut Vec<GmodRealmRange>) {
     let condition_realm = if_stat
         .get_condition_expr()
@@ -2684,13 +2730,106 @@ fn collect_if_realm_ranges(if_stat: &LuaIfStat, ranges: &mut Vec<GmodRealmRange>
                 }
             }
         }
+
+        // Check for early-return guard: `if not REALM then return end` or `if REALM then return end`
+        // This should narrow the code AFTER the if-statement to the complement realm
+        if let Some(block) = if_stat.get_block() {
+            if is_early_return_block(&block) {
+                if let Some(parent_block) = find_parent_block(if_stat.syntax()) {
+                    let if_end = if_stat.syntax().text_range().end();
+                    let block_end = parent_block.syntax().text_range().end();
+                    let after_range = TextRange::new(if_end, block_end);
+
+                    let after_realm = if let Some(expr) = if_stat.get_condition_expr() {
+                        if is_not_condition(&expr) {
+                            // `if not CLIENT then return end` → code after is Client
+                            get_original_realm_from_complement(realm)
+                        } else {
+                            // `if CLIENT then return end` → code after is Server
+                            complement
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(after_realm) = after_realm {
+                        ranges.push(GmodRealmRange {
+                            range: after_range,
+                            realm: after_realm,
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
+/// Check if a condition expression is a "not" unary expression
+fn is_not_condition(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => {
+            // Handle `(not CLIENT)` - check inside parentheses
+            if let Some(inner) = paren_expr.get_expr() {
+                return is_not_condition(&inner);
+            }
+            false
+        }
+        LuaExpr::UnaryExpr(unary_expr) => {
+            let op = unary_expr.get_op_token();
+            if let Some(op) = op {
+                let op_kind = op.get_op();
+                return op_kind == glua_parser::UnaryOperator::OpNot;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Given a complement realm (e.g., Server from `not CLIENT`), get the original realm (Client)
+fn get_original_realm_from_complement(complement: GmodRealm) -> Option<GmodRealm> {
+    match complement {
+        GmodRealm::Client => Some(GmodRealm::Server),
+        GmodRealm::Server => Some(GmodRealm::Client),
+        _ => None,
+    }
+}
+
+/// Check if a block contains only a return statement (early-return guard pattern)
+fn is_early_return_block(block: &LuaBlock) -> bool {
+    let mut stats = block.get_stats().peekable();
+
+    // Check if there's exactly one statement
+    let first_stat = stats.next();
+    if first_stat.is_none() || stats.peek().is_some() {
+        return false;
+    }
+
+    // Check if that statement is a return statement
+    matches!(first_stat, Some(LuaStat::ReturnStat(_)))
+}
+
+/// Find the parent block containing a syntax node
+fn find_parent_block(node: &LuaSyntaxNode) -> Option<LuaBlock> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if let Some(block) = LuaBlock::cast(parent.clone()) {
+            return Some(block);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
 /// Match condition expressions to realms.
-/// Handles: `CLIENT`, `SERVER`, `not CLIENT`, `not SERVER`
+/// Handles: `CLIENT`, `SERVER`, `not CLIENT`, `not SERVER`, `(CLIENT)`, `(SERVER)`
 fn realm_from_condition(expr: &LuaExpr) -> Option<GmodRealm> {
     match expr {
+        // Handle parentheses: extract inner expression and recurse
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .as_ref()
+            .and_then(realm_from_condition),
         LuaExpr::NameExpr(name_expr) => match name_expr.get_name_text()?.as_str() {
             "CLIENT" => Some(GmodRealm::Client),
             "SERVER" => Some(GmodRealm::Server),
@@ -2728,6 +2867,19 @@ fn rebuild_realm_metadata(
             .iter()
             .copied()
             .filter(|file_id| module_index.is_meta_file(file_id))
+            .collect()
+    };
+    let library_file_ids: HashSet<FileId> = {
+        let module_index = db.get_module_index();
+        file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| {
+                module_index
+                    .get_workspace_id(*file_id)
+                    .map(|ws_id| module_index.is_library_workspace_id(ws_id))
+                    .unwrap_or(false)
+            })
             .collect()
     };
     let default_realm = gmod_config_default_realm(db);
@@ -2784,8 +2936,10 @@ fn rebuild_realm_metadata(
                     resolve_branch_ranges(&file_id)
                 };
                 let annotation_realm = resolve_annotation_realm(&file_id);
-                let realm = if meta_file_ids.contains(&file_id) {
-                    annotation_realm.unwrap_or(GmodRealm::Unknown)
+                let is_meta_file = meta_file_ids.contains(&file_id);
+                let is_library_file = library_file_ids.contains(&file_id);
+                let realm = if is_meta_file || is_library_file {
+                    annotation_realm.unwrap_or(GmodRealm::Shared)
                 } else {
                     annotation_realm.unwrap_or(default_realm)
                 };
@@ -2946,8 +3100,14 @@ fn rebuild_realm_metadata(
             hints
         };
 
+        let is_library_file = library_file_ids.contains(&file_id);
+
         let final_realm = if is_meta_file {
-            annotation_realm.unwrap_or(GmodRealm::Unknown)
+            // Meta files default to Shared unless explicitly annotated otherwise
+            annotation_realm.unwrap_or(GmodRealm::Shared)
+        } else if is_library_file {
+            // Library files (annotations) default to Shared since they define cross-realm APIs
+            annotation_realm.unwrap_or(GmodRealm::Shared)
         } else {
             annotation_realm.unwrap_or_else(|| {
                 inferred_realms
@@ -3008,14 +3168,10 @@ fn infer_realm(
     }
 
     if hints.len() == 2 {
-        // Shared + Client/Server → resolve to the specific realm
+        // Shared + Client/Server → the file is used in Shared context, so it's Shared
+        // Being included in a Shared file means it's available in both realms
         if hints.contains(&GmodRealm::Shared) {
-            if hints.contains(&GmodRealm::Client) {
-                return GmodRealm::Client;
-            }
-            if hints.contains(&GmodRealm::Server) {
-                return GmodRealm::Server;
-            }
+            return GmodRealm::Shared;
         }
 
         // Client + Server → the file runs on both realms, so it's Shared
@@ -3043,31 +3199,57 @@ fn infer_realm_from_filename(db: &DbIndex, file_id: FileId) -> Option<GmodRealm>
         .to_string_lossy()
         .to_ascii_lowercase();
 
-    if file_name == "cl_init.lua" || file_name.starts_with("cl_") {
+    // 1. Check filename prefixes FIRST (highest confidence)
+    if file_name.starts_with("cl_") {
         return Some(GmodRealm::Client);
     }
-
-    if file_name == "init.lua" || file_name.starts_with("sv_") {
+    if file_name.starts_with("sv_") {
         return Some(GmodRealm::Server);
     }
-
-    if file_name == "shared.lua" || file_name.starts_with("sh_") {
+    if file_name.starts_with("sh_") {
         return Some(GmodRealm::Shared);
     }
 
-    // Check parent directory names for realm hints (e.g., lua/glide/server/network.lua).
+    // 2. Check parent directory names for realm hints SECOND
     // Only inspect the path segment after the last `/lua/` anchor to avoid false realm hints
     // from unrelated parent directory names (e.g. a user home directory named "server").
-    // If there is no `/lua/` anchor the file is outside a GMod lua tree and we cannot
-    // reliably infer realm from directory structure alone.
+    // For GMod-specific directories (gamemode, entities, weapons, effects), check the full path
+    // since these don't always have a /lua/ anchor.
     let path_str = file_path.to_string_lossy().to_ascii_lowercase();
     let path_str = path_str.replace('\\', "/");
-    let search_str = path_str.rfind("/lua/").map(|idx| &path_str[idx..])?;
+
+    // Try to find /lua/ anchor first
+    let search_str = if let Some(idx) = path_str.rfind("/lua/") {
+        &path_str[idx..]
+    } else {
+        // Only use full-path detection when this appears to be a GMod content tree.
+        // This avoids false positives from unrelated paths that contain /client|/server|/shared.
+        let is_gmod_tree = path_str.contains("/addons/") || path_str.contains("/gamemodes/");
+        if !is_gmod_tree {
+            return None;
+        }
+        &path_str
+    };
+
+    if search_str.contains("/client/") || search_str.contains("/cl/") {
+        return Some(GmodRealm::Client);
+    }
     if search_str.contains("/server/") || search_str.contains("/sv/") {
         return Some(GmodRealm::Server);
     }
-    if search_str.contains("/client/") || search_str.contains("/cl/") {
+    if search_str.contains("/shared/") || search_str.contains("/sh/") {
+        return Some(GmodRealm::Shared);
+    }
+
+    // 3. Check specific filenames LAST (lowest confidence)
+    if file_name == "cl_init.lua" {
         return Some(GmodRealm::Client);
+    }
+    if file_name == "init.lua" {
+        return Some(GmodRealm::Server);
+    }
+    if file_name == "shared.lua" {
+        return Some(GmodRealm::Shared);
     }
 
     None

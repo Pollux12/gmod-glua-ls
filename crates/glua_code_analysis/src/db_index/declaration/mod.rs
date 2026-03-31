@@ -40,6 +40,10 @@ impl LuaDeclIndex {
         self.decl_trees.get(file_id)
     }
 
+    pub fn get_decl_tree_mut(&mut self, file_id: &FileId) -> Option<&mut LuaDeclarationTree> {
+        self.decl_trees.get_mut(file_id)
+    }
+
     pub fn get_decl(&self, decl_id: &LuaDeclId) -> Option<&LuaDecl> {
         let tree = self.decl_trees.get(&decl_id.file_id)?;
         tree.get_decl(decl_id)

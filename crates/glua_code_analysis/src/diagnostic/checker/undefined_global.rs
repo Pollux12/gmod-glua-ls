@@ -307,6 +307,19 @@ fn collect_truthy_guarded_names(
             }
             names
         }
+        LuaExpr::IndexExpr(index_expr) => {
+            // For index expressions like `ctp.Disable`, extract the base name (`ctp`)
+            // If we're checking `if ctp.Disable then`, it implies `ctp` exists
+            let mut names = HashSet::new();
+            if let Some(prefix_expr) = index_expr.get_prefix_expr()
+                && let Some(name_expr) = extract_name_expr(&prefix_expr)
+                && let Some(name_text) = name_expr.get_name_text()
+            {
+                condition_guard_ranges.insert(name_expr.get_range());
+                names.insert(name_text.to_string());
+            }
+            names
+        }
         _ => HashSet::new(),
     }
 }

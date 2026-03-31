@@ -259,4 +259,38 @@ foo({})
         "#
         ));
     }
+
+    #[test]
+    fn test_union_with_array_keeps_missing_fields_for_record_like_table() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class NeedsA
+            ---@field a number
+
+            ---@param v NeedsA | NeedsA[]
+            local function takes(v) end
+
+            takes({ b = 1 })
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_union_with_array_skips_missing_fields_for_array_like_table() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class NeedsA
+            ---@field a number
+
+            ---@param v NeedsA | NeedsA[]
+            local function takes(v) end
+
+            takes({ { a = 1 } })
+            "#
+        ));
+    }
 }

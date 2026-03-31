@@ -3627,4 +3627,51 @@ mod test {
                 .collect::<Vec<_>>()
         );
     }
+
+    #[gtest]
+    fn test_derma_define_control_registers_global() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "addons/test/lua/vgui/test_derma_panel.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+            end
+
+            function PANEL:Paint(w, h)
+            end
+
+            derma.DefineControl("TestDermaPanel", "Description", PANEL, "DFrame")
+
+            -- TestPanel should be recognized as a valid global
+            local x = TestDermaPanel  -- should not report undefined global
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+
+        // Verify the class type was created
+        let class_id = LuaTypeDeclId::global("TestDermaPanel");
+        let class_decl = db.get_type_index().get_type_decl(&class_id);
+        assert!(
+            class_decl.is_some(),
+            "TestDermaPanel class should be created"
+        );
+
+        // Verify the global was registered
+        let global_decl_ids = db.get_global_index().get_global_decl_ids("TestDermaPanel");
+        assert!(
+            global_decl_ids.is_some(),
+            "TestDermaPanel should be registered as a global"
+        );
+        assert!(
+            !global_decl_ids.unwrap().is_empty(),
+            "TestDermaPanel global decl should exist"
+        );
+    }
 }

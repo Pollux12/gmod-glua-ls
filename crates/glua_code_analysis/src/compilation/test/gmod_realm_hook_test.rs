@@ -132,7 +132,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_meta_file_without_annotation_stays_unknown() {
+    fn test_meta_file_without_annotation_defaults_to_shared() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
         let meta_file_id = ws.def_file("sv_meta.lua", "---@meta\n");
@@ -152,7 +152,8 @@ mod test {
             .cloned()
             .expect("expected realm metadata");
 
-        assert_eq!(metadata.inferred_realm, GmodRealm::Unknown);
+        // Meta files without annotation default to Shared since they define cross-realm APIs
+        assert_eq!(metadata.inferred_realm, GmodRealm::Shared);
         assert_eq!(metadata.annotation_realm, None);
         assert_eq!(metadata.filename_hint, None);
         assert!(metadata.dependency_hints.is_empty());
@@ -183,6 +184,28 @@ mod test {
         assert_eq!(metadata.annotation_realm, Some(GmodRealm::Server));
         assert_eq!(metadata.filename_hint, None);
         assert!(metadata.dependency_hints.is_empty());
+    }
+
+    #[gtest]
+    fn test_meta_file_without_annotation_defaults_to_shared_when_detection_disabled() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.detect_realm_from_filename = Some(false);
+        emmyrc.gmod.detect_realm_from_calls = Some(false);
+        ws.update_emmyrc(emmyrc);
+
+        let meta_file_id = ws.def_file("sv_meta_disabled.lua", "---@meta\n");
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&meta_file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        assert_eq!(metadata.inferred_realm, GmodRealm::Shared);
+        assert_eq!(metadata.annotation_realm, None);
     }
 
     #[gtest]
@@ -671,6 +694,408 @@ mod test {
                 .iter()
                 .any(|r| r.realm == GmodRealm::Client),
             "Expected Client realm range from if CLIENT block"
+        );
+    }
+
+    #[gtest]
+    fn test_branch_realm_narrowing_with_parenthesised_client() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_paren_client.lua",
+            r#"
+            if (CLIENT) then
+                print("client only")
+            end
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        assert!(
+            metadata
+                .branch_realm_ranges
+                .iter()
+                .any(|r| r.realm == GmodRealm::Client),
+            "Expected Client realm range from `if (CLIENT)`"
+        );
+    }
+
+    #[gtest]
+    fn test_branch_realm_narrowing_with_parenthesised_server() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_paren_server.lua",
+            r#"
+            if (SERVER) then
+                print("server only")
+            end
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        assert!(
+            metadata
+                .branch_realm_ranges
+                .iter()
+                .any(|r| r.realm == GmodRealm::Server),
+            "Expected Server realm range from `if (SERVER)`"
+        );
+    }
+
+    #[gtest]
+    fn test_branch_realm_narrowing_with_parenthesised_not_client() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_paren_not_client.lua",
+            r#"
+            if (not CLIENT) then
+                print("server only")
+            end
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        assert!(
+            metadata
+                .branch_realm_ranges
+                .iter()
+                .any(|r| r.realm == GmodRealm::Server),
+            "Expected Server realm range from `if (not CLIENT)` with parentheses"
+        );
+    }
+
+    #[gtest]
+    fn test_branch_realm_narrowing_with_nested_parentheses() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_nested_paren.lua",
+            r#"
+            if ((CLIENT)) then
+                print("client only")
+            end
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        assert!(
+            metadata
+                .branch_realm_ranges
+                .iter()
+                .any(|r| r.realm == GmodRealm::Client),
+            "Expected Client realm range from `if ((CLIENT))` with nested parentheses"
+        );
+    }
+
+    #[gtest]
+    fn test_directory_over_filename_precedence_client_init_lua() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        // The bug case: pac3/lua/pac3/client/init.lua should be Client, not Server
+        let file_id = ws.def_file("lua/pac3/client/init.lua", "local x = true");
+
+        assert_eq!(
+            ws.get_db_mut()
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm),
+            Some(GmodRealm::Client),
+            "client/init.lua should be detected as Client (directory over filename precedence)"
+        );
+    }
+
+    #[gtest]
+    fn test_directory_over_filename_precedence_server_shared_lua() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        // server/shared.lua should be Server, not Shared
+        let file_id = ws.def_file("lua/pac3/server/shared.lua", "local x = true");
+
+        assert_eq!(
+            ws.get_db_mut()
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm),
+            Some(GmodRealm::Server),
+            "server/shared.lua should be detected as Server (directory over filename precedence)"
+        );
+    }
+
+    #[gtest]
+    fn test_filename_prefix_takes_precedence_over_directory() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        // cl_something.lua in server directory should still be Client (prefix > directory)
+        let file_id = ws.def_file("lua/pac3/server/cl_something.lua", "local x = true");
+
+        assert_eq!(
+            ws.get_db_mut()
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm),
+            Some(GmodRealm::Client),
+            "cl_something.lua should be detected as Client (prefix takes precedence over directory)"
+        );
+    }
+
+    #[gtest]
+    fn test_no_lua_anchor_does_not_infer_from_unrelated_parent_directory_names() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        // No /lua/ anchor and no known GMod content-tree hint (addons/gamemodes),
+        // so `/server/` in the path must NOT force Server realm.
+        let file_id = ws.def_file("workspace/server/plain.lua", "local x = true");
+
+        assert_eq!(
+            ws.get_db_mut()
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm),
+            Some(GmodRealm::Shared)
+        );
+    }
+
+    #[gtest]
+    fn test_cl_init_lua_is_client() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        // cl_init.lua should still be detected as Client
+        let file_id = ws.def_file("lua/entities/cl_init.lua", "local x = true");
+
+        assert_eq!(
+            ws.get_db_mut()
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm),
+            Some(GmodRealm::Client),
+            "cl_init.lua should be detected as Client"
+        );
+    }
+
+    #[gtest]
+    fn test_shared_directory_detection() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        // Files in shared/ directory should be detected as Shared
+        let file_id = ws.def_file(
+            "lua/pac3/core/shared/hash.lua",
+            "function pac.Hash(obj) end",
+        );
+
+        assert_eq!(
+            ws.get_db_mut()
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm),
+            Some(GmodRealm::Shared),
+            "shared/hash.lua should be detected as Shared (directory detection)"
+        );
+    }
+
+    #[gtest]
+    fn test_sh_directory_detection() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        // Files in sh/ directory should be detected as Shared
+        let file_id = ws.def_file("lua/pac3/sh/util.lua", "local x = true");
+
+        assert_eq!(
+            ws.get_db_mut()
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm),
+            Some(GmodRealm::Shared),
+            "sh/util.lua should be detected as Shared (directory detection)"
+        );
+    }
+
+    #[gtest]
+    fn test_early_return_realm_narrowing_not_client_then_return() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_early_return_test.lua",
+            r#"
+            print("shared")
+            if not CLIENT then return end
+            print("client-only")
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        // File should be shared (sh_ prefix)
+        assert_eq!(metadata.inferred_realm, GmodRealm::Shared);
+        // But there should be a Client branch range covering code after the early-return guard
+        assert!(
+            metadata
+                .branch_realm_ranges
+                .iter()
+                .any(|r| r.realm == GmodRealm::Client),
+            "Expected Client realm range from `if not CLIENT then return end` early-return guard"
+        );
+    }
+
+    #[gtest]
+    fn test_early_return_realm_narrowing_not_server_then_return() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_early_return_server.lua",
+            r#"
+            print("shared")
+            if not SERVER then return end
+            print("server-only")
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        // File should be shared (sh_ prefix)
+        assert_eq!(metadata.inferred_realm, GmodRealm::Shared);
+        // But there should be a Server branch range covering code after the early-return guard
+        assert!(
+            metadata
+                .branch_realm_ranges
+                .iter()
+                .any(|r| r.realm == GmodRealm::Server),
+            "Expected Server realm range from `if not SERVER then return end` early-return guard"
+        );
+    }
+
+    #[gtest]
+    fn test_early_return_realm_narrowing_client_then_return() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_early_return_client.lua",
+            r#"
+            print("shared")
+            if CLIENT then return end
+            print("server-only")
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        // File should be shared (sh_ prefix)
+        assert_eq!(metadata.inferred_realm, GmodRealm::Shared);
+        // But there should be a Server branch range covering code after the early-return guard
+        assert!(
+            metadata
+                .branch_realm_ranges
+                .iter()
+                .any(|r| r.realm == GmodRealm::Server),
+            "Expected Server realm range from `if CLIENT then return end` early-return guard"
+        );
+    }
+
+    #[gtest]
+    fn test_early_return_realm_narrowing_server_then_return() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_early_return_server_bare.lua",
+            r#"
+            print("shared")
+            if SERVER then return end
+            print("client-only")
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        // File should be shared (sh_ prefix)
+        assert_eq!(metadata.inferred_realm, GmodRealm::Shared);
+        // But there should be a Client branch range covering code after the early-return guard
+        assert!(
+            metadata
+                .branch_realm_ranges
+                .iter()
+                .any(|r| r.realm == GmodRealm::Client),
+            "Expected Client realm range from `if SERVER then return end` early-return guard"
+        );
+    }
+
+    #[gtest]
+    fn test_early_return_realm_narrowing_nested_blocks() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_nested_early_return.lua",
+            r#"
+            print("shared outer")
+            if true then
+                if not CLIENT then return end
+                print("client-only inner")
+            end
+            print("shared after nested")
+        "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&file_id)
+            .cloned()
+            .expect("expected realm metadata");
+
+        // File should be shared (sh_ prefix)
+        assert_eq!(metadata.inferred_realm, GmodRealm::Shared);
+        // Should have a Client branch range for the nested early-return
+        assert!(
+            metadata
+                .branch_realm_ranges
+                .iter()
+                .any(|r| r.realm == GmodRealm::Client),
+            "Expected Client realm range from nested `if not CLIENT then return end`"
         );
     }
 }

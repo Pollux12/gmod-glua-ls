@@ -3,6 +3,8 @@ mod configs;
 mod flatten_config;
 mod lua_loader;
 mod pre_process;
+#[cfg(test)]
+mod test;
 
 use std::{collections::HashMap, path::Path};
 

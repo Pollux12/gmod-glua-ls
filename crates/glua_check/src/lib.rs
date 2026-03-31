@@ -51,6 +51,7 @@ pub async fn run_check(cmd_args: CmdArgs) -> Result<(), Box<dyn Error + Sync + S
         workspaces.clone(),
         cmd_args.config,
         cmd_args.ignore,
+        cmd_args.gmod_annotations,
     )
     .await
     {

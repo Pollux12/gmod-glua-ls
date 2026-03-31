@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use glua_parser::{LuaAstNode, LuaTableExpr};
+use glua_parser::{LuaAstNode, LuaIndexKey, LuaTableExpr, LuaTableField};
 
 use crate::{DiagnosticCode, LuaMemberOwner, LuaType, LuaTypeCache, LuaTypeDeclId, SemanticModel};
 
@@ -37,6 +37,7 @@ fn check_table_expr(
 
     let db = context.db;
 
+    let mut union_has_array_type = false;
     let table_type = match semantic_model.infer_table_should_be(expr.clone())? {
         LuaType::Union(union) => {
             let mut set = HashSet::new();
@@ -56,6 +57,12 @@ fn check_table_expr(
                     }
                     LuaType::TableGeneric(_) => {
                         return Some(());
+                    }
+                    // If the union contains an array type (e.g., Entity[]), skip the missing fields check
+                    // This is because a table literal being passed as an array shouldn't be checked
+                    // against class types in the union
+                    LuaType::Array(_) => {
+                        union_has_array_type = true;
                     }
                     _ => {}
                 }
@@ -83,6 +90,9 @@ fn check_table_expr(
     };
 
     let fields = expr.get_fields().collect::<Vec<_>>();
+    if union_has_array_type && table_literal_looks_array_like(&fields) {
+        return Some(());
+    }
     if fields.len() > 50 {
         return Some(());
     }
@@ -147,6 +157,23 @@ fn check_table_expr(
     }
 
     Some(())
+}
+
+fn table_literal_looks_array_like(fields: &[LuaTableField]) -> bool {
+    if fields.is_empty() {
+        return false;
+    }
+
+    fields.iter().all(|field| {
+        if field.is_value_field() {
+            return true;
+        }
+
+        matches!(
+            field.get_field_key(),
+            Some(LuaIndexKey::Idx(_) | LuaIndexKey::Integer(_))
+        )
+    })
 }
 
 fn get_required_fields(

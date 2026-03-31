@@ -12,7 +12,9 @@ use crate::{
         infer_index::infer_member_by_member_key,
         narrow::{
             ResultTypeOrContinue,
-            condition_flow::{InferConditionFlow, call_flow::get_type_at_call_expr},
+            condition_flow::{
+                InferConditionFlow, call_flow::get_type_at_call_expr, get_type_at_condition_flow,
+            },
             get_single_antecedent,
             get_type_at_flow::get_type_at_flow,
             get_var_ref_type, narrow_down_type,
@@ -86,6 +88,17 @@ pub fn get_type_at_binary_expr(
             right_expr,
             condition_flow,
             false,
+        ),
+        BinaryOperator::OpAnd => try_get_at_and_expr(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            left_expr,
+            right_expr,
+            condition_flow,
         ),
         _ => Ok(ResultTypeOrContinue::Continue),
     }
@@ -710,4 +723,63 @@ fn const_type_eq(left_type: &LuaType, right_type: &LuaType) -> bool {
         ) => l == r,
         _ => false,
     }
+}
+
+/// Handle AND expressions (e.g., `if ctp and ctp.Disable then`)
+/// In the true branch, both sides must be truthy, so we narrow each side
+/// by removing false/nil from their types.
+#[allow(clippy::too_many_arguments)]
+fn try_get_at_and_expr(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    left_expr: LuaExpr,
+    right_expr: LuaExpr,
+    condition_flow: InferConditionFlow,
+) -> Result<ResultTypeOrContinue, InferFailReason> {
+    // False branch of `a and b` is disjunctive: `!a OR (a AND !b)`.
+    // The simple per-side narrowing below is only sound for the true branch.
+    if !matches!(condition_flow, InferConditionFlow::TrueCondition) {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
+
+    // For AND expressions, we need to check if the current var_ref_id
+    // appears in either the left or right side
+    //
+    // Example: `if ctp and ctp.Disable then`
+    // - For `ctp`: left_expr is NameExpr("ctp") → narrow it
+    // - For `ctp.Disable`: right_expr is IndexExpr("ctp", "Disable") → narrow `ctp`
+
+    // Try to narrow based on left expression
+    let left_result = get_type_at_condition_flow(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        left_expr,
+        condition_flow,
+    )?;
+
+    // Try to narrow based on right expression
+    let right_result = get_type_at_condition_flow(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        right_expr,
+        condition_flow,
+    )?;
+
+    if !matches!(right_result, ResultTypeOrContinue::Continue) {
+        return Ok(right_result);
+    }
+
+    Ok(left_result)
 }

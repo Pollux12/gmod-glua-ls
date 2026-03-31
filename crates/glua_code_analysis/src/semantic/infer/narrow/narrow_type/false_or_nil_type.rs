@@ -54,6 +54,11 @@ pub fn remove_false_or_nil(t: LuaType) -> LuaType {
         LuaType::BooleanConst(false) => LuaType::Unknown,
         LuaType::DocBooleanConst(false) => LuaType::Unknown,
         LuaType::Boolean => LuaType::BooleanConst(true),
+        LuaType::Unknown => {
+            // For unknown types in truthy checks, narrow to Any
+            // since we know it's truthy but don't know the specific type
+            LuaType::Any
+        }
         LuaType::Union(u) => {
             let types = u.into_vec();
             let mut new_types = Vec::new();

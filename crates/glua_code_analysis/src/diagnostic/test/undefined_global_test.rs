@@ -472,4 +472,42 @@ mod test {
             DiagnosticCode::UndefinedGlobal,
         ));
     }
+
+    #[test]
+    fn test_guarded_global_with_index_expr_and_condition() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        // Pattern: if ctp and ctp.Disable then ... end
+        // The base name 'ctp' should be guarded when accessed within the if block
+        // check_code_for returns true when NO diagnostics are found
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if ctp and ctp.Disable then
+                print(ctp)
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_derma_define_control_panel_not_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // TestPanel should NOT be reported as undefined global after derma.DefineControl
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "lua/vgui/test_panel.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            derma.DefineControl("TestPanel", "Description", PANEL, "DFrame")
+            -- Access the panel global - should not be undefined
+            local x = TestPanel
+            "#,
+            "TestPanel"
+        ));
+    }
 }

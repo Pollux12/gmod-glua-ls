@@ -338,7 +338,7 @@ impl GmodInferIndex {
 
     /// Get the effective realm at a specific text offset within a file.
     /// If the offset is inside a branch-narrowed block, returns that block's realm.
-    /// Otherwise returns the file-level inferred realm.
+    /// Otherwise returns the file-level inferred realm, or annotation realm if inferred is Unknown.
     pub fn get_realm_at_offset(&self, file_id: &FileId, offset: rowan::TextSize) -> GmodRealm {
         let Some(metadata) = self.realm_file_metadata.get(file_id) else {
             return GmodRealm::Unknown;
@@ -349,7 +349,12 @@ impl GmodInferIndex {
                 return range.realm;
             }
         }
-        metadata.inferred_realm
+        // If inferred realm is known, use it
+        if metadata.inferred_realm != GmodRealm::Unknown {
+            return metadata.inferred_realm;
+        }
+        // Fall back to annotation realm (for meta/annotation files)
+        metadata.annotation_realm.unwrap_or(GmodRealm::Unknown)
     }
 
     pub fn set_all_realm_file_metadata(

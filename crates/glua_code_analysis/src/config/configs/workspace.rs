@@ -7,6 +7,15 @@ pub struct EmmyrcWorkspace {
     /// Ignore directories.
     #[serde(default)]
     pub ignore_dir: Vec<String>,
+    /// Default directories to ignore (e.g., E2 files, test directories).
+    /// Set `useDefaultIgnores` to false to disable these defaults.
+    #[serde(default = "ignore_dir_defaults")]
+    pub ignore_dir_defaults: Vec<String>,
+    /// Whether to apply default ignore directories. Set to false to disable
+    /// default exclusions like E2 files and test directories.
+    #[serde(default = "use_default_ignores_default")]
+    #[schemars(extend("x-vscode-setting" = true))]
+    pub use_default_ignores: bool,
     /// Ignore globs. eg: ["**/*.lua"]
     #[serde(default)]
     pub ignore_globs: Vec<String>,
@@ -45,6 +54,8 @@ impl Default for EmmyrcWorkspace {
     fn default() -> Self {
         Self {
             ignore_dir: Vec::new(),
+            ignore_dir_defaults: ignore_dir_defaults(),
+            use_default_ignores: true,
             ignore_globs: Vec::new(),
             library: Vec::new(),
             package_dirs: Vec::new(),
@@ -104,4 +115,17 @@ fn reindex_duration_default() -> u64 {
 
 fn enable_reindex_default() -> bool {
     false
+}
+
+fn ignore_dir_defaults() -> Vec<String> {
+    vec![
+        "**/gmod_wire_expression2/**".to_string(),
+        "**/wire_expression*.lua".to_string(),
+        "**/tests/**".to_string(),
+        "**/test/**".to_string(),
+    ]
+}
+
+fn use_default_ignores_default() -> bool {
+    true
 }

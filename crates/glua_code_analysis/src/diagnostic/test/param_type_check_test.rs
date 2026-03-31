@@ -2050,4 +2050,65 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_inherited_entity_array_in_union_param() {
+        let mut ws = VirtualWorkspace::new();
+        // Test that inherited Entity classes work correctly when passed in an array
+        // to a function with Entity|Entity[] union parameter type
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            ---@field Activate function
+            
+            ---@class BaseEntity : Entity
+            ---@field baseField number
+            
+            ---@class MyEntity : BaseEntity  
+            ---@field myField number
+            
+            ---@param filter Entity|Entity[]|function
+            local function testFunc(filter) end
+            
+            local myInstance = {} ---@type MyEntity
+            -- This should work - MyEntity inherits from Entity through BaseEntity
+            testFunc({myInstance})
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_simple_type_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        // Verify basic type checking works
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param x number
+            local function test(x) end
+            
+            test("string")
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_invalid_type_in_entity_array_still_reports_error() {
+        let mut ws = VirtualWorkspace::new();
+        // Test that passing invalid types in an array to Entity|Entity[] param
+        // reports param-type-mismatch (not MissingFields, but actual type mismatch)
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            
+            ---@param filter Entity|Entity[]|function
+            local function testFunc(filter) end
+            
+            -- This should report an error - number is not compatible with Entity
+            testFunc({123})
+        "#
+        ));
+    }
 }

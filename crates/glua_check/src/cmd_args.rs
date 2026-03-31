@@ -47,6 +47,10 @@ pub struct CmdArgs {
     /// Verbose output
     #[cfg_attr(feature = "cli", arg(long))]
     pub verbose: bool,
+
+    /// Path to GMod annotations directory
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub gmod_annotations: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

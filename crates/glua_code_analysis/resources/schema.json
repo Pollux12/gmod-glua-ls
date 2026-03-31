@@ -74,7 +74,7 @@
     "gmod": {
       "$ref": "#/$defs/EmmyrcGmod",
       "default": {
-        "autoLoadAnnotations": null,
+        "autoLoadAnnotations": true,
         "defaultRealm": "shared",
         "dynamicFieldsGlobal": true,
         "enabled": true,
@@ -208,7 +208,8 @@
               "icon": "tools",
               "id": "stools",
               "include": [
-                "weapons/gmod_tool/stools/**"
+                "weapons/gmod_tool/stools/**",
+                "weapons/gmod_tool/*.lua"
               ],
               "label": "STools",
               "parentId": "weapons",
@@ -333,11 +334,18 @@
         "enableReindex": false,
         "encoding": "utf-8",
         "ignoreDir": [],
+        "ignoreDirDefaults": [
+          "**/gmod_wire_expression2/**",
+          "**/wire_expression*.lua",
+          "**/tests/**",
+          "**/test/**"
+        ],
         "ignoreGlobs": [],
         "library": [],
         "moduleMap": [],
         "packageDirs": [],
         "reindexDuration": 5000,
+        "useDefaultIgnores": true,
         "workspaceRoots": []
       }
     }
@@ -1771,7 +1779,7 @@
       "type": "object",
       "properties": {
         "annotationsPath": {
-          "description": "Path to GMod annotations to load as core library.\nWhen set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).\nSet to explicit path to override, or use `autoLoadAnnotations: false` in .emmyrc to disable entirely.",
+          "description": "Path to GMod annotations to load as core library.\nWhen set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).\nSet to explicit path to override, or use `autoLoadAnnotations: false` in .gluarc to disable entirely.",
           "type": [
             "string",
             "null"
@@ -1779,11 +1787,8 @@
         },
         "autoLoadAnnotations": {
           "description": "Disable auto-loading of annotations (from VSCode or default path).\nThis takes precedence over extension settings.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
+          "type": "boolean",
+          "default": true
         },
         "defaultRealm": {
           "$ref": "#/$defs/EmmyrcGmodRealm",
@@ -1963,7 +1968,8 @@
                 "icon": "tools",
                 "id": "stools",
                 "include": [
-                  "weapons/gmod_tool/stools/**"
+                  "weapons/gmod_tool/stools/**",
+                  "weapons/gmod_tool/*.lua"
                 ],
                 "label": "STools",
                 "parentId": "weapons",
@@ -2338,7 +2344,8 @@
               "icon": "tools",
               "id": "stools",
               "include": [
-                "weapons/gmod_tool/stools/**"
+                "weapons/gmod_tool/stools/**",
+                "weapons/gmod_tool/*.lua"
               ],
               "label": "STools",
               "parentId": "weapons",
@@ -2781,6 +2788,19 @@
             "type": "string"
           }
         },
+        "ignoreDirDefaults": {
+          "description": "Default directories to ignore (e.g., E2 files, test directories).\nSet `useDefaultIgnores` to false to disable these defaults.",
+          "type": "array",
+          "default": [
+            "**/gmod_wire_expression2/**",
+            "**/wire_expression*.lua",
+            "**/tests/**",
+            "**/test/**"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
         "ignoreGlobs": {
           "description": "Ignore globs. eg: [\"**/*.lua\"]",
           "type": "array",
@@ -2819,6 +2839,12 @@
           "format": "uint64",
           "default": 5000,
           "minimum": 0,
+          "x-vscode-setting": true
+        },
+        "useDefaultIgnores": {
+          "description": "Whether to apply default ignore directories. Set to false to disable\ndefault exclusions like E2 files and test directories.",
+          "type": "boolean",
+          "default": true,
           "x-vscode-setting": true
         },
         "workspaceRoots": {

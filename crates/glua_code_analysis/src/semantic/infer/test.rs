@@ -280,4 +280,49 @@ mod test {
 
         assert_eq!(ty, ws.ty("string"));
     }
+
+    #[test]
+    fn test_truthy_guard_with_index_expr_narrows_unknown_to_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        // Pattern: if ctp and ctp.Disable then ... end
+        // The undefined global 'ctp' should be narrowed from Unknown to Any (truthy)
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            if ctp and ctp.Disable then ---@diagnostic disable-line: undefined-global
+                print(ctp) ---@diagnostic disable-line: undefined-global
+            end
+        "#,
+            "ctp",
+        );
+
+        // After truthy check, Unknown should be narrowed to Any
+        assert_eq!(
+            ty,
+            ws.ty("any"),
+            "Type should be Any after truthy guard, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
+    fn test_and_false_branch_does_not_over_narrow_left_operand() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@type string?
+            local x
+
+            local cond = false
+            if x and cond then
+            else
+                print(x)
+            end
+            "#,
+            "x",
+        );
+
+        assert_eq!(ty, ws.ty("string?"));
+    }
 }

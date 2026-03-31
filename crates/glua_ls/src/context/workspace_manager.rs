@@ -562,7 +562,7 @@ fn merge_client_config(client_config: &ClientConfig, emmyrc: &mut Emmyrc) -> Opt
 /// Inject GMod annotations path into workspace library if appropriate
 fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
     // Check if explicitly disabled in .emmyrc (auto_load_annotations: false)
-    if let Some(false) = emmyrc.gmod.auto_load_annotations {
+    if !emmyrc.gmod.auto_load_annotations {
         log::info!("GMod annotations auto-load explicitly disabled in .emmyrc");
         return;
     }
@@ -588,7 +588,7 @@ fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
         );
         cli_path.clone()
     } else {
-        // No path available
+        // No path provided by config or client - skip injection
         log::info!("No GMod annotations path available");
         return;
     };
