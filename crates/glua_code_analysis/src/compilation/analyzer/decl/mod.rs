@@ -295,13 +295,22 @@ impl<'a> DeclAnalyzer<'a> {
         }
 
         if let Some(owner) = module_member_owner {
+            let member_id = LuaMemberId::new(syntax_id, file_id);
             let member = LuaMember::new(
-                LuaMemberId::new(syntax_id, file_id),
+                member_id,
                 LuaMemberKey::Name(name.into()),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             );
             self.db.get_member_index_mut().add_member(owner, member);
+            // Link the member's property to the same property as the decl so that
+            // description/annotations stored on the decl (or its signature) are visible
+            // when looking up the member (e.g. hover over a legacy-module member).
+            self.db.get_property_index_mut().add_owner_map(
+                crate::LuaSemanticDeclId::LuaDecl(id),
+                crate::LuaSemanticDeclId::Member(member_id),
+                file_id,
+            );
         }
 
         id

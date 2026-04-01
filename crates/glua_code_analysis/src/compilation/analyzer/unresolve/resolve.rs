@@ -10,16 +10,16 @@ use glua_parser::{
 };
 
 use crate::{
-    FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclTypeKind, LuaMember,
+    DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclTypeKind, LuaMember,
     LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner,
     LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
     OperatorFunction, SemanticDeclLevel, SignatureReturnStatus, TypeOps,
     compilation::analyzer::{
         common::{add_member, bind_type},
-        lua::{analyze_return_point, infer_for_range_iter_expr_func},
+        lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
         unresolve::UnResolveSpecialCall,
     },
-    db_index::{DbIndex, LuaFunctionType, LuaMemberOwner, LuaSignature, LuaSignatureId},
+    db_index::{LuaFunctionType, LuaMemberOwner, LuaSignature, LuaSignatureId},
     find_members_with_key,
     semantic::{
         InferGuard, LuaInferCache, SemanticDeclGuard, infer_call_expr_func, infer_expr,
@@ -194,16 +194,21 @@ pub fn try_resolve_module(
     module: &mut UnResolveModule,
 ) -> ResolveResult {
     let expr = module.expr.clone();
-    let expr_type = infer_expr(db, cache, expr)?;
+    let expr_type = infer_expr(db, cache, expr.clone())?;
     let expr_type = match &expr_type {
         LuaType::Variadic(multi) => multi.get_type(0).cloned().unwrap_or(LuaType::Unknown),
         _ => expr_type,
     };
+
+    // Compute semantic_id for the exported expression using the shared helper
+    let semantic_id = compute_module_semantic_id(db, module.file_id, &module.expr);
+
     let module_info = db
         .get_module_index_mut()
         .get_module_mut(module.file_id)
         .ok_or(InferFailReason::None)?;
     module_info.export_type = Some(expr_type);
+    module_info.semantic_id = semantic_id;
     Ok(())
 }
 

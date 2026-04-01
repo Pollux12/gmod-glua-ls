@@ -64,12 +64,14 @@ impl LuaPropertyIndex {
     ) -> Option<()> {
         let (_, property_id) = self.get_or_create_property(source_owner_id.clone())?;
         self.property_owners_map
-            .insert(same_property_owner_id, property_id);
+            .insert(same_property_owner_id.clone(), property_id);
 
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(source_owner_id);
+        let file_owners = self.in_filed_owner.entry(file_id).or_default();
+        file_owners.insert(source_owner_id);
+        // Also track the alias so it is removed from property_owners_map when the
+        // file is invalidated/reparsed.  Without this, the alias key accumulates as
+        // a dead entry pointing to a deleted LuaPropertyId across LS session reparsing.
+        file_owners.insert(same_property_owner_id);
 
         Some(())
     }

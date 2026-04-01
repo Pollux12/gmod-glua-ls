@@ -122,7 +122,7 @@ pub fn humanize_type(db: &DbIndex, ty: &LuaType, level: RenderLevel) -> String {
         LuaType::Variadic(multi) => humanize_variadic_type(db, multi, level),
         LuaType::Instance(ins) => humanize_instance_type(db, ins, level),
         LuaType::Signature(signature_id) => humanize_signature_type(db, signature_id, level),
-        LuaType::Namespace(ns) => format!("{{ {} }}", ns),
+        LuaType::Namespace(ns) => ns.to_string(),
         LuaType::MultiLineUnion(multi_union) => {
             humanize_multi_line_union_type(db, multi_union, level)
         }

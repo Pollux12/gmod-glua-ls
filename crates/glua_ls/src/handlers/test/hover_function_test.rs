@@ -2,6 +2,7 @@
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualHoverResult, check};
     use googletest::prelude::*;
+    use lsp_types::HoverContents;
 
     #[gtest]
     fn test_1() -> Result<()> {
@@ -712,6 +713,196 @@ mod tests {
                     .to_string(),
             },
         ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_require_module_member_rich_hover() -> Result<()> {
+        // Regression test for required module hovers using the module export owner.
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def_file(
+            "netstream.lua",
+            r#"
+                ---@class NetStream
+                local NetStream = {}
+
+                ---Send data over the network stream
+                ---@param channel string The channel to send on
+                ---@param data table The data to send
+                ---@return boolean success Whether the send succeeded
+                function NetStream:Send(channel, data)
+                end
+
+                return NetStream
+            "#,
+        );
+
+        check!(ws.check_hover(
+            r#"
+                local netstream = require("netstream")
+                local <??>ns = netstream
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal ns: NetStream {\n    Send: function,\n}\n```".to_string(),
+            },
+        ));
+
+        check!(ws.check_hover(
+            r#"
+                local netstream = require("netstream")
+                local send_<??>fn = netstream.Send
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(method) NetStream:Send(channel: string, data: table)\n  -> success: boolean\n\n```\n\n---\n\nSend data over the network stream\n\n@*param* `channel` — The channel to send on\n\n@*param* `data` — The data to send\n\n@*return* `success`  — Whether the send succeeded".to_string(),
+            },
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_global_alias_preserves_table_identity() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "includes.lua",
+            r#"
+                ---@class Includes
+                local Includes = {}
+
+                ---Include a file by path
+                ---@param path string The file to include
+                ---@return boolean success Whether the include succeeded
+                function Includes.File(path)
+                end
+
+                _G.includes = Includes
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local file_fn = includes<??>.File
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("Includes"),
+            "expected hover to preserve exported table identity, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("File: function"),
+            "expected hover to include exported members, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_global_alias_preserves_static_member_identity() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "includes.lua",
+            r#"
+                ---@class Includes
+                local Includes = {}
+
+                ---Include a file by path
+                ---@param path string The file to include
+                ---@return boolean success Whether the include succeeded
+                function Includes.File(path)
+                end
+
+                _G.includes = Includes
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                includes.Fi<??>le("sv_init.lua")
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("function Includes.File(path: string)"),
+            "expected rich static member hover, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Include a file by path"),
+            "expected member docs to be preserved, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_global_alias_preserves_method_identity() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "netstream.lua",
+            r#"
+                ---@class NetStream
+                local NetStream = {}
+
+                ---Send a net message
+                ---@param name string The message name
+                ---@param payload table The payload to send
+                ---@return boolean success Whether sending succeeded
+                function NetStream:Send(name, payload)
+                end
+
+                _G.netstream = NetStream
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                netstream.Se<??>nd("chat", {})
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("(method) NetStream:Send(name: string, payload: table)"),
+            "expected rich method hover, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Send a net message"),
+            "expected method docs to be preserved, got: {}",
+            markup.value
+        );
+
         Ok(())
     }
 }

@@ -17,6 +17,7 @@ pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
+pub use module::compute_module_semantic_id;
 use stats::{
     analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,
     analyze_table_field,

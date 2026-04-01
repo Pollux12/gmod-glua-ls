@@ -682,10 +682,12 @@ fn adjust_semantic_decls(
     // 如果当前定义在最初定义组中存在, 那么我们也不需要添加.
     // 具有一个难以解决的问题, 返回的`current_semantic_decl_id`为 member 时, 不一定是当前 token 指向的内容, 因此我们还需要再做一层判断,
     // 如果是具有实际定义的, 我们仍然需要添加, 例如 signature.
-    if semantic_decls
-        .iter()
-        .any(|(decl, typ)| decl == current_semantic_decl_id && !typ.is_signature())
-    {
+    // Also exclude Unknown types: a legacy-module `NameExpr` member has its type bound to the
+    // LuaDecl owner (not the Member owner), so the member's cached type is Unknown. In that case
+    // we must still add the current Signature type so hover can render the function properly.
+    if semantic_decls.iter().any(|(decl, typ)| {
+        decl == current_semantic_decl_id && !typ.is_signature() && !typ.is_unknown()
+    }) {
         return Some(());
     }
 

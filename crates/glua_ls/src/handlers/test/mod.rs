@@ -6,6 +6,7 @@ mod hover_function_test;
 mod hover_test;
 mod implementation_test;
 mod inlay_hint_test;
+mod legacy_module_test;
 mod references_test;
 mod rename_test;
 mod semantic_token_test;

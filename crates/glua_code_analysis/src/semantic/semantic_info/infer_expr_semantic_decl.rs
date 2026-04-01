@@ -323,6 +323,9 @@ fn infer_member_semantic_decl_by_member_key(
             member_access_position,
             semantic_guard.next_level()?,
         ),
+        LuaType::Namespace(ns) => {
+            infer_namespace_member_semantic_decl(db, cache, ns, member_key, member_access_position)
+        }
         _ => None,
     }
 }
@@ -503,4 +506,15 @@ fn infer_intersection_member_semantic_info(
     }
 
     None
+}
+
+fn infer_namespace_member_semantic_decl(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    ns: &str,
+    member_key: &LuaMemberKey,
+    member_access_position: Option<rowan::TextSize>,
+) -> Option<LuaSemanticDeclId> {
+    let owner = LuaMemberOwner::GlobalPath(GlobalId::new(ns));
+    infer_table_member_semantic_decl(db, cache, owner, member_key, member_access_position)
 }

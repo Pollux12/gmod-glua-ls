@@ -237,6 +237,71 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_global_alias_static_member_definition() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "includes.lua",
+            r#"
+                ---@class Includes
+                local Includes = {}
+
+                ---Include a file by path
+                ---@param path string The file to include
+                ---@return boolean success Whether the include succeeded
+                function Includes.File(path)
+                end
+
+                _G.includes = Includes
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                includes.Fi<??>le("sv_init.lua")
+            "#,
+            vec![Expected {
+                file: "includes.lua".to_string(),
+                line: 7,
+            }]
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_global_alias_method_definition() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "netstream.lua",
+            r#"
+                ---@class NetStream
+                local NetStream = {}
+
+                ---Send a net message
+                ---@param name string The message name
+                ---@param payload table The payload to send
+                ---@return boolean success Whether sending succeeded
+                function NetStream:Send(name, payload)
+                end
+
+                _G.netstream = NetStream
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                netstream:Se<??>nd("chat", {})
+            "#,
+            vec![Expected {
+                file: "netstream.lua".to_string(),
+                line: 8,
+            }]
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_require_return_table_fallback() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         ws.def_file(
