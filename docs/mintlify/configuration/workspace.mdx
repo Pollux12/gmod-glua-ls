@@ -16,7 +16,7 @@ The `workspace` section tells the language server what files to analyse, what to
 | `workspace.library` | `array` | `[]` | External library paths to include in analysis (strings or objects) |
 | `workspace.workspaceRoots` | `string[]` | `[]` | Additional workspace root directories for multi-root setups |
 | `workspace.ignoreDir` | `string[]` | `[]` | Directory names to exclude from analysis |
-| `workspace.ignoreDirDefaults` | `string[]` | built-in list | Built-in directories and globs to ignore, such as Wire Expression 2 and common test directories |
+| `workspace.ignoreDirDefaults` | `(string \| object)[]` | built-in list | Built-in directories and globs to ignore. Accepts legacy strings or override objects — see below. |
 | `workspace.useDefaultIgnores` | `boolean` | `true` | Whether to apply `workspace.ignoreDirDefaults` |
 | `workspace.ignoreGlobs` | `string[]` | `[]` | Glob patterns of files to exclude from analysis |
 | `workspace.moduleMap` | `array` | `[]` | Module path rewrite rules (regex patterns) |
@@ -74,7 +74,69 @@ Common directories to ignore for GMod projects:
 
 ---
 
-## Module map
+## Ignore default overrides
+
+`workspace.ignoreDirDefaults` lets you override, disable, or extend the built-in ignore defaults without replacing the whole list.
+
+The list accepts two forms:
+
+- **Legacy strings** — when the list contains only plain strings, those strings replace all built-in defaults (original behavior, backward compatible).
+- **Object entries** — when any object entry is present, the built-in list is used as the starting point and each entry is applied in turn.
+
+Built-in default ids:
+
+| id | Default glob |
+|---|---|
+| `wire-expression2` | `**/gmod_wire_expression2/**` |
+| `wire-expression-files` | `**/wire_expression*.lua` |
+| `tests` | `**/tests/**` |
+| `test` | `**/test/**` |
+
+Object entry fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `string` | Stable identifier matching a built-in or a custom id. |
+| `label` | `string` | Optional human-readable label (informational only). |
+| `glob` | `string` | Glob pattern to apply. Omit when only using `disabled`. |
+| `disabled` | `boolean` | Set `true` to remove this built-in default from the workspace. |
+
+**Disable a single built-in:**
+
+```json .gluarc.json
+{
+  "workspace": {
+    "ignoreDirDefaults": [
+      { "id": "tests", "disabled": true }
+    ]
+  }
+}
+```
+
+**Override a built-in pattern and add a custom entry:**
+
+```json .gluarc.json
+{
+  "workspace": {
+    "ignoreDirDefaults": [
+      { "id": "test", "glob": "**/my_tests/**" },
+      { "id": "legacy-stuff", "glob": "**/legacy/**" }
+    ]
+  }
+}
+```
+
+**Disable all built-in defaults globally:**
+
+```json .gluarc.json
+{
+  "workspace": {
+    "useDefaultIgnores": false
+  }
+}
+```
+
+---
 
 `moduleMap` rewrites require paths to file paths using regex replacement. Useful when your project uses non-standard require patterns.
 

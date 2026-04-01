@@ -227,8 +227,8 @@ pub fn calculate_include_and_exclude(emmyrc: &Emmyrc) -> (Vec<String>, Vec<Strin
 
     // Merge default ignore globs if enabled (use_default_ignores defaults to true)
     if emmyrc.workspace.use_default_ignores {
-        for glob_pattern in &emmyrc.workspace.ignore_dir_defaults {
-            exclude.push(glob_pattern.clone());
+        for glob_pattern in emmyrc.workspace.resolve_ignore_dir_defaults() {
+            exclude.push(glob_pattern);
         }
     }
 

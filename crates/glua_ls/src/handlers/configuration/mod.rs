@@ -29,7 +29,7 @@ pub async fn on_did_change_configuration(
         let mut workspace_manager = context.workspace_manager().write().await;
         workspace_manager.client_config = new_client_config;
         log::info!("reloading workspace folders");
-        workspace_manager.add_reload_workspace_task();
+        workspace_manager.add_reload_workspace_task(context.workspace_manager_arc());
     }
 
     Some(())

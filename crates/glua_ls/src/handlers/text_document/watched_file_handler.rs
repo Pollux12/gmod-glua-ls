@@ -65,11 +65,13 @@ pub async fn on_did_change_watched_files(
                     }
                 }
                 Some(WatchedFileType::Emmyrc) => {
-                    if file_event.typ != FileChangeType::DELETED {
-                        if let Some(path) = uri_to_file_path(&file_event.uri) {
-                            if let Some(dir) = path.parent() {
-                                emmyrc_dirs.push(dir.to_path_buf());
-                            }
+                    // Treat DELETE the same as CREATE/CHANGE: the config is
+                    // gone so the workspace must reload with defaults (or a
+                    // parent config).  Derive the parent dir from the URI
+                    // directly since the file no longer exists on disk.
+                    if let Some(path) = uri_to_file_path(&file_event.uri) {
+                        if let Some(dir) = path.parent() {
+                            emmyrc_dirs.push(dir.to_path_buf());
                         }
                     }
                 }
@@ -117,7 +119,9 @@ pub async fn on_did_change_watched_files(
             );
         }
         for dir in emmyrc_dirs {
-            workspace.add_update_emmyrc_task(dir).await;
+            workspace
+                .add_update_emmyrc_task(dir, context.workspace_manager_arc())
+                .await;
         }
     }
 

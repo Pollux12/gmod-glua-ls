@@ -372,8 +372,59 @@ Definitions without `scaffold.files` remain explorable/analyzable but do not exp
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `ignoreDirDefaults` | `string[]` | built-in list | Default directories and globs to ignore, such as Wire Expression 2 files and common test directories. |
+| `ignoreDirDefaults` | `(string \| object)[]` | built-in list | Default directories and globs to ignore, such as Wire Expression 2 files and common test directories. Accepts legacy strings or override objects. |
 | `useDefaultIgnores` | `boolean` | `true` | Whether to apply `ignoreDirDefaults`. Set `false` to disable the built-in ignore list. |
+
+`ignoreDirDefaults` supports two forms:
+
+- **Legacy strings** — when the list contains only plain strings, those strings replace the built-in defaults entirely (original behavior preserved).
+- **Object entries** — when any object entry is present, the built-in list is used as the starting point and each entry is applied in order.
+
+Object entry fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `string` | Stable identifier. Built-in ids: `"wire-expression2"`, `"wire-expression-files"`, `"tests"`, `"test"`. |
+| `label` | `string` | Optional human-readable label (informational only). |
+| `glob` | `string` | Glob pattern to apply. Omit when only using `disabled`. |
+| `disabled` | `boolean` | Set `true` to remove this built-in default for the workspace. |
+
+**Examples:**
+
+Disable only the `tests` built-in default:
+```json
+{
+  "workspace": {
+    "ignoreDirDefaults": [
+      { "id": "tests", "disabled": true }
+    ]
+  }
+}
+```
+
+Override the `test` pattern and add a custom entry:
+```json
+{
+  "workspace": {
+    "ignoreDirDefaults": [
+      { "id": "test", "glob": "**/my_tests/**" },
+      { "id": "legacy-stuff", "glob": "**/legacy/**" }
+    ]
+  }
+}
+```
+
+Mixed legacy string + object (string is appended alongside object-resolved list):
+```json
+{
+  "workspace": {
+    "ignoreDirDefaults": [
+      { "id": "tests", "disabled": true },
+      "**/my_test_framework/**"
+    ]
+  }
+}
+```
 
 ### Scripted Class Override Example
 
@@ -696,7 +747,7 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
 | `library` | `array` | `[]` | Library paths (strings or objects with `path`, `ignoreDir`, `ignoreGlobs`) |
 | `workspaceRoots` | `string[]` | `[]` | Additional workspace root directories |
 | `ignoreDir` | `string[]` | `[]` | Directories to ignore |
-| `ignoreDirDefaults` | `string[]` | built-in list | Built-in directories and globs to ignore, such as Wire Expression 2 and common test directories |
+| `ignoreDirDefaults` | `(string \| object)[]` | built-in list | Built-in directories and globs to ignore, such as Wire Expression 2 and common test directories. Accepts strings (legacy replace) or override objects. |
 | `useDefaultIgnores` | `boolean` | `true` | Whether to apply `ignoreDirDefaults` |
 | `ignoreGlobs` | `string[]` | `[]` | Glob patterns to ignore |
 | `moduleMap` | `array` | `[]` | Module path mappings (regex patterns) |

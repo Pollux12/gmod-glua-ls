@@ -55,6 +55,10 @@ impl ServerContextSnapshot {
         &self.inner.workspace_manager
     }
 
+    pub fn workspace_manager_arc(&self) -> Arc<RwLock<WorkspaceManager>> {
+        self.inner.workspace_manager.clone()
+    }
+
     pub fn status_bar(&self) -> &StatusBar {
         &self.inner.status_bar
     }

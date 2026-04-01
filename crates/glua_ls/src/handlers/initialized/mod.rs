@@ -108,6 +108,7 @@ pub async fn initialized_handler(
     let emmyrc = loaded.emmyrc;
     let workspace_diagnostic_configs = loaded.workspace_diagnostic_configs;
     let workspace_emmyrcs = loaded.workspace_emmyrcs;
+    let workspace_matchers = loaded.workspace_matchers;
     load_editorconfig(workspace_folders.clone(), emmyrc.as_ref());
 
     // init std lib
@@ -119,6 +120,7 @@ pub async fn initialized_handler(
         let (include, exclude, exclude_dir) = calculate_include_and_exclude(&emmyrc);
         workspace_manager.match_file_pattern =
             WorkspaceFileMatcher::new(include, exclude, exclude_dir);
+        workspace_manager.per_root_matchers = workspace_matchers;
         log::info!("workspace manager updated with client config and watch file patterns")
     }
 

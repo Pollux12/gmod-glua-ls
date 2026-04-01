@@ -20,7 +20,8 @@ pub use configs::{
     EmmyrcGmodScriptedClassScopeEntry, EmmyrcGmodScriptedClassScopes, EmmyrcHover, EmmyrcInlayHint,
     EmmyrcInlineValues, EmmyrcLuaVersion, EmmyrcReference, EmmyrcReformat, EmmyrcResource,
     EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcStrict, EmmyrcWorkspace, EmmyrcWorkspaceModuleMap,
-    ResolvedGmodScriptedClassDefinition, ResolvedGmodScriptedClassMatch,
+    IgnoreDirDefaultDefinition, IgnoreDirDefaultEntry, ResolvedGmodScriptedClassDefinition,
+    ResolvedGmodScriptedClassMatch,
 };
 use glua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig, SpecialFunction};
 use rowan::NodeCache;

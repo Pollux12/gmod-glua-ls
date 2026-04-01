@@ -44,4 +44,5 @@ pub use semantictoken::EmmyrcSemanticToken;
 pub use strict::EmmyrcStrict;
 pub use workspace::{
     EmmyLibraryConfig, EmmyLibraryItem, EmmyrcWorkspace, EmmyrcWorkspaceModuleMap,
+    IgnoreDirDefaultDefinition, IgnoreDirDefaultEntry,
 };
