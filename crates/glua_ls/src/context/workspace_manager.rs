@@ -447,9 +447,15 @@ fn pre_process_emmyrc_for_all_roots(
                 workspace_emmyrc.workspace.ignore_dir,
             );
             extend_unique(
+                &mut merged.workspace.ignore_dir_defaults,
+                workspace_emmyrc.workspace.ignore_dir_defaults,
+            );
+            extend_unique(
                 &mut merged.workspace.ignore_globs,
                 workspace_emmyrc.workspace.ignore_globs,
             );
+            merged.workspace.use_default_ignores = merged.workspace.use_default_ignores
+                || workspace_emmyrc.workspace.use_default_ignores;
             extend_unique(
                 &mut merged.runtime.extensions,
                 workspace_emmyrc.runtime.extensions,
@@ -562,7 +568,7 @@ fn merge_client_config(client_config: &ClientConfig, emmyrc: &mut Emmyrc) -> Opt
 /// Inject GMod annotations path into workspace library if appropriate
 fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
     // Check if explicitly disabled in .emmyrc (auto_load_annotations: false)
-    if !emmyrc.gmod.auto_load_annotations {
+    if matches!(emmyrc.gmod.auto_load_annotations, Some(false)) {
         log::info!("GMod annotations auto-load explicitly disabled in .emmyrc");
         return;
     }
@@ -1338,6 +1344,85 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(cli_annotations_dir);
+    }
+
+    #[test]
+    fn test_auto_load_annotations_null_remains_compatible() {
+        let workspace = create_temp_dir();
+        let cli_annotations_dir = create_temp_dir();
+        touch(&workspace.join(".emmyrc.json"));
+
+        fs::write(
+            workspace.join(".emmyrc.json"),
+            r#"{ "gmod": { "autoLoadAnnotations": null } }"#,
+        )
+        .expect("failed to write config");
+
+        let client_config = ClientConfig {
+            gmod_annotations_path: Some(cli_annotations_dir.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let loaded = load_emmy_config(vec![workspace.clone()], client_config);
+
+        let library_paths: Vec<PathBuf> = loaded
+            .emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|item| PathBuf::from(item.get_path()))
+            .collect();
+
+        assert!(library_paths.iter().any(|p| {
+            p.canonicalize().unwrap_or_else(|_| p.clone())
+                == cli_annotations_dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| cli_annotations_dir.clone())
+        }));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cli_annotations_dir);
+    }
+
+    #[test]
+    fn test_multi_root_merge_keeps_default_ignore_enablement_if_any_root_requires_it() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "workspace": { "useDefaultIgnores": false, "ignoreDirDefaults": ["**/custom-a/**"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "workspace": { "useDefaultIgnores": true, "ignoreDirDefaults": ["**/custom-b/**"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        assert!(loaded.emmyrc.workspace.use_default_ignores);
+        assert!(
+            loaded
+                .emmyrc
+                .workspace
+                .ignore_dir_defaults
+                .contains(&"**/custom-a/**".to_string())
+        );
+        assert!(
+            loaded
+                .emmyrc
+                .workspace
+                .ignore_dir_defaults
+                .contains(&"**/custom-b/**".to_string())
+        );
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
     }
 
     #[test]

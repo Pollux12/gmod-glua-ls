@@ -307,7 +307,21 @@ fn infer_custom_type_member(
     }
     let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
     if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, &key) {
-        return member_item.resolve_type_with_realm(db, &cache.get_file_id());
+        let resolved = member_item.resolve_type_with_realm(db, &cache.get_file_id());
+        if resolved.is_ok() {
+            return resolved;
+        }
+
+        if let Some(module_decl_type) = resolve_decl_backed_global_path_member_type(
+            db,
+            member_item,
+            &cache.get_file_id(),
+            key.clone(),
+        ) {
+            return Ok(module_decl_type);
+        }
+
+        return resolved;
     }
 
     // 解决`key`为表达式的情况
@@ -354,6 +368,41 @@ fn infer_custom_type_member(
     }
 
     Err(InferFailReason::FieldNotFound)
+}
+
+fn resolve_decl_backed_global_path_member_type(
+    db: &DbIndex,
+    member_item: &crate::db_index::LuaMemberIndexItem,
+    caller_file_id: &crate::FileId,
+    key: LuaMemberKey,
+) -> Option<LuaType> {
+    let visible_member_ids = member_item.visible_member_ids_with_realm(db, caller_file_id);
+    let mut result = LuaType::Unknown;
+
+    for member_id in visible_member_ids {
+        let decl_id = crate::LuaDeclId::new(member_id.file_id, member_id.get_position());
+        let decl = db.get_decl_index().get_decl(&decl_id)?;
+        if !decl.is_module_scoped() || decl.get_name() != key.get_name()? {
+            continue;
+        }
+
+        let decl_type = crate::semantic::infer::infer_name::infer_global_type(
+            db,
+            Some(member_id.file_id),
+            Some(member_id.get_position()),
+            decl.get_name(),
+        )
+        .or_else(|_| {
+            db.get_type_index()
+                .get_type_cache(&decl_id.into())
+                .map(|cache| cache.as_type().clone())
+                .ok_or(InferFailReason::None)
+        })
+        .unwrap_or(LuaType::Unknown);
+        result = TypeOps::Union.apply(db, &result, &decl_type);
+    }
+
+    (!result.is_unknown()).then_some(result)
 }
 
 fn get_expr_key_members(
@@ -1174,6 +1223,28 @@ fn infer_namespace_member(
 ) -> InferResult {
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let member_key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
+
+    if let Some(member_item) = db
+        .get_member_index()
+        .get_member_item(&LuaMemberOwner::GlobalPath(GlobalId::new(ns)), &member_key)
+    {
+        let resolved = member_item.resolve_type_with_realm(db, &cache.get_file_id());
+        if resolved.is_ok() {
+            return resolved;
+        }
+
+        if let Some(module_decl_type) = resolve_decl_backed_global_path_member_type(
+            db,
+            member_item,
+            &cache.get_file_id(),
+            member_key.clone(),
+        ) {
+            return Ok(module_decl_type);
+        }
+
+        return resolved;
+    }
+
     let member_key = match member_key {
         LuaMemberKey::Name(name) => name.to_string(),
         LuaMemberKey::Integer(i) => i.to_string(),

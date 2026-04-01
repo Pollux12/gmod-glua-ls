@@ -1,14 +1,14 @@
 use std::path::Path;
 
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaDocTagCast, LuaExpr,
-    LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLiteralExpr, LuaLiteralToken, LuaNameExpr,
-    LuaTableExpr, LuaVarExpr, NumberResult,
+    LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaCallExprStat, LuaClosureExpr,
+    LuaDocTagCast, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLiteralExpr,
+    LuaLiteralToken, LuaNameExpr, LuaTableExpr, LuaVarExpr, NumberResult,
 };
 
 use crate::{
-    FileId, InFiled, InferFailReason, LuaDeclExtra, LuaDeclId, LuaMemberFeature, LuaMemberId,
-    LuaSignatureId,
+    EmmyrcLuaVersion, FileId, InFiled, InferFailReason, LegacyModuleEnv, LuaDeclExtra, LuaDeclId,
+    LuaMemberFeature, LuaMemberId, LuaSignatureId,
     compilation::analyzer::unresolve::UnResolveTableField,
     db_index::{LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey, LuaMemberOwner},
 };
@@ -340,6 +340,8 @@ pub fn analyze_literal_expr(analyzer: &mut DeclAnalyzer, expr: LuaLiteralExpr) -
 }
 
 pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Option<()> {
+    try_analyze_legacy_module_call(analyzer, &expr);
+
     let Some((dependency_kind, dependency_path)) = get_dependency_call_info(&expr) else {
         return Some(());
     };
@@ -355,6 +357,74 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
     }
 
     Some(())
+}
+
+fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExpr) -> Option<()> {
+    let runtime_version = analyzer.db.get_emmyrc().runtime.version;
+    if !matches!(
+        runtime_version,
+        EmmyrcLuaVersion::Lua51 | EmmyrcLuaVersion::LuaJIT
+    ) {
+        return Some(());
+    }
+
+    let Some(call_name) = get_call_name(expr) else {
+        return Some(());
+    };
+    if call_name != "module" {
+        return Some(());
+    }
+
+    let Some(call_stat) = expr.get_parent::<LuaCallExprStat>() else {
+        return Some(());
+    };
+    let Some(parent_block) = call_stat.get_parent::<LuaBlock>() else {
+        return Some(());
+    };
+    let Some(LuaAst::LuaChunk(_)) = parent_block.get_parent::<LuaAst>() else {
+        return Some(());
+    };
+
+    let args = expr.get_args_list()?;
+    let mut args_iter = args.get_args();
+    let module_path = match args_iter.next()? {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(str) => str.get_value(),
+            _ => return Some(()),
+        },
+        _ => return Some(()),
+    };
+
+    let seeall = args_iter.any(|arg| is_package_seeall_expr(&arg));
+    let activation_position = expr.get_range().end();
+
+    analyzer.set_legacy_module_env(LegacyModuleEnv {
+        module_path,
+        activation_position,
+        seeall,
+    });
+
+    Some(())
+}
+
+fn is_package_seeall_expr(expr: &LuaExpr) -> bool {
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return false;
+    };
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let LuaExpr::NameExpr(prefix_name) = prefix_expr else {
+        return false;
+    };
+    if prefix_name.get_name_text().as_deref() != Some("package") {
+        return false;
+    }
+
+    matches!(
+        index_expr.get_index_key(),
+        Some(LuaIndexKey::Name(name)) if name.get_name_text() == "seeall"
+    )
 }
 
 fn get_dependency_call_info(expr: &LuaCallExpr) -> Option<(LuaDependencyKind, String)> {

@@ -78,8 +78,8 @@ pub struct EmmyrcGmod {
     pub annotations_path: Option<String>,
     /// Disable auto-loading of annotations (from VSCode or default path).
     /// This takes precedence over extension settings.
-    #[serde(default = "auto_load_annotations_default")]
-    pub auto_load_annotations: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_load_annotations: Option<bool>,
     /// Path to a folder containing custom GLua scaffolding templates (`.lua` files).
     /// Built-in templates are used as fallback when a custom one is not found.
     /// Accepts an absolute path or a path relative to the workspace root.
@@ -181,10 +181,6 @@ fn dynamic_fields_global_default() -> bool {
     true
 }
 
-fn auto_load_annotations_default() -> bool {
-    true
-}
-
 fn file_param_defaults_default() -> HashMap<String, String> {
     FILE_PARAM_DEFAULTS
         .iter()
@@ -236,7 +232,7 @@ impl Default for EmmyrcGmod {
             infer_dynamic_fields: infer_dynamic_fields_default(),
             dynamic_fields_global: dynamic_fields_global_default(),
             annotations_path: None,
-            auto_load_annotations: auto_load_annotations_default(),
+            auto_load_annotations: None,
             template_path: None,
         }
     }

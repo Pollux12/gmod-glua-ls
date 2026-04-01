@@ -5,7 +5,7 @@ mod stats;
 
 use crate::{
     compilation::analyzer::AnalysisPipeline,
-    db_index::{DbIndex, LuaScopeKind},
+    db_index::{DbIndex, LegacyModuleEnv, LuaScopeKind},
     profile::Profile,
 };
 
@@ -16,8 +16,13 @@ use rowan::{TextRange, TextSize, WalkEvent};
 
 use crate::{
     FileId,
-    db_index::{LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclarationTree, LuaScopeId},
+    db_index::{
+        GlobalId, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclarationTree, LuaMember,
+        LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaScopeId, LuaType,
+        LuaTypeCache,
+    },
 };
+use smol_str::SmolStr;
 
 pub struct DeclAnalysisPipeline;
 
@@ -190,6 +195,7 @@ pub struct DeclAnalyzer<'a> {
     root: LuaChunk,
     decl: LuaDeclarationTree,
     scoped_class_global_name: Option<String>,
+    legacy_module_envs: Vec<LegacyModuleEnv>,
     scopes: Vec<LuaScopeId>,
     is_meta: bool,
     context: &'a mut AnalyzeContext,
@@ -208,6 +214,7 @@ impl<'a> DeclAnalyzer<'a> {
             root,
             decl: LuaDeclarationTree::new(file_id),
             scoped_class_global_name,
+            legacy_module_envs: Vec::new(),
             scopes: Vec::new(),
             is_meta: false,
             context,
@@ -259,7 +266,20 @@ impl<'a> DeclAnalyzer<'a> {
             decl.extra = LuaDeclExtra::Local { kind, attrib: None };
         }
 
+        if let Some(module_env) = self.get_legacy_module_env_at(decl.get_position())
+            && should_bind_decl_to_legacy_module(&decl, module_env)
+            && let Some(kind) = decl_kind(&decl)
+        {
+            decl.extra = LuaDeclExtra::Module {
+                kind,
+                module_path: SmolStr::new(module_env.module_path.as_str()),
+            };
+        }
+
         let is_global = decl.is_global();
+        let module_member_owner = decl
+            .get_module_path()
+            .map(|module_path| LuaMemberOwner::GlobalPath(GlobalId::new(module_path)));
         let file_id = decl.get_file_id();
         let name = decl.get_name().to_string();
         let syntax_id = decl.get_syntax_id();
@@ -274,17 +294,96 @@ impl<'a> DeclAnalyzer<'a> {
                 .add_global_reference(&name, file_id, syntax_id);
         }
 
+        if let Some(owner) = module_member_owner {
+            let member = LuaMember::new(
+                LuaMemberId::new(syntax_id, file_id),
+                LuaMemberKey::Name(name.into()),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            );
+            self.db.get_member_index_mut().add_member(owner, member);
+        }
+
         id
     }
 
     pub fn find_decl(&self, name: &str, position: TextSize) -> Option<&LuaDecl> {
-        self.decl.find_local_decl(name, position)
+        let decl = self.decl.find_local_decl(name, position)?;
+        let Some(module_env) = self.get_legacy_module_env_at(position) else {
+            return Some(decl);
+        };
+        if decl.is_module_scoped()
+            && decl.get_module_path() != Some(module_env.module_path.as_str())
+        {
+            return None;
+        }
+
+        Some(decl)
     }
 
     pub fn is_scoped_class_global_name(&self, name: &str) -> bool {
         self.scoped_class_global_name
             .as_ref()
             .is_some_and(|scoped_name| scoped_name == name)
+    }
+
+    pub fn set_legacy_module_env(&mut self, legacy_module_env: LegacyModuleEnv) {
+        self.project_legacy_module_chain_members(&legacy_module_env);
+        let file_id = self.decl.file_id();
+        self.db
+            .get_module_index_mut()
+            .set_legacy_module_env(file_id, legacy_module_env.clone());
+        self.legacy_module_envs.push(legacy_module_env);
+        self.legacy_module_envs
+            .sort_by_key(|env| env.activation_position);
+    }
+
+    pub fn get_legacy_module_env_at(&self, position: TextSize) -> Option<&LegacyModuleEnv> {
+        self.legacy_module_envs
+            .iter()
+            .rev()
+            .find(|env| position > env.activation_position)
+    }
+
+    fn project_legacy_module_chain_members(&mut self, legacy_module_env: &LegacyModuleEnv) {
+        let parts = legacy_module_env
+            .module_path
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.len() < 2 {
+            return;
+        }
+
+        let file_id = self.decl.file_id();
+        let env_start = legacy_module_env.activation_position;
+        for idx in 1..parts.len() {
+            let owner_path = parts[..idx].join(".");
+            let child_segment = parts[idx];
+            let child_path = parts[..=idx].join(".");
+            let synthetic_offset = TextSize::new(idx as u32);
+            let synthetic_position = env_start + synthetic_offset;
+
+            let member_id = LuaMemberId::new(
+                glua_parser::LuaSyntaxId::new(
+                    glua_parser::LuaSyntaxKind::CallExpr.into(),
+                    TextRange::new(synthetic_position, synthetic_position),
+                ),
+                file_id,
+            );
+            let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&owner_path));
+            let member = LuaMember::new(
+                member_id,
+                LuaMemberKey::Name(child_segment.into()),
+                LuaMemberFeature::FileFieldDecl,
+                Some(GlobalId::new(&child_path)),
+            );
+            self.db.get_member_index_mut().add_member(owner, member);
+            self.db.get_type_index_mut().bind_type(
+                member_id.into(),
+                LuaTypeCache::InferType(LuaType::Namespace(SmolStr::new(&child_path).into())),
+            );
+        }
     }
 }
 
@@ -294,4 +393,19 @@ fn is_method_func_stat(stat: &LuaFuncStat) -> Option<bool> {
         return Some(index_expr.get_index_token()?.is_colon());
     }
     None
+}
+
+fn decl_kind(decl: &LuaDecl) -> Option<glua_parser::LuaKind> {
+    match decl.extra {
+        LuaDeclExtra::Local { kind, .. }
+        | LuaDeclExtra::ImplicitSelf { kind }
+        | LuaDeclExtra::Global { kind }
+        | LuaDeclExtra::Module { kind, .. } => Some(kind),
+        LuaDeclExtra::Param { .. } => None,
+    }
+}
+
+fn should_bind_decl_to_legacy_module(decl: &LuaDecl, module_env: &LegacyModuleEnv) -> bool {
+    matches!(decl.extra, LuaDeclExtra::Global { kind } if kind != LuaSyntaxKind::IndexExpr.into())
+        && decl.get_position() > module_env.activation_position
 }

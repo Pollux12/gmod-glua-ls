@@ -107,4 +107,16 @@ mod test {
         // Defaults are separate from user ignores (now 4 patterns)
         assert_eq!(emmyrc.workspace.ignore_dir_defaults.len(), 4);
     }
+
+    #[test]
+    fn test_auto_load_annotations_null_deserializes() {
+        let json = r#"{
+            "gmod": {
+                "autoLoadAnnotations": null
+            }
+        }"#;
+
+        let emmyrc: Emmyrc = serde_json::from_str(json).unwrap();
+        assert_eq!(emmyrc.gmod.auto_load_annotations, None);
+    }
 }

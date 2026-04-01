@@ -32,6 +32,10 @@ pub enum LuaDeclExtra {
     Global {
         kind: LuaKind,
     },
+    Module {
+        kind: LuaKind,
+        module_path: SmolStr,
+    },
 }
 
 impl LuaDecl {
@@ -78,7 +82,9 @@ impl LuaDecl {
                 LuaSyntaxId::new(LuaSyntaxKind::ParamName.into(), self.range)
             }
             LuaDeclExtra::ImplicitSelf { kind } => LuaSyntaxId::new(kind, self.range),
-            LuaDeclExtra::Global { kind, .. } => LuaSyntaxId::new(kind, self.range),
+            LuaDeclExtra::Global { kind, .. } | LuaDeclExtra::Module { kind, .. } => {
+                LuaSyntaxId::new(kind, self.range)
+            }
         }
     }
 
@@ -101,6 +107,17 @@ impl LuaDecl {
 
     pub fn is_global(&self) -> bool {
         matches!(&self.extra, LuaDeclExtra::Global { .. })
+    }
+
+    pub fn is_module_scoped(&self) -> bool {
+        matches!(&self.extra, LuaDeclExtra::Module { .. })
+    }
+
+    pub fn get_module_path(&self) -> Option<&str> {
+        match &self.extra {
+            LuaDeclExtra::Module { module_path, .. } => Some(module_path.as_str()),
+            _ => None,
+        }
     }
 
     pub fn is_implicit_self(&self) -> bool {

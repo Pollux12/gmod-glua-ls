@@ -43,6 +43,12 @@ pub fn infer_name_expr(
             VarRefId::VarRef(decl_id),
         )
     } else {
+        if let Some(implicit_module_type) =
+            infer_legacy_module_implicit_type(db, file_id, name_expr.get_position(), name)
+        {
+            return Ok(implicit_module_type);
+        }
+
         if let Some(define_baseclass_type) = infer_define_baseclass_type(db, file_id, name) {
             return Ok(define_baseclass_type);
         }
@@ -698,23 +704,46 @@ pub fn infer_global_type(
     call_offset: Option<TextSize>,
     name: &str,
 ) -> InferResult {
+    if let Some(module_decl_type) =
+        infer_legacy_module_local_type(db, current_file_id, call_offset, name)
+    {
+        return Ok(module_decl_type);
+    }
+
     let module_index = db.get_module_index();
     let global_index = db.get_global_index();
     let priority_tiers = if let Some(current_workspace_id) =
         current_file_id.and_then(|file_id| module_index.get_workspace_id(file_id))
     {
-        global_index
-            .get_global_decl_id_priority_tiers(name, module_index, current_workspace_id)
-            .ok_or(InferFailReason::None)?
+        match global_index.get_global_decl_id_priority_tiers(
+            name,
+            module_index,
+            current_workspace_id,
+        ) {
+            Some(tiers) => tiers,
+            None => {
+                if has_legacy_module_namespace_for_file(db, current_file_id, name) {
+                    return Ok(LuaType::Namespace(smol_str::SmolStr::new(name).into()));
+                }
+                return Err(InferFailReason::None);
+            }
+        }
     } else {
-        vec![(
-            0,
-            global_index
-                .get_global_decl_ids(name)
-                .cloned()
-                .ok_or(InferFailReason::None)?,
-        )]
+        vec![match global_index.get_global_decl_ids(name).cloned() {
+            Some(decls) => (0, decls),
+            None => {
+                if has_legacy_module_namespace_for_file(db, current_file_id, name) {
+                    return Ok(LuaType::Namespace(smol_str::SmolStr::new(name).into()));
+                }
+                return Err(InferFailReason::None);
+            }
+        }]
     };
+
+    if priority_tiers.is_empty() && has_legacy_module_namespace_for_file(db, current_file_id, name)
+    {
+        return Ok(LuaType::Namespace(smol_str::SmolStr::new(name).into()));
+    }
 
     let decl_ids =
         select_decl_ids_for_global_infer(db, current_file_id, call_offset, &priority_tiers);
@@ -784,6 +813,72 @@ pub fn infer_global_type(
     }
 
     Err(last_resolve_reason)
+}
+
+fn infer_legacy_module_local_type(
+    db: &DbIndex,
+    current_file_id: Option<FileId>,
+    call_offset: Option<TextSize>,
+    name: &str,
+) -> Option<LuaType> {
+    let file_id = current_file_id?;
+    let position = call_offset?;
+    let module_env = db
+        .get_module_index()
+        .get_legacy_module_env_at(file_id, position)?;
+
+    let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
+    let decl = decl_tree
+        .find_local_decl(name, position)
+        .filter(|decl| {
+            decl.is_module_scoped()
+                && decl.get_module_path() == Some(module_env.module_path.as_str())
+        })
+        .or_else(|| {
+            decl_tree.find_module_scoped_decl_anywhere(
+                name,
+                &module_env.module_path,
+                module_env.activation_position,
+            )
+        })?;
+
+    db.get_type_index()
+        .get_type_cache(&decl.get_id().into())
+        .map(|cache| cache.as_type().clone())
+}
+
+fn infer_legacy_module_implicit_type(
+    db: &DbIndex,
+    file_id: FileId,
+    position: TextSize,
+    name: &str,
+) -> Option<LuaType> {
+    let module_env = db
+        .get_module_index()
+        .get_legacy_module_env_at(file_id, position)?;
+    match name {
+        "_M" => Some(LuaType::Namespace(
+            smol_str::SmolStr::new(&module_env.module_path).into(),
+        )),
+        "_NAME" => Some(LuaType::StringConst(
+            smol_str::SmolStr::new(&module_env.module_path).into(),
+        )),
+        "_PACKAGE" => Some(LuaType::StringConst(
+            smol_str::SmolStr::new(module_env.package_name()).into(),
+        )),
+        _ => None,
+    }
+}
+
+fn has_legacy_module_namespace(db: &DbIndex, name: &str) -> bool {
+    db.get_module_index().has_legacy_module_namespace(name)
+}
+
+fn has_legacy_module_namespace_for_file(db: &DbIndex, file_id: Option<FileId>, name: &str) -> bool {
+    file_id.is_some_and(|file_id| {
+        db.get_module_index()
+            .has_legacy_module_namespace_for_file(file_id, name)
+    }) || file_id.is_none() && has_legacy_module_namespace(db, name)
 }
 
 fn select_decl_ids_for_global_infer(

@@ -155,9 +155,11 @@ fn analyze_maybe_global_index_expr(
         let name_token = name_expr.get_name_token()?;
         let name_token_text = name_token.get_name_text();
         if name_token_text == "_G" || name_token_text == "_ENV" {
-            let position = index_expr.get_position();
             let range = index_expr.get_range();
-            if let Some(decl) = analyzer.find_decl(&index_name, position) {
+            let decl_id = crate::LuaDeclId::new(file_id, range.start());
+            if let Some(decl) = analyzer.db.get_decl_index().get_decl(&decl_id)
+                && decl.is_global()
+            {
                 let decl_id = decl.get_id();
                 analyzer
                     .db

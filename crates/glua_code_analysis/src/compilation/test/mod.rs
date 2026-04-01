@@ -19,6 +19,7 @@ mod gmod_realm_hook_test;
 mod gmod_scripted_class_test;
 mod infer_str_tpl_test;
 mod inherit_type;
+mod legacy_module_test;
 mod mathlib_test;
 mod member_infer_test;
 mod metatable_test;

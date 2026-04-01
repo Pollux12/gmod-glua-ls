@@ -13,6 +13,14 @@ pub fn resolve_global_decl_id(
     name: &str,
     name_expr: Option<&LuaNameExpr>,
 ) -> Option<LuaDeclId> {
+    if let Some(module_decl_id) = resolve_legacy_module_local_decl_id(db, cache, name, name_expr) {
+        return Some(module_decl_id);
+    }
+
+    if is_legacy_module_without_seeall_at_position(db, cache, name_expr) {
+        return None;
+    }
+
     let module_index = db.get_module_index();
     let global_index = db.get_global_index();
     let priority_tiers = if let Some(current_workspace_id) =
@@ -71,6 +79,61 @@ pub fn resolve_global_decl_id(
     }
 
     last_valid_decl_id.cloned()
+}
+
+fn is_legacy_module_without_seeall_at_position(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    name_expr: Option<&LuaNameExpr>,
+) -> bool {
+    let file_id = cache.get_file_id();
+    let Some(position) = name_expr.map(|expr| expr.get_position()) else {
+        return false;
+    };
+    let Some(module_env) = db
+        .get_module_index()
+        .get_legacy_module_env_at(file_id, position)
+    else {
+        return false;
+    };
+    if module_env.seeall {
+        return false;
+    }
+
+    !matches!(
+        name_expr.and_then(|expr| expr.get_name_text()).as_deref(),
+        Some("_M" | "_NAME" | "_PACKAGE")
+    )
+}
+
+fn resolve_legacy_module_local_decl_id(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    name: &str,
+    name_expr: Option<&LuaNameExpr>,
+) -> Option<LuaDeclId> {
+    let file_id = cache.get_file_id();
+    let position = name_expr.map(|expr| expr.get_position())?;
+    let module_env = db
+        .get_module_index()
+        .get_legacy_module_env_at(file_id, position)?;
+
+    let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
+
+    if let Some(decl) = decl_tree.find_local_decl(name, position)
+        && decl.is_module_scoped()
+        && decl.get_module_path() == Some(module_env.module_path.as_str())
+    {
+        return Some(decl.get_id());
+    }
+
+    decl_tree
+        .find_module_scoped_decl_anywhere(
+            name,
+            &module_env.module_path,
+            module_env.activation_position,
+        )
+        .map(|decl| decl.get_id())
 }
 
 fn resolve_global_func_decl_id(

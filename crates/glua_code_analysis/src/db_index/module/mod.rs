@@ -1,13 +1,16 @@
+mod legacy_module_env;
 mod module_info;
 mod module_node;
 mod test;
 mod workspace;
 
 use glua_parser::LuaVersionCondition;
+pub use legacy_module_env::LegacyModuleEnv;
 use log::{error, info};
 pub use module_info::ModuleInfo;
 pub use module_node::{ModuleNode, ModuleNodeId};
 use regex::Regex;
+use rowan::TextSize;
 pub use workspace::{Workspace, WorkspaceId, WorkspaceKind};
 
 use super::traits::LuaIndex;
@@ -25,6 +28,7 @@ pub struct LuaModuleIndex {
     module_nodes: HashMap<ModuleNodeId, ModuleNode>,
     file_module_map: HashMap<FileId, ModuleInfo>,
     module_name_to_file_ids: HashMap<String, Vec<FileId>>,
+    legacy_module_envs: HashMap<FileId, Vec<LegacyModuleEnv>>,
     workspaces: Vec<Workspace>,
     workspace_kind_map: HashMap<WorkspaceId, WorkspaceKind>,
     id_counter: u32,
@@ -46,6 +50,7 @@ impl LuaModuleIndex {
             module_nodes: HashMap::new(),
             file_module_map: HashMap::new(),
             module_name_to_file_ids: HashMap::new(),
+            legacy_module_envs: HashMap::new(),
             workspaces: Vec::new(),
             workspace_kind_map: HashMap::new(),
             id_counter: 1,
@@ -201,6 +206,61 @@ impl LuaModuleIndex {
 
     pub fn get_module_mut(&mut self, file_id: FileId) -> Option<&mut ModuleInfo> {
         self.file_module_map.get_mut(&file_id)
+    }
+
+    pub fn set_legacy_module_env(&mut self, file_id: FileId, env: LegacyModuleEnv) {
+        let envs = self.legacy_module_envs.entry(file_id).or_default();
+        envs.push(env);
+        envs.sort_by_key(|env| env.activation_position);
+    }
+
+    pub fn get_legacy_module_env(&self, file_id: FileId) -> Option<&LegacyModuleEnv> {
+        self.legacy_module_envs.get(&file_id)?.last()
+    }
+
+    pub fn get_legacy_module_env_at(
+        &self,
+        file_id: FileId,
+        position: TextSize,
+    ) -> Option<&LegacyModuleEnv> {
+        self.legacy_module_envs
+            .get(&file_id)?
+            .iter()
+            .rev()
+            .find(|env| position > env.activation_position)
+    }
+
+    pub fn has_legacy_module_namespace(&self, name: &str) -> bool {
+        self.legacy_module_envs.values().flatten().any(|env| {
+            env.module_path == name
+                || env
+                    .module_path
+                    .strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    }
+
+    pub fn has_legacy_module_namespace_for_file(&self, file_id: FileId, name: &str) -> bool {
+        let Some(current_workspace_id) = self.get_workspace_id(file_id) else {
+            return self.has_legacy_module_namespace(name);
+        };
+
+        self.legacy_module_envs
+            .iter()
+            .any(|(candidate_file_id, envs)| {
+                let Some(candidate_workspace_id) = self.get_workspace_id(*candidate_file_id) else {
+                    return false;
+                };
+                self.workspace_resolution_priority(current_workspace_id, candidate_workspace_id)
+                    .is_some()
+                    && envs.iter().any(|env| {
+                        env.module_path == name
+                            || env
+                                .module_path
+                                .strip_prefix(name)
+                                .is_some_and(|rest| rest.starts_with('.'))
+                    })
+            })
     }
 
     pub fn set_module_visibility(&mut self, file_id: FileId, visible: bool) {
@@ -813,6 +873,8 @@ impl LuaIndex for LuaModuleIndex {
                 (None, None)
             };
 
+        self.legacy_module_envs.remove(&file_id);
+
         if parent_id.is_none() || child_id.is_none() {
             return;
         }
@@ -869,6 +931,7 @@ impl LuaIndex for LuaModuleIndex {
         self.module_nodes.clear();
         self.file_module_map.clear();
         self.module_name_to_file_ids.clear();
+        self.legacy_module_envs.clear();
 
         let root_node = ModuleNode::default();
         self.module_nodes.insert(self.module_root_id, root_node);

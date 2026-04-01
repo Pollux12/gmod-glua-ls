@@ -117,6 +117,9 @@ pub async fn load_workspace(
     }
 
     for path in &workspace_folders {
+        if path.is_library {
+            continue;
+        }
         analysis.add_main_workspace(path.root.clone());
     }
 

@@ -16,6 +16,8 @@ The `workspace` section tells the language server what files to analyse, what to
 | `workspace.library` | `array` | `[]` | External library paths to include in analysis (strings or objects) |
 | `workspace.workspaceRoots` | `string[]` | `[]` | Additional workspace root directories for multi-root setups |
 | `workspace.ignoreDir` | `string[]` | `[]` | Directory names to exclude from analysis |
+| `workspace.ignoreDirDefaults` | `string[]` | built-in list | Built-in directories and globs to ignore, such as Wire Expression 2 and common test directories |
+| `workspace.useDefaultIgnores` | `boolean` | `true` | Whether to apply `workspace.ignoreDirDefaults` |
 | `workspace.ignoreGlobs` | `string[]` | `[]` | Glob patterns of files to exclude from analysis |
 | `workspace.moduleMap` | `array` | `[]` | Module path rewrite rules (regex patterns) |
 | `workspace.encoding` | `string` | `"utf-8"` | File encoding for all Lua files in the workspace |

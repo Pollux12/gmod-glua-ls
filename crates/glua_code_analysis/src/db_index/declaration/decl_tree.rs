@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::{LuaDeclId, decl, scope};
 use crate::{FileId, db_index::LuaMemberId};
@@ -10,6 +10,7 @@ use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};
 pub struct LuaDeclarationTree {
     file_id: FileId,
     decls: HashMap<LuaDeclId, LuaDecl>,
+    module_decls_by_name: HashMap<String, BTreeMap<TextSize, LuaDeclId>>,
     scopes: Vec<LuaScope>,
 }
 
@@ -18,6 +19,7 @@ impl LuaDeclarationTree {
         Self {
             file_id,
             decls: HashMap::new(),
+            module_decls_by_name: HashMap::new(),
             scopes: Vec::new(),
         }
     }
@@ -47,6 +49,22 @@ impl LuaDeclarationTree {
             false
         });
         result
+    }
+
+    pub fn find_module_scoped_decl_anywhere(
+        &self,
+        name: &str,
+        module_path: &str,
+        activation_position: TextSize,
+    ) -> Option<&LuaDecl> {
+        let positions = self.module_decls_by_name.get(name)?;
+        positions
+            .range((activation_position + TextSize::new(1))..)
+            .find_map(|(_, decl_id)| {
+                self.get_decl(decl_id).filter(|decl| {
+                    decl.is_module_scoped() && decl.get_module_path() == Some(module_path)
+                })
+            })
     }
 
     pub fn get_env_decls(&self, position: TextSize) -> Option<Vec<LuaDeclId>> {
@@ -215,6 +233,12 @@ impl LuaDeclarationTree {
     }
 
     pub fn add_decl(&mut self, decl: LuaDecl) -> LuaDeclId {
+        if decl.is_module_scoped() {
+            self.module_decls_by_name
+                .entry(decl.get_name().to_string())
+                .or_default()
+                .insert(decl.get_position(), decl.get_id());
+        }
         let decl_id = decl.get_id();
         self.decls.insert(decl_id, decl);
         decl_id

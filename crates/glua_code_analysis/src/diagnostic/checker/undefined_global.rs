@@ -479,6 +479,37 @@ fn check_name_expr(
     }
 
     let db = semantic_model.get_db();
+    if context
+        .config
+        .global_disable_set
+        .contains(name_text.as_str())
+    {
+        return Some(());
+    }
+
+    if context
+        .config
+        .global_disable_glob
+        .iter()
+        .any(|re| re.is_match(&name_text))
+    {
+        return Some(());
+    }
+
+    if is_legacy_module_local_name_visible(semantic_model, &name_expr, &name_text) {
+        return Some(());
+    }
+
+    if is_legacy_module_without_seeall_after_activation(semantic_model, &name_expr) {
+        context.add_diagnostic(
+            DiagnosticCode::UndefinedGlobal,
+            name_range,
+            t!("undefined global variable: %{name}", name = name_text).to_string(),
+            None,
+        );
+        return Some(());
+    }
+
     let module_index = db.get_module_index();
     if let Some(current_workspace_id) = module_index.get_workspace_id(semantic_model.get_file_id())
     {
@@ -498,23 +529,6 @@ fn check_name_expr(
             .get_gmod_infer_index()
             .get_scoped_class_info(&semantic_model.get_file_id())
             .is_some_and(|info| info.global_name == name_text.as_str())
-    {
-        return Some(());
-    }
-
-    if context
-        .config
-        .global_disable_set
-        .contains(name_text.as_str())
-    {
-        return Some(());
-    }
-
-    if context
-        .config
-        .global_disable_glob
-        .iter()
-        .any(|re| re.is_match(&name_text))
     {
         return Some(());
     }
@@ -545,6 +559,63 @@ fn check_name_expr(
     );
 
     Some(())
+}
+
+fn is_legacy_module_local_name_visible(
+    semantic_model: &SemanticModel,
+    name_expr: &LuaNameExpr,
+    name: &str,
+) -> bool {
+    let db = semantic_model.get_db();
+    let file_id = semantic_model.get_file_id();
+    let Some(module_env) = db
+        .get_module_index()
+        .get_legacy_module_env_at(file_id, name_expr.get_position())
+    else {
+        return false;
+    };
+
+    if matches!(name, "_M" | "_NAME" | "_PACKAGE") {
+        return true;
+    }
+
+    db.get_decl_index()
+        .get_decl_tree(&file_id)
+        .is_some_and(|tree| {
+            tree.find_local_decl(name, name_expr.get_position())
+                .filter(|decl| {
+                    decl.is_module_scoped()
+                        && decl.get_module_path() == Some(module_env.module_path.as_str())
+                })
+                .or_else(|| {
+                    tree.find_module_scoped_decl_anywhere(
+                        name,
+                        &module_env.module_path,
+                        module_env.activation_position,
+                    )
+                })
+                .is_some()
+        })
+}
+
+fn is_legacy_module_without_seeall_after_activation(
+    semantic_model: &SemanticModel,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    let db = semantic_model.get_db();
+    let file_id = semantic_model.get_file_id();
+    let Some(module_env) = db
+        .get_module_index()
+        .get_legacy_module_env_at(file_id, name_expr.get_position())
+    else {
+        return false;
+    };
+
+    !module_env.seeall
+        && !matches!(
+            name_expr.get_name_text().as_deref(),
+            Some("_M" | "_NAME" | "_PACKAGE")
+        )
 }
 
 fn check_self_name(semantic_model: &SemanticModel, name_expr: LuaNameExpr) -> Option<()> {

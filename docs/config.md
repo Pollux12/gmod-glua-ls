@@ -341,7 +341,7 @@ These keys accept string expressions such as `"keep"`, `"fixed(n)"`, `"min(n)"`,
 | `vgui.codeLensEnabled` | `boolean` | `true` | Enable Code Lenses for VGUI panel definitions |
 | `vgui.inlayHintEnabled` | `boolean` | `false` | Enable Inlay Hints for VGUI panel definitions |
 | `annotationsPath` | `string \| null` | `null` | Path to GMod annotations to load as core library. When not set, uses the VSCode extension's auto-downloaded annotations (if enabled). Set to an explicit path to override. |
-| `autoLoadAnnotations` | `boolean \| null` | `null` | Disable auto-loading of annotations from VSCode or the default path. Takes precedence over extension settings. |
+| `autoLoadAnnotations` | `boolean \| null` | `null` | Override annotation auto-loading for this workspace. Set `false` to disable auto-loading even if the extension or CLI provides annotations. `null` preserves external auto-load behavior. |
 | `templatePath` | `string \| null` | `null` | Path to a folder containing custom GLua scaffolding templates (`.lua` files). Built-in templates are used as fallback when a custom one is not found. Accepts an absolute path or a path relative to the workspace root. |
 
 `gmod.fileParamDefaults` is applied as an override layer on top of the built-in fallback map. When editing raw JSON directly, set a value to `""` to remove a built-in fallback for your workspace while still inheriting future upstream additions.
@@ -367,6 +367,13 @@ Each scripted class definition can provide:
 - `scaffold.files`: optional scaffold output list, each entry shaped like `{ "path": "{{name}}/shared.lua", "template": "ent_shared.lua" }`
 
 Definitions without `scaffold.files` remain explorable/analyzable but do not expose the `new` scaffold action.
+
+### Workspace ignore defaults
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `ignoreDirDefaults` | `string[]` | built-in list | Default directories and globs to ignore, such as Wire Expression 2 files and common test directories. |
+| `useDefaultIgnores` | `boolean` | `true` | Whether to apply `ignoreDirDefaults`. Set `false` to disable the built-in ignore list. |
 
 ### Scripted Class Override Example
 
@@ -689,6 +696,8 @@ Map function names to special behaviors: `none`, `require`, `error`, `assert`, `
 | `library` | `array` | `[]` | Library paths (strings or objects with `path`, `ignoreDir`, `ignoreGlobs`) |
 | `workspaceRoots` | `string[]` | `[]` | Additional workspace root directories |
 | `ignoreDir` | `string[]` | `[]` | Directories to ignore |
+| `ignoreDirDefaults` | `string[]` | built-in list | Built-in directories and globs to ignore, such as Wire Expression 2 and common test directories |
+| `useDefaultIgnores` | `boolean` | `true` | Whether to apply `ignoreDirDefaults` |
 | `ignoreGlobs` | `string[]` | `[]` | Glob patterns to ignore |
 | `moduleMap` | `array` | `[]` | Module path mappings (regex patterns) |
 | `encoding` | `string` | `"utf-8"` | File encoding |

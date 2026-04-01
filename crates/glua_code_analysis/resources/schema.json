@@ -74,7 +74,6 @@
     "gmod": {
       "$ref": "#/$defs/EmmyrcGmod",
       "default": {
-        "autoLoadAnnotations": true,
         "defaultRealm": "shared",
         "dynamicFieldsGlobal": true,
         "enabled": true,
@@ -1787,8 +1786,10 @@
         },
         "autoLoadAnnotations": {
           "description": "Disable auto-loading of annotations (from VSCode or default path).\nThis takes precedence over extension settings.",
-          "type": "boolean",
-          "default": true
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "defaultRealm": {
           "$ref": "#/$defs/EmmyrcGmodRealm",
