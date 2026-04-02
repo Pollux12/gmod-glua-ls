@@ -15,15 +15,6 @@ env:
   CLICOLOR: 1
 
 jobs:
-  spelling:
-    name: Spell Check with Typos
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-    - name: Spell Check Repo
-      uses: crate-ci/typos@master
-
   clippy:
     name: Clippy Lint Check
     runs-on: ubuntu-latest

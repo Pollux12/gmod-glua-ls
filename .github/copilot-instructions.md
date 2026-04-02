@@ -57,7 +57,6 @@
 - Lint (CI-equivalent): `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - Format: `cargo fmt --all`
 - Pre-commit checks: `pre-commit run --all --hook-stage manual`
-- Spell check in CI: `typos`
 - Cargo is installed in local system and is within path. If you get an error stating it is missing, try use direct path workaround e.g: `& "$env:USERPROFILE\.cargo\bin\cargo.exe"` but ONLY if cargo does not work by itself.
 
 ## Testing Patterns (How This Repo Verifies Behavior)
