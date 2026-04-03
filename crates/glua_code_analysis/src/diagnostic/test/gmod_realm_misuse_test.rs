@@ -12,11 +12,11 @@ mod tests {
         emmyrc.gmod.enabled = false;
         ws.update_emmyrc(emmyrc);
         ws.def_file(
-            "addons/test/lua/autorun/server/sv_api.lua",
+            "lua/autorun/server/sv_api.lua",
             r#"function ServerOnlyApi() return true end"#,
         );
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/client/cl_test.lua",
+            "lua/autorun/client/cl_test.lua",
             r#"ServerOnlyApi()"#,
         );
         let diagnostics = ws
@@ -39,11 +39,11 @@ mod tests {
             .diagnostic
             .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
         ws.def_file(
-            "addons/test/lua/autorun/server/sv_api.lua",
+            "lua/autorun/server/sv_api.lua",
             r#"function ServerOnlyApi() return true end"#,
         );
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/client/cl_test.lua",
+            "lua/autorun/client/cl_test.lua",
             r#"ServerOnlyApi()"#,
         );
         let diagnostics = ws
@@ -68,7 +68,7 @@ mod tests {
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/client/cl_test.lua",
+            "lua/autorun/client/cl_test.lua",
             r#"AddCSLuaFile("shared.lua")"#,
         );
         let diagnostics = ws
@@ -99,7 +99,7 @@ mod tests {
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/sh_test.lua",
+            "lua/autorun/sh_test.lua",
             r#"
                 if CLIENT then
                     AddCSLuaFile("shared.lua")
@@ -133,7 +133,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/sh_test.lua",
+            "lua/autorun/sh_test.lua",
             r#"
                 if SERVER then
                     ---@realm server
@@ -172,7 +172,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/sh_test.lua",
+            "lua/autorun/sh_test.lua",
             r#"
                 if SERVER then
                     ---@realm server
@@ -222,7 +222,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
 
         ws.def_file(
-            "addons/test/lua/autorun/server/sv_api.lua",
+            "lua/autorun/server/sv_api.lua",
             r#"
                 function ServerOnlyApi()
                     return true
@@ -231,7 +231,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/client/cl_test.lua",
+            "lua/autorun/client/cl_test.lua",
             r#"
                 ServerOnlyApi()
             "#,
@@ -275,7 +275,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodUnknownRealm);
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_decl.lua",
+            "lua/autorun/sh_decl.lua",
             r#"
                 ---@realm server
                 function ServerOnlyApi()
@@ -285,7 +285,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/use_api.lua",
+            "lua/modules/use_api.lua",
             r#"
                 ServerOnlyApi()
             "#,
@@ -321,7 +321,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodUnknownRealm);
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_decl.lua",
+            "lua/autorun/sh_decl.lua",
             r#"
                 function SharedApi()
                     return true
@@ -330,7 +330,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/use_api.lua",
+            "lua/modules/use_api.lua",
             r#"
                 SharedApi()
             "#,
@@ -362,7 +362,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/client/cl_item.lua",
+            "lua/autorun/client/cl_item.lua",
             r#"
                 ITEM = ITEM or {}
                 function ITEM:GetBase() return true end
@@ -370,7 +370,7 @@ mod tests {
         );
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_item.lua",
+            "lua/autorun/sh_item.lua",
             r#"
                 ITEM = ITEM or {}
                 function ITEM:GetBase() return true end
@@ -379,7 +379,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/server/sv_use.lua",
+            "lua/autorun/server/sv_use.lua",
             r#"
                 if SERVER then
                     local item = ITEM
@@ -415,7 +415,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/sh_test.lua",
+            "lua/autorun/sh_test.lua",
             r#"
                 if SERVER then
                     function ServerOnlyFunc() return true end
@@ -455,7 +455,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_item.lua",
+            "lua/autorun/sh_item.lua",
             r#"
                 ITEM = ITEM or {}
 
@@ -471,7 +471,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/server/sv_use.lua",
+            "lua/autorun/server/sv_use.lua",
             r#"
                 if SERVER then
                     local item = ITEM
@@ -506,7 +506,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_override.lua",
+            "lua/autorun/sh_override.lua",
             r#"
                 if SERVER then
                     function Color(r, g, b, a)
@@ -521,7 +521,7 @@ mod tests {
         );
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_shared_color.lua",
+            "lua/autorun/sh_shared_color.lua",
             r#"
                 function Color(r, g, b, a)
                     return r
@@ -530,7 +530,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/client/cl_use_color.lua",
+            "lua/autorun/client/cl_use_color.lua",
             r#"
                 local c = Color(255, 255, 255, 255)
             "#,
@@ -574,7 +574,7 @@ mod tests {
         );
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_override.lua",
+            "lua/autorun/sh_override.lua",
             r#"
                 if SERVER then
                     function Color(r, g, b, a)
@@ -589,7 +589,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/client/cl_use_color.lua",
+            "lua/autorun/client/cl_use_color.lua",
             r#"
                 local c = Color(255, 255, 255, 255)
             "#,
@@ -621,7 +621,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_gm_decl.lua",
+            "lua/autorun/sh_gm_decl.lua",
             r#"
                 ---@realm server
                 function GM:RealmReproOnly()
@@ -631,7 +631,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/sh_gm_call.lua",
+            "lua/autorun/sh_gm_call.lua",
             r#"
                 if CLIENT then
                     GM:RealmReproOnly()
@@ -665,7 +665,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_gm_decl_client.lua",
+            "lua/autorun/sh_gm_decl_client.lua",
             r#"
                 ---@realm client
                 function GM:PreRender()
@@ -675,7 +675,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/sh_gm_call_server.lua",
+            "lua/autorun/sh_gm_call_server.lua",
             r#"
                 if SERVER then
                     GM:PreRender()
@@ -709,7 +709,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_table_method_decl.lua",
+            "lua/autorun/sh_table_method_decl.lua",
             r#"
                 testTbl = testTbl or {}
 
@@ -721,7 +721,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/sh_table_method_call.lua",
+            "lua/autorun/sh_table_method_call.lua",
             r#"
                 if SERVER then
                     testTbl:TestMethod()
@@ -755,7 +755,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_global_function_decl.lua",
+            "lua/autorun/sh_global_function_decl.lua",
             r#"
                 ---@realm client
                 function TestFunction()
@@ -765,7 +765,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/sh_global_function_call.lua",
+            "lua/autorun/sh_global_function_call.lua",
             r#"
                 if SERVER then
                     TestFunction()
@@ -799,7 +799,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_redef_shared.lua",
+            "lua/autorun/sh_redef_shared.lua",
             r#"
                 function RealmRedefinitionTarget()
                     return true
@@ -808,7 +808,7 @@ mod tests {
         );
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_redef_client.lua",
+            "lua/autorun/sh_redef_client.lua",
             r#"
                 ---@realm client
                 function RealmRedefinitionTarget()
@@ -818,7 +818,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/sh_redef_call.lua",
+            "lua/autorun/sh_redef_call.lua",
             r#"
                 if SERVER then
                     RealmRedefinitionTarget()
@@ -852,7 +852,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
 
         ws.def_file(
-            "addons/test/lua/entities/realm_repro_entity/shared.lua",
+            "lua/entities/realm_repro_entity/shared.lua",
             r#"
                 ---@realm server
                 function ENT:ServerRealmOnlyMethod()
@@ -862,7 +862,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/entities/realm_repro_entity/cl_init.lua",
+            "lua/entities/realm_repro_entity/cl_init.lua",
             r#"
                 ENT:ServerRealmOnlyMethod()
             "#,
@@ -897,7 +897,7 @@ mod tests {
 
         // Server file defines the method
         ws.def_file(
-            "addons/test/lua/entities/dual_realm_ent/init.lua",
+            "lua/entities/dual_realm_ent/init.lua",
             r#"
                 function ENT:GetFuelAmountUnits()
                     return self.fuelAmount or 0
@@ -907,7 +907,7 @@ mod tests {
 
         // Client block in shared.lua also defines the same method
         ws.def_file(
-            "addons/test/lua/entities/dual_realm_ent/shared.lua",
+            "lua/entities/dual_realm_ent/shared.lua",
             r#"
                 if CLIENT then
                     function ENT:GetFuelAmountUnits()
@@ -919,7 +919,7 @@ mod tests {
 
         // Server file calls the method — should see both candidates
         let file_id = ws.def_file(
-            "addons/test/lua/entities/dual_realm_ent/sv_fuel.lua",
+            "lua/entities/dual_realm_ent/sv_fuel.lua",
             r#"
                 function ENT:ConsumeFuel()
                     local current = self:GetFuelAmountUnits()
@@ -963,7 +963,7 @@ mod tests {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/dual_realm_ent2/init.lua",
+            "lua/entities/dual_realm_ent2/init.lua",
             r#"
                 function ENT:GetFuelAmountUnits()
                     return self.fuelAmount or 0
@@ -972,7 +972,7 @@ mod tests {
         );
 
         ws.def_file(
-            "addons/test/lua/entities/dual_realm_ent2/shared.lua",
+            "lua/entities/dual_realm_ent2/shared.lua",
             r#"
                 if CLIENT then
                     function ENT:GetFuelAmountUnits()
@@ -983,7 +983,7 @@ mod tests {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/entities/dual_realm_ent2/cl_init.lua",
+            "lua/entities/dual_realm_ent2/cl_init.lua",
             r#"
                 function ENT:Draw()
                     local fuel = self:GetFuelAmountUnits()
@@ -1027,7 +1027,7 @@ mod tests {
 
         // Server file defines the method on a table
         ws.def_file(
-            "addons/test/lua/autorun/server/sv_mylib.lua",
+            "lua/autorun/server/sv_mylib.lua",
             r#"
                 MyLib = MyLib or {}
                 function MyLib:GetValue()
@@ -1038,7 +1038,7 @@ mod tests {
 
         // Client file also defines the same method
         ws.def_file(
-            "addons/test/lua/autorun/client/cl_mylib.lua",
+            "lua/autorun/client/cl_mylib.lua",
             r#"
                 MyLib = MyLib or {}
                 function MyLib:GetValue()
@@ -1049,7 +1049,7 @@ mod tests {
 
         // Server file calls the method — should see both definitions
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/server/sv_use_mylib.lua",
+            "lua/autorun/server/sv_use_mylib.lua",
             r#"
                 local val = MyLib:GetValue()
             "#,
@@ -1087,14 +1087,14 @@ mod tests {
         emmyrc.gmod.enabled = false;
         ws.update_emmyrc(emmyrc);
         ws.def_file(
-            "addons/test/lua/autorun/server/sv_api.lua",
+            "lua/autorun/server/sv_api.lua",
             r#"function ServerOnlyApi() return true end"#,
         );
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::GmodRealmMismatch);
         let file_id = ws.def_file(
-            "addons/test/lua/autorun/client/cl_test.lua",
+            "lua/autorun/client/cl_test.lua",
             r#"ServerOnlyApi()"#,
         );
         let diagnostics = ws

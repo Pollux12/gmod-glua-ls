@@ -82,13 +82,13 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
         ws.def_file(
-            "sv_init.lua",
+            "lua/sv_init.lua",
             r#"
             util.AddNetworkString("cross_file_dup")
             "#,
         );
         let second_file = ws.def_file(
-            "sv_second.lua",
+            "lua/sv_second.lua",
             r#"
             util.AddNetworkString("cross_file_dup")
             "#,

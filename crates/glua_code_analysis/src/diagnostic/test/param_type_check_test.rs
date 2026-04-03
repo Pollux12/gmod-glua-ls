@@ -1630,7 +1630,7 @@ mod test {
     fn test_no_false_positive_realm_specific_member_overload() {
         let mut ws = VirtualWorkspace::new();
         ws.def_file(
-            "addons/test/lua/glide/client/network.lua",
+            "lua/glide/client/network.lua",
             r#"
             Glide = Glide or {}
 
@@ -1641,7 +1641,7 @@ mod test {
             "#,
         );
         ws.def_file(
-            "addons/test/lua/glide/server/network.lua",
+            "lua/glide/server/network.lua",
             r#"
             Glide = Glide or {}
             Glide.Repair = Glide.Repair or {}
@@ -1661,7 +1661,7 @@ mod test {
 
         ws.enable_check(DiagnosticCode::ParamTypeMismatch);
         let file_id = ws.def_file(
-            "addons/test/lua/glide/server/repair_network.lua",
+            "lua/glide/server/repair_network.lua",
             r#"
             Glide.AddCommandHandler(1, function(ply)
                 Glide.Repair.StartSession(ply)

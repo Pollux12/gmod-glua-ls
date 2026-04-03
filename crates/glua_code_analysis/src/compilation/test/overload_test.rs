@@ -476,7 +476,7 @@ mod test {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
         ws.def_file(
-            "addons/test/lua/autorun/sh_meta.lua",
+            "lua/autorun/sh_meta.lua",
             r#"
             if SERVER then
                 ---@generic T
@@ -504,7 +504,7 @@ mod test {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
         ws.def_file(
-            "addons/test/lua/autorun/client/cl_meta.lua",
+            "lua/autorun/client/cl_meta.lua",
             r#"
             if CLIENT then
                 ---@generic T

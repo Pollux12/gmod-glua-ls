@@ -530,7 +530,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/my_entity/init.lua",
+            "lua/entities/my_entity/init.lua",
             r#"
             AccessorFunc(ENT, "m_iHealth", "Health", FORCE_NUMBER)
             AccessorFunc(ENT, "m_sName", "Name", FORCE_STRING)
@@ -590,7 +590,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/typed_ent/init.lua",
+            "lua/entities/typed_ent/init.lua",
             r#"
             AccessorFunc(ENT, "m_vPos", "Position", FORCE_VECTOR)
         "#,
@@ -625,7 +625,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/nw_entity/init.lua",
+            "lua/entities/nw_entity/init.lua",
             r#"
             function ENT:SetupDataTables()
                 self:NetworkVar("Float", 0, "Speed")
@@ -682,7 +682,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/derived_ent/init.lua",
+            "lua/entities/derived_ent/init.lua",
             r#"
             DEFINE_BASECLASS("base_anim")
             ENT.Type = "anim"
@@ -712,7 +712,7 @@ mod test {
         ws.enable_check(DiagnosticCode::UndefinedGlobal);
 
         let file_id = ws.def_file(
-            "addons/test/lua/entities/fl_dodge_charger/shared.lua",
+            "lua/entities/fl_dodge_charger/shared.lua",
             r#"
             DEFINE_BASECLASS("base_glide")
             local _ = BaseClass
@@ -768,7 +768,7 @@ mod test {
         ws.enable_check(DiagnosticCode::UndefinedGlobal);
 
         let file_id = ws.def_file(
-            "addons/test/lua/vgui/test_panel.lua",
+            "lua/vgui/test_panel.lua",
             r#"
             DEFINE_BASECLASS("base_panel")
             local _ = BaseClass
@@ -889,7 +889,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/mapped_ent/shared.lua",
+            "lua/entities/mapped_ent/shared.lua",
             r#"
             ENT.Base = "base_gmodentity"
         "#,
@@ -924,14 +924,14 @@ mod test {
 
         ws.def_files(vec![
             (
-                "addons/test/lua/entities/base_glide_car/shared.lua",
+                "lua/entities/base_glide_car/shared.lua",
                 r#"
                 function ENT:Initialize()
                 end
             "#,
             ),
             (
-                "addons/test/lua/autorun/use_base.lua",
+                "lua/autorun/use_base.lua",
                 r#"
                 ---@param ent base_glide_car
                 local function consume(ent)
@@ -942,7 +942,7 @@ mod test {
 
         let param_uri = ws
             .virtual_url_generator
-            .new_uri("addons/test/lua/autorun/use_base.lua");
+            .new_uri("lua/autorun/use_base.lua");
         let param_file_id = ws
             .analysis
             .get_file_id(&param_uri)
@@ -971,7 +971,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/vgui/my_panel.lua",
+            "lua/vgui/my_panel.lua",
             r#"
             local PANEL = {}
 
@@ -1013,7 +1013,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/vgui/multi_panel.lua",
+            "lua/vgui/multi_panel.lua",
             r#"
             local PANEL = {}
 
@@ -1112,7 +1112,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/vgui/reassigned_panel.lua",
+            "lua/vgui/reassigned_panel.lua",
             r#"
             local PANEL = {}
             function PANEL:Init() end
@@ -1177,7 +1177,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/vgui/reassigned_panel_stress.lua",
+            "lua/vgui/reassigned_panel_stress.lua",
             r#"
             local PANEL = {}
             function PANEL:Alpha() end
@@ -1262,7 +1262,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/vgui/panel_do_scope.lua",
+            "lua/vgui/panel_do_scope.lua",
             r#"
             do
                 local PANEL = {}
@@ -1334,7 +1334,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/vgui/panel_orphan_scope.lua",
+            "lua/vgui/panel_orphan_scope.lua",
             r#"
             do
                 local PANEL = {}
@@ -1378,7 +1378,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
-            "addons/test/lua/vgui/panel_hover_type.lua",
+            "lua/vgui/panel_hover_type.lua",
             r#"
             local PANEL = {}
             vgui.Register("HoverPanelOne", PANEL, "DPanel")
@@ -1467,7 +1467,7 @@ mod test {
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         let file_id = ws.def_file(
-            "addons/test/lua/vgui/self_field_panel.lua",
+            "lua/vgui/self_field_panel.lua",
             r#"
             local PANEL = {}
 
@@ -1524,7 +1524,7 @@ mod test {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/vgui/test_dynamic_field_panel.lua",
+            "lua/vgui/test_dynamic_field_panel.lua",
             r#"
             local TOP = 1
             local PANEL = {}
@@ -1570,7 +1570,7 @@ mod test {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/vgui/cross_method_panel.lua",
+            "lua/vgui/cross_method_panel.lua",
             r#"
             local PANEL = {}
 
@@ -1610,7 +1610,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/vgui/disabled_panel.lua",
+            "lua/vgui/disabled_panel.lua",
             r#"
             local PANEL = {}
             vgui.Register("DisabledPanel", PANEL, "DPanel")
@@ -1635,7 +1635,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/two_arg_nw/init.lua",
+            "lua/entities/two_arg_nw/init.lua",
             r#"
             function ENT:SetupDataTables()
                 self:NetworkVar("String", "Label")
@@ -1683,7 +1683,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
-            "addons/test/lua/entities/nve_entity/init.lua",
+            "lua/entities/nve_entity/init.lua",
             r#"
             function ENT:SetupDataTables()
                 self:NetworkVarElement("Float", 0, "x", "VehiclePos")
@@ -1746,7 +1746,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/nve_short/init.lua",
+            "lua/entities/nve_short/init.lua",
             r#"
             function ENT:SetupDataTables()
                 self:NetworkVarElement("Float", 0, "Offset")
@@ -1786,7 +1786,7 @@ mod test {
 
         ws.def_files(vec![
             (
-                "addons/test/lua/entities/base_glide_car/shared.lua",
+                "lua/entities/base_glide_car/shared.lua",
                 r#"
                 function ENT:SetupDataTables()
                     self:NetworkVar("Vector", 0, "HeadlightColor")
@@ -1795,7 +1795,7 @@ mod test {
             "#,
             ),
             (
-                "addons/test/lua/entities/fl_dodge_charger/shared.lua",
+                "lua/entities/fl_dodge_charger/shared.lua",
                 r#"
                 ENT.Base = "base_glide_car"
             "#,
@@ -1851,7 +1851,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/mixed_nw/init.lua",
+            "lua/entities/mixed_nw/init.lua",
             r#"
             function ENT:SetupDataTables()
                 self:NetworkVar("Float", 0, "Speed")
@@ -2096,7 +2096,7 @@ mod test {
 
         ws.def_files(vec![
             (
-                "addons/test/lua/entities/base_glide_car/shared.lua",
+                "lua/entities/base_glide_car/shared.lua",
                 r#"
                 function ENT:SetupDataTables()
                     self:NetworkVar("Bool", "IsRedlining")
@@ -2105,7 +2105,7 @@ mod test {
             "#,
             ),
             (
-                "addons/test/lua/entities/base_glide_car/cl_init.lua",
+                "lua/entities/base_glide_car/cl_init.lua",
                 r#"
                 function ENT:Think()
                     local x = self:GetIsRedlining()
@@ -2117,7 +2117,7 @@ mod test {
 
         let target_uri = ws
             .virtual_url_generator
-            .new_uri("addons/test/lua/entities/base_glide_car/cl_init.lua");
+            .new_uri("lua/entities/base_glide_car/cl_init.lua");
         let target_file_id = ws
             .analysis
             .get_file_id(&target_uri)
@@ -2148,13 +2148,13 @@ mod test {
 
         ws.def_files(vec![
             (
-                "addons/test/lua/entities/multi_file_ent/shared.lua",
+                "lua/entities/multi_file_ent/shared.lua",
                 r#"
                 ENT.Type = "anim"
             "#,
             ),
             (
-                "addons/test/lua/entities/multi_file_ent/cl_init.lua",
+                "lua/entities/multi_file_ent/cl_init.lua",
                 r#"
                 function ENT:Draw()
                     local self_copy = self
@@ -2165,7 +2165,7 @@ mod test {
 
         let target_uri = ws
             .virtual_url_generator
-            .new_uri("addons/test/lua/entities/multi_file_ent/cl_init.lua");
+            .new_uri("lua/entities/multi_file_ent/cl_init.lua");
         let file_id = ws
             .analysis
             .get_file_id(&target_uri)
@@ -2209,7 +2209,7 @@ mod test {
 
         ws.def_files(vec![
             (
-                "addons/test/lua/entities/base_vehicle/shared.lua",
+                "lua/entities/base_vehicle/shared.lua",
                 r#"
                 function ENT:SetupDataTables()
                     self:NetworkVar("Vector", 0, "HeadlightColor")
@@ -2218,13 +2218,13 @@ mod test {
             "#,
             ),
             (
-                "addons/test/lua/entities/derived_vehicle/shared.lua",
+                "lua/entities/derived_vehicle/shared.lua",
                 r#"
                 ENT.Base = "base_vehicle"
             "#,
             ),
             (
-                "addons/test/lua/entities/derived_vehicle/cl_init.lua",
+                "lua/entities/derived_vehicle/cl_init.lua",
                 r#"
                 function ENT:Think()
                     self:SetHeadlightColor(Vector(0, 0, 0))
@@ -2236,7 +2236,7 @@ mod test {
 
         let target_uri = ws
             .virtual_url_generator
-            .new_uri("addons/test/lua/entities/derived_vehicle/cl_init.lua");
+            .new_uri("lua/entities/derived_vehicle/cl_init.lua");
         let target_file_id = ws
             .analysis
             .get_file_id(&target_uri)
@@ -2266,7 +2266,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/local_wrap_ent/init.lua",
+            "lua/entities/local_wrap_ent/init.lua",
             r#"
             function ENT:SetupDataTables()
                 local function AddFloatVar(key, min, max)
@@ -2320,7 +2320,7 @@ mod test {
 
         ws.def_files(vec![
             (
-                "addons/test/lua/entities/two_arg_diag/shared.lua",
+                "lua/entities/two_arg_diag/shared.lua",
                 r#"
                 function ENT:SetupDataTables()
                     self:NetworkVar("Bool", "IsRedlining")
@@ -2329,7 +2329,7 @@ mod test {
             "#,
             ),
             (
-                "addons/test/lua/entities/two_arg_diag/cl_init.lua",
+                "lua/entities/two_arg_diag/cl_init.lua",
                 r#"
                 function ENT:Think()
                     local x = self:GetIsRedlining()
@@ -2341,7 +2341,7 @@ mod test {
 
         let target_uri = ws
             .virtual_url_generator
-            .new_uri("addons/test/lua/entities/two_arg_diag/cl_init.lua");
+            .new_uri("lua/entities/two_arg_diag/cl_init.lua");
         let target_file_id = ws
             .analysis
             .get_file_id(&target_uri)
@@ -2373,7 +2373,7 @@ mod test {
 
         ws.def_files(vec![
             (
-                "addons/test/lua/entities/base_glide_car_realistic/shared.lua",
+                "lua/entities/base_glide_car_realistic/shared.lua",
                 r#"
                 function ENT:SetupDataTables()
                     self:NetworkVar("Bool", "IsRedlining")
@@ -2409,7 +2409,7 @@ mod test {
             "#,
             ),
             (
-                "addons/test/lua/entities/base_glide_car_realistic/cl_init.lua",
+                "lua/entities/base_glide_car_realistic/cl_init.lua",
                 r#"
                 function ENT:OnUpdateSounds()
                     local redlining = self:GetIsRedlining()
@@ -2477,7 +2477,7 @@ mod test {
 
         let cl_uri = ws
             .virtual_url_generator
-            .new_uri("addons/test/lua/entities/base_glide_car_realistic/cl_init.lua");
+            .new_uri("lua/entities/base_glide_car_realistic/cl_init.lua");
         let cl_file_id = ws
             .analysis
             .get_file_id(&cl_uri)
@@ -2509,7 +2509,7 @@ mod test {
 
         // First batch: shared.lua analyzed alone
         ws.def_file(
-            "addons/test/lua/entities/seq_entity/shared.lua",
+            "lua/entities/seq_entity/shared.lua",
             r#"
         function ENT:SetupDataTables()
             self:NetworkVar("Bool", "IsRedlining")
@@ -2520,7 +2520,7 @@ mod test {
 
         // Second batch: cl_init.lua analyzed separately (incremental)
         let cl_file_id = ws.def_file(
-            "addons/test/lua/entities/seq_entity/cl_init.lua",
+            "lua/entities/seq_entity/cl_init.lua",
             r#"
         function ENT:Think()
             local x = self:GetIsRedlining()
@@ -2558,7 +2558,7 @@ mod test {
 
         ws.def_files(vec![
             (
-                "addons/test/lua/entities/stdlib_ent/shared.lua",
+                "lua/entities/stdlib_ent/shared.lua",
                 r#"
             function ENT:SetupDataTables()
                 self:NetworkVar("Bool", "IsRedlining")
@@ -2567,7 +2567,7 @@ mod test {
         "#,
             ),
             (
-                "addons/test/lua/entities/stdlib_ent/cl_init.lua",
+                "lua/entities/stdlib_ent/cl_init.lua",
                 r#"
             function ENT:Think()
                 local x = self:GetIsRedlining()
@@ -2579,7 +2579,7 @@ mod test {
 
         let cl_uri = ws
             .virtual_url_generator
-            .new_uri("addons/test/lua/entities/stdlib_ent/cl_init.lua");
+            .new_uri("lua/entities/stdlib_ent/cl_init.lua");
         let cl_file_id = ws
             .analysis
             .get_file_id(&cl_uri)
@@ -2918,7 +2918,7 @@ mod test {
 
         ws.def_files(vec![
             (
-                "addons/test/lua/includes/entity_defs.lua",
+                "lua/includes/entity_defs.lua",
                 r#"
             ---@class Entity
             ---@field NetworkVar fun(self: Entity, type: string, name: string)
@@ -2931,7 +2931,7 @@ mod test {
         "#,
             ),
             (
-                "addons/test/lua/entities/base_glide/shared.lua",
+                "lua/entities/base_glide/shared.lua",
                 r#"
             ENT.Type = "anim"
             ENT.Base = "base_anim"
@@ -3009,7 +3009,7 @@ mod test {
 
         let shared_uri = ws
             .virtual_url_generator
-            .new_uri("addons/test/lua/entities/base_glide/shared.lua");
+            .new_uri("lua/entities/base_glide/shared.lua");
         let shared_file_id = ws
             .analysis
             .get_file_id(&shared_uri)
@@ -3081,7 +3081,7 @@ mod test {
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_file(
-            "addons/test/lua/includes/custom_classes.lua",
+            "lua/includes/custom_classes.lua",
             r#"
                 ---@class Tool
                 ---@class TOOL : Tool
@@ -3089,7 +3089,7 @@ mod test {
         );
 
         ws.def_file(
-            "addons/test/lua/includes/tool_meta.lua",
+            "lua/includes/tool_meta.lua",
             r#"
                 ---@class Player
                 ---@param command string
@@ -3126,7 +3126,7 @@ mod test {
         );
 
         let file_id = ws.def_file(
-            "addons/test/lua/weapons/gmod_tool/stools/my_tool.lua",
+            "lua/weapons/gmod_tool/stools/my_tool.lua",
             r#"
                 TOOL.Category = "Test"
                 TOOL.Name = "My Tool"
@@ -3205,7 +3205,7 @@ mod test {
 
         // class.TOOL.lua - exact real annotation structure
         ws.def_file(
-            "addons/test/lua/annotations/class.TOOL.lua",
+            "lua/annotations/class.TOOL.lua",
             r#"
                 ---@class Tool
                 ---@field BuildCPanel fun(panel: ControlPanel) Called to populate the tool's control panel.
@@ -3218,7 +3218,7 @@ mod test {
 
         // tool.lua - Tool methods
         ws.def_file(
-            "addons/test/lua/annotations/tool.lua",
+            "lua/annotations/tool.lua",
             r#"
                 ---@return Player
                 function Tool:GetOwner() end
@@ -3227,7 +3227,7 @@ mod test {
 
         // player.lua
         ws.def_file(
-            "addons/test/lua/annotations/player.lua",
+            "lua/annotations/player.lua",
             r#"
                 ---@class Player
                 ---@param command string
@@ -3237,7 +3237,7 @@ mod test {
 
         // class.ControlPanel.lua (separate from controlpanel.lua methods)
         ws.def_file(
-            "addons/test/lua/annotations/class.ControlPanel.lua",
+            "lua/annotations/class.ControlPanel.lua",
             r#"
                 ---@class ControlPanel : DForm
                 local ControlPanel = {}
@@ -3246,7 +3246,7 @@ mod test {
 
         // controlpanel.lua (methods, separate from class declaration)
         ws.def_file(
-            "addons/test/lua/annotations/controlpanel.lua",
+            "lua/annotations/controlpanel.lua",
             r#"
                 ---@param type string
                 ---@param controlinfo table
@@ -3260,7 +3260,7 @@ mod test {
 
         // dform.lua (DForm methods, inherited by ControlPanel)
         ws.def_file(
-            "addons/test/lua/annotations/dform.lua",
+            "lua/annotations/dform.lua",
             r#"
                 ---@class DForm : DCollapsibleCategory
                 local DForm = {}
@@ -3281,7 +3281,7 @@ mod test {
 
         // dcollapsiblecategory.lua
         ws.def_file(
-            "addons/test/lua/annotations/dcollapsiblecategory.lua",
+            "lua/annotations/dcollapsiblecategory.lua",
             r#"
                 ---@class DCollapsibleCategory
                 ---@class DNumSlider
@@ -3292,7 +3292,7 @@ mod test {
 
         // Stool file: NO @param annotations, types come from @field on Tool
         let file_id = ws.def_file(
-            "addons/test/lua/weapons/gmod_tool/stools/glide_test.lua",
+            "lua/weapons/gmod_tool/stools/glide_test.lua",
             r#"
                 TOOL.Category = "Glide"
                 TOOL.Name = "Projectile Launcher"
@@ -3352,7 +3352,7 @@ mod test {
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         let file_id = ws.def_file(
-            "addons/test/lua/glide/server/vector_chain.lua",
+            "lua/glide/server/vector_chain.lua",
             r#"
                 local function compute(steerDir, fixedLen)
                     local dirLen = steerDir:Length()
@@ -3581,7 +3581,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/entities/dual_realm_ent/init.lua",
+            "lua/entities/dual_realm_ent/init.lua",
             r#"
             function ENT:GetFuelAmountUnits()
                 return self.fuelAmount or 0
@@ -3590,7 +3590,7 @@ mod test {
         );
 
         ws.def_file(
-            "addons/test/lua/entities/dual_realm_ent/shared.lua",
+            "lua/entities/dual_realm_ent/shared.lua",
             r#"
             if CLIENT then
                 function ENT:GetFuelAmountUnits()
@@ -3636,7 +3636,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
-            "addons/test/lua/vgui/test_derma_panel.lua",
+            "lua/vgui/test_derma_panel.lua",
             r#"
             local PANEL = {}
 

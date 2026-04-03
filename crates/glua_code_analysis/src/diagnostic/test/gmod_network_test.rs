@@ -48,7 +48,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             util.AddNetworkString("Msg")
             net.Start("Msg")
@@ -57,7 +57,7 @@ mod tests {
             "#,
         );
         let client_file_id = ws.def_file(
-            "addons/test/lua/autorun/client/receive.lua",
+            "lua/autorun/client/receive.lua",
             r#"
             net.Receive("Msg", function()
                 local x = net.ReadString()
@@ -93,7 +93,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodNetReadWriteOrderMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             util.AddNetworkString("Msg")
             net.Start("Msg")
@@ -103,7 +103,7 @@ mod tests {
             "#,
         );
         let client_file_id = ws.def_file(
-            "addons/test/lua/autorun/client/receive.lua",
+            "lua/autorun/client/receive.lua",
             r#"
             net.Receive("Msg", function()
                 local name = net.ReadString()
@@ -127,7 +127,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
 
         let server_file_id = ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             util.AddNetworkString("Orphan")
             net.Start("Orphan")
@@ -155,7 +155,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
 
         let client_file_id = ws.def_file(
-            "addons/test/lua/autorun/client/receive.lua",
+            "lua/autorun/client/receive.lua",
             r#"
             net.Receive("NoSender", function()
                 local x = net.ReadString()
@@ -178,7 +178,7 @@ mod tests {
         let mut ws = new_gmod_workspace();
 
         let server_file_id = ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             util.AddNetworkString("Match")
             net.Start("Match")
@@ -188,7 +188,7 @@ mod tests {
             "#,
         );
         let client_file_id = ws.def_file(
-            "addons/test/lua/autorun/client/receive.lua",
+            "lua/autorun/client/receive.lua",
             r#"
             net.Receive("Match", function()
                 local ent = net.ReadEntity()
@@ -209,7 +209,7 @@ mod tests {
         let mut ws = new_gmod_workspace();
 
         ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             util.AddNetworkString("Msg")
 
@@ -229,7 +229,7 @@ mod tests {
             "#,
         );
         let client_file_id = ws.def_file(
-            "addons/test/lua/autorun/client/receive.lua",
+            "lua/autorun/client/receive.lua",
             r#"
             net.Receive("Msg", function()
                 local id = net.ReadUInt(8)
@@ -264,7 +264,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             util.AddNetworkString("Msg")
             net.Start("Msg")
@@ -273,7 +273,7 @@ mod tests {
             "#,
         );
         let client_file_id = ws.def_file(
-            "addons/test/lua/autorun/client/receive.lua",
+            "lua/autorun/client/receive.lua",
             r#"
             net.Receive("Msg", function()
                 local x = net.ReadString()
@@ -300,7 +300,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
 
         let server_file_id = ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             util.AddNetworkString("Orphan")
             net.Start("Orphan")
@@ -327,7 +327,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
 
         let server_file_id = ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             local msg = "dynamic"
             net.Start(msg)
@@ -354,7 +354,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
 
         ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             function Glide.StartCommand(id)
                 net.Start("glide.command")
@@ -367,7 +367,7 @@ mod tests {
         );
 
         let client_file_id = ws.def_file(
-            "addons/test/lua/autorun/client/receive.lua",
+            "lua/autorun/client/receive.lua",
             r#"
             net.Receive("glide.command", function()
                 local x = net.ReadUInt(8)
@@ -393,7 +393,7 @@ mod tests {
             .enable_only(DiagnosticCode::GmodNetReadWriteOrderMismatch);
 
         ws.def_file(
-            "addons/test/lua/autorun/server/send.lua",
+            "lua/autorun/server/send.lua",
             r#"
             function Glide.StartCommand(id)
                 net.Start("glide.command")
@@ -406,7 +406,7 @@ mod tests {
         );
 
         let client_file_id = ws.def_file(
-            "addons/test/lua/autorun/client/receive.lua",
+            "lua/autorun/client/receive.lua",
             r#"
             net.Receive("glide.command", function()
                 local x = net.ReadUInt(8)

@@ -347,8 +347,14 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
     };
 
     let file_id = analyzer.get_file_id();
-    let dependency_file_id =
-        resolve_dependency_file_id(analyzer, file_id, dependency_kind, &dependency_path);
+
+    let dependency_file_id = if let Some(ref path) = dependency_path {
+        resolve_dependency_file_id(analyzer, file_id, dependency_kind, path)
+    } else {
+        // No-arg AddCSLuaFile() means "send self to client" — self-reference
+        Some(file_id)
+    };
+
     if let Some(dependency_file_id) = dependency_file_id {
         analyzer
             .db
@@ -427,17 +433,23 @@ fn is_package_seeall_expr(expr: &LuaExpr) -> bool {
     )
 }
 
-fn get_dependency_call_info(expr: &LuaCallExpr) -> Option<(LuaDependencyKind, String)> {
+fn get_dependency_call_info(expr: &LuaCallExpr) -> Option<(LuaDependencyKind, Option<String>)> {
     let dependency_kind = if expr.is_require() {
         LuaDependencyKind::Require
     } else {
         match get_call_name(expr).as_deref()? {
             "include" => LuaDependencyKind::Include,
             "AddCSLuaFile" => LuaDependencyKind::AddCSLuaFile,
+            "IncludeCS" => LuaDependencyKind::IncludeCS,
             _ => return None,
         }
     };
-    let dependency_path = get_static_string_arg(expr)?;
+    let dependency_path = get_static_string_arg(expr);
+    // AddCSLuaFile() with no args is valid (sends current file to client).
+    // IncludeCS() requires a filename in GMod's util.lua implementation.
+    if dependency_path.is_none() && dependency_kind != LuaDependencyKind::AddCSLuaFile {
+        return None;
+    }
     Some((dependency_kind, dependency_path))
 }
 
@@ -476,7 +488,9 @@ fn resolve_dependency_file_id(
         LuaDependencyKind::Require => module_index
             .find_module_for_file(dependency_path, file_id)
             .map(|it| it.file_id),
-        LuaDependencyKind::Include | LuaDependencyKind::AddCSLuaFile => {
+        LuaDependencyKind::Include
+        | LuaDependencyKind::AddCSLuaFile
+        | LuaDependencyKind::IncludeCS => {
             resolve_gmod_include_file_id(analyzer, file_id, dependency_path).or_else(|| {
                 module_index
                     .find_module_for_file(dependency_path, file_id)

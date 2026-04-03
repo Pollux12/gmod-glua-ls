@@ -2686,6 +2686,15 @@ fn collect_if_realm_ranges(if_stat: &LuaIfStat, ranges: &mut Vec<GmodRealmRange>
         if let Some(block) = if_stat.get_block() {
             let range = block.syntax().text_range();
             ranges.push(GmodRealmRange { range, realm });
+        } else {
+            // Empty block (e.g., comment-only if-body): still record the realm
+            // so that realm-awareness checks (like AddCSLuaFile CLIENT detection) work.
+            // Use a zero-width range at the start of the if-statement as a marker.
+            let pos = if_stat.syntax().text_range().start();
+            ranges.push(GmodRealmRange {
+                range: TextRange::new(pos, pos),
+                realm,
+            });
         }
 
         // Identify the complementary realm for else block
@@ -2980,27 +2989,47 @@ fn rebuild_realm_metadata(
             };
 
             for dependency_file_id in dependencies {
-                match dependency_index.get_dependency_kind(source_file_id, dependency_file_id) {
-                    Some(LuaDependencyKind::AddCSLuaFile) => {
+                let Some(kinds) =
+                    dependency_index.get_dependency_kinds(source_file_id, dependency_file_id)
+                else {
+                    continue;
+                };
+                if kinds.contains(&LuaDependencyKind::AddCSLuaFile)
+                    || kinds.contains(&LuaDependencyKind::IncludeCS)
+                {
+                    if source_file_id == dependency_file_id {
+                        // Self-ref AddCSLuaFile() (no args): file sends itself to client,
+                        // meaning it runs on both server (caller) and client → Shared.
                         dependency_hints
                             .entry(*source_file_id)
                             .or_default()
-                            .insert(GmodRealm::Server);
+                            .insert(GmodRealm::Shared);
+                    } else {
+                        // AddCSLuaFile/IncludeCS marks the TARGET as Client
+                        // (it's being sent to the client for download/execution).
+                        // We do NOT add a Server hint to the source file — although AddCSLuaFile is
+                        // server-only, shared files commonly call it inside `if SERVER then` blocks,
+                        // so hinting the source as Server would cause false positives.
                         dependency_hints
                             .entry(*dependency_file_id)
                             .or_default()
                             .insert(GmodRealm::Client);
                     }
-                    Some(LuaDependencyKind::Require) => {
-                        dependency_hints
-                            .entry(*dependency_file_id)
-                            .or_default()
-                            .insert(GmodRealm::Shared);
-                    }
-                    Some(LuaDependencyKind::Include) => {
-                        include_edges.push((*source_file_id, *dependency_file_id));
-                    }
-                    _ => {}
+                }
+                if kinds.contains(&LuaDependencyKind::Require) {
+                    dependency_hints
+                        .entry(*dependency_file_id)
+                        .or_default()
+                        .insert(GmodRealm::Shared);
+                }
+                if kinds.contains(&LuaDependencyKind::Include)
+                    || kinds.contains(&LuaDependencyKind::IncludeCS)
+                {
+                    // NOTE: Include edges are file-level, not branch-scoped.
+                    // An include() inside `if CLIENT then` still creates a file-level edge.
+                    // This is a deliberate simplification; branch-scoped tracking would
+                    // require storing call-site offsets in dependency edges (major arch change).
+                    include_edges.push((*source_file_id, *dependency_file_id));
                 }
             }
         }
@@ -3025,29 +3054,26 @@ fn rebuild_realm_metadata(
         .collect();
 
     if detect_calls && !include_edges.is_empty() {
-        for _ in 0..3 {
+        for _ in 0..20 {
             let mut next_dependency_hints = dependency_hints.clone();
             for (source_file_id, dependency_file_id) in &include_edges {
-                let source_realm = inferred_realms
-                    .get(source_file_id)
-                    .copied()
-                    .unwrap_or(GmodRealm::Unknown);
-                let dependency_realm = inferred_realms
-                    .get(dependency_file_id)
-                    .copied()
-                    .unwrap_or(GmodRealm::Unknown);
+                // Collect evidence for the source file: filename hint + dependency hints
+                let mut source_evidence: HashSet<GmodRealm> = HashSet::new();
+                if let Some(Some(fh)) = filename_hints.get(source_file_id) {
+                    source_evidence.insert(*fh);
+                }
+                if let Some(hints) = next_dependency_hints.get(source_file_id) {
+                    source_evidence.extend(hints.iter().copied());
+                }
 
-                if source_realm != GmodRealm::Unknown {
+                // Forward propagation only: source → dependency.
+                // We do NOT propagate backward (dependency → source) because a server-only
+                // file can legitimately include a shared file without becoming shared itself.
+                for hint in &source_evidence {
                     next_dependency_hints
                         .entry(*dependency_file_id)
                         .or_default()
-                        .insert(source_realm);
-                }
-                if dependency_realm != GmodRealm::Unknown {
-                    next_dependency_hints
-                        .entry(*source_file_id)
-                        .or_default()
-                        .insert(dependency_realm);
+                        .insert(*hint);
                 }
             }
 
@@ -3167,20 +3193,15 @@ fn infer_realm(
         return *hints.iter().next().expect("len checked");
     }
 
-    if hints.len() == 2 {
-        // Shared + Client/Server → the file is used in Shared context, so it's Shared
-        // Being included in a Shared file means it's available in both realms
-        if hints.contains(&GmodRealm::Shared) {
-            return GmodRealm::Shared;
-        }
-
-        // Client + Server → the file runs on both realms, so it's Shared
-        if hints.contains(&GmodRealm::Client) && hints.contains(&GmodRealm::Server) {
-            return GmodRealm::Shared;
-        }
+    // Any combination containing Shared, or both Client+Server, resolves to Shared
+    if hints.contains(&GmodRealm::Shared)
+        || (hints.contains(&GmodRealm::Client) && hints.contains(&GmodRealm::Server))
+    {
+        return GmodRealm::Shared;
     }
 
-    GmodRealm::Unknown
+    // Fallback for unexpected combinations
+    default_realm
 }
 
 fn gmod_config_default_realm(db: &DbIndex) -> GmodRealm {
@@ -3211,20 +3232,40 @@ fn infer_realm_from_filename(db: &DbIndex, file_id: FileId) -> Option<GmodRealm>
     }
 
     // 2. Check parent directory names for realm hints SECOND
-    // Only inspect the path segment after the last `/lua/` anchor to avoid false realm hints
+    // Prefer the path segment after the last `/lua/` anchor to avoid false realm hints
     // from unrelated parent directory names (e.g. a user home directory named "server").
-    // For GMod-specific directories (gamemode, entities, weapons, effects), check the full path
-    // since these don't always have a /lua/ anchor.
+    // If there is no `/lua/` anchor, still allow inference for known GMod workspace layouts
+    // such as addon-root (`lua/...`) and gamemode-root (`gamemode/...`, `entities/...`).
     let path_str = file_path.to_string_lossy().to_ascii_lowercase();
     let path_str = path_str.replace('\\', "/");
+    let components = file_path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect::<Vec<_>>();
 
     // Try to find /lua/ anchor first
     let search_str = if let Some(idx) = path_str.rfind("/lua/") {
         &path_str[idx..]
     } else {
-        // Only use full-path detection when this appears to be a GMod content tree.
-        // This avoids false positives from unrelated paths that contain /client|/server|/shared.
-        let is_gmod_tree = path_str.contains("/addons/") || path_str.contains("/gamemodes/");
+        // Fall back to full-path detection only for known GMod-like trees.
+        let is_gmod_tree = components.iter().any(|segment| {
+            matches!(
+                segment.as_str(),
+                "addons"
+                    | "gamemodes"
+                    | "lua"
+                    | "gamemode"
+                    | "entities"
+                    | "weapons"
+                    | "effects"
+                    | "postprocess"
+                    | "vgui"
+                    | "matproxy"
+                    | "skins"
+                    | "autorun"
+                    | "includes"
+            )
+        });
         if !is_gmod_tree {
             return None;
         }
@@ -3241,7 +3282,37 @@ fn infer_realm_from_filename(db: &DbIndex, file_id: FileId) -> Option<GmodRealm>
         return Some(GmodRealm::Shared);
     }
 
-    // 3. Check specific filenames LAST (lowest confidence)
+    // 3. Check GMod special directory patterns (engine-defined realm behavior per GMod loading order)
+    // These MUST come before the init.lua/shared.lua filename checks because e.g.
+    // effects/init.lua should be Shared (effects load on both realms), not Server.
+    if search_str.contains("/effects/") {
+        return Some(GmodRealm::Shared);
+    }
+    if search_str.contains("/vgui/") {
+        return Some(GmodRealm::Client);
+    }
+    if search_str.contains("/postprocess/") {
+        return Some(GmodRealm::Client);
+    }
+    if search_str.contains("/matproxy/") {
+        return Some(GmodRealm::Client);
+    }
+    if search_str.contains("/skins/") {
+        return Some(GmodRealm::Client);
+    }
+    if search_str.contains("/autorun/") {
+        // Note: autorun/server/ and autorun/client/ are already caught above
+        // by the /server/ and /client/ directory checks.
+        return Some(GmodRealm::Shared);
+    }
+    if search_str.contains("/includes/") {
+        return Some(GmodRealm::Shared);
+    }
+    if search_str.contains("/stools/") {
+        return Some(GmodRealm::Shared);
+    }
+
+    // 4. Check specific filenames LAST (lowest confidence)
     if file_name == "cl_init.lua" {
         return Some(GmodRealm::Client);
     }

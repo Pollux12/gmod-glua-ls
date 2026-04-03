@@ -13,12 +13,13 @@ pub enum LuaDependencyKind {
     Require,
     Include,
     AddCSLuaFile,
+    IncludeCS,
 }
 
 #[derive(Debug)]
 pub struct LuaDependencyIndex {
     dependencies: HashMap<FileId, HashSet<FileId>>,
-    dependency_kinds: HashMap<FileId, HashMap<FileId, LuaDependencyKind>>,
+    dependency_kinds: HashMap<FileId, HashMap<FileId, HashSet<LuaDependencyKind>>>,
 }
 
 impl Default for LuaDependencyIndex {
@@ -52,22 +53,23 @@ impl LuaDependencyIndex {
         self.dependency_kinds
             .entry(file_id)
             .or_default()
-            .insert(dependency_id, kind);
+            .entry(dependency_id)
+            .or_default()
+            .insert(kind);
     }
 
     pub fn get_required_files(&self, file_id: &FileId) -> Option<&HashSet<FileId>> {
         self.dependencies.get(file_id)
     }
 
-    pub fn get_dependency_kind(
+    pub fn get_dependency_kinds(
         &self,
         file_id: &FileId,
         dependency_id: &FileId,
-    ) -> Option<LuaDependencyKind> {
+    ) -> Option<&HashSet<LuaDependencyKind>> {
         self.dependency_kinds
             .get(file_id)
             .and_then(|dependencies| dependencies.get(dependency_id))
-            .copied()
     }
 
     pub fn get_file_dependencies<'a>(&'a self) -> FileDependencyRelation<'a> {
