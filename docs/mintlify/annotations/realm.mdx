@@ -1,6 +1,6 @@
 ---
 title: "@realm"
-description: Declare which GMod realm (client, server, or shared) a file or function belongs to.
+description: Declare which GMod realm a file or function belongs to.
 ---
 
 ## Overview
@@ -10,7 +10,7 @@ description: Declare which GMod realm (client, server, or shared) a file or func
 ---
 
 ## Syntax
-
+  
 ```lua
 ---@realm client
 ---@realm server
@@ -65,9 +65,6 @@ end
 | `client` | Clientside (runs in the `CLIENT` state) |
 | `server` | Serverside (runs in the `SERVER` state) |
 | `shared` | Both client and server |
-
----
-
 ## When `@realm` is missing
 
 GLuaLS auto-detects realm from:

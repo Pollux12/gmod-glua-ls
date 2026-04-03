@@ -14,9 +14,9 @@ All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These co
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `gmod.enabled` | `boolean` | `true` | Enable all GMod-specific analysis. Set `false` to use as a generic Lua LS |
-| `gmod.defaultRealm` | `string` | `"shared"` | Realm assumed for files with no realm signal. Values: `"client"`, `"server"`, `"shared"`, `"menu"` |
+| `gmod.defaultRealm` | `string` | `"shared"` | Realm assumed for files with no realm signal. Use `"client"`, `"server"`, or `"shared"` |
 | `gmod.detectRealmFromFilename` | `boolean` | `true` | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
-| `gmod.detectRealmFromCalls` | `boolean` | `true` | Infer realm from API usage (e.g. calling a server-only API signals server realm) |
+| `gmod.detectRealmFromCalls` | `boolean` | `true` | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, and `require` |
 | `gmod.inferDynamicFields` | `boolean` | `true` | Track fields dynamically assigned to GMod objects |
 | `gmod.dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files. Set `false` to scope them per-file |
 | `gmod.fileParamDefaults` | `object` | built-in map | Parameter-name → type fallback, applied to params without explicit `@param`. Editable in the Settings UI. Set a value to `""` to remove a built-in default |
@@ -60,6 +60,7 @@ Each definition supports:
 | `icon` | `string` | VS Code icon ID for Class Explorer display |
 | `rootDir` | `string` | Default root used by the scaffold action |
 | `scaffold.files` | `array` | Scaffold output entries: `{ path, template }` with `{{name}}` variable |
+| `disabled` | `boolean` | Disable this definition (useful for turning off built-in groups) |
 
 To **override** a built-in definition, add an entry with its `id` and only the fields to change. To **disable** a built-in group, set `{ "id": "effects", "disabled": true }`.
 
@@ -114,6 +115,9 @@ To **override** a built-in definition, add an entry with its `id` and only the f
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `gmod.network.enabled` | `boolean` | `true` | Enable all network flow analysis |
+| `gmod.network.diagnostics.typeMismatch` | `boolean` | `true` | Warn when read type doesn't match written type |
+| `gmod.network.diagnostics.orderMismatch` | `boolean` | `true` | Warn when read order doesn't match written order |
+| `gmod.network.diagnostics.missingCounterpart` | `boolean` | `true` | Warn when net message is missing read/write in other realm |
 | `gmod.network.completion.smartReadSuggestions` | `boolean` | `true` | Suggest net.Read* calls in expected order inside receive callbacks |
 | `gmod.network.completion.mismatchHints` | `boolean` | `true` | Annotate suggestions with hints when expected read doesn't match current |
 
@@ -163,7 +167,8 @@ These settings can also be configured via VS Code's settings (`gluals.*` prefix)
 
 | VSCode Setting | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|---|
-| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `boolean` | `true` | Auto-download GMod annotations |
+| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `boolean` (`boolean \| null` in workspace) | `true` (`null` in workspace) | Auto-download GMod annotations |
 | `gluals.gmod.templatePath` | `gmod.templatePath` | `string` | `null` | Custom scaffolding template path |
 | `gluals.gmod.vgui.codeLensEnabled` | `gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI code lens |
 | `gluals.gmod.vgui.inlayHintEnabled` | `gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI inlay hints |
+

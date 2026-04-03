@@ -1,0 +1,43 @@
+---
+title: "@source"
+description: Redirect Go to Definition to a source URI.
+---
+
+## Overview
+
+`@source` tells GLuaLS to open a different location when you use **Go to Definition**.
+
+This is mainly useful in generated annotation files that point back to a real source file or external URI.
+
+---
+
+## Syntax
+
+```lua
+---@source file:///absolute/path/to/file.lua#41:0
+```
+
+The current implementation expects a URI followed by `#line:column`.
+
+- `file:///...` for local files
+- `https://...` for web links
+- `line` and `column` use zero-based positions
+- `#l41:0` is also accepted for the line part
+
+---
+
+## Usage
+
+This is most commonly used in generated stubs where you want **Go to Definition** on a stub to jump to the real implementation.
+
+```lua
+-- In some generated definition file:
+
+---@class Player
+local Player = {}
+
+---@source file:///garrysmod/lua/includes/extensions/player.lua#41:0
+function Player:SetHealth(hp) end
+```
+
+When you use **Go to Definition** on `Player:SetHealth()`, GLuaLS opens the `@source` target instead of the stub.

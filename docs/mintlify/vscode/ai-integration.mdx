@@ -71,17 +71,4 @@ You: Run print(game.GetMap()) on the server
 Copilot: [calls run_lua] Output: gm_flatgrass
 ```
 
----
 
-## Security
-
-The MCP server includes these security controls:
-
-- **Local-only by default** — the server only accepts connections from `localhost`. Remote access is blocked unless explicitly configured.
-- **Auth token** — each session uses a random token that must be included in requests
-- **Rate limiting** — requests are rate-limited to prevent excessive calls.
-- **Tool allowlist** — you can restrict which tools are available to AI agents
-
-<Warning>
-The MCP server provides direct access to execute Lua on your game server. Only use this feature with trusted AI tools on a local development server. Never expose the MCP endpoint publicly. Never use this or any other debugger features on production servers.
-</Warning>

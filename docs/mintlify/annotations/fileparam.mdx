@@ -43,9 +43,9 @@ end
 
 ## Precedence
 
-Type resolution for parameters follows this order (highest to lowest):
+If GLuaLS cannot already infer the parameter type from the function signature or owning type, it falls back in this order:
 
-1. **Explicit `@param`** annotation on the function itself — always wins
+1. **Explicit `@param`** annotation on the function itself
 2. **`@fileparam`** for the current file
 3. **`gmod.fileParamDefaults`** in `.gluarc.json` — workspace-wide defaults
 
@@ -67,6 +67,8 @@ local function inspectGeneric(vehicle)
     -- vehicle: Entity
 end
 ```
+
+
 
 ---
 
@@ -91,7 +93,7 @@ Configure defaults that apply to all files in the workspace:
 
 ## Common patterns
 
-In GMod addon development, certain parameter names are almost universally the same type. Using `@fileparam` (or workspace defaults) reduces annotation boilerplate significantly:
+In GMod addon development, certain parameter names are almost always the same type. Using `@fileparam` or workspace defaults cuts down on repeated `@param` annotations:
 
 ```lua
 ---@fileparam ply Player

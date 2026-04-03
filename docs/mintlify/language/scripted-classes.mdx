@@ -11,8 +11,8 @@ Garry's Mod uses a "scripted class" pattern where you use a global table (`ENT`,
 
 - Automatic class registration including inheritance
 - Automatic synthesis of `NetworkVar` getter/setter pairs
-- Detection of `AccessorFunc`-generated methods
-- Type checking for required fields
+- Automatic synthesis of `AccessorFunc` getter/setter pairs
+- Better completions and type checking for scripted class code
 
 ---
 
@@ -22,10 +22,9 @@ GLuaLS detects scripted classes by their **file path**. Any file under a recogni
 
 | Directory pattern | Class table | Base class |
 |---|---|---|
-| `lua/entities/**/` | `ENT` | `base_entity` |
-| `lua/weapons/**/` | `SWEP` | `base_weapon` |
+| `lua/entities/**/` | `ENT` | `Entity` |
+| `lua/weapons/**/` | `SWEP` | `Weapon` |
 | `lua/effects/**/` | `EFFECT` | (none) |
-| `lua/entities/**/` (npc prefix) | `ENT` | `base_ai` |
 
 The detected class table is automatically typed with the base class's methods and fields, so you get completions and type-checking without any annotation.
 
@@ -33,37 +32,6 @@ This table can be adjusted in settings.
 
 ---
 
-## NetworkVar synthesis
-
-When you call `self:NetworkVar(...)` inside a scripted class `SetupDataTables` function, GLuaLS automatically synthesizes the corresponding getter and setter methods:
-
-```lua
-function ENT:SetupDataTables()
-    self:NetworkVar("Int", 0, "Health")   -- synthesizes GetHealth() and SetHealth()
-    self:NetworkVar("Bool", 0, "Active")  -- synthesizes GetActive() and SetActive()
-    self:NetworkVar("String", 0, "Name")  -- synthesizes GetName() and SetName()
-end
-
-function ENT:Think()
-    local hp = self:GetHealth()  -- ✅ typed as number
-    self:SetActive(true)          -- ✅ typed, argument must be boolean
-    print(self:GetName())         -- ✅ typed as string
-end
-```
-
-### Supported NetworkVar types
-
-| NetworkVar type | Getter/setter types |
-|---|---|
-| `"Int"` | `number` |
-| `"Float"` | `number` |
-| `"Bool"` | `boolean` |
-| `"String"` | `string` |
-| `"Entity"` | `Entity` |
-| `"Vector"` | `Vector` |
-| `"Angle"` | `Angle` |
-
----
 
 ## AccessorFunc synthesis
 
@@ -81,13 +49,52 @@ This can be done via the annotation `---@accessorfunc` for custom getters/setter
 
 ---
 
+## NetworkVar synthesis
+
+`ENT:NetworkVar(type, slot, name, ...)` generates entity accessors. GLuaLS detects these calls and synthesizes matching methods:
+
+```lua
+function ENT:SetupDataTables()
+    self:NetworkVar("Int", 0, "Health")
+    self:NetworkVar("Bool", 1, "Active")
+    self:NetworkVar("String", 2, "Name")
+end
+
+-- GLuaLS synthesizes:
+-- ENT:GetHealth() -> number
+-- ENT:SetHealth(value: number) -> nil
+-- ENT:GetActive() -> boolean
+-- ENT:SetActive(value: boolean) -> nil
+-- ENT:GetName() -> string
+-- ENT:SetName(value: string) -> nil
+```
+
+This gives you completions and type checking for generated accessors without manual annotations.
+
+### Supported NetworkVar types
+
+| NetworkVar type | Getter/setter type |
+|---|---|
+| `"Int"` | `integer` |
+| `"UInt"` | `integer` |
+| `"Float"` | `number` |
+| `"Double"` | `number` |
+| `"Bool"` | `boolean` |
+| `"String"` | `string` |
+| `"Entity"` | `Entity` |
+| `"Vector"` | `Vector` |
+| `"Angle"` | `Angle` |
+| `"Color"` | `Color` |
+
+---
+
 ## Base class inheritance
 
-Scripted classes in GMod inherit from base classes (like `base_gmodentity`). GLuaLS understands this chain and provides completions for all inherited methods. `ENT.Base` will be used to determine the base class, with `BaseClass` being valid that file scope.
+Scripted classes in GMod inherit from base classes. GLuaLS understands this chain and provides completions for inherited methods. The scripted class table also gets the standard base type for that scope (`Entity`, `Weapon`, `Tool`, and so on). `DEFINE_BASECLASS(...)` and values like `ENT.Base` can refine that further.
 
 ```lua
 function ENT:Use(ply)
-    self:EmitSound("...")    -- inherited from base_entity ✅
+    self:EmitSound("...")    -- inherited from Entity / base class chain ✅
     ply:ChatPrint("Hello")   -- Player method ✅
 end
 ```
@@ -108,6 +115,43 @@ Completions suggest the correct signature for each override.
 
 ---
 
+## Class Explorer integration
+
+Detected scripted classes are listed in the VS Code **Class Explorer**. You can browse groups (entities, weapons, effects, and custom scopes) and jump to class definitions quickly.
+
+Class grouping and labels come from `gmod.scriptedClassScopes.include`.
+
+---
+
+## Scaffolding integration
+
+Scripted class scopes also drive class scaffolding. Each scope can define scaffold output files via `scaffold.files` and a `rootDir` in `gmod.scriptedClassScopes.include`.
+
+This lets you create new classes with your own template layout while keeping class analysis, explorer grouping, and generated files in sync.
+
+See [GMod settings](/configuration/gmod#scripted-classes) for all supported fields.
+
+### Creating a new class
+
+1. Open the **Class Explorer** in the sidebar.
+2. Find the group you want, such as **Entities**.
+3. Click the **+** button next to that group.
+4. Enter the class name.
+5. The VS Code extension creates the files and opens the main file.
+
+### Built-in templates
+
+The VS Code extension ships with built-in templates for the standard scripted class types:
+
+| Class type | Generated files |
+|---|---|
+| **Entity** | `shared.lua`, `init.lua`, `cl_init.lua` |
+| **Weapon (SWEP)** | `shared.lua` |
+| **Effect** | `your_effect_name.lua` |
+| **Scripted Tool (STOOL)** | `your_tool_name.lua` |
+
+---
+
 ## Custom class scopes
 
 If you use a non-standard directory structure or custom class types, configure GLuaLS to recognize them:
@@ -123,17 +167,9 @@ If you use a non-standard directory structure or custom class types, configure G
           "id": "my_panels",
           "label": "Panels",
           "classGlobal": "PANEL",
-          "baseClass": "Panel",
           "path": ["panels"],
           "include": ["lua/panels/**"],
-          "rootDir": "lua/panels",
-          "icon": "symbol-class",
-          "filePattern": "**/init.lua",
-          "scaffold": {
-            "files": [
-              { "path": "{{name}}/init.lua", "template": "panel_init.lua" }
-            ]
-          }
+          "rootDir": "lua/panels"
         }
       ]
     }
@@ -152,157 +188,26 @@ If you use a non-standard directory structure or custom class types, configure G
 | `include` | Glob patterns matching files that belong to this class type |
 | `rootDir` | Root directory for scaffolded files |
 | `icon` | VS Code icon ID shown in the Class Explorer (e.g., `symbol-class`) |
-| `filePattern` | Glob pattern restricting which files define the class table |
-| `scaffold` | File generation configuration (see [Scaffolding](#scaffolding) below) |
 
 ---
 
-## Class Explorer
 
-The Class Explorer is a tree view in the VS Code Activity Bar that lets you browse all scripted classes and workspace resources at a glance. Click any class or file to jump directly to its definition.
-
-### Classes section
-
-The Classes section groups your scripted classes by type:
-
-| Group | Detected from |
-|---|---|
-| **Entities** | Files under `lua/entities/` or custom `path` config |
-| **Weapons** | Files under `lua/weapons/` |
-| **Effects** | Files under `lua/effects/` |
-| **Scripted Tools** | Files under `lua/weapons/gmod_tool/stools/` |
-| **Gamemodes/Plugins** | Files under configured plugin paths |
-
-Each group shows the detected class name alongside its class global (`ENT`, `SWEP`, etc.). Expand a class to navigate to its definition. These are the same classes described in [Automatic detection](#automatic-detection) and [Custom class scopes](#custom-class-scopes).
-
-When a scripted class definition has scaffold files configured, a **+** (New) button appears next to the class group. See [Scaffolding](#scaffolding) below for details.
-
-### Resources section
-
-The Resources section shows workspace assets organized by type:
-
-| Category | Contents |
-|---|---|
-| **Materials** | `.vmt` and `materials/` references found in Lua files |
-| **Models** | `models/` path references |
-| **Sounds** | `sounds/` and `sound/` references |
-
-Click any resource to open the file it was referenced from.
-
-### Filtering
-
-Use the search box at the top of the Class Explorer to filter classes by name. The filter matches against the class name, its global (`ENT`, `SWEP`, etc.), and file path.
-
-### Custom class groups
-
-You can define custom class groups for frameworks that use their own class patterns. The `label`, `icon`, `path`, and `include` fields from [Custom class scopes](#custom-class-scopes) control how the group appears in the Explorer:
-
-<ConfigTip />
-```json .gluarc.json
-{
-  "gmod": {
-    "scriptedClassScopes": {
-      "include": [
-        {
-          "id": "my-controllers",
-          "label": "Controllers",
-          "classGlobal": "CONTROLLER",
-          "path": ["myframework", "controllers"],
-          "include": ["lua/myframework/controllers/**"],
-          "rootDir": "lua/myframework/controllers",
-          "icon": "symbol-class"
-        }
-      ]
-    }
-  }
-}
-```
-
----
-
-## Scaffolding
-
-GLuaLS can generate boilerplate files for new scripted classes from templates. When you create a new entity or weapon, all the required files are created in the correct location with your class name substituted in.
-
-### Creating a new class
-
-1. Open the **Class Explorer** in the sidebar
-2. Find the class group you want to create in (e.g., **Entities**)
-3. Click the **+** (New) icon next to the group header
-4. Enter the class name when prompted
-5. The files are generated and the main file opens automatically
-
-### Built-in templates
-
-GLuaLS ships with templates for all standard GMod scripted class types:
-
-| Class type | Generated files |
-|---|---|
-| **Entity** | `shared.lua`, `cl_init.lua`, `init.lua` |
-| **Weapon (SWEP)** | `shared.lua`, `cl_init.lua`, `init.lua` |
-| **Effect** | `init.lua` |
-| **Scripted Tool (STOOL)** | `shared.lua` |
-
-### Custom templates
-
-You can override any built-in template or add templates for custom class types by setting a template directory:
-
-<ConfigTip />
-```json .gluarc.json
-{
-  "gmod": {
-    "templatePath": ".gluals/templates"
-  }
-}
-```
-
-Templates are `.lua` files with `{{name}}` placeholders:
-
-```lua .gluals/templates/ent_shared.lua
-ENT.Type = "anim"
-ENT.Base = "base_gmodentity"
-ENT.PrintName = "{{name}}"
-ENT.Author = ""
-ENT.Spawnable = false
-ENT.AdminSpawnable = false
-```
-
-| Placeholder | Value |
-|---|---|
-| `{{name}}` | The class name entered when scaffolding |
-
-### Wiring templates to class definitions
-
-Add scaffold configuration to your [custom class scope](#custom-class-scopes) to tell GLuaLS which template files to generate:
-
-<ConfigTip />
-```json .gluarc.json
-{
-  "gmod": {
-    "templatePath": ".gluals/templates",
-    "scriptedClassScopes": {
-      "include": [
-        {
-          "id": "entities",
-          "rootDir": "lua/entities",
-          "scaffold": {
-            "files": [
-              { "path": "{{name}}/shared.lua", "template": "ent_shared.lua" },
-              { "path": "{{name}}/cl_init.lua", "template": "ent_cl.lua" },
-              { "path": "{{name}}/init.lua", "template": "ent_sv.lua" }
-            ]
-          }
-        }
-      ]
-    }
-  }
-}
-```
-
-The `path` value is relative to the class `rootDir` (e.g., `lua/entities/`), and `template` refers to the filename inside your `templatePath` folder. Built-in templates are used as fallback if the custom template file is not found.
-
----
 
 ## Disabling scripted class inference
 
-Individual scripted class scopes can be disabled by removing them from the `scriptedClassScopes` configuration.
+To disable a built-in scripted class scope, add an override with the same `id` and set `"disabled": true`.
+
+```json .gluarc.json
+{
+  "gmod": {
+    "scriptedClassScopes": {
+      "include": [
+        {
+          "id": "effects",
+          "disabled": true
+        }
+      ]
+    }
+  }
+}
+```

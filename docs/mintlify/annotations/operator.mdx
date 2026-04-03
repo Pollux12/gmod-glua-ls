@@ -1,0 +1,51 @@
+---
+title: "@operator"
+description: Declare operator behavior for a class.
+---
+
+## Overview
+
+`@operator` tells GLuaLS what a class supports for operators like `+`, `==`, `#`, indexing, or calling.
+
+Use it in annotation files or class definitions when GLuaLS cannot infer the operator behavior by itself.
+
+---
+
+## Syntax
+
+```lua
+---@operator op_name(operand_type): return_type
+---@operator call: return_type
+```
+
+---
+
+## Usage
+
+Add the operator on the class before the local assignment or returned table:
+
+```lua
+---@class Vector
+---@operator add(Vector): Vector
+---@operator sub(Vector): Vector
+---@operator mul(number): Vector
+local Vector = {}
+
+local v1 = Vector()
+local v2 = Vector()
+
+-- GLuaLS understands v3 is a Vector because of the add operator
+local v3 = v1 + v2
+```
+
+---
+
+## Supported Operators
+
+- Arithmetic: `add`, `sub`, `mul`, `div`, `mod`, `pow`, `unm` (unary minus)
+- Bitwise: `band`, `bor`, `bxor`, `shl`, `shr`, `bnot`
+- Other numeric: `idiv`
+- Relational: `eq`, `lt`, `le`
+- Other: `len` (length operator `#`), `concat` (concatenation `..`), `call`, `index`
+
+`pairs` is parsed internally but is not currently implemented for type inference, so it is not documented as supported here.

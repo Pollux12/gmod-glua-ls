@@ -37,7 +37,7 @@ If you need to use a custom annotations build or are in an environment without i
 
 | VSCode Setting | .gluarc.json Key | Default | Description |
 |---|---|---|---|
-| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `true` | Auto-download and load GMod wiki annotations |
+| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `true` (`null` in workspace) | Auto-download and load GMod wiki annotations |
 
 ### Via VSCode settings
 
@@ -66,7 +66,7 @@ Point GLuaLS at your own annotations folder instead of the auto-downloaded ones:
 
 | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|
-| `gmod.annotationsPath` | `string` | `null` | Path to custom annotations folder |
+| `gmod.annotationsPath` | `string \| null` | `null` | Path to custom annotations folder |
 
 ```json .gluarc.json
 {

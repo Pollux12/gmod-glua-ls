@@ -13,7 +13,9 @@ GLua networking requires manually matching `net.Start(name)` + `net.Write*` call
 
 ### Message registration
 
-Every `net.Start(name)` call must have a corresponding `util.AddNetworkString(name)` on the server.
+Every `net.Start(name)` call must have a corresponding `util.AddNetworkString(name)`.
+
+In real Garry's Mod code, `util.AddNetworkString` must run on the server. GLuaLS checks for that registration across the workspace so it can still connect senders and receivers across files.
 
 ```lua
 -- ❌ Error: "PlayerData" not registered with util.AddNetworkString
@@ -26,7 +28,6 @@ net.Broadcast()
 -- ✅ OK
 util.AddNetworkString("PlayerData")  -- in a sv_ file or SERVER block
 
--- In a shared or cl_ file:
 net.Start("PlayerData")
 net.WriteString("test")
 net.Broadcast()
@@ -34,7 +35,7 @@ net.Broadcast()
 
 ### Missing counterpart
 
-Every `net.Start(name)` (sender) should have a `net.Receive(name)` (receiver) in the opposite realm:
+Every `net.Start(name)` (sender) should usually have a matching `net.Receive(name)` (receiver) somewhere in your workspace:
 
 ```lua
 -- sv_comms.lua: sends "PlayerInfo" to client
@@ -42,12 +43,12 @@ net.Start("PlayerInfo")
 net.WriteString(ply:Nick())
 net.Send(ply)
 
--- cl_comms.lua: ❌ Warning — no net.Receive("PlayerInfo") found on client
+-- Elsewhere in your workspace: ❌ Warning — no net.Receive("PlayerInfo") found
 ```
 
 ### Read/write type mismatch
 
-The sequence of `net.Read*` calls must match the sequence of `net.Write*` calls for the same message:
+The sequence of `net.Read*` calls must match the sequence of `net.Write*` calls for the same message type-wise:
 
 ```lua
 -- Server writes:
@@ -73,7 +74,7 @@ The order in which reads occur must match the write order. GLuaLS analyzes the s
 | Code | Description |
 |---|---|
 | `gmod-unknown-net-message` | `net.Start(name)` uses a name not registered with `util.AddNetworkString` |
-| `gmod-net-missing-network-counterpart` | Sender exists but no matching receiver found in the expected realm |
+| `gmod-net-missing-network-counterpart` | A sender or receiver exists, but no matching counterpart with the same message name was found |
 | `gmod-net-read-write-type-mismatch` | `net.Read*` type doesn't match the `net.Write*` type for the same sequence position |
 | `gmod-net-read-write-order-mismatch` | The order of reads doesn't match the order of writes |
 
@@ -81,7 +82,7 @@ The order in which reads occur must match the write order. GLuaLS analyzes the s
 
 ## Smart completions
 
-When typing the name argument to `net.Start()` or `net.Receive()`, GLuaLS autocompletes with the known registered message names in your workspace.
+When typing the name argument to `net.Start()` or `net.Receive()`, GLuaLS autocompletes with known network message names from your workspace.
 
 ---
 
@@ -93,9 +94,13 @@ Network analysis works across files. Messages registered in one file, sent in a 
 
 ## Configuration
 
-Network diagnostics are controlled via the central `diagnostics` section (e.g. `diagnostics.disable`/`diagnostics.enables`).
+Most network flow checks are configured under `gmod.network`.
 
-See the [GMod settings](/configuration/gmod#network) for the full reference on network-related configuration options.
+You can disable the network flow diagnostics with `gmod.network.enabled`, or tune specific checks with `gmod.network.diagnostics.*`.
+
+The missing `util.AddNetworkString` check is separate. If you want to silence a specific diagnostic code entirely, use the global `diagnostics.disable` setting.
+
+See the [GMod settings](/configuration/gmod#network-analysis) for the full reference on network-related configuration options.
 
 ---
 
@@ -103,7 +108,7 @@ See the [GMod settings](/configuration/gmod#network) for the full reference on n
 
 - Dynamic message names computed at runtime (e.g., `net.Start("msg" .. id)`) cannot be statically verified and are skipped
 - Very complex conditional logic around `net.Write*` calls may not be fully modeled
-- Only files included in workspace analysis are considered; files outside `workspace.library` paths are not checked for counterparts
+- Only files included in workspace analysis are considered; files outside the current analysis scope are not checked for counterparts
 
 ## VSCode integration
 

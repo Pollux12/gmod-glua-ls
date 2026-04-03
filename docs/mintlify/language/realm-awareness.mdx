@@ -56,8 +56,13 @@ Files in well-known directories are assigned a realm:
 | `lua/autorun/client/` | Client |
 | `lua/autorun/server/` | Server |
 | `lua/autorun/` | Shared |
-| `lua/client/` or `lua/vgui/` | Client |
-| Other recognized GMod paths | Shared or unresolved |
+| `lua/client/`, `lua/vgui/`, `lua/postprocess/`, `lua/matproxy/`, `lua/skins/` | Client |
+| `lua/effects/`, `lua/includes/`, `*/stools/` | Shared |
+
+This works for both common workspace layouts:
+
+- Garry's Mod root: `addons/<name>/lua/...` and `gamemodes/<name>/...`
+- Addon or gamemode root: `lua/...`, `gamemode/...`, and `entities/...`
 
 ### 4. Block-level narrowing
 
@@ -78,6 +83,27 @@ end
 ### 5. Heuristic inference (lowest priority)
 
 If none of the above apply, GLuaLS can infer realm from code usage (for example, calling a server-only API suggests server realm). This heuristic may be wrong in some cases.
+
+---
+
+## Call-based inference
+
+When call-based detection is on, GLuaLS also looks at file-loading calls:
+
+- `AddCSLuaFile("file.lua")` marks that file as **Client**
+- `AddCSLuaFile()` (no args) adds a **Shared** hint to the current file (stronger filename/path hints can still resolve as Client or Server)
+- `IncludeCS("file.lua")` is treated like `AddCSLuaFile("file.lua")` + `include("file.lua")`
+- `IncludeCS()` with no filename is ignored
+- `require("mod")` marks the required module as **Shared**
+- `include("file.lua")` passes realm hints to the included file
+
+`AddCSLuaFile` does not mark the caller as server. It only affects the target file.
+
+---
+
+## Loading defaults
+
+Default path-based realm rules are based on Garry's Mod's usual loading conventions (or very similar patterns). See [Lua Loading Order](https://wiki.facepunch.com/gmod/Lua_Loading_Order) for reference.
 
 ---
 
@@ -145,3 +171,5 @@ Every hover tooltip for a GMod API function includes a realm badge showing where
 The badge appears in completions as well, so you can check a function's realm before inserting it.
 
 Realm also filters autocomplete. In client files, server-only functions are hidden (and vice versa). If a function seems missing, check inferred realm first.
+
+

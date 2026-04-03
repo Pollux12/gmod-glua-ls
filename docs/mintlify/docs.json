@@ -93,7 +93,8 @@
               "annotations/field",
               "annotations/alias",
               "annotations/enum",
-              "annotations/generic"
+              "annotations/generic",
+              "annotations/operator"
             ]
           },
           {
@@ -123,6 +124,8 @@
               "annotations/deprecated",
               "annotations/meta",
               "annotations/module",
+              "annotations/source",
+              "annotations/version",
               "annotations/see"
             ]
           }

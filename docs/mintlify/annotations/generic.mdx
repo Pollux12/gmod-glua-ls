@@ -89,17 +89,17 @@ local players = filter(player.GetAll(), function(ply) return ply:IsAdmin() end)
 ## When to use generics
 
 Generics are most useful when:
-- A function transforms a value but preserves its type (e.g., `clone`, `wrap`)
-- A function filters or maps over a typed collection
+- A function transforms a value but keeps its type
+- A function filters or maps over a typed list
 - A function takes a callback and returns its result type
 
-For simpler cases, union types or `any` are often more practical.
+For simpler cases, a union type or `any` is often easier to read.
 
 ---
 
 ## String-template capture (GLuaLS)
 
-Use backticks when a string argument should pick a class/type.
+Use backticks when a string argument should pick a class or type.
 
 Use this when a function takes a class name as text and should return that class type:
 
@@ -125,8 +125,8 @@ function ents.FindByClass(class) end
 ```
 
 Quick rule:
-- `T` uses the normal Lua value type (`"x"` -> `string`)
-- `` `T` `` uses the string text as a class/type name (`"sent_npc"` -> `sent_npc`)
+- `T` uses the normal Lua value type (`"x"` becomes `string`)
+- `` `T` `` uses the string text as a class or type name (`"sent_npc"` becomes `sent_npc`)
 
 Common string-template forms:
 
@@ -136,24 +136,6 @@ Common string-template forms:
 ---@class `T`.bbb
 ---@class `T`
 ```
-
----
-
-## Constructor-style generic capture
-
-For APIs that accept either a class object or a class-name string:
-
-```lua
----@alias ConstructorParameters<T> T extends new (fun(...: infer P): any) and P or never
-
----@generic T
----@param name `T`|T
----@param ... ConstructorParameters<T>...
----@return T
-function make(name, ...) end
-```
-
-In `` `T`|T ``, the `T` part handles class objects and the `` `T` `` part handles class-name strings.
 
 ---
 

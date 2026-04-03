@@ -33,6 +33,7 @@ GLuaLS follows EmmyLua-style annotations, with extra support for GMod-specific c
 | [`@alias`](/annotations/alias) | Create a new type alias | `---@alias ID string \| number` |
 | [`@enum`](/annotations/enum) | Mark a table as an enumeration | `---@enum TEAM` |
 | [`@generic`](/annotations/generic) | Add generic type parameters to a function | `---@generic T` |
+| [`@operator`](/annotations/operator) | Document an operator overload | `---@operator add(Vector): Vector` |
 
 ## Function annotations
 
@@ -49,7 +50,7 @@ GLuaLS follows EmmyLua-style annotations, with extra support for GMod-specific c
 | Annotation | Description | Example |
 |---|---|---|
 | [`@realm`](/annotations/realm) | Declare which realm code runs in | `---@realm server` |
-| [`@hook`](/annotations/hook) | Register method as a hook handler | `---@hook PlayerSpawn` |
+| [`@hook`](/annotations/hook) | Mark a function or method as a hook handler | `---@hook PlayerSpawn` |
 | [`@fileparam`](/annotations/fileparam) | Set a file-wide parameter type default | `---@fileparam ply Player` |
 | [`@accessorfunc`](/annotations/accessorfunc) | Mark a function as an accessor generator | `---@accessorfunc` |
 
@@ -61,7 +62,10 @@ GLuaLS follows EmmyLua-style annotations, with extra support for GMod-specific c
 | [`@cast`](/annotations/cast) | Cast a variable to a different type | `---@cast ply Player` |
 | [`@deprecated`](/annotations/deprecated) | Mark a symbol as deprecated | `---@deprecated Use NewFunc()` |
 | [`@meta`](/annotations/meta) | Mark a file as type-only (not runtime) | `---@meta` |
+| [`@module`](/annotations/module) | Declare a file as a named module | `---@module mymodule` |
 | [`@see`](/annotations/see) | Add a cross-reference to another symbol | `---@see AnotherClass` |
+| [`@source`](/annotations/source) | Map a definition to its true source location | `---@source file:///path/file.lua#41:0` |
+| [`@version`](/annotations/version) | Restrict features to specific Lua versions | `---@version >5.1` |
 
 ---
 
