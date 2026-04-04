@@ -15,10 +15,7 @@ mod tests {
             "lua/autorun/server/sv_api.lua",
             r#"function ServerOnlyApi() return true end"#,
         );
-        let file_id = ws.def_file(
-            "lua/autorun/client/cl_test.lua",
-            r#"ServerOnlyApi()"#,
-        );
+        let file_id = ws.def_file("lua/autorun/client/cl_test.lua", r#"ServerOnlyApi()"#);
         let diagnostics = ws
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
@@ -42,10 +39,7 @@ mod tests {
             "lua/autorun/server/sv_api.lua",
             r#"function ServerOnlyApi() return true end"#,
         );
-        let file_id = ws.def_file(
-            "lua/autorun/client/cl_test.lua",
-            r#"ServerOnlyApi()"#,
-        );
+        let file_id = ws.def_file("lua/autorun/client/cl_test.lua", r#"ServerOnlyApi()"#);
         let diagnostics = ws
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
@@ -1093,10 +1087,7 @@ mod tests {
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::GmodRealmMismatch);
-        let file_id = ws.def_file(
-            "lua/autorun/client/cl_test.lua",
-            r#"ServerOnlyApi()"#,
-        );
+        let file_id = ws.def_file("lua/autorun/client/cl_test.lua", r#"ServerOnlyApi()"#);
         let diagnostics = ws
             .analysis
             .diagnose_file(file_id, CancellationToken::new())

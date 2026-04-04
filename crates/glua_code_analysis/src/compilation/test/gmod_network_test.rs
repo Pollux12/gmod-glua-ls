@@ -186,6 +186,46 @@ mod test {
     }
 
     #[gtest]
+    fn test_send_flow_includes_writes_inside_control_flow_blocks() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let file_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/net_send_control_flow.lua",
+            r#"
+            net.Start("Msg")
+            net.WriteUInt(1, 8)
+            net.WriteString("name")
+            if ( true ) then
+                for _, wsid in ipairs({ "123" }) do
+                    net.WriteString(wsid)
+                end
+            end
+            net.WriteBool(true)
+            net.Broadcast()
+            "#,
+        );
+
+        let data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(file_id)
+            .expect("expected network data");
+
+        assert_that!(data.send_flows.len(), eq(1usize));
+        let flow = &data.send_flows[0];
+        assert_that!(
+            send_op_kinds(flow),
+            eq(&vec![
+                NetOpKind::WriteUInt,
+                NetOpKind::WriteString,
+                NetOpKind::WriteString,
+                NetOpKind::WriteBool,
+            ])
+        );
+    }
+
+    #[gtest]
     fn test_nested_closure_reads_are_not_included_in_parent_callback() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

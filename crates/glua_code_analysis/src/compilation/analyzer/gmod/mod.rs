@@ -381,31 +381,20 @@ fn collect_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
             let mut send = None;
 
             for next_stat in stats.iter().skip(index + 1) {
-                let Some(next_call_expr) = call_expr_from_stat(next_stat) else {
-                    continue;
-                };
-
-                let Some(next_method_name) = get_exact_net_method_name(&next_call_expr) else {
-                    continue;
-                };
-
-                if next_method_name == "Start" {
-                    break;
-                }
-
-                if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
-                    send = Some((next_call_expr.get_range(), send_kind));
-                    break;
-                }
-
-                if let Some(op_kind) = NetOpKind::from_fn_name(next_method_name.as_str())
-                    && op_kind.is_write()
+                if let Some(next_call_expr) = call_expr_from_stat(next_stat)
+                    && let Some(next_method_name) = get_exact_net_method_name(&next_call_expr)
                 {
-                    writes.push(NetOpEntry {
-                        kind: op_kind,
-                        range: next_call_expr.get_range(),
-                    });
+                    if next_method_name == "Start" {
+                        break;
+                    }
+
+                    if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
+                        send = Some((next_call_expr.get_range(), send_kind));
+                        break;
+                    }
                 }
+
+                collect_net_write_ops_from_stat(&block, next_stat, &mut writes);
             }
 
             let Some((send_range, send_kind)) = send else {
@@ -511,31 +500,20 @@ fn collect_wrapped_net_send_flows_in_function_block(
             let mut send = None;
 
             for next_stat in stats.iter().skip(index + 1) {
-                let Some(next_call_expr) = call_expr_from_stat(next_stat) else {
-                    continue;
-                };
-
-                let Some(next_method_name) = get_exact_net_method_name(&next_call_expr) else {
-                    continue;
-                };
-
-                if next_method_name == "Start" {
-                    break;
-                }
-
-                if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
-                    send = Some((next_call_expr.get_range(), send_kind));
-                    break;
-                }
-
-                if let Some(op_kind) = NetOpKind::from_fn_name(next_method_name.as_str())
-                    && op_kind.is_write()
+                if let Some(next_call_expr) = call_expr_from_stat(next_stat)
+                    && let Some(next_method_name) = get_exact_net_method_name(&next_call_expr)
                 {
-                    writes.push(NetOpEntry {
-                        kind: op_kind,
-                        range: next_call_expr.get_range(),
-                    });
+                    if next_method_name == "Start" {
+                        break;
+                    }
+
+                    if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
+                        send = Some((next_call_expr.get_range(), send_kind));
+                        break;
+                    }
                 }
+
+                collect_net_write_ops_from_stat(&block, next_stat, &mut writes);
             }
 
             writes.sort_by_key(|entry| entry.range.start());
@@ -614,6 +592,27 @@ fn collect_net_read_ops_from_block(block: LuaBlock, reads: &mut Vec<NetOpEntry>)
             && op_kind.is_read()
         {
             reads.push(NetOpEntry {
+                kind: op_kind,
+                range: call_expr.get_range(),
+            });
+        }
+    }
+}
+
+fn collect_net_write_ops_from_stat(block: &LuaBlock, stat: &LuaStat, writes: &mut Vec<NetOpEntry>) {
+    for call_expr in stat.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        if is_call_expr_in_nested_closure(block, &call_expr) {
+            continue;
+        }
+
+        let Some(method_name) = get_exact_net_method_name(&call_expr) else {
+            continue;
+        };
+
+        if let Some(op_kind) = NetOpKind::from_fn_name(method_name.as_str())
+            && op_kind.is_write()
+        {
+            writes.push(NetOpEntry {
                 kind: op_kind,
                 range: call_expr.get_range(),
             });

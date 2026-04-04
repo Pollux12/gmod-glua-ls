@@ -253,6 +253,77 @@ mod tests {
     }
 
     #[gtest]
+    fn test_multiple_senders_with_control_flow_writer_avoids_false_count_mismatch() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteOrderMismatch);
+
+        ws.def_file(
+            "lua/autorun/server/send_simple.lua",
+            r#"
+            util.AddNetworkString("CopiedDupe")
+
+            net.Start("CopiedDupe")
+            net.WriteUInt(1, 1)
+            net.WriteVector(Vector(0, 0, 0))
+            net.WriteVector(Vector(1, 1, 1))
+            net.WriteString("simple")
+            net.WriteUInt(10, 24)
+            net.WriteUInt(0, 16)
+            net.WriteUInt(20, 24)
+            net.Broadcast()
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/server/send_control_flow.lua",
+            r#"
+            net.Start("CopiedDupe")
+            net.WriteUInt(1, 1)
+            net.WriteVector(Vector(0, 0, 0))
+            net.WriteVector(Vector(1, 1, 1))
+            net.WriteString("with_addons")
+            net.WriteUInt(10, 24)
+
+            local addon_count = 1
+            net.WriteUInt(addon_count, 16)
+            if ( addon_count > 0 ) then
+                for _, wsid in ipairs({ "123456" }) do
+                    net.WriteString(wsid)
+                end
+            end
+            net.WriteUInt(20, 24)
+            net.Send(Entity(1))
+            "#,
+        );
+
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("CopiedDupe", function()
+                local can_save = net.ReadUInt(1)
+                local mins = net.ReadVector()
+                local maxs = net.ReadVector()
+                local name = net.ReadString()
+                local ent_count = net.ReadUInt(24)
+                local workshop_count = net.ReadUInt(16)
+                for _ = 1, workshop_count do
+                    net.ReadString()
+                end
+                local constraint_count = net.ReadUInt(24)
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch),
+            eq(0usize)
+        );
+    }
+
+    #[gtest]
     fn test_config_toggle_disables_type_mismatch() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
