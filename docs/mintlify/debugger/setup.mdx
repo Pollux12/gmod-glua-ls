@@ -189,6 +189,17 @@ end
 This script is copy-pasted from version 1.0.6 and may be outdated if you are using a newer version of the extension. It is always recommended to use the setup wizard for the latest version of the loader script.
 </Note>
 
+### Runtime launch flags
+
+`gm_rdb` reads these optional commandline flags when the module loads. These flags are optional.
+
+| Flag | Effect | Default without flag |
+|---|---|---|
+| `-rdb_allow_remote` | Accept debugger connections from non-loopback addresses | Only localhost or loopback connections are allowed |
+| `-rdb_pause_on_activate [seconds]` | Pause on the next event after `rdb.activate(...)` runs. Optional timeout in seconds; use `0` to wait indefinitely. | `activate` does not pause |
+
+These CLI flags should be added to your Garry's Mod or SRCDS launch options.
+
 ---
 
 ## Step 2: Configure VS Code
@@ -301,6 +312,34 @@ Make sure to update `"port"` in your `launch.json` to match.
 
 ## Remote debugging
 
-<Danger>Do not use the debugger on untrusted or public networks. Use remote debugging only if you understand and accept the risk.</Danger>
+<Warning>Do not use the debugger on untrusted or public networks. Use remote debugging only if you understand and accept the risk.</Warning>
 
-If debugging a remote server, open the `gm_rdb` port (default `21111`) in your server's firewall.
+If debugging a remote server, start SRCDS with `-rdb_allow_remote`, open the `gm_rdb` port (default `21111`) in your server's firewall, and set `host` in your `launch.json` to the server's reachable address.
+
+Without `-rdb_allow_remote`, `gm_rdb` only accepts loopback connections and remote attach will fail.
+
+<Danger>Do not enable this option unless you understand and accept the risk. If this option is enabled on the client and your local port is exposed, any server could technically activate the debugger via clientside lua and start debugging.</Danger>
+
+---
+
+## Pause on activation
+
+<Warning>Do not use the debugger on untrusted or public networks. This option pauses execution once loaded (usually during startup/initial join). If no timeout is provided, execution resumes automatically after 60 seconds if no debugger connects.</Warning>
+
+`rdb.activate(...)` does not pause execution by default. This means that the startup sequence of the server and client will likely not be captured by the debugger, unless you've very quick at connecting it.
+
+If you want the debugger to pause on the next hook event after `rdb.activate(...)` runs, add `-rdb_pause_on_activate` to the server startup arguments or client steam launch options. You can optionally provide a timeout in seconds.
+
+```txt
+-rdb_pause_on_activate
+-rdb_pause_on_activate 120
+-rdb_pause_on_activate 0
+```
+
+- `-rdb_pause_on_activate` pauses on activation and resumes after 60 seconds if no debugger connects.
+- `-rdb_pause_on_activate 120` pauses on activation with a 120-second timeout.
+- `-rdb_pause_on_activate 0` pauses indefinitely until a debugger connects.
+
+This is useful for when you want to capture the startup sequence of the server and/or client.
+
+<Danger>If this option is enabled on the client, any server could technically activate the debugger, which will freeze your game.</Danger>

@@ -10,7 +10,7 @@ description: Install the GLua Language Server VSCode extension and get set up in
 The VS Code extension is the recommended way to use GLuaLS. It handles setup automatically:
 - downloads the language server binary
 - downloads GMod wiki annotations
-- installs debugger pieces
+- installs server and client debugger (optional)
 - keeps these updated
 
 <Steps>
@@ -29,6 +29,8 @@ The VS Code extension is the recommended way to use GLuaLS. It handles setup aut
     - Sets up the `.gluarc.json` configuration file if needed
 
     A notification in the bottom-right corner confirms when initialization is complete.
+
+    If you want to setup the debugger, continue to [Debugger setup](/debugger/setup).
   </Step>
 </Steps>
 
@@ -127,11 +129,11 @@ If you are not seeing any diagnostics but expected to, check the Garry's Mod Lan
   <Card title="Get started" icon="rocket" href="/getting-started/workspace-setup">
     Configure your workspace for the best GLuaLS experience.
   </Card>
-  <Card title="Settings UI" icon="sliders" href="/configuration/overview">
-    Configure `.gluarc.json` with the interactive settings panel.
+  <Card title="Set up the debugger" icon="bug" href="/debugger/setup">
+    Install `gm_rdb` and connect VS Code to a running SRCDS server.
   </Card>
   <Card title="Annotations" icon="tag" href="/annotations">
-    Improve type accuracy with EmmyLua/LuaCATS.
+    Improve type accuracy with EmmyLua and LuaCATS annotations.
   </Card>
   <Card title="Configuration reference" icon="file-code" href="/configuration/overview">
     Reference all GLuaLS configuration options.
