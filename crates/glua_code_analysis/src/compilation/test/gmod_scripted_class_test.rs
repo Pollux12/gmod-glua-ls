@@ -940,9 +940,7 @@ mod test {
             ),
         ]);
 
-        let param_uri = ws
-            .virtual_url_generator
-            .new_uri("lua/autorun/use_base.lua");
+        let param_uri = ws.virtual_url_generator.new_uri("lua/autorun/use_base.lua");
         let param_file_id = ws
             .analysis
             .get_file_id(&param_uri)

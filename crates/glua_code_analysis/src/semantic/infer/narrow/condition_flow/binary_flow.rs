@@ -21,6 +21,7 @@ use crate::{
             var_ref_id::get_var_expr_var_ref_id,
         },
     },
+    semantic::type_check::is_sub_type_of,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -132,6 +133,22 @@ fn try_get_at_eq_or_neq_expr(
     }
 
     result_type = maybe_field_literal_eq_narrow(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        left_expr.clone(),
+        right_expr.clone(),
+        condition_flow,
+    )?;
+
+    if let ResultTypeOrContinue::Result(result_type) = result_type {
+        return Ok(ResultTypeOrContinue::Result(result_type));
+    }
+
+    result_type = maybe_type_name_literal_eq_narrow(
         db,
         tree,
         cache,
@@ -703,6 +720,158 @@ fn maybe_field_literal_eq_narrow(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_type_name_literal_eq_narrow(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    left_expr: LuaExpr,
+    right_expr: LuaExpr,
+    condition_flow: InferConditionFlow,
+) -> Result<ResultTypeOrContinue, InferFailReason> {
+    let (call_expr, literal_expr) = match (left_expr, right_expr) {
+        (LuaExpr::CallExpr(call_expr), LuaExpr::LiteralExpr(literal_expr)) => {
+            (call_expr, literal_expr)
+        }
+        (LuaExpr::LiteralExpr(literal_expr), LuaExpr::CallExpr(call_expr)) => {
+            (call_expr, literal_expr)
+        }
+        _ => return Ok(ResultTypeOrContinue::Continue),
+    };
+
+    let class_name = match literal_expr.get_literal() {
+        Some(LuaLiteralToken::String(s)) => s.get_value(),
+        _ => return Ok(ResultTypeOrContinue::Continue),
+    };
+
+    let Some(target_type) = resolve_class_name_target_type(db, cache, &class_name) else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+
+    let Some(target_expr) = extract_type_name_guard_target_expr(&call_expr) else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+
+    let Some(target_ref_id) = get_var_expr_var_ref_id(db, cache, target_expr) else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+    if target_ref_id != *var_ref_id {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
+
+    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+
+    let LuaType::Ref(target_type_id) = &target_type else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+
+    if !can_target_class_be_a_more_specific_narrowing(db, &antecedent_type, target_type_id) {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
+
+    let result_type = match condition_flow {
+        InferConditionFlow::TrueCondition => target_type.clone(),
+        InferConditionFlow::FalseCondition => {
+            TypeOps::Remove.apply(db, &antecedent_type, &target_type)
+        }
+    };
+
+    Ok(ResultTypeOrContinue::Result(result_type))
+}
+
+fn resolve_class_name_target_type(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    class_name: &str,
+) -> Option<LuaType> {
+    let target_decl = db
+        .get_type_index()
+        .find_type_decl(cache.get_file_id(), class_name)?;
+
+    target_decl
+        .is_class()
+        .then(|| LuaType::Ref(target_decl.get_id()))
+}
+
+fn can_target_class_be_a_more_specific_narrowing(
+    db: &DbIndex,
+    antecedent_type: &LuaType,
+    target_type_id: &crate::LuaTypeDeclId,
+) -> bool {
+    antecedent_can_be_target_class(db, antecedent_type, target_type_id)
+        && !antecedent_already_target_or_more_specific(db, antecedent_type, target_type_id)
+}
+
+fn antecedent_can_be_target_class(
+    db: &DbIndex,
+    antecedent_type: &LuaType,
+    target_type_id: &crate::LuaTypeDeclId,
+) -> bool {
+    match antecedent_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            type_id == target_type_id || is_sub_type_of(db, target_type_id, type_id)
+        }
+        LuaType::Instance(instance_type) => {
+            antecedent_can_be_target_class(db, instance_type.get_base(), target_type_id)
+        }
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(|ty| antecedent_can_be_target_class(db, ty, target_type_id)),
+        LuaType::MultiLineUnion(multi_line_union) => multi_line_union
+            .get_unions()
+            .iter()
+            .any(|(ty, _)| antecedent_can_be_target_class(db, ty, target_type_id)),
+        LuaType::Any | LuaType::Unknown => true,
+        _ => false,
+    }
+}
+
+fn antecedent_already_target_or_more_specific(
+    db: &DbIndex,
+    antecedent_type: &LuaType,
+    target_type_id: &crate::LuaTypeDeclId,
+) -> bool {
+    match antecedent_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            type_id == target_type_id || is_sub_type_of(db, type_id, target_type_id)
+        }
+        LuaType::Instance(instance_type) => {
+            antecedent_already_target_or_more_specific(db, instance_type.get_base(), target_type_id)
+        }
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .all(|ty| antecedent_already_target_or_more_specific(db, ty, target_type_id)),
+        LuaType::MultiLineUnion(multi_line_union) => multi_line_union
+            .get_unions()
+            .iter()
+            .all(|(ty, _)| antecedent_already_target_or_more_specific(db, ty, target_type_id)),
+        _ => false,
+    }
+}
+
+fn extract_type_name_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
+    if !call_expr.is_colon_call() {
+        return None;
+    }
+
+    let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+
+    let args = call_expr.get_args_list()?;
+    if args.get_args().next().is_some() {
+        return None;
+    }
+
+    index_expr.get_prefix_expr()
 }
 
 fn const_type_eq(left_type: &LuaType, right_type: &LuaType) -> bool {

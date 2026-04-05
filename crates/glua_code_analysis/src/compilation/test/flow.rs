@@ -2079,6 +2079,140 @@ _2 = a[1]
         assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
     }
 
+    #[gtest]
+    fn test_getclass_guard_narrows_entity_to_matching_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+
+            ---@class edit_sky: Entity
+            ---@field SetTopColor fun(self: edit_sky, v: number)
+
+            ---@class prop_physics: Entity
+
+            ---@param ent Entity
+            local function CopySky(ent)
+                if ent:GetClass() ~= "edit_sky" then return end
+                ent:SetTopColor(1)
+                a = ent
+            end
+        "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            eq(false)
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "a", 0);
+        assert_that!(ws.humanize_type(narrowed), eq("edit_sky"));
+    }
+
+    #[gtest]
+    fn test_type_name_method_guard_supports_literal_left_comparison() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@class Entity
+            ---@field TypeName fun(self: Entity): string
+
+            ---@class edit_sky: Entity
+            ---@field SetTopColor fun(self: edit_sky, v: number)
+
+            ---@class prop_physics: Entity
+
+            ---@param ent Entity
+            local function CopySky(ent)
+                if "edit_sky" == ent:TypeName() then
+                    ent:SetTopColor(1)
+                    a = ent
+                end
+            end
+        "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            eq(false)
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "a", 0);
+        assert_that!(ws.humanize_type(narrowed), eq("edit_sky"));
+    }
+
+    #[gtest]
+    fn test_type_name_method_guard_does_not_widen_existing_specific_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@class Entity
+            ---@field TypeName fun(self: Entity): string
+
+            ---@class edit_sky: Entity
+            ---@field SetTopColor fun(self: edit_sky, v: number)
+
+            ---@param ent edit_sky
+            local function KeepSpecific(ent)
+                if ent:TypeName() == "Entity" then
+                    ent:SetTopColor(1)
+                    a = ent
+                end
+            end
+        "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            eq(false)
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "a", 0);
+        assert_that!(ws.humanize_type(narrowed), eq("edit_sky"));
+    }
+
+    #[gtest]
+    fn test_type_name_method_guard_false_branch_removes_target_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@class Entity
+            ---@field TypeName fun(self: Entity): string
+
+            ---@class edit_sky: Entity
+            ---@field SetTopColor fun(self: edit_sky, v: number)
+
+            ---@class prop_physics: Entity
+            ---@field GetMass fun(self: prop_physics): number
+
+            ---@param ent edit_sky|prop_physics
+            local function Handle(ent)
+                if ent:TypeName() == "edit_sky" then return end
+                local mass = ent:GetMass()
+                a = mass
+                b = ent
+            end
+        "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            eq(false)
+        );
+
+        let ent_ty = nth_name_expr_type_from_end(&mut ws, file_id, "b", 0);
+        assert_that!(ws.humanize_type(ent_ty), eq("prop_physics"));
+    }
+
     #[test]
     fn test_isfunction_simple_var_narrows_nil() {
         let mut ws = VirtualWorkspace::new();
