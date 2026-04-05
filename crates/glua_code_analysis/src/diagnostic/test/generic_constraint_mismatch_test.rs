@@ -397,6 +397,54 @@ mod test {
     }
 
     #[test]
+    fn test_union_str_tpl_with_constraint_panel_known_type_no_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Panel
+
+            ---@generic T: Panel
+            ---@param name `T`|T
+            ---@return T
+            function create_panel(name)
+                return name
+            end
+        "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::GenericConstraintMismatch,
+            r#"
+            create_panel("Panel")
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_union_str_tpl_with_constraint_panel_missing_type_reports_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Panel
+
+            ---@generic T: Panel
+            ---@param name `T`|T
+            ---@return T
+            function create_panel(name)
+                return name
+            end
+        "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::GenericConstraintMismatch,
+            r#"
+            create_panel("MissingPanel")
+        "#
+        ));
+    }
+
+    #[test]
     fn test_generic_keyof_param_scope() {
         let mut ws = VirtualWorkspace::new();
         ws.def(

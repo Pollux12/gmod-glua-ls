@@ -178,6 +178,18 @@ fn check_param(
             );
         }
         LuaType::TplRef(tpl_ref) | LuaType::ConstTplRef(tpl_ref) => {
+            if from_union && let Some(arg_expr) = call_expr.get_args_list()?.get_args().nth(param_index) {
+                let arg_type = semantic_model.infer_expr(arg_expr).ok()?;
+                if let LuaType::StringConst(type_name) | LuaType::DocStringConst(type_name) = arg_type
+                    && semantic_model
+                        .get_db()
+                        .get_type_index()
+                        .find_type_decl(semantic_model.get_file_id(), &type_name)
+                        .is_some_and(|decl| !decl.is_auto_generated())
+                {
+                    return None;
+                }
+            }
             let extend_type = tpl_ref.get_constraint().cloned().map(|ty| {
                 normalize_constraint_type(
                     semantic_model.get_db(),
