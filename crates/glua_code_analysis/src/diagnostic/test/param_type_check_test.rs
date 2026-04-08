@@ -2111,4 +2111,49 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn test_std_loadfile_mode_and_env_align_with_load_types() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local chunk, err = loadfile("autorun/server/sv_test.lua", "bt", _G)
+        "#
+        ));
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local chunk, err = loadfile("autorun/server/sv_test.lua", "x", _G)
+        "#
+        ));
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local chunk, err = loadfile("autorun/server/sv_test.lua", "bt", 1)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_std_debug_setlocal_requires_integer_index() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local name = debug.setlocal(1, 1, 1)
+        "#
+        ));
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local name = debug.setlocal(1, "x", 1)
+        "#
+        ));
+    }
 }
