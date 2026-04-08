@@ -148,14 +148,11 @@ fn parse_param_list(p: &mut LuaParser) -> ParseResult {
     }
 
     let mut is_vararg = false;
+    let mut reported_trailing_after_vararg = false;
     if p.current_token() != LuaTokenKind::TkRightParen {
         loop {
             match parse_param_name(p, &mut is_vararg) {
-                Ok(_) => {
-                    if is_vararg {
-                        break;
-                    }
-                }
+                Ok(_) => {}
                 Err(_) => {
                     p.push_error(LuaParseError::syntax_error_from(
                         &t!("expected parameter name"),
@@ -185,6 +182,14 @@ fn parse_param_list(p: &mut LuaParser) -> ParseResult {
                     ));
                     break;
                 }
+
+                if is_vararg && !reported_trailing_after_vararg {
+                    p.push_error(LuaParseError::syntax_error_from(
+                        &t!("vararg '...' must be the last parameter"),
+                        p.current_token_range(),
+                    ));
+                    reported_trailing_after_vararg = true;
+                }
             } else {
                 break;
             }
@@ -193,11 +198,6 @@ fn parse_param_list(p: &mut LuaParser) -> ParseResult {
 
     if p.current_token() == LuaTokenKind::TkRightParen {
         p.bump();
-    } else if is_vararg {
-        p.push_error(LuaParseError::syntax_error_from(
-            &t!("vararg '...' must be the last parameter"),
-            p.current_token_range(),
-        ));
     } else {
         p.push_error(LuaParseError::syntax_error_from(
             &t!("expected ')' to close parameter list"),
