@@ -178,9 +178,12 @@ fn check_param(
             );
         }
         LuaType::TplRef(tpl_ref) | LuaType::ConstTplRef(tpl_ref) => {
-            if from_union && let Some(arg_expr) = call_expr.get_args_list()?.get_args().nth(param_index) {
+            if from_union
+                && let Some(arg_expr) = call_expr.get_args_list()?.get_args().nth(param_index)
+            {
                 let arg_type = semantic_model.infer_expr(arg_expr).ok()?;
-                if let LuaType::StringConst(type_name) | LuaType::DocStringConst(type_name) = arg_type
+                if let LuaType::StringConst(type_name) | LuaType::DocStringConst(type_name) =
+                    arg_type
                     && semantic_model
                         .get_db()
                         .get_type_index()
