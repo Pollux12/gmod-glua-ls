@@ -151,7 +151,9 @@ fn get_equality_should_type(
     if let Some(binary_expr) = token
         .parent_ancestors()
         .filter_map(LuaBinaryExpr::cast)
-        .find(is_equality_binary_expr)
+        .find(|binary_expr| {
+            is_equality_binary_expr(binary_expr) && cursor_is_in_binary_rhs(builder, binary_expr)
+        })
         && let Some(typ) = infer_left_type_if_equality(builder, &binary_expr)
     {
         return Some(typ);
@@ -163,8 +165,28 @@ fn get_equality_should_type(
     let binary_expr = op_token
         .parent_ancestors()
         .filter_map(LuaBinaryExpr::cast)
-        .find(is_equality_binary_expr)?;
+        .find(|binary_expr| {
+            is_equality_binary_expr(binary_expr) && cursor_is_in_binary_rhs(builder, binary_expr)
+        })?;
     infer_left_type_if_equality(builder, &binary_expr)
+}
+
+fn cursor_is_in_binary_rhs(builder: &CompletionBuilder, binary_expr: &LuaBinaryExpr) -> bool {
+    let cursor = builder.position_offset;
+    let Some(op_token) = binary_expr.get_op_token() else {
+        return false;
+    };
+    let op_end = op_token.get_range().end();
+    if cursor < op_end {
+        return false;
+    }
+
+    if let Some((_, right_expr)) = binary_expr.get_exprs() {
+        let right_range = right_expr.get_range();
+        return right_range.contains_inclusive(cursor) || cursor <= right_range.start();
+    }
+
+    true
 }
 
 fn infer_left_type_if_equality(
