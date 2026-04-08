@@ -3,7 +3,8 @@ use glua_code_analysis::{
     infer_table_should_be,
 };
 use glua_parser::{
-    BinaryOperator, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaLiteralExpr, LuaTokenKind,
+    BinaryOperator, LuaAst, LuaAstNode, LuaAstToken, LuaBinaryExpr, LuaBlock, LuaLiteralExpr,
+    LuaSyntaxNode, LuaSyntaxToken, LuaTokenKind,
 };
 
 use crate::handlers::completion::{
@@ -52,20 +53,11 @@ fn get_token_should_type(builder: &mut CompletionBuilder) -> Option<Vec<LuaType>
         }
     }
 
-    match LuaAst::cast(parent_node)? {
-        // == 和 ~= 操作符
-        LuaAst::LuaBinaryExpr(binary_expr) => {
-            let op_token = binary_expr.get_op_token()?;
-            let op = op_token.get_op();
-            if op == BinaryOperator::OpEq || op == BinaryOperator::OpNe {
-                let left = binary_expr.get_left_expr()?;
-                let left_type = builder.semantic_model.infer_expr(left);
+    if let Some(typ) = get_equality_should_type(builder, &token, &parent_node) {
+        return Some(vec![typ]);
+    }
 
-                if let Ok(typ) = left_type {
-                    return Some(vec![typ]);
-                }
-            }
-        }
+    match LuaAst::cast(parent_node)? {
         LuaAst::LuaLocalStat(local_stat) => {
             let locals = local_stat.get_local_name_list().collect::<Vec<_>>();
             if locals.len() != 1 {
@@ -138,6 +130,80 @@ fn get_token_should_type(builder: &mut CompletionBuilder) -> Option<Vec<LuaType>
             return Some(vec![typ]);
         }
         _ => {}
+    }
+
+    None
+}
+
+fn get_equality_should_type(
+    builder: &CompletionBuilder,
+    token: &LuaSyntaxToken,
+    parent_node: &LuaSyntaxNode,
+) -> Option<LuaType> {
+    // Fast path for the old/direct tree shape.
+    if let Some(binary_expr) = LuaBinaryExpr::cast(parent_node.clone())
+        && let Some(typ) = infer_left_type_if_equality(builder, &binary_expr)
+    {
+        return Some(typ);
+    }
+
+    // Recovery-tolerant path: any binary-expression ancestor of the trigger token.
+    if let Some(binary_expr) = token
+        .parent_ancestors()
+        .filter_map(LuaBinaryExpr::cast)
+        .find(is_equality_binary_expr)
+        && let Some(typ) = infer_left_type_if_equality(builder, &binary_expr)
+    {
+        return Some(typ);
+    }
+
+    // Fallback for newer recovery shapes: locate nearby equality operator token,
+    // then resolve its binary-expression ancestor.
+    let op_token = find_previous_equality_op_token(token.clone())?;
+    let binary_expr = op_token
+        .parent_ancestors()
+        .filter_map(LuaBinaryExpr::cast)
+        .find(is_equality_binary_expr)?;
+    infer_left_type_if_equality(builder, &binary_expr)
+}
+
+fn infer_left_type_if_equality(
+    builder: &CompletionBuilder,
+    binary_expr: &LuaBinaryExpr,
+) -> Option<LuaType> {
+    if !is_equality_binary_expr(binary_expr) {
+        return None;
+    }
+
+    let left = binary_expr.get_left_expr()?;
+    builder.semantic_model.infer_expr(left).ok()
+}
+
+fn is_equality_binary_expr(binary_expr: &LuaBinaryExpr) -> bool {
+    let Some(op_token) = binary_expr.get_op_token() else {
+        return false;
+    };
+
+    matches!(
+        op_token.get_op(),
+        BinaryOperator::OpEq | BinaryOperator::OpNe
+    )
+}
+
+fn find_previous_equality_op_token(token: LuaSyntaxToken) -> Option<LuaSyntaxToken> {
+    let mut cursor = token;
+
+    // Keep this local and bounded to avoid pulling in unrelated context.
+    for _ in 0..32 {
+        let prev = cursor.prev_token()?;
+        cursor = prev.clone();
+
+        match prev.kind().into() {
+            LuaTokenKind::TkWhitespace => continue,
+            LuaTokenKind::TkEq | LuaTokenKind::TkNe => return Some(prev),
+            LuaTokenKind::TkEndOfLine | LuaTokenKind::TkSemicolon => return None,
+            _ => {}
+        }
     }
 
     None

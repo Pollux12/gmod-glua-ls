@@ -27,6 +27,11 @@ pub async fn on_did_change_configuration(
     // Update config and reload - acquire write lock only when necessary
     {
         let mut workspace_manager = context.workspace_manager().write().await;
+        if workspace_manager.client_config == new_client_config {
+            log::info!("skip workspace reload; client config unchanged");
+            return Some(());
+        }
+
         workspace_manager.client_config = new_client_config;
         log::info!("reloading workspace folders");
         workspace_manager.add_reload_workspace_task(context.workspace_manager_arc());

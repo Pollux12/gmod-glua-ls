@@ -169,7 +169,14 @@ fn build_function_define_hover(
     }
 
     // 去重, 这是必须的
-    function_infos.dedup_by_key(|info| info.primary.clone());
+    function_infos.dedup_by(|incoming, existing| {
+        if incoming.primary != existing.primary {
+            return false;
+        }
+
+        merge_preferred_description(existing, incoming);
+        true
+    });
 
     // 需要显示重载的情况
     match function_infos.len() {
@@ -198,6 +205,32 @@ fn build_function_define_hover(
         }
     }
     Some(())
+}
+
+fn merge_preferred_description(existing: &mut HoverFunctionInfo, incoming: &HoverFunctionInfo) {
+    match (&mut existing.description, &incoming.description) {
+        (None, Some(incoming_description)) => {
+            existing.description = Some(incoming_description.clone());
+        }
+        (Some(existing_description), Some(incoming_description)) => {
+            if existing_description.realm.is_none() && incoming_description.realm.is_some() {
+                existing_description.realm = incoming_description.realm;
+            }
+
+            if existing_description.description.is_none()
+                && incoming_description.description.is_some()
+            {
+                existing_description.description = incoming_description.description.clone();
+            }
+
+            if existing_description.tag_content.is_none()
+                && incoming_description.tag_content.is_some()
+            {
+                existing_description.tag_content = incoming_description.tag_content.clone();
+            }
+        }
+        _ => {}
+    }
 }
 
 fn process_function_type(
