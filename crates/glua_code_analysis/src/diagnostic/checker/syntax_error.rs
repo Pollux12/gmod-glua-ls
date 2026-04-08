@@ -1,6 +1,6 @@
 use glua_parser::{
-    LuaAstNode, LuaClosureExpr, LuaLiteralExpr, LuaParamName, LuaParseErrorKind, LuaSyntaxKind,
-    LuaSyntaxToken, LuaTokenKind, float_token_value, int_token_value,
+    LuaAstNode, LuaClosureExpr, LuaLiteralExpr, LuaParseErrorKind, LuaSyntaxKind, LuaSyntaxToken,
+    LuaTokenKind, float_token_value, int_token_value,
 };
 
 use crate::{DiagnosticCode, LuaSignatureId, SemanticModel};
@@ -165,39 +165,20 @@ fn check_dots_literal_error(
     dots_token: &LuaSyntaxToken,
 ) -> Option<()> {
     if let Some(literal_expr) = dots_token.parent() {
-        match literal_expr.kind().into() {
-            LuaSyntaxKind::LiteralExpr => {
-                let literal_expr = LuaLiteralExpr::cast(literal_expr)?;
-                let closure_expr = literal_expr.ancestors::<LuaClosureExpr>().next()?;
-                let signature_id =
-                    LuaSignatureId::from_closure(semantic_model.get_file_id(), &closure_expr);
-                let signature = context.db.get_signature_index().get(&signature_id)?;
-                if !signature.params.iter().any(|param| param == "...") {
-                    context.add_diagnostic(
-                        DiagnosticCode::SyntaxError,
-                        literal_expr.get_range(),
-                        t!("Cannot use `...` outside a vararg function.").to_string(),
-                        None,
-                    );
-                }
+        if literal_expr.kind() == LuaSyntaxKind::LiteralExpr.into() {
+            let literal_expr = LuaLiteralExpr::cast(literal_expr)?;
+            let closure_expr = literal_expr.ancestors::<LuaClosureExpr>().next()?;
+            let signature_id =
+                LuaSignatureId::from_closure(semantic_model.get_file_id(), &closure_expr);
+            let signature = context.db.get_signature_index().get(&signature_id)?;
+            if !signature.params.iter().any(|param| param == "...") {
+                context.add_diagnostic(
+                    DiagnosticCode::SyntaxError,
+                    literal_expr.get_range(),
+                    t!("Cannot use `...` outside a vararg function.").to_string(),
+                    None,
+                );
             }
-            LuaSyntaxKind::ParamName => {
-                let param_name = LuaParamName::cast(literal_expr)?;
-                let closure_expr = param_name.ancestors::<LuaClosureExpr>().next()?;
-                let signature_id =
-                    LuaSignatureId::from_closure(semantic_model.get_file_id(), &closure_expr);
-                let signature = context.db.get_signature_index().get(&signature_id)?;
-                // 确保 ... 位于最后一个参数
-                if signature.params.last()? != "..." {
-                    context.add_diagnostic(
-                        DiagnosticCode::SyntaxError,
-                        param_name.get_range(),
-                        t!("`...` should be the last arg.").to_string(),
-                        None,
-                    );
-                }
-            }
-            _ => {}
         }
     }
 
