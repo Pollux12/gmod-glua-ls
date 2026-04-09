@@ -221,9 +221,9 @@ fn find_previous_equality_op_token(token: LuaSyntaxToken) -> Option<LuaSyntaxTok
         cursor = prev.clone();
 
         match prev.kind().into() {
-            LuaTokenKind::TkWhitespace => continue,
+            LuaTokenKind::TkWhitespace | LuaTokenKind::TkEndOfLine => continue,
             LuaTokenKind::TkEq | LuaTokenKind::TkNe => return Some(prev),
-            LuaTokenKind::TkEndOfLine | LuaTokenKind::TkSemicolon => return None,
+            LuaTokenKind::TkSemicolon => return None,
             _ => {}
         }
     }

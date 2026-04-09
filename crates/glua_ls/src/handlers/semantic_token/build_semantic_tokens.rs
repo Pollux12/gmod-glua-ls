@@ -8,9 +8,9 @@ use crate::handlers::semantic_token::semantic_token_builder::{
 use crate::util::parse_desc;
 use crate::{context::ClientId, handlers::semantic_token::language_injector::inject_language};
 use glua_code_analysis::{
-    Emmyrc, LocalAttribute, LuaDecl, LuaDeclExtra, LuaMemberId, LuaMemberOwner, LuaSemanticDeclId,
-    LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel, WorkspaceId,
-    parse_require_module_info,
+    DbIndex, Emmyrc, GlobalId, LocalAttribute, LuaDecl, LuaDeclExtra, LuaMemberFeature,
+    LuaMemberId, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaTypeOwner,
+    SemanticDeclLevel, SemanticModel, WorkspaceId, parse_require_module_info,
 };
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaComment,
@@ -813,43 +813,11 @@ fn build_node_semantic_token(
                         .get_member(&member_id)
                     {
                         if let Some(global_id) = member.get_global_id() {
-                            use glua_code_analysis::{
-                                LuaMemberFeature, LuaMemberOwner, LuaTypeOwner,
-                            };
-                            let owner = LuaMemberOwner::GlobalPath(global_id.clone());
-                            if let Some(child_members) = semantic_model
-                                .get_db()
-                                .get_member_index()
-                                .get_members(&owner)
-                            {
-                                let mut callable_count = 0;
-                                for child in child_members {
-                                    let feature = child.get_feature();
-
-                                    let is_callable = if feature == LuaMemberFeature::FileMethodDecl
-                                        || feature == LuaMemberFeature::MetaMethodDecl
-                                        || feature == LuaMemberFeature::MetaDefine
-                                    {
-                                        true
-                                    } else if let Some(type_cache) = semantic_model
-                                        .get_db()
-                                        .get_type_index()
-                                        .get_type_cache(&LuaTypeOwner::Member(child.get_id()))
-                                    {
-                                        type_cache.is_function()
-                                    } else {
-                                        false
-                                    };
-
-                                    if is_callable {
-                                        callable_count += 1;
-                                        if callable_count >= 2 {
-                                            is_class_like = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                            is_class_like = global_path_has_class_like_children(
+                                semantic_model,
+                                builder,
+                                global_id,
+                            );
                         }
                     }
                 }
@@ -1696,6 +1664,52 @@ fn is_table_like_type(decl_type: &glua_code_analysis::LuaType) -> bool {
     )
 }
 
+fn global_path_has_class_like_children(
+    semantic_model: &SemanticModel,
+    builder: &mut SemanticBuilder,
+    global_id: &GlobalId,
+) -> bool {
+    if let Some(is_class_like) = builder.cached_class_like_global(global_id) {
+        return is_class_like;
+    }
+
+    let db = semantic_model.get_db();
+    let is_class_like =
+        owner_has_multiple_callable_children(db, &LuaMemberOwner::GlobalPath(global_id.clone()))
+            || owner_has_multiple_callable_children(
+                db,
+                &LuaMemberOwner::Type(LuaTypeDeclId::global(global_id.get_name())),
+            );
+
+    builder.cache_class_like_global(global_id.clone(), is_class_like);
+    is_class_like
+}
+
+fn owner_has_multiple_callable_children(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
+    let Some(members) = db.get_member_index().get_members(owner) else {
+        return false;
+    };
+
+    members
+        .iter()
+        .filter(|child| member_is_callable(db, child))
+        .take(2)
+        .count()
+        >= 2
+}
+
+fn member_is_callable(db: &DbIndex, child: &glua_code_analysis::LuaMember) -> bool {
+    matches!(
+        child.get_feature(),
+        LuaMemberFeature::FileMethodDecl
+            | LuaMemberFeature::MetaMethodDecl
+            | LuaMemberFeature::MetaDefine
+    ) || db
+        .get_type_index()
+        .get_type_cache(&LuaTypeOwner::Member(child.get_id()))
+        .is_some_and(|type_cache| type_cache.is_function())
+}
+
 fn render_doc_at(builder: &mut SemanticBuilder, token: &LuaSyntaxToken) {
     let text = token.text();
     // find '@'/'|'
@@ -1880,23 +1894,20 @@ fn enrich_modifiers_from_decl(
 
     enrich_from_property(semantic_decl, modifiers);
 
-    match decl_type {
-        glua_code_analysis::LuaType::Signature(signature_id) => {
-            if let Some(signature) = semantic_model
-                .get_db()
-                .get_signature_index()
-                .get(signature_id)
-            {
-                if signature.async_state == glua_code_analysis::AsyncState::Async {
-                    modifiers.push(lsp_types::SemanticTokenModifier::ASYNC);
-                }
-            }
-
-            let sig_decl_id = glua_code_analysis::LuaSemanticDeclId::Signature(*signature_id);
-            if sig_decl_id != *semantic_decl {
-                enrich_from_property(&sig_decl_id, modifiers);
+    if let glua_code_analysis::LuaType::Signature(signature_id) = decl_type {
+        if let Some(signature) = semantic_model
+            .get_db()
+            .get_signature_index()
+            .get(signature_id)
+        {
+            if signature.async_state == glua_code_analysis::AsyncState::Async {
+                modifiers.push(lsp_types::SemanticTokenModifier::ASYNC);
             }
         }
-        _ => {}
+
+        let sig_decl_id = glua_code_analysis::LuaSemanticDeclId::Signature(*signature_id);
+        if sig_decl_id != *semantic_decl {
+            enrich_from_property(&sig_decl_id, modifiers);
+        }
     }
 }

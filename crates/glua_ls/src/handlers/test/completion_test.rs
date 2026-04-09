@@ -510,6 +510,47 @@ mod tests {
     }
 
     #[gtest]
+    fn test_type_comparison_across_newline_preserves_expected_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@alias second.domain
+                ---| "x"
+                ---| "y"
+
+                ---@param v any
+                ---@return second.domain kind2
+                function kind2(v) end
+            "#,
+        );
+
+        check!(ws.check_completion_with_kind(
+            r#"
+                local b = "x"
+
+                if kind2(b) ==
+                    <??> then
+                end
+            "#,
+            vec![
+                VirtualCompletionItem {
+                    label: "\"x\"".to_string(),
+                    kind: CompletionItemKind::ENUM_MEMBER,
+                    ..Default::default()
+                },
+                VirtualCompletionItem {
+                    label: "\"y\"".to_string(),
+                    kind: CompletionItemKind::ENUM_MEMBER,
+                    ..Default::default()
+                },
+            ],
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_issue_272() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_completion_with_kind(
