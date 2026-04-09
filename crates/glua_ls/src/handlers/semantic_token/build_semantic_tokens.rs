@@ -306,6 +306,40 @@ fn build_tokens_semantic_token(
     }
 }
 
+fn get_global_rooted_index_depth(
+    semantic_model: &glua_code_analysis::SemanticModel,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> Option<usize> {
+    let mut current = index_expr.clone();
+    let mut depth = 1;
+    while let Some(prefix) = current.get_prefix_expr() {
+        if let glua_parser::LuaExpr::NameExpr(name_expr) = prefix {
+            if let Some(glua_code_analysis::LuaSemanticDeclId::LuaDecl(id)) = semantic_model
+                .find_decl(
+                    name_expr.syntax().clone().into(),
+                    glua_code_analysis::SemanticDeclLevel::NoTrace,
+                )
+            {
+                if semantic_model
+                    .get_db()
+                    .get_decl_index()
+                    .get_decl(&id)
+                    .is_some_and(|d| d.is_global())
+                {
+                    return Some(depth);
+                }
+            }
+            return None;
+        } else if let glua_parser::LuaExpr::IndexExpr(expr) = prefix {
+            current = expr;
+            depth += 1;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
 fn build_node_semantic_token(
     semantic_model: &SemanticModel,
     builder: &mut SemanticBuilder,
@@ -496,47 +530,110 @@ fn build_node_semantic_token(
         }
         LuaAst::LuaForRangeStat(for_range_stat) => {
             for name in for_range_stat.get_var_name_list() {
-                builder.push_with_modifier(
+                builder.push_with_modifiers(
                     name.syntax(),
                     SemanticTokenType::VARIABLE,
-                    SemanticTokenModifier::DECLARATION,
+                    &[
+                        SemanticTokenModifier::DECLARATION,
+                        SemanticTokenModifier::READONLY,
+                        CustomSemanticTokenModifier::LOCAL,
+                    ],
                 );
             }
         }
         LuaAst::LuaForStat(for_stat) => {
             let name = for_stat.get_var_name()?;
-            builder.push_with_modifier(
+            builder.push_with_modifiers(
                 name.syntax(),
                 SemanticTokenType::VARIABLE,
-                SemanticTokenModifier::DECLARATION,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    SemanticTokenModifier::READONLY,
+                    CustomSemanticTokenModifier::LOCAL,
+                ],
             );
         }
         LuaAst::LuaLocalFuncStat(local_func_stat) => {
             let name = local_func_stat.get_local_name()?.get_name_token()?;
-            builder.push_with_modifier(
-                name.syntax(),
-                SemanticTokenType::FUNCTION,
-                SemanticTokenModifier::DECLARATION,
-            );
+            let mut modifiers = vec![SemanticTokenModifier::DECLARATION];
+            if let Some(semantic_decl) = semantic_model.find_decl(
+                local_func_stat.get_local_name()?.syntax().clone().into(),
+                glua_code_analysis::SemanticDeclLevel::NoTrace,
+            ) {
+                let decl_type = match semantic_decl {
+                    glua_code_analysis::LuaSemanticDeclId::Member(member_id) => {
+                        semantic_model.get_type(member_id.into())
+                    }
+                    glua_code_analysis::LuaSemanticDeclId::LuaDecl(decl_id) => {
+                        semantic_model.get_type(decl_id.into())
+                    }
+                    _ => glua_code_analysis::LuaType::Unknown,
+                };
+                enrich_modifiers_from_decl(
+                    semantic_model,
+                    &semantic_decl,
+                    &decl_type,
+                    &mut modifiers,
+                );
+            }
+            builder.push_with_modifiers(name.syntax(), SemanticTokenType::FUNCTION, &modifiers);
         }
         LuaAst::LuaFuncStat(func_stat) => {
             let func_name = func_stat.get_func_name()?;
             match func_name {
                 LuaVarExpr::NameExpr(name_expr) => {
                     let name = name_expr.get_name_token()?;
-                    builder.push_with_modifier(
+                    let mut modifiers = vec![SemanticTokenModifier::DECLARATION];
+                    if let Some(semantic_decl) = semantic_model.find_decl(
+                        name_expr.syntax().clone().into(),
+                        glua_code_analysis::SemanticDeclLevel::NoTrace,
+                    ) {
+                        let decl_type = match semantic_decl {
+                            glua_code_analysis::LuaSemanticDeclId::Member(member_id) => {
+                                semantic_model.get_type(member_id.into())
+                            }
+                            glua_code_analysis::LuaSemanticDeclId::LuaDecl(decl_id) => {
+                                semantic_model.get_type(decl_id.into())
+                            }
+                            _ => glua_code_analysis::LuaType::Unknown,
+                        };
+                        enrich_modifiers_from_decl(
+                            semantic_model,
+                            &semantic_decl,
+                            &decl_type,
+                            &mut modifiers,
+                        );
+                    }
+                    builder.push_with_modifiers(
                         name.syntax(),
                         SemanticTokenType::FUNCTION,
-                        SemanticTokenModifier::DECLARATION,
+                        &modifiers,
                     );
                 }
                 LuaVarExpr::IndexExpr(index_expr) => {
                     let name = index_expr.get_index_name_token()?;
-                    builder.push_with_modifier(
-                        &name,
-                        SemanticTokenType::METHOD,
-                        SemanticTokenModifier::DECLARATION,
-                    );
+                    let mut modifiers = vec![SemanticTokenModifier::DECLARATION];
+                    if let Some(semantic_decl) = semantic_model.find_decl(
+                        index_expr.syntax().clone().into(),
+                        glua_code_analysis::SemanticDeclLevel::NoTrace,
+                    ) {
+                        let decl_type = match semantic_decl {
+                            glua_code_analysis::LuaSemanticDeclId::Member(member_id) => {
+                                semantic_model.get_type(member_id.into())
+                            }
+                            glua_code_analysis::LuaSemanticDeclId::LuaDecl(decl_id) => {
+                                semantic_model.get_type(decl_id.into())
+                            }
+                            _ => glua_code_analysis::LuaType::Unknown,
+                        };
+                        enrich_modifiers_from_decl(
+                            semantic_model,
+                            &semantic_decl,
+                            &decl_type,
+                            &mut modifiers,
+                        );
+                    }
+                    builder.push_with_modifiers(&name, SemanticTokenType::METHOD, &modifiers);
                 }
             }
         }
@@ -661,12 +758,19 @@ fn build_node_semantic_token(
             {
                 let decl_type = semantic_model.get_type(member_id.into());
                 if decl_type.is_function() {
+                    let mut modifiers = vec![];
+                    enrich_modifiers_from_decl(
+                        semantic_model,
+                        &property_owner,
+                        &decl_type,
+                        &mut modifiers,
+                    );
                     push_name_or_syntax_with_context_modifiers(
                         builder,
                         name.syntax(),
                         index_expr.syntax(),
                         SemanticTokenType::METHOD,
-                        &[],
+                        &modifiers,
                     );
                     return Some(());
                 }
@@ -679,11 +783,13 @@ fn build_node_semantic_token(
                     return Some(());
                 }
 
+                let global_depth = get_global_rooted_index_depth(semantic_model, &index_expr);
+
                 let owner_id = semantic_model
                     .get_db()
                     .get_member_index()
                     .get_current_owner(&member_id);
-                if let Some(LuaMemberOwner::Type(type_id)) = owner_id
+                if let Some(glua_code_analysis::LuaMemberOwner::Type(type_id)) = owner_id
                     && let Some(type_decl) = semantic_model
                         .get_db()
                         .get_type_index()
@@ -696,6 +802,71 @@ fn build_node_semantic_token(
                         SemanticTokenModifier::READONLY,
                     );
                     return Some(());
+                }
+
+                let mut is_class_like = is_table_like_type(&decl_type);
+
+                if !is_class_like && global_depth == Some(1) {
+                    if let Some(member) = semantic_model
+                        .get_db()
+                        .get_member_index()
+                        .get_member(&member_id)
+                    {
+                        if let Some(global_id) = member.get_global_id() {
+                            use glua_code_analysis::{
+                                LuaMemberFeature, LuaMemberOwner, LuaTypeOwner,
+                            };
+                            let owner = LuaMemberOwner::GlobalPath(global_id.clone());
+                            if let Some(child_members) = semantic_model
+                                .get_db()
+                                .get_member_index()
+                                .get_members(&owner)
+                            {
+                                let mut callable_count = 0;
+                                for child in child_members {
+                                    let feature = child.get_feature();
+
+                                    let is_callable = if feature == LuaMemberFeature::FileMethodDecl
+                                        || feature == LuaMemberFeature::MetaMethodDecl
+                                        || feature == LuaMemberFeature::MetaDefine
+                                    {
+                                        true
+                                    } else if let Some(type_cache) = semantic_model
+                                        .get_db()
+                                        .get_type_index()
+                                        .get_type_cache(&LuaTypeOwner::Member(child.get_id()))
+                                    {
+                                        type_cache.is_function()
+                                    } else {
+                                        false
+                                    };
+
+                                    if is_callable {
+                                        callable_count += 1;
+                                        if callable_count >= 2 {
+                                            is_class_like = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if is_class_like {
+                    // Only highlight as CLASS if it is the first segment (depth == 1) of a global path.
+                    // This prevents local table fields or deeper segments from becoming CLASS.
+                    if global_depth == Some(1) {
+                        push_name_or_syntax_with_context_modifiers(
+                            builder,
+                            name.syntax(),
+                            index_expr.syntax(),
+                            SemanticTokenType::CLASS,
+                            &[],
+                        );
+                        return Some(());
+                    }
                 }
 
                 if is_function_like_type(&decl_type) {
@@ -711,7 +882,7 @@ fn build_node_semantic_token(
                         builder,
                         name.syntax(),
                         index_expr.syntax(),
-                        SemanticTokenType::PROPERTY,
+                        CustomSemanticTokenType::FIELD,
                         &[],
                     );
                 }
@@ -777,10 +948,23 @@ fn build_node_semantic_token(
             match value_type {
                 LuaType::Signature(_) | LuaType::DocFunction(_) => {
                     if let Some(field_name) = table_field.get_field_key()?.get_name() {
-                        builder.push_with_modifier(
+                        let mut modifiers = vec![SemanticTokenModifier::DECLARATION];
+                        if let Some(member) = semantic_model
+                            .get_db()
+                            .get_member_index()
+                            .get_member(&owner_id)
+                        {
+                            enrich_modifiers_from_decl(
+                                semantic_model,
+                                &glua_code_analysis::LuaSemanticDeclId::Member(member.get_id()),
+                                &value_type,
+                                &mut modifiers,
+                            );
+                        }
+                        builder.push_with_modifiers(
                             field_name.syntax(),
                             SemanticTokenType::METHOD,
-                            SemanticTokenModifier::DECLARATION,
+                            &modifiers,
                         );
                     }
                 }
@@ -1009,13 +1193,15 @@ fn handle_name_node(
     match semantic_decl {
         LuaSemanticDeclId::Member(member_id) => {
             let decl_type = semantic_model.get_type(member_id.into());
+            let mut modifiers = vec![];
+            enrich_modifiers_from_decl(semantic_model, &semantic_decl, &decl_type, &mut modifiers);
             if matches!(decl_type, LuaType::Signature(_)) {
                 push_name_or_syntax_with_context_modifiers(
                     builder,
                     name_token.syntax(),
                     node,
                     SemanticTokenType::FUNCTION,
-                    &[],
+                    &modifiers,
                 );
                 return Some(());
             }
@@ -1078,6 +1264,33 @@ fn handle_name_node(
                 return Some(());
             }
 
+            // GMod namespace pattern: user-defined global tables acting as namespace
+            // containers (e.g. cityrp in cityrp.vehicle = cityrp.vehicle or {}).
+            // When a global variable with an unresolved/generic type is used as an index
+            // expression prefix, color it as NAMESPACE for better theme compatibility —
+            // NAMESPACE maps to entity.name.namespace which is styled in most VS Code themes.
+            if decl.is_global()
+                && !decl_is_callable
+                && !is_builtin_global_constant(name_text)
+                && !matches!(
+                    decl_type,
+                    glua_code_analysis::LuaType::Def(_)
+                        | glua_code_analysis::LuaType::Ref(_)
+                        | glua_code_analysis::LuaType::Namespace(_)
+                        | glua_code_analysis::LuaType::ModuleRef(_)
+                )
+                && is_index_expr_prefix(node)
+            {
+                builder.push_with_modifier(
+                    name_token.syntax(),
+                    SemanticTokenType::NAMESPACE,
+                    CustomSemanticTokenModifier::GLOBAL,
+                );
+                return Some(());
+            }
+
+            let mut modifiers = vec![];
+            enrich_modifiers_from_decl(semantic_model, &semantic_decl, &decl_type, &mut modifiers);
             let (token_type, mut modifier) = match &decl_type {
                 LuaType::Def(type_id) => (
                     semantic_token_type_for_type_decl(semantic_model, type_id)
@@ -1127,7 +1340,6 @@ fn handle_name_node(
                 modifier = Some(SemanticTokenModifier::READONLY);
             }
 
-            let mut modifiers = vec![];
             if is_declaration {
                 modifiers.push(SemanticTokenModifier::DECLARATION);
             }
@@ -1466,6 +1678,24 @@ fn is_decl_readonly(decl: &LuaDecl) -> bool {
     )
 }
 
+/// Returns true if node is the prefix expression of an IndexExpr.
+/// E.g., for cityrp.vehicle, the cityrp NameExpr node returns true.
+fn is_index_expr_prefix(node: &glua_parser::LuaSyntaxNode) -> bool {
+    node.parent()
+        .is_some_and(|p| p.kind() == glua_parser::LuaSyntaxKind::IndexExpr.into())
+}
+
+/// Returns true for table-like types that commonly act as class/module containers
+/// in GMod Lua (e.g., plain tables, table literals, object types).
+fn is_table_like_type(decl_type: &glua_code_analysis::LuaType) -> bool {
+    matches!(
+        decl_type,
+        glua_code_analysis::LuaType::Table
+            | glua_code_analysis::LuaType::TableConst(_)
+            | glua_code_analysis::LuaType::Object(_)
+    )
+}
+
 fn render_doc_at(builder: &mut SemanticBuilder, token: &LuaSyntaxToken) {
     let text = token.text();
     // find '@'/'|'
@@ -1619,5 +1849,54 @@ fn render_type_parameter(builder: &mut SemanticBuilder, type_decl: &LuaDocGeneri
             SemanticTokenType::TYPE,
             SemanticTokenModifier::DECLARATION,
         );
+    }
+}
+
+fn enrich_modifiers_from_decl(
+    semantic_model: &glua_code_analysis::SemanticModel,
+    semantic_decl: &glua_code_analysis::LuaSemanticDeclId,
+    decl_type: &glua_code_analysis::LuaType,
+    modifiers: &mut Vec<lsp_types::SemanticTokenModifier>,
+) {
+    let enrich_from_property =
+        |property_id: &glua_code_analysis::LuaSemanticDeclId,
+         mods: &mut Vec<lsp_types::SemanticTokenModifier>| {
+            if let Some(property) = semantic_model
+                .get_db()
+                .get_property_index()
+                .get_property(property_id)
+            {
+                if property.deprecated().is_some() {
+                    mods.push(lsp_types::SemanticTokenModifier::DEPRECATED);
+                }
+                if property
+                    .decl_features
+                    .has_feature(glua_code_analysis::PropertyDeclFeature::ReadOnly)
+                {
+                    mods.push(lsp_types::SemanticTokenModifier::READONLY);
+                }
+            }
+        };
+
+    enrich_from_property(semantic_decl, modifiers);
+
+    match decl_type {
+        glua_code_analysis::LuaType::Signature(signature_id) => {
+            if let Some(signature) = semantic_model
+                .get_db()
+                .get_signature_index()
+                .get(signature_id)
+            {
+                if signature.async_state == glua_code_analysis::AsyncState::Async {
+                    modifiers.push(lsp_types::SemanticTokenModifier::ASYNC);
+                }
+            }
+
+            let sig_decl_id = glua_code_analysis::LuaSemanticDeclId::Signature(*signature_id);
+            if sig_decl_id != *semantic_decl {
+                enrich_from_property(&sig_decl_id, modifiers);
+            }
+        }
+        _ => {}
     }
 }
