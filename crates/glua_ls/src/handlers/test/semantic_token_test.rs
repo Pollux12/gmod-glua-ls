@@ -87,9 +87,6 @@ m.foo()
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         let namespace_idx = token_type_index(SemanticTokenType::NAMESPACE);
         let method_idx = token_type_index(SemanticTokenType::METHOD);
@@ -134,9 +131,6 @@ local x = 1
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         let keyword_idx = token_type_index(SemanticTokenType::KEYWORD);
         let doc_modifier = modifier_bitset(&[SemanticTokenModifier::DOCUMENTATION]);
@@ -167,9 +161,6 @@ print(global_var, x)
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(
@@ -264,9 +255,6 @@ end
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(
@@ -320,9 +308,6 @@ end
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(
@@ -368,9 +353,6 @@ fn()
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(
@@ -437,9 +419,6 @@ maybeFn()
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(
@@ -484,9 +463,6 @@ print(panel.headerPanel)
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(
@@ -522,9 +498,6 @@ local pnl = create()
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(
@@ -567,9 +540,6 @@ hook.Run("Think")
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(&tokens, 0, 9, 7, SemanticTokenType::EVENT, &[]),
@@ -604,9 +574,6 @@ end
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(&tokens, 0, 0, 3, SemanticTokenType::CLASS, &[]),
@@ -639,9 +606,6 @@ do_work()
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         // Deprecated
         verify_that!(
@@ -707,9 +671,6 @@ for i = 1, 10 do end
         );
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         // k
         verify_that!(
@@ -781,9 +742,6 @@ function cityrp.vehicle.drive() end
         );
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(
@@ -840,9 +798,6 @@ my_table.first.second = 1
         );
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         // my_table
         verify_that!(
@@ -895,9 +850,6 @@ my_table.first.second = 1
         let main = ws.def_file("main.lua", r#"local x = unknown.field"#);
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         verify_that!(
             has_token(&tokens, 0, 18, 5, CustomSemanticTokenType::FIELD, &[]),
@@ -918,9 +870,6 @@ function my_global.action() end
         );
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-        for t in &tokens {
-            println!("TOKEN: {:?}", t);
-        }
 
         // my_global
         verify_that!(

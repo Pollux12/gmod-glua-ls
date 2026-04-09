@@ -54,4 +54,15 @@ impl LspFeatures {
         }
         false
     }
+
+    pub fn supports_semantic_tokens_refresh(&self) -> bool {
+        if let Some(workspace) = &self.client_capabilities.workspace {
+            if let Some(semantic) = &workspace.semantic_tokens {
+                if let Some(supports) = semantic.refresh_support {
+                    return supports;
+                }
+            }
+        }
+        false
+    }
 }
