@@ -1,4 +1,4 @@
-use glua_code_analysis::LuaDocument;
+use glua_code_analysis::{GlobalId, LuaDocument};
 use glua_parser::LuaSyntaxToken;
 use lsp_types::{SemanticToken, SemanticTokenModifier, SemanticTokenType};
 use rowan::{TextRange, TextSize};
@@ -91,6 +91,7 @@ pub struct SemanticBuilder<'a> {
     modifier_to_id: HashMap<SemanticTokenModifier, u32>,
     data: HashMap<TextSize, SemanticTokenData>,
     string_special_range: HashSet<TextRange>,
+    class_like_global_cache: HashMap<GlobalId, bool>,
 }
 
 impl<'a> SemanticBuilder<'a> {
@@ -116,6 +117,7 @@ impl<'a> SemanticBuilder<'a> {
             modifier_to_id,
             data: HashMap::new(),
             string_special_range: HashSet::new(),
+            class_like_global_cache: HashMap::new(),
         }
     }
 
@@ -221,6 +223,15 @@ impl<'a> SemanticBuilder<'a> {
             }),
         );
         Some(())
+    }
+
+    pub fn cached_class_like_global(&self, global_id: &GlobalId) -> Option<bool> {
+        self.class_like_global_cache.get(global_id).copied()
+    }
+
+    pub fn cache_class_like_global(&mut self, global_id: GlobalId, is_class_like: bool) {
+        self.class_like_global_cache
+            .insert(global_id, is_class_like);
     }
 
     pub fn push_at_range(

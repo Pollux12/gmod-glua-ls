@@ -226,4 +226,16 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn test_std_loadfile_without_filename_is_allowed() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            local chunk, err = loadfile()
+        "#
+        ));
+    }
 }

@@ -816,4 +816,17 @@ mod test {
         let result_ty = ws.expr_ty("result");
         assert_eq!(ws.humanize_type(result_ty), "integer");
     }
+
+    #[test]
+    fn test_extends_true() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::TypeNotFound,
+            r#"
+            ---@alias TestA<T> T extends "test" and number or string
+            ---@alias TestB<T> T extends true and number or string
+            ---@alias TestC<T> T extends 111 and number or string
+            "#,
+        ));
+    }
 }

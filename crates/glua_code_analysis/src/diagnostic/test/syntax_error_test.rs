@@ -28,13 +28,26 @@ mod test {
     }
 
     #[test]
-    fn test_1() {
+    fn test_vararg_param_not_last_reports_syntax_error() {
         let mut ws = VirtualWorkspace::new();
 
         assert!(!ws.check_code_for(
             DiagnosticCode::SyntaxError,
             r#"
             local function aaa(..., n)
+            end
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_vararg_param_last_is_valid() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::SyntaxError,
+            r#"
+            local function aaa(n, ...)
             end
         "#
         ));

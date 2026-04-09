@@ -688,6 +688,9 @@ impl LuaDocLexer<'_> {
             ch if is_name_start(ch) => {
                 let (text, _) = read_doc_name(reader);
                 match text {
+                    "true" => LuaTokenKind::TkTrue,
+                    "false" => LuaTokenKind::TkFalse,
+                    "nil" => LuaTokenKind::TkNil,
                     "new" => LuaTokenKind::TkDocNew,
                     _ => LuaTokenKind::TkName,
                 }

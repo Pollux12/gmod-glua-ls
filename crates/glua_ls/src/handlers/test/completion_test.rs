@@ -459,6 +459,98 @@ mod tests {
     }
 
     #[gtest]
+    fn test_type_comparison_does_not_reuse_earlier_equality_in_same_statement() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@alias first.domain
+                ---| "alpha"
+                ---| "beta"
+
+                ---@alias second.domain
+                ---| "x"
+                ---| "y"
+
+                ---@param v any
+                ---@return first.domain kind1
+                function kind1(v) end
+
+                ---@param v any
+                ---@return second.domain kind2
+                function kind2(v) end
+            "#,
+        );
+
+        // The cursor is in the second comparison's RHS (incomplete/recovery stage).
+        // Completion must be inferred from `kind2(b) == ...`, not from earlier `kind1(a) == ...`.
+        check!(ws.check_completion_with_kind(
+            r#"
+                local a = 1
+                local b = "x"
+
+                if (kind1(a) == "alpha") and (kind2(b) == <??>) then
+                end
+            "#,
+            vec![
+                VirtualCompletionItem {
+                    label: "\"x\"".to_string(),
+                    kind: CompletionItemKind::ENUM_MEMBER,
+                    ..Default::default()
+                },
+                VirtualCompletionItem {
+                    label: "\"y\"".to_string(),
+                    kind: CompletionItemKind::ENUM_MEMBER,
+                    ..Default::default()
+                },
+            ],
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_type_comparison_across_newline_preserves_expected_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@alias second.domain
+                ---| "x"
+                ---| "y"
+
+                ---@param v any
+                ---@return second.domain kind2
+                function kind2(v) end
+            "#,
+        );
+
+        check!(ws.check_completion_with_kind(
+            r#"
+                local b = "x"
+
+                if kind2(b) ==
+                    <??> then
+                end
+            "#,
+            vec![
+                VirtualCompletionItem {
+                    label: "\"x\"".to_string(),
+                    kind: CompletionItemKind::ENUM_MEMBER,
+                    ..Default::default()
+                },
+                VirtualCompletionItem {
+                    label: "\"y\"".to_string(),
+                    kind: CompletionItemKind::ENUM_MEMBER,
+                    ..Default::default()
+                },
+            ],
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_issue_272() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_completion_with_kind(
