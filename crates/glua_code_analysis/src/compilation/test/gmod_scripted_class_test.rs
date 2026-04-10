@@ -3862,8 +3862,8 @@ mod test {
             crate::LuaMemberIndexItem::Many(ids) => ids.len(),
         };
         assert_eq!(
-            member_count_before, 2,
-            "expected both shared.lua and cl_init.lua assignments to be retained before edit"
+            member_count_before, 1,
+            "expected latest assignment to replace previous assignment"
         );
 
         ws.analysis
@@ -3882,9 +3882,8 @@ mod test {
             crate::LuaMemberIndexItem::Many(ids) => ids.len(),
         };
         assert_eq!(
-            member_count_after, 2,
-            "single-file reindex should retain the conflicting cl_init assignment"
+            member_count_after, 1,
+            "single-file reindex should retain the latest assignment"
         );
     }
-
 }

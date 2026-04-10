@@ -1819,4 +1819,47 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_regression_typed_assignment_accumulate() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        // File 1
+        ws.def_file(
+            "lua/glide/sh_lighting_api.lua",
+            r#"
+            ---@class Lighting
+            Lighting = Lighting or {}
+            Lighting.Standard = Lighting.Standard or {}
+        "#,
+        );
+
+        // File 2
+        let file2 = ws.def_file(
+            "lua/glide/sh_lighting_api_2.lua",
+            r#"
+            ---@class Lighting
+            Lighting = Lighting or {}
+            Lighting.Standard = Lighting.Standard or {}
+
+            local Z = Lighting.Standard
+        "#,
+        );
+
+        let diags = ws
+            .analysis
+            .diagnose_file(file2, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+
+        let has_undefined = diags.iter().any(|d| {
+            d.code.as_ref()
+                == Some(&lsp_types::NumberOrString::String(
+                    "undefined-field".to_string(),
+                ))
+        });
+        assert!(!has_undefined, "Expected no undefined-field, but got one");
+    }
 }
