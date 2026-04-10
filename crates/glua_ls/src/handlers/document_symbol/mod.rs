@@ -447,9 +447,7 @@ fn resolve_func_parent_id(
                 return sym_id;
             }
 
-            if let Some(decl) = builder.get_decl(&decl_id)
-                && decl.is_global()
-                && builder.scripted_class_global_name() == Some(prefix_name.as_ref())
+            if builder.scripted_class_global_name() == Some(prefix_name.as_ref())
                 && let Some(class_sym_id) = builder.get_scripted_class_symbol_id()
             {
                 return class_sym_id;

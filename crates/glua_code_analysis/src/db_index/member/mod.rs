@@ -128,12 +128,30 @@ impl LuaMemberIndex {
                 (new_items, Vec::new())
             } else if self.is_item_only_file_define(&item) {
                 let old_member_ids = member_ids_from_item(&item);
-                let should_accumulate_assignments = self.is_assignment_file_define_member(id)
+                let all_assignment_file_defines = self.is_assignment_file_define_member(id)
                     && old_member_ids
                         .iter()
                         .all(|old_id| self.is_assignment_file_define_member(*old_id));
+                let should_accumulate_typed_assignments =
+                    matches!(owner, LuaMemberOwner::Type(_)) && all_assignment_file_defines;
+                let should_keep_legacy_assignment_replace =
+                    !matches!(owner, LuaMemberOwner::Type(_)) && all_assignment_file_defines;
 
-                if should_accumulate_assignments {
+                if should_accumulate_typed_assignments {
+                    match item {
+                        LuaMemberIndexItem::One(old_id) if old_id == id => return Some(()),
+                        LuaMemberIndexItem::One(old_id) => {
+                            (LuaMemberIndexItem::Many(vec![old_id, id]), Vec::new())
+                        }
+                        LuaMemberIndexItem::Many(mut ids) => {
+                            if ids.contains(&id) {
+                                return Some(());
+                            }
+                            ids.push(id);
+                            (LuaMemberIndexItem::Many(ids), Vec::new())
+                        }
+                    }
+                } else if should_keep_legacy_assignment_replace {
                     match item {
                         LuaMemberIndexItem::One(old_id) if old_id == id => return Some(()),
                         LuaMemberIndexItem::Many(ids) if ids.contains(&id) => return Some(()),

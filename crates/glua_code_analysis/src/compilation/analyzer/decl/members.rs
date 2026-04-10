@@ -133,6 +133,12 @@ fn is_in_global_member(analyzer: &DeclAnalyzer, index_expr: &LuaIndexExpr) -> Op
                 return Some(false);
             }
 
+            // The scoped class global (e.g. SWEP, ENT) is not a real global in this file:
+            // its members belong to the per-entity class type resolved in the Lua phase.
+            if analyzer.is_scoped_class_global_name(&name_text) {
+                return Some(false);
+            }
+
             if legacy_module_global_path(analyzer, name_text.as_str(), name.get_position())
                 .is_some()
             {

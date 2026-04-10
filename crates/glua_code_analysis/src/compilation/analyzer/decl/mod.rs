@@ -88,6 +88,7 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
     match node {
         LuaAst::LuaChunk(chunk) => {
             analyzer.create_scope(chunk.get_range(), LuaScopeKind::Normal);
+            analyzer.maybe_seed_scoped_class_local_decl(chunk.get_range());
         }
         LuaAst::LuaBlock(block) => {
             analyzer.create_scope(block.get_range(), LuaScopeKind::Normal);
@@ -195,6 +196,7 @@ pub struct DeclAnalyzer<'a> {
     root: LuaChunk,
     decl: LuaDeclarationTree,
     scoped_class_global_name: Option<String>,
+    seeded_scoped_class_decl: bool,
     legacy_module_envs: Vec<LegacyModuleEnv>,
     scopes: Vec<LuaScopeId>,
     is_meta: bool,
@@ -214,6 +216,7 @@ impl<'a> DeclAnalyzer<'a> {
             root,
             decl: LuaDeclarationTree::new(file_id),
             scoped_class_global_name,
+            seeded_scoped_class_decl: false,
             legacy_module_envs: Vec::new(),
             scopes: Vec::new(),
             is_meta: false,
@@ -352,6 +355,33 @@ impl<'a> DeclAnalyzer<'a> {
             .iter()
             .rev()
             .find(|env| position > env.activation_position)
+    }
+
+    fn maybe_seed_scoped_class_local_decl(&mut self, chunk_range: TextRange) {
+        if self.seeded_scoped_class_decl {
+            return;
+        }
+
+        let Some(scoped_class_global_name) = self.scoped_class_global_name.as_ref() else {
+            return;
+        };
+
+        let file_id = self.get_file_id();
+        let synthetic_pos = chunk_range.start();
+        let synthetic_range = TextRange::new(synthetic_pos, synthetic_pos);
+        let decl = LuaDecl::new(
+            scoped_class_global_name,
+            file_id,
+            synthetic_range,
+            LuaDeclExtra::Local {
+                kind: LuaSyntaxKind::NameExpr.into(),
+                attrib: None,
+            },
+            None,
+        );
+
+        self.add_decl(decl);
+        self.seeded_scoped_class_decl = true;
     }
 
     fn project_legacy_module_chain_members(&mut self, legacy_module_env: &LegacyModuleEnv) {

@@ -6,8 +6,8 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GmodClassCallLiteral,
-        LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral,
+        LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
     };
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
@@ -3672,4 +3672,219 @@ mod test {
             "TestDermaPanel global decl should exist"
         );
     }
+
+    /// Regression test: SWEP field assignments in scope files (without an explicit `local SWEP
+    /// = {}` declaration) should be owned by the per-entity class type, not by the shared
+    /// `GlobalPath("SWEP")` owner. Before the fix, all weapon files that assigned the same field
+    /// via `SWEP.Field = …` would accumulate that field on the global SWEP path, causing
+    /// cross-contamination between different weapons' member types (e.g. `number|IMaterial`).
+    #[gtest]
+    fn test_swep_members_scoped_to_weapon_class_not_global_swep() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/weapons/weapon_a/shared.lua",
+                r#"
+                SWEP.UniqueFieldA = 1
+                "#,
+            ),
+            (
+                "lua/weapons/weapon_b/shared.lua",
+                r#"
+                SWEP.UniqueFieldB = 2
+                "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+
+        // Each weapon's class should own only its own field
+        let weapon_a_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("weapon_a")))
+            .expect("weapon_a should have members");
+        let weapon_a_names: Vec<_> = weapon_a_members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            weapon_a_names.contains(&"UniqueFieldA".to_string()),
+            "weapon_a should have UniqueFieldA, got {weapon_a_names:?}"
+        );
+        assert!(
+            !weapon_a_names.contains(&"UniqueFieldB".to_string()),
+            "weapon_a should NOT contain UniqueFieldB from weapon_b, got {weapon_a_names:?}"
+        );
+
+        let weapon_b_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("weapon_b")))
+            .expect("weapon_b should have members");
+        let weapon_b_names: Vec<_> = weapon_b_members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            weapon_b_names.contains(&"UniqueFieldB".to_string()),
+            "weapon_b should have UniqueFieldB, got {weapon_b_names:?}"
+        );
+        assert!(
+            !weapon_b_names.contains(&"UniqueFieldA".to_string()),
+            "weapon_b should NOT contain UniqueFieldA from weapon_a, got {weapon_b_names:?}"
+        );
+
+        // Neither field should be left on the global SWEP path after migration
+        let global_swep_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::GlobalPath(GlobalId::new("SWEP")));
+        if let Some(global_members) = global_swep_members {
+            let global_names: Vec<_> = global_members
+                .iter()
+                .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                .collect();
+            assert!(
+                !global_names.contains(&"UniqueFieldA".to_string()),
+                "UniqueFieldA should NOT remain on GlobalPath(SWEP), got {global_names:?}"
+            );
+            assert!(
+                !global_names.contains(&"UniqueFieldB".to_string()),
+                "UniqueFieldB should NOT remain on GlobalPath(SWEP), got {global_names:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_swep_wepselecticon_does_not_union_with_global_annotation_on_first_analysis() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+
+        let file_id = ws.def_file(
+            "lua/weapons/weapon_mad_deagle/shared.lua",
+            r#"
+            if ( SERVER ) then return end
+
+            SWEP.WepSelectIcon = Material("swepicons/cityrp_deagle.png")
+
+            function SWEP:DrawWeaponSelection( x, y, w, h, a )
+                surface.SetMaterial( self.WepSelectIcon )
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let mismatch_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == param_type_mismatch_code)
+            .collect();
+        assert!(
+            mismatch_diags.is_empty(),
+            "unexpected param-type-mismatch diagnostics: {mismatch_diags:?}"
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let swep_name_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "SWEP")
+            })
+            .expect("expected SWEP name expression");
+        let swep_token = swep_name_expr
+            .get_name_token()
+            .expect("expected SWEP token");
+        let swep_semantic = semantic_model
+            .get_semantic_info(swep_token.syntax().clone().into())
+            .expect("expected semantic info for SWEP");
+        assert_eq!(
+            swep_semantic.typ,
+            LuaType::Def(LuaTypeDeclId::global("weapon_mad_deagle")),
+            "expected SWEP to resolve to the scoped weapon class"
+        );
+    }
+
+    #[gtest]
+    fn test_scripted_class_cross_file_assignments_survive_single_file_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let shared_path = "lua/weapons/weapon_mad_deagle/shared.lua";
+        let shared_text = r#"
+            SWEP.WepSelectIcon = "material"
+        "#;
+
+        ws.def_files(vec![
+            (shared_path, shared_text),
+            (
+                "lua/weapons/weapon_mad_deagle/cl_init.lua",
+                r#"
+                include("shared.lua")
+                SWEP.WepSelectIcon = 1
+                "#,
+            ),
+        ]);
+
+        let shared_uri = ws.virtual_url_generator.new_uri(shared_path);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("weapon_mad_deagle"));
+        let key = LuaMemberKey::Name("WepSelectIcon".into());
+
+        let member_item_before = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_member_item(&owner, &key)
+            .expect("expected WepSelectIcon member item before edit");
+        let member_count_before = match member_item_before {
+            crate::LuaMemberIndexItem::One(_) => 1,
+            crate::LuaMemberIndexItem::Many(ids) => ids.len(),
+        };
+        assert_eq!(
+            member_count_before, 2,
+            "expected both shared.lua and cl_init.lua assignments to be retained before edit"
+        );
+
+        ws.analysis
+            .update_file_by_uri(&shared_uri, Some(format!("\n{shared_text}")))
+            .expect("shared file should update");
+
+        let member_item_after = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_member_item(&owner, &key)
+            .expect("expected WepSelectIcon member item after edit");
+        let member_count_after = match member_item_after {
+            crate::LuaMemberIndexItem::One(_) => 1,
+            crate::LuaMemberIndexItem::Many(ids) => ids.len(),
+        };
+        assert_eq!(
+            member_count_after, 2,
+            "single-file reindex should retain the conflicting cl_init assignment"
+        );
+    }
+
 }
