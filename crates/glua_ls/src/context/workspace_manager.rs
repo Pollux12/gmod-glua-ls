@@ -438,6 +438,9 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
     // Inject GMod annotations path if provided and not explicitly disabled
     inject_gmod_annotations(&client_config, &mut emmyrc);
 
+    // Inject gamemode base libraries if detected and not explicitly disabled
+    inject_gamemode_base_libraries(&client_config, &mut emmyrc);
+
     let (workspace_diagnostic_configs, workspace_emmyrcs) = pre_process_emmyrc_for_all_roots(
         &mut emmyrc,
         &config_roots,
@@ -493,6 +496,7 @@ fn pre_process_emmyrc_for_all_roots(
         );
         merge_client_config(client_config, &mut workspace_emmyrc);
         inject_gmod_annotations(client_config, &mut workspace_emmyrc);
+        inject_gamemode_base_libraries(client_config, &mut workspace_emmyrc);
         workspace_emmyrc.pre_process_emmyrc(workspace_root);
 
         // Store per-workspace diagnostic config before merging
@@ -710,6 +714,48 @@ fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
         .library
         .push(EmmyLibraryItem::Path(annotations_path));
     log::info!("GMod annotations added to workspace library");
+}
+
+/// Inject gamemode base libraries detected by the VSCode extension.
+///
+/// When a gamemode derives from a base gamemode (e.g., cityrp derives from
+/// sandbox), the base gamemode's folder is added as a library so that the
+/// language server can resolve references to code defined in the base.
+///
+/// This is controlled by `gmod.autoDetectGamemodeBase` — set to `false` to
+/// disable.
+fn inject_gamemode_base_libraries(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
+    // Check if explicitly disabled in config
+    if matches!(emmyrc.gmod.auto_detect_gamemode_base, Some(false)) {
+        log::info!("Gamemode base auto-detection explicitly disabled in config");
+        return;
+    }
+
+    if client_config.gamemode_base_libraries.is_empty() {
+        return;
+    }
+
+    use glua_code_analysis::EmmyLibraryItem;
+    for lib_path in &client_config.gamemode_base_libraries {
+        if emmyrc
+            .workspace
+            .library
+            .iter()
+            .any(|item| item.get_path() == lib_path)
+        {
+            log::info!(
+                "Gamemode base library already exists in workspace library: {}",
+                lib_path
+            );
+            continue;
+        }
+
+        emmyrc
+            .workspace
+            .library
+            .push(EmmyLibraryItem::Path(lib_path.clone()));
+        log::info!("Gamemode base library added to workspace library: {}", lib_path);
+    }
 }
 
 #[derive(Debug)]

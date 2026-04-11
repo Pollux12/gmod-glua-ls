@@ -81,6 +81,25 @@ pub async fn initialized_handler(
                 }
             }
         }
+
+        // Extract gamemode base libraries detected by the VSCode extension
+        if let Some(libraries) = init_options.get("gamemodeBaseLibraries") {
+            if let Some(arr) = libraries.as_array() {
+                for lib in arr {
+                    if let Some(lib_str) = lib.as_str() {
+                        if !lib_str.is_empty() {
+                            client_config.gamemode_base_libraries.push(lib_str.to_string());
+                        }
+                    }
+                }
+                if !client_config.gamemode_base_libraries.is_empty() {
+                    log::info!(
+                        "Received gamemode base libraries from VSCode: {:?}",
+                        client_config.gamemode_base_libraries
+                    );
+                }
+            }
+        }
     }
 
     // Apply CLI-provided annotations path (highest precedence after .gluarc.json)
