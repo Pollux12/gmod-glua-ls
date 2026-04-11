@@ -3,6 +3,7 @@ mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualLocation, check};
     use glua_code_analysis::{DocSyntax, Emmyrc};
     use googletest::prelude::*;
+    use lsp_types::GotoDefinitionResponse;
 
     type Expected = VirtualLocation;
 
@@ -699,6 +700,234 @@ mod tests {
                 line: 3,
             }],
         ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_prefers_same_file_scripted_class_field_definition() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "lua/entities/base_glide/cl_init.lua",
+            r#"
+                local ENT = {}
+
+                function ENT:InitWeapons()
+                    self.weapons = {}
+                end
+            "#,
+        );
+
+        let (server_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local ENT = {}
+
+                function ENT:InitWeapons()
+                    self.weapons = {}
+                end
+
+                function ENT:ClearWeapons()
+                    local myWeapons = self.we<??>apons
+                end
+            "#,
+        )?;
+        let server_file_id = ws.def_file("lua/entities/base_glide/sv_weapons.lua", &server_content);
+
+        let result =
+            crate::handlers::definition::definition(&ws.analysis, server_file_id, position)
+                .ok_or("failed to get go to definition response")
+                .or_fail()?;
+        let locations = match result {
+            GotoDefinitionResponse::Scalar(location) => vec![location],
+            GotoDefinitionResponse::Array(locations) => locations,
+            GotoDefinitionResponse::Link(_) => {
+                return fail!("unexpected go to definition response");
+            }
+        };
+        let first = locations
+            .first()
+            .ok_or("missing definition result")
+            .or_fail()?;
+        let file_name = first
+            .uri
+            .get_file_path()
+            .or_fail()?
+            .file_name()
+            .or_fail()?
+            .to_string_lossy()
+            .to_string();
+
+        verify_eq!(file_name, "sv_weapons.lua".to_string())?;
+        verify_eq!(first.range.start.line, 4)?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_prefers_same_file_in_included_server_scripted_class_file() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "lua/entities/base_glide/shared.lua",
+            r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_glide/init.lua",
+            r#"
+                AddCSLuaFile("shared.lua")
+                AddCSLuaFile("cl_init.lua")
+
+                include("shared.lua")
+                include("sv_weapons.lua")
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_glide/cl_init.lua",
+            r#"
+                include("shared.lua")
+
+                function ENT:Initialize()
+                    self.weapons = {}
+                end
+            "#,
+        );
+
+        let (server_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                function ENT:WeaponInit()
+                    self.weapons = {}
+                end
+
+                function ENT:ClearWeapons()
+                    local myWeapons = self.we<??>apons
+                end
+            "#,
+        )?;
+        let server_file_id = ws.def_file("lua/entities/base_glide/sv_weapons.lua", &server_content);
+
+        let result =
+            crate::handlers::definition::definition(&ws.analysis, server_file_id, position)
+                .ok_or("failed to get go to definition response")
+                .or_fail()?;
+        let locations = match result {
+            GotoDefinitionResponse::Scalar(location) => vec![location],
+            GotoDefinitionResponse::Array(locations) => locations,
+            GotoDefinitionResponse::Link(_) => {
+                return fail!("unexpected go to definition response");
+            }
+        };
+        check!(ProviderVirtualWorkspace::assert_locations(
+            locations,
+            vec![Expected {
+                file: "sv_weapons.lua".to_string(),
+                line: 2,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_scripted_class_field_definitions_survive_load_order_changes() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "lua/entities/base_glide/shared.lua",
+            r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_glide/init.lua",
+            r#"
+                AddCSLuaFile("shared.lua")
+                AddCSLuaFile("cl_init.lua")
+
+                include("shared.lua")
+                include("sv_weapons.lua")
+            "#,
+        );
+
+        let (server_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                function ENT:WeaponInit()
+                    self.weapons = {}
+                end
+
+                function ENT:ClearWeapons()
+                    local myWeapons = self.we<??>apons
+                    if not myWeapons then return end
+                    self.weapons = {}
+                end
+            "#,
+        )?;
+        let server_file_id = ws.def_file("lua/entities/base_glide/sv_weapons.lua", &server_content);
+
+        ws.def_file(
+            "lua/entities/base_glide/cl_init.lua",
+            r#"
+                include("shared.lua")
+
+                function ENT:Initialize()
+                    self.weapons = {}
+                end
+            "#,
+        );
+
+        let result =
+            crate::handlers::definition::definition(&ws.analysis, server_file_id, position)
+                .ok_or("failed to get go to definition response")
+                .or_fail()?;
+        let locations = match result {
+            GotoDefinitionResponse::Scalar(location) => vec![location],
+            GotoDefinitionResponse::Array(locations) => locations,
+            GotoDefinitionResponse::Link(_) => {
+                return fail!("unexpected go to definition response");
+            }
+        };
+        let virtual_locations = locations
+            .iter()
+            .map(|location| {
+                Ok(Expected {
+                    file: location
+                        .uri
+                        .get_file_path()
+                        .or_fail()?
+                        .file_name()
+                        .or_fail()?
+                        .to_string_lossy()
+                        .to_string(),
+                    line: location.range.start.line,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let first_location = virtual_locations
+            .first()
+            .ok_or("missing goto definition results")
+            .or_fail()?;
+        assert_eq!(first_location.file, "sv_weapons.lua".to_string());
+        assert_eq!(first_location.line, 2);
+        assert!(
+            virtual_locations
+                .iter()
+                .any(|location| location.file == "sv_weapons.lua" && location.line == 8),
+            "expected goto definition results to include the later same-file server assignment: {virtual_locations:?}"
+        );
 
         Ok(())
     }

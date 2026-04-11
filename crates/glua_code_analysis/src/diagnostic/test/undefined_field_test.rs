@@ -2,7 +2,9 @@
 mod test {
     use std::{ops::Deref, sync::Arc};
 
-    use crate::{DiagnosticCode, LuaType, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn test_1() {
@@ -25,6 +27,158 @@ mod test {
                 end
             "#
         ));
+    }
+
+    #[test]
+    fn test_numeric_for_index_expr_on_inferred_setmetatable_table() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local registry = {
+                    base = {
+                        Initialize = function(self) end,
+                        OnRemove = function(self) end,
+                    }
+                }
+
+                local function CreateVehicleWeapon(className, data)
+                    local class = registry[className]
+                    return setmetatable(data or {}, { __index = class })
+                end
+
+                local weapons = {}
+                local weaponCount = 0
+
+                local function CreateWeapon(className, data)
+                    local weapon = CreateVehicleWeapon(className, data)
+                    local index = weaponCount + 1
+
+                    weaponCount = index
+                    weapons[index] = weapon
+                    weapon:Initialize()
+                end
+
+                CreateWeapon("base", {})
+
+                local myWeapons = weapons
+
+                for i = #myWeapons, 1, -1 do
+                    myWeapons[i]:OnRemove()
+                    myWeapons[i] = nil
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_included_server_scripted_class_reverse_numeric_for_does_not_report_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "lua/entities/base_glide/shared.lua",
+            r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_glide/init.lua",
+            r#"
+                AddCSLuaFile("shared.lua")
+                AddCSLuaFile("cl_init.lua")
+                include("shared.lua")
+                include("sv_weapons.lua")
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_glide/cl_init.lua",
+            r#"
+                include("shared.lua")
+                include("cl_hud.lua")
+
+                function ENT:Initialize()
+                    self.weapons = {}
+                    self.weaponSlotIndex = 0
+                end
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_glide/cl_hud.lua",
+            r#"
+                function ENT:OnDriverChange(_, _, _)
+                    self.weapons = {}
+                    self.weaponSlotIndex = 0
+                end
+
+                function ENT:OnSyncWeaponData()
+                    local slotIndex = net.ReadUInt(5)
+                    local className = net.ReadString()
+                    local weapon = self.weapons[slotIndex]
+
+                    if not weapon then
+                        weapon = Glide.CreateVehicleWeapon(className)
+                        weapon.Vehicle = self
+                        weapon:Initialize()
+
+                        self.weapons[slotIndex] = weapon
+                        self:OnActivateWeapon(weapon, slotIndex)
+                    end
+                end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/entities/base_glide/sv_weapons.lua",
+            r#"
+                function ENT:WeaponInit()
+                    self.weapons = {}
+                    self.weaponCount = 0
+                end
+
+                function ENT:ClearWeapons()
+                    local myWeapons = self.weapons
+                    if not myWeapons then return end
+
+                    for i = #myWeapons, 1, -1 do
+                        myWeapons[i]:OnRemove()
+                        myWeapons[i] = nil
+                    end
+
+                    self.weapons = {}
+                    self.weaponCount = 0
+                end
+
+                function ENT:CreateWeapon(class, data)
+                    local weapon = Glide.CreateVehicleWeapon(class, data)
+                    local index = self.weaponCount + 1
+
+                    self.weaponCount = index
+                    self.weapons[index] = weapon
+                    weapon:Initialize()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field),
+            "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+        );
     }
 
     #[test]

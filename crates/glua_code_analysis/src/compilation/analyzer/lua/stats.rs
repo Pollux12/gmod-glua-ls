@@ -518,8 +518,22 @@ fn get_widened_member_assignment_type(
         }
     }
 
+    let should_widen_table_literals = is_table_assignment_merge_type(incoming_type)
+        && related_members
+            .iter()
+            .filter(|related_member| related_member.get_id() != *member_id)
+            .all(|related_member| {
+                analyzer
+                    .db
+                    .get_type_index()
+                    .get_type_cache(&related_member.get_id().into())
+                    .is_some_and(|cache| {
+                        cache.is_doc() || is_table_assignment_merge_type(cache.as_type())
+                    })
+            });
     let mut doc_type: Option<LuaType> = None;
-    let mut widened_type = crate::widen_literal_type_for_assignment(incoming_type);
+    let mut widened_type =
+        widen_related_assignment_type(incoming_type, should_widen_table_literals);
     let mut saw_previous_assignment = false;
 
     for related_member in related_members {
@@ -551,7 +565,8 @@ fn get_widened_member_assignment_type(
             continue;
         }
 
-        let existing_type = crate::widen_literal_type_for_assignment(existing_cache.as_type());
+        let existing_type =
+            widen_related_assignment_type(existing_cache.as_type(), should_widen_table_literals);
         widened_type = TypeOps::Union.apply(analyzer.db, &widened_type, &existing_type);
     }
 
@@ -560,6 +575,17 @@ fn get_widened_member_assignment_type(
     }
 
     Some(doc_type.unwrap_or(widened_type))
+}
+
+fn widen_related_assignment_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
+    match typ {
+        LuaType::TableConst(_) if widen_table_literals => LuaType::Table,
+        _ => crate::widen_literal_type_for_assignment(typ),
+    }
+}
+
+fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Table | LuaType::TableConst(_))
 }
 
 fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {

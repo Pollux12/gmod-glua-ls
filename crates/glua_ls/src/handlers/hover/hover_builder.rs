@@ -179,6 +179,7 @@ impl<'a> HoverBuilder<'a> {
                 description,
                 tag_content,
                 realm,
+                explicit_realm: _,
             } = desc_info;
 
             if let Some(realm) = realm

@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use glua_code_analysis::{
-    LuaCompilation, LuaDeclExtra, LuaDeclId, LuaMemberId, LuaMemberOwner, LuaSemanticDeclId,
-    LuaType, LuaUnionType, SemanticDeclLevel, SemanticModel,
+    LuaCompilation, LuaDeclExtra, LuaDeclId, LuaMemberId, LuaMemberIndexItem, LuaMemberOwner,
+    LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel, SemanticModel,
 };
 use glua_parser::{LuaAssignStat, LuaAstNode, LuaSyntaxKind, LuaTableExpr, LuaTableField};
 use rowan::TextSize;
@@ -166,6 +166,8 @@ pub fn find_all_same_named_members(
         .get_db()
         .get_member_index()
         .get_member(member_id)?;
+    let is_scripted_class_assignment_file_define = original_member.get_feature().is_file_define()
+        && original_member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr;
 
     let target_key = original_member.get_key().clone();
     let current_owner = semantic_model
@@ -181,62 +183,127 @@ pub fn find_all_same_named_members(
         }
     };
 
-    match current_owner {
-        LuaMemberOwner::Type(type_decl_id) => {
-            let members = if let Some(position_offset) = position_offset {
-                semantic_model.get_member_info_with_key_at_offset(
-                    &LuaType::Def(type_decl_id.clone()),
-                    target_key,
-                    true,
-                    position_offset,
-                )?
-            } else {
-                semantic_model.get_member_info_with_key(
-                    &LuaType::Def(type_decl_id.clone()),
-                    target_key,
-                    true,
-                )?
-            };
+    let scoped_class_info = semantic_model
+        .get_db()
+        .get_gmod_infer_index()
+        .get_scoped_class_info(&semantic_model.get_file_id());
 
-            for member_info in members {
-                if let Some(LuaSemanticDeclId::Member(member_id)) = member_info.property_owner_id {
-                    push_member(member_id);
-                }
+    if is_scripted_class_assignment_file_define && scoped_class_info.is_some() {
+        let mut owner_candidates = vec![current_owner.clone()];
+        if let Some(scoped_class_info) = scoped_class_info {
+            let scripted_owner =
+                LuaMemberOwner::Type(LuaTypeDeclId::global(&scoped_class_info.class_name));
+            if !owner_candidates.contains(&scripted_owner) {
+                owner_candidates.push(scripted_owner);
             }
         }
-        _ => {
-            if let Some(member_item) = semantic_model
-                .get_db()
-                .get_member_index()
-                .get_member_item(current_owner, &target_key)
-            {
-                let visible_member_ids = position_offset.map_or_else(
-                    || {
-                        member_item.visible_member_ids_with_realm(
-                            semantic_model.get_db(),
-                            &semantic_model.get_file_id(),
-                        )
-                    },
-                    |position_offset| {
-                        member_item.visible_member_ids_with_realm_at_offset(
-                            semantic_model.get_db(),
-                            &semantic_model.get_file_id(),
-                            position_offset,
-                        )
-                    },
-                );
 
-                for member_id in visible_member_ids {
-                    push_member(member_id);
-                }
-            } else {
-                let all_members = semantic_model
+        let mut matching_member_ids = owner_candidates
+            .iter()
+            .flat_map(|owner| {
+                semantic_model
                     .get_db()
                     .get_member_index()
-                    .get_members(current_owner)?;
-                for member in all_members {
-                    if member.get_key() == &target_key {
-                        push_member(member.get_id());
+                    .get_members_for_owner_key(owner, &target_key)
+                    .into_iter()
+                    .map(|member| member.get_id())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let same_file_member_ids = semantic_model
+            .get_db()
+            .get_member_index()
+            .get_file_members(semantic_model.get_file_id())
+            .into_iter()
+            .filter(|member| {
+                member.get_key() == &target_key
+                    && member.get_feature().is_file_define()
+                    && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
+                    && semantic_model
+                        .get_db()
+                        .get_member_index()
+                        .get_current_owner(&member.get_id())
+                        .is_some_and(|owner| {
+                            owner_candidates.iter().any(|candidate| candidate == owner)
+                        })
+            })
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        matching_member_ids.extend(same_file_member_ids);
+
+        let mut matching_members =
+            member_ids_to_visible_same_named(semantic_model, matching_member_ids, position_offset);
+        matching_members.sort_by_key(|member_id| {
+            (
+                member_id.file_id != semantic_model.get_file_id(),
+                member_id.get_position(),
+            )
+        });
+
+        for member_id in matching_members {
+            push_member(member_id);
+        }
+    } else {
+        match current_owner {
+            LuaMemberOwner::Type(type_decl_id) => {
+                let members = if let Some(position_offset) = position_offset {
+                    semantic_model.get_member_info_with_key_at_offset(
+                        &LuaType::Def(type_decl_id.clone()),
+                        target_key,
+                        true,
+                        position_offset,
+                    )?
+                } else {
+                    semantic_model.get_member_info_with_key(
+                        &LuaType::Def(type_decl_id.clone()),
+                        target_key,
+                        true,
+                    )?
+                };
+
+                for member_info in members {
+                    if let Some(LuaSemanticDeclId::Member(member_id)) =
+                        member_info.property_owner_id
+                    {
+                        push_member(member_id);
+                    }
+                }
+            }
+            _ => {
+                if let Some(member_item) = semantic_model
+                    .get_db()
+                    .get_member_index()
+                    .get_member_item(current_owner, &target_key)
+                {
+                    let visible_member_ids = position_offset.map_or_else(
+                        || {
+                            member_item.visible_member_ids_with_realm(
+                                semantic_model.get_db(),
+                                &semantic_model.get_file_id(),
+                            )
+                        },
+                        |position_offset| {
+                            member_item.visible_member_ids_with_realm_at_offset(
+                                semantic_model.get_db(),
+                                &semantic_model.get_file_id(),
+                                position_offset,
+                            )
+                        },
+                    );
+
+                    for member_id in visible_member_ids {
+                        push_member(member_id);
+                    }
+                } else {
+                    let all_members = semantic_model
+                        .get_db()
+                        .get_member_index()
+                        .get_members(current_owner)?;
+                    for member in all_members {
+                        if member.get_key() == &target_key {
+                            push_member(member.get_id());
+                        }
                     }
                 }
             }
@@ -248,6 +315,29 @@ pub fn find_all_same_named_members(
     } else {
         Some(same_named)
     }
+}
+
+fn member_ids_to_visible_same_named(
+    semantic_model: &SemanticModel,
+    member_ids: Vec<LuaMemberId>,
+    position_offset: Option<rowan::TextSize>,
+) -> Vec<LuaMemberId> {
+    let member_item = LuaMemberIndexItem::Many(member_ids);
+    position_offset.map_or_else(
+        || {
+            member_item.visible_member_ids_with_realm(
+                semantic_model.get_db(),
+                &semantic_model.get_file_id(),
+            )
+        },
+        |position_offset| {
+            member_item.visible_member_ids_with_realm_at_offset(
+                semantic_model.get_db(),
+                &semantic_model.get_file_id(),
+                position_offset,
+            )
+        },
+    )
 }
 
 fn resolve_member_owner(

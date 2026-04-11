@@ -3568,6 +3568,78 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_numeric_for_index_expr_on_inferred_ent_weapons_table() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "lua/entities/base_glide/shared.lua",
+            r#"
+                ---@class base_glide : Entity
+                local ENT = {}
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/base_glide/sv_weapons.lua",
+            r#"
+                ---@class base_glide
+                local ENT = {}
+
+                local registry = {
+                    base = {
+                        Initialize = function(self) end,
+                        OnRemove = function(self) end,
+                    }
+                }
+
+                local function CreateVehicleWeapon(className, data)
+                    local class = registry[className]
+                    return setmetatable(data or {}, { __index = class })
+                end
+
+                function ENT:CreateWeapon(className, data)
+                    local weapon = CreateVehicleWeapon(className, data)
+                    local index = (self.weaponCount or 0) + 1
+
+                    self.weaponCount = index
+                    self.weapons = self.weapons or {}
+                    self.weapons[index] = weapon
+                    weapon:Initialize()
+                end
+
+                function ENT:ClearWeapons()
+                    local myWeapons = self.weapons
+                    if not myWeapons then return end
+
+                    for i = #myWeapons, 1, -1 do
+                        myWeapons[i]:OnRemove()
+                        myWeapons[i] = nil
+                    end
+                end
+            "#,
+        );
+
+        let field_names: Vec<String> = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("undefined-field".to_string())))
+            .map(|d| d.message)
+            .collect();
+
+        assert!(
+            !field_names.iter().any(|m| m.contains("`[i]`")),
+            "numeric for index into inferred ENT weapons table should not trigger undefined-field: {field_names:?}"
+        );
+    }
+
     /// Verify that a method defined in two entity files (init.lua + shared.lua CLIENT block)
     /// is stored as Many with both member IDs in the member index.
     #[gtest]

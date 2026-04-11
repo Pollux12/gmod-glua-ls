@@ -168,13 +168,28 @@ fn build_function_define_hover(
         });
     }
 
+    let caller_realm = builder
+        .get_trigger_token()
+        .map(|token| token.text_range().start())
+        .map_or_else(
+            || {
+                db.get_gmod_infer_index()
+                    .get_realm_file_metadata(&builder.semantic_model.get_file_id())
+                    .map(|metadata| metadata.inferred_realm)
+                    .unwrap_or(glua_code_analysis::GmodRealm::Unknown)
+            },
+            |trigger_position| {
+                db.get_gmod_infer_index()
+                    .get_realm_at_offset(&builder.semantic_model.get_file_id(), trigger_position)
+            },
+        );
     // 去重, 这是必须的
-    function_infos.dedup_by(|incoming, existing| {
-        if incoming.primary != existing.primary {
+    function_infos.dedup_by(|current, previous| {
+        if current.primary != previous.primary {
             return false;
         }
 
-        merge_preferred_description(existing, incoming);
+        merge_preferred_description(previous, current, caller_realm);
         true
     });
 
@@ -207,7 +222,11 @@ fn build_function_define_hover(
     Some(())
 }
 
-fn merge_preferred_description(existing: &mut HoverFunctionInfo, incoming: &HoverFunctionInfo) {
+fn merge_preferred_description(
+    existing: &mut HoverFunctionInfo,
+    incoming: &HoverFunctionInfo,
+    caller_realm: glua_code_analysis::GmodRealm,
+) {
     match (&mut existing.description, &incoming.description) {
         (None, Some(incoming_description)) => {
             existing.description = Some(incoming_description.clone());
@@ -228,9 +247,86 @@ fn merge_preferred_description(existing: &mut HoverFunctionInfo, incoming: &Hove
             {
                 existing_description.tag_content = incoming_description.tag_content.clone();
             }
+
+            if existing_description.description.is_none()
+                && incoming_description.description.is_none()
+                && existing_description.tag_content.is_none()
+                && incoming_description.tag_content.is_none()
+            {
+                existing_description.realm = merge_docless_realms(
+                    caller_realm,
+                    existing_description.realm,
+                    existing_description.explicit_realm,
+                    incoming_description.realm,
+                    incoming_description.explicit_realm,
+                );
+            }
         }
         _ => {}
     }
+}
+
+fn merge_docless_realms(
+    caller_realm: glua_code_analysis::GmodRealm,
+    existing_realm: Option<glua_code_analysis::GmodRealm>,
+    existing_explicit_realm: bool,
+    incoming_realm: Option<glua_code_analysis::GmodRealm>,
+    incoming_explicit_realm: bool,
+) -> Option<glua_code_analysis::GmodRealm> {
+    let existing_realm = existing_realm.or(incoming_realm)?;
+    let incoming_realm = incoming_realm.unwrap_or(existing_realm);
+
+    if !super::is_realm_compatible(caller_realm, incoming_realm) {
+        return Some(existing_realm);
+    }
+    if !super::is_realm_compatible(caller_realm, existing_realm) {
+        return Some(incoming_realm);
+    }
+
+    let merged = match caller_realm {
+        glua_code_analysis::GmodRealm::Server | glua_code_analysis::GmodRealm::Client => {
+            if incoming_realm == glua_code_analysis::GmodRealm::Shared {
+                glua_code_analysis::GmodRealm::Shared
+            } else {
+                existing_realm
+            }
+        }
+        glua_code_analysis::GmodRealm::Shared | glua_code_analysis::GmodRealm::Unknown => {
+            if existing_realm == glua_code_analysis::GmodRealm::Shared
+                && incoming_realm == glua_code_analysis::GmodRealm::Client
+                && incoming_explicit_realm
+            {
+                glua_code_analysis::GmodRealm::Client
+            } else if incoming_realm == glua_code_analysis::GmodRealm::Shared {
+                glua_code_analysis::GmodRealm::Shared
+            } else if existing_realm == glua_code_analysis::GmodRealm::Shared {
+                glua_code_analysis::GmodRealm::Shared
+            } else if matches!(
+                (existing_realm, incoming_realm),
+                (
+                    glua_code_analysis::GmodRealm::Server,
+                    glua_code_analysis::GmodRealm::Client
+                ) | (
+                    glua_code_analysis::GmodRealm::Client,
+                    glua_code_analysis::GmodRealm::Server
+                )
+            ) {
+                glua_code_analysis::GmodRealm::Unknown
+            } else if existing_realm == glua_code_analysis::GmodRealm::Client
+                && existing_explicit_realm
+            {
+                glua_code_analysis::GmodRealm::Client
+            } else if existing_realm == glua_code_analysis::GmodRealm::Unknown {
+                incoming_realm
+            } else if incoming_realm == glua_code_analysis::GmodRealm::Unknown {
+                existing_realm
+            } else {
+                existing_realm
+            }
+        }
+    };
+
+    Some(merged)
 }
 
 fn process_function_type(

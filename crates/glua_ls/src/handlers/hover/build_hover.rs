@@ -4,11 +4,11 @@ use glua_code_analysis::humanize_type;
 use glua_code_analysis::{
     DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaMemberId, LuaMemberKey,
     LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
-    SemanticInfo, SemanticModel,
+    SemanticDeclLevel, SemanticInfo, SemanticModel,
 };
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaIndexExpr, LuaSyntaxKind,
-    LuaSyntaxToken, LuaTableExpr, LuaTableField,
+    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaSyntaxKind,
+    LuaSyntaxToken, LuaTableExpr, LuaTableField, PathTrait,
 };
 use lsp_types::{Hover, HoverContents, MarkedString, MarkupContent};
 use rowan::TextRange;
@@ -502,6 +502,15 @@ fn extend_gmod_hook_semantic_decls(
     let trigger_position = builder
         .get_trigger_token()
         .map(|token| token.text_range().start());
+    extend_gmod_hook_same_owner_semantic_decls(
+        builder,
+        db,
+        owner_type_decl_id,
+        &member_key,
+        trigger_position,
+        semantic_decls,
+    );
+
     for fallback_owner_name in fallback_owner_names {
         let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
         let member_infos = match trigger_position {
@@ -549,6 +558,128 @@ fn extend_gmod_hook_semantic_decls(
 
             semantic_decls.push((property_owner_id, owner_type));
         }
+    }
+}
+
+fn extend_gmod_hook_same_owner_semantic_decls(
+    builder: &HoverBuilder,
+    db: &DbIndex,
+    owner_type_decl_id: &LuaTypeDeclId,
+    member_key: &LuaMemberKey,
+    trigger_position: Option<rowan::TextSize>,
+    semantic_decls: &mut Vec<(LuaSemanticDeclId, LuaType)>,
+) {
+    let LuaMemberKey::Name(hook_name) = member_key else {
+        return;
+    };
+
+    let module_index = db.get_module_index();
+    let caller_workspace_id = module_index.get_workspace_id(builder.semantic_model.get_file_id());
+    let caller_realm = trigger_position.map_or_else(
+        || {
+            db.get_gmod_infer_index()
+                .get_realm_file_metadata(&builder.semantic_model.get_file_id())
+                .map(|metadata| metadata.inferred_realm)
+                .unwrap_or(glua_code_analysis::GmodRealm::Unknown)
+        },
+        |trigger_position| {
+            db.get_gmod_infer_index()
+                .get_realm_at_offset(&builder.semantic_model.get_file_id(), trigger_position)
+        },
+    );
+    let target_access_path = format!("{}.{}", owner_type_decl_id.get_simple_name(), hook_name);
+    let mut same_owner_candidates = Vec::new();
+    for file_id in db.get_vfs().get_all_file_ids() {
+        let workspace_priority = if let Some(caller_workspace_id) = caller_workspace_id {
+            let Some(candidate_workspace_id) = module_index.get_workspace_id(file_id) else {
+                continue;
+            };
+            let Some(priority) = module_index
+                .workspace_resolution_priority(caller_workspace_id, candidate_workspace_id)
+            else {
+                continue;
+            };
+            priority
+        } else {
+            0
+        };
+
+        let Some(semantic_model) = builder.compilation.get_semantic_model(file_id) else {
+            continue;
+        };
+        let Some(tree) = semantic_model.get_db().get_vfs().get_syntax_tree(&file_id) else {
+            continue;
+        };
+        let root = tree.get_red_root();
+
+        for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
+            let Some(func_name) = func_stat.get_func_name() else {
+                continue;
+            };
+            if func_name.get_access_path().as_deref() != Some(target_access_path.as_str()) {
+                continue;
+            }
+
+            let Some(node) = func_stat.get_syntax_id().to_node_from_root(&root) else {
+                continue;
+            };
+            let Some(func_stat) = LuaFuncStat::cast(node) else {
+                continue;
+            };
+            let Some(func_name) = func_stat.get_func_name() else {
+                continue;
+            };
+            let Some(LuaSemanticDeclId::Member(member_id)) = semantic_model.find_decl(
+                func_name.syntax().clone().into(),
+                SemanticDeclLevel::default(),
+            ) else {
+                continue;
+            };
+            let Some(LuaMemberOwner::Type(candidate_owner)) =
+                db.get_member_index().get_current_owner(&member_id)
+            else {
+                continue;
+            };
+            if *candidate_owner != *owner_type_decl_id {
+                continue;
+            }
+            let candidate_realm = db
+                .get_gmod_infer_index()
+                .get_realm_at_offset(&member_id.file_id, member_id.get_position());
+            if !super::is_realm_compatible(caller_realm, candidate_realm) {
+                continue;
+            }
+
+            let same_owner_decl = LuaSemanticDeclId::Member(member_id);
+            if semantic_decls
+                .iter()
+                .any(|(decl_id, _)| decl_id == &same_owner_decl)
+            {
+                continue;
+            }
+
+            let owner_type = semantic_model.get_type(member_id.into());
+            if !is_function(&owner_type) {
+                continue;
+            }
+
+            same_owner_candidates.push((workspace_priority, same_owner_decl, owner_type));
+        }
+    }
+
+    let Some(best_priority) = same_owner_candidates
+        .iter()
+        .map(|(priority, _, _)| *priority)
+        .min()
+    else {
+        return;
+    };
+
+    for (_, same_owner_decl, owner_type) in same_owner_candidates
+        .into_iter()
+        .filter(|(priority, _, _)| *priority == best_priority)
+    {
+        semantic_decls.push((same_owner_decl, owner_type));
     }
 }
 

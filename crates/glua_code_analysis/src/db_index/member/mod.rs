@@ -146,7 +146,9 @@ impl LuaMemberIndex {
                             LuaMemberIndexItem::One(id),
                             old_member_ids
                                 .into_iter()
-                                .filter(|old_id| *old_id != id)
+                                .filter(|old_id| {
+                                    *old_id != id && !self.is_assignment_file_define_member(*old_id)
+                                })
                                 .collect(),
                         ),
                     }
@@ -362,6 +364,20 @@ impl LuaMemberIndex {
             .collect()
     }
 
+    pub fn get_file_members(&self, file_id: FileId) -> Vec<&LuaMember> {
+        let Some(member_or_owners) = self.in_filed.get(&file_id) else {
+            return Vec::new();
+        };
+
+        member_or_owners
+            .iter()
+            .filter_map(|entry| match entry {
+                MemberOrOwner::Member(member_id) => self.get_member(member_id),
+                MemberOrOwner::Owner(_) => None,
+            })
+            .collect()
+    }
+
     pub fn retain_only_member_for_owner_key(&mut self, member_id: LuaMemberId) -> Option<()> {
         let owner = self.member_current_owner.get(&member_id)?.clone();
         let key = self.get_member(&member_id)?.get_key().clone();
@@ -546,5 +562,56 @@ mod tests {
         index.clear();
 
         assert!(index.get_member_owner(&member_id).is_none());
+    }
+
+    #[test]
+    fn file_define_assignment_history_stays_visible_for_owner_key_queries() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let key = LuaMemberKey::Name("field".into());
+        let first_member_id = LuaMemberId::new(
+            LuaSyntaxId::new(
+                LuaSyntaxKind::IndexExpr.into(),
+                TextRange::new(TextSize::new(1), TextSize::new(2)),
+            ),
+            FileId::new(4),
+        );
+        let second_member_id = LuaMemberId::new(
+            LuaSyntaxId::new(
+                LuaSyntaxKind::IndexExpr.into(),
+                TextRange::new(TextSize::new(3), TextSize::new(4)),
+            ),
+            FileId::new(5),
+        );
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(
+                first_member_id,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(
+                second_member_id,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::One(second_member_id))
+        );
+        let member_ids = index
+            .get_members_for_owner_key(&owner, &key)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        assert_eq!(member_ids, vec![first_member_id, second_member_id]);
     }
 }

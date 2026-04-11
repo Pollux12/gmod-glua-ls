@@ -75,6 +75,7 @@ impl LuaMemberIndexItem {
         let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &member_ids);
         select_member_ids_by_workspace_and_realm(
             db,
+            caller_file_id,
             priority_tiers,
             infer_caller_file_realm(db, caller_file_id),
         )
@@ -90,6 +91,7 @@ impl LuaMemberIndexItem {
         let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &member_ids);
         select_member_ids_by_workspace_and_realm(
             db,
+            caller_file_id,
             priority_tiers,
             db.get_gmod_infer_index()
                 .get_realm_at_offset(caller_file_id, caller_position),
@@ -137,6 +139,14 @@ fn resolve_member_type(
                 });
             let should_widen_file_defines =
                 !should_prefer_doc_file_defines && members.len() > 1 && all_file_defines;
+            let should_widen_table_literals = should_widen_file_defines
+                && members.iter().all(|member| {
+                    db.get_type_index()
+                        .get_type_cache(&member.get_id().into())
+                        .is_some_and(|cache| {
+                            cache.is_doc() || is_table_assignment_merge_type(cache.as_type())
+                        })
+                });
             if db.get_emmyrc().strict.meta_override_file_define {
                 for member in &members {
                     let feature = member.get_feature();
@@ -163,7 +173,7 @@ fn resolve_member_type(
 
                         let member_type = member_type_cache.as_type();
                         let member_type = if should_widen_file_defines {
-                            crate::widen_literal_type_for_assignment(member_type)
+                            widen_file_define_member_type(member_type, should_widen_table_literals)
                         } else {
                             member_type.clone()
                         };
@@ -299,17 +309,25 @@ fn get_member_id_priority_tiers(
 
 fn select_member_ids_by_workspace_and_realm(
     db: &DbIndex,
+    _caller_file_id: &FileId,
     priority_tiers: Vec<(u8, Vec<LuaMemberId>)>,
     caller_realm: GmodRealm,
 ) -> Vec<LuaMemberId> {
+    if !db.get_emmyrc().gmod.enabled {
+        return priority_tiers
+            .first()
+            .map(|(_, member_ids)| member_ids.clone())
+            .unwrap_or_default();
+    }
+
     let fallback_member_ids = priority_tiers
         .first()
-        .map(|(_, member_ids)| member_ids.clone())
+        .map(|(_, member_ids)| {
+            let mut member_ids = member_ids.clone();
+            sort_member_ids_for_caller(db, caller_realm, &mut member_ids);
+            member_ids
+        })
         .unwrap_or_default();
-
-    if !db.get_emmyrc().gmod.enabled {
-        return fallback_member_ids;
-    }
 
     let infer_index = db.get_gmod_infer_index();
     for (_, tier_member_ids) in priority_tiers {
@@ -322,11 +340,49 @@ fn select_member_ids_by_workspace_and_realm(
             })
             .collect::<Vec<_>>();
         if !compatible_member_ids.is_empty() {
+            let mut compatible_member_ids = compatible_member_ids;
+            sort_member_ids_for_caller(db, caller_realm, &mut compatible_member_ids);
             return compatible_member_ids;
         }
     }
 
     fallback_member_ids
+}
+
+fn sort_member_ids_for_caller(
+    db: &DbIndex,
+    caller_realm: GmodRealm,
+    member_ids: &mut [LuaMemberId],
+) {
+    let infer_index = db.get_gmod_infer_index();
+    member_ids.sort_by_key(|member_id| {
+        let member_realm =
+            infer_index.get_realm_at_offset(&member_id.file_id, member_id.get_position());
+        realm_match_rank(caller_realm, member_realm)
+    });
+}
+
+fn realm_match_rank(caller_realm: GmodRealm, member_realm: GmodRealm) -> u8 {
+    if caller_realm == member_realm {
+        0
+    } else if member_realm == GmodRealm::Shared {
+        1
+    } else if member_realm == GmodRealm::Unknown {
+        2
+    } else {
+        3
+    }
+}
+
+fn widen_file_define_member_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
+    match typ {
+        LuaType::TableConst(_) if widen_table_literals => LuaType::Table,
+        _ => crate::widen_literal_type_for_assignment(typ),
+    }
+}
+
+fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Table | LuaType::TableConst(_))
 }
 
 fn member_item_from_ids(member_ids: Vec<LuaMemberId>) -> LuaMemberIndexItem {
@@ -622,6 +678,7 @@ mod tests {
 
         let selected = select_member_ids_by_workspace_and_realm(
             &db,
+            &FileId::new(100),
             vec![(0, vec![tier_one_member]), (1, vec![tier_two_member])],
             GmodRealm::Client,
         );
@@ -645,11 +702,38 @@ mod tests {
 
         let selected = select_member_ids_by_workspace_and_realm(
             &db,
+            &FileId::new(101),
             vec![(0, vec![server_member]), (1, vec![unknown_member])],
             GmodRealm::Client,
         );
 
         assert_eq!(selected, vec![server_member]);
+    }
+
+    #[test]
+    fn select_member_ids_by_workspace_and_realm_preserves_order_for_equivalent_matches() {
+        let mut db = make_db();
+        let caller_file = FileId::new(30);
+        let other_file = FileId::new(31);
+        let same_file_member = make_member_id(caller_file, 20);
+        let other_file_member = make_member_id(other_file, 1);
+
+        set_file_realms(
+            &mut db,
+            &[
+                (caller_file, GmodRealm::Server),
+                (other_file, GmodRealm::Server),
+            ],
+        );
+
+        let selected = select_member_ids_by_workspace_and_realm(
+            &db,
+            &caller_file,
+            vec![(0, vec![other_file_member, same_file_member])],
+            GmodRealm::Server,
+        );
+
+        assert_eq!(selected, vec![other_file_member, same_file_member]);
     }
 
     #[test]

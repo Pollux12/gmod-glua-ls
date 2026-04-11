@@ -198,6 +198,7 @@ pub struct DescriptionInfo {
     pub description: Option<String>,
     pub tag_content: Option<Vec<(String, String)>>,
     pub realm: Option<GmodRealm>,
+    pub explicit_realm: bool,
 }
 
 impl DescriptionInfo {
@@ -206,6 +207,7 @@ impl DescriptionInfo {
             description: None,
             tag_content: None,
             realm: None,
+            explicit_realm: false,
         }
     }
 
@@ -227,7 +229,9 @@ pub fn extract_description_from_property_owner(
     let mut result = DescriptionInfo::new();
 
     result.description = property.description().map(|detail| detail.to_string());
-    result.realm = infer_description_realm(semantic_model, property_owner);
+    let (realm, explicit_realm) = infer_description_realm(semantic_model, property_owner);
+    result.realm = realm;
+    result.explicit_realm = explicit_realm;
 
     if let Some(tag_content) = property.tag_content() {
         for (tag_name, description) in tag_content.get_all_tags() {
@@ -250,14 +254,46 @@ pub fn extract_description_from_property_owner(
 fn infer_description_realm(
     semantic_model: &SemanticModel,
     property_owner: &LuaSemanticDeclId,
-) -> Option<GmodRealm> {
+) -> (Option<GmodRealm>, bool) {
     if !semantic_model.get_emmyrc().gmod.enabled {
-        return None;
+        return (None, false);
     }
 
-    match infer_property_owner_realm(semantic_model, property_owner)? {
-        GmodRealm::Unknown => None,
-        realm => Some(realm),
+    let db = semantic_model.get_db();
+    let (file_id, offset) = match property_owner {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
+                return (None, false);
+            };
+            (decl.get_file_id(), decl.get_range().start())
+        }
+        LuaSemanticDeclId::Member(member_id) => {
+            let Some(member) = db.get_member_index().get_member(member_id) else {
+                return (None, false);
+            };
+            (member.get_file_id(), member.get_range().start())
+        }
+        _ => return (None, false),
+    };
+
+    if let Some(annotation_realm) =
+        resolve_decl_annotation_realm_at_offset(semantic_model, &file_id, offset)
+    {
+        return (Some(annotation_realm), true);
+    }
+
+    if let Some(metadata) = db.get_gmod_infer_index().get_realm_file_metadata(&file_id)
+        && let Some(annotation_realm) = metadata.annotation_realm
+    {
+        return (Some(annotation_realm), true);
+    }
+
+    match db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&file_id, offset)
+    {
+        GmodRealm::Unknown => (None, false),
+        realm => (Some(realm), false),
     }
 }
 
