@@ -7,9 +7,10 @@ use rowan::TextSize;
 use crate::{
     AssignVarHint, CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
     GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSignatureId, LuaType, TypeOps, infer_expr,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, TypeOps, infer_expr,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
+        infer_name::infer_param,
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{InferConditionFlow, get_type_at_condition_flow},
@@ -189,7 +190,13 @@ fn get_type_at_flow_walk(
             }
             FlowNodeKind::DeclPosition(position) => {
                 if *position <= var_ref_id.get_position() {
-                    match get_var_ref_type(db, cache, var_ref_id) {
+                    if let Some(decl_id) = var_ref_id.get_decl_id_ref()
+                        && should_defer_uninitialized_local_decl_type(db, decl_id)
+                    {
+                        return Err(InferFailReason::UnResolveDeclType(decl_id));
+                    }
+
+                    match get_decl_position_var_ref_type(db, cache, var_ref_id) {
                         Ok(var_type) => {
                             return Ok(var_type);
                         }
@@ -433,6 +440,24 @@ fn get_type_at_flow_walk(
     }
 }
 
+fn get_decl_position_var_ref_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    var_ref_id: &VarRefId,
+) -> InferResult {
+    if let Some(decl_id) = var_ref_id.get_decl_id_ref()
+        && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
+    {
+        if decl.is_param()
+            && let Ok(param_type) = infer_param(db, decl)
+        {
+            return Ok(param_type);
+        }
+    }
+
+    get_var_ref_type(db, cache, var_ref_id)
+}
+
 fn with_flow_query_realm<T>(
     cache: &mut LuaInferCache,
     query_realm: GmodRealm,
@@ -460,6 +485,48 @@ fn should_treat_unresolved_decl_as_nil(db: &DbIndex, decl_id: crate::LuaDeclId) 
     db.get_type_index()
         .get_type_cache(&decl_id.into())
         .is_none()
+        || should_defer_uninitialized_local_decl_type(db, decl_id)
+}
+
+fn should_defer_uninitialized_local_decl_type(db: &DbIndex, decl_id: crate::LuaDeclId) -> bool {
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return false;
+    };
+
+    if !matches!(decl.extra, crate::LuaDeclExtra::Local { .. }) {
+        return false;
+    }
+
+    if decl.get_value_syntax_id().is_some() {
+        return false;
+    }
+
+    if db
+        .get_property_index()
+        .get_property(&LuaSemanticDeclId::LuaDecl(decl_id))
+        .and_then(|property| property.find_attribute_use("lsp_optimization"))
+        .and_then(|attr| attr.get_param_by_name("code"))
+        .is_some_and(|param| matches!(param, LuaType::DocStringConst(code) if code.as_ref() == "delayed_definition"))
+    {
+        return false;
+    }
+
+    if !db
+        .get_reference_index()
+        .get_decl_references(&decl_id.file_id, &decl_id)
+        .is_some_and(|decl_refs| decl_refs.mutable)
+    {
+        return false;
+    }
+
+    let Some(type_cache) = db.get_type_index().get_type_cache(&decl_id.into()) else {
+        return false;
+    };
+
+    // Mutable uninitialized locals may get an inferred type from later assignments.
+    // At the declaration point this type is not yet guaranteed, so keep the value
+    // unresolved and let branch merge handling map it to nil when appropriate.
+    type_cache.is_infer() && !type_cache.as_type().is_nil()
 }
 
 fn try_get_multi_antecedent_type(

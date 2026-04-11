@@ -1796,6 +1796,13 @@
             "null"
           ]
         },
+        "autoDetectGamemodeBase": {
+          "description": "Automatically detect and add the base gamemode as a library when a gamemode\nderives from another (via the `\"base\"` field in the gamemode `.txt` file).\nSet to `false` to disable this detection.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "autoLoadAnnotations": {
           "description": "Disable auto-loading of annotations (from VSCode or default path).\nThis takes precedence over extension settings.",
           "type": [

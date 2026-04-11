@@ -54,6 +54,21 @@ pub fn get_var_ref_type(
             .get_decl(&decl_id)
             .ok_or(InferFailReason::None)?;
 
+        // Parameter declarations carry their canonical type in signature metadata.
+        // Flow/assignment analysis may also create a decl type cache entry for params,
+        // but that inferred cache must not replace the declared parameter type.
+        if decl.is_param() {
+            if let Ok(param_type) = infer_param(db, decl) {
+                return Ok(param_type);
+            }
+
+            if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
+                return Ok(type_cache.as_type().clone());
+            }
+
+            return Err(InferFailReason::UnResolveDeclType(decl.get_id()));
+        }
+
         if decl.is_global() {
             if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
                 let typ = type_cache.as_type();
@@ -72,10 +87,6 @@ pub fn get_var_ref_type(
             let result = type_cache.as_type().clone();
             // 不要在此阶段展开泛型别名, 必须让后续的泛型匹配阶段基于声明形态完成推断
             return Ok(result);
-        }
-
-        if decl.is_param() {
-            return infer_param(db, decl);
         }
 
         Err(InferFailReason::UnResolveDeclType(decl.get_id()))

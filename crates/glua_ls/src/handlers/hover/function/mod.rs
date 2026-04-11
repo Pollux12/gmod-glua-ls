@@ -297,9 +297,9 @@ fn merge_docless_realms(
                 && incoming_explicit_realm
             {
                 glua_code_analysis::GmodRealm::Client
-            } else if incoming_realm == glua_code_analysis::GmodRealm::Shared {
-                glua_code_analysis::GmodRealm::Shared
-            } else if existing_realm == glua_code_analysis::GmodRealm::Shared {
+            } else if incoming_realm == glua_code_analysis::GmodRealm::Shared
+                || existing_realm == glua_code_analysis::GmodRealm::Shared
+            {
                 glua_code_analysis::GmodRealm::Shared
             } else if matches!(
                 (existing_realm, incoming_realm),
@@ -318,8 +318,6 @@ fn merge_docless_realms(
                 glua_code_analysis::GmodRealm::Client
             } else if existing_realm == glua_code_analysis::GmodRealm::Unknown {
                 incoming_realm
-            } else if incoming_realm == glua_code_analysis::GmodRealm::Unknown {
-                existing_realm
             } else {
                 existing_realm
             }
