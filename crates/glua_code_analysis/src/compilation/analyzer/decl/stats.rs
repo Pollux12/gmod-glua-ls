@@ -241,7 +241,42 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
             let position = name_token.get_position();
             let name = name_token.get_name_text();
             let range = name_token.get_range();
-            if analyzer.find_decl(name, position).is_none() || analyzer.is_meta {
+            let decl_id = if !analyzer.is_meta {
+                if let Some(decl) = analyzer.find_decl(name, position) {
+                    if !decl.is_global() {
+                        let decl_id = decl.get_id();
+                        analyzer
+                            .db
+                            .get_reference_index_mut()
+                            .add_decl_reference(decl_id, file_id, range, true);
+                        decl_id
+                    } else {
+                        let decl = LuaDecl::new(
+                            name,
+                            file_id,
+                            range,
+                            LuaDeclExtra::Global {
+                                kind: LuaSyntaxKind::NameExpr.into(),
+                            },
+                            None,
+                        );
+
+                        analyzer.add_decl(decl)
+                    }
+                } else {
+                    let decl = LuaDecl::new(
+                        name,
+                        file_id,
+                        range,
+                        LuaDeclExtra::Global {
+                            kind: LuaSyntaxKind::NameExpr.into(),
+                        },
+                        None,
+                    );
+
+                    analyzer.add_decl(decl)
+                }
+            } else {
                 let decl = LuaDecl::new(
                     name,
                     file_id,
@@ -252,11 +287,10 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
                     None,
                 );
 
-                let decl_id = analyzer.add_decl(decl);
-                LuaSemanticDeclId::LuaDecl(decl_id)
-            } else {
-                return Some(());
-            }
+                analyzer.add_decl(decl)
+            };
+
+            LuaSemanticDeclId::LuaDecl(decl_id)
         }
         LuaVarExpr::IndexExpr(index_expr) => {
             let index_key = index_expr.get_index_key()?;

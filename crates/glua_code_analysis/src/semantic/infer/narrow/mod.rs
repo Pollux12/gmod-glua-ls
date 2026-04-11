@@ -55,6 +55,15 @@ pub fn get_var_ref_type(
             .ok_or(InferFailReason::None)?;
 
         if decl.is_global() {
+            if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
+                let typ = type_cache.as_type();
+                return if typ.contain_tpl() {
+                    Ok(LuaType::Unknown)
+                } else {
+                    Ok(typ.clone())
+                };
+            }
+
             let name = decl.get_name();
             return infer_global_type(db, Some(cache.get_file_id()), None, name);
         }

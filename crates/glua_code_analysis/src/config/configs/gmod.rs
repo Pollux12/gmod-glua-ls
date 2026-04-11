@@ -85,6 +85,11 @@ pub struct EmmyrcGmod {
     /// Accepts an absolute path or a path relative to the workspace root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_path: Option<String>,
+    /// Automatically detect and add the base gamemode as a library when a gamemode
+    /// derives from another (via the `"base"` field in the gamemode `.txt` file).
+    /// Set to `false` to disable this detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_detect_gamemode_base: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
@@ -234,6 +239,7 @@ impl Default for EmmyrcGmod {
             annotations_path: None,
             auto_load_annotations: None,
             template_path: None,
+            auto_detect_gamemode_base: None,
         }
     }
 }

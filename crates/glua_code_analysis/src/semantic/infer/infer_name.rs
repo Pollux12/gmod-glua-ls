@@ -774,8 +774,11 @@ pub fn infer_global_type(
         b_is_std.cmp(&a_is_std)
     });
 
-    // TODO: 或许应该联合所有定义的类型?
-    let mut valid_type = LuaType::Unknown;
+    // Prefer callable declarations when a name has both callable and table-like
+    // global decls (e.g. constructor functions alongside class bootstrap tables).
+    let mut callable_type: Option<LuaType> = None;
+    let mut def_or_ref_type: Option<LuaType> = None;
+    let mut table_type: Option<LuaType> = None;
     let mut last_resolve_reason = InferFailReason::None;
     for decl_id in sorted_decl_ids {
         let decl_type_cache = db.get_type_index().get_type_cache(&decl_id.into());
@@ -790,16 +793,23 @@ pub fn infer_global_type(
                     continue;
                 }
 
-                if typ.is_def() || typ.is_ref() {
-                    return Ok(typ.clone());
+                if matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
+                    || typ.is_function()
+                {
+                    callable_type = Some(match callable_type {
+                        Some(existing) => TypeOps::Union.apply(db, &existing, typ),
+                        None => typ.clone(),
+                    });
+                    continue;
                 }
 
-                if typ.is_function() {
-                    valid_type = TypeOps::Union.apply(db, &valid_type, typ);
+                if (typ.is_def() || typ.is_ref()) && def_or_ref_type.is_none() {
+                    def_or_ref_type = Some(typ.clone());
+                    continue;
                 }
 
-                if type_cache.is_table() {
-                    valid_type = typ.clone();
+                if type_cache.is_table() && table_type.is_none() {
+                    table_type = Some(typ.clone());
                 }
             }
             None => {
@@ -808,8 +818,16 @@ pub fn infer_global_type(
         }
     }
 
-    if !valid_type.is_unknown() {
-        return Ok(valid_type);
+    if let Some(callable_type) = callable_type {
+        return Ok(callable_type);
+    }
+
+    if let Some(def_or_ref_type) = def_or_ref_type {
+        return Ok(def_or_ref_type);
+    }
+
+    if let Some(table_type) = table_type {
+        return Ok(table_type);
     }
 
     Err(last_resolve_reason)

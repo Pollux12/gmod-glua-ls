@@ -143,42 +143,58 @@ fn resolve_global_func_decl_id(
     call_expr: LuaCallExpr,
 ) -> Option<LuaDeclId> {
     let mut overload_signature = vec![];
+    let mut callable_decl_ids = Vec::new();
+    let mut fallback_decl_ids = Vec::new();
+
     for decl_id in decl_ids {
         let decl_type_cache = db.get_type_index().get_type_cache(&(*decl_id).into());
         if let Some(type_cache) = decl_type_cache {
             let typ = type_cache.as_type();
-            if typ.is_def() || typ.is_ref() || typ.is_table() {
-                return Some(*decl_id);
-            }
-
-            if let LuaType::Signature(signature) = typ {
-                let signature = db.get_signature_index().get(signature)?;
-                overload_signature.push((decl_id.clone(), signature.to_doc_func_type()));
-            }
-        }
-    }
-
-    let signature = resolve_signature(
-        db,
-        cache,
-        overload_signature
-            .iter()
-            .map(|(_, doc_func)| doc_func.clone())
-            .collect(),
-        call_expr,
-        false,
-        None,
-    );
-
-    if let Ok(signature) = signature {
-        for (decl_id, doc_func) in &overload_signature {
-            if Arc::ptr_eq(&signature, doc_func) {
-                return Some(decl_id.clone());
+            match typ {
+                LuaType::Signature(signature) => {
+                    let signature = db.get_signature_index().get(signature)?;
+                    overload_signature.push((*decl_id, signature.to_doc_func_type()));
+                }
+                LuaType::DocFunction(_) | LuaType::Function => {
+                    callable_decl_ids.push(*decl_id);
+                }
+                _ if typ.is_def() || typ.is_ref() || typ.is_table() => {
+                    fallback_decl_ids.push(*decl_id);
+                }
+                _ => {}
             }
         }
     }
 
-    overload_signature.first().map(|(id, _)| id.clone())
+    if !overload_signature.is_empty() {
+        let signature = resolve_signature(
+            db,
+            cache,
+            overload_signature
+                .iter()
+                .map(|(_, doc_func)| doc_func.clone())
+                .collect(),
+            call_expr,
+            false,
+            None,
+        );
+
+        if let Ok(signature) = signature {
+            for (decl_id, doc_func) in &overload_signature {
+                if Arc::ptr_eq(&signature, doc_func) {
+                    return Some(*decl_id);
+                }
+            }
+        }
+
+        return overload_signature.first().map(|(id, _)| *id);
+    }
+
+    if let Some(decl_id) = callable_decl_ids.first() {
+        return Some(*decl_id);
+    }
+
+    fallback_decl_ids.first().copied()
 }
 
 fn select_realm_compatible_decl_ids(

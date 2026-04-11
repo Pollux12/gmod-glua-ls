@@ -5,7 +5,8 @@ use glua_parser::{
 };
 
 use crate::{
-    InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId, LuaTypeCache,
+    InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
+    LuaTypeCache,
     LuaTypeOwner, TypeOps,
     compilation::analyzer::{
         common::{add_member, bind_type},
@@ -187,8 +188,12 @@ fn get_var_owner(analyzer: &mut LuaAnalyzer, var: LuaVarExpr) -> LuaTypeOwner {
     let file_id = analyzer.file_id;
     match var {
         LuaVarExpr::NameExpr(var_name) => {
-            let position = var_name.get_position();
-            let decl_id = LuaDeclId::new(file_id, position);
+            let decl_id = analyzer
+                .db
+                .get_reference_index()
+                .get_local_reference(&file_id)
+                .and_then(|file_ref| file_ref.get_decl_id(&var_name.get_range()))
+                .unwrap_or_else(|| LuaDeclId::new(file_id, var_name.get_position()));
             LuaTypeOwner::Decl(decl_id)
         }
         LuaVarExpr::IndexExpr(index_expr) => {
@@ -952,7 +957,7 @@ fn merge_type_owner_and_unresolve_expr(
 pub fn analyze_func_stat(analyzer: &mut LuaAnalyzer, func_stat: LuaFuncStat) -> Option<()> {
     let closure = func_stat.get_closure()?;
     let func_name = func_stat.get_func_name()?;
-    let signature_type = analyzer.infer_expr(&closure.clone().into()).ok()?;
+    let signature_type = LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
     let type_owner = get_var_owner(analyzer, func_name.clone());
     set_index_expr_owner(analyzer, func_name.clone());
     analyzer
@@ -969,7 +974,7 @@ pub fn analyze_local_func_stat(
 ) -> Option<()> {
     let closure = local_func_stat.get_closure()?;
     let func_name = local_func_stat.get_local_name()?;
-    let signature_type = analyzer.infer_expr(&closure.clone().into()).ok()?;
+    let signature_type = LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
     let position = func_name.get_position();
     let decl_id = LuaDeclId::new(analyzer.file_id, position);
     analyzer.db.get_type_index_mut().bind_type(

@@ -164,6 +164,30 @@ mod test {
     }
 
     #[test]
+    fn test_global_call_prefers_function_over_table_decl_collision() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Color
+            Color = {}
+
+            ---@param r integer
+            ---@param g integer
+            ---@param b integer
+            ---@param a? integer
+            ---@return integer
+            function Color(r, g, b, a)
+                return r
+            end
+
+        "#,
+        );
+
+        assert_eq!(ws.expr_ty("Color(255, 255, 255)"), ws.ty("integer"));
+    }
+
+    #[test]
     fn test_infer_expr_list_types_tolerates_infer_failures() {
         let mut ws = VirtualWorkspace::new();
         let code = r#"
