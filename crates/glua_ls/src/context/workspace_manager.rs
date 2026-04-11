@@ -533,6 +533,8 @@ fn pre_process_emmyrc_for_all_roots(
             );
             merged.workspace.use_default_ignores = merged.workspace.use_default_ignores
                 || workspace_emmyrc.workspace.use_default_ignores;
+            merged.workspace.enable_isolation =
+                merged.workspace.enable_isolation && workspace_emmyrc.workspace.enable_isolation;
             extend_unique(
                 &mut merged.runtime.extensions,
                 workspace_emmyrc.runtime.extensions,
@@ -754,7 +756,10 @@ fn inject_gamemode_base_libraries(client_config: &ClientConfig, emmyrc: &mut Emm
             .workspace
             .library
             .push(EmmyLibraryItem::Path(lib_path.clone()));
-        log::info!("Gamemode base library added to workspace library: {}", lib_path);
+        log::info!(
+            "Gamemode base library added to workspace library: {}",
+            lib_path
+        );
     }
 }
 
@@ -1558,6 +1563,33 @@ mod tests {
             "resolved globs should include custom-b: {:?}",
             resolved
         );
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_multi_root_merge_disables_isolation_if_any_root_disables_it() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "workspace": { "enableIsolation": true } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "workspace": { "enableIsolation": false } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        assert!(!loaded.emmyrc.workspace.enable_isolation);
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);

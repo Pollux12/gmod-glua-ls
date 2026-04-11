@@ -232,6 +232,46 @@ mod tests {
     }
 
     #[test]
+    fn test_find_module_in_workspace_allows_cross_main_roots_when_isolation_disabled() {
+        let mut m = create_module();
+        let workspace_a = WorkspaceId::MAIN;
+        let workspace_b = WorkspaceId { id: 3 };
+
+        m.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectA").into(),
+            workspace_a,
+            WorkspaceKind::Main,
+        );
+        m.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectB").into(),
+            workspace_b,
+            WorkspaceKind::Main,
+        );
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.enable_isolation = false;
+        m.update_config(Arc::new(emmyrc));
+
+        let file_a = FileId { id: 20 };
+        m.add_module_by_path(file_a, "C:/Users/username/ProjectA/shared.lua");
+
+        let file_b = FileId { id: 21 };
+        m.add_module_by_path(file_b, "C:/Users/username/ProjectB/shared.lua");
+
+        let only_b = FileId { id: 22 };
+        m.add_module_by_path(only_b, "C:/Users/username/ProjectB/only_b.lua");
+
+        let shared_a = m.find_module_in_workspace("shared", workspace_a).unwrap();
+        assert_eq!(shared_a.file_id, file_a);
+
+        let shared_b = m.find_module_in_workspace("shared", workspace_b).unwrap();
+        assert_eq!(shared_b.file_id, file_b);
+
+        let visible_from_a = m.find_module_in_workspace("only_b", workspace_a).unwrap();
+        assert_eq!(visible_from_a.file_id, only_b);
+    }
+
+    #[test]
     fn test_extract_module_path_with_mixed_separators_prefers_library_workspace() {
         let mut m = create_module();
         let workspace_main = WorkspaceId::MAIN;

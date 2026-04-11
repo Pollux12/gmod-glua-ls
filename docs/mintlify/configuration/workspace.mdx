@@ -18,6 +18,7 @@ The `workspace` section tells the language server what files to analyse, what to
 | `workspace.ignoreDir` | `string[]` | `[]` | Directory names to exclude from analysis |
 | `workspace.ignoreDirDefaults` | `(string \| object)[]` | built-in list | Built-in directories and globs to ignore. Accepts legacy strings or override objects — see below. |
 | `workspace.useDefaultIgnores` | `boolean` | `true` | Whether to apply `workspace.ignoreDirDefaults` |
+| `workspace.enableIsolation` | `boolean` | `true` | Keep multi-root main workspaces isolated. Set to `false` to allow symbol resolution across main workspaces while preserving per-workspace config loading. |
 | `workspace.ignoreGlobs` | `string[]` | `[]` | Glob patterns of files to exclude from analysis |
 | `workspace.moduleMap` | `array` | `[]` | Module path rewrite rules (regex patterns) |
 | `workspace.encoding` | `string` | `"utf-8"` | File encoding for all Lua files in the workspace |
@@ -29,7 +30,11 @@ The `workspace` section tells the language server what files to analyse, what to
 
 ## Library paths
 
-`workspace.library` includes additional directories in analysis without treating them as project source. Use this for shared annotation files, third-party stubs, or GMod module stubs.
+`workspace.library` includes additional directories in analysis without treating them as project source. Use this for annotation files, dependencies or other code that you need to reference in your project without it being present in the workspace itself.
+
+<Note>
+This is useful for gamemodes such as Helix, where you need to reference the "core" Helix gamemode from your schema. You can do this by adding `../helix` as a library path in your schema gamemode.
+</Note>
 
 Each entry is either a path string or an object with per-library ignore options:
 

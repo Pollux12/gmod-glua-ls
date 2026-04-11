@@ -330,6 +330,7 @@
     "workspace": {
       "$ref": "#/$defs/EmmyrcWorkspace",
       "default": {
+        "enableIsolation": true,
         "enableReindex": false,
         "encoding": "utf-8",
         "ignoreDir": [],
@@ -2789,6 +2790,12 @@
     "EmmyrcWorkspace": {
       "type": "object",
       "properties": {
+        "enableIsolation": {
+          "description": "Whether multi-root workspaces should remain isolated.\n\nWhen false, main workspaces can resolve symbols from other main workspaces,\nwhich allows index/diagnostic overlap while keeping per-workspace config loading.",
+          "type": "boolean",
+          "default": true,
+          "x-vscode-setting": true
+        },
         "enableReindex": {
           "description": "Enable full project reindex after changing a file.",
           "type": "boolean",

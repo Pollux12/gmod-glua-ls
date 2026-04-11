@@ -56,11 +56,18 @@ pub fn check_visibility(
             return Some(file_id == property_owner.get_file_id()?);
         }
         VisibilityKind::Internal => {
+            let module_index = db.get_module_index();
             let property_file_id = property_owner.get_file_id()?;
-            let property_workspace_id = db.get_module_index().get_workspace_id(property_file_id)?;
-            let current_workspace_id = db.get_module_index().get_workspace_id(file_id)?;
+            let property_workspace_id = module_index.get_workspace_id(property_file_id)?;
+            let current_workspace_id = module_index.get_workspace_id(file_id)?;
+
             if current_workspace_id != property_workspace_id {
-                return Some(false);
+                let allow_cross_main_internal = !module_index.workspace_isolation_enabled()
+                    && module_index.is_main_workspace_id(current_workspace_id)
+                    && module_index.is_main_workspace_id(property_workspace_id);
+                if !allow_cross_main_internal {
+                    return Some(false);
+                }
             }
         }
     }

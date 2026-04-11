@@ -132,8 +132,10 @@ mod tests {
 
     use rowan::TextSize;
 
+    use std::sync::Arc;
+
     use crate::{
-        FileId, WorkspaceId,
+        Emmyrc, FileId, WorkspaceId,
         db_index::{LuaModuleIndex, WorkspaceKind},
     };
 
@@ -232,5 +234,46 @@ mod tests {
             .unwrap();
         assert_eq!(visible_from_b.len(), 1);
         assert_eq!(visible_from_b[0], lib_decl);
+    }
+
+    #[test]
+    fn test_get_global_decl_ids_in_workspace_allows_cross_main_when_isolation_disabled() {
+        let mut global_index = LuaGlobalIndex::new();
+        let mut module_index = create_module_index();
+
+        let workspace_a = WorkspaceId::MAIN;
+        let workspace_b = WorkspaceId { id: 3 };
+
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectA").into(),
+            workspace_a,
+            WorkspaceKind::Main,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectB").into(),
+            workspace_b,
+            WorkspaceKind::Main,
+        );
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.enable_isolation = false;
+        module_index.update_config(Arc::new(emmyrc));
+
+        let file_a = FileId { id: 40 };
+        module_index.add_module_by_path(file_a, "C:/Users/username/ProjectA/shared.lua");
+        let decl_a = LuaDeclId::new(file_a, TextSize::new(0));
+        global_index.add_global_decl("SharedGlobal", decl_a);
+
+        let file_b = FileId { id: 41 };
+        module_index.add_module_by_path(file_b, "C:/Users/username/ProjectB/shared.lua");
+        let decl_b = LuaDeclId::new(file_b, TextSize::new(0));
+        global_index.add_global_decl("SharedGlobal", decl_b);
+
+        let scoped_a = global_index
+            .get_global_decl_ids_in_workspace("SharedGlobal", &module_index, workspace_a)
+            .unwrap();
+        assert_eq!(scoped_a.len(), 2);
+        assert!(scoped_a.contains(&decl_a));
+        assert!(scoped_a.contains(&decl_b));
     }
 }

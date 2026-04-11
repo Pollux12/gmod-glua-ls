@@ -562,9 +562,11 @@ mod tests {
     use super::{
         LuaMemberIndexItem, get_member_id_priority_tiers, select_member_ids_by_workspace_and_realm,
     };
+    use std::sync::Arc;
+
     use crate::{
-        DbIndex, FileId, GmodRealm, GmodRealmFileMetadata, GmodRealmRange, LuaSemanticDeclId,
-        LuaTypeDeclId, WorkspaceId,
+        DbIndex, Emmyrc, FileId, GmodRealm, GmodRealmFileMetadata, GmodRealmRange,
+        LuaSemanticDeclId, LuaTypeDeclId, WorkspaceId,
         db_index::{
             LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner, WorkspaceKind,
         },
@@ -660,6 +662,45 @@ mod tests {
         assert_eq!(tiers.len(), 2);
         assert_eq!(tiers[0], (1, vec![library_member]));
         assert_eq!(tiers[1], (2, vec![std_member]));
+    }
+
+    #[test]
+    fn member_id_priority_tiers_include_other_main_when_isolation_disabled() {
+        let mut db = make_db();
+        let module_index = db.get_module_index_mut();
+
+        let workspace_a = WorkspaceId::MAIN;
+        let workspace_b = WorkspaceId { id: 3 };
+
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectA").into(),
+            workspace_a,
+            WorkspaceKind::Main,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectB").into(),
+            workspace_b,
+            WorkspaceKind::Main,
+        );
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.enable_isolation = false;
+        module_index.update_config(Arc::new(emmyrc));
+
+        let caller_file = FileId::new(10);
+        module_index.add_module_by_path(caller_file, "C:/Users/username/ProjectA/init.lua");
+
+        let other_main_file = FileId::new(11);
+        module_index.add_module_by_path(other_main_file, "C:/Users/username/ProjectB/init.lua");
+
+        let caller_member = make_member_id(caller_file, 1);
+        let other_main_member = make_member_id(other_main_file, 2);
+
+        let tiers =
+            get_member_id_priority_tiers(&db, &caller_file, &[caller_member, other_main_member]);
+
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0], (0, vec![caller_member, other_main_member]));
     }
 
     #[test]

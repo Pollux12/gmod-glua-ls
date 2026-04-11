@@ -19,6 +19,13 @@ pub struct EmmyrcWorkspace {
     #[serde(default = "use_default_ignores_default")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub use_default_ignores: bool,
+    /// Whether multi-root workspaces should remain isolated.
+    ///
+    /// When false, main workspaces can resolve symbols from other main workspaces,
+    /// which allows index/diagnostic overlap while keeping per-workspace config loading.
+    #[serde(default = "enable_isolation_default")]
+    #[schemars(extend("x-vscode-setting" = true))]
+    pub enable_isolation: bool,
     /// Ignore globs. eg: ["**/*.lua"]
     #[serde(default)]
     pub ignore_globs: Vec<String>,
@@ -59,6 +66,7 @@ impl Default for EmmyrcWorkspace {
             ignore_dir: Vec::new(),
             ignore_dir_defaults: ignore_dir_defaults(),
             use_default_ignores: true,
+            enable_isolation: enable_isolation_default(),
             ignore_globs: Vec::new(),
             library: Vec::new(),
             package_dirs: Vec::new(),
@@ -269,5 +277,9 @@ fn ignore_dir_defaults() -> Vec<IgnoreDirDefaultEntry> {
 }
 
 fn use_default_ignores_default() -> bool {
+    true
+}
+
+fn enable_isolation_default() -> bool {
     true
 }

@@ -37,7 +37,9 @@ Open the addon or gamemode folder directly in VS Code. The extension detects the
 
 If you work on a gamemode and multiple addons, use a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces) and add each as its own folder.
 
-Each folder has its own `.gluarc.json`, and the language server analyzes each one separately. Settings, diagnostics, and file param defaults stay scoped to that folder.
+By default, multi-root workspace isolation is enabled. This means that each folder has its own `.gluarc.json`, and the language server analyzes each one separately. Settings, diagnostics, and file param defaults stay scoped to that folder.
+
+Multi-root workspace isolation can be disabled (`workspace.enableIsolation`) to allow for easier cross-folder analysis, which may be useful for gamemode development. See [Configuration](/configuration/workspace) for details.
 
 <Note>
 Do not open the entire `garrysmod/` folder as your workspace root. GLuaLS expects each root to be an individual addon or gamemode, not the entire game directory.

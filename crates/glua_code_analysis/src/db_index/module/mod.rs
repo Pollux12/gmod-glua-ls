@@ -34,6 +34,7 @@ pub struct LuaModuleIndex {
     id_counter: u32,
     fuzzy_search: bool,
     module_replace_vec: Vec<(Regex, String)>,
+    workspace_isolation_enabled: bool,
 }
 
 impl Default for LuaModuleIndex {
@@ -56,6 +57,7 @@ impl LuaModuleIndex {
             id_counter: 1,
             fuzzy_search: false,
             module_replace_vec: Vec::new(),
+            workspace_isolation_enabled: true,
         };
 
         let root_node = ModuleNode::default();
@@ -453,7 +455,14 @@ impl LuaModuleIndex {
             };
 
             match best {
-                Some((_, best_priority)) if priority >= best_priority => {}
+                Some((_best_module, best_priority)) if priority > best_priority => {}
+                Some((best_module, best_priority)) if priority == best_priority => {
+                    let best_is_current_workspace = best_module.workspace_id == workspace_id;
+                    let candidate_is_current_workspace = module_info.workspace_id == workspace_id;
+                    if !best_is_current_workspace && candidate_is_current_workspace {
+                        best = Some((module_info, priority));
+                    }
+                }
                 _ => best = Some((module_info, priority)),
             }
         }
@@ -476,7 +485,14 @@ impl LuaModuleIndex {
             };
 
             match best {
-                Some((_, best_priority)) if priority >= best_priority => {}
+                Some((_best_module, best_priority)) if priority > best_priority => {}
+                Some((best_module, best_priority)) if priority == best_priority => {
+                    let best_is_current_workspace = best_module.workspace_id == workspace_id;
+                    let candidate_is_current_workspace = module_info.workspace_id == workspace_id;
+                    if !best_is_current_workspace && candidate_is_current_workspace {
+                        best = Some((module_info, priority));
+                    }
+                }
                 _ => best = Some((module_info, priority)),
             }
         }
@@ -556,6 +572,10 @@ impl LuaModuleIndex {
         self.get_workspace_kind(workspace_id) == WorkspaceKind::Remote
     }
 
+    pub fn workspace_isolation_enabled(&self) -> bool {
+        self.workspace_isolation_enabled
+    }
+
     pub fn workspace_resolution_priority(
         &self,
         current_workspace_id: WorkspaceId,
@@ -576,6 +596,7 @@ impl LuaModuleIndex {
                 }
             }
             WorkspaceKind::Main => match candidate_kind {
+                WorkspaceKind::Main if !self.workspace_isolation_enabled => Some(0),
                 // Library (e.g. GMod annotations) takes priority over std so user-provided
                 // type definitions override the built-in Lua stdlib definitions.
                 WorkspaceKind::Library => Some(1),
@@ -756,6 +777,7 @@ impl LuaModuleIndex {
                 .collect(),
         );
 
+        self.workspace_isolation_enabled = config.workspace.enable_isolation;
         self.fuzzy_search = !config.strict.require_path;
     }
 
