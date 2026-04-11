@@ -1,4 +1,4 @@
-use glua_code_analysis::LuaDocument;
+use glua_code_analysis::{LuaDocument, SemanticModel};
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaLiteralToken, LuaSyntaxNode, LuaSyntaxToken, LuaTokenKind,
     NumberResult,
@@ -6,7 +6,11 @@ use glua_parser::{
 use lsp_types::{Color, ColorInformation};
 use rowan::{TextRange, TextSize};
 
-pub fn build_colors(root: LuaSyntaxNode, document: &LuaDocument) -> Vec<ColorInformation> {
+pub fn build_colors(
+    root: LuaSyntaxNode,
+    document: &LuaDocument,
+    semantic_model: Option<&SemanticModel>,
+) -> Vec<ColorInformation> {
     let mut result = vec![];
 
     // Scan for hex colors embedded in string literals.
@@ -22,12 +26,136 @@ pub fn build_colors(root: LuaSyntaxNode, document: &LuaDocument) -> Vec<ColorInf
         try_build_color_information(token, document, &mut result);
     }
 
-    // Scan for GMod Color(r, g, b[, a]) constructor calls.
+    // Scan for GMod Color(r, g, b[, a]) constructor calls or tuple arguments.
     for call_expr in root.descendants().filter_map(LuaCallExpr::cast) {
-        try_build_gmod_color_call(call_expr, document, &mut result);
+        if try_build_gmod_color_call(call_expr.clone(), document, &mut result).is_some() {
+            continue;
+        }
+
+        if let Some(semantic_model) = semantic_model {
+            try_build_semantic_color_tuple(call_expr, document, semantic_model, &mut result);
+        }
     }
 
     result
+}
+
+fn try_build_semantic_color_tuple(
+    call_expr: LuaCallExpr,
+    document: &LuaDocument,
+    semantic_model: &SemanticModel,
+    result: &mut Vec<ColorInformation>,
+) -> Option<()> {
+    let args_list = call_expr.get_args_list()?;
+    let args: Vec<_> = args_list.get_args().collect();
+    if args.len() < 3 {
+        return None;
+    }
+
+    // Cheap pre-check: require at least 3 numeric literal args before the expensive inference call.
+    let numeric_literal_count = args.iter().filter(|arg| {
+        matches!(arg, LuaExpr::LiteralExpr(lit) if matches!(lit.get_literal(), Some(LuaLiteralToken::Number(_))))
+    }).count();
+    if numeric_literal_count < 3 {
+        return None;
+    }
+
+    let func = semantic_model.infer_call_expr_func(call_expr.clone(), Some(args.len()))?;
+    let params = func.get_params();
+
+    let mut effective_params = Vec::new();
+    for (name, _) in params {
+        effective_params.push(name.clone());
+    }
+
+    match (func.is_colon_define(), call_expr.is_colon_call()) {
+        (true, false) => {
+            effective_params.insert(0, "self".to_string());
+        }
+        (false, true) => {
+            if !effective_params.is_empty() {
+                effective_params.remove(0);
+            }
+        }
+        _ => {}
+    }
+
+    let mut tuple_start = None;
+    let mut tuple_len = 0;
+
+    for i in 0..effective_params.len() {
+        let name = effective_params[i].to_lowercase();
+        if name == "r" || name == "red" {
+            if i + 2 < effective_params.len() {
+                let g = effective_params[i + 1].to_lowercase();
+                let b = effective_params[i + 2].to_lowercase();
+                if (g == "g" || g == "green") && (b == "b" || b == "blue") {
+                    tuple_start = Some(i);
+                    tuple_len = 3;
+                    if i + 3 < effective_params.len() {
+                        let a = effective_params[i + 3].to_lowercase();
+                        if a == "a" || a == "alpha" {
+                            tuple_len = 4;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let start_idx = tuple_start?;
+    if args.len() < start_idx + 3 {
+        return None;
+    }
+
+    let supplied_len = (args.len() - start_idx).min(tuple_len);
+    if supplied_len < 3 {
+        return None;
+    }
+
+    let mut components = [0.0f32; 4];
+    components[3] = 1.0;
+
+    for i in 0..supplied_len {
+        let arg = &args[start_idx + i];
+        let LuaExpr::LiteralExpr(lit_expr) = arg else {
+            return None;
+        };
+        let LuaLiteralToken::Number(num_token) = lit_expr.get_literal()? else {
+            return None;
+        };
+        let value: f64 = match num_token.get_number_value() {
+            NumberResult::Int(n) => n as f64,
+            NumberResult::Uint(n) => n as f64,
+            NumberResult::Float(n) => n,
+        };
+        if !(0.0..=255.0).contains(&value) {
+            return None;
+        }
+        components[i] = (value / 255.0) as f32;
+    }
+
+    let first_arg = &args[start_idx];
+    let last_arg = &args[start_idx + supplied_len - 1];
+
+    let text_range = TextRange::new(
+        first_arg.syntax().text_range().start(),
+        last_arg.syntax().text_range().end(),
+    );
+    let range = document.to_lsp_range(text_range)?;
+
+    result.push(ColorInformation {
+        range,
+        color: Color {
+            red: components[0],
+            green: components[1],
+            blue: components[2],
+            alpha: components[3],
+        },
+    });
+
+    Some(())
 }
 
 /// Detects `Color(r, g, b)` or `Color(r, g, b, a)` calls where every argument is a
@@ -75,7 +203,15 @@ fn try_build_gmod_color_call(
         components[i] = (value / 255.0) as f32;
     }
 
-    let range = document.to_lsp_range(call_expr.syntax().text_range())?;
+    // Use the range of the arguments only (not the whole call expr) so the swatch
+    // appears inside the brackets, consistent with other color-tuple detections.
+    let first_arg = args.first()?;
+    let last_arg = args.last()?;
+    let args_range = TextRange::new(
+        first_arg.syntax().text_range().start(),
+        last_arg.syntax().text_range().end(),
+    );
+    let range = document.to_lsp_range(args_range)?;
     result.push(ColorInformation {
         range,
         color: Color {
@@ -211,8 +347,8 @@ pub fn convert_color_to_hex(color: Color, len: usize) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use glua_code_analysis::FileId;
-    use glua_parser::{LineIndex, LuaParser, ParserConfig};
+    use glua_code_analysis::{FileId, VirtualWorkspace};
+    use glua_parser::{LineIndex, LuaAstNode, LuaParser, ParserConfig};
     use googletest::prelude::*;
 
     use super::build_colors;
@@ -223,7 +359,16 @@ mod tests {
         let path = PathBuf::from("test.lua");
         let document =
             glua_code_analysis::LuaDocument::new(FileId::new(0), &path, text, &line_index);
-        build_colors(tree.get_red_root(), &document)
+        build_colors(tree.get_red_root(), &document, None)
+    }
+
+    fn collect_colors_semantic(text: &str) -> Vec<lsp_types::ColorInformation> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(text);
+        let semantic_model = ws.analysis.compilation.get_semantic_model(file_id).unwrap();
+        let document = semantic_model.get_document();
+        let root = semantic_model.get_root();
+        build_colors(root.syntax().clone(), &document, Some(&semantic_model))
     }
 
     #[gtest]
@@ -239,6 +384,64 @@ mod tests {
         let colors = collect_colors(r##"print("#FF00AA")"##);
 
         verify_that!(colors.len(), eq(1))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn detects_semantic_rgb_tuple() -> Result<()> {
+        let colors = collect_colors_semantic(
+            r#"
+            ---@class Surface
+            local surface = {}
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a? number
+            function surface.SetDrawColor(r, g, b, a) end
+            
+            surface.SetDrawColor(255, 0, 0)
+            surface.SetDrawColor(255, 0, 0, 255)
+            "#,
+        );
+
+        verify_that!(colors.len(), eq(2))?;
+        verify_that!(colors[0].color.alpha, eq(1.0))?;
+        verify_that!(colors[1].color.alpha, eq(1.0))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn does_not_duplicate_color_swatches() -> Result<()> {
+        let colors = collect_colors_semantic(
+            r#"
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a? number
+            function Color(r, g, b, a) end
+            
+            local c = Color(255, 0, 0)
+            "#,
+        );
+
+        verify_that!(colors.len(), eq(1))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn ignores_non_color_tuples() -> Result<()> {
+        let colors = collect_colors_semantic(
+            r#"
+            ---@param x number
+            ---@param y number
+            ---@param z number
+            function SetPos(x, y, z) end
+            
+            SetPos(255, 0, 0)
+            "#,
+        );
+
+        verify_that!(colors, is_empty())?;
         Ok(())
     }
 }
