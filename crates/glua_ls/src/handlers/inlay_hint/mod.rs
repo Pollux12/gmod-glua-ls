@@ -23,12 +23,15 @@ pub async fn on_inlay_hint_handler(
 
     let uri = params.text_document.uri;
 
+    if !context
+        .wait_until_latest_document_version_applied(&uri, &cancel_token)
+        .await
+    {
+        return None;
+    }
+
     // Wait for any pending reindex to finish so we serve fresh hints
-    // computed against consistent tree + index data. The wait is
-    // cancel-aware: if a new didChange arrives, cancel_all_requests()
-    // fires the cancel token and we bail out. The task() wrapper will
-    // then send whatever result we have (keep_stale_editor_data_on_cancel)
-    // or RequestCanceled, both of which let the client keep its display.
+    // computed against consistent tree + index data.
     if !context
         .debounced_analysis()
         .wait_until_fresh(&cancel_token)

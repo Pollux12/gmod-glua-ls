@@ -136,6 +136,25 @@ fn keep_stale_editor_data_on_cancel(method: &str) -> bool {
     )
 }
 
+fn should_send_stale_response_on_cancel(method: &str, response: &Response) -> bool {
+    let Some(result) = response.result.as_ref() else {
+        return false;
+    };
+
+    if result.is_null() {
+        return false;
+    }
+
+    if method == "textDocument/inlayHint" {
+        // Returning stale-but-empty inlay hints clears currently rendered hints
+        // while the user is typing. Let RequestCanceled keep the previous hints
+        // visible until we have a fresh, complete inlay result.
+        return result.as_array().is_some_and(|hints| !hints.is_empty());
+    }
+
+    true
+}
+
 pub struct ServerContext {
     #[allow(unused)]
     conn: Connection,
@@ -245,7 +264,7 @@ impl ServerContext {
             if cancel_token.is_cancelled() {
                 if keep_stale_editor_data_on_cancel(&request_method)
                     && let Some(response) = res
-                    && response.result.as_ref().is_some_and(|v| !v.is_null())
+                    && should_send_stale_response_on_cancel(&request_method, &response)
                 {
                     // Handler completed with a non-null result before/during
                     // cancellation — send it. Per LSP spec, "the result even
@@ -283,9 +302,16 @@ impl ServerContext {
         }
     }
 
-    pub async fn cancel_all_requests(&self) {
+    pub async fn cancel_all_requests_except(&self, excluded_methods: &[&str]) {
         let requests = self.requests.lock().await;
         for request in requests.values() {
+            if excluded_methods
+                .iter()
+                .any(|method| request.metadata.method == *method)
+            {
+                continue;
+            }
+
             request.cancel_token.cancel();
         }
     }
@@ -321,5 +347,109 @@ impl ServerContext {
 
     pub async fn send_response(&self, response: Response) {
         self.inner.client.on_response(response).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RequestTaskMetadata, ServerContext, should_send_stale_response_on_cancel};
+    use googletest::prelude::*;
+    use lsp_server::{RequestId, Response};
+    use lsp_types::ClientCapabilities;
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[gtest]
+    fn stale_inlay_hint_response_requires_non_empty_array() -> Result<()> {
+        let empty = Response::new_ok(1.into(), json!([]));
+        let non_empty = Response::new_ok(2.into(), json!([{"label": ": number"}]));
+
+        verify_that!(
+            should_send_stale_response_on_cancel("textDocument/inlayHint", &empty),
+            eq(false)
+        )?;
+        verify_that!(
+            should_send_stale_response_on_cancel("textDocument/inlayHint", &non_empty),
+            eq(true)
+        )?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn stale_semantic_tokens_still_allow_non_null_payload() -> Result<()> {
+        let empty_data = Response::new_ok(1.into(), json!({"data": []}));
+
+        verify_that!(
+            should_send_stale_response_on_cancel("textDocument/semanticTokens/full", &empty_data),
+            eq(true)
+        )?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn stale_response_rejects_null_payloads() -> Result<()> {
+        let null_result = Response::new_ok(1.into(), serde_json::Value::Null);
+
+        verify_that!(
+            should_send_stale_response_on_cancel("textDocument/inlayHint", &null_result),
+            eq(false)
+        )?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn cancel_all_requests_except_preserves_inlay_requests() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (conn, _peer) = lsp_server::Connection::memory();
+            let context = ServerContext::new(conn, ClientCapabilities::default());
+
+            let inlay_id: RequestId = 1.into();
+            context
+                .task(
+                    inlay_id.clone(),
+                    RequestTaskMetadata::new("textDocument/inlayHint", None),
+                    |_cancel_token| async move {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        Some(Response::new_ok(inlay_id, json!([{"label": ": number"}])))
+                    },
+                )
+                .await;
+
+            let hover_id: RequestId = 2.into();
+            context
+                .task(
+                    hover_id.clone(),
+                    RequestTaskMetadata::new("textDocument/hover", None),
+                    |_cancel_token| async move {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        Some(Response::new_ok(hover_id, serde_json::Value::Null))
+                    },
+                )
+                .await;
+
+            let (inlay_token, hover_token) = {
+                let requests = context.requests.lock().await;
+                let inlay = requests
+                    .get(&RequestId::from(1))
+                    .expect("inlay request should exist")
+                    .cancel_token
+                    .clone();
+                let hover = requests
+                    .get(&RequestId::from(2))
+                    .expect("hover request should exist")
+                    .cancel_token
+                    .clone();
+                (inlay, hover)
+            };
+
+            context
+                .cancel_all_requests_except(&["textDocument/inlayHint"])
+                .await;
+
+            verify_that!(inlay_token.is_cancelled(), eq(false))?;
+            verify_that!(hover_token.is_cancelled(), eq(true))?;
+            Ok(())
+        })
     }
 }
