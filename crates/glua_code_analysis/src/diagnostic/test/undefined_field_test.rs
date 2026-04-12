@@ -1360,6 +1360,71 @@ mod test {
     }
 
     #[test]
+    fn test_find_meta_table_definition_receiver_method_is_resolvable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Player
+            local Player = {}
+
+            player = player or {}
+
+            ---@return Player[]
+            function player.GetAll() end
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T|nil
+            function _G.FindMetaTable(metaName) end
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        let file_id = ws.def(
+            r#"
+            local PLAYER = FindMetaTable("Player")
+            if PLAYER == nil then return end
+
+            function PLAYER:GetTime()
+                return 0
+            end
+
+            local pl = player.GetAll()[1]
+            print(pl:GetTime())
+
+            A = PLAYER.GetTime
+            B = pl.GetTime
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field),
+            "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+        );
+
+        let player_meta_method = ws.expr_ty("A");
+        assert!(
+            !player_meta_method.is_unknown(),
+            "expected PLAYER.GetTime to be resolvable"
+        );
+
+        let player_instance_method = ws.expr_ty("B");
+        assert!(
+            !player_instance_method.is_unknown(),
+            "expected pl.GetTime to be resolvable"
+        );
+    }
+
+    #[test]
     fn test_buildcpanel_param_from_field_annotation() {
         // BuildCPanel field annotation fun(panel: ControlPanel) should propagate
         // the ControlPanel type to the panel parameter

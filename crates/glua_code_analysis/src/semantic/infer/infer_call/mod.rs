@@ -9,9 +9,10 @@ use super::{
 };
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
 use crate::{
-    CacheEntry, DbIndex, InFiled, LuaFunctionType, LuaGenericType, LuaInstanceType,
-    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature, LuaSignatureId, LuaType, LuaTypeDeclId,
-    LuaUnionType,
+    CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType,
+    LuaInstanceType, LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature,
+    LuaSignatureId, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, ReturnTypeKind,
+    VariadicType,
 };
 use crate::{
     InferGuardRef,
@@ -333,17 +334,23 @@ fn infer_signature_doc_function(
             fake_doc_function = instantiate_func_generic(db, cache, &fake_doc_function, call_expr)?;
         }
 
-        Ok(fake_doc_function.into())
+        Ok(apply_signature_return_kinds_to_function(
+            signature,
+            &fake_doc_function,
+        ))
     } else {
         let mut new_overloads = signature.overloads.clone();
-        let fake_doc_function = Arc::new(LuaFunctionType::new(
+        let fake_doc_function = LuaFunctionType::new(
             signature.async_state,
             signature.is_colon_define,
             signature.is_vararg,
             signature.get_type_params(),
             signature.get_return_type(),
+        );
+        new_overloads.push(apply_signature_return_kinds_to_function(
+            signature,
+            &fake_doc_function,
         ));
-        new_overloads.push(fake_doc_function);
 
         resolve_signature(
             db,
@@ -422,7 +429,10 @@ fn infer_type_doc_function(
                     return Err(InferFailReason::UnResolveSignatureReturn(signature_id));
                 }
 
-                overloads.push(signature.to_call_operator_func_type());
+                overloads.push(apply_signature_return_kinds_to_function(
+                    signature,
+                    signature.to_call_operator_func_type().as_ref(),
+                ));
             }
             _ => {}
         }
@@ -493,7 +503,7 @@ fn infer_generic_type_doc_function(
                 let typ = LuaType::DocFunction(signature.to_call_operator_func_type());
                 let new_f = instantiate_type_generic(db, &typ, &substitutor);
                 if let LuaType::DocFunction(f) = new_f {
-                    overloads.push(f.clone());
+                    overloads.push(apply_signature_return_kinds_to_function(signature, &f));
                 }
                 // todo: support overload?
             }
@@ -553,7 +563,10 @@ fn infer_table_type_doc_function(db: &DbIndex, table: InFiled<TextRange>) -> Inf
                     return Err(InferFailReason::UnResolveSignatureReturn(signature_id));
                 }
 
-                return Ok(signature.to_call_operator_func_type());
+                return Ok(apply_signature_return_kinds_to_function(
+                    signature,
+                    signature.to_call_operator_func_type().as_ref(),
+                ));
             }
             _ => {}
         }
@@ -612,7 +625,10 @@ fn infer_union(
                             call_expr.clone(),
                         )?;
                     }
-                    base_signatures.push(Arc::new(fake_doc_function));
+                    base_signatures.push(apply_signature_return_kinds_to_function(
+                        signature,
+                        &fake_doc_function,
+                    ));
                 }
             }
             LuaType::DocFunction(func) => {
@@ -824,6 +840,141 @@ fn signature_is_generic(
         // 对于 Generic 直接认为是泛型
         LuaType::Generic(_) => Some(true),
         _ => Some(prefix_type.contain_tpl()),
+    }
+}
+
+fn apply_signature_return_kinds_to_function(
+    signature: &LuaSignature,
+    function: &LuaFunctionType,
+) -> Arc<LuaFunctionType> {
+    let return_type = apply_signature_return_kinds(signature, function.get_ret().clone());
+
+    Arc::new(LuaFunctionType::new(
+        function.get_async_state(),
+        function.is_colon_define(),
+        function.is_variadic(),
+        function.get_params().to_vec(),
+        return_type,
+    ))
+}
+
+fn apply_signature_return_kinds(signature: &LuaSignature, return_type: LuaType) -> LuaType {
+    match signature.return_docs.len() {
+        0 => return_type,
+        1 => apply_return_kind(signature.return_docs[0].return_kind, return_type),
+        _ => match return_type {
+            LuaType::Variadic(variadic) => match variadic.as_ref() {
+                VariadicType::Base(base) => LuaType::Variadic(
+                    VariadicType::Base(apply_return_kind(
+                        signature.return_docs[0].return_kind,
+                        base.clone(),
+                    ))
+                    .into(),
+                ),
+                VariadicType::Multi(types) => LuaType::Variadic(
+                    VariadicType::Multi(
+                        types
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, typ)| {
+                                let kind = signature
+                                    .return_docs
+                                    .get(idx)
+                                    .map(|info| info.return_kind)
+                                    .unwrap_or(ReturnTypeKind::Reference);
+                                apply_return_kind(kind, typ.clone())
+                            })
+                            .collect(),
+                    )
+                    .into(),
+                ),
+            },
+            _ => apply_return_kind(signature.return_docs[0].return_kind, return_type),
+        },
+    }
+}
+
+fn apply_return_kind(return_kind: ReturnTypeKind, return_type: LuaType) -> LuaType {
+    match return_kind {
+        ReturnTypeKind::Definition => apply_definition_return_type(return_type),
+        ReturnTypeKind::Instance | ReturnTypeKind::Reference => return_type,
+    }
+}
+
+fn apply_definition_return_type(return_type: LuaType) -> LuaType {
+    match return_type {
+        LuaType::Ref(type_id) => LuaType::Def(type_id),
+        LuaType::Array(array) => LuaType::Array(
+            LuaArrayType::from_base_type(apply_definition_return_type(array.get_base().clone()))
+                .into(),
+        ),
+        LuaType::Tuple(tuple) => LuaType::Tuple(
+            LuaTupleType::new(
+                tuple
+                    .get_types()
+                    .iter()
+                    .cloned()
+                    .map(apply_definition_return_type)
+                    .collect(),
+                tuple.status,
+            )
+            .into(),
+        ),
+        LuaType::Instance(instance) => LuaType::Instance(
+            LuaInstanceType::new(
+                apply_definition_return_type(instance.get_base().clone()),
+                instance.get_range().clone(),
+            )
+            .into(),
+        ),
+        LuaType::TypeGuard(inner) => {
+            LuaType::TypeGuard(apply_definition_return_type(inner.as_ref().clone()).into())
+        }
+        LuaType::TableOf(inner) => {
+            LuaType::TableOf(apply_definition_return_type(inner.as_ref().clone()).into())
+        }
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .into_vec()
+                .iter()
+                .cloned()
+                .map(apply_definition_return_type)
+                .collect(),
+        ),
+        LuaType::Intersection(intersection) => LuaType::Intersection(
+            LuaIntersectionType::new(
+                intersection
+                    .get_types()
+                    .iter()
+                    .cloned()
+                    .map(apply_definition_return_type)
+                    .collect(),
+            )
+            .into(),
+        ),
+        LuaType::MultiLineUnion(multi_union) => LuaType::from_vec(
+            multi_union
+                .get_unions()
+                .iter()
+                .map(|(typ, _)| apply_definition_return_type(typ.clone()))
+                .collect(),
+        ),
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Base(base) => LuaType::Variadic(
+                VariadicType::Base(apply_definition_return_type(base.clone())).into(),
+            ),
+            VariadicType::Multi(types) => LuaType::Variadic(
+                VariadicType::Multi(
+                    types
+                        .iter()
+                        .cloned()
+                        .map(apply_definition_return_type)
+                        .collect(),
+                )
+                .into(),
+            ),
+        },
+        _ => return_type,
     }
 }
 
