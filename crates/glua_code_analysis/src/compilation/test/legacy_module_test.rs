@@ -655,4 +655,57 @@ mod test {
             info.typ
         );
     }
+
+    #[test]
+    fn legacy_module_seeall_variable_alias_resolves_globals() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "shared.lua",
+            r#"
+            SGSModuleLoader = package.seeall
+            "#,
+        );
+        let module_file = ws.def_file(
+            "consumer.lua",
+            r#"
+            module("ErrorLog", SGSModuleLoader)
+            function LogError() end
+            local c = LogError
+            "#,
+        );
+
+        assert!(local_type_by_name(&mut ws, module_file, "c").is_function());
+    }
+
+    #[test]
+    fn legacy_module_seeall_variable_alias_external_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "shared.lua",
+            r#"
+            SGSModuleLoader = package.seeall
+            "#,
+        );
+        ws.def_file(
+            "module.lua",
+            r#"
+            module("ErrorLog", SGSModuleLoader)
+            function LogError() end
+            "#,
+        );
+        let consumer_file = ws.def_file(
+            "consumer.lua",
+            r#"
+            local c = ErrorLog.LogError
+            "#,
+        );
+
+        assert!(index_expr_type_by_text(&mut ws, consumer_file, "ErrorLog.LogError").is_function());
+    }
 }

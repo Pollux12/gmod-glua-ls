@@ -190,4 +190,45 @@ mod test {
             "print",
         ));
     }
+
+    #[test]
+    fn legacy_module_seeall_variable_alias_allows_global_fallback() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "shared.lua",
+            r#"
+            SGSModuleLoader = package.seeall
+            "#,
+        );
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "consumer.lua",
+            r#"
+            module("ErrorLog", SGSModuleLoader)
+            local _ = print
+            "#,
+            "print",
+        ));
+    }
+
+    #[test]
+    fn legacy_module_unknown_option_func_defaults_to_seeall() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        // unknown_func is not defined anywhere — should default to seeall=true (safe)
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "class.lua",
+            r#"
+            module("class", unknown_func)
+            local _ = print
+            "#,
+            "print",
+        ));
+    }
 }
