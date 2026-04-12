@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
@@ -87,6 +89,10 @@ mod test {
     fn legacy_module_namespace_does_not_leak_across_main_workspaces() {
         let mut analysis = crate::EmmyLuaAnalysis::new();
         analysis.init_std_lib(None);
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.enable_isolation = true;
+        analysis.update_config(Arc::new(emmyrc));
+
         let workspace_a = std::env::temp_dir().join("legacy-module-workspace-a");
         let workspace_b = std::env::temp_dir().join("legacy-module-workspace-b");
         analysis.add_main_workspace(workspace_a.clone());

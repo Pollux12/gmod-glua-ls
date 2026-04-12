@@ -21,8 +21,9 @@ pub struct EmmyrcWorkspace {
     pub use_default_ignores: bool,
     /// Whether multi-root workspaces should remain isolated.
     ///
-    /// When false, main workspaces can resolve symbols from other main workspaces,
-    /// which allows index/diagnostic overlap while keeping per-workspace config loading.
+    /// When false, workspace configs are merged into one global baseline
+    /// (first workspace config wins scalar conflicts, arrays are unioned), while
+    /// local workspace configs can still override file-scoped behavior.
     #[serde(default = "enable_isolation_default")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub enable_isolation: bool,
@@ -281,5 +282,5 @@ fn use_default_ignores_default() -> bool {
 }
 
 fn enable_isolation_default() -> bool {
-    true
+    false
 }

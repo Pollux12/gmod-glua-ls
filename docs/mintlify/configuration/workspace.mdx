@@ -18,7 +18,7 @@ The `workspace` section tells the language server what files to analyse, what to
 | `workspace.ignoreDir` | `string[]` | `[]` | Directory names to exclude from analysis |
 | `workspace.ignoreDirDefaults` | `(string \| object)[]` | built-in list | Built-in directories and globs to ignore. Accepts legacy strings or override objects — see below. |
 | `workspace.useDefaultIgnores` | `boolean` | `true` | Whether to apply `workspace.ignoreDirDefaults` |
-| `workspace.enableIsolation` | `boolean` | `true` | Keep multi-root main workspaces isolated. Set to `false` to allow symbol resolution across main workspaces while preserving per-workspace config loading. |
+| `workspace.enableIsolation` | `boolean` | `false` | Keep multi-root main workspaces isolated. Set to `false` to merge workspace configs into one global baseline (first workspace config wins scalar conflicts, arrays are unioned) while still allowing per-workspace file-scoped overrides. |
 | `workspace.ignoreGlobs` | `string[]` | `[]` | Glob patterns of files to exclude from analysis |
 | `workspace.moduleMap` | `array` | `[]` | Module path rewrite rules (regex patterns) |
 | `workspace.encoding` | `string` | `"utf-8"` | File encoding for all Lua files in the workspace |

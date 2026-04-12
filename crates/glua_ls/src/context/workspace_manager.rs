@@ -15,6 +15,7 @@ use glua_code_analysis::{
 };
 use log::{debug, info};
 use lsp_types::Uri;
+use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use wax::Pattern;
@@ -480,15 +481,19 @@ fn pre_process_emmyrc_for_all_roots(
         return (workspace_diagnostic_configs, workspace_emmyrcs);
     }
 
-    let mut merged_emmyrc: Option<Emmyrc> = None;
+    let mut workspace_configs = Vec::new();
+
     for workspace_root in config_roots {
-        let mut workspace_config_files = global_config_files.to_vec();
-        workspace_config_files.extend(collect_config_files_from_dir(
+        let local_config_files = collect_config_files_from_dir(
             workspace_root,
             luarc_file,
             emmyrc_file,
             emmyrc_lua_file,
-        ));
+        );
+        let has_local_config = !local_config_files.is_empty();
+
+        let mut workspace_config_files = global_config_files.to_vec();
+        workspace_config_files.extend(local_config_files);
 
         let mut workspace_emmyrc = load_configs(
             workspace_config_files,
@@ -498,62 +503,166 @@ fn pre_process_emmyrc_for_all_roots(
         inject_gmod_annotations(client_config, &mut workspace_emmyrc);
         inject_gamemode_base_libraries(client_config, &mut workspace_emmyrc);
         workspace_emmyrc.pre_process_emmyrc(workspace_root);
+        workspace_configs.push((workspace_root.clone(), workspace_emmyrc, has_local_config));
+    }
 
-        // Store per-workspace diagnostic config before merging
-        workspace_diagnostic_configs.insert(
-            workspace_root.clone(),
-            LuaDiagnosticConfig::new(&workspace_emmyrc),
-        );
-        workspace_emmyrcs.insert(workspace_root.clone(), Arc::new(workspace_emmyrc.clone()));
+    // Isolation can only stay enabled if all workspace configs keep it enabled.
+    let isolation_enabled = workspace_configs
+        .iter()
+        .all(|(_, workspace_emmyrc, _)| workspace_emmyrc.workspace.enable_isolation);
 
-        if let Some(merged) = merged_emmyrc.as_mut() {
-            extend_unique(
-                &mut merged.workspace.workspace_roots,
-                workspace_emmyrc.workspace.workspace_roots,
+    if isolation_enabled {
+        let mut merged_emmyrc: Option<Emmyrc> = None;
+        for (workspace_root, workspace_emmyrc, _) in &workspace_configs {
+            workspace_diagnostic_configs.insert(
+                workspace_root.clone(),
+                LuaDiagnosticConfig::new(workspace_emmyrc),
             );
-            extend_unique(
-                &mut merged.workspace.library,
-                workspace_emmyrc.workspace.library,
-            );
-            extend_unique(
-                &mut merged.workspace.package_dirs,
-                workspace_emmyrc.workspace.package_dirs,
-            );
-            extend_unique(
-                &mut merged.workspace.ignore_dir,
-                workspace_emmyrc.workspace.ignore_dir,
-            );
-            extend_unique(
-                &mut merged.workspace.ignore_dir_defaults,
-                workspace_emmyrc.workspace.ignore_dir_defaults,
-            );
-            extend_unique(
-                &mut merged.workspace.ignore_globs,
-                workspace_emmyrc.workspace.ignore_globs,
-            );
-            merged.workspace.use_default_ignores = merged.workspace.use_default_ignores
-                || workspace_emmyrc.workspace.use_default_ignores;
-            merged.workspace.enable_isolation =
-                merged.workspace.enable_isolation && workspace_emmyrc.workspace.enable_isolation;
-            extend_unique(
-                &mut merged.runtime.extensions,
-                workspace_emmyrc.runtime.extensions,
-            );
-            extend_unique(
-                &mut merged.runtime.require_pattern,
-                workspace_emmyrc.runtime.require_pattern,
-            );
-            extend_unique(&mut merged.resource.paths, workspace_emmyrc.resource.paths);
-        } else {
-            merged_emmyrc = Some(workspace_emmyrc);
+            workspace_emmyrcs.insert(workspace_root.clone(), Arc::new(workspace_emmyrc.clone()));
+
+            if let Some(merged) = merged_emmyrc.as_mut() {
+                merge_isolated_workspace_fields(merged, workspace_emmyrc);
+            } else {
+                merged_emmyrc = Some(workspace_emmyrc.clone());
+            }
         }
+
+        if let Some(merged_emmyrc) = merged_emmyrc {
+            *emmyrc = merged_emmyrc;
+        }
+
+        return (workspace_diagnostic_configs, workspace_emmyrcs);
     }
 
-    if let Some(merged_emmyrc) = merged_emmyrc {
-        *emmyrc = merged_emmyrc;
+    // isolation disabled: build one global merged config while keeping
+    // local workspace configs as optional overrides only where present.
+    let baseline_index = workspace_configs
+        .iter()
+        .position(|(_, _, has_local)| *has_local)
+        .unwrap_or(0);
+
+    let mut merged_emmyrc = workspace_configs
+        .get(baseline_index)
+        .map(|(_, cfg, _)| cfg.clone())
+        .unwrap_or_else(|| emmyrc.clone());
+
+    for (index, (workspace_root, workspace_emmyrc, has_local_config)) in
+        workspace_configs.into_iter().enumerate()
+    {
+        if has_local_config {
+            workspace_diagnostic_configs.insert(
+                workspace_root.clone(),
+                LuaDiagnosticConfig::new(&workspace_emmyrc),
+            );
+            workspace_emmyrcs.insert(workspace_root.clone(), Arc::new(workspace_emmyrc.clone()));
+        }
+
+        if index == baseline_index {
+            continue;
+        }
+
+        merge_emmyrc_prefer_existing_with_array_union(&mut merged_emmyrc, &workspace_emmyrc);
     }
+
+    // This branch is only entered when at least one workspace disabled isolation.
+    merged_emmyrc.workspace.enable_isolation = false;
+
+    *emmyrc = merged_emmyrc;
 
     (workspace_diagnostic_configs, workspace_emmyrcs)
+}
+
+fn merge_isolated_workspace_fields(merged: &mut Emmyrc, workspace_emmyrc: &Emmyrc) {
+    extend_unique(
+        &mut merged.workspace.workspace_roots,
+        workspace_emmyrc.workspace.workspace_roots.clone(),
+    );
+    extend_unique(
+        &mut merged.workspace.library,
+        workspace_emmyrc.workspace.library.clone(),
+    );
+    extend_unique(
+        &mut merged.workspace.package_dirs,
+        workspace_emmyrc.workspace.package_dirs.clone(),
+    );
+    extend_unique(
+        &mut merged.workspace.ignore_dir,
+        workspace_emmyrc.workspace.ignore_dir.clone(),
+    );
+    extend_unique(
+        &mut merged.workspace.ignore_dir_defaults,
+        workspace_emmyrc.workspace.ignore_dir_defaults.clone(),
+    );
+    extend_unique(
+        &mut merged.workspace.ignore_globs,
+        workspace_emmyrc.workspace.ignore_globs.clone(),
+    );
+    merged.workspace.use_default_ignores =
+        merged.workspace.use_default_ignores || workspace_emmyrc.workspace.use_default_ignores;
+    merged.workspace.enable_isolation =
+        merged.workspace.enable_isolation && workspace_emmyrc.workspace.enable_isolation;
+    extend_unique(
+        &mut merged.runtime.extensions,
+        workspace_emmyrc.runtime.extensions.clone(),
+    );
+    extend_unique(
+        &mut merged.runtime.require_pattern,
+        workspace_emmyrc.runtime.require_pattern.clone(),
+    );
+    extend_unique(
+        &mut merged.resource.paths,
+        workspace_emmyrc.resource.paths.clone(),
+    );
+}
+
+fn merge_emmyrc_prefer_existing_with_array_union(merged: &mut Emmyrc, incoming: &Emmyrc) {
+    let Ok(mut merged_value) = serde_json::to_value(&*merged) else {
+        return;
+    };
+    let Ok(incoming_value) = serde_json::to_value(incoming) else {
+        return;
+    };
+
+    merge_value_prefer_existing_with_array_union(&mut merged_value, incoming_value);
+
+    if let Ok(new_merged) = serde_json::from_value::<Emmyrc>(merged_value) {
+        *merged = new_merged;
+    }
+}
+
+fn merge_value_prefer_existing_with_array_union(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (key, overlay_value) in overlay_map {
+                if let Some(base_value) = base_map.get_mut(&key) {
+                    merge_value_prefer_existing_with_array_union(base_value, overlay_value);
+                } else {
+                    base_map.insert(key, overlay_value);
+                }
+            }
+        }
+        (Value::Array(base_array), Value::Array(overlay_array)) => {
+            let mut seen = HashSet::new();
+            for item in base_array.iter() {
+                if let Ok(key) = serde_json::to_string(item) {
+                    seen.insert(key);
+                }
+            }
+
+            for item in overlay_array {
+                if let Ok(key) = serde_json::to_string(&item) {
+                    if seen.insert(key) {
+                        base_array.push(item);
+                    }
+                } else if !base_array.contains(&item) {
+                    base_array.push(item);
+                }
+            }
+        }
+        _ => {
+            // Keep existing scalar/object value on conflict.
+        }
+    }
 }
 
 /// Build a per-workspace-root `WorkspaceFileMatcher` map from the per-root
@@ -1018,18 +1127,18 @@ mod tests {
     }
 
     #[test]
-    fn test_load_emmy_config_does_not_overlay_with_secondary_workspace_local_config() {
+    fn test_load_emmy_config_isolation_enabled_does_not_overlay_secondary_workspace_diagnostics() {
         let workspace_a = create_temp_dir();
         let workspace_b = create_temp_dir();
 
         fs::write(
             workspace_a.join(".emmyrc.json"),
-            r#"{ "diagnostics": { "globals": ["A_ONLY"], "disable": ["inject-field"] } }"#,
+            r#"{ "workspace": { "enableIsolation": true }, "diagnostics": { "globals": ["A_ONLY"], "disable": ["inject-field"] } }"#,
         )
         .expect("failed to write workspace a config");
         fs::write(
             workspace_b.join(".emmyrc.json"),
-            r#"{ "diagnostics": { "globals": ["B_ONLY"], "disable": ["undefined-global"] } }"#,
+            r#"{ "workspace": { "enableIsolation": true }, "diagnostics": { "globals": ["B_ONLY"], "disable": ["undefined-global"] } }"#,
         )
         .expect("failed to write workspace b config");
 
@@ -1531,13 +1640,13 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_root_merge_keeps_default_ignore_enablement_if_any_root_requires_it() {
+    fn test_multi_root_merge_prefers_first_root_scalar_conflicts_when_isolation_disabled() {
         let workspace_a = create_temp_dir();
         let workspace_b = create_temp_dir();
 
         fs::write(
             workspace_a.join(".emmyrc.json"),
-            r#"{ "workspace": { "useDefaultIgnores": false, "ignoreDirDefaults": ["**/custom-a/**"] } }"#,
+            r#"{ "workspace": { "enableIsolation": false, "useDefaultIgnores": false, "ignoreDirDefaults": ["**/custom-a/**"] } }"#,
         )
         .expect("failed to write workspace a config");
         fs::write(
@@ -1551,7 +1660,7 @@ mod tests {
             ClientConfig::default(),
         );
 
-        assert!(loaded.emmyrc.workspace.use_default_ignores);
+        assert!(!loaded.emmyrc.workspace.use_default_ignores);
         let resolved = loaded.emmyrc.workspace.resolve_ignore_dir_defaults();
         assert!(
             resolved.contains(&"**/custom-a/**".to_string()),
@@ -1569,18 +1678,58 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_root_merge_unions_diagnostic_globals_when_isolation_disabled() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "workspace": { "enableIsolation": false }, "diagnostics": { "globals": ["A_ONLY"] } }"#,
+        )
+        .expect("failed to write workspace a config");
+        fs::write(
+            workspace_b.join(".emmyrc.json"),
+            r#"{ "diagnostics": { "globals": ["B_ONLY"] } }"#,
+        )
+        .expect("failed to write workspace b config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        assert!(
+            loaded
+                .emmyrc
+                .diagnostics
+                .globals
+                .contains(&"A_ONLY".to_string())
+        );
+        assert!(
+            loaded
+                .emmyrc
+                .diagnostics
+                .globals
+                .contains(&"B_ONLY".to_string())
+        );
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
     fn test_multi_root_merge_disables_isolation_if_any_root_disables_it() {
         let workspace_a = create_temp_dir();
         let workspace_b = create_temp_dir();
 
         fs::write(
             workspace_a.join(".emmyrc.json"),
-            r#"{ "workspace": { "enableIsolation": true } }"#,
+            r#"{ "workspace": { "enableIsolation": true }, "diagnostics": { "globals": ["A_ONLY"] } }"#,
         )
         .expect("failed to write workspace a config");
         fs::write(
             workspace_b.join(".emmyrc.json"),
-            r#"{ "workspace": { "enableIsolation": false } }"#,
+            r#"{ "workspace": { "enableIsolation": false }, "diagnostics": { "globals": ["B_ONLY"] } }"#,
         )
         .expect("failed to write workspace b config");
 
@@ -1590,6 +1739,47 @@ mod tests {
         );
 
         assert!(!loaded.emmyrc.workspace.enable_isolation);
+        assert!(
+            loaded
+                .emmyrc
+                .diagnostics
+                .globals
+                .contains(&"A_ONLY".to_string())
+        );
+        assert!(
+            loaded
+                .emmyrc
+                .diagnostics
+                .globals
+                .contains(&"B_ONLY".to_string())
+        );
+
+        let _ = fs::remove_dir_all(workspace_a);
+        let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_isolation_disabled_only_registers_workspace_overrides_with_local_configs() {
+        let workspace_a = create_temp_dir();
+        let workspace_b = create_temp_dir();
+
+        fs::write(
+            workspace_a.join(".emmyrc.json"),
+            r#"{ "workspace": { "enableIsolation": false }, "diagnostics": { "severity": { "undefined-global": "warning" } } }"#,
+        )
+        .expect("failed to write workspace a config");
+
+        let loaded = load_emmy_config(
+            vec![workspace_a.clone(), workspace_b.clone()],
+            ClientConfig::default(),
+        );
+
+        assert!(loaded.workspace_diagnostic_configs.contains_key(&workspace_a));
+        assert!(!loaded.workspace_diagnostic_configs.contains_key(&workspace_b));
+        assert!(loaded.workspace_emmyrcs.contains_key(&workspace_a));
+        assert!(!loaded.workspace_emmyrcs.contains_key(&workspace_b));
+        assert!(loaded.workspace_matchers.contains_key(&workspace_a));
+        assert!(!loaded.workspace_matchers.contains_key(&workspace_b));
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);
