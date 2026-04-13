@@ -7,6 +7,18 @@ on:
     tags:
      - "*.*.*"
   workflow_dispatch:
+    inputs:
+      channel:
+        description: Optional release channel override for tag builds
+        required: false
+        type: choice
+        options:
+          - prerelease
+          - stable
+      version:
+        description: Optional version validation for manual tag dispatch
+        required: false
+        type: string
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
@@ -100,6 +112,40 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   platform: win32-x64, cross: general,  crate: glua_check, output: glua_check }
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Preflight stable-release secrets
+        shell: bash
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+          CHANNEL_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.channel || '' }}
+          CARGO_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          require_cargo="false"
+          case "${CHANNEL_OVERRIDE}" in
+            stable)
+              require_cargo="true"
+              ;;
+            prerelease)
+              require_cargo="false"
+              ;;
+            "")
+              IFS='.' read -r _ _ patch <<< "${TAG_VERSION}"
+              if (( patch == 0 )); then
+                require_cargo="true"
+              fi
+              ;;
+            *)
+              echo "Unknown channel override '${CHANNEL_OVERRIDE}'." >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "${require_cargo}" == "true" && -z "${CARGO_TOKEN}" ]]; then
+            echo "::error::CARGO_TOKEN is required for stable releases (crate publish path)."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -152,28 +198,29 @@ jobs:
   publish-crates:
     name: Publish Cargo crates
     needs: [build-release]
-    if: startsWith(github.ref, 'refs/tags/') && endsWith(github.ref_name, '.0')
+    if: startsWith(github.ref, 'refs/tags/') && (endsWith(github.ref_name, '.0') || (github.event_name == 'workflow_dispatch' && github.event.inputs.channel == 'stable'))
     runs-on: ubuntu-latest
     env:
       CARGO_TOKEN: ${{ secrets.CARGO_TOKEN }}
     steps:
-      - name: Skip publish when CARGO_TOKEN is not configured
-        if: env.CARGO_TOKEN == ''
-        run: echo "CARGO_TOKEN is not set; skipping crates publish."
+      - name: Verify publish token
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_TOKEN}" ]]; then
+            echo "::error::CARGO_TOKEN is required for this publish-crates run."
+            exit 1
+          fi
       - uses: actions/checkout@v4
-        if: env.CARGO_TOKEN != ''
         with:
           submodules: recursive
       - name: Install Rust toolchain
-        if: env.CARGO_TOKEN != ''
         uses: dtolnay/rust-toolchain@stable
       - name: Set version
-        if: env.CARGO_TOKEN != ''
         run: |
           echo "current ref ${{ github.ref }}"
           cargo run -p edit_version -- ${{ github.ref }}
       - name: Publish crates
-        if: env.CARGO_TOKEN != ''
         run: |
           set -euo pipefail
 
@@ -247,6 +294,8 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_CHANNEL_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.channel || '' }}
+          RELEASE_VERSION_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || '' }}
         run: |
           set -euo pipefail
 
@@ -258,13 +307,33 @@ jobs:
             exit 1
           fi
 
-          IFS='.' read -r _ _ patch <<< "$tag"
-          release_flags=()
-          release_kind="stable"
-          if (( patch != 0 )); then
-            release_flags+=(--prerelease)
-            release_kind="prerelease"
+          if [[ -n "${RELEASE_VERSION_OVERRIDE}" && "${RELEASE_VERSION_OVERRIDE}" != "${tag}" ]]; then
+            echo "Manual version '${RELEASE_VERSION_OVERRIDE}' does not match tag '${tag}'." >&2
+            exit 1
           fi
+
+          release_flags=()
+          case "${RELEASE_CHANNEL_OVERRIDE}" in
+            stable)
+              release_kind="stable"
+              ;;
+            prerelease)
+              release_flags+=(--prerelease)
+              release_kind="prerelease"
+              ;;
+            "")
+              IFS='.' read -r _ _ patch <<< "$tag"
+              release_kind="stable"
+              if (( patch != 0 )); then
+                release_flags+=(--prerelease)
+                release_kind="prerelease"
+              fi
+              ;;
+            *)
+              echo "Unknown RELEASE_CHANNEL_OVERRIDE '${RELEASE_CHANNEL_OVERRIDE}'." >&2
+              exit 1
+              ;;
+          esac
 
           echo "Publishing ${release_kind} release for tag ${tag_ref}"
 
