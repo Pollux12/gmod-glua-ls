@@ -71,7 +71,7 @@ Available behaviours: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"`, `"
 | `strict.docBaseConstMatchBaseType` | `boolean` | `true` | Allow base constants (e.g., `0`, `""`) to match their base type |
 | `strict.requireExportGlobal` | `boolean` | `false` | Require explicit `---@export global` annotation for globals to be visible outside their file |
 | `strict.allowNullableAsNonNullable` | `boolean` | `true` | Allow optional types (`T?`) to be passed where non-optional (`T`) is expected (lenient nil-safety) |
-| `strict.inferredTypeMismatch` | `boolean` | `false` | Report type mismatch diagnostics for inferred types (more strict, may produce false positives) |
+| `strict.inferredTypeMismatch` | `boolean` | `false` | Report type mismatch diagnostics for inferred values (stricter checker, may produce false positives) |
 
 ### Enabling stricter nil checking
 
