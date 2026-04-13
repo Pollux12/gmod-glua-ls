@@ -186,6 +186,20 @@ pub fn infer_member_by_member_key(
         | LuaType::StringConst(_)
         | LuaType::DocStringConst(_)
         | LuaType::Language(_) => {
+            if db.get_emmyrc().gmod.enabled {
+                if let Some(index_key) = index_expr.get_index_key() {
+                    let is_numeric = match &index_key {
+                        LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_) => true,
+                        LuaIndexKey::Expr(expr) => infer_expr(db, cache, expr.clone())
+                            .map(|t| t.is_number())
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if is_numeric {
+                        return Ok(LuaType::String);
+                    }
+                }
+            }
             let decl_id = get_buildin_type_map_type_id(prefix_type).ok_or(InferFailReason::None)?;
             infer_custom_type_member(db, cache, decl_id, index_expr, infer_guard)
         }

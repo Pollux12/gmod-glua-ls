@@ -36,6 +36,20 @@ fn infer_raw_member_type_guard(
         | LuaType::StringConst(_)
         | LuaType::DocStringConst(_)
         | LuaType::Language(_) => {
+            if db.get_emmyrc().gmod.enabled {
+                let is_numeric = match member_key {
+                    LuaMemberKey::Integer(_) => true,
+                    LuaMemberKey::ExprType(t) => {
+                        t.is_integer()
+                            || t.is_number()
+                            || matches!(t, LuaType::Number | LuaType::Integer)
+                    }
+                    _ => false,
+                };
+                if is_numeric {
+                    return Ok(LuaType::String);
+                }
+            }
             let decl_id = get_buildin_type_map_type_id(prefix_type).ok_or(InferFailReason::None)?;
             let owner = LuaMemberOwner::Type(decl_id);
             infer_owner_raw_member_type(db, owner, member_key)

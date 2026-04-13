@@ -278,6 +278,32 @@ pub(super) fn is_valid_member(
                 }
             }
         }
+        // In GMod mode, strings support numeric byte indexing (e.g. `str[2]`, `str[i]`).
+        // This mirrors the inference behaviour in `infer_raw_member.rs`.
+        LuaType::String
+        | LuaType::Io
+        | LuaType::StringConst(_)
+        | LuaType::DocStringConst(_)
+        | LuaType::Language(_) => {
+            if semantic_model.get_db().get_emmyrc().gmod.enabled {
+                if matches!(index_key, LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_)) {
+                    return Some(());
+                }
+                if let LuaIndexKey::Expr(expr) = index_key {
+                    match semantic_model.infer_expr(expr.clone()) {
+                        Ok(key_type)
+                            if key_type.is_integer()
+                                || key_type.is_number()
+                                || matches!(key_type, LuaType::Number | LuaType::Integer) =>
+                        {
+                            return Some(());
+                        }
+                        Err(_) => return Some(()),
+                        _ => {}
+                    }
+                }
+            }
+        }
         LuaType::Ref(_) => {
             // 如果类型是 Ref 的 enum, 那么需要检查变量是否为参数, 因为作为参数的 enum 本质上是 value 而不是 enum
             if check_enum_is_param(semantic_model, prefix_typ, index_expr).is_some() {

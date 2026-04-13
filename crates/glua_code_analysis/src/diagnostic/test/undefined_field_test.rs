@@ -237,6 +237,46 @@ mod test {
     }
 
     #[test]
+    fn test_gmod_string_numeric_indexing_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Both literal numeric index and integer-typed variable index should be accepted
+        // for string types when GMod mode is enabled.
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local str = "hello"
+            local a = str[2]
+            ---@type integer
+            local i
+            local b = str[i]
+            ---@type number
+            local n
+            local c = str[n]
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_lua_string_indexing_still_reports() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = false;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local str = "hello"
+            local a = str[1]
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_917() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(
