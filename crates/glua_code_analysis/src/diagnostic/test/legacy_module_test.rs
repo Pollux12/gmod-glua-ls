@@ -63,7 +63,7 @@ mod test {
     }
 
     #[test]
-    fn legacy_module_does_not_leak_bare_name_to_other_files() {
+    fn legacy_module_leaks_bare_name_to_other_files_in_same_module() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
@@ -75,14 +75,52 @@ mod test {
             function Create() end
             "#,
         );
-        assert!(has_undefined_global_name(
-            &mut ws,
+        let consumer_file = ws.def_file(
             "consumer.lua",
             r#"
+            module("class", package.seeall)
             Create()
             "#,
-            "Create",
-        ));
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(consumer_file, CancellationToken::new())
+            .unwrap();
+        assert!(
+            diagnostics.is_empty(),
+            "Expected no diagnostics, but got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn legacy_module_does_not_leak_bare_name_to_different_module() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "class.lua",
+            r#"
+            module("class", package.seeall)
+            function Create() end
+            "#,
+        );
+        let consumer_file = ws.def_file(
+            "consumer.lua",
+            r#"
+            module("other", package.seeall)
+            Create()
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(consumer_file, CancellationToken::new())
+            .unwrap();
+        assert!(
+            !diagnostics.is_empty(),
+            "Expected diagnostics for different module, but got none"
+        );
     }
 
     #[test]
@@ -229,6 +267,23 @@ mod test {
             local _ = print
             "#,
             "print",
+        ));
+    }
+
+    #[test]
+    fn legacy_module_seeall_typo_reports_undefined_global() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "class.lua",
+            r#"
+            module("class", package.seeall)
+            local _ = unknown_typo_here
+            "#,
+            "unknown_typo_here",
         ));
     }
 }

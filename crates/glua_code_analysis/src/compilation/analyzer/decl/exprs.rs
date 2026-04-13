@@ -462,7 +462,10 @@ fn is_name_alias_of_package_seeall(analyzer: &DeclAnalyzer, name_expr: &LuaNameE
 }
 
 /// Finds the assignment/local statement at `position` and checks if its value is `package.seeall`.
-fn check_assign_value_is_package_seeall(tree: &glua_parser::LuaChunk, position: rowan::TextSize) -> bool {
+fn check_assign_value_is_package_seeall(
+    tree: &glua_parser::LuaChunk,
+    position: rowan::TextSize,
+) -> bool {
     use glua_parser::{LuaAssignStat, LuaLocalStat};
 
     let token = match tree.syntax().token_at_offset(position) {

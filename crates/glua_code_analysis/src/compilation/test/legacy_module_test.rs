@@ -656,6 +656,52 @@ mod test {
         );
     }
 
+    /// Regression: bare names defined in one file under a legacy module must be
+    /// visible by bare name in another file belonging to the **same** module.
+    ///
+    /// file A: `module("class", package.seeall); function Create() end; Value = 1`
+    /// file B: `module("class", package.seeall); local c = Create; local v = Value`
+    ///
+    /// `c` must resolve to a function type and `v` to an integer/number type.
+    #[test]
+    fn legacy_module_same_module_bare_names_visible_across_files() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "class.lua",
+            r#"
+            module("class", package.seeall)
+            function Create() end
+            Value = 1
+            "#,
+        );
+        let consumer_file = ws.def_file(
+            "consumer.lua",
+            r#"
+            module("class", package.seeall)
+            local c = Create
+            local v = Value
+            "#,
+        );
+
+        let c_type = local_type_by_name(&mut ws, consumer_file, "c");
+        assert!(
+            c_type.is_function(),
+            "expected `c` to be a function, got: {:?}",
+            c_type
+        );
+
+        let v_type = local_type_by_name(&mut ws, consumer_file, "v");
+        assert!(
+            matches!(v_type, LuaType::Integer | LuaType::IntegerConst(_)),
+            "expected `v` to be integer/IntegerConst, got: {:?}",
+            v_type
+        );
+    }
+
     #[test]
     fn legacy_module_seeall_variable_alias_resolves_globals() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

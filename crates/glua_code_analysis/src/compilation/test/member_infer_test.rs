@@ -908,6 +908,37 @@ mod test {
     }
 
     #[test]
+    fn test_gmod_string_numeric_index() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+        local str = "XX"
+        local var = str[2]
+        "#,
+        );
+
+        let index_ty = index_expr_type(&mut ws, file_id, "str[2]");
+        assert_eq!(
+            index_ty,
+            LuaType::String,
+            "str[2] index expression should be string, got {:?}",
+            index_ty
+        );
+
+        let var_ty = local_name_type(&mut ws, file_id, "var");
+        assert_eq!(
+            var_ty,
+            LuaType::String,
+            "local var assigned from str[2] should be string, got {:?}",
+            var_ty
+        );
+    }
+
+    #[test]
     fn test_table_expr_key_string() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

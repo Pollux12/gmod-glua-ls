@@ -33,7 +33,7 @@ pub struct EmmyrcStrict {
     /// Allow nullable types (T?) to be passed where non-nullable (T) is expected.
     #[serde(default = "default_true")]
     pub allow_nullable_as_non_nullable: bool,
-    /// Keep inferred types lenient in mismatch diagnostics.
+    /// Report type mismatch diagnostics for inferred values when strict mode is enabled.
     #[serde(default = "default_false")]
     pub inferred_type_mismatch: bool,
 }

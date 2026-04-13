@@ -127,13 +127,26 @@ fn resolve_legacy_module_local_decl_id(
         return Some(decl.get_id());
     }
 
-    decl_tree
-        .find_module_scoped_decl_anywhere(
-            name,
-            &module_env.module_path,
-            module_env.activation_position,
-        )
-        .map(|decl| decl.get_id())
+    if let Some(decl) = decl_tree.find_module_scoped_decl_anywhere(
+        name,
+        &module_env.module_path,
+        module_env.activation_position,
+    ) {
+        return Some(decl.get_id());
+    }
+
+    // fallback: cross-file member search via GlobalPath member index
+    let owner = crate::LuaMemberOwner::GlobalPath(crate::GlobalId::new(&module_env.module_path));
+    let key = crate::LuaMemberKey::Name(name.into());
+    let member_item = db.get_member_index().get_member_item(&owner, &key)?;
+    let visible_ids = member_item.visible_member_ids_with_realm_at_offset(db, &file_id, position);
+    for member_id in visible_ids {
+        let decl_id = LuaDeclId::new(member_id.file_id, member_id.get_position());
+        if db.get_decl_index().get_decl(&decl_id).is_some() {
+            return Some(decl_id);
+        }
+    }
+    None
 }
 
 fn resolve_global_func_decl_id(

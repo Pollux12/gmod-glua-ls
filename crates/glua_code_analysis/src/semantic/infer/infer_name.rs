@@ -6,8 +6,8 @@ use wax::Pattern;
 
 use super::{InferFailReason, InferResult, infer_expr};
 use crate::{
-    FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId,
-    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, TypeOps,
+    FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, TypeOps,
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
     semantic::{
@@ -846,7 +846,7 @@ fn infer_legacy_module_local_type(
         .get_legacy_module_env_at(file_id, position)?;
 
     let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
-    let decl = decl_tree
+    if let Some(decl) = decl_tree
         .find_local_decl(name, position)
         .filter(|decl| {
             decl.is_module_scoped()
@@ -858,11 +858,35 @@ fn infer_legacy_module_local_type(
                 &module_env.module_path,
                 module_env.activation_position,
             )
-        })?;
+        })
+    {
+        return db
+            .get_type_index()
+            .get_type_cache(&decl.get_id().into())
+            .map(|cache| cache.as_type().clone());
+    }
 
-    db.get_type_index()
-        .get_type_cache(&decl.get_id().into())
-        .map(|cache| cache.as_type().clone())
+    // fallback: cross-file member search via GlobalPath member index
+    // (module-scoped decls in other files are stored under GlobalPath, not the global index)
+    let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(&module_env.module_path));
+    let member_key = LuaMemberKey::Name(name.into());
+    if let Some(member_item) = db.get_member_index().get_member_item(&owner, &member_key) {
+        if let Ok(ty) = member_item.resolve_type_with_realm(db, &file_id) {
+            return Some(ty);
+        }
+        // For module-scoped function/value decls, the type cache is stored under
+        // LuaTypeOwner::Decl (keyed by position), not LuaTypeOwner::Member.
+        // The member's syntax_id start position matches the decl's position, so
+        // we can reconstruct the LuaDeclId and look up the type from there.
+        for member_id in member_item.get_member_ids() {
+            let decl_id = LuaDeclId::new(member_id.file_id, member_id.get_position());
+            if let Some(type_cache) = db.get_type_index().get_type_cache(&decl_id.into()) {
+                return Some(type_cache.as_type().clone());
+            }
+        }
+    }
+
+    None
 }
 
 fn infer_legacy_module_implicit_type(
