@@ -1,12 +1,34 @@
 #[cfg(test)]
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualHoverResult, check};
-    use glua_code_analysis::EmmyrcGmodScriptedClassScopeEntry;
+    use glua_code_analysis::{
+        EmmyrcGmodScriptedClassDefinition, EmmyrcGmodScriptedClassScopeEntry,
+    };
     use googletest::prelude::*;
     use lsp_types::HoverContents;
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
         EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
+    }
+
+    fn plugin_scope_definition() -> EmmyrcGmodScriptedClassScopeEntry {
+        EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(EmmyrcGmodScriptedClassDefinition {
+            id: "plugins".to_string(),
+            label: Some("Plugins".to_string()),
+            path: Some(vec!["plugins".to_string()]),
+            include: Some(vec!["plugins/**".to_string()]),
+            exclude: None,
+            class_global: Some("PLUGIN".to_string()),
+            fixed_class_name: None,
+            is_global_singleton: None,
+            hide_from_outline: None,
+            strip_file_prefix: None,
+            parent_id: None,
+            icon: None,
+            root_dir: Some("plugins".to_string()),
+            scaffold: None,
+            disabled: None,
+        }))
     }
 
     fn dedent(input: &str) -> String {
@@ -642,7 +664,7 @@ mod tests {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
+        emmyrc.gmod.scripted_class_scopes.include = vec![plugin_scope_definition()];
         emmyrc.gmod.hook_mappings.method_prefixes = vec!["PLUGIN".to_string()];
         ws.update_emmyrc(emmyrc);
 

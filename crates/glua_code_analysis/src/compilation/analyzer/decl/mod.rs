@@ -37,27 +37,51 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
         };
         for in_filed_tree in tree_list.iter() {
             // Detect scoped class once here and cache in GmodInferIndex for gmod_pre reuse.
-            let scoped_class_global_name = if let Some(scripted_scope_files) =
+            let scoped_class_info = if let Some(scripted_scope_files) =
                 scripted_scope_files.as_ref()
                 && scripted_scope_files.contains(&in_filed_tree.file_id)
             {
-                if let Some((class_name, global_name)) =
-                    super::gmod::get_scripted_class_info_for_file(db, in_filed_tree.file_id)
-                {
+                let scope_match =
+                    super::gmod::detect_scoped_class_from_path(db, in_filed_tree.file_id);
+                if let Some(m) = scope_match {
+                    let extra_globals = super::gmod::compute_extra_scope_matches(
+                        db,
+                        in_filed_tree.file_id,
+                        &m.global_name,
+                    );
                     db.get_gmod_infer_index_mut().set_scoped_class_info(
                         in_filed_tree.file_id,
                         GmodScopedClassInfo {
-                            class_name,
-                            global_name: global_name.clone(),
+                            class_name: m.class_name.clone(),
+                            global_name: m.global_name.clone(),
+                            aliases: {
+                                let alias = super::gmod::remap_scoped_alias(&m.global_name);
+                                if alias.is_empty() {
+                                    vec![]
+                                } else {
+                                    vec![alias]
+                                }
+                            },
+                            is_global_singleton: m.is_global_singleton,
+                            extra_scope_matches: extra_globals.clone(),
                         },
                     );
-                    Some(global_name)
+                    Some((m.global_name, m.is_global_singleton, extra_globals))
                 } else {
                     None
                 }
             } else {
                 None
             };
+            let scoped_class_global_name =
+                scoped_class_info.as_ref().map(|(name, _, _)| name.clone());
+            let scoped_class_is_global_singleton = scoped_class_info
+                .as_ref()
+                .map(|(_, s, _)| *s)
+                .unwrap_or(false);
+            let scoped_class_extra_globals = scoped_class_info
+                .map(|(_, _, extras)| extras)
+                .unwrap_or_default();
             db.get_reference_index_mut()
                 .create_local_reference(in_filed_tree.file_id);
             let mut analyzer = DeclAnalyzer::new(
@@ -66,6 +90,8 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
                 in_filed_tree.value.clone(),
                 context,
                 scoped_class_global_name,
+                scoped_class_is_global_singleton,
+                scoped_class_extra_globals,
             );
             analyzer.analyze();
             let decl_tree = analyzer.get_decl_tree();
@@ -196,6 +222,12 @@ pub struct DeclAnalyzer<'a> {
     root: LuaChunk,
     decl: LuaDeclarationTree,
     scoped_class_global_name: Option<String>,
+    scoped_class_is_global_singleton: bool,
+    /// Extra scope matches from other scope definitions that also match this file.
+    /// Each entry is `(class_name, global_name, is_global_singleton)`. Used to seed
+    /// additional per-file declarations and create type bindings for all matching
+    /// scopes, not just the primary one.
+    scoped_class_extra_globals: Vec<(String, String, bool)>,
     seeded_scoped_class_decl: bool,
     legacy_module_envs: Vec<LegacyModuleEnv>,
     scopes: Vec<LuaScopeId>,
@@ -210,12 +242,16 @@ impl<'a> DeclAnalyzer<'a> {
         root: LuaChunk,
         context: &'a mut AnalyzeContext,
         scoped_class_global_name: Option<String>,
+        scoped_class_is_global_singleton: bool,
+        scoped_class_extra_globals: Vec<(String, String, bool)>,
     ) -> DeclAnalyzer<'a> {
         DeclAnalyzer {
             db,
             root,
             decl: LuaDeclarationTree::new(file_id),
             scoped_class_global_name,
+            scoped_class_is_global_singleton,
+            scoped_class_extra_globals,
             seeded_scoped_class_decl: false,
             legacy_module_envs: Vec::new(),
             scopes: Vec::new(),
@@ -264,6 +300,7 @@ impl<'a> DeclAnalyzer<'a> {
     pub fn add_decl(&mut self, mut decl: LuaDecl) -> LuaDeclId {
         if let Some(scoped_class_global_name) = self.scoped_class_global_name.as_ref()
             && decl.get_name() == scoped_class_global_name
+            && !self.scoped_class_is_global_singleton
             && let LuaDeclExtra::Global { kind } = decl.extra.clone()
         {
             decl.extra = LuaDeclExtra::Local { kind, attrib: None };
@@ -362,25 +399,95 @@ impl<'a> DeclAnalyzer<'a> {
             return;
         }
 
-        let Some(scoped_class_global_name) = self.scoped_class_global_name.as_ref() else {
+        let Some(scoped_class_global_name) = self.scoped_class_global_name.clone() else {
             return;
         };
 
         let file_id = self.get_file_id();
         let synthetic_pos = chunk_range.start();
         let synthetic_range = TextRange::new(synthetic_pos, synthetic_pos);
-        let decl = LuaDecl::new(
-            scoped_class_global_name,
-            file_id,
-            synthetic_range,
+        // Global singletons (like Schema) should be registered as real globals so they
+        // are visible from any file in the workspace. Per-file scoped classes (like PLUGIN,
+        // ENT) stay as locals because each file gets its own independent instance.
+        let extra = if self.scoped_class_is_global_singleton {
+            LuaDeclExtra::Global {
+                kind: LuaSyntaxKind::NameExpr.into(),
+            }
+        } else {
             LuaDeclExtra::Local {
                 kind: LuaSyntaxKind::NameExpr.into(),
                 attrib: None,
-            },
+            }
+        };
+        let decl = LuaDecl::new(
+            &scoped_class_global_name,
+            file_id,
+            synthetic_range,
+            extra,
             None,
         );
 
         self.add_decl(decl);
+
+        // For global singletons, also seed well-known aliases as globals
+        // (e.g. "Schema" when classGlobal is "SCHEMA" in Helix).
+        if self.scoped_class_is_global_singleton {
+            let alias = super::gmod::remap_scoped_alias(&scoped_class_global_name);
+            if !alias.is_empty() && alias != scoped_class_global_name.as_str() {
+                let alias_decl = LuaDecl::new(
+                    &alias,
+                    file_id,
+                    synthetic_range,
+                    LuaDeclExtra::Global {
+                        kind: LuaSyntaxKind::NameExpr.into(),
+                    },
+                    None,
+                );
+                self.add_decl(alias_decl);
+            }
+        }
+
+        // Seed extra scope matches as per-file declarations. These are scope
+        // matches from other scope definitions that also match this file (e.g.
+        // PLUGIN in a file that primarily belongs to the items scope because
+        // it's inside plugins/*/items/).
+        // Global singletons (like Schema) are seeded as globals so they don't
+        // trigger "redefined local" diagnostics; non-singletons are seeded as
+        // per-file locals.
+        let extra_matches: Vec<(String, String, bool)> = self.scoped_class_extra_globals.clone();
+        for (_extra_class_name, extra_global_name, is_singleton) in extra_matches {
+            let extra = if is_singleton {
+                LuaDeclExtra::Global {
+                    kind: LuaSyntaxKind::NameExpr.into(),
+                }
+            } else {
+                LuaDeclExtra::Local {
+                    kind: LuaSyntaxKind::NameExpr.into(),
+                    attrib: None,
+                }
+            };
+            let extra_decl =
+                LuaDecl::new(&extra_global_name, file_id, synthetic_range, extra, None);
+            self.add_decl(extra_decl);
+
+            // For global singleton extras, also seed their alias as a global.
+            if is_singleton {
+                let alias = super::gmod::remap_scoped_alias(&extra_global_name);
+                if !alias.is_empty() && alias != extra_global_name.as_str() {
+                    let alias_decl = LuaDecl::new(
+                        &alias,
+                        file_id,
+                        synthetic_range,
+                        LuaDeclExtra::Global {
+                            kind: LuaSyntaxKind::NameExpr.into(),
+                        },
+                        None,
+                    );
+                    self.add_decl(alias_decl);
+                }
+            }
+        }
+
         self.seeded_scoped_class_decl = true;
     }
 

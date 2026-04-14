@@ -428,6 +428,30 @@ mod test {
     }
 
     #[gtest]
+    fn test_hook_detection_treats_schema_as_builtin_owner_without_config() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def(
+            r#"
+            function SCHEMA:PlayerSpawn(client) end
+            "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_hook_file_metadata(&file_id)
+            .cloned()
+            .expect("expected hook metadata");
+
+        assert!(metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::GamemodeMethod
+                && site.hook_name.as_deref() == Some("PlayerSpawn")
+                && site.callback_params == vec!["client".to_string()]
+        }));
+    }
+
+    #[gtest]
     fn test_hook_detection_from_hook_annotation() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

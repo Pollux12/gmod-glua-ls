@@ -180,6 +180,19 @@ impl Default for GmodRealmFileMetadata {
 pub struct GmodScopedClassInfo {
     pub class_name: String,
     pub global_name: String,
+    pub aliases: Vec<String>,
+    /// When `true`, the global variable is a workspace-wide singleton (like `Schema` in Helix)
+    /// and should be registered as a global declaration accessible from any file.
+    pub is_global_singleton: bool,
+    /// Additional scope matches from other scope definitions whose include
+    /// patterns also match this file. Each entry carries `(class_name, global_name,
+    /// is_global_singleton)` — enough information to create a proper type
+    /// declaration and bind the variable to its type.
+    /// For example, a file at `plugins/writing/items/writing/sh_paper.lua`
+    /// primarily belongs to the items scope (ITEM), but also matches the
+    /// plugins scope (PLUGIN). This list enables PLUGIN to get its own type
+    /// binding (class_name "writing" extending PLUGIN) in addition to ITEM's.
+    pub extra_scope_matches: Vec<(String, String, bool)>,
 }
 
 #[derive(Debug, Default)]

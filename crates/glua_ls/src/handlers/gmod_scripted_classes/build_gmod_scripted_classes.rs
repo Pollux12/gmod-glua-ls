@@ -19,6 +19,11 @@ pub fn build_gmod_scripted_classes(
 
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
     let definitions = scopes.resolved_definitions();
+    let visible_definitions: Vec<_> = definitions
+        .iter()
+        .filter(|d| !d.hide_from_outline)
+        .cloned()
+        .collect();
     let include_patterns = scopes.include_patterns();
     let exclude_patterns = scopes.exclude_patterns();
     let include_glob = if include_patterns.is_empty() {
@@ -51,7 +56,7 @@ pub fn build_gmod_scripted_classes(
             Err(err) => {
                 log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");
                 return Some(GmodScriptedClassesResult {
-                    definitions,
+                    definitions: visible_definitions.clone(),
                     entries: Vec::new(),
                 });
             }
@@ -74,6 +79,10 @@ pub fn build_gmod_scripted_classes(
         let Some(scope_match) = scopes.detect_class_for_path(file_path) else {
             continue;
         };
+        // Skip entries for definitions hidden from the outline
+        if scope_match.definition.hide_from_outline {
+            continue;
+        }
         let Some(uri) = file_uri_string(db, file_id) else {
             continue;
         };
@@ -124,7 +133,7 @@ pub fn build_gmod_scripted_classes(
     });
 
     Some(GmodScriptedClassesResult {
-        definitions,
+        definitions: visible_definitions,
         entries,
     })
 }
@@ -241,17 +250,45 @@ fn push_candidate_path(candidate_paths: &mut Vec<String>, candidate: &str) {
 
 #[cfg(test)]
 mod tests {
-    use glua_code_analysis::{Emmyrc, VirtualWorkspace};
+    use glua_code_analysis::{
+        Emmyrc, EmmyrcGmodScriptedClassDefinition, EmmyrcGmodScriptedClassScopeEntry,
+        VirtualWorkspace,
+    };
     use googletest::prelude::*;
     use tokio_util::sync::CancellationToken;
 
     use super::build_gmod_scripted_classes;
+
+    fn plugin_scope_definition() -> EmmyrcGmodScriptedClassScopeEntry {
+        EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(EmmyrcGmodScriptedClassDefinition {
+            id: "plugins".to_string(),
+            label: Some("Plugins".to_string()),
+            path: Some(vec!["plugins".to_string()]),
+            include: Some(vec!["plugins/**".to_string()]),
+            exclude: None,
+            class_global: Some("PLUGIN".to_string()),
+            fixed_class_name: None,
+            is_global_singleton: None,
+            hide_from_outline: None,
+            strip_file_prefix: None,
+            parent_id: None,
+            icon: None,
+            root_dir: Some("plugins".to_string()),
+            scaffold: None,
+            disabled: None,
+        }))
+    }
 
     #[gtest]
     fn build_gmod_scripted_classes_filters_to_scoped_paths() -> Result<()> {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .include
+            .push(plugin_scope_definition());
         ws.update_emmyrc(emmyrc);
 
         ws.def_file("lua/entities/test_entity/init.lua", "local ENT = {}");

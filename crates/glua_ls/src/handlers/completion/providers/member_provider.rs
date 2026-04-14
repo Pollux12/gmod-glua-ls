@@ -89,7 +89,8 @@ fn extend_gmod_hook_fallback_members(
         return;
     };
 
-    let owner_candidates = gmod_hook_owner_candidates(owner_name.as_str());
+    let owner_candidates =
+        gmod_hook_owner_candidates(builder.semantic_model.get_db(), owner_name.as_str());
     if owner_candidates.is_empty() {
         return;
     }
@@ -103,7 +104,7 @@ fn extend_gmod_hook_fallback_members(
     }
 
     for owner_candidate in owner_candidates {
-        let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_candidate));
+        let owner_type = LuaType::Ref(LuaTypeDeclId::global(&owner_candidate));
         let Some(fallback_map) = builder
             .semantic_model
             .get_member_info_map_at_offset(&owner_type, builder.position_offset)
@@ -123,15 +124,55 @@ fn extend_gmod_hook_fallback_members(
     }
 }
 
-fn gmod_hook_owner_candidates(owner_name: &str) -> &'static [&'static str] {
+fn gmod_hook_owner_candidates(db: &DbIndex, owner_name: &str) -> Vec<String> {
+    // Check configured scriptedOwners entries first
+    if let Some(configured) = db
+        .get_emmyrc()
+        .gmod
+        .scripted_owners
+        .hook_owner_candidates_configured(owner_name)
+    {
+        return configured;
+    }
+
+    // Built-in defaults for GM/GAMEMODE/SANDBOX/PLUGIN
     if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
-        &["GM", "GAMEMODE", "SANDBOX"]
+        vec![
+            "GM".to_string(),
+            "GAMEMODE".to_string(),
+            "SANDBOX".to_string(),
+        ]
     } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
-        &["PLUGIN", "GM", "GAMEMODE", "SANDBOX"]
+        vec![
+            "PLUGIN".to_string(),
+            "GM".to_string(),
+            "GAMEMODE".to_string(),
+            "SANDBOX".to_string(),
+        ]
+    } else if owner_name.eq_ignore_ascii_case("SCHEMA") {
+        // Include both case variants: "Schema" and "SCHEMA"
+        let canonical = "SCHEMA";
+        let alias = "Schema";
+        vec![
+            owner_name.to_string(),
+            if owner_name == canonical {
+                alias
+            } else {
+                canonical
+            }
+            .to_string(),
+            "GM".to_string(),
+            "GAMEMODE".to_string(),
+            "SANDBOX".to_string(),
+        ]
     } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
-        &["SANDBOX", "GM", "GAMEMODE"]
+        vec![
+            "SANDBOX".to_string(),
+            "GM".to_string(),
+            "GAMEMODE".to_string(),
+        ]
     } else {
-        &[]
+        vec![]
     }
 }
 
@@ -383,10 +424,10 @@ fn is_gmod_hook_member_info(db: &DbIndex, info: &LuaMemberInfo) -> bool {
     };
 
     let owner_name = owner_type_id.get_simple_name();
-    owner_name.eq_ignore_ascii_case("GM")
-        || owner_name.eq_ignore_ascii_case("GAMEMODE")
-        || owner_name.eq_ignore_ascii_case("SANDBOX")
-        || owner_name.eq_ignore_ascii_case("PLUGIN")
+    // Delegate to the config-driven candidate lookup so that configured
+    // `gmod.scriptedOwners` hook owners are treated consistently with the
+    // built-in GM/GAMEMODE/SANDBOX/PLUGIN defaults.
+    !gmod_hook_owner_candidates(db, owner_name).is_empty()
 }
 
 fn is_member_realm_compatible(builder: &CompletionBuilder, info: &LuaMemberInfo) -> bool {

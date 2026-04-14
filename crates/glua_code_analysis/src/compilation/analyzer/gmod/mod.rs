@@ -38,7 +38,7 @@ struct GmodKeywords {
     has_net: bool,
     /// timer/concommand/ConVar/AddNetworkString — system call metadata
     has_system_call: bool,
-    /// "GM:" or "GAMEMODE:" — GM/GAMEMODE method sites
+    /// Built-in / configured hook-owner method sites such as `GM:` or `SCHEMA:`
     has_gm_func: bool,
     /// "CLIENT" or "SERVER" — branch realm ranges (if CLIENT/if SERVER)
     has_realm_branch: bool,
@@ -63,15 +63,16 @@ impl GmodKeywords {
     }
 }
 
+const BUILTIN_METHOD_HOOK_PREFIXES: &[&str] =
+    &["GM", "GAMEMODE", "PLUGIN", "SANDBOX", "SCHEMA", "Schema"];
+
 fn scan_gmod_keywords(content: &str, hook_method_prefixes: &[String]) -> GmodKeywords {
-    let has_gm_func = content.contains("GM:")
-        || content.contains("GAMEMODE:")
-        || hook_method_prefixes
-            .iter()
-            .any(|p| content.contains(&format!("{p}:")));
+    let has_gm_func = hook_method_prefixes
+        .iter()
+        .any(|p| content.contains(&format!("{p}:")));
     GmodKeywords {
         has_hook: content.contains("hook"),
-        has_net: content.contains("net."),
+        has_net: content.contains("net"),
         has_system_call: content.contains("timer.")
             || content.contains("concommand")
             || content.contains("ConVar")
@@ -114,12 +115,23 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
 
-            // Pre-scan file source for gmod-relevant keywords to skip unnecessary AST walks
-            let method_prefixes = &db.get_emmyrc().gmod.hook_mappings.method_prefixes;
+            // Pre-scan file source for gmod-relevant keywords to skip unnecessary AST walks.
+            // Combine configured method prefixes with built-in hook-owner prefixes so that
+            // built-in-like method declarations (e.g. `GM:` / `SCHEMA:`) are detected.
+            let combined_hook_prefixes: Vec<String> = {
+                let emmyrc = db.get_emmyrc();
+                let mut prefixes: Vec<String> = emmyrc.gmod.hook_mappings.method_prefixes.clone();
+                prefixes.extend(
+                    BUILTIN_METHOD_HOOK_PREFIXES
+                        .iter()
+                        .map(|prefix| prefix.to_string()),
+                );
+                prefixes
+            };
             let keywords = db
                 .get_vfs()
                 .get_file_content(&in_filed_tree.file_id)
-                .map(|c| scan_gmod_keywords(c, method_prefixes))
+                .map(|c| scan_gmod_keywords(c, &combined_hook_prefixes))
                 .unwrap_or_default();
 
             let s = std::time::Instant::now();
@@ -154,14 +166,23 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     .map(|info| GmodScopedClassMatch {
                         class_name: info.class_name.clone(),
                         global_name: info.global_name.clone(),
+                        is_global_singleton: info.is_global_singleton,
                     })
                     .or_else(|| {
                         let m = detect_scoped_class_from_path(db, in_filed_tree.file_id)?;
+                        let extra_globals =
+                            compute_extra_scope_matches(db, in_filed_tree.file_id, &m.global_name);
                         db.get_gmod_infer_index_mut().set_scoped_class_info(
                             in_filed_tree.file_id,
                             GmodScopedClassInfo {
                                 class_name: m.class_name.clone(),
                                 global_name: m.global_name.clone(),
+                                aliases: vec![remap_scoped_alias(&m.global_name)]
+                                    .into_iter()
+                                    .filter(|a| !a.is_empty())
+                                    .collect(),
+                                is_global_singleton: m.is_global_singleton,
+                                extra_scope_matches: extra_globals,
                             },
                         );
                         Some(m)
@@ -186,6 +207,34 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                         in_filed_tree.value.clone(),
                         &scope_match,
                     );
+
+                    // Also create type declarations and bindings for extra scope matches.
+                    // For example, a file in plugins/writing/items/ needs both ITEM
+                    // (primary) and PLUGIN (extra) to have proper types.
+                    let extra_matches: Vec<(String, String, bool)> = db
+                        .get_gmod_infer_index()
+                        .get_scoped_class_info(&in_filed_tree.file_id)
+                        .map(|info| info.extra_scope_matches.clone())
+                        .unwrap_or_default();
+                    for (extra_class_name, extra_global_name, _is_singleton) in extra_matches {
+                        let extra_scope_match = GmodScopedClassMatch {
+                            class_name: extra_class_name.clone(),
+                            global_name: extra_global_name.clone(),
+                            is_global_singleton: _is_singleton,
+                        };
+                        ensure_scoped_class_type_decl(
+                            db,
+                            in_filed_tree.file_id,
+                            &extra_class_name,
+                            &extra_global_name,
+                            in_filed_tree.value.syntax().text_range(),
+                        );
+                        collect_scripted_scope_type_bindings_with(
+                            db,
+                            in_filed_tree.file_id,
+                            &extra_scope_match,
+                        );
+                    }
                 }
                 t_scoped += s.elapsed();
             }
@@ -685,6 +734,9 @@ fn net_send_kind_from_method_name(method_name: &str) -> Option<NetSendKind> {
 pub(crate) struct GmodScopedClassMatch {
     pub global_name: String,
     pub class_name: String,
+    /// When `true`, the global variable is a workspace-wide singleton that should be
+    /// registered as a global declaration.
+    pub is_global_singleton: bool,
 }
 
 const GMOD_ENT_BASE_TO_ENT: &[&str] = &[
@@ -805,6 +857,7 @@ fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
         "SWEP" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Weapon"))),
         "ENT" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Entity"))),
         "PLUGIN" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("GM"))),
+        "SCHEMA" | "Schema" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("GM"))),
         _ => {}
     }
 
@@ -1047,6 +1100,16 @@ fn remap_scoped_base_name(scope_match: &GmodScopedClassMatch, base_name: &str) -
     }
 
     base_name.to_string()
+}
+
+pub(crate) fn remap_scoped_alias(global_name: &str) -> String {
+    match global_name {
+        // When classGlobal is "SCHEMA", "Schema" is the runtime alias (e.g. Helix).
+        "SCHEMA" => "Schema".to_string(),
+        // When classGlobal is "Schema", "SCHEMA" is the conventional uppercase alias.
+        "Schema" => "SCHEMA".to_string(),
+        _ => "".to_string(),
+    }
 }
 
 /// A wrapper function that internally calls NetworkVar or NetworkVarElement.
@@ -2049,7 +2112,10 @@ fn resolve_networkvar_type(type_name: &str) -> LuaType {
     }
 }
 
-fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodScopedClassMatch> {
+pub(crate) fn detect_scoped_class_from_path(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Option<GmodScopedClassMatch> {
     let file_path = db.get_vfs().get_file_path(&file_id)?;
     db.get_emmyrc()
         .gmod
@@ -2058,7 +2124,43 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
         .map(|scope_match| GmodScopedClassMatch {
             global_name: scope_match.definition.class_global,
             class_name: scope_match.class_name,
+            is_global_singleton: scope_match.definition.is_global_singleton,
         })
+}
+
+/// Computes the list of extra scope matches (class_name, global_name,
+/// is_global_singleton) from scope definitions that match the given file
+/// but are not the primary scope. Used to populate
+/// `GmodScopedClassInfo::extra_scope_matches` so that all matching
+/// classGlobal variables get proper type declarations and bindings.
+pub(crate) fn compute_extra_scope_matches(
+    db: &DbIndex,
+    file_id: FileId,
+    primary_global_name: &str,
+) -> Vec<(String, String, bool)> {
+    let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
+        return Vec::new();
+    };
+    let all_matches = db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .detect_all_scoped_class_matches_for_path(file_path);
+    all_matches
+        .into_iter()
+        .filter(|m| {
+            !m.definition
+                .class_global
+                .eq_ignore_ascii_case(primary_global_name)
+        })
+        .map(|m| {
+            (
+                m.class_name,
+                m.definition.class_global,
+                m.definition.is_global_singleton,
+            )
+        })
+        .collect()
 }
 
 /// Returns the gmod scripted-class name that the given file belongs to, if any.
@@ -2386,7 +2488,8 @@ fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<Gmod
         (hook_name, name_issue)
     } else if let Some(annotation_hook) = annotation
         && (is_builtin_method_hook_prefix(&prefix_name)
-            || is_configured_method_hook_prefix(db, &prefix_name))
+            || is_configured_method_hook_prefix(db, &prefix_name)
+            || is_scripted_hook_owner_prefix(db, &prefix_name))
     {
         let hook_name = annotation_hook.hook_name.or_else(|| {
             (!trimmed_method_name.is_empty()).then_some(trimmed_method_name.to_string())
@@ -2400,7 +2503,8 @@ fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<Gmod
     } else {
         if !is_colon
             || (!is_builtin_method_hook_prefix(&prefix_name)
-                && !is_configured_method_hook_prefix(db, &prefix_name))
+                && !is_configured_method_hook_prefix(db, &prefix_name)
+                && !is_scripted_hook_owner_prefix(db, &prefix_name))
         {
             return None;
         }
@@ -2467,7 +2571,7 @@ fn extract_param_names_from_closure(closure_expr: glua_parser::LuaClosureExpr) -
 }
 
 fn is_builtin_method_hook_prefix(prefix_name: &str) -> bool {
-    matches!(prefix_name, "GM" | "GAMEMODE" | "PLUGIN" | "SANDBOX")
+    BUILTIN_METHOD_HOOK_PREFIXES.contains(&prefix_name)
 }
 
 fn is_configured_method_hook_prefix(db: &DbIndex, prefix_name: &str) -> bool {
@@ -2482,6 +2586,17 @@ fn is_configured_method_hook_prefix(db: &DbIndex, prefix_name: &str) -> bool {
                 .trim_end_matches([':', '.'])
                 .eq_ignore_ascii_case(prefix_name)
         })
+}
+
+/// Returns `true` when `prefix_name` matches a configured `gmod.scriptedOwners.include` entry
+/// whose `hookOwner` flag is `true` (including aliases).
+fn is_scripted_hook_owner_prefix(db: &DbIndex, prefix_name: &str) -> bool {
+    db.get_emmyrc()
+        .gmod
+        .scripted_owners
+        .hook_owner_names()
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(prefix_name))
 }
 
 #[derive(Debug, Clone)]

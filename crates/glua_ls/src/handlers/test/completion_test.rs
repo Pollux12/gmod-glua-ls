@@ -3593,4 +3593,56 @@ mod tests {
 
         Ok(())
     }
+
+    #[gtest]
+    fn test_gmod_schema_function_decl_completion_uses_canonical_schema_owner() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            ---@class SCHEMA
+            ---@type SCHEMA
+            SCHEMA = SCHEMA or {}
+
+            function SCHEMA:ZzzSchemaHook(player, entity) end
+
+            local Schema = {}
+            function Schema:<??>()
+            end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .into_iter()
+            .find(|it| it.label == "ZzzSchemaHook")
+            .ok_or("missing ZzzSchemaHook completion")
+            .or_fail()?;
+
+        verify_eq!(item.kind, Some(CompletionItemKind::FUNCTION))?;
+        let item_detail = item
+            .label_details
+            .as_ref()
+            .and_then(|details| details.detail.clone());
+        verify_eq!(item_detail, Some("(player, entity)".to_string()))?;
+
+        Ok(())
+    }
 }

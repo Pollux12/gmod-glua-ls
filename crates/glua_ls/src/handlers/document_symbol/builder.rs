@@ -67,14 +67,26 @@ impl<'a> DocumentSymbolBuilder<'a> {
             Self::collect_class_panel_names(db, decl_tree, file_id, gmod_enabled);
         let gmod_call_map = Self::collect_gmod_call_map(db, file_id, gmod_enabled);
         let scripted_class_info = if gmod_enabled {
-            get_scripted_class_info_for_file(db, file_id).map(|(class_name, global_name)| {
+            get_scripted_class_info_for_file(db, file_id).and_then(|(class_name, global_name)| {
+                // Skip outline entry if the scope definition is hidden from outline
+                for def in db
+                    .get_emmyrc()
+                    .gmod
+                    .scripted_class_scopes
+                    .resolved_definitions()
+                {
+                    if def.class_global.eq_ignore_ascii_case(&global_name) && def.hide_from_outline
+                    {
+                        return None;
+                    }
+                }
                 let type_label = scripted_class_type_label(&global_name);
                 let class_label = format!("{class_name} ({type_label})");
-                ScriptedClassInfo {
+                Some(ScriptedClassInfo {
                     class_name,
                     global_name,
                     class_label,
-                }
+                })
             })
         } else {
             None
@@ -121,16 +133,31 @@ impl<'a> DocumentSymbolBuilder<'a> {
 
         // Scripted entity classes (ENT, SWEP, TOOL, EFFECT, PLUGIN).
         if let Some((class_name, global_name)) = get_scripted_class_info_for_file(db, file_id) {
-            let type_label = scripted_class_type_label(&global_name);
-            let class_label = format!("{class_name} ({type_label})");
-            let class_decl_id = decl_tree
-                .get_decls()
-                .values()
-                .filter(|decl| decl.get_name() == global_name)
-                .min_by_key(|decl| decl.get_position())
-                .map(|decl| decl.get_id());
-            if let Some(class_decl_id) = class_decl_id {
-                panel_names.insert(class_decl_id, class_label);
+            // Skip if the scope definition is hidden from outline
+            let mut hidden = false;
+            for def in db
+                .get_emmyrc()
+                .gmod
+                .scripted_class_scopes
+                .resolved_definitions()
+            {
+                if def.class_global.eq_ignore_ascii_case(&global_name) && def.hide_from_outline {
+                    hidden = true;
+                    break;
+                }
+            }
+            if !hidden {
+                let type_label = scripted_class_type_label(&global_name);
+                let class_label = format!("{class_name} ({type_label})");
+                let class_decl_id = decl_tree
+                    .get_decls()
+                    .values()
+                    .filter(|decl| decl.get_name() == global_name)
+                    .min_by_key(|decl| decl.get_position())
+                    .map(|decl| decl.get_id());
+                if let Some(class_decl_id) = class_decl_id {
+                    panel_names.insert(class_decl_id, class_label);
+                }
             }
         }
 

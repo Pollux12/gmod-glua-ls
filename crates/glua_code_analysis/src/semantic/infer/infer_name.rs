@@ -116,14 +116,29 @@ pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
     cache: &mut LuaInferCache,
     name: &str,
 ) -> Option<LuaTypeDeclId> {
-    if !db.get_emmyrc().gmod.enabled
-        || !db
-            .get_emmyrc()
-            .gmod
-            .scripted_class_scopes
-            .resolved_definitions()
-            .iter()
-            .any(|definition| definition.class_global == name)
+    if !db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let definitions = db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions();
+
+    // Fixed-class-name scopes define a workspace-wide singleton global (e.g. Schema in Helix).
+    // Resolve the type regardless of which file we are currently in.
+    for definition in definitions.iter() {
+        if definition.class_global == name {
+            if let Some(ref fixed_name) = definition.fixed_class_name {
+                return Some(LuaTypeDeclId::global(fixed_name));
+            }
+        }
+    }
+
+    if !definitions
+        .iter()
+        .any(|definition| definition.class_global == name)
     {
         return None;
     }

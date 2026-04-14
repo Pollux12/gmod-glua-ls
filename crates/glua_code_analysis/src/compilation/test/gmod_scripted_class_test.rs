@@ -6,9 +6,34 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral,
-        LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassDefinition,
+        EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral, LuaMemberKey,
+        LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
     };
+
+    /// Creates an explicit Definition scope entry for the `plugins` directory with
+    /// `classGlobal = PLUGIN`.  Used in tests that previously relied on the
+    /// `plugins` built-in default, which was removed so that plugin support is
+    /// opt-in (configured via presets) rather than always-on.
+    fn plugin_scope_definition() -> EmmyrcGmodScriptedClassScopeEntry {
+        EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(EmmyrcGmodScriptedClassDefinition {
+            id: "plugins".to_string(),
+            label: Some("Plugins".to_string()),
+            path: Some(vec!["plugins".to_string()]),
+            include: Some(vec!["plugins/**".to_string()]),
+            exclude: None,
+            class_global: Some("PLUGIN".to_string()),
+            fixed_class_name: None,
+            is_global_singleton: None,
+            hide_from_outline: None,
+            strip_file_prefix: None,
+            parent_id: None,
+            icon: None,
+            root_dir: Some("plugins".to_string()),
+            scaffold: None,
+            disabled: None,
+        }))
+    }
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
         EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
@@ -182,7 +207,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
+        emmyrc.gmod.scripted_class_scopes.include = vec![plugin_scope_definition()];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -249,7 +274,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
+        emmyrc.gmod.scripted_class_scopes.include = vec![plugin_scope_definition()];
         ws.update_emmyrc(emmyrc);
 
         let file_id = ws.def_file(
@@ -3956,6 +3981,62 @@ mod test {
         assert_eq!(
             member_count_after, 1,
             "single-file reindex should retain the latest assignment"
+        );
+    }
+
+    #[test]
+    fn test_helix_schema_alias_suppression() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        // SCHEMA class scope
+        emmyrc.gmod.scripted_class_scopes.include =
+            vec![EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(
+                EmmyrcGmodScriptedClassDefinition {
+                    id: "helix-schema".to_string(),
+                    class_global: Some("SCHEMA".to_string()),
+                    include: Some(vec!["schema/**".to_string()]),
+                    label: Some("Helix Schema".to_string()),
+                    path: Some(vec!["schema".to_string()]),
+                    root_dir: Some("schema".to_string()),
+                    fixed_class_name: Some("SCHEMA".to_string()),
+                    is_global_singleton: Some(true),
+                    strip_file_prefix: None,
+                    hide_from_outline: None,
+                    exclude: None,
+                    parent_id: None,
+                    icon: None,
+                    scaffold: None,
+                    disabled: None,
+                },
+            ))];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedGlobal);
+
+        let file_id = ws.def_file(
+            "schema/sh_schema.lua",
+            r#"
+            SCHEMA.Name = "Test Schema"
+            
+            function SCHEMA:Initialize()
+                print(Schema.Name) -- Should not trigger undefined-global
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_global_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("undefined-global".to_string())))
+            .collect();
+
+        assert!(
+            undefined_global_diags.is_empty(),
+            "Schema should be suppressed via SCHEMA alias, got: {undefined_global_diags:?}"
         );
     }
 }

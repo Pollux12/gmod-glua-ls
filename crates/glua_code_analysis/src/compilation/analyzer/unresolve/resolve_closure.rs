@@ -291,7 +291,17 @@ fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
         "GAMEMODE".to_string(),
         "SANDBOX".to_string(),
         "PLUGIN".to_string(),
+        "SCHEMA".to_string(),
     ];
+    // Add any configured hook-owner globals and aliases
+    for configured_name in db.get_emmyrc().gmod.scripted_owners.hook_owner_names() {
+        if !names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&configured_name))
+        {
+            names.push(configured_name);
+        }
+    }
     for configured_prefix in &db.get_emmyrc().gmod.hook_mappings.method_prefixes {
         let normalized = configured_prefix
             .trim()

@@ -493,7 +493,7 @@ fn extend_gmod_hook_semantic_decls(
         return;
     };
 
-    let fallback_owner_names = gmod_hook_owner_fallbacks(owner_type_decl_id.get_simple_name());
+    let fallback_owner_names = gmod_hook_owner_fallbacks(db, owner_type_decl_id.get_simple_name());
     if fallback_owner_names.is_empty() {
         return;
     }
@@ -512,7 +512,7 @@ fn extend_gmod_hook_semantic_decls(
     );
 
     for fallback_owner_name in fallback_owner_names {
-        let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
+        let fallback_type = LuaType::Ref(LuaTypeDeclId::global(&fallback_owner_name));
         let member_infos = match trigger_position {
             Some(trigger_position) => builder.semantic_model.get_member_info_with_key_at_offset(
                 &fallback_type,
@@ -683,15 +683,31 @@ fn extend_gmod_hook_same_owner_semantic_decls(
     }
 }
 
-fn gmod_hook_owner_fallbacks(owner_name: &str) -> &'static [&'static str] {
+fn gmod_hook_owner_fallbacks(db: &DbIndex, owner_name: &str) -> Vec<String> {
+    // Check configured scriptedOwners entries first
+    if let Some(configured) = db
+        .get_emmyrc()
+        .gmod
+        .scripted_owners
+        .hook_owner_fallbacks_configured(owner_name)
+    {
+        return configured;
+    }
+
+    // Built-in defaults for GM/GAMEMODE/SANDBOX/PLUGIN
     if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
-        &["SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
-        &["GM", "GAMEMODE", "SANDBOX"]
+        vec!["SANDBOX".to_string()]
+    } else if owner_name.eq_ignore_ascii_case("PLUGIN") || owner_name.eq_ignore_ascii_case("SCHEMA")
+    {
+        vec![
+            "GM".to_string(),
+            "GAMEMODE".to_string(),
+            "SANDBOX".to_string(),
+        ]
     } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
-        &["GM", "GAMEMODE"]
+        vec!["GM".to_string(), "GAMEMODE".to_string()]
     } else {
-        &[]
+        vec![]
     }
 }
 
