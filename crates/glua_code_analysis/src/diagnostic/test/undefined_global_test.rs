@@ -510,4 +510,136 @@ mod test {
             "TestPanel"
         ));
     }
+    #[gtest]
+    fn test_undefined_global_suppressed_in_assignment_rhs() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"mysqlOO = mysqloo"#,
+            "mysqloo",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_suppressed_in_local_assignment_rhs() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"local x = mysqloo"#,
+            "mysqloo",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_suppressed_in_or_fallback() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"mysqlOO = mysqloo or {}"#,
+            "mysqloo",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_suppressed_in_or_chain_both_undefined() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"local x = mysqloo or tmysql"#,
+            "mysqloo",
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"local x = mysqloo or tmysql"#,
+            "tmysql",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_suppressed_in_paren_wrapped_or() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"a = (mysqloo) or {}"#,
+            "mysqloo",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_still_reported_for_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"mysqloo()"#,
+            "mysqloo",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_still_reported_for_index() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"mysqloo.connect"#,
+            "mysqloo",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_still_reported_for_index_in_assignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"a = mysqloo.connect"#,
+            "mysqloo",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_still_reported_for_or_result_indexed() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"a = (mysqloo or tmysql).connect"#,
+            "mysqloo",
+        ));
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"a = (mysqloo or tmysql).connect"#,
+            "tmysql",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_still_reported_for_call_in_or_rhs() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"a = mysqloo or tmysql.connect()"#,
+            "tmysql",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_still_reported_for_arithmetic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"a = mysqloo + 1"#,
+            "mysqloo",
+        ));
+    }
 }

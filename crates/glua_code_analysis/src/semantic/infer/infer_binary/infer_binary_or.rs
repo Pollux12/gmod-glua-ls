@@ -102,6 +102,13 @@ pub fn special_or_rule(
         }
         LuaExpr::TableExpr(table_expr) => {
             if table_expr.is_empty() {
+                // When left is Unknown (an unresolved global), `x or {}` should
+                // produce `{} | nil` (i.e. `{}?`), not `Any`. Fall through to
+                // the general `infer_binary_expr_or` which handles this correctly.
+                if left_type.is_unknown() {
+                    return None;
+                }
+
                 // Remove nil/false from left type and check if result is table-compatible
                 let left_without_nil = remove_false_or_nil(left_type.clone());
                 if check_type_compact(db, &left_without_nil, &LuaType::Table).is_ok() {
@@ -124,6 +131,12 @@ pub fn special_or_rule(
                 return None;
             }
 
+            // When left is Unknown (an unresolved global), fall through to
+            // general or logic which produces `nil | right_type` (nullable).
+            if left_type.is_unknown() {
+                return None;
+            }
+
             if check_type_compact(db, left_type, right_type).is_ok() {
                 return Some(remove_false_or_nil(left_type.clone()));
             }
@@ -140,6 +153,28 @@ pub fn infer_binary_expr_or(db: &DbIndex, left: LuaType, right: LuaType) -> Infe
         return Ok(left);
     } else if left.is_always_falsy() {
         return Ok(right);
+    }
+
+    // When the left side is Unknown (an unresolved global), the `or` acts as a
+    // nil-guard: if the global is undefined (nil), the right side is used.
+    // In that case the result should be nullable-right, not `Any`.
+    // e.g. `mysqloo or {}` should produce `{} | nil` (i.e. `{}?`), not `Any`.
+    if left.is_unknown() {
+        // Treat the right side as Nil if it is also Unknown (another undefined global)
+        // since reading an undefined global returns nil in Lua.
+        let effective_right = if right.is_unknown() {
+            LuaType::Nil
+        } else {
+            right
+        };
+        return Ok(TypeOps::Union.apply(db, &LuaType::Nil, &effective_right));
+    }
+
+    // Similarly, when the right side is Unknown (an unresolved global), treat it
+    // as Nil for the union, since it would only be nil when reached via `or`.
+    // e.g. `definedGlobal or undefinedGlobal` → `definedGlobal | nil` (nullable)
+    if right.is_unknown() {
+        return Ok(TypeOps::Union.apply(db, &remove_false_or_nil(left), &LuaType::Nil));
     }
 
     Ok(TypeOps::Union.apply(db, &remove_false_or_nil(left), &right))

@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaBlock, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIfStat,
-    LuaIndexKey, LuaLiteralToken, LuaNameExpr, LuaStat, UnaryOperator,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBlock, LuaCallExpr, LuaClosureExpr, LuaExpr,
+    LuaIfStat, LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaStat, UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -19,6 +19,7 @@ impl Checker for UndefinedGlobalChecker {
         let root = semantic_model.get_root().clone();
         let mut use_range_set = HashSet::new();
         let guarded_range_set = calc_guarded_name_expr_ranges(semantic_model);
+        let safe_read_ranges = calc_safe_read_name_expr_ranges(&root);
         calc_name_expr_ref(semantic_model, &mut use_range_set);
         for name_expr in root.descendants::<LuaNameExpr>() {
             check_name_expr(
@@ -26,6 +27,7 @@ impl Checker for UndefinedGlobalChecker {
                 semantic_model,
                 &mut use_range_set,
                 &guarded_range_set,
+                &safe_read_ranges,
                 name_expr,
             );
         }
@@ -445,6 +447,50 @@ fn starts_with_boolean_helper_prefix(name: &str, prefix: &str) -> bool {
     first_char == '_' || first_char.is_ascii_uppercase()
 }
 
+fn calc_safe_read_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<TextRange> {
+    let mut ranges = HashSet::new();
+
+    for assign_stat in root.descendants::<LuaAssignStat>() {
+        let (_, exprs) = assign_stat.get_var_and_expr_list();
+        for expr in exprs {
+            collect_safe_name_exprs_from_value(&expr, &mut ranges);
+        }
+    }
+
+    for local_stat in root.descendants::<LuaLocalStat>() {
+        for expr in local_stat.get_value_exprs() {
+            collect_safe_name_exprs_from_value(&expr, &mut ranges);
+        }
+    }
+
+    ranges
+}
+
+fn collect_safe_name_exprs_from_value(expr: &LuaExpr, ranges: &mut HashSet<TextRange>) {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => {
+            ranges.insert(name_expr.get_range());
+        }
+        LuaExpr::ParenExpr(paren_expr) => {
+            if let Some(inner) = paren_expr.get_expr() {
+                collect_safe_name_exprs_from_value(&inner, ranges);
+            }
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let is_or = binary_expr
+                .get_op_token()
+                .is_some_and(|op| op.get_op() == BinaryOperator::OpOr);
+            if is_or {
+                if let Some((left, right)) = binary_expr.get_exprs() {
+                    collect_safe_name_exprs_from_value(&left, ranges);
+                    collect_safe_name_exprs_from_value(&right, ranges);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn calc_name_expr_ref(
     semantic_model: &SemanticModel,
     use_range_set: &mut HashSet<TextRange>,
@@ -466,6 +512,7 @@ fn check_name_expr(
     semantic_model: &SemanticModel,
     use_range_set: &mut HashSet<TextRange>,
     guarded_range_set: &HashSet<TextRange>,
+    safe_read_ranges: &HashSet<TextRange>,
     name_expr: LuaNameExpr,
 ) -> Option<()> {
     let name_range = name_expr.get_range();
@@ -510,17 +557,26 @@ fn check_name_expr(
         return Some(());
     }
 
+    // Check if name exists as a global
     let module_index = db.get_module_index();
-    if let Some(current_workspace_id) = module_index.get_workspace_id(semantic_model.get_file_id())
+    let is_valid_global = if let Some(current_workspace_id) =
+        module_index.get_workspace_id(semantic_model.get_file_id())
     {
-        if db.get_global_index().is_exist_global_decl_in_workspace(
+        db.get_global_index().is_exist_global_decl_in_workspace(
             &name_text,
             module_index,
             current_workspace_id,
-        ) {
-            return Some(());
-        }
-    } else if db.get_global_index().is_exist_global_decl(&name_text) {
+        )
+    } else {
+        db.get_global_index().is_exist_global_decl(&name_text)
+    };
+
+    if is_valid_global {
+        // Name exists as global - skip diagnostic
+        return Some(());
+    }
+
+    if name_text == "self" && check_self_name(semantic_model, name_expr.clone()).is_some() {
         return Some(());
     }
 
@@ -530,10 +586,6 @@ fn check_name_expr(
             .get_scoped_class_info(&semantic_model.get_file_id())
             .is_some_and(|info| info.global_name == name_text.as_str())
     {
-        return Some(());
-    }
-
-    if name_text == "self" && check_self_name(semantic_model, name_expr.clone()).is_some() {
         return Some(());
     }
 
@@ -547,7 +599,20 @@ fn check_name_expr(
         return Some(());
     }
 
-    if is_narrowed_unresolved_global_valid(semantic_model, &name_expr) {
+    let in_legacy_module = semantic_model
+        .get_db()
+        .get_module_index()
+        .get_legacy_module_env_at(semantic_model.get_file_id(), name_expr.get_position())
+        .is_some();
+
+    // In legacy modules with seeall, the type inference may resolve names through
+    // the _G.__index chain and return a non-unknown type even for truly undefined
+    // globals. Only trust the narrowing check outside legacy modules.
+    if !in_legacy_module && is_narrowed_unresolved_global_valid(semantic_model, &name_expr) {
+        return Some(());
+    }
+
+    if !in_legacy_module && safe_read_ranges.contains(&name_range) {
         return Some(());
     }
 
