@@ -8,13 +8,15 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 GLuaLS ships without bundled GMod API definitions — instead, the VSCode extension automatically downloads the latest annotations generated from the Garry's Mod wiki. This means your API definitions stay current without waiting for extension updates.
 
+For framework plugin detection/presets (DarkRP, Helix, etc), see [Framework plugins](/configuration/framework-plugins).
+
 ---
 
 ## How it works
 
 On first launch and periodically thereafter, the extension:
 
-1. Checks the remote metadata for the [gluals-annotations](https://github.com/Pollux12/gmod-luals-addon/tree/gluals-annotations) branch
+1. Checks the remote metadata for the [gluals-annotations](https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations) branch
 2. If the annotations are outdated or missing, downloads and extracts the latest ZIP
 3. Points the language server at the annotations path automatically
 

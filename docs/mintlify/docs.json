@@ -145,7 +145,8 @@
               "configuration/hints-and-hover",
               "configuration/workspace",
               "configuration/runtime",
-              "configuration/annotations-management"
+              "configuration/annotations-management",
+              "configuration/framework-plugins"
             ]
           }
         ]

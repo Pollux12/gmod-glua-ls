@@ -17,6 +17,7 @@ pub struct ClientConfig {
     pub partial_emmyrcs: Option<Vec<Value>>,
     pub gmod_annotations_path: Option<String>,
     pub gamemode_base_libraries: Vec<String>,
+    pub gmod_plugin_library_paths: Vec<String>,
 }
 
 pub async fn get_client_config(
@@ -32,6 +33,7 @@ pub async fn get_client_config(
         partial_emmyrcs: None,
         gmod_annotations_path: None,
         gamemode_base_libraries: Vec::new(),
+        gmod_plugin_library_paths: Vec::new(),
     };
     match client_id {
         ClientId::VSCode => {

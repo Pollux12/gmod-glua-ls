@@ -439,6 +439,9 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
     // Inject GMod annotations path if provided and not explicitly disabled
     inject_gmod_annotations(&client_config, &mut emmyrc);
 
+    // Inject plugin libraries selected by the VSCode extension.
+    inject_gmod_plugin_libraries(&client_config, &mut emmyrc);
+
     // Inject gamemode base libraries if detected and not explicitly disabled
     inject_gamemode_base_libraries(&client_config, &mut emmyrc);
 
@@ -497,6 +500,7 @@ fn pre_process_emmyrc_for_all_roots(
         );
         merge_client_config(client_config, &mut workspace_emmyrc);
         inject_gmod_annotations(client_config, &mut workspace_emmyrc);
+        inject_gmod_plugin_libraries(client_config, &mut workspace_emmyrc);
         inject_gamemode_base_libraries(client_config, &mut workspace_emmyrc);
         workspace_emmyrc.pre_process_emmyrc(workspace_root);
         workspace_configs.push((workspace_root.clone(), workspace_emmyrc, has_local_config));
@@ -868,6 +872,43 @@ fn inject_gamemode_base_libraries(client_config: &ClientConfig, emmyrc: &mut Emm
     }
 }
 
+/// Inject plugin annotation libraries selected by the VSCode extension.
+fn inject_gmod_plugin_libraries(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
+    if matches!(emmyrc.gmod.auto_load_annotations, Some(false)) {
+        log::info!("GMod plugin annotations auto-load explicitly disabled in config");
+        return;
+    }
+
+    if client_config.gmod_plugin_library_paths.is_empty() {
+        return;
+    }
+
+    use glua_code_analysis::EmmyLibraryItem;
+    for lib_path in &client_config.gmod_plugin_library_paths {
+        if emmyrc
+            .workspace
+            .library
+            .iter()
+            .any(|item| item.get_path() == lib_path)
+        {
+            log::info!(
+                "GMod plugin library already exists in workspace library: {}",
+                lib_path
+            );
+            continue;
+        }
+
+        emmyrc
+            .workspace
+            .library
+            .push(EmmyLibraryItem::Path(lib_path.clone()));
+        log::info!(
+            "GMod plugin library added to workspace library: {}",
+            lib_path
+        );
+    }
+}
+
 #[derive(Debug)]
 pub struct ReindexToken {
     cancel_token: CancellationToken,
@@ -997,13 +1038,13 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use glua_code_analysis::{DiagnosticCode, WorkspaceFolder, collect_workspace_files};
+    use glua_code_analysis::{DiagnosticCode, Emmyrc, WorkspaceFolder, collect_workspace_files};
 
     use crate::handlers::ClientConfig;
 
     use super::{
         WorkspaceFileMatcher, collect_config_files_from_dir, collect_config_roots, dedup_paths,
-        load_emmy_config, push_configs_from_preferred_workspace_root,
+        inject_gmod_plugin_libraries, load_emmy_config, push_configs_from_preferred_workspace_root,
     };
 
     fn create_temp_dir() -> PathBuf {
@@ -1216,6 +1257,46 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    #[test]
+    fn test_inject_gmod_plugin_libraries_respects_auto_load_annotations_disabled() {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.auto_load_annotations = Some(false);
+
+        let mut client_config = ClientConfig::default();
+        client_config.gmod_plugin_library_paths = vec!["/plugins/darkrp".to_string()];
+
+        inject_gmod_plugin_libraries(&client_config, &mut emmyrc);
+        assert!(!emmyrc
+            .workspace
+            .library
+            .iter()
+            .any(|item| item.get_path() == "/plugins/darkrp"));
+    }
+
+    #[test]
+    fn test_inject_gmod_plugin_libraries_appends_unique_paths() {
+        let mut emmyrc = Emmyrc::default();
+        let mut client_config = ClientConfig::default();
+        client_config.gmod_plugin_library_paths = vec![
+            "/plugins/darkrp".to_string(),
+            "/plugins/darkrp".to_string(),
+            "/plugins/helix".to_string(),
+        ];
+
+        inject_gmod_plugin_libraries(&client_config, &mut emmyrc);
+
+        assert!(emmyrc
+            .workspace
+            .library
+            .iter()
+            .any(|item| item.get_path() == "/plugins/darkrp"));
+        assert!(emmyrc
+            .workspace
+            .library
+            .iter()
+            .any(|item| item.get_path() == "/plugins/helix"));
     }
 
     #[test]

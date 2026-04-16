@@ -46,6 +46,11 @@ pub struct EmmyrcGmod {
     pub scripted_class_scopes: EmmyrcGmodScriptedClassScopes,
     #[serde(default)]
     pub hook_mappings: EmmyrcGmodHookMappings,
+    /// Ordered plugin ids persisted by editor integrations.
+    /// The language server remains plugin-agnostic and consumes resolved config only.
+    #[serde(default)]
+    #[schemars(extend("x-gluals-editor" = "pluginList"))]
+    pub plugins: Vec<String>,
     #[serde(default)]
     pub network: EmmyrcGmodNetwork,
     #[serde(default)]
@@ -272,6 +277,7 @@ impl Default for EmmyrcGmod {
             default_realm: EmmyrcGmodRealm::default(),
             scripted_class_scopes: EmmyrcGmodScriptedClassScopes::default(),
             hook_mappings: EmmyrcGmodHookMappings::default(),
+            plugins: Vec::new(),
             network: EmmyrcGmodNetwork::default(),
             vgui: EmmyrcGmodVgui::default(),
             outline: EmmyrcGmodOutline::default(),
