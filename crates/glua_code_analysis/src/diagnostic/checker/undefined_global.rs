@@ -6,20 +6,27 @@ use glua_parser::{
 };
 use rowan::{TextRange, TextSize};
 
-use crate::{DiagnosticCode, LuaSignatureId, SemanticModel};
+use crate::{
+    DiagnosticCode, GlobalId, LuaDeclId, LuaMemberKey, LuaMemberOwner, LuaSignatureId,
+    SemanticModel,
+};
 
 use super::{Checker, DiagnosticContext};
 
 pub struct UndefinedGlobalChecker;
 
 impl Checker for UndefinedGlobalChecker {
-    const CODES: &[DiagnosticCode] = &[DiagnosticCode::UndefinedGlobal];
+    const CODES: &[DiagnosticCode] = &[
+        DiagnosticCode::UndefinedGlobal,
+        DiagnosticCode::UndefinedGlobalArgument,
+    ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
         let mut use_range_set = HashSet::new();
         let guarded_range_set = calc_guarded_name_expr_ranges(semantic_model);
         let safe_read_ranges = calc_safe_read_name_expr_ranges(&root);
+        let direct_call_arg_name_ranges = calc_direct_call_arg_name_expr_ranges(&root);
         calc_name_expr_ref(semantic_model, &mut use_range_set);
         for name_expr in root.descendants::<LuaNameExpr>() {
             check_name_expr(
@@ -28,6 +35,7 @@ impl Checker for UndefinedGlobalChecker {
                 &mut use_range_set,
                 &guarded_range_set,
                 &safe_read_ranges,
+                &direct_call_arg_name_ranges,
                 name_expr,
             );
         }
@@ -491,6 +499,32 @@ fn collect_safe_name_exprs_from_value(expr: &LuaExpr, ranges: &mut HashSet<TextR
     }
 }
 
+fn calc_direct_call_arg_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<TextRange> {
+    let mut ranges = HashSet::new();
+
+    for call_expr in root.descendants::<LuaCallExpr>() {
+        let Some(args_list) = call_expr.get_args_list() else {
+            continue;
+        };
+
+        for arg_expr in args_list.get_args() {
+            if let Some(name_expr) = extract_direct_name_expr(&arg_expr) {
+                ranges.insert(name_expr.get_range());
+            }
+        }
+    }
+
+    ranges
+}
+
+fn extract_direct_name_expr(expr: &LuaExpr) -> Option<LuaNameExpr> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => Some(name_expr.clone()),
+        LuaExpr::ParenExpr(paren_expr) => extract_direct_name_expr(&paren_expr.get_expr()?),
+        _ => None,
+    }
+}
+
 fn calc_name_expr_ref(
     semantic_model: &SemanticModel,
     use_range_set: &mut HashSet<TextRange>,
@@ -513,6 +547,7 @@ fn check_name_expr(
     use_range_set: &mut HashSet<TextRange>,
     guarded_range_set: &HashSet<TextRange>,
     safe_read_ranges: &HashSet<TextRange>,
+    direct_call_arg_name_ranges: &HashSet<TextRange>,
     name_expr: LuaNameExpr,
 ) -> Option<()> {
     let name_range = name_expr.get_range();
@@ -549,7 +584,7 @@ fn check_name_expr(
 
     if is_legacy_module_without_seeall_after_activation(semantic_model, &name_expr) {
         context.add_diagnostic(
-            DiagnosticCode::UndefinedGlobal,
+            undefined_global_diagnostic_code(name_range, direct_call_arg_name_ranges),
             name_range,
             t!("undefined global variable: %{name}", name = name_text).to_string(),
             None,
@@ -617,13 +652,24 @@ fn check_name_expr(
     }
 
     context.add_diagnostic(
-        DiagnosticCode::UndefinedGlobal,
+        undefined_global_diagnostic_code(name_range, direct_call_arg_name_ranges),
         name_range,
         t!("undefined global variable: %{name}", name = name_text).to_string(),
         None,
     );
 
     Some(())
+}
+
+fn undefined_global_diagnostic_code(
+    name_range: TextRange,
+    direct_call_arg_name_ranges: &HashSet<TextRange>,
+) -> DiagnosticCode {
+    if direct_call_arg_name_ranges.contains(&name_range) {
+        DiagnosticCode::UndefinedGlobalArgument
+    } else {
+        DiagnosticCode::UndefinedGlobal
+    }
 }
 
 fn is_legacy_module_local_name_visible(
@@ -644,7 +690,8 @@ fn is_legacy_module_local_name_visible(
         return true;
     }
 
-    db.get_decl_index()
+    let decl_visible = db
+        .get_decl_index()
         .get_decl_tree(&file_id)
         .is_some_and(|tree| {
             tree.find_local_decl(name, name_expr.get_position())
@@ -660,7 +707,22 @@ fn is_legacy_module_local_name_visible(
                     )
                 })
                 .is_some()
-        })
+        });
+    if decl_visible {
+        return true;
+    }
+
+    let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&module_env.module_path));
+    let key = LuaMemberKey::Name(name.into());
+    let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) else {
+        return false;
+    };
+    let visible_ids =
+        member_item.visible_member_ids_with_realm_at_offset(db, &file_id, name_expr.get_position());
+    visible_ids.into_iter().any(|member_id| {
+        let decl_id = LuaDeclId::new(member_id.file_id, member_id.get_position());
+        db.get_decl_index().get_decl(&decl_id).is_some()
+    })
 }
 
 fn is_legacy_module_without_seeall_after_activation(

@@ -31,6 +31,8 @@ pub enum DiagnosticCode {
     UnusedSelf,
     /// Undefined global
     UndefinedGlobal,
+    /// Undefined global used directly as function argument
+    UndefinedGlobalArgument,
     /// Deprecated
     Deprecated,
     /// Access invisible
@@ -156,6 +158,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::Unused => DiagnosticSeverity::HINT,
         DiagnosticCode::UnusedSelf => DiagnosticSeverity::HINT,
         DiagnosticCode::UndefinedGlobal => DiagnosticSeverity::ERROR,
+        DiagnosticCode::UndefinedGlobalArgument => DiagnosticSeverity::WARNING,
         DiagnosticCode::Deprecated => DiagnosticSeverity::HINT,
         DiagnosticCode::AccessInvisible => DiagnosticSeverity::WARNING,
         DiagnosticCode::DiscardReturns => DiagnosticSeverity::WARNING,
@@ -314,6 +317,19 @@ mod tests {
         assert_that!(
             get_default_severity(DiagnosticCode::GmodUnknownRealm),
             eq(DiagnosticSeverity::HINT)
+        );
+    }
+
+    #[gtest]
+    fn undefined_global_argument_default_severity_and_enable() {
+        let level = LuaLanguageLevel::Lua54;
+        assert_that!(
+            get_default_severity(DiagnosticCode::UndefinedGlobalArgument),
+            eq(DiagnosticSeverity::WARNING)
+        );
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::UndefinedGlobalArgument, level),
+            eq(true)
         );
     }
 }

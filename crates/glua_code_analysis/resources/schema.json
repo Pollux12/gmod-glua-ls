@@ -427,6 +427,11 @@
           "const": "undefined-global"
         },
         {
+          "description": "Undefined global used directly as function argument",
+          "type": "string",
+          "const": "undefined-global-argument"
+        },
+        {
           "description": "Deprecated",
           "type": "string",
           "const": "deprecated"

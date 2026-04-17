@@ -53,6 +53,32 @@ mod test {
         })
     }
 
+    fn has_undefined_global_argument_name(
+        ws: &mut VirtualWorkspace,
+        file_path: &str,
+        content: &str,
+        name: &str,
+    ) -> bool {
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedGlobalArgument);
+        let file_id = ws.def_file(file_path, content);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedGlobalArgument
+                .get_name()
+                .to_string(),
+        ));
+        let message_needled = format!("undefined global variable: {name}");
+
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == code && diagnostic.message.contains(&message_needled)
+        })
+    }
+
     #[test]
     fn test_issue_250() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -212,7 +238,7 @@ mod test {
     fn test_guard_clause_that_implies_falsy_still_reports_undefined_global() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedGlobal,
+            DiagnosticCode::UndefinedGlobalArgument,
             r#"
             if invalidVar then
                 return
@@ -260,7 +286,7 @@ mod test {
     fn test_top_level_not_guard_without_early_return_does_not_suppress_later_use() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedGlobal,
+            DiagnosticCode::UndefinedGlobalArgument,
             r#"
             if not MR then
                 local _ = true
@@ -289,7 +315,7 @@ mod test {
             content,
             "testVarThen",
         ));
-        assert!(has_undefined_global_name(
+        assert!(has_undefined_global_argument_name(
             &mut ws,
             "test.lua",
             content,
@@ -301,7 +327,7 @@ mod test {
     fn test_top_level_guard_clause_not_equal_nil_does_not_suppress_later_use() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedGlobal,
+            DiagnosticCode::UndefinedGlobalArgument,
             r#"
             if MR ~= nil then
                 return
@@ -388,7 +414,7 @@ mod test {
             end
         "#;
 
-        assert!(has_undefined_global_name(
+        assert!(has_undefined_global_argument_name(
             &mut ws,
             "test.lua",
             content,
@@ -406,7 +432,7 @@ mod test {
     fn test_unguarded_undefined_global_still_reports() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedGlobal,
+            DiagnosticCode::UndefinedGlobalArgument,
             r#"
             print(invalidVar)
             "#
@@ -640,6 +666,80 @@ mod test {
             "test.lua",
             r#"a = mysqloo + 1"#,
             "mysqloo",
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_direct_argument_uses_argument_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let content = r#"
+        local function foo(_) end
+        foo(mysqloo)
+        "#;
+
+        assert!(has_diagnostic(
+            &mut ws,
+            "test.lua",
+            content,
+            DiagnosticCode::UndefinedGlobalArgument,
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws, "test.lua", content, "mysqloo"
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_parenthesized_direct_argument_uses_argument_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let content = r#"
+        local function foo(_) end
+        foo((mysqloo))
+        "#;
+
+        assert!(has_diagnostic(
+            &mut ws,
+            "test.lua",
+            content,
+            DiagnosticCode::UndefinedGlobalArgument,
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws, "test.lua", content, "mysqloo"
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_nested_argument_keeps_undefined_global_code() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let content = r#"
+        local fallback = 1
+        local function foo(_) end
+        foo(mysqloo or fallback)
+        "#;
+
+        assert!(has_undefined_global_name(
+            &mut ws, "test.lua", content, "mysqloo"
+        ));
+        assert!(!has_diagnostic(
+            &mut ws,
+            "test.lua",
+            content,
+            DiagnosticCode::UndefinedGlobalArgument,
+        ));
+    }
+
+    #[gtest]
+    fn test_undefined_global_call_prefix_is_not_argument_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let content = r#"mysqloo()"#;
+
+        assert!(has_undefined_global_name(
+            &mut ws, "test.lua", content, "mysqloo"
+        ));
+        assert!(!has_diagnostic(
+            &mut ws,
+            "test.lua",
+            content,
+            DiagnosticCode::UndefinedGlobalArgument,
         ));
     }
 }
