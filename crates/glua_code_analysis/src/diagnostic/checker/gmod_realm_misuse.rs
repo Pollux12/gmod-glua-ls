@@ -8,8 +8,8 @@ use glua_parser::{
 use rowan::{NodeOrToken, TextRange, TextSize};
 
 use crate::{
-    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaMemberKey, LuaSemanticDeclId,
-    LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
+    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaMemberKey, LuaMemberOwner,
+    LuaSemanticDeclId, LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -361,16 +361,18 @@ fn resolve_member_candidate_realms(
         && let Some(member_key) = semantic_model.get_member_key(&index_key)
         && let Some(owner_expr) = index_expr.get_prefix_expr()
         && let Ok(owner_type) = semantic_model.infer_expr(owner_expr)
-        && let Some(member_infos) =
-            semantic_model.get_member_info_with_key(&owner_type, member_key, true)
     {
-        for member_info in member_infos {
+        // For realm diagnostics we need ALL candidate declarations across
+        // every workspace priority tier. The normal member-resolution path
+        // `get_member_info_with_key` returns only realm-compatible members.
+        let all_member_ids = collect_all_member_ids_for_type_key(
+            semantic_model, &owner_type, &member_key,
+        );
+        for member_id in all_member_ids {
             if context.is_cancelled() {
                 return Some(realms);
             }
-            let Some(property_owner_id) = member_info.property_owner_id else {
-                continue;
-            };
+            let property_owner_id = LuaSemanticDeclId::Member(member_id);
             if let Some(realm) = resolve_decl_realm(
                 context,
                 semantic_model,
@@ -497,6 +499,58 @@ fn resolve_annotated_gm_method_realms(
         .get(&target_method_name)
         .cloned()
         .unwrap_or_default()
+}
+
+/// Collect ALL member IDs for a given type and key, bypassing the
+/// workspace-priority-tier and realm-compatibility filtering that
+/// `get_member_info_with_key` applies.
+fn collect_all_member_ids_for_type_key(
+    semantic_model: &SemanticModel,
+    owner_type: &LuaType,
+    member_key: &LuaMemberKey,
+) -> Vec<crate::LuaMemberId> {
+    let db = semantic_model.get_db();
+    let member_index = db.get_member_index();
+
+    // Resolve the LuaMemberOwner from the type.
+    let owners = owner_type_to_member_owners(owner_type);
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for owner in owners {
+        if let Some(member_item) = member_index.get_member_item(&owner, member_key) {
+            for member_id in member_item.get_member_ids() {
+                if seen.insert(member_id) {
+                    result.push(member_id);
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Convert a `LuaType` into one or more `LuaMemberOwner` values to look up
+/// members in the index.  This mirrors the owner-resolution logic in
+/// `find_members_guard` and `member_owner_from_type` but returns *all*
+/// applicable owners (not realm filtered etc...)
+fn owner_type_to_member_owners(typ: &LuaType) -> Vec<LuaMemberOwner> {
+    match typ {
+        LuaType::TableConst(id) => vec![LuaMemberOwner::Element(id.clone())],
+        LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
+            vec![LuaMemberOwner::Type(type_decl_id.clone())]
+        }
+        LuaType::Instance(inst) => {
+            let mut owners = Vec::new();
+            if let Some(owner) = owner_type_to_member_owners(inst.get_base()).into_iter().next() {
+                owners.push(owner);
+            } else {
+                owners.push(LuaMemberOwner::Element(inst.get_range().clone()));
+            }
+            owners
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn collect_annotated_gm_method_realms(
