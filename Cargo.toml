@@ -129,3 +129,13 @@ manual_let_else = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 undocumented_unsafe_blocks = "allow"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true

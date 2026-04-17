@@ -1,9 +1,12 @@
-use glua_parser::LuaExpr;
+use glua_parser::{LuaAstNode, LuaExpr};
 
 use crate::{
-    DbIndex, LuaType, LuaUnionType, TypeOps, check_type_compact,
+    DbIndex, LuaInferCache, LuaType, LuaUnionType, TypeOps, check_type_compact,
     db_index::{LuaMemberOwner, LuaTypeCache, LuaTypeDeclId},
-    semantic::infer::{InferResult, narrow::remove_false_or_nil},
+    semantic::{
+        infer::{InferResult, narrow::remove_false_or_nil},
+        resolve_global_decl_id, unwrap_paren_to_name_expr,
+    },
 };
 
 /// Checks if an empty table `{}` can satisfy the given type.
@@ -88,18 +91,37 @@ fn has_required_fields(db: &DbIndex, type_decl_id: &LuaTypeDeclId) -> bool {
 
 pub fn special_or_rule(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     left_type: &LuaType,
     right_type: &LuaType,
     left_expr: LuaExpr,
     right_expr: LuaExpr,
 ) -> Option<LuaType> {
+    if let LuaExpr::CallExpr(call_expr) = &right_expr
+        && call_expr.is_error()
+    {
+        return Some(remove_false_or_nil(left_type.clone()));
+    }
+
+    if is_unresolved_global_unknown_name_expr(db, cache, &left_expr, left_type) {
+        let effective_right =
+            if is_unresolved_global_unknown_name_expr(db, cache, &right_expr, right_type) {
+                LuaType::Nil
+            } else {
+                right_type.clone()
+            };
+        return Some(TypeOps::Union.apply(db, &LuaType::Nil, &effective_right));
+    }
+
+    if is_unresolved_global_unknown_name_expr(db, cache, &right_expr, right_type) {
+        return Some(TypeOps::Union.apply(
+            db,
+            &remove_false_or_nil(left_type.clone()),
+            &LuaType::Nil,
+        ));
+    }
+
     match right_expr {
-        // workaround for x or error('')
-        LuaExpr::CallExpr(call_expr) => {
-            if call_expr.is_error() {
-                return Some(remove_false_or_nil(left_type.clone()));
-            }
-        }
         LuaExpr::TableExpr(table_expr) => {
             if table_expr.is_empty() {
                 // When left is Unknown (an unresolved global), `x or {}` should
@@ -155,27 +177,40 @@ pub fn infer_binary_expr_or(db: &DbIndex, left: LuaType, right: LuaType) -> Infe
         return Ok(right);
     }
 
-    // When the left side is Unknown (an unresolved global), the `or` acts as a
-    // nil-guard: if the global is undefined (nil), the right side is used.
-    // In that case the result should be nullable-right, not `Any`.
-    // e.g. `mysqloo or {}` should produce `{} | nil` (i.e. `{}?`), not `Any`.
-    if left.is_unknown() {
-        // Treat the right side as Nil if it is also Unknown (another undefined global)
-        // since reading an undefined global returns nil in Lua.
-        let effective_right = if right.is_unknown() {
-            LuaType::Nil
-        } else {
-            right
-        };
-        return Ok(TypeOps::Union.apply(db, &LuaType::Nil, &effective_right));
-    }
-
-    // Similarly, when the right side is Unknown (an unresolved global), treat it
-    // as Nil for the union, since it would only be nil when reached via `or`.
-    // e.g. `definedGlobal or undefinedGlobal` → `definedGlobal | nil` (nullable)
-    if right.is_unknown() {
-        return Ok(TypeOps::Union.apply(db, &remove_false_or_nil(left), &LuaType::Nil));
-    }
-
     Ok(TypeOps::Union.apply(db, &remove_false_or_nil(left), &right))
+}
+
+fn is_unresolved_global_unknown_name_expr(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    if !expr_type.is_unknown() {
+        return false;
+    }
+
+    let name_expr = unwrap_paren_to_name_expr(expr);
+    let Some(name_expr) = name_expr else {
+        return false;
+    };
+
+    let Some(name_text) = name_expr.get_name_text() else {
+        return false;
+    };
+
+    let file_id = cache.get_file_id();
+    let name_position = name_expr.get_position();
+    if db
+        .get_decl_index()
+        .get_decl_tree(&file_id)
+        .is_some_and(|tree| {
+            tree.find_local_decl(name_text.as_str(), name_position)
+                .is_some()
+        })
+    {
+        return false;
+    }
+
+    resolve_global_decl_id(db, cache, name_text.as_str(), Some(&name_expr)).is_none()
 }

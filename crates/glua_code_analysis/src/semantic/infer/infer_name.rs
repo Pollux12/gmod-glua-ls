@@ -710,6 +710,14 @@ pub fn infer_global_type(
         return Ok(module_decl_type);
     }
 
+    // A name matching a legacy module path resolves to that module's namespace,
+    // even if a synthetic global decl exists for it (we add one so goto-def
+    // jumps to the `module(...)` call site). Member access like `tc.foo` then
+    // routes through the namespace as expected.
+    if has_legacy_module_namespace_for_file(db, current_file_id, name) {
+        return Ok(LuaType::Namespace(smol_str::SmolStr::new(name).into()));
+    }
+
     let module_index = db.get_module_index();
     let global_index = db.get_global_index();
     let priority_tiers = if let Some(current_workspace_id) =
@@ -722,9 +730,6 @@ pub fn infer_global_type(
         ) {
             Some(tiers) => tiers,
             None => {
-                if has_legacy_module_namespace_for_file(db, current_file_id, name) {
-                    return Ok(LuaType::Namespace(smol_str::SmolStr::new(name).into()));
-                }
                 return Err(InferFailReason::None);
             }
         }
@@ -732,17 +737,13 @@ pub fn infer_global_type(
         vec![match global_index.get_global_decl_ids(name).cloned() {
             Some(decls) => (0, decls),
             None => {
-                if has_legacy_module_namespace_for_file(db, current_file_id, name) {
-                    return Ok(LuaType::Namespace(smol_str::SmolStr::new(name).into()));
-                }
                 return Err(InferFailReason::None);
             }
         }]
     };
 
-    if priority_tiers.is_empty() && has_legacy_module_namespace_for_file(db, current_file_id, name)
-    {
-        return Ok(LuaType::Namespace(smol_str::SmolStr::new(name).into()));
+    if priority_tiers.is_empty() {
+        return Err(InferFailReason::None);
     }
 
     let decl_ids =

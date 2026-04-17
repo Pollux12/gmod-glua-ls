@@ -349,4 +349,85 @@ mod test {
 
         assert_eq!(ty, ws.ty("string?"));
     }
+
+    #[test]
+    fn test_or_with_local_unknown_does_not_coerce_to_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@type unknown
+            local maybe
+            local result = maybe or {}
+            print(result)
+            "#,
+            "result",
+        );
+
+        assert_eq!(ty, ws.ty("any"));
+    }
+
+    #[test]
+    fn test_or_with_unresolved_global_keeps_nullable_fallback_behavior() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            local result = mysqloo or {}
+            print(result) ---@diagnostic disable-line: undefined-global, undefined-global-argument
+            "#,
+            "result",
+        );
+
+        assert!(ty.is_nullable());
+        assert_ne!(ty, ws.ty("any"));
+    }
+
+    #[test]
+    fn test_or_with_rhs_unresolved_global_keeps_nullable_known_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@type string?
+            local known
+            local result = known or unknownGlobal
+            print(result) ---@diagnostic disable-line: undefined-global, undefined-global-argument
+            "#,
+            "result",
+        );
+
+        assert!(ty.is_nullable());
+        assert_ne!(ty, ws.ty("any"));
+    }
+
+    #[test]
+    fn test_or_with_both_unresolved_globals_infers_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            local result = leftUnknown or rightUnknown
+            print(result) ---@diagnostic disable-line: undefined-global, undefined-global-argument
+            "#,
+            "result",
+        );
+
+        assert_eq!(ty, ws.ty("nil"));
+    }
+
+    #[test]
+    fn test_or_with_unresolved_global_and_error_keeps_error_workaround() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            local result = missingGlobal or error("boom")
+            print(result) ---@diagnostic disable-line: undefined-global, undefined-global-argument
+            "#,
+            "result",
+        );
+
+        assert_eq!(ty, ws.ty("any"));
+    }
 }

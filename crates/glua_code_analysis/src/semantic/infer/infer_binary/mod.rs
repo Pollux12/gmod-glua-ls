@@ -31,7 +31,8 @@ pub fn infer_binary_expr(
     // Handle special binary operators first
     match op {
         BinaryOperator::OpOr => {
-            if let Some(ty) = special_or_rule(db, left_type_ref, right_type_ref, left, right) {
+            if let Some(ty) = special_or_rule(db, cache, left_type_ref, right_type_ref, left, right)
+            {
                 return Ok(ty);
             }
         }

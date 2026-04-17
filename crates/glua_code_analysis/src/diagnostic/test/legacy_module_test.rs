@@ -28,6 +28,26 @@ mod test {
         })
     }
 
+    fn has_diagnostic_name(
+        ws: &mut VirtualWorkspace,
+        file_path: &str,
+        content: &str,
+        diagnostic_code: DiagnosticCode,
+        name: &str,
+    ) -> bool {
+        let file_id = ws.def_file(file_path, content);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(diagnostic_code.get_name().to_string()));
+        let message_needled = format!("undefined global variable: {name}");
+
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == code && diagnostic.message.contains(&message_needled)
+        })
+    }
+
     #[test]
     fn legacy_module_seeall_allows_global_fallback() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -121,6 +141,148 @@ mod test {
             !diagnostics.is_empty(),
             "Expected diagnostics for different module, but got none"
         );
+    }
+
+    #[test]
+    fn legacy_module_cross_file_call_keeps_prefix_resolved_and_flags_only_undefined_argument() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "class.lua",
+            r#"
+            module("class", package.seeall)
+            function Create(v)
+                return v
+            end
+            "#,
+        );
+
+        let content = r#"
+            module("class", package.seeall)
+            local _ = Create(MissingArg)
+            "#;
+
+        assert!(has_diagnostic_name(
+            &mut ws,
+            "consumer.lua",
+            content,
+            DiagnosticCode::UndefinedGlobalArgument,
+            "MissingArg",
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "consumer.lua",
+            content,
+            "MissingArg",
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "consumer.lua",
+            content,
+            "Create",
+        ));
+    }
+
+    #[test]
+    fn legacy_module_self_reference_by_module_name_is_not_undefined() {
+        // module("tc", package.seeall) registers `tc` as a global pointing at the
+        // module's environment table. References to `tc` from inside (or outside)
+        // the module must not be reported as undefined globals.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+
+        let content = r#"
+            module("tc", package.seeall)
+            function checkTable() end
+            local _ = tc.checkTable
+        "#;
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "tablecheck.lua",
+            content,
+            "tc",
+        ));
+    }
+
+    #[test]
+    fn legacy_module_self_reference_from_other_file_is_not_undefined() {
+        // External consumers should also see the module's name as a defined global.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "tablecheck.lua",
+            r#"
+            module("tc", package.seeall)
+            function checkTable() end
+            "#,
+        );
+
+        let consumer_content = r#"
+            local _ = tc.checkTable
+        "#;
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "consumer.lua",
+            consumer_content,
+            "tc",
+        ));
+    }
+
+    #[test]
+    fn legacy_module_seeall_safe_read_pattern_is_suppressed() {
+        // Canonical defensive optional-import pattern inside a seeall module:
+        // `local mysqloo = mysqloo` should NOT flag undefined-global because
+        // the read goes through the `_G.__index` fallback at runtime. Only
+        // the self-shadow form is suppressed; unrelated typos still report.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+
+        let content = r#"
+            module("mymod", package.seeall)
+
+            local mysqloo = mysqloo
+        "#;
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "mymod.lua",
+            content,
+            "mysqloo",
+        ));
+    }
+
+    #[test]
+    fn legacy_module_without_seeall_safe_read_pattern_still_reports_undefined() {
+        // Without seeall the bare name cannot reach _G, so even safe-read
+        // patterns must still flag truly-undefined globals.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+
+        let content = r#"
+            module("mymod")
+
+            local mysqloo = mysqloo
+        "#;
+
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "mymod.lua",
+            content,
+            "mysqloo",
+        ));
     }
 
     #[test]

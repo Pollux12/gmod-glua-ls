@@ -403,13 +403,44 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
 
     let remaining_args: Vec<_> = args_iter.collect();
     let seeall = detect_seeall_from_option_args(analyzer, &remaining_args);
-    let activation_position = expr.get_range().end();
+    let call_range = expr.get_range();
+    let activation_position = call_range.end();
 
     analyzer.set_legacy_module_env(LegacyModuleEnv {
-        module_path,
+        module_path: module_path.clone(),
         activation_position,
         seeall,
     });
+
+    // Synthesize a global decl for the module's top-level chain segment so that
+    // references to the module's own name (e.g. `tc` inside `module("tc", ...)`,
+    // or `tc` from any other file) resolve cleanly: no undefined-global
+    // diagnostic, goto-definition jumps to the `module(...)` call, and hover
+    // shows the module table.
+    //
+    // The decl points at the `module(...)` call (not the `"tc"` string literal)
+    // so goto-def lands on the module declaration statement itself — analogous
+    // to a Lua 5.1 module's "definition site". Member goto-def (e.g. on
+    // `tc.checkTable`) is unaffected and continues to resolve to the actual
+    // function definition via the existing namespace member resolver.
+    //
+    // Type inference for these names is special-cased in `infer_global_type` to
+    // return `LuaType::Namespace(module_path)` so member access (e.g. `tc.foo`)
+    // resolves through the legacy module namespace, not through this synthetic
+    // decl's type.
+    if let Some(top_segment) = module_path.split('.').next()
+        && !top_segment.is_empty()
+    {
+        let kind = glua_parser::LuaSyntaxKind::NameExpr.into();
+        let synthetic_decl = LuaDecl::new(
+            top_segment,
+            analyzer.get_file_id(),
+            call_range,
+            LuaDeclExtra::Global { kind },
+            None,
+        );
+        analyzer.add_decl(synthetic_decl);
+    }
 
     Some(())
 }

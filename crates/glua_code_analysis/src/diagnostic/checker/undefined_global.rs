@@ -8,7 +8,7 @@ use rowan::{TextRange, TextSize};
 
 use crate::{
     DiagnosticCode, GlobalId, LuaDeclId, LuaMemberKey, LuaMemberOwner, LuaSignatureId,
-    SemanticModel,
+    SemanticModel, semantic::unwrap_paren_to_name_expr,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -322,7 +322,7 @@ fn collect_truthy_guarded_names(
             // If we're checking `if ctp.Disable then`, it implies `ctp` exists
             let mut names = HashSet::new();
             if let Some(prefix_expr) = index_expr.get_prefix_expr()
-                && let Some(name_expr) = extract_name_expr(&prefix_expr)
+                && let Some(name_expr) = unwrap_paren_to_name_expr(&prefix_expr)
                 && let Some(name_text) = name_expr.get_name_text()
             {
                 condition_guard_ranges.insert(name_expr.get_range());
@@ -336,11 +336,11 @@ fn collect_truthy_guarded_names(
 
 fn name_compared_with_nil(left_expr: &LuaExpr, right_expr: &LuaExpr) -> Option<LuaNameExpr> {
     if is_nil_literal(left_expr) {
-        return extract_name_expr(right_expr);
+        return unwrap_paren_to_name_expr(right_expr);
     }
 
     if is_nil_literal(right_expr) {
-        return extract_name_expr(left_expr);
+        return unwrap_paren_to_name_expr(left_expr);
     }
 
     None
@@ -354,14 +354,6 @@ fn is_nil_literal(expr: &LuaExpr) -> bool {
     matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
 }
 
-fn extract_name_expr(expr: &LuaExpr) -> Option<LuaNameExpr> {
-    match expr {
-        LuaExpr::NameExpr(name_expr) => Some(name_expr.clone()),
-        LuaExpr::ParenExpr(paren_expr) => extract_name_expr(&paren_expr.get_expr()?),
-        _ => None,
-    }
-}
-
 fn guarded_call_target_name(call_expr: &LuaCallExpr) -> Option<LuaNameExpr> {
     let prefix_expr = call_expr.get_prefix_expr()?;
 
@@ -373,7 +365,7 @@ fn guarded_call_target_name(call_expr: &LuaCallExpr) -> Option<LuaNameExpr> {
             }
 
             let first_arg = call_expr.get_args_list()?.get_args().next()?;
-            extract_name_expr(&first_arg)
+            unwrap_paren_to_name_expr(&first_arg)
         }
         LuaExpr::IndexExpr(index_expr) => {
             if !call_expr.is_colon_call() {
@@ -388,7 +380,7 @@ fn guarded_call_target_name(call_expr: &LuaCallExpr) -> Option<LuaNameExpr> {
                 return None;
             }
 
-            extract_name_expr(&index_expr.get_prefix_expr()?)
+            unwrap_paren_to_name_expr(&index_expr.get_prefix_expr()?)
         }
         _ => None,
     }
@@ -634,11 +626,12 @@ fn check_name_expr(
         return Some(());
     }
 
-    let in_legacy_module = semantic_model
+    let legacy_module_env = semantic_model
         .get_db()
         .get_module_index()
-        .get_legacy_module_env_at(semantic_model.get_file_id(), name_expr.get_position())
-        .is_some();
+        .get_legacy_module_env_at(semantic_model.get_file_id(), name_expr.get_position());
+    let in_legacy_module = legacy_module_env.is_some();
+    let in_seeall_module = legacy_module_env.is_some_and(|env| env.seeall);
 
     // In legacy modules with seeall, the type inference may resolve names through
     // the _G.__index chain and return a non-unknown type even for truly undefined
@@ -648,6 +641,18 @@ fn check_name_expr(
     }
 
     if !in_legacy_module && safe_read_ranges.contains(&name_range) {
+        return Some(());
+    }
+
+    // Self-shadowing defensive-import pattern: `local foo = foo` (and the
+    // colon-call equivalent on indexed targets). This is the canonical Lua
+    // idiom for capturing an optional/conditionally-loaded global into a
+    // module-local. Inside a seeall module the RHS read goes through the
+    // `_G.__index` fallback, so flagging it as undefined is noise. Outside
+    // legacy modules it's already covered by `safe_read_ranges` above; this
+    // arm only adds the in-seeall case so we don't regress typo detection
+    // for unrelated `local x = unknown` patterns.
+    if in_seeall_module && is_self_shadowing_local_assignment(&name_expr, &name_text) {
         return Some(());
     }
 
@@ -687,6 +692,15 @@ fn is_legacy_module_local_name_visible(
     };
 
     if matches!(name, "_M" | "_NAME" | "_PACKAGE") {
+        return true;
+    }
+
+    // The module's own name is bound as a global by `module(name, ...)` at runtime
+    // (and chain segments like `foo` in `module("foo.bar", ...)` get tables created
+    // in `_G` as well). We don't synthesize global decls for these, so treat them
+    // as visible here. Cross-file references resolve through the legacy module
+    // namespace check earlier in the pipeline.
+    if is_legacy_module_chain_segment(&module_env.module_path, name) {
         return true;
     }
 
@@ -743,6 +757,49 @@ fn is_legacy_module_without_seeall_after_activation(
             name_expr.get_name_text().as_deref(),
             Some("_M" | "_NAME" | "_PACKAGE")
         )
+        && name_expr
+            .get_name_text()
+            .as_deref()
+            .is_none_or(|name| !is_legacy_module_chain_segment(&module_env.module_path, name))
+}
+
+/// Returns true if `name` is the full module path or any leading dotted-chain segment
+/// of `module_path`. For `module("foo.bar.baz", ...)` the chain segments are
+/// "foo", "foo.bar", "foo.bar.baz" — all are bound as globals at runtime.
+fn is_legacy_module_chain_segment(module_path: &str, name: &str) -> bool {
+    if module_path == name {
+        return true;
+    }
+    module_path
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Detects the canonical defensive-import idiom `local foo = foo`, where the
+/// RHS is the bare-name reference being checked and the matching LHS local
+/// has the same identifier text. Used to suppress undefined-global noise for
+/// optional-import patterns inside seeall legacy modules without weakening
+/// generic typo detection (`local _ = unknown_typo`).
+fn is_self_shadowing_local_assignment(name_expr: &LuaNameExpr, name_text: &str) -> bool {
+    let Some(local_stat) = name_expr.get_parent::<LuaLocalStat>() else {
+        return false;
+    };
+    let value_exprs: Vec<LuaExpr> = local_stat.get_value_exprs().collect();
+    let Some(value_index) = value_exprs.iter().position(|expr| {
+        unwrap_paren_to_name_expr(expr)
+            .map(|n| n.syntax() == name_expr.syntax())
+            .unwrap_or(false)
+    }) else {
+        return false;
+    };
+    let local_names: Vec<_> = local_stat.get_local_name_list().collect();
+    let Some(local_name) = local_names.get(value_index) else {
+        return false;
+    };
+    local_name
+        .get_name_token()
+        .map(|t| t.get_name_text() == name_text)
+        .unwrap_or(false)
 }
 
 fn check_self_name(semantic_model: &SemanticModel, name_expr: LuaNameExpr) -> Option<()> {

@@ -555,6 +555,201 @@ mod test {
         );
     }
 
+    /// Goto-definition on the module name itself (e.g. `tc` inside or outside
+    /// `module("tc", ...)`) must resolve to a real LuaDecl pointing at the
+    /// module() call site. This makes module support first-class: the name
+    /// behaves like a normal global with a definition, not a phantom value.
+    #[test]
+    fn legacy_module_self_name_has_semantic_decl_in_module_file() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        let module_file = ws.def_file(
+            "tc.lua",
+            r#"
+            module("tc", package.seeall)
+
+            function tc.checkTable() end
+
+            local _ = tc
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(module_file)
+            .expect("expected semantic model");
+
+        let token = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter_map(|expr| expr.get_name_token())
+            .find(|t| t.get_name_text() == "tc")
+            .expect("expected 'tc' name token");
+
+        let info = semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("expected semantic info");
+
+        assert!(
+            matches!(info.semantic_decl, Some(LuaSemanticDeclId::LuaDecl(_))),
+            "self-reference to module name must produce a LuaDecl, got {:?}",
+            info.semantic_decl
+        );
+    }
+
+    /// Cross-file goto-definition on the module name must also resolve to a
+    /// LuaDecl at the module() call site (not just a Namespace type with no
+    /// decl).
+    #[test]
+    fn legacy_module_self_name_has_semantic_decl_from_other_file() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "tc.lua",
+            r#"
+            module("tc", package.seeall)
+
+            function tc.checkTable() end
+            "#,
+        );
+        let consumer_file = ws.def_file(
+            "consumer.lua",
+            r#"
+            local t = tc
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(consumer_file)
+            .expect("expected semantic model");
+
+        let token = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter_map(|expr| expr.get_name_token())
+            .find(|t| t.get_name_text() == "tc")
+            .expect("expected 'tc' name token");
+
+        let info = semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("expected semantic info");
+
+        assert!(
+            matches!(info.semantic_decl, Some(LuaSemanticDeclId::LuaDecl(_))),
+            "cross-file reference to module name must produce a LuaDecl, got {:?}",
+            info.semantic_decl
+        );
+    }
+
+    /// Hover on the module name (in-module) must produce the namespace type so
+    /// member access (`tc.foo`) keeps working and `humanize_type` renders
+    /// it as `tc`, not a synthetic global type.
+    #[test]
+    fn legacy_module_self_name_in_module_resolves_to_namespace() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        let module_file = ws.def_file(
+            "tc.lua",
+            r#"
+            module("tc", package.seeall)
+
+            function tc.checkTable() end
+
+            local _ = tc
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(module_file)
+            .expect("expected semantic model");
+
+        let token = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter_map(|expr| expr.get_name_token())
+            .find(|t| t.get_name_text() == "tc")
+            .expect("expected 'tc' name token");
+
+        let info = semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("expected semantic info");
+
+        assert!(
+            matches!(&info.typ, LuaType::Namespace(name) if name.as_str() == "tc"),
+            "self-reference to module name in-module must infer as Namespace(\"tc\"), got {:?}",
+            info.typ
+        );
+    }
+
+    /// Goto-def on the module name itself must land on the `module(...)` call,
+    /// not on the `"tc"` string literal nor on a member function.
+    #[test]
+    fn legacy_module_self_name_goto_def_lands_on_module_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        let module_file = ws.def_file(
+            "tc.lua",
+            r#"module("tc", package.seeall)
+
+function tc.checkTable() end
+
+local _ = tc
+"#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(module_file)
+            .expect("expected semantic model");
+
+        let token = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter_map(|expr| expr.get_name_token())
+            .find(|t| {
+                t.get_name_text() == "tc" && u32::from(t.get_position()) > 11
+            })
+            .expect("expected later 'tc' name token (the local _ = tc one)");
+
+        let info = semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("expected semantic info");
+
+        let Some(LuaSemanticDeclId::LuaDecl(decl_id)) = info.semantic_decl else {
+            panic!("expected LuaDecl, got {:?}", info.semantic_decl);
+        };
+
+        let decl = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_decl_index()
+            .get_decl(&decl_id)
+            .expect("expected decl");
+
+        // The decl range should start at the beginning of the file (module call).
+        assert_eq!(
+            u32::from(decl.get_range().start()),
+            0,
+            "goto-def for module name should land on the module(...) call (offset 0), got {:?}",
+            decl.get_range()
+        );
+    }
+
     // ── Reparse / invalidation regression tests ───────────────────────────
 
     /// Regression: reparsing a legacy-module file must not leave stale alias entries

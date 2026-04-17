@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{
-    LuaCallExpr, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaParseError, LuaSyntaxNode,
-    LuaSyntaxToken, LuaTableExpr,
+    LuaCallExpr, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaNameExpr, LuaParseError,
+    LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr,
 };
 pub use infer::infer_index_expr;
 use infer::{infer_bind_value_type, infer_expr_list_types};
@@ -65,6 +65,17 @@ pub use type_check::{TypeCheckFailReason, TypeCheckResult};
 
 pub use generic::get_keyof_members;
 pub use infer::{DocTypeInferContext, infer_doc_type};
+
+/// Recursively unwrap parenthesised expressions to extract the underlying
+/// `LuaNameExpr`, if any. Returns `None` if the expression (after fully
+/// unwrapping parens) is not a name expression.
+pub(crate) fn unwrap_paren_to_name_expr(expr: &LuaExpr) -> Option<LuaNameExpr> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => Some(name_expr.clone()),
+        LuaExpr::ParenExpr(paren_expr) => unwrap_paren_to_name_expr(&paren_expr.get_expr()?),
+        _ => None,
+    }
+}
 
 #[derive(Debug)]
 pub struct LuaInferCacheCell {
