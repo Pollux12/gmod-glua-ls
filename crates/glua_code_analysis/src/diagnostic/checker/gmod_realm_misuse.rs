@@ -513,7 +513,7 @@ fn collect_all_member_ids_for_type_key(
     let member_index = db.get_member_index();
 
     // Resolve the LuaMemberOwner from the type.
-    let owners = owner_type_to_member_owners(owner_type);
+    let owners = owner_type_to_member_owners(owner_type, db);
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -531,23 +531,68 @@ fn collect_all_member_ids_for_type_key(
 }
 
 /// Convert a `LuaType` into one or more `LuaMemberOwner` values to look up
-/// members in the index.  This mirrors the owner-resolution logic in
-/// `find_members_guard` and `member_owner_from_type` but returns *all*
-/// applicable owners (not realm filtered etc...)
-fn owner_type_to_member_owners(typ: &LuaType) -> Vec<LuaMemberOwner> {
+/// members in the index. Mirrors the owner-resolution intent of
+/// `find_members_guard` / `find_*_members` in `semantic::member` but returns
+/// raw owners (no realm/workspace filtering, no alias/generic instantiation,
+/// no member-info construction). Recursion is bounded by `depth` to guard
+/// against pathological self-referential type graphs.
+fn owner_type_to_member_owners(typ: &LuaType, db: &crate::DbIndex) -> Vec<LuaMemberOwner> {
+    owner_type_to_member_owners_inner(typ, db, 0)
+}
+
+fn owner_type_to_member_owners_inner(
+    typ: &LuaType,
+    db: &crate::DbIndex,
+    depth: u8,
+) -> Vec<LuaMemberOwner> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    let next_depth = depth + 1;
     match typ {
         LuaType::TableConst(id) => vec![LuaMemberOwner::Element(id.clone())],
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
             vec![LuaMemberOwner::Type(type_decl_id.clone())]
         }
+        LuaType::Generic(generic_type) => {
+            vec![LuaMemberOwner::Type(generic_type.get_base_type_id())]
+        }
         LuaType::Instance(inst) => {
             let mut owners = Vec::new();
-            if let Some(owner) = owner_type_to_member_owners(inst.get_base()).into_iter().next() {
-                owners.push(owner);
-            } else {
-                owners.push(LuaMemberOwner::Element(inst.get_range().clone()));
+            owners.push(LuaMemberOwner::Element(inst.get_range().clone()));
+            owners.extend(owner_type_to_member_owners_inner(
+                inst.get_base(),
+                db,
+                next_depth,
+            ));
+            owners
+        }
+        LuaType::TableOf(inner) => owner_type_to_member_owners_inner(inner, db, next_depth),
+        LuaType::Union(union_type) => {
+            let mut owners = Vec::new();
+            for sub in union_type.into_vec() {
+                owners.extend(owner_type_to_member_owners_inner(&sub, db, next_depth));
             }
             owners
+        }
+        LuaType::MultiLineUnion(multi_union) => {
+            owner_type_to_member_owners_inner(&multi_union.to_union(), db, next_depth)
+        }
+        LuaType::Intersection(intersection_type) => {
+            let mut owners = Vec::new();
+            for sub in intersection_type.get_types().iter() {
+                owners.extend(owner_type_to_member_owners_inner(sub, db, next_depth));
+            }
+            owners
+        }
+        LuaType::ModuleRef(file_id) => {
+            if let Some(module_info) = db.get_module_index().get_module(*file_id)
+                && let Some(export_type) = &module_info.export_type
+            {
+                owner_type_to_member_owners_inner(export_type, db, next_depth)
+            } else {
+                Vec::new()
+            }
         }
         _ => Vec::new(),
     }
