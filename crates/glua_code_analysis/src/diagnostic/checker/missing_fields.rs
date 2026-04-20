@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use glua_parser::{LuaAstNode, LuaIndexKey, LuaTableExpr, LuaTableField};
 
-use crate::{DiagnosticCode, LuaMemberOwner, LuaType, LuaTypeCache, LuaTypeDeclId, SemanticModel};
+use crate::{
+    DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaType, LuaTypeCache, LuaTypeDeclId,
+    SemanticModel,
+};
 
 use super::{Checker, DiagnosticContext, humanize_lint_type};
 use itertools::Itertools;
@@ -236,6 +239,12 @@ fn get_required_fields(
         for member in members {
             if context.is_cancelled() {
                 return Some(());
+            }
+            if matches!(
+                member.get_feature(),
+                LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl
+            ) {
+                continue;
             }
             let name = member.get_key().to_path();
             let decl_type = context

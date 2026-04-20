@@ -25,13 +25,15 @@ pub fn get_type_at_index_expr(
     index_expr: LuaIndexExpr,
     condition_flow: InferConditionFlow,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
-    let Some(name_var_ref_id) =
-        get_var_expr_var_ref_id(db, cache, LuaExpr::IndexExpr(index_expr.clone()))
-    else {
-        return Ok(ResultTypeOrContinue::Continue);
-    };
+    // The IndexExpr may not resolve to its own VarRefId — e.g. when the prefix
+    // is an undefined global (`tmysql.Version`), `get_index_expr_var_ref_id`
+    // bails out because it only handles `SelfRef`/`VarRef` prefixes. In that
+    // case we still need to try prefix-based narrowing so that
+    // `if tmysql.Version then` narrows the prefix `tmysql` itself.
+    let name_var_ref_id =
+        get_var_expr_var_ref_id(db, cache, LuaExpr::IndexExpr(index_expr.clone()));
 
-    if name_var_ref_id != *var_ref_id {
+    if name_var_ref_id.as_ref() != Some(var_ref_id) {
         return maybe_field_exist_narrow(
             db,
             tree,
@@ -70,18 +72,36 @@ fn maybe_field_exist_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    let Some(maybe_var_ref_id) = get_var_expr_var_ref_id(db, cache, prefix_expr.clone()) else {
-        // If we cannot find a reference declaration ID, we cannot narrow it
-        return Ok(ResultTypeOrContinue::Continue);
-    };
+    let maybe_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr.clone());
 
-    if maybe_var_ref_id != *var_ref_id {
-        return Ok(ResultTypeOrContinue::Continue);
+    if maybe_var_ref_id.as_ref() != Some(var_ref_id) {
+        // Direct prefix doesn't match the queried var. For an Unknown base in
+        // the truthy branch we still want to narrow the *transitive* leftmost
+        // name (e.g. `if a.b.c then` → `a` is non-nil), so fall through to the
+        // transitive prefix scan below.
+        return maybe_transitive_unknown_prefix_narrow(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            &prefix_expr,
+            condition_flow,
+        );
     }
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
     let Some(candidates) = collect_field_exist_narrow_candidates(db, &left_type) else {
+        // Indexing an Unknown base (e.g. an undefined global like `tmysql.Version`)
+        // implies the base is non-nil/non-false at this point — both branches of
+        // an `if tmysql.X then ... else ... end` only execute if `tmysql.X` was
+        // successfully evaluated, which requires `tmysql` to be non-nil. Narrow
+        // Unknown → Any so subsequent reads aren't reported as `unknown`.
+        if matches!(left_type, LuaType::Unknown) {
+            return Ok(ResultTypeOrContinue::Result(LuaType::Any));
+        }
         return Ok(ResultTypeOrContinue::Continue);
     };
 
@@ -239,4 +259,54 @@ fn is_strict_sub_type_of(db: &DbIndex, candidate: &LuaType, possible_base: &LuaT
 
     candidate_id != base_id
         && crate::semantic::type_check::is_sub_type_of(db, &candidate_id.clone(), base_id)
+}
+
+/// Walk up an index chain looking for the leftmost prefix that resolves to the
+/// queried ar_ref_id. If found, and we are in the truthy branch with the
+/// base type still `Unknown`, narrow it to `Any` — successfully indexing
+/// any link in the chain (e.g. `a.b.c.d`) implies every prefix is non-nil.
+///
+/// We intentionally only widen `Unknown` here. For known base types, walking
+/// up beyond the immediate prefix would require recomputing field-existence
+/// candidates against intermediate IndexExpr types, which the regular path
+/// (maybe_field_exist_narrow) already handles when it actually matches.
+#[allow(clippy::too_many_arguments)]
+fn maybe_transitive_unknown_prefix_narrow(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    prefix_expr: &LuaExpr,
+    _condition_flow: InferConditionFlow,
+) -> Result<ResultTypeOrContinue, InferFailReason> {
+    let mut current = prefix_expr.clone();
+    loop {
+        match current {
+            LuaExpr::IndexExpr(idx) => {
+                let Some(next_prefix) = idx.get_prefix_expr() else {
+                    return Ok(ResultTypeOrContinue::Continue);
+                };
+                current = next_prefix;
+            }
+            LuaExpr::NameExpr(_) => break,
+            _ => return Ok(ResultTypeOrContinue::Continue),
+        }
+    }
+
+    let Some(leftmost_var_ref_id) = get_var_expr_var_ref_id(db, cache, current) else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+
+    if leftmost_var_ref_id != *var_ref_id {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
+
+    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+    let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    if matches!(left_type, LuaType::Unknown) {
+        return Ok(ResultTypeOrContinue::Result(LuaType::Any));
+    }
+    Ok(ResultTypeOrContinue::Continue)
 }

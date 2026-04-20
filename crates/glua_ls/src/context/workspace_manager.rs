@@ -484,12 +484,8 @@ fn pre_process_emmyrc_for_all_roots(
     let mut workspace_configs = Vec::new();
 
     for workspace_root in config_roots {
-        let local_config_files = collect_config_files_from_dir(
-            workspace_root,
-            luarc_file,
-            emmyrc_file,
-            emmyrc_lua_file,
-        );
+        let local_config_files =
+            collect_config_files_from_dir(workspace_root, luarc_file, emmyrc_file, emmyrc_lua_file);
         let has_local_config = !local_config_files.is_empty();
 
         let mut workspace_config_files = global_config_files.to_vec();
@@ -1774,8 +1770,16 @@ mod tests {
             ClientConfig::default(),
         );
 
-        assert!(loaded.workspace_diagnostic_configs.contains_key(&workspace_a));
-        assert!(!loaded.workspace_diagnostic_configs.contains_key(&workspace_b));
+        assert!(
+            loaded
+                .workspace_diagnostic_configs
+                .contains_key(&workspace_a)
+        );
+        assert!(
+            !loaded
+                .workspace_diagnostic_configs
+                .contains_key(&workspace_b)
+        );
         assert!(loaded.workspace_emmyrcs.contains_key(&workspace_a));
         assert!(!loaded.workspace_emmyrcs.contains_key(&workspace_b));
         assert!(loaded.workspace_matchers.contains_key(&workspace_a));

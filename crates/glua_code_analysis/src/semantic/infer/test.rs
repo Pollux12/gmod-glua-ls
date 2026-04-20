@@ -430,4 +430,26 @@ mod test {
 
         assert_eq!(ty, ws.ty("any"));
     }
+
+    /// Regression: assigning an undefined global to a (global / table) target
+    /// should bind the target's type to `nil`, not `unknown`. Hovering the LHS
+    /// used to show `unknown` after the user's MySQLite repro.
+    ///
+    /// `local x = SOME_UNDEF` deliberately keeps the legacy `unknown` binding,
+    /// because the cached-alias narrowing patterns
+    /// (`local IsValid = IsValid`, `local is_fn = isfunction`) rely on the
+    /// local decl staying `unknown` so the flow analyzer can trace the alias
+    /// back to the original global by name. See
+    /// `compilation::analyzer::lua::stats::is_undefined_global_name_expr`.
+    #[test]
+    fn test_assignment_from_undefined_global_binds_nil() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            multistatements = CLIENT_MULTI_STATEMENTS ---@diagnostic disable-line: undefined-global, undefined-global-assignment
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("multistatements"), ws.ty("nil"));
+    }
 }

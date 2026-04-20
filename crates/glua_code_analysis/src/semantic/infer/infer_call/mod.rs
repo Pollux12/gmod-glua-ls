@@ -9,10 +9,9 @@ use super::{
 };
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
 use crate::{
-    CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType,
-    LuaInstanceType, LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature,
-    LuaSignatureId, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, ReturnTypeKind,
-    VariadicType,
+    CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType, LuaInstanceType,
+    LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature, LuaSignatureId,
+    LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, ReturnTypeKind, VariadicType,
 };
 use crate::{
     InferGuardRef,

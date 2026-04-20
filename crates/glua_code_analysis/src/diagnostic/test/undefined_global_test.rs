@@ -53,7 +53,7 @@ mod test {
         })
     }
 
-    fn has_undefined_global_argument_name(
+    fn has_undefined_global_assignment_name(
         ws: &mut VirtualWorkspace,
         file_path: &str,
         content: &str,
@@ -61,14 +61,14 @@ mod test {
     ) -> bool {
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::UndefinedGlobalArgument);
+            .enable_only(DiagnosticCode::UndefinedGlobalAssignment);
         let file_id = ws.def_file(file_path, content);
         let diagnostics = ws
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         let code = Some(NumberOrString::String(
-            DiagnosticCode::UndefinedGlobalArgument
+            DiagnosticCode::UndefinedGlobalAssignment
                 .get_name()
                 .to_string(),
         ));
@@ -238,7 +238,7 @@ mod test {
     fn test_guard_clause_that_implies_falsy_still_reports_undefined_global() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedGlobalArgument,
+            DiagnosticCode::UndefinedGlobalAssignment,
             r#"
             if invalidVar then
                 return
@@ -286,7 +286,7 @@ mod test {
     fn test_top_level_not_guard_without_early_return_does_not_suppress_later_use() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedGlobalArgument,
+            DiagnosticCode::UndefinedGlobalAssignment,
             r#"
             if not MR then
                 local _ = true
@@ -315,7 +315,7 @@ mod test {
             content,
             "testVarThen",
         ));
-        assert!(has_undefined_global_argument_name(
+        assert!(has_undefined_global_assignment_name(
             &mut ws,
             "test.lua",
             content,
@@ -327,7 +327,7 @@ mod test {
     fn test_top_level_guard_clause_not_equal_nil_does_not_suppress_later_use() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedGlobalArgument,
+            DiagnosticCode::UndefinedGlobalAssignment,
             r#"
             if MR ~= nil then
                 return
@@ -414,7 +414,7 @@ mod test {
             end
         "#;
 
-        assert!(has_undefined_global_argument_name(
+        assert!(has_undefined_global_assignment_name(
             &mut ws,
             "test.lua",
             content,
@@ -432,7 +432,7 @@ mod test {
     fn test_unguarded_undefined_global_still_reports() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedGlobalArgument,
+            DiagnosticCode::UndefinedGlobalAssignment,
             r#"
             print(invalidVar)
             "#
@@ -681,7 +681,7 @@ mod test {
             &mut ws,
             "test.lua",
             content,
-            DiagnosticCode::UndefinedGlobalArgument,
+            DiagnosticCode::UndefinedGlobalAssignment,
         ));
         assert!(!has_undefined_global_name(
             &mut ws, "test.lua", content, "mysqloo"
@@ -700,7 +700,7 @@ mod test {
             &mut ws,
             "test.lua",
             content,
-            DiagnosticCode::UndefinedGlobalArgument,
+            DiagnosticCode::UndefinedGlobalAssignment,
         ));
         assert!(!has_undefined_global_name(
             &mut ws, "test.lua", content, "mysqloo"
@@ -723,7 +723,7 @@ mod test {
             &mut ws,
             "test.lua",
             content,
-            DiagnosticCode::UndefinedGlobalArgument,
+            DiagnosticCode::UndefinedGlobalAssignment,
         ));
     }
 
@@ -739,7 +739,303 @@ mod test {
             &mut ws,
             "test.lua",
             content,
-            DiagnosticCode::UndefinedGlobalArgument,
+            DiagnosticCode::UndefinedGlobalAssignment,
+        ));
+    }
+
+    /// Regression: `if not X.Y or X.Y < N then` should guard *all* occurrences of
+    /// the index-expr base `X` inside the condition, not just the first. Previously,
+    /// `collect_truthy_guarded_names` only descended into known logical/equality
+    /// operators, so the second `X.Y` (under `<`) leaked an undefined-global
+    /// diagnostic.
+    #[gtest]
+    fn test_indexed_global_in_comparison_under_or_is_guarded() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if not tmysql.Version or tmysql.Version < 4.1 then
+                print("old")
+            end
+            "#,
+            "tmysql",
+        ));
+    }
+
+    /// Same idea but with `and` chaining different comparison ops.
+    #[gtest]
+    fn test_indexed_global_in_chained_comparisons_is_guarded() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if tmysql.Version >= 4.1 and tmysql.Version < 5.0 then
+                print("ok")
+            end
+            "#,
+            "tmysql",
+        ));
+    }
+
+    /// Same idea, but the indexed access is the operand of an arithmetic op.
+    /// Indexing implies the prefix is non-nil, so we should guard the prefix.
+    #[gtest]
+    fn test_indexed_global_in_arithmetic_is_guarded() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if tmysql.Count + 1 > 0 then
+                print("ok")
+            end
+            "#,
+            "tmysql",
+        ));
+    }
+
+    /// A bare NameExpr under an arithmetic op is NOT a guard - reading
+    /// `mysqloo + 1` doesn't imply `mysqloo` is defined; in Lua it would error.
+    /// We must not over-eagerly suppress diagnostics for naked names.
+    #[gtest]
+    fn test_bare_global_in_arithmetic_is_still_reported() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if mysqloo + 1 > 0 then
+                print("ok")
+            end
+            "#,
+            "mysqloo",
+        ));
+    }
+
+    #[gtest]
+    fn test_nested_indexed_global_in_if_condition_is_guarded() {
+        // `foo.bar.baz` — the outer IndexExpr's prefix is itself an IndexExpr,
+        // so the guard must recurse to reach the deepest base name (`foo`).
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if foo.bar.baz then
+                print("ok")
+            end
+            "#,
+            "foo",
+        ));
+    }
+
+    #[gtest]
+    fn test_nested_indexed_global_in_comparison_is_guarded() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if not foo.bar.baz or foo.bar.baz < 4.1 then
+                print("ok")
+            end
+            "#,
+            "foo",
+        ));
+    }
+
+    #[gtest]
+    fn test_nested_indexed_global_in_method_call_is_guarded() {
+        // `foo.bar:baz()` under a comparison — prefix walk must descend through
+        // the CallExpr and the nested IndexExpr to reach `foo`.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if foo.bar:baz() < 1 then
+                print("ok")
+            end
+            "#,
+            "foo",
+        ));
+    }
+
+    /// Regression: `local x = UNDEF` and `x = UNDEF` are silent uses (the
+    /// nil simply gets bound) so they should be reported as the demoted
+    /// `UndefinedGlobalAssignment` warning, not the strict `UndefinedGlobal`
+    /// error. Previously only direct call args were demoted.
+    #[test]
+    fn assignment_rhs_undefined_global_demoted_to_assignment_code() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_assignment_name(
+            &mut ws,
+            "assign.lua",
+            r#"
+            local _ = UNDEF_LOCAL
+            "#,
+            "UNDEF_LOCAL",
+        ));
+
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_assignment_name(
+            &mut ws,
+            "assign2.lua",
+            r#"
+            multistatements = CLIENT_MULTI_STATEMENTS
+            "#,
+            "CLIENT_MULTI_STATEMENTS",
+        ));
+
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_assignment_name(
+            &mut ws,
+            "tablefield.lua",
+            r#"
+            local t = { k = SOME_UNDEF }
+            "#,
+            "SOME_UNDEF",
+        ));
+    }
+
+    /// Regression: assignment-RHS undefined globals must NOT be reported under
+    /// the strict `UndefinedGlobal` (Error) code — that demotion is the whole
+    /// point of `UndefinedGlobalAssignment`.
+    #[test]
+    fn assignment_rhs_undefined_global_does_not_fire_strict_code() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "assign.lua",
+            r#"
+            local _ = UNDEF_LOCAL
+            x = UNDEF_GLOBAL
+            "#,
+            "UNDEF_LOCAL",
+        ));
+    }
+
+    /// Index/call/arith uses must keep firing the strict `UndefinedGlobal`
+    /// error code — only silent reads (call arg, assignment RHS) get demoted.
+    #[test]
+    fn index_and_call_undefined_global_remain_strict_code() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "index.lua",
+            r#"
+            local _ = UNDEF_X.field
+            "#,
+            "UNDEF_X",
+        ));
+
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "call.lua",
+            r#"
+            UNDEF_FN()
+            "#,
+            "UNDEF_FN",
+        ));
+    }
+
+    /// Regression: the `if X.Y < N then ... else USE(X) end` else-branch must
+    /// also see `X` widened to Any — evaluating `X.Y` in the condition implies
+    /// `X` is non-nil regardless of which branch we take.
+    #[gtest]
+    fn test_indexed_global_in_comparison_guards_false_branch_too() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if tmysql.Version < 4.1 then
+                tmysql.Connect()
+            else
+                tmysql.Other()
+            end
+            "#,
+            "tmysql",
+        ));
+    }
+
+    /// Short-circuit guard: in `if a and tmysql.Version then T else F end`,
+    /// the *else* branch is reached when `a` is falsy, in which case
+    /// `tmysql.Version` was never evaluated. We must NOT widen `tmysql` in
+    /// the else branch, so a use there should still report undefined-global.
+    /// (The true branch is fine — both operands evaluated.)
+    #[gtest]
+    fn test_short_circuit_and_does_not_widen_in_false_branch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "and_true.lua",
+            r#"
+            local a = true
+            if a and tmysql.Version then
+                tmysql.Connect()
+            end
+            "#,
+            "tmysql",
+        ));
+
+        let mut ws2 = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws2,
+            "and_false.lua",
+            r#"
+            local a = true
+            if a and tmysql.Version then
+            else
+                tmysql.Other()
+            end
+            "#,
+            "tmysql",
+        ));
+    }
+
+    /// Regression: table-constructor field values reached via `or`/`and` must
+    /// be demoted to the warning code, not the strict error code. Previously
+    /// only direct names (`{ k = UNDEF }`) were demoted.
+    #[test]
+    fn table_field_or_chain_undefined_global_demoted() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "tablefield_or.lua",
+            r#"
+            local t = { k = ModA or ModB }
+            "#,
+            "ModA",
+        ));
+
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_assignment_name(
+            &mut ws,
+            "tablefield_or2.lua",
+            r#"
+            local t = { k = ModA or ModB }
+            "#,
+            "ModA",
+        ));
+    }
+
+    /// Self-shadow `local foo = foo` outside legacy `module(...,seeall)` files
+    /// is no longer fully silenced — typos surface as the demoted
+    /// `UndefinedGlobalAssignment` warning so users still see them.
+    #[gtest]
+    fn test_self_shadow_outside_legacy_module_demoted_not_silenced() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_assignment_name(
+            &mut ws,
+            "self_shadow_typo.lua",
+            r#"
+            local typoo = typoo
+            "#,
+            "typoo",
         ));
     }
 }

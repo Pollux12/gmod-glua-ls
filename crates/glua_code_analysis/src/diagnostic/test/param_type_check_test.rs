@@ -245,6 +245,63 @@ mod test {
     }
 
     #[test]
+    fn test_method_members_do_not_cause_param_type_mismatch_for_table_literals() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "libraries/sh_cami.lua",
+            r#"
+            CAMI = {}
+
+            ---@class CAMI_PRIVILEGE
+            ---@field Name string
+            ---@field MinAccess "'user'" | "'admin'" | "'superadmin'"
+            ---@field Description string?
+            local CAMI_PRIVILEGE = {}
+
+            function CAMI_PRIVILEGE:HasAccess(actor, target)
+                return true
+            end
+
+            ---@param privilege CAMI_PRIVILEGE
+            function CAMI.RegisterPrivilege(privilege)
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            CAMI.RegisterPrivilege{
+                Name = "DarkRP_SetLicense",
+                MinAccess = "superadmin",
+            }
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_function_fields_still_cause_param_type_mismatch_when_missing() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class CAMI_PRIVILEGE
+            ---@field Name string
+            ---@field HasAccess fun(): boolean
+
+            ---@param privilege CAMI_PRIVILEGE
+            local function register_privilege(privilege)
+            end
+
+            register_privilege({
+                Name = "DarkRP_SetLicense",
+            })
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_135() {
         let mut ws = VirtualWorkspace::new();
 
@@ -1828,6 +1885,107 @@ mod test {
 
                 return EnterVehicle(self, seat)
             end
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_and_or_chain_false_suppression() {
+        let mut ws = VirtualWorkspace::new();
+        // Idiomatic Lua pattern: require(a and "x" or b and "y")
+        // The `and` operator produces `false | "literal"` when left operand may be falsy.
+        // The `false` is an inference artifact that should be stripped for diagnostic purposes.
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+                local moo = true
+                local tmsql = true
+                local preferred = "mysqloo"
+
+                ---@param name string
+                local function require_module(name)
+                end
+
+                require_module(
+                    moo and tmsql and preferred or
+                    moo and "mysqloo" or
+                    tmsql and "tmysql4"
+                )
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_and_or_chain_false_suppression_real_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        // When remaining types after stripping false DON'T match, diagnostic should still fire.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+                local cond = true
+
+                ---@param n integer
+                local function f(n)
+                end
+
+                f(cond and "not_an_integer")
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_and_or_chain_false_suppression_annotated_not_stripped() {
+        let mut ws = VirtualWorkspace::new();
+        // When the expression involves annotated types, the false stripping should NOT apply
+        // because expr_has_inferred_type returns false for annotated operands.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+                ---@type boolean
+                local cond = true
+
+                ---@param s string
+                local function f(s)
+                end
+
+                f(cond and "valid")
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_and_or_simple_false_suppression() {
+        let mut ws = VirtualWorkspace::new();
+        // Simple case: `x and "literal"` should not warn when x is unannotated.
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+                local has_module = true
+
+                ---@param name string
+                local function require_module(name)
+                end
+
+                require_module(has_module and "mymodule")
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_and_or_nil_and_false_combined() {
+        let mut ws = VirtualWorkspace::new();
+        // Both nil and false should be stripped together.
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+                local a = nil
+                local b = true
+
+                ---@param s string
+                local function f(s)
+                end
+
+                f(a and "first" or b and "second")
         "#
         ));
     }

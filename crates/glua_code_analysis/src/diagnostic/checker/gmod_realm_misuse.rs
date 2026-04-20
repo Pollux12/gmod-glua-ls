@@ -365,9 +365,8 @@ fn resolve_member_candidate_realms(
         // For realm diagnostics we need ALL candidate declarations across
         // every workspace priority tier. The normal member-resolution path
         // `get_member_info_with_key` returns only realm-compatible members.
-        let all_member_ids = collect_all_member_ids_for_type_key(
-            semantic_model, &owner_type, &member_key,
-        );
+        let all_member_ids =
+            collect_all_member_ids_for_type_key(semantic_model, &owner_type, &member_key);
         for member_id in all_member_ids {
             if context.is_cancelled() {
                 return Some(realms);

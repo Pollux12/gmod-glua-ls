@@ -31,8 +31,11 @@ pub enum DiagnosticCode {
     UnusedSelf,
     /// Undefined global
     UndefinedGlobal,
-    /// Undefined global used directly as function argument
-    UndefinedGlobalArgument,
+    /// Undefined global passed as a function argument or assigned to a
+    /// variable / table field. These are silent uses (no immediate runtime
+    /// error) so they're warned rather than errored.
+    #[serde(alias = "undefined-global-argument")]
+    UndefinedGlobalAssignment,
     /// Deprecated
     Deprecated,
     /// Access invisible
@@ -158,7 +161,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::Unused => DiagnosticSeverity::HINT,
         DiagnosticCode::UnusedSelf => DiagnosticSeverity::HINT,
         DiagnosticCode::UndefinedGlobal => DiagnosticSeverity::ERROR,
-        DiagnosticCode::UndefinedGlobalArgument => DiagnosticSeverity::WARNING,
+        DiagnosticCode::UndefinedGlobalAssignment => DiagnosticSeverity::WARNING,
         DiagnosticCode::Deprecated => DiagnosticSeverity::HINT,
         DiagnosticCode::AccessInvisible => DiagnosticSeverity::WARNING,
         DiagnosticCode::DiscardReturns => DiagnosticSeverity::WARNING,
@@ -229,6 +232,7 @@ impl DiagnosticCode {
         match name {
             "gmod-realm-misuse" => DiagnosticCode::GmodRealmMismatch,
             "gmod-realm-misuse-risky" => DiagnosticCode::GmodRealmMismatchHeuristic,
+            "undefined-global-argument" => DiagnosticCode::UndefinedGlobalAssignment,
             _ => name.parse().unwrap_or(DiagnosticCode::None),
         }
     }
@@ -321,15 +325,25 @@ mod tests {
     }
 
     #[gtest]
-    fn undefined_global_argument_default_severity_and_enable() {
+    fn undefined_global_assignment_default_severity_and_enable() {
         let level = LuaLanguageLevel::Lua54;
         assert_that!(
-            get_default_severity(DiagnosticCode::UndefinedGlobalArgument),
+            get_default_severity(DiagnosticCode::UndefinedGlobalAssignment),
             eq(DiagnosticSeverity::WARNING)
         );
         assert_that!(
-            is_code_default_enable(&DiagnosticCode::UndefinedGlobalArgument, level),
+            is_code_default_enable(&DiagnosticCode::UndefinedGlobalAssignment, level),
             eq(true)
+        );
+    }
+
+    #[gtest]
+    fn legacy_undefined_global_argument_alias_parses() {
+        // Backwards compat: configs / `---@diagnostic disable: ...` pragmas
+        // that referenced the old name keep working.
+        assert_eq!(
+            DiagnosticCode::from_name_or_legacy("undefined-global-argument"),
+            DiagnosticCode::UndefinedGlobalAssignment
         );
     }
 }

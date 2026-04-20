@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBlock, LuaCallExpr, LuaClosureExpr, LuaExpr,
-    LuaIfStat, LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaStat, UnaryOperator,
+    LuaIfStat, LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaStat, LuaTableField,
+    UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -18,15 +19,21 @@ pub struct UndefinedGlobalChecker;
 impl Checker for UndefinedGlobalChecker {
     const CODES: &[DiagnosticCode] = &[
         DiagnosticCode::UndefinedGlobal,
-        DiagnosticCode::UndefinedGlobalArgument,
+        DiagnosticCode::UndefinedGlobalAssignment,
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
         let mut use_range_set = HashSet::new();
         let guarded_range_set = calc_guarded_name_expr_ranges(semantic_model);
-        let safe_read_ranges = calc_safe_read_name_expr_ranges(&root);
-        let direct_call_arg_name_ranges = calc_direct_call_arg_name_expr_ranges(&root);
+        // Positions where an undefined-global read is "silent" (the read itself
+        // can't crash; the resulting nil just propagates). We demote these from
+        // `UndefinedGlobal` (Error) to `UndefinedGlobalAssignment` (Warning):
+        //   * direct argument of a call:  `f(UNDEF)`
+        //   * RHS of an assignment:        `x = UNDEF`, `local x = UNDEF`,
+        //                                   `t.x = UNDEF`, `{ k = UNDEF }`
+        //   * names reached through `or`/`and`/parens in those positions
+        let silent_use_ranges = calc_silent_use_name_expr_ranges(&root);
         calc_name_expr_ref(semantic_model, &mut use_range_set);
         for name_expr in root.descendants::<LuaNameExpr>() {
             check_name_expr(
@@ -34,8 +41,7 @@ impl Checker for UndefinedGlobalChecker {
                 semantic_model,
                 &mut use_range_set,
                 &guarded_range_set,
-                &safe_read_ranges,
-                &direct_call_arg_name_ranges,
+                &silent_use_ranges,
                 name_expr,
             );
         }
@@ -304,7 +310,19 @@ fn collect_truthy_guarded_names(
                     }
                     HashSet::new()
                 }
-                _ => HashSet::new(),
+                // Comparison / arithmetic / bitwise operators do not produce
+                // truthy names (e.g. `x.y < 4` doesn't make `x.y` a truthy
+                // *name* the way `x` or `x.y` alone does), but operands that
+                // *index* a global still imply the index base is non-nil
+                // (otherwise the runtime would error). Descend purely for the
+                // side-effect of registering those bases in `condition_guard_ranges`.
+                _ => {
+                    let _ =
+                        collect_condition_guard_side_effects(&left_expr, condition_guard_ranges);
+                    let _ =
+                        collect_condition_guard_side_effects(&right_expr, condition_guard_ranges);
+                    HashSet::new()
+                }
             }
         }
         LuaExpr::CallExpr(call_expr) => {
@@ -319,14 +337,19 @@ fn collect_truthy_guarded_names(
         }
         LuaExpr::IndexExpr(index_expr) => {
             // For index expressions like `ctp.Disable`, extract the base name (`ctp`)
-            // If we're checking `if ctp.Disable then`, it implies `ctp` exists
+            // If we're checking `if ctp.Disable then`, it implies `ctp` exists.
+            // For nested chains like `foo.bar.baz`, recurse into the prefix so
+            // the deepest base name (`foo`) is still registered as guarded.
             let mut names = HashSet::new();
-            if let Some(prefix_expr) = index_expr.get_prefix_expr()
-                && let Some(name_expr) = unwrap_paren_to_name_expr(&prefix_expr)
-                && let Some(name_text) = name_expr.get_name_text()
-            {
-                condition_guard_ranges.insert(name_expr.get_range());
-                names.insert(name_text.to_string());
+            if let Some(prefix_expr) = index_expr.get_prefix_expr() {
+                if let Some(name_expr) = unwrap_paren_to_name_expr(&prefix_expr)
+                    && let Some(name_text) = name_expr.get_name_text()
+                {
+                    condition_guard_ranges.insert(name_expr.get_range());
+                    names.insert(name_text.to_string());
+                } else {
+                    collect_condition_guard_side_effects(&prefix_expr, condition_guard_ranges);
+                }
             }
             names
         }
@@ -427,6 +450,67 @@ fn collect_truthy_guarded_names_with_not_chain(
     }
 }
 
+/// Walk an expression purely to register IndexExpr / IsValid-style call bases
+/// in `condition_guard_ranges` without producing any truthy *names*.
+///
+/// Used for binary/unary operands where the operand cannot itself act as a
+/// `if X then` style guard (e.g. operands of `<`, `+`, `..`), but where an
+/// `X.Y` subexpression still implies `X` is non-nil at runtime — so flagging
+/// `X` as `undefined-global` would be noisy.
+fn collect_condition_guard_side_effects(
+    expr: &LuaExpr,
+    condition_guard_ranges: &mut HashSet<TextRange>,
+) {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => {
+            if let Some(inner) = paren_expr.get_expr() {
+                collect_condition_guard_side_effects(&inner, condition_guard_ranges);
+            }
+        }
+        LuaExpr::UnaryExpr(unary_expr) => {
+            if let Some(inner) = unary_expr.get_expr() {
+                collect_condition_guard_side_effects(&inner, condition_guard_ranges);
+            }
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            if let Some((left, right)) = binary_expr.get_exprs() {
+                collect_condition_guard_side_effects(&left, condition_guard_ranges);
+                collect_condition_guard_side_effects(&right, condition_guard_ranges);
+            }
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            if let Some(prefix_expr) = index_expr.get_prefix_expr() {
+                if let Some(name_expr) = unwrap_paren_to_name_expr(&prefix_expr) {
+                    condition_guard_ranges.insert(name_expr.get_range());
+                } else {
+                    // Nested chain like `foo.bar.baz` — keep descending to reach
+                    // the deepest base name.
+                    collect_condition_guard_side_effects(&prefix_expr, condition_guard_ranges);
+                }
+            }
+        }
+        LuaExpr::CallExpr(call_expr) => {
+            // `IsValid(x)` / `x:IsValid()` style helper calls already imply
+            // their target exists — reuse the existing helper so we stay in
+            // sync with the truthy-path detection.
+            if let Some(name_expr) = guarded_call_target_name(call_expr) {
+                condition_guard_ranges.insert(name_expr.get_range());
+            }
+            // Also walk argument expressions — `foo(x.y)` should still guard `x`.
+            if let Some(args_list) = call_expr.get_args_list() {
+                for arg in args_list.get_args() {
+                    collect_condition_guard_side_effects(&arg, condition_guard_ranges);
+                }
+            }
+            // And the prefix itself: `x.y(...)` → `x` is implicit non-nil.
+            if let Some(prefix_expr) = call_expr.get_prefix_expr() {
+                collect_condition_guard_side_effects(&prefix_expr, condition_guard_ranges);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn is_validity_helper_name(helper_name: &str) -> bool {
     VALIDITY_HELPER_NAMES.contains(&helper_name) || looks_like_validity_helper(helper_name)
 }
@@ -447,62 +531,70 @@ fn starts_with_boolean_helper_prefix(name: &str, prefix: &str) -> bool {
     first_char == '_' || first_char.is_ascii_uppercase()
 }
 
-fn calc_safe_read_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<TextRange> {
-    let mut ranges = HashSet::new();
-
-    for assign_stat in root.descendants::<LuaAssignStat>() {
-        let (_, exprs) = assign_stat.get_var_and_expr_list();
-        for expr in exprs {
-            collect_safe_name_exprs_from_value(&expr, &mut ranges);
-        }
-    }
-
-    for local_stat in root.descendants::<LuaLocalStat>() {
-        for expr in local_stat.get_value_exprs() {
-            collect_safe_name_exprs_from_value(&expr, &mut ranges);
-        }
-    }
-
-    ranges
-}
-
-fn collect_safe_name_exprs_from_value(expr: &LuaExpr, ranges: &mut HashSet<TextRange>) {
+fn collect_silent_assignment_rhs_names(expr: &LuaExpr, ranges: &mut HashSet<TextRange>) {
     match expr {
         LuaExpr::NameExpr(name_expr) => {
             ranges.insert(name_expr.get_range());
         }
         LuaExpr::ParenExpr(paren_expr) => {
             if let Some(inner) = paren_expr.get_expr() {
-                collect_safe_name_exprs_from_value(&inner, ranges);
+                collect_silent_assignment_rhs_names(&inner, ranges);
             }
         }
         LuaExpr::BinaryExpr(binary_expr) => {
-            let is_or = binary_expr
-                .get_op_token()
-                .is_some_and(|op| op.get_op() == BinaryOperator::OpOr);
-            if is_or {
-                if let Some((left, right)) = binary_expr.get_exprs() {
-                    collect_safe_name_exprs_from_value(&left, ranges);
-                    collect_safe_name_exprs_from_value(&right, ranges);
-                }
+            // `a or b` and `a and b` chains keep the silent-nil-bind shape:
+            // any branch that resolves to an undefined global just propagates
+            // nil/false rather than indexing or calling. Recurse so each bare
+            // name in the chain participates in the demoted warning.
+            let is_short_circuit = binary_expr.get_op_token().is_some_and(|op| {
+                matches!(op.get_op(), BinaryOperator::OpOr | BinaryOperator::OpAnd)
+            });
+            if is_short_circuit && let Some((left, right)) = binary_expr.get_exprs() {
+                collect_silent_assignment_rhs_names(&left, ranges);
+                collect_silent_assignment_rhs_names(&right, ranges);
             }
         }
         _ => {}
     }
 }
 
-fn calc_direct_call_arg_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<TextRange> {
+fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<TextRange> {
     let mut ranges = HashSet::new();
 
+    // Direct call arguments: `f(UNDEF)` and `f((UNDEF))`.
     for call_expr in root.descendants::<LuaCallExpr>() {
         let Some(args_list) = call_expr.get_args_list() else {
             continue;
         };
-
         for arg_expr in args_list.get_args() {
             if let Some(name_expr) = extract_direct_name_expr(&arg_expr) {
                 ranges.insert(name_expr.get_range());
             }
+        }
+    }
+
+    // RHS of assignments: `x = UNDEF`, `t.x, y = UNDEF, OTHER`, plus names
+    // reached through `or`/`and`/parens (e.g. `local m = ModA or ModB`).
+    for assign_stat in root.descendants::<LuaAssignStat>() {
+        let (_vars, exprs) = assign_stat.get_var_and_expr_list();
+        for expr in &exprs {
+            collect_silent_assignment_rhs_names(expr, &mut ranges);
+        }
+    }
+
+    // RHS of `local` declarations: `local x = UNDEF`, `local x = A or B`.
+    for local_stat in root.descendants::<LuaLocalStat>() {
+        for expr in local_stat.get_value_exprs() {
+            collect_silent_assignment_rhs_names(&expr, &mut ranges);
+        }
+    }
+
+    // Table constructor field values: `{ k = UNDEF }`, `{ k = A or B }`. Same
+    // silent-nil-bind semantics as a regular assignment, so route through the
+    // OR/AND-aware collector rather than only matching bare names.
+    for field in root.descendants::<LuaTableField>() {
+        if let Some(value_expr) = field.get_value_expr() {
+            collect_silent_assignment_rhs_names(&value_expr, &mut ranges);
         }
     }
 
@@ -538,8 +630,7 @@ fn check_name_expr(
     semantic_model: &SemanticModel,
     use_range_set: &mut HashSet<TextRange>,
     guarded_range_set: &HashSet<TextRange>,
-    safe_read_ranges: &HashSet<TextRange>,
-    direct_call_arg_name_ranges: &HashSet<TextRange>,
+    silent_use_ranges: &HashSet<TextRange>,
     name_expr: LuaNameExpr,
 ) -> Option<()> {
     let name_range = name_expr.get_range();
@@ -576,7 +667,7 @@ fn check_name_expr(
 
     if is_legacy_module_without_seeall_after_activation(semantic_model, &name_expr) {
         context.add_diagnostic(
-            undefined_global_diagnostic_code(name_range, direct_call_arg_name_ranges),
+            undefined_global_diagnostic_code(name_range, silent_use_ranges),
             name_range,
             t!("undefined global variable: %{name}", name = name_text).to_string(),
             None,
@@ -626,12 +717,11 @@ fn check_name_expr(
         return Some(());
     }
 
-    let legacy_module_env = semantic_model
+    let in_legacy_module = semantic_model
         .get_db()
         .get_module_index()
-        .get_legacy_module_env_at(semantic_model.get_file_id(), name_expr.get_position());
-    let in_legacy_module = legacy_module_env.is_some();
-    let in_seeall_module = legacy_module_env.is_some_and(|env| env.seeall);
+        .get_legacy_module_env_at(semantic_model.get_file_id(), name_expr.get_position())
+        .is_some();
 
     // In legacy modules with seeall, the type inference may resolve names through
     // the _G.__index chain and return a non-unknown type even for truly undefined
@@ -640,24 +730,24 @@ fn check_name_expr(
         return Some(());
     }
 
-    if !in_legacy_module && safe_read_ranges.contains(&name_range) {
+    // Self-shadowing defensive-import pattern: `local foo = foo` (and the
+    // colon-call equivalent on indexed targets). In legacy `module(..., package.seeall)`
+    // files, `foo` may legitimately resolve through the _G.__index chain at
+    // runtime, so we silence the diagnostic entirely there. Outside legacy
+    // modules we still surface the typo, but demoted to the
+    // `UndefinedGlobalAssignment` warning rather than the strict error.
+    let is_self_shadow = is_self_shadowing_local_assignment(&name_expr, &name_text);
+    if is_self_shadow && in_legacy_module {
         return Some(());
     }
 
-    // Self-shadowing defensive-import pattern: `local foo = foo` (and the
-    // colon-call equivalent on indexed targets). This is the canonical Lua
-    // idiom for capturing an optional/conditionally-loaded global into a
-    // module-local. Inside a seeall module the RHS read goes through the
-    // `_G.__index` fallback, so flagging it as undefined is noise. Outside
-    // legacy modules it's already covered by `safe_read_ranges` above; this
-    // arm only adds the in-seeall case so we don't regress typo detection
-    // for unrelated `local x = unknown` patterns.
-    if in_seeall_module && is_self_shadowing_local_assignment(&name_expr, &name_text) {
-        return Some(());
+    let mut diag_code = undefined_global_diagnostic_code(name_range, silent_use_ranges);
+    if is_self_shadow {
+        diag_code = DiagnosticCode::UndefinedGlobalAssignment;
     }
 
     context.add_diagnostic(
-        undefined_global_diagnostic_code(name_range, direct_call_arg_name_ranges),
+        diag_code,
         name_range,
         t!("undefined global variable: %{name}", name = name_text).to_string(),
         None,
@@ -668,10 +758,10 @@ fn check_name_expr(
 
 fn undefined_global_diagnostic_code(
     name_range: TextRange,
-    direct_call_arg_name_ranges: &HashSet<TextRange>,
+    silent_use_ranges: &HashSet<TextRange>,
 ) -> DiagnosticCode {
-    if direct_call_arg_name_ranges.contains(&name_range) {
-        DiagnosticCode::UndefinedGlobalArgument
+    if silent_use_ranges.contains(&name_range) {
+        DiagnosticCode::UndefinedGlobalAssignment
     } else {
         DiagnosticCode::UndefinedGlobal
     }

@@ -21,13 +21,20 @@ pub use type_check_fail_reason::TypeCheckFailReason;
 use type_check_guard::TypeCheckGuard;
 
 use crate::{
-    LuaUnionType,
+    LuaMemberFeature, LuaUnionType,
     db_index::{DbIndex, LuaType},
     semantic::type_check::type_check_context::TypeCheckContext,
 };
 pub use sub_type::is_sub_type_of;
 pub type TypeCheckResult = Result<(), TypeCheckFailReason>;
 pub use type_check_context::TypeCheckCheckLevel;
+
+fn is_required_structural_member(feature: Option<LuaMemberFeature>) -> bool {
+    !matches!(
+        feature,
+        Some(LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl)
+    )
+}
 
 pub fn check_type_compact(
     db: &DbIndex,

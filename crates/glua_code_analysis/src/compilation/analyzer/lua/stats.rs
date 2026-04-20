@@ -6,8 +6,7 @@ use glua_parser::{
 
 use crate::{
     InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
-    LuaTypeCache,
-    LuaTypeOwner, TypeOps,
+    LuaTypeCache, LuaTypeOwner, TypeOps,
     compilation::analyzer::{
         common::{add_member, bind_type},
         unresolve::{UnResolveDecl, UnResolveMember},
@@ -127,9 +126,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                                     LuaTypeCache::InferType(ret_type.clone()),
                                 );
                             } else {
+                                // Out of variadic values; per Lua semantics
+                                // the missing values are `nil`.
                                 analyzer.db.get_type_index_mut().bind_type(
                                     decl_id.into(),
-                                    LuaTypeCache::InferType(LuaType::Unknown),
+                                    LuaTypeCache::InferType(LuaType::Nil),
                                 );
                             }
                         }
@@ -278,9 +279,20 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         let expr_type = match analyzer.infer_expr(expr) {
             Ok(expr_type) => match expr_type {
                 LuaType::Variadic(multi) => multi.get_type(0)?.clone(),
-                _ => expr_type,
+                other => {
+                    if other.is_unknown() && is_undefined_global_name_expr(analyzer, expr) {
+                        // See note in analyze_local_stat: undefined-global RHS
+                        // is `nil` at runtime, not "unknown".
+                        LuaType::Nil
+                    } else {
+                        other
+                    }
+                }
             },
-            Err(InferFailReason::None) => LuaType::Unknown,
+            // Reading an undefined global yields `nil` at runtime, so the
+            // assignment target's value is `nil` (not unknown). This mirrors
+            // the local-stat path above so hover/inference stays consistent.
+            Err(InferFailReason::None) => LuaType::Nil,
             Err(reason) => {
                 match type_owner {
                     LuaTypeOwner::Decl(decl_id) => {
@@ -957,7 +969,8 @@ fn merge_type_owner_and_unresolve_expr(
 pub fn analyze_func_stat(analyzer: &mut LuaAnalyzer, func_stat: LuaFuncStat) -> Option<()> {
     let closure = func_stat.get_closure()?;
     let func_name = func_stat.get_func_name()?;
-    let signature_type = LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
+    let signature_type =
+        LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
     let type_owner = get_var_owner(analyzer, func_name.clone());
     set_index_expr_owner(analyzer, func_name.clone());
     analyzer
@@ -974,7 +987,8 @@ pub fn analyze_local_func_stat(
 ) -> Option<()> {
     let closure = local_func_stat.get_closure()?;
     let func_name = local_func_stat.get_local_name()?;
-    let signature_type = LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
+    let signature_type =
+        LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
     let position = func_name.get_position();
     let decl_id = LuaDeclId::new(analyzer.file_id, position);
     analyzer.db.get_type_index_mut().bind_type(
@@ -1038,9 +1052,17 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
         let value_type = match analyzer.infer_expr(&value_expr.clone()) {
             Ok(value_type) => match value_type {
                 LuaType::Def(ref_id) => LuaType::Ref(ref_id),
-                _ => value_type,
+                other => {
+                    if other.is_unknown() && is_undefined_global_name_expr(analyzer, &value_expr) {
+                        LuaType::Nil
+                    } else {
+                        other
+                    }
+                }
             },
-            Err(InferFailReason::None) => LuaType::Unknown,
+            // Same rationale as `analyze_assign_stat`: a missing/undefined
+            // RHS evaluates to `nil` at runtime.
+            Err(InferFailReason::None) => LuaType::Nil,
             Err(reason) => {
                 let unresolve = UnResolveMember {
                     file_id: analyzer.file_id,
@@ -1138,4 +1160,45 @@ fn get_delayed_definition_decl_id(
         return None;
     }
     Some(decl_id)
+}
+
+/// Returns `true` when `expr` is a bare `NameExpr` that resolves to neither a
+/// local declaration nor a registered global. Such reads evaluate to `nil` at
+/// runtime, but `infer_expr` reports them as `Unknown` (see
+/// `semantic/infer/mod.rs` where `InferFailReason::None` is collapsed to
+/// `Ok(LuaType::Unknown)`). Callers use this to substitute `Nil` when binding
+/// the LHS of a local/assign/table-field declaration so hover and downstream
+/// inference reflect the runtime value.
+fn is_undefined_global_name_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+    if name == "self" {
+        return false;
+    }
+    let position = name_expr.get_position();
+    let has_local = analyzer
+        .db
+        .get_decl_index()
+        .get_decl_tree(&analyzer.file_id)
+        .and_then(|tree| tree.find_local_decl(&name, position))
+        .is_some();
+    if has_local {
+        return false;
+    }
+    // Workspace-scoped lookup matches the diagnostic's own visibility check
+    // (see `diagnostic/checker/undefined_global.rs`). With multi-workspace
+    // isolation enabled, a global declared in another root must not "rescue"
+    // an undefined read in the current root.
+    let module_index = analyzer.db.get_module_index();
+    let global_index = analyzer.db.get_global_index();
+    let has_global = if let Some(ws_id) = module_index.get_workspace_id(analyzer.file_id) {
+        global_index.is_exist_global_decl_in_workspace(&name, module_index, ws_id)
+    } else {
+        global_index.is_exist_global_decl(&name)
+    };
+    !has_global
 }

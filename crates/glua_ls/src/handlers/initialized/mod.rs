@@ -88,7 +88,9 @@ pub async fn initialized_handler(
                 for lib in arr {
                     if let Some(lib_str) = lib.as_str() {
                         if !lib_str.is_empty() {
-                            client_config.gamemode_base_libraries.push(lib_str.to_string());
+                            client_config
+                                .gamemode_base_libraries
+                                .push(lib_str.to_string());
                         }
                     }
                 }

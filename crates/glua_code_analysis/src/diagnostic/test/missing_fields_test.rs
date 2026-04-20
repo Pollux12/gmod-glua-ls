@@ -293,4 +293,53 @@ foo({})
             "#
         ));
     }
+
+    #[test]
+    fn test_method_members_do_not_count_as_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class CAMI_PRIVILEGE
+            ---@field Name string
+            ---@field MinAccess "'user'" | "'admin'" | "'superadmin'"
+            ---@field Description string?
+            local CAMI_PRIVILEGE = {}
+
+            function CAMI_PRIVILEGE:HasAccess(actor, target)
+                return true
+            end
+
+            ---@param privilege CAMI_PRIVILEGE
+            local function register_privilege(privilege)
+            end
+
+            register_privilege({
+                Name = "DarkRP_SetMoney",
+                MinAccess = "superadmin",
+            })
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_field_function_members_still_count_as_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class CAMI_PRIVILEGE
+            ---@field Name string
+            ---@field HasAccess fun(): boolean
+
+            ---@param privilege CAMI_PRIVILEGE
+            local function register_privilege(privilege)
+            end
+
+            register_privilege({
+                Name = "DarkRP_SetMoney",
+            })
+            "#
+        ));
+    }
 }

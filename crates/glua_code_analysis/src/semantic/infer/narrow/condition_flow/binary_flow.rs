@@ -43,7 +43,7 @@ pub fn get_type_at_binary_expr(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    match op_token.get_op() {
+    let dispatched = match op_token.get_op() {
         BinaryOperator::OpEq => try_get_at_eq_or_neq_expr(
             db,
             tree,
@@ -51,8 +51,8 @@ pub fn get_type_at_binary_expr(
             root,
             var_ref_id,
             flow_node,
-            left_expr,
-            right_expr,
+            left_expr.clone(),
+            right_expr.clone(),
             condition_flow,
         ),
         BinaryOperator::OpNe => try_get_at_eq_or_neq_expr(
@@ -62,8 +62,8 @@ pub fn get_type_at_binary_expr(
             root,
             var_ref_id,
             flow_node,
-            left_expr,
-            right_expr,
+            left_expr.clone(),
+            right_expr.clone(),
             condition_flow.get_negated(),
         ),
         BinaryOperator::OpGt => try_get_at_gt_or_ge_expr(
@@ -73,8 +73,8 @@ pub fn get_type_at_binary_expr(
             root,
             var_ref_id,
             flow_node,
-            left_expr,
-            right_expr,
+            left_expr.clone(),
+            right_expr.clone(),
             condition_flow,
             true,
         ),
@@ -85,8 +85,8 @@ pub fn get_type_at_binary_expr(
             root,
             var_ref_id,
             flow_node,
-            left_expr,
-            right_expr,
+            left_expr.clone(),
+            right_expr.clone(),
             condition_flow,
             false,
         ),
@@ -97,11 +97,93 @@ pub fn get_type_at_binary_expr(
             root,
             var_ref_id,
             flow_node,
-            left_expr,
-            right_expr,
+            left_expr.clone(),
+            right_expr.clone(),
             condition_flow,
         ),
         _ => Ok(ResultTypeOrContinue::Continue),
+    }?;
+
+    if matches!(dispatched, ResultTypeOrContinue::Result(_)) {
+        return Ok(dispatched);
+    }
+
+    // Fallback: any binary expression that successfully evaluates implies its
+    // index-typed operands have non-nil prefixes. For an undefined-global
+    // prefix (Unknown base) this lets us widen to Any so hover/inference don't
+    // keep reporting `unknown` after a pattern like
+    // `if tmysql.Version < 4.1 then ... else ... end` — the *evaluation* of
+    // `tmysql.Version` already requires `tmysql` to be non-nil, regardless of
+    // which branch we end up in. Comparison/equality ops that already matched
+    // a more-specific narrowing return above; we only run this when dispatch
+    // produced Continue.
+    //
+    // Short-circuit operators (OpAnd / OpOr) need branch-aware gating: the
+    // right operand is only guaranteed to evaluate in one branch, so widening
+    // it in the other branch would falsely promote a possibly-nil prefix to
+    // Any. The left operand always evaluates regardless of branch.
+    let widen_right = match op_token.get_op() {
+        BinaryOperator::OpAnd => matches!(condition_flow, InferConditionFlow::TrueCondition),
+        BinaryOperator::OpOr => matches!(condition_flow, InferConditionFlow::FalseCondition),
+        _ => true,
+    };
+    let operands: &[(&LuaExpr, bool)] = &[(&left_expr, true), (&right_expr, widen_right)];
+    for (operand, eligible) in operands {
+        if !*eligible {
+            continue;
+        }
+        if let LuaExpr::IndexExpr(index_expr) = operand {
+            if let Some(result) =
+                try_unknown_prefix_widen(db, tree, cache, root, var_ref_id, flow_node, index_expr)?
+            {
+                return Ok(ResultTypeOrContinue::Result(result));
+            }
+        }
+    }
+
+    Ok(ResultTypeOrContinue::Continue)
+}
+
+/// If `index_expr`'s leftmost-name prefix matches `var_ref_id` and that var's
+/// antecedent type is `Unknown`, return `Any`. Used as a fallback for binary
+/// expressions where evaluating the index implies the prefix is non-nil.
+#[allow(clippy::too_many_arguments)]
+fn try_unknown_prefix_widen(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let mut current = LuaExpr::IndexExpr(index_expr.clone());
+    loop {
+        match current {
+            LuaExpr::IndexExpr(idx) => {
+                let Some(next) = idx.get_prefix_expr() else {
+                    return Ok(None);
+                };
+                current = next;
+            }
+            LuaExpr::NameExpr(_) => break,
+            _ => return Ok(None),
+        }
+    }
+
+    let Some(leftmost) = get_var_expr_var_ref_id(db, cache, current) else {
+        return Ok(None);
+    };
+    if leftmost != *var_ref_id {
+        return Ok(None);
+    }
+
+    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+    let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    if matches!(left_type, LuaType::Unknown) {
+        Ok(Some(LuaType::Any))
+    } else {
+        Ok(None)
     }
 }
 

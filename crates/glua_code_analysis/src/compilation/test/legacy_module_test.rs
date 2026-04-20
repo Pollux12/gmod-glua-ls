@@ -720,9 +720,7 @@ local _ = tc
             .get_root()
             .descendants::<LuaNameExpr>()
             .filter_map(|expr| expr.get_name_token())
-            .find(|t| {
-                t.get_name_text() == "tc" && u32::from(t.get_position()) > 11
-            })
+            .find(|t| t.get_name_text() == "tc" && u32::from(t.get_position()) > 11)
             .expect("expected later 'tc' name token (the local _ = tc one)");
 
         let info = semantic_model

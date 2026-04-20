@@ -514,7 +514,12 @@ fn strip_inferred_uncertainty(typ: &LuaType) -> LuaType {
                 .into_vec()
                 .into_iter()
                 .filter_map(|member| match member {
-                    LuaType::Nil | LuaType::Never | LuaType::Unknown | LuaType::SelfInfer => None,
+                    LuaType::Nil
+                    | LuaType::Never
+                    | LuaType::Unknown
+                    | LuaType::SelfInfer
+                    | LuaType::BooleanConst(false)
+                    | LuaType::DocBooleanConst(false) => None,
                     other => Some(strip_inferred_uncertainty(&other)),
                 })
                 .collect::<Vec<_>>();
@@ -529,7 +534,12 @@ fn strip_inferred_uncertainty(typ: &LuaType) -> LuaType {
                 .get_unions()
                 .iter()
                 .filter_map(|(member, _)| match member {
-                    LuaType::Nil | LuaType::Never | LuaType::Unknown | LuaType::SelfInfer => None,
+                    LuaType::Nil
+                    | LuaType::Never
+                    | LuaType::Unknown
+                    | LuaType::SelfInfer
+                    | LuaType::BooleanConst(false)
+                    | LuaType::DocBooleanConst(false) => None,
                     other => Some(strip_inferred_uncertainty(other)),
                 })
                 .collect::<Vec<_>>();
@@ -539,7 +549,12 @@ fn strip_inferred_uncertainty(typ: &LuaType) -> LuaType {
                 LuaType::from_vec(stripped)
             }
         }
-        LuaType::Nil | LuaType::Never | LuaType::Unknown | LuaType::SelfInfer => LuaType::Any,
+        LuaType::Nil
+        | LuaType::Never
+        | LuaType::Unknown
+        | LuaType::SelfInfer
+        | LuaType::BooleanConst(false)
+        | LuaType::DocBooleanConst(false) => LuaType::Any,
         LuaType::TableOf(inner) => LuaType::TableOf(Box::new(strip_inferred_uncertainty(inner))),
         _ => typ.clone(),
     }

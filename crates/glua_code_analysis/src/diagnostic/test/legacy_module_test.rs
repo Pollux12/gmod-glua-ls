@@ -28,6 +28,37 @@ mod test {
         })
     }
 
+    /// Like [`has_undefined_global_name`] but matches either the strict
+    /// `UndefinedGlobal` code or the demoted `UndefinedGlobalAssignment`
+    /// variant — useful when a test only cares that the name is flagged at
+    /// all, not which severity tier it landed in.
+    fn has_any_undefined_global_name(
+        ws: &mut VirtualWorkspace,
+        file_path: &str,
+        content: &str,
+        name: &str,
+    ) -> bool {
+        let file_id = ws.def_file(file_path, content);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let strict_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedGlobal.get_name().to_string(),
+        ));
+        let assignment_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedGlobalAssignment
+                .get_name()
+                .to_string(),
+        ));
+        let message_needled = format!("undefined global variable: {name}");
+
+        diagnostics.iter().any(|diagnostic| {
+            (diagnostic.code == strict_code || diagnostic.code == assignment_code)
+                && diagnostic.message.contains(&message_needled)
+        })
+    }
+
     fn has_diagnostic_name(
         ws: &mut VirtualWorkspace,
         file_path: &str,
@@ -40,7 +71,9 @@ mod test {
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
-        let code = Some(NumberOrString::String(diagnostic_code.get_name().to_string()));
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
         let message_needled = format!("undefined global variable: {name}");
 
         diagnostics.iter().any(|diagnostic| {
@@ -71,7 +104,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
         ws.update_emmyrc(emmyrc);
-        assert!(has_undefined_global_name(
+        assert!(has_any_undefined_global_name(
             &mut ws,
             "class.lua",
             r#"
@@ -168,7 +201,7 @@ mod test {
             &mut ws,
             "consumer.lua",
             content,
-            DiagnosticCode::UndefinedGlobalArgument,
+            DiagnosticCode::UndefinedGlobalAssignment,
             "MissingArg",
         ));
         assert!(!has_undefined_global_name(
@@ -277,7 +310,7 @@ mod test {
             local mysqloo = mysqloo
         "#;
 
-        assert!(has_undefined_global_name(
+        assert!(has_any_undefined_global_name(
             &mut ws,
             "mymod.lua",
             content,
@@ -438,7 +471,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
         ws.update_emmyrc(emmyrc);
-        assert!(has_undefined_global_name(
+        assert!(has_any_undefined_global_name(
             &mut ws,
             "class.lua",
             r#"

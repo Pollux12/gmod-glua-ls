@@ -12,8 +12,9 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_sub_type_of, sub_type::get_base_type_id,
-    type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
+    TypeCheckResult, check_general_type_compact, is_required_structural_member, is_sub_type_of,
+    sub_type::get_base_type_id, type_check_fail_reason::TypeCheckFailReason,
+    type_check_guard::TypeCheckGuard,
 };
 
 pub fn check_ref_type_compact(
@@ -276,6 +277,9 @@ fn check_ref_type_compact_table(
     };
 
     for source_member in source_type_members {
+        if !is_required_structural_member(Some(source_member.get_feature())) {
+            continue;
+        }
         let source_member_type = context
             .db
             .get_type_index()
@@ -372,6 +376,9 @@ fn check_ref_type_compact_object(
     };
 
     for source_member in source_type_members {
+        if !is_required_structural_member(source_member.feature) {
+            continue;
+        }
         let source_member_type = source_member.typ;
         let key = source_member.key;
         if context.is_key_checked(&key) {

@@ -7,8 +7,8 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, type_check_fail_reason::TypeCheckFailReason,
-    type_check_guard::TypeCheckGuard,
+    TypeCheckResult, check_general_type_compact, is_required_structural_member,
+    type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
 };
 
 pub fn check_generic_type_compact(
@@ -157,6 +157,9 @@ fn check_generic_type_compact_table(
     let next_guard = check_guard.next_level()?;
 
     for source_member in source_type_members {
+        if !is_required_structural_member(source_member.feature) {
+            continue;
+        }
         let source_member_type = source_member.typ;
         let key = source_member.key;
 
