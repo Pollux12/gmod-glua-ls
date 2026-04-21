@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use schemars::JsonSchema;
 use serde::de::Deserializer;
@@ -110,6 +111,9 @@ pub struct EmmyrcGmodScriptedClassScopes {
     #[serde(default, rename = "exclude", skip_serializing)]
     #[schemars(skip)]
     pub legacy_exclude: Vec<String>,
+    #[serde(skip, default)]
+    #[schemars(skip)]
+    resolved_definitions_cache: OnceLock<Vec<ResolvedGmodScriptedClassDefinition>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
@@ -157,6 +161,18 @@ pub struct EmmyrcGmodScriptedClassDefinition {
     /// ever one instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hide_from_outline: Option<bool>,
+    /// Additional global names that the runtime exposes for the same singleton
+    /// (e.g. Helix exposes `Schema` as a runtime alias for `SCHEMA`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<String>>,
+    /// Class types that this scope's classGlobal inherits from. Used to resolve
+    /// member lookups on subclass globals to the parent class (e.g. SCHEMA inherits from GM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub super_types: Option<Vec<String>>,
+    /// Whether this scope's classGlobal should be treated as a hook owner (its method
+    /// definitions count as hook entry points, included in hook prefix lists). Defaults to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_owner: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -208,6 +224,15 @@ pub struct ResolvedGmodScriptedClassDefinition {
     /// When `true`, this scope is hidden from the outline/class explorer tree.
     #[serde(default)]
     pub hide_from_outline: bool,
+    /// Additional global names that the runtime exposes for the same singleton.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Class types that this scope's classGlobal inherits from.
+    #[serde(default)]
+    pub super_types: Vec<String>,
+    /// Whether this scope's classGlobal should be treated as a hook owner.
+    #[serde(default)]
+    pub hook_owner: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -456,6 +481,9 @@ fn default_scripted_class_definition(
         is_global_singleton: None,
         strip_file_prefix: None,
         hide_from_outline: None,
+        aliases: None,
+        super_types: None,
+        hook_owner: None,
     })
 }
 
@@ -501,22 +529,27 @@ fn resolve_scripted_class_definition(
             .map(str::to_string),
     );
 
-    let root_dir = definition.root_dir.clone().unwrap_or_else(|| {
-        format!("lua/{}", path.join("/"))
-    });
+    let root_dir = definition
+        .root_dir
+        .clone()
+        .unwrap_or_else(|| format!("lua/{}", path.join("/")));
 
     Some(ResolvedGmodScriptedClassDefinition {
         id: definition.id.trim().to_string(),
         label: label.to_string(),
         path: path
             .into_iter()
-            .map(|segment| segment.trim().to_string())
-            .filter(|segment| !segment.is_empty())
+            .filter_map(|segment| {
+                let trimmed = segment.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
             .collect(),
         include: include
             .into_iter()
-            .map(|pattern| pattern.trim().to_string())
-            .filter(|pattern| !pattern.is_empty())
+            .filter_map(|pattern| {
+                let trimmed = pattern.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
             .collect(),
         exclude,
         class_global: class_global.to_string(),
@@ -529,6 +562,27 @@ fn resolve_scripted_class_definition(
         is_global_singleton: definition.is_global_singleton.unwrap_or(false),
         strip_file_prefix: definition.strip_file_prefix.unwrap_or(false),
         hide_from_outline: definition.hide_from_outline.unwrap_or(false),
+        aliases: definition
+            .aliases
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|alias| {
+                let trimmed = alias.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+            .collect(),
+        super_types: definition
+            .super_types
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|ty| {
+                let trimmed = ty.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+            .collect(),
+        hook_owner: definition.hook_owner.unwrap_or(false),
         parent_id: definition
             .parent_id
             .as_deref()
@@ -603,6 +657,9 @@ fn merge_scripted_class_definitions(
                     is_global_singleton: None,
                     strip_file_prefix: None,
                     hide_from_outline: None,
+                    aliases: None,
+                    super_types: None,
+                    hook_owner: None,
                 };
 
                 if let Some(definition) =
@@ -936,6 +993,9 @@ pub struct EmmyrcGmodScriptedOwners {
     /// `GM` / `GAMEMODE` / `SANDBOX` / `PLUGIN` set.
     #[serde(default)]
     pub include: Vec<EmmyrcGmodScriptedOwnerEntry>,
+    #[serde(skip, default)]
+    #[schemars(skip)]
+    resolved_owners_cache: OnceLock<Vec<ResolvedGmodScriptedOwnerDefinition>>,
 }
 
 /// Specificity score for a single glob pattern used by [`EmmyrcGmodScriptedOwners::detect_owner_for_path`].
@@ -1012,8 +1072,10 @@ fn resolve_scripted_owner_entry(
     let include: Vec<String> = entry
         .include
         .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        })
         .collect();
     if include.is_empty() {
         return None;
@@ -1024,8 +1086,10 @@ fn resolve_scripted_owner_entry(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        })
         .collect();
 
     // Aliases: trim, dedupe, drop if equal to global (case-insensitive)
@@ -1035,8 +1099,10 @@ fn resolve_scripted_owner_entry(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&global))
+        .filter_map(|s| {
+            let t = s.trim();
+            (!t.is_empty() && !t.eq_ignore_ascii_case(&global)).then(|| t.to_string())
+        })
         .filter(|s| seen_aliases.insert(s.to_ascii_lowercase()))
         .collect();
 
@@ -1049,11 +1115,12 @@ fn resolve_scripted_owner_entry(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| {
-            !s.is_empty()
-                && !s.eq_ignore_ascii_case(&global)
-                && !aliases.iter().any(|a| a.eq_ignore_ascii_case(s))
+        .filter_map(|s| {
+            let t = s.trim();
+            (!t.is_empty()
+                && !t.eq_ignore_ascii_case(&global)
+                && !aliases.iter().any(|a| a.eq_ignore_ascii_case(t)))
+            .then(|| t.to_string())
         })
         .filter(|s| seen_fb.insert(s.to_ascii_lowercase()))
         .collect();
@@ -1078,8 +1145,7 @@ fn resolve_scripted_owner_entry(
 fn builtin_hook_owner_fallbacks(owner_name: &str) -> Vec<String> {
     if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
         vec!["SANDBOX".to_string()]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") || owner_name.eq_ignore_ascii_case("SCHEMA")
-    {
+    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
         vec![
             "GM".to_string(),
             "GAMEMODE".to_string(),
@@ -1105,8 +1171,7 @@ fn builtin_hook_owner_candidates(owner_name: &str) -> Vec<String> {
             "GAMEMODE".to_string(),
             "SANDBOX".to_string(),
         ]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") || owner_name.eq_ignore_ascii_case("SCHEMA")
-    {
+    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
         vec![
             owner_name.to_string(),
             "GM".to_string(),
@@ -1145,32 +1210,34 @@ impl EmmyrcGmodScriptedOwners {
     /// Duplicate detection is based on the first *successfully resolved* entry
     /// for a given id. An invalid earlier entry (e.g. missing `global` or
     /// `include`) does **not** block a later valid one with the same id.
-    pub fn resolved_owners(&self) -> Vec<ResolvedGmodScriptedOwnerDefinition> {
-        let mut result = Vec::new();
-        let mut seen_ids: HashSet<String> = HashSet::new();
+    pub fn resolved_owners(&self) -> &[ResolvedGmodScriptedOwnerDefinition] {
+        self.resolved_owners_cache.get_or_init(|| {
+            let mut result = Vec::new();
+            let mut seen_ids: HashSet<String> = HashSet::new();
 
-        for entry in &self.include {
-            let id = entry.id.trim();
-            if id.is_empty() {
-                continue;
+            for entry in &self.include {
+                let id = entry.id.trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let id_lower = id.to_ascii_lowercase();
+                // Only block duplicates of ids that were already *successfully* resolved.
+                // An invalid prior entry must not prevent a valid later one from being used.
+                if seen_ids.contains(&id_lower) {
+                    log::warn!(
+                        "gmod.scriptedOwners: duplicate id '{}' — first-valid entry wins",
+                        id
+                    );
+                    continue;
+                }
+                if let Some(def) = resolve_scripted_owner_entry(entry) {
+                    seen_ids.insert(id_lower);
+                    result.push(def);
+                }
             }
-            let id_lower = id.to_ascii_lowercase();
-            // Only block duplicates of ids that were already *successfully* resolved.
-            // An invalid prior entry must not prevent a valid later one from being used.
-            if seen_ids.contains(&id_lower) {
-                log::warn!(
-                    "gmod.scriptedOwners: duplicate id '{}' — first-valid entry wins",
-                    id
-                );
-                continue;
-            }
-            if let Some(def) = resolve_scripted_owner_entry(entry) {
-                seen_ids.insert(id_lower);
-                result.push(def);
-            }
-        }
 
-        result
+            result
+        })
     }
 
     /// Detects which configured owner (if any) best matches the given file path.
@@ -1216,7 +1283,7 @@ impl EmmyrcGmodScriptedOwners {
             ResolvedGmodScriptedOwnerDefinition,
         )> = Vec::new();
 
-        for (decl_idx, def) in self.resolved_owners().into_iter().enumerate() {
+        for (decl_idx, def) in self.resolved_owners().iter().enumerate() {
             // Exclusion check (per-pattern, invalid patterns warned and skipped)
             if !def.exclude.is_empty() {
                 let excluded = def
@@ -1265,7 +1332,7 @@ impl EmmyrcGmodScriptedOwners {
                 continue;
             };
 
-            matches.push((entry_score, decl_idx, def));
+            matches.push((entry_score, decl_idx, def.clone()));
         }
 
         // Sort: highest specificity first (descending); ties broken by
@@ -1283,7 +1350,7 @@ impl EmmyrcGmodScriptedOwners {
     pub fn hook_owner_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for def in self.resolved_owners() {
+        for def in self.resolved_owners().iter() {
             if !def.hook_owner {
                 continue;
             }
@@ -1308,7 +1375,7 @@ impl EmmyrcGmodScriptedOwners {
     /// conservative configured entry that omits `fallbackOwners` still preserves the
     /// expected hover / doc-resolution behaviour.  Deduplication is case-insensitive.
     pub fn hook_owner_fallbacks_configured(&self, owner_name: &str) -> Option<Vec<String>> {
-        for def in self.resolved_owners() {
+        for def in self.resolved_owners().iter() {
             if def.global.eq_ignore_ascii_case(owner_name)
                 || def
                     .aliases
@@ -1334,7 +1401,7 @@ impl EmmyrcGmodScriptedOwners {
     /// configured entry that omits aliases / fallbackOwners still surfaces all expected
     /// completions.  Deduplication is case-insensitive.
     pub fn hook_owner_candidates_configured(&self, owner_name: &str) -> Option<Vec<String>> {
-        for def in self.resolved_owners() {
+        for def in self.resolved_owners().iter() {
             if def.global.eq_ignore_ascii_case(owner_name)
                 || def
                     .aliases
@@ -1459,6 +1526,31 @@ fn merge_scripted_class_definition_override(
         hide_from_outline: override_definition
             .hide_from_outline
             .unwrap_or(base.hide_from_outline),
+        aliases: if override_definition.aliases.is_some() {
+            override_definition
+                .aliases
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|alias| alias.trim().to_string())
+                .filter(|alias| !alias.is_empty())
+                .collect()
+        } else {
+            base.aliases.clone()
+        },
+        super_types: if override_definition.super_types.is_some() {
+            override_definition
+                .super_types
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ty| ty.trim().to_string())
+                .filter(|ty| !ty.is_empty())
+                .collect()
+        } else {
+            base.super_types.clone()
+        },
+        hook_owner: override_definition.hook_owner.unwrap_or(base.hook_owner),
     }
 }
 
@@ -1467,13 +1559,15 @@ impl Default for EmmyrcGmodScriptedClassScopes {
         Self {
             include: scripted_scope_include_default(),
             legacy_exclude: Vec::new(),
+            resolved_definitions_cache: OnceLock::new(),
         }
     }
 }
 
 impl EmmyrcGmodScriptedClassScopes {
-    pub fn resolved_definitions(&self) -> Vec<ResolvedGmodScriptedClassDefinition> {
-        merge_scripted_class_definitions(&self.include, &self.legacy_exclude)
+    pub fn resolved_definitions(&self) -> &[ResolvedGmodScriptedClassDefinition] {
+        self.resolved_definitions_cache
+            .get_or_init(|| merge_scripted_class_definitions(&self.include, &self.legacy_exclude))
     }
 
     pub fn include_patterns(&self) -> Vec<String> {
@@ -1488,8 +1582,8 @@ impl EmmyrcGmodScriptedClassScopes {
 
         let mut patterns = self
             .resolved_definitions()
-            .into_iter()
-            .flat_map(|definition| definition.include)
+            .iter()
+            .flat_map(|definition| definition.include.iter().cloned())
             .collect::<Vec<_>>();
         for pattern in legacy_include {
             if !patterns.iter().any(|existing| existing == &pattern) {
@@ -1502,8 +1596,8 @@ impl EmmyrcGmodScriptedClassScopes {
 
     pub fn exclude_patterns(&self) -> Vec<String> {
         self.resolved_definitions()
-            .into_iter()
-            .flat_map(|definition| definition.exclude)
+            .iter()
+            .flat_map(|definition| definition.exclude.iter().cloned())
             .collect()
     }
 
@@ -1533,7 +1627,7 @@ impl EmmyrcGmodScriptedClassScopes {
         // Find the definition whose path pattern best matches a contiguous run
         // of segments in the file's path.  Longer / later matches win.
         let mut best_match: Option<(ResolvedGmodScriptedClassDefinition, usize, usize)> = None;
-        for definition in &definitions {
+        for definition in definitions {
             if !matches_scope_patterns(file_path, &definition.include, &definition.exclude) {
                 continue;
             }
@@ -1624,7 +1718,7 @@ impl EmmyrcGmodScriptedClassScopes {
         // not have a segment hierarchy that path-matching can use (e.g.
         // `gamemode/schema.lua` covered by `include: ['gamemode/schema.lua']`
         // with `fixedClassName: 'SCHEMA'`).
-        for definition in &definitions {
+        for definition in definitions {
             let Some(ref fixed_name) = definition.fixed_class_name else {
                 continue;
             };
@@ -1652,7 +1746,7 @@ impl EmmyrcGmodScriptedClassScopes {
         let definitions = self.resolved_definitions();
         let mut globals = Vec::new();
         let mut seen = HashSet::new();
-        for definition in &definitions {
+        for definition in definitions {
             if !matches_scope_patterns(file_path, &definition.include, &definition.exclude) {
                 continue;
             }
@@ -1679,7 +1773,7 @@ impl EmmyrcGmodScriptedClassScopes {
         let mut matches = Vec::new();
         let mut seen_globals = HashSet::new();
 
-        for definition in &definitions {
+        for definition in definitions {
             if !matches_scope_patterns(file_path, &definition.include, &definition.exclude) {
                 continue;
             }
@@ -1772,6 +1866,53 @@ impl EmmyrcGmodScriptedClassScopes {
         }
 
         matches
+    }
+
+    /// Returns all aliases for a scope whose `class_global` matches the given name (case-insensitive).
+    /// Returns empty vec if no matching scope is found.
+    pub fn aliases_for_global(&self, global_name: &str) -> Vec<String> {
+        let definitions = self.resolved_definitions();
+        for definition in definitions {
+            if definition.class_global.eq_ignore_ascii_case(global_name) {
+                return definition.aliases.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Returns super_types for the scope whose `class_global` matches the given name (case-insensitive).
+    /// If the name matches an alias instead of a canonical class_global, looks up the canonical scope.
+    /// Returns empty vec if no matching scope is found.
+    pub fn super_types_for_global(&self, global_name: &str) -> Vec<String> {
+        let definitions = self.resolved_definitions();
+        for definition in definitions {
+            if definition.class_global.eq_ignore_ascii_case(global_name) {
+                return definition.super_types.clone();
+            }
+            // Check if global_name is an alias for this scope
+            if definition
+                .aliases
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(global_name))
+            {
+                return definition.super_types.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Returns all `class_global` names where `hook_owner == true`, plus their aliases.
+    /// This is used to build the combined hook prefix list for method-site detection.
+    pub fn hook_owner_globals(&self) -> Vec<String> {
+        let definitions = self.resolved_definitions();
+        let mut globals = Vec::new();
+        for definition in definitions {
+            if definition.hook_owner {
+                globals.push(definition.class_global.clone());
+                globals.extend(definition.aliases.clone());
+            }
+        }
+        globals
     }
 }
 

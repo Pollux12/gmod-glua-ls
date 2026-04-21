@@ -27,6 +27,9 @@ mod test {
             is_global_singleton: None,
             hide_from_outline: None,
             strip_file_prefix: None,
+            aliases: None,
+            super_types: None,
+            hook_owner: None,
             parent_id: None,
             icon: None,
             root_dir: Some("plugins".to_string()),
@@ -4003,6 +4006,9 @@ mod test {
                     is_global_singleton: Some(true),
                     strip_file_prefix: None,
                     hide_from_outline: None,
+                    aliases: Some(vec!["Schema".to_string()]),
+                    super_types: Some(vec!["GM".to_string()]),
+                    hook_owner: Some(true),
                     exclude: None,
                     parent_id: None,
                     icon: None,
@@ -4017,7 +4023,7 @@ mod test {
             "schema/sh_schema.lua",
             r#"
             SCHEMA.Name = "Test Schema"
-            
+
             function SCHEMA:Initialize()
                 print(Schema.Name) -- Should not trigger undefined-global
             end

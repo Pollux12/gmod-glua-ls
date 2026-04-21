@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use glua_code_analysis::{DocSyntax, Emmyrc, EmmyrcFilenameConvention};
+    use glua_code_analysis::{
+        DocSyntax, Emmyrc, EmmyrcFilenameConvention, EmmyrcGmodScriptedClassDefinition,
+        EmmyrcGmodScriptedClassScopeEntry,
+    };
     use googletest::prelude::*;
     use lsp_types::{
         CompletionItemKind, CompletionResponse, CompletionTriggerKind, InsertTextFormat,
@@ -3599,6 +3602,32 @@ mod tests {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
+        // SCHEMA is no longer a built-in hook owner; it must be supplied by the
+        // (Helix) plugin preset. Configure a SCHEMA scope here so completion can
+        // resolve `Schema` -> canonical `SCHEMA` via the scope's aliases.
+        emmyrc.gmod.scripted_class_scopes.include =
+            vec![EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(
+                EmmyrcGmodScriptedClassDefinition {
+                    id: "helix-schema".to_string(),
+                    label: Some("Helix Schema".to_string()),
+                    class_global: Some("SCHEMA".to_string()),
+                    fixed_class_name: Some("SCHEMA".to_string()),
+                    is_global_singleton: Some(true),
+                    strip_file_prefix: None,
+                    hide_from_outline: None,
+                    aliases: Some(vec!["Schema".to_string()]),
+                    super_types: Some(vec!["GM".to_string()]),
+                    hook_owner: Some(true),
+                    path: Some(vec!["schema".to_string()]),
+                    include: Some(vec!["schema/**".to_string()]),
+                    exclude: None,
+                    parent_id: None,
+                    icon: None,
+                    root_dir: None,
+                    scaffold: None,
+                    disabled: None,
+                },
+            ))];
         ws.analysis.update_config(emmyrc.into());
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(

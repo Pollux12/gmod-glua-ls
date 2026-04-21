@@ -444,7 +444,29 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
+        emmyrc.gmod.scripted_class_scopes.include =
+            vec![EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(
+                crate::EmmyrcGmodScriptedClassDefinition {
+                    id: "plugins".to_string(),
+                    label: Some("Plugins".to_string()),
+                    class_global: Some("PLUGIN".to_string()),
+                    path: Some(vec!["plugins".to_string()]),
+                    include: Some(vec!["plugins/**".to_string()]),
+                    exclude: None,
+                    fixed_class_name: None,
+                    is_global_singleton: None,
+                    hide_from_outline: None,
+                    strip_file_prefix: None,
+                    aliases: None,
+                    super_types: None,
+                    hook_owner: None,
+                    parent_id: None,
+                    icon: None,
+                    root_dir: None,
+                    scaffold: None,
+                    disabled: None,
+                },
+            ))];
         ws.update_emmyrc(emmyrc);
 
         assert!(!has_diagnostic(
@@ -536,6 +558,113 @@ mod test {
             "TestPanel"
         ));
     }
+
+    // =========================================================================
+    // scripted-owner multi-match suppression tests
+    // =========================================================================
+
+    /// When only one owner glob matches the file, its global and aliases must
+    /// still be suppressed (backward-compatibility / single-match path).
+    #[gtest]
+    fn test_scripted_class_scope_fixed_class_name_suppresses_global() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include =
+            vec![EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(
+                crate::EmmyrcGmodScriptedClassDefinition {
+                    id: "helix-schema".to_string(),
+                    label: Some("Helix Schema".to_string()),
+                    class_global: Some("SCHEMA".to_string()),
+                    fixed_class_name: Some("SCHEMA".to_string()),
+                    is_global_singleton: Some(true),
+                    strip_file_prefix: None,
+                    hide_from_outline: None,
+                    aliases: Some(vec!["Schema".to_string()]),
+                    super_types: Some(vec!["GM".to_string()]),
+                    hook_owner: Some(true),
+                    path: Some(vec!["schema".to_string()]),
+                    include: Some(vec![
+                        "schema/**".to_string(),
+                        "gamemode/schema.lua".to_string(),
+                    ]),
+                    exclude: None,
+                    parent_id: None,
+                    icon: None,
+                    root_dir: None,
+                    scaffold: None,
+                    disabled: None,
+                },
+            ))];
+        ws.update_emmyrc(emmyrc);
+
+        // schema/sh_schema.lua should have SCHEMA defined
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "schema/sh_schema.lua",
+            r#"SCHEMA.Name = "Test""#,
+            "SCHEMA",
+        ));
+
+        // gamemode/schema.lua should also have SCHEMA defined via include fallback
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "gamemode/schema.lua",
+            r#"SCHEMA.Name = "Test""#,
+            "SCHEMA",
+        ));
+    }
+
+    #[gtest]
+    fn test_scripted_class_scope_item_suppresses_global() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include =
+            vec![EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(
+                crate::EmmyrcGmodScriptedClassDefinition {
+                    id: "helix-items".to_string(),
+                    label: Some("Helix Items".to_string()),
+                    class_global: Some("ITEM".to_string()),
+                    fixed_class_name: None,
+                    is_global_singleton: None,
+                    hide_from_outline: None,
+                    strip_file_prefix: Some(true),
+                    aliases: None,
+                    super_types: None,
+                    hook_owner: None,
+                    path: Some(vec!["items".to_string()]),
+                    include: Some(vec![
+                        "schema/items/**".to_string(),
+                        "plugins/**/items/**".to_string(),
+                    ]),
+                    exclude: None,
+                    parent_id: None,
+                    icon: None,
+                    root_dir: None,
+                    scaffold: None,
+                    disabled: None,
+                },
+            ))];
+        ws.update_emmyrc(emmyrc);
+
+        // schema/items/sh_bandage.lua should have ITEM defined
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "schema/items/sh_bandage.lua",
+            r#"ITEM.name = "Bandage""#,
+            "ITEM",
+        ));
+
+        // plugins/foo/items/sh_stuff.lua should also have ITEM defined
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "plugins/foo/items/sh_stuff.lua",
+            r#"ITEM.name = "Stuff""#,
+            "ITEM",
+        ));
+    }
+
     #[gtest]
     fn test_undefined_global_suppressed_in_assignment_rhs() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

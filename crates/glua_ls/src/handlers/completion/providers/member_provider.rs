@@ -89,11 +89,12 @@ fn extend_gmod_hook_fallback_members(
         return;
     };
 
-    let owner_candidates =
-        gmod_hook_owner_candidates(builder.semantic_model.get_db(), owner_name.as_str());
-    if owner_candidates.is_empty() {
+    if !gmod_has_hook_owner_candidates(builder.semantic_model.get_db(), owner_name.as_str()) {
         return;
     }
+
+    let owner_candidates =
+        gmod_hook_owner_candidates(builder.semantic_model.get_db(), owner_name.as_str());
 
     let mut existing: HashMap<LuaMemberKey, HashSet<Option<LuaSemanticDeclId>>> = HashMap::new();
     for (key, infos) in members.iter() {
@@ -135,6 +136,36 @@ fn gmod_hook_owner_candidates(db: &DbIndex, owner_name: &str) -> Vec<String> {
         return configured;
     }
 
+    // Check configured scriptedClassScopes for hook_owner entries
+    let scoped_class_scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+    let definitions = scoped_class_scopes.resolved_definitions();
+    for definition in definitions {
+        // Check if owner_name matches the canonical class_global
+        if definition.class_global.eq_ignore_ascii_case(owner_name) && definition.hook_owner {
+            let mut result = vec![definition.class_global.clone()];
+            result.extend(definition.aliases.clone());
+            // Add fallback owners based on super_types
+            result.extend(definition.super_types.clone());
+            return result;
+        }
+        // Check if owner_name matches any alias
+        if definition
+            .aliases
+            .iter()
+            .any(|a: &String| a.eq_ignore_ascii_case(owner_name))
+            && definition.hook_owner
+        {
+            // Always include canonical class_global first so type lookup
+            // resolves to the registered global type (aliases are not
+            // typically registered as global types).
+            let mut result = vec![definition.class_global.clone()];
+            result.extend(definition.aliases.clone());
+            // Add fallback owners based on super_types
+            result.extend(definition.super_types.clone());
+            return result;
+        }
+    }
+
     // Built-in defaults for GM/GAMEMODE/SANDBOX/PLUGIN
     if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
         vec![
@@ -149,22 +180,6 @@ fn gmod_hook_owner_candidates(db: &DbIndex, owner_name: &str) -> Vec<String> {
             "GAMEMODE".to_string(),
             "SANDBOX".to_string(),
         ]
-    } else if owner_name.eq_ignore_ascii_case("SCHEMA") {
-        // Include both case variants: "Schema" and "SCHEMA"
-        let canonical = "SCHEMA";
-        let alias = "Schema";
-        vec![
-            owner_name.to_string(),
-            if owner_name == canonical {
-                alias
-            } else {
-                canonical
-            }
-            .to_string(),
-            "GM".to_string(),
-            "GAMEMODE".to_string(),
-            "SANDBOX".to_string(),
-        ]
     } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
         vec![
             "SANDBOX".to_string(),
@@ -174,6 +189,42 @@ fn gmod_hook_owner_candidates(db: &DbIndex, owner_name: &str) -> Vec<String> {
     } else {
         vec![]
     }
+}
+
+/// Returns true if the given owner name has any hook owner candidates
+/// without allocating the full Vec. More efficient than calling
+/// `gmod_hook_owner_candidates` just to check is_empty().
+fn gmod_has_hook_owner_candidates(db: &DbIndex, owner_name: &str) -> bool {
+    // Check configured scriptedOwners entries first
+    if db
+        .get_emmyrc()
+        .gmod
+        .scripted_owners
+        .hook_owner_candidates_configured(owner_name)
+        .is_some()
+    {
+        return true;
+    }
+
+    // Check configured scriptedClassScopes for hook_owner entries
+    let scoped_class_scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+    let definitions = scoped_class_scopes.resolved_definitions();
+    if definitions.iter().any(|definition| {
+        (definition.class_global.eq_ignore_ascii_case(owner_name)
+            || definition
+                .aliases
+                .iter()
+                .any(|a: &String| a.eq_ignore_ascii_case(owner_name)))
+            && definition.hook_owner
+    }) {
+        return true;
+    }
+
+    // Built-in defaults for GM/GAMEMODE/SANDBOX/PLUGIN
+    owner_name.eq_ignore_ascii_case("GM")
+        || owner_name.eq_ignore_ascii_case("GAMEMODE")
+        || owner_name.eq_ignore_ascii_case("PLUGIN")
+        || owner_name.eq_ignore_ascii_case("SANDBOX")
 }
 
 pub fn add_completions_for_members(
@@ -427,7 +478,7 @@ fn is_gmod_hook_member_info(db: &DbIndex, info: &LuaMemberInfo) -> bool {
     // Delegate to the config-driven candidate lookup so that configured
     // `gmod.scriptedOwners` hook owners are treated consistently with the
     // built-in GM/GAMEMODE/SANDBOX/PLUGIN defaults.
-    !gmod_hook_owner_candidates(db, owner_name).is_empty()
+    gmod_has_hook_owner_candidates(db, owner_name)
 }
 
 fn is_member_realm_compatible(builder: &CompletionBuilder, info: &LuaMemberInfo) -> bool {

@@ -291,8 +291,21 @@ fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
         "GAMEMODE".to_string(),
         "SANDBOX".to_string(),
         "PLUGIN".to_string(),
-        "SCHEMA".to_string(),
     ];
+    // Add any hook owners from scripted class scopes
+    for scoped_hook_owner in db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .hook_owner_globals()
+    {
+        if !names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&scoped_hook_owner))
+        {
+            names.push(scoped_hook_owner);
+        }
+    }
     // Add any configured hook-owner globals and aliases
     for configured_name in db.get_emmyrc().gmod.scripted_owners.hook_owner_names() {
         if !names

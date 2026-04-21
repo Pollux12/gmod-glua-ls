@@ -698,13 +698,40 @@ fn check_name_expr(
         return Some(());
     }
 
-    if db.get_emmyrc().gmod.enabled
-        && db
+    if db.get_emmyrc().gmod.enabled {
+        if let Some(info) = db
             .get_gmod_infer_index()
             .get_scoped_class_info(&semantic_model.get_file_id())
-            .is_some_and(|info| info.global_name == name_text.as_str())
-    {
-        return Some(());
+        {
+            if info.global_name == name_text.as_str()
+                || info.aliases.iter().any(|a| a == name_text.as_str())
+                || info
+                    .extra_scope_matches
+                    .iter()
+                    .any(|(_, g, _)| g == name_text.as_str())
+            {
+                return Some(());
+            }
+        }
+
+        // Global-singleton scoped classes (e.g. `SCHEMA` / `Schema` in Helix) are
+        // workspace-wide — valid as globals in any file, not just scope-matched files.
+        // Match both the classGlobal itself and config-driven aliases.
+        for d in db
+            .get_emmyrc()
+            .gmod
+            .scripted_class_scopes
+            .resolved_definitions()
+            .iter()
+        {
+            if d.is_global_singleton && d.class_global == name_text.as_str() {
+                return Some(());
+            }
+            // Check config-driven aliases for this scope
+            if d.is_global_singleton && d.aliases.contains(&name_text.to_string()) {
+                return Some(());
+            }
+        }
     }
 
     if name_text == "BaseClass"

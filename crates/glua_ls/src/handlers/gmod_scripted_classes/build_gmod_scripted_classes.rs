@@ -276,6 +276,9 @@ mod tests {
             root_dir: Some("plugins".to_string()),
             scaffold: None,
             disabled: None,
+            aliases: None,
+            super_types: None,
+            hook_owner: None,
         }))
     }
 

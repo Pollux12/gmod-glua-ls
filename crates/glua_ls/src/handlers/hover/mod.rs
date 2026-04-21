@@ -196,7 +196,7 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
     }
 }
 
-const HOOK_OWNER_TYPES: &[&str] = &["GM", "GAMEMODE", "SANDBOX", "PLUGIN", "SCHEMA"];
+const HOOK_OWNER_TYPES: &[&str] = &["GM", "GAMEMODE", "SANDBOX", "PLUGIN"];
 
 fn hover_gmod_hook_name_string(
     analysis: &EmmyLuaAnalysis,
@@ -340,7 +340,8 @@ pub(crate) fn resolve_hook_property_owner(
 
     // Build the full set of owner type names, mirroring iter_hook_owner_names() in
     // resolve_closure.rs: builtins + user-configured method_prefixes +
-    // scripted owner globals/aliases where hookOwner: true.
+    // scripted owner globals/aliases where hookOwner: true +
+    // scripted class scope globals where hookOwner: true.
     let mut owner_names: Vec<String> = HOOK_OWNER_TYPES.iter().map(|s| s.to_string()).collect();
     for prefix in &db.get_emmyrc().gmod.hook_mappings.method_prefixes {
         let normalized = prefix.trim().trim_end_matches([':', '.']).to_string();
@@ -358,6 +359,19 @@ pub(crate) fn resolve_hook_property_owner(
             .any(|n| n.eq_ignore_ascii_case(&configured_name))
         {
             owner_names.push(configured_name);
+        }
+    }
+    for scoped_class_name in db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .hook_owner_globals()
+    {
+        if !owner_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&scoped_class_name))
+        {
+            owner_names.push(scoped_class_name);
         }
     }
 

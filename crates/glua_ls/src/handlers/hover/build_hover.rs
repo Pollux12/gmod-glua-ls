@@ -694,11 +694,20 @@ fn gmod_hook_owner_fallbacks(db: &DbIndex, owner_name: &str) -> Vec<String> {
         return configured;
     }
 
+    // Check scripted class scopes for super_types
+    let super_types = db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .super_types_for_global(owner_name);
+    if !super_types.is_empty() {
+        return super_types;
+    }
+
     // Built-in defaults for GM/GAMEMODE/SANDBOX/PLUGIN
     if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
         vec!["SANDBOX".to_string()]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") || owner_name.eq_ignore_ascii_case("SCHEMA")
-    {
+    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
         vec![
             "GM".to_string(),
             "GAMEMODE".to_string(),

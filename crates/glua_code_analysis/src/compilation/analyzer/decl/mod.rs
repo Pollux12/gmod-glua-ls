@@ -49,19 +49,16 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
                         in_filed_tree.file_id,
                         &m.global_name,
                     );
+                    let aliases = super::gmod::remap_scoped_alias(
+                        &m.global_name,
+                        &db.get_emmyrc().gmod.scripted_class_scopes,
+                    );
                     db.get_gmod_infer_index_mut().set_scoped_class_info(
                         in_filed_tree.file_id,
                         GmodScopedClassInfo {
                             class_name: m.class_name.clone(),
                             global_name: m.global_name.clone(),
-                            aliases: {
-                                let alias = super::gmod::remap_scoped_alias(&m.global_name);
-                                if alias.is_empty() {
-                                    vec![]
-                                } else {
-                                    vec![alias]
-                                }
-                            },
+                            aliases,
                             is_global_singleton: m.is_global_singleton,
                             extra_scope_matches: extra_globals.clone(),
                         },
@@ -432,8 +429,14 @@ impl<'a> DeclAnalyzer<'a> {
         // For global singletons, also seed well-known aliases as globals
         // (e.g. "Schema" when classGlobal is "SCHEMA" in Helix).
         if self.scoped_class_is_global_singleton {
-            let alias = super::gmod::remap_scoped_alias(&scoped_class_global_name);
-            if !alias.is_empty() && alias != scoped_class_global_name.as_str() {
+            let aliases = super::gmod::remap_scoped_alias(
+                &scoped_class_global_name,
+                &self.db.get_emmyrc().gmod.scripted_class_scopes,
+            );
+            for alias in aliases {
+                if alias.eq_ignore_ascii_case(&scoped_class_global_name) {
+                    continue;
+                }
                 let alias_decl = LuaDecl::new(
                     &alias,
                     file_id,
@@ -472,8 +475,14 @@ impl<'a> DeclAnalyzer<'a> {
 
             // For global singleton extras, also seed their alias as a global.
             if is_singleton {
-                let alias = super::gmod::remap_scoped_alias(&extra_global_name);
-                if !alias.is_empty() && alias != extra_global_name.as_str() {
+                let aliases = super::gmod::remap_scoped_alias(
+                    &extra_global_name,
+                    &self.db.get_emmyrc().gmod.scripted_class_scopes,
+                );
+                for alias in aliases {
+                    if alias.eq_ignore_ascii_case(&extra_global_name) {
+                        continue;
+                    }
                     let alias_decl = LuaDecl::new(
                         &alias,
                         file_id,

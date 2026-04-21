@@ -134,18 +134,15 @@ impl<'a> DocumentSymbolBuilder<'a> {
         // Scripted entity classes (ENT, SWEP, TOOL, EFFECT, PLUGIN).
         if let Some((class_name, global_name)) = get_scripted_class_info_for_file(db, file_id) {
             // Skip if the scope definition is hidden from outline
-            let mut hidden = false;
-            for def in db
+            let hidden = db
                 .get_emmyrc()
                 .gmod
                 .scripted_class_scopes
                 .resolved_definitions()
-            {
-                if def.class_global.eq_ignore_ascii_case(&global_name) && def.hide_from_outline {
-                    hidden = true;
-                    break;
-                }
-            }
+                .iter()
+                .any(|def| {
+                    def.class_global.eq_ignore_ascii_case(&global_name) && def.hide_from_outline
+                });
             if !hidden {
                 let type_label = scripted_class_type_label(&global_name);
                 let class_label = format!("{class_name} ({type_label})");

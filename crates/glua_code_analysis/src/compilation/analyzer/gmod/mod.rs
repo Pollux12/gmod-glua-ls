@@ -63,16 +63,23 @@ impl GmodKeywords {
     }
 }
 
-const BUILTIN_METHOD_HOOK_PREFIXES: &[&str] =
-    &["GM", "GAMEMODE", "PLUGIN", "SANDBOX", "SCHEMA", "Schema"];
+const BUILTIN_METHOD_HOOK_PREFIXES: &[&str] = &["GM", "GAMEMODE", "PLUGIN", "SANDBOX"];
 
-fn scan_gmod_keywords(content: &str, hook_method_prefixes: &[String]) -> GmodKeywords {
-    let has_gm_func = hook_method_prefixes
+/// Scans `content` for gmod-relevant keywords.
+///
+/// `hook_method_prefixes_with_colon` MUST already include the trailing `:` for each
+/// prefix (e.g. `"GM:"`, `"SCHEMA:"`). Pre-formatting allows callers to build the
+/// prefix list once outside of the per-file loop, avoiding `format!` allocations on
+/// every file.
+fn scan_gmod_keywords(content: &str, hook_method_prefixes_with_colon: &[String]) -> GmodKeywords {
+    let has_gm_func = hook_method_prefixes_with_colon
         .iter()
-        .any(|p| content.contains(&format!("{p}:")));
+        .any(|p| content.contains(p.as_str()));
     GmodKeywords {
         has_hook: content.contains("hook"),
-        has_net: content.contains("net"),
+        // Use `net.` to avoid matching unrelated identifiers/comments containing `net`
+        // such as `planet`, `subnet`, `network` (for plain words) etc.
+        has_net: content.contains("net."),
         has_system_call: content.contains("timer.")
             || content.contains("concommand")
             || content.contains("ConVar")
@@ -112,26 +119,38 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let mut t_netflow = std::time::Duration::ZERO;
         let mut t_scoped = std::time::Duration::ZERO;
         let mut t_realm = std::time::Duration::ZERO;
+
+        // Pre-compute the combined hook-owner prefix list once for the whole pipeline.
+        // Combines configured method prefixes with built-in hook-owner prefixes and
+        // scripted class scope hook owners, then pre-appends `:` so the per-file
+        // `scan_gmod_keywords` call does no allocations.
+        let combined_hook_prefixes_with_colon: Vec<String> = {
+            let emmyrc = db.get_emmyrc();
+            let configured = emmyrc.gmod.hook_mappings.method_prefixes.iter().cloned();
+            let builtin = BUILTIN_METHOD_HOOK_PREFIXES
+                .iter()
+                .map(|p| (*p).to_string());
+            let scoped_owners = emmyrc.gmod.scripted_owners.hook_owner_names();
+            let scoped_class_hooks = emmyrc.gmod.scripted_class_scopes.hook_owner_globals();
+            configured
+                .chain(builtin)
+                .chain(scoped_owners)
+                .chain(scoped_class_hooks)
+                .map(|mut p| {
+                    p.push(':');
+                    p
+                })
+                .collect()
+        };
+
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
 
             // Pre-scan file source for gmod-relevant keywords to skip unnecessary AST walks.
-            // Combine configured method prefixes with built-in hook-owner prefixes so that
-            // built-in-like method declarations (e.g. `GM:` / `SCHEMA:`) are detected.
-            let combined_hook_prefixes: Vec<String> = {
-                let emmyrc = db.get_emmyrc();
-                let mut prefixes: Vec<String> = emmyrc.gmod.hook_mappings.method_prefixes.clone();
-                prefixes.extend(
-                    BUILTIN_METHOD_HOOK_PREFIXES
-                        .iter()
-                        .map(|prefix| prefix.to_string()),
-                );
-                prefixes
-            };
             let keywords = db
                 .get_vfs()
                 .get_file_content(&in_filed_tree.file_id)
-                .map(|c| scan_gmod_keywords(c, &combined_hook_prefixes))
+                .map(|c| scan_gmod_keywords(c, &combined_hook_prefixes_with_colon))
                 .unwrap_or_default();
 
             let s = std::time::Instant::now();
@@ -172,15 +191,16 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                         let m = detect_scoped_class_from_path(db, in_filed_tree.file_id)?;
                         let extra_globals =
                             compute_extra_scope_matches(db, in_filed_tree.file_id, &m.global_name);
+                        let aliases = remap_scoped_alias(
+                            &m.global_name,
+                            &db.get_emmyrc().gmod.scripted_class_scopes,
+                        );
                         db.get_gmod_infer_index_mut().set_scoped_class_info(
                             in_filed_tree.file_id,
                             GmodScopedClassInfo {
                                 class_name: m.class_name.clone(),
                                 global_name: m.global_name.clone(),
-                                aliases: vec![remap_scoped_alias(&m.global_name)]
-                                    .into_iter()
-                                    .filter(|a| !a.is_empty())
-                                    .collect(),
+                                aliases,
                                 is_global_singleton: m.is_global_singleton,
                                 extra_scope_matches: extra_globals,
                             },
@@ -836,7 +856,8 @@ fn ensure_scoped_class_type_decl(
         );
     }
 
-    for super_type in scoped_class_super_types(global_name) {
+    let scoped_class_scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+    for super_type in scoped_class_super_types(global_name, scoped_class_scopes) {
         let has_super = db
             .get_type_index()
             .get_super_types_iter(&class_decl_id)
@@ -850,15 +871,29 @@ fn ensure_scoped_class_type_decl(
     class_decl_id
 }
 
-fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
+fn scoped_class_super_types(
+    global_name: &str,
+    scoped_class_scopes: &crate::config::EmmyrcGmodScriptedClassScopes,
+) -> Vec<LuaType> {
     let mut super_types = vec![LuaType::Ref(LuaTypeDeclId::global(global_name))];
+
+    // Built-in GMod engine super_types (not plugin-specific)
     match global_name {
         "TOOL" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Tool"))),
         "SWEP" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Weapon"))),
         "ENT" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Entity"))),
         "PLUGIN" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("GM"))),
-        "SCHEMA" | "Schema" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("GM"))),
         _ => {}
+    }
+
+    // Config-driven super_types (e.g., SCHEMA -> GM from Helix preset)
+    for super_type_name in scoped_class_scopes.super_types_for_global(global_name) {
+        let super_type = LuaType::Ref(LuaTypeDeclId::global(&super_type_name));
+        if !super_types.iter().any(
+            |t| matches!(t, LuaType::Ref(id) if id.get_simple_name() == super_type_name.as_str()),
+        ) {
+            super_types.push(super_type);
+        }
     }
 
     super_types
@@ -1102,14 +1137,39 @@ fn remap_scoped_base_name(scope_match: &GmodScopedClassMatch, base_name: &str) -
     base_name.to_string()
 }
 
-pub(crate) fn remap_scoped_alias(global_name: &str) -> String {
-    match global_name {
-        // When classGlobal is "SCHEMA", "Schema" is the runtime alias (e.g. Helix).
-        "SCHEMA" => "Schema".to_string(),
-        // When classGlobal is "Schema", "SCHEMA" is the conventional uppercase alias.
-        "Schema" => "SCHEMA".to_string(),
-        _ => "".to_string(),
+pub(crate) fn remap_scoped_alias(
+    global_name: &str,
+    scopes: &crate::config::EmmyrcGmodScriptedClassScopes,
+) -> Vec<String> {
+    // Return all aliases for the scope whose class_global matches global_name.
+    // If global_name is itself an alias, find the canonical scope and return all aliases.
+    let definitions = scopes.resolved_definitions();
+
+    for definition in definitions {
+        // Check if global_name matches the canonical class_global
+        if definition.class_global.eq_ignore_ascii_case(global_name) {
+            return definition.aliases.clone();
+        }
+        // Check if global_name matches any alias
+        if definition
+            .aliases
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(global_name))
+        {
+            // Return the canonical class_global + all other aliases
+            let mut result = vec![definition.class_global.clone()];
+            result.extend(
+                definition
+                    .aliases
+                    .iter()
+                    .filter(|a| !a.eq_ignore_ascii_case(global_name))
+                    .cloned(),
+            );
+            return result;
+        }
     }
+
+    Vec::new()
 }
 
 /// A wrapper function that internally calls NetworkVar or NetworkVarElement.
@@ -2591,12 +2651,19 @@ fn is_configured_method_hook_prefix(db: &DbIndex, prefix_name: &str) -> bool {
 /// Returns `true` when `prefix_name` matches a configured `gmod.scriptedOwners.include` entry
 /// whose `hookOwner` flag is `true` (including aliases).
 fn is_scripted_hook_owner_prefix(db: &DbIndex, prefix_name: &str) -> bool {
-    db.get_emmyrc()
+    let emmyrc = db.get_emmyrc();
+    emmyrc
         .gmod
         .scripted_owners
         .hook_owner_names()
         .iter()
         .any(|name| name.eq_ignore_ascii_case(prefix_name))
+        || emmyrc
+            .gmod
+            .scripted_class_scopes
+            .hook_owner_globals()
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(prefix_name))
 }
 
 #[derive(Debug, Clone)]

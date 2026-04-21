@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod test {
     use crate::{
-        Emmyrc, EmmyrcGmodRealm, GmodConVarKind, GmodHookKind, GmodHookNameIssue, GmodRealm,
-        GmodTimerKind, VirtualWorkspace,
+        Emmyrc, EmmyrcGmodRealm, EmmyrcGmodScriptedClassDefinition,
+        EmmyrcGmodScriptedClassScopeEntry, GmodConVarKind, GmodHookKind, GmodHookNameIssue,
+        GmodRealm, GmodTimerKind, VirtualWorkspace,
     };
     use googletest::prelude::*;
 
@@ -428,10 +429,37 @@ mod test {
     }
 
     #[gtest]
-    fn test_hook_detection_treats_schema_as_builtin_owner_without_config() {
-        let mut ws = VirtualWorkspace::new();
-        set_gmod_enabled(&mut ws);
-        let file_id = ws.def(
+    fn test_hook_detection_with_schema_scope_config() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        // Add SCHEMA scope with hook_owner = true
+        emmyrc.gmod.scripted_class_scopes.include =
+            vec![EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(
+                EmmyrcGmodScriptedClassDefinition {
+                    id: "helix-schema".to_string(),
+                    class_global: Some("SCHEMA".to_string()),
+                    include: Some(vec!["schema/**".to_string()]),
+                    label: Some("Helix Schema".to_string()),
+                    path: Some(vec!["schema".to_string()]),
+                    root_dir: Some("schema".to_string()),
+                    fixed_class_name: Some("SCHEMA".to_string()),
+                    is_global_singleton: Some(true),
+                    strip_file_prefix: None,
+                    hide_from_outline: None,
+                    aliases: Some(vec!["Schema".to_string()]),
+                    super_types: Some(vec!["GM".to_string()]),
+                    hook_owner: Some(true),
+                    exclude: None,
+                    parent_id: None,
+                    icon: None,
+                    scaffold: None,
+                    disabled: None,
+                },
+            ))];
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "schema/sh_schema.lua",
             r#"
             function SCHEMA:PlayerSpawn(client) end
             "#,
