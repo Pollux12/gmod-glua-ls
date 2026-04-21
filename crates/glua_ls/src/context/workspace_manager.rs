@@ -1264,39 +1264,49 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.auto_load_annotations = Some(false);
 
-        let mut client_config = ClientConfig::default();
-        client_config.gmod_plugin_library_paths = vec!["/plugins/darkrp".to_string()];
+        let client_config = ClientConfig {
+            gmod_plugin_library_paths: vec!["/plugins/darkrp".to_string()],
+            ..Default::default()
+        };
 
         inject_gmod_plugin_libraries(&client_config, &mut emmyrc);
-        assert!(!emmyrc
-            .workspace
-            .library
-            .iter()
-            .any(|item| item.get_path() == "/plugins/darkrp"));
+        assert!(
+            !emmyrc
+                .workspace
+                .library
+                .iter()
+                .any(|item| item.get_path() == "/plugins/darkrp")
+        );
     }
 
     #[test]
     fn test_inject_gmod_plugin_libraries_appends_unique_paths() {
         let mut emmyrc = Emmyrc::default();
-        let mut client_config = ClientConfig::default();
-        client_config.gmod_plugin_library_paths = vec![
-            "/plugins/darkrp".to_string(),
-            "/plugins/darkrp".to_string(),
-            "/plugins/helix".to_string(),
-        ];
+        let client_config = ClientConfig {
+            gmod_plugin_library_paths: vec![
+                "/plugins/darkrp".to_string(),
+                "/plugins/darkrp".to_string(),
+                "/plugins/helix".to_string(),
+            ],
+            ..Default::default()
+        };
 
         inject_gmod_plugin_libraries(&client_config, &mut emmyrc);
 
-        assert!(emmyrc
-            .workspace
-            .library
-            .iter()
-            .any(|item| item.get_path() == "/plugins/darkrp"));
-        assert!(emmyrc
-            .workspace
-            .library
-            .iter()
-            .any(|item| item.get_path() == "/plugins/helix"));
+        assert!(
+            emmyrc
+                .workspace
+                .library
+                .iter()
+                .any(|item| item.get_path() == "/plugins/darkrp")
+        );
+        assert!(
+            emmyrc
+                .workspace
+                .library
+                .iter()
+                .any(|item| item.get_path() == "/plugins/helix")
+        );
     }
 
     #[test]

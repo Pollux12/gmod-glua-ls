@@ -1552,6 +1552,15 @@
             "verbosity": "normal"
           }
         },
+        "plugins": {
+          "default": [],
+          "description": "Ordered plugin ids persisted by editor integrations.\nThe language server remains plugin-agnostic and consumes resolved config only.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-gluals-editor": "pluginList"
+        },
         "scriptedClassScopes": {
           "$ref": "#/$defs/EmmyrcGmodScriptedClassScopes",
           "default": {
@@ -1654,22 +1663,16 @@
                     }
                   ]
                 }
-              },
-              {
-                "classGlobal": "PLUGIN",
-                "icon": "extensions",
-                "id": "plugins",
-                "include": [
-                  "plugins/**"
-                ],
-                "label": "Plugins",
-                "path": [
-                  "plugins"
-                ],
-                "rootDir": "plugins"
               }
             ]
           }
+        },
+        "scriptedOwners": {
+          "$ref": "#/$defs/EmmyrcGmodScriptedOwners",
+          "default": {
+            "include": []
+          },
+          "description": "Configures additional hook-owner globals beyond the built-in\n`GM` / `GAMEMODE` / `SANDBOX` / `PLUGIN` set."
         },
         "templatePath": {
           "description": "Path to a folder containing custom GLua scaffolding templates (`.lua` files).\nBuilt-in templates are used as fallback when a custom one is not found.\nAccepts an absolute path or a path relative to the workspace root.",
@@ -1808,6 +1811,16 @@
     },
     "EmmyrcGmodScriptedClassDefinition": {
       "properties": {
+        "aliases": {
+          "description": "Additional global names that the runtime exposes for the same singleton\n(e.g. Helix exposes `Schema` as a runtime alias for `SCHEMA`).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "classGlobal": {
           "type": [
             "string",
@@ -1829,6 +1842,27 @@
             "null"
           ]
         },
+        "fixedClassName": {
+          "description": "When set, every file matched by this scope's include patterns resolves to\nthis fixed class name instead of deriving a name from the next path segment.\nUse for singleton / global scripted classes like `SCHEMA` in Helix where\nthere is only one class instance for the whole directory tree.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hideFromOutline": {
+          "description": "When `true`, this scope definition is excluded from the outline/class\nexplorer tree view. Useful for global singletons like `Schema` that\nshould not appear as a folder in the explorer because there is only\never one instance.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "hookOwner": {
+          "description": "Whether this scope's classGlobal should be treated as a hook owner (its method\ndefinitions count as hook entry points, included in hook prefix lists). Defaults to `false`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "icon": {
           "type": [
             "string",
@@ -1844,6 +1878,13 @@
           },
           "type": [
             "array",
+            "null"
+          ]
+        },
+        "isGlobalSingleton": {
+          "description": "When `true`, the `classGlobal` variable is a workspace-wide singleton that should be\nregistered as a global (accessible from any file), not a per-file local.\nUse for globals like `Schema` in Helix that are set once and persist globally,\nsimilar to how `GM` works.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -1882,6 +1923,23 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "stripFilePrefix": {
+          "description": "When `true`, the `sh_`, `sv_`, and `cl_` realm prefixes are stripped from\nsingle-file class names when the class name is derived from the filename.\nFor example, `sh_administrator.lua` becomes `administrator` instead of\n`sh_administrator`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "superTypes": {
+          "description": "Class types that this scope's classGlobal inherits from. Used to resolve\nmember lookups on subclass globals to the parent class (e.g. SCHEMA inherits from GM).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
           ]
         }
       },
@@ -2029,19 +2087,6 @@
                   }
                 ]
               }
-            },
-            {
-              "classGlobal": "PLUGIN",
-              "icon": "extensions",
-              "id": "plugins",
-              "include": [
-                "plugins/**"
-              ],
-              "label": "Plugins",
-              "path": [
-                "plugins"
-              ],
-              "rootDir": "plugins"
             }
           ],
           "items": {
@@ -2049,6 +2094,90 @@
           },
           "type": "array",
           "x-gluals-editor": "scriptedClassTable"
+        }
+      },
+      "type": "object"
+    },
+    "EmmyrcGmodScriptedOwnerEntry": {
+      "description": "A single entry in `gmod.scriptedOwners.include`.",
+      "properties": {
+        "aliases": {
+          "description": "Additional names that resolve to the same owner type (e.g. `[\"GAMEMODE\"]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "disabled": {
+          "description": "Set to `true` to suppress this entry without removing it from the config.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "exclude": {
+          "description": "Glob patterns for files to exclude from this owner.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "fallbackOwners": {
+          "description": "Other owner globals to fall back to when looking up hook docs or completing\nmember access (e.g. `[\"SANDBOX\"]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "global": {
+          "description": "Primary global name (e.g. `\"GM\"`).",
+          "type": "string"
+        },
+        "hookOwner": {
+          "description": "Whether methods on this global are hook entry points used when resolving\n`hook.Add` callback parameters.  Defaults to `false`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Unique identifier for this entry (used for duplicate detection).",
+          "type": "string"
+        },
+        "include": {
+          "description": "Glob patterns for files that belong to this owner (required, at least one).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "global",
+        "include"
+      ],
+      "type": "object"
+    },
+    "EmmyrcGmodScriptedOwners": {
+      "description": "Configuration for `gmod.scriptedOwners`.",
+      "properties": {
+        "include": {
+          "default": [],
+          "description": "List of scripted-owner entries.  Empty by default; add entries to describe\nadditional hook-owner globals beyond the built-in\n`GM` / `GAMEMODE` / `SANDBOX` / `PLUGIN` set.",
+          "items": {
+            "$ref": "#/$defs/EmmyrcGmodScriptedOwnerEntry"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -2731,6 +2860,7 @@
         "outline": {
           "verbosity": "normal"
         },
+        "plugins": [],
         "scriptedClassScopes": {
           "include": [
             {
@@ -2831,21 +2961,11 @@
                   }
                 ]
               }
-            },
-            {
-              "classGlobal": "PLUGIN",
-              "icon": "extensions",
-              "id": "plugins",
-              "include": [
-                "plugins/**"
-              ],
-              "label": "Plugins",
-              "path": [
-                "plugins"
-              ],
-              "rootDir": "plugins"
             }
           ]
+        },
+        "scriptedOwners": {
+          "include": []
         },
         "vgui": {
           "codeLensEnabled": true,
