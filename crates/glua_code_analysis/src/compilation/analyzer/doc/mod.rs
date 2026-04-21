@@ -140,3 +140,14 @@ pub fn preprocess_description(mut description: &str, owner: Option<&LuaSemanticD
     // trim end
     result.trim_end().to_string()
 }
+
+pub(super) fn normalize_doc_string_const(value: String) -> String {
+    if let Some(inner) = value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return inner.to_string();
+    }
+    if let Some(inner) = value.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return inner.to_string();
+    }
+
+    value
+}

@@ -1932,3 +1932,43 @@ fn test_reassigned_inferred_member_does_not_lock_to_last_literal() {
         "#
     ));
 }
+
+#[test]
+fn test_doc_string_union_with_legacy_wrapped_literals_accepts_matching_string() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class CAMI_PRIVILEGE
+        ---@field MinAccess "'user'" | "'admin'" | "'superadmin'"
+
+        ---@param privilege CAMI_PRIVILEGE
+        local function register_privilege(privilege)
+        end
+
+        register_privilege({
+            MinAccess = "superadmin"
+        })
+        "#
+    ));
+}
+
+#[test]
+fn test_doc_string_union_with_legacy_wrapped_literals_stays_strict() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class CAMI_PRIVILEGE
+        ---@field MinAccess "'user'" | "'admin'" | "'superadmin'"
+
+        ---@param privilege CAMI_PRIVILEGE
+        local function register_privilege(privilege)
+        end
+
+        register_privilege({
+            MinAccess = "root"
+        })
+        "#
+    ));
+}

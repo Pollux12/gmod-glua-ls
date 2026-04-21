@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-use super::{DocAnalyzer, preprocess_description};
+use super::{DocAnalyzer, normalize_doc_string_const, preprocess_description};
 
 pub fn infer_type(analyzer: &mut DocAnalyzer, node: LuaDocType) -> LuaType {
     match &node {
@@ -59,7 +59,8 @@ pub fn infer_type(analyzer: &mut DocAnalyzer, node: LuaDocType) -> LuaType {
             if let Some(literal_token) = literal.get_literal() {
                 match literal_token {
                     LuaLiteralToken::String(str_token) => {
-                        return LuaType::DocStringConst(SmolStr::new(str_token.get_value()).into());
+                        let value = normalize_doc_string_const(str_token.get_value());
+                        return LuaType::DocStringConst(SmolStr::new(value).into());
                     }
                     LuaLiteralToken::Number(number_token) => {
                         if let NumberResult::Int(i) = number_token.get_number_value() {

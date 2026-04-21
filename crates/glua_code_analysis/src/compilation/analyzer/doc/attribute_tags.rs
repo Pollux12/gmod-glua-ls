@@ -9,6 +9,7 @@ use crate::{
     compilation::analyzer::doc::{
         DocAnalyzer,
         infer_type::infer_type,
+        normalize_doc_string_const,
         tags::{get_owner_id, report_orphan_tag},
     },
 };
@@ -107,7 +108,8 @@ fn infer_attribute_arg_type(expr: LuaLiteralExpr) -> LuaType {
     if let Some(literal_token) = expr.get_literal() {
         match literal_token {
             LuaLiteralToken::String(str_token) => {
-                return LuaType::DocStringConst(SmolStr::new(str_token.get_value()).into());
+                let value = normalize_doc_string_const(str_token.get_value());
+                return LuaType::DocStringConst(SmolStr::new(value).into());
             }
             LuaLiteralToken::Number(number_token) => {
                 if let NumberResult::Int(i) = number_token.get_number_value() {
