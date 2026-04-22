@@ -202,6 +202,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 if let Some(realm) = collect_realm_annotation(&in_filed_tree.value) {
                     annotation_realms.insert(in_filed_tree.file_id, realm);
                 }
+                let member_ranges = collect_member_realm_ranges(&in_filed_tree.value);
+                db.get_gmod_infer_index_mut()
+                    .set_member_realm_ranges(in_filed_tree.file_id, member_ranges);
             }
             t_realm += s.elapsed();
 
@@ -2906,6 +2909,32 @@ fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
         "shared" => Some(GmodRealm::Shared),
         _ => None,
     }
+}
+
+/// Collect `---@realm` ranges from every function/local-function decl in `root`.
+fn collect_member_realm_ranges(root: &LuaChunk) -> Vec<GmodRealmRange> {
+    let mut ranges = Vec::new();
+    for func_stat in root.descendants::<LuaFuncStat>() {
+        if let Some(comment) = func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            ranges.push(GmodRealmRange {
+                range: func_stat.get_range(),
+                realm,
+            });
+        }
+    }
+    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
+        if let Some(comment) = local_func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            ranges.push(GmodRealmRange {
+                range: local_func_stat.get_range(),
+                realm,
+            });
+        }
+    }
+    ranges
 }
 
 /// Extract realm narrowing from a single if-statement, handling if/elseif/else clauses.

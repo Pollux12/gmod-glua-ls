@@ -3973,11 +3973,59 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_field_narrow_drops_wrong_realm_subclass_in_serverside_scope() {
+        // Realm-aware narrow: in server scope, drop EFFECT (client `Foo`)
+        // from a `[EFFECT, ENT]` narrow union; keep ENT (server `Foo`).
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@realm server
+
+            ---@class Entity
+
+            ---@class EFFECT : Entity
+            EFFECT = {}
+
+            ---@realm client
+            function EFFECT:Foo() end
+
+            ---@class ENT : Entity
+            ENT = {}
+
+            ---@realm server
+            function ENT:Foo() end
+
+            ---@param ent Entity?
+            local function test(ent)
+                if ent and ent.Foo then
+                    a = ent
+                end
+            end
+            "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::GmodRealmMismatchHeuristic),
+            eq(false),
+            "realm-aware narrowing must not produce a wrong-realm diagnostic"
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "a", 0);
+        let desc = ws.humanize_type(narrowed);
+        assert_that!(
+            desc.contains("EFFECT"),
+            eq(false),
+            "narrowed type must drop wrong-realm subclass EFFECT in serverside scope: {}",
+            desc
+        );
+    }
+
+    #[gtest]
     fn test_field_narrow_does_not_pick_subclass_when_base_directly_defines_field() {
-        // Regression: `Entity` directly defines `EndTouch`. A subclass `EFFECT`
-        // overrides `EndTouch`. When narrowing a value typed as `Entity` via
-        // `if x.EndTouch then`, the result must remain `Entity` and must NOT
-        // collapse to `EFFECT` just because EFFECT is a more direct definer.
+        // `if x.EndTouch then` on `Entity` must not collapse to `EFFECT`
+        // override — the base already defines the field.
         let mut ws = VirtualWorkspace::new();
         ws.def(
             r#"

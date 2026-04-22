@@ -1,8 +1,8 @@
-use glua_parser::{LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexMemberExpr};
+use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexMemberExpr};
 
 use crate::{
-    DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaInferCache, LuaMemberKey,
-    LuaMemberOwner, LuaType,
+    DbIndex, FlowNode, FlowTree, GmodRealm, InferFailReason, InferGuard, LuaInferCache,
+    LuaMemberKey, LuaMemberOwner, LuaType,
     semantic::infer::{
         VarRefId,
         infer_index::infer_member_by_member_key,
@@ -94,13 +94,9 @@ fn maybe_field_exist_narrow(
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
 
-    // Bug fix: when the input is a single concrete `Ref`/`Def` that already
-    // directly defines the queried field, the field-existence check is
-    // useless since every value of this type already has the field. Falling
-    // through to class expansion + "direct definer" filtering
-    // can sometimes narrow to a an incorrect override (e.g. `Entity` →
-    // `EFFECT` because `EFFECT` overrides `EndTouch`), which then causes
-    // false-positive realm/type diagnostics.
+    // If the base type already directly owns the field, the field-existence
+    // check tells us nothing new. Skip subtype expansion to avoid wrongly
+    // narrowing to a subclass override (e.g. Entity -> EFFECT).
     if matches!(condition_flow, InferConditionFlow::TrueCondition)
         && let LuaType::Ref(type_id) | LuaType::Def(type_id) = &left_type
     {
@@ -162,6 +158,7 @@ fn maybe_field_exist_narrow(
             } else {
                 result
             };
+            let narrowed = filter_candidates_by_caller_realm(db, cache, narrowed, &index);
             if !narrowed.is_empty() {
                 return Ok(ResultTypeOrContinue::Result(LuaType::from_vec(narrowed)));
             }
@@ -288,6 +285,69 @@ fn is_strict_sub_type_of(db: &DbIndex, candidate: &LuaType, possible_base: &LuaT
 
     candidate_id != base_id
         && crate::semantic::type_check::is_sub_type_of(db, &candidate_id.clone(), base_id)
+}
+
+/// Drop narrow candidates whose member decls all carry a conflicting
+/// `---@realm`. Only fires for unions of >=2 candidates in Client/Server
+/// scope. Never returns empty.
+fn filter_candidates_by_caller_realm(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    candidates: Vec<LuaType>,
+    index: &LuaIndexMemberExpr,
+) -> Vec<LuaType> {
+    if candidates.len() < 2 {
+        return candidates;
+    }
+    let caller_file_id = cache.get_file_id();
+    let caller_offset = index.get_range().start();
+    let gmod_infer = db.get_gmod_infer_index();
+    let caller_realm = gmod_infer.get_realm_at_offset(&caller_file_id, caller_offset);
+    if !matches!(caller_realm, GmodRealm::Client | GmodRealm::Server) {
+        return candidates;
+    }
+    let Some(index_key) = index.get_index_key() else {
+        return candidates;
+    };
+    let Ok(key) = LuaMemberKey::from_index_key(db, cache, &index_key) else {
+        return candidates;
+    };
+    let member_index = db.get_member_index();
+
+    let filtered: Vec<LuaType> = candidates
+        .iter()
+        .filter(|t| {
+            let type_id = match t {
+                LuaType::Ref(id) | LuaType::Def(id) => id,
+                _ => return true,
+            };
+            let owner = LuaMemberOwner::Type(type_id.clone());
+            let global_owner =
+                LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
+            let mut decls = member_index.get_members_for_owner_key(&owner, &key);
+            decls.extend(member_index.get_members_for_owner_key(&global_owner, &key));
+            if decls.is_empty() {
+                // Inherited member, can't decide — keep.
+                return true;
+            }
+            // Keep if any decl is compatible (no anno / shared / matches caller).
+            decls.iter().any(|m| {
+                let decl_file = m.get_file_id();
+                let decl_offset = m.get_range().start();
+                match gmod_infer.get_member_annotation_realm_at_offset(&decl_file, decl_offset) {
+                    None | Some(GmodRealm::Shared | GmodRealm::Unknown) => true,
+                    Some(r) => r == caller_realm,
+                }
+            })
+        })
+        .cloned()
+        .collect();
+
+    if filtered.is_empty() {
+        candidates
+    } else {
+        filtered
+    }
 }
 
 /// Walk up an index chain looking for the leftmost prefix that resolves to the

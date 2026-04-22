@@ -193,6 +193,9 @@ pub struct GmodInferIndex {
     system_aggregate_cache: OnceLock<GmodSystemAggregate>,
     realm_file_metadata: HashMap<FileId, GmodRealmFileMetadata>,
     gm_method_realm_annotations: HashMap<FileId, Vec<(String, GmodRealm)>>,
+    /// `---@realm` ranges over function decls, sorted by start offset.
+    /// Used by narrow + diagnostics for O(log n) realm lookup per member.
+    member_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>>,
     /// Pre-indexed @fileparam annotations per file: (param_name_lowercase, type_text)
     fileparam_index: HashMap<FileId, Vec<(String, String)>>,
     /// Cached scoped class detection results, computed once during gmod_pre.
@@ -207,6 +210,7 @@ impl GmodInferIndex {
             system_aggregate_cache: OnceLock::new(),
             realm_file_metadata: HashMap::new(),
             gm_method_realm_annotations: HashMap::new(),
+            member_realm_ranges: HashMap::new(),
             fileparam_index: HashMap::new(),
             scoped_class_info: HashMap::new(),
         }
@@ -388,6 +392,37 @@ impl GmodInferIndex {
         self.gm_method_realm_annotations.iter()
     }
 
+    /// Store per-file member realm ranges. Empty Vec clears. Sorted by start.
+    pub fn set_member_realm_ranges(&mut self, file_id: FileId, mut ranges: Vec<GmodRealmRange>) {
+        if ranges.is_empty() {
+            self.member_realm_ranges.remove(&file_id);
+            return;
+        }
+        ranges.sort_by_key(|r| r.range.start());
+        self.member_realm_ranges.insert(file_id, ranges);
+    }
+
+    /// Look up the `---@realm` covering a member decl at `offset`. O(log n).
+    pub fn get_member_annotation_realm_at_offset(
+        &self,
+        file_id: &FileId,
+        offset: rowan::TextSize,
+    ) -> Option<GmodRealm> {
+        let ranges = self.member_realm_ranges.get(file_id)?;
+        let idx = match ranges.binary_search_by_key(&offset, |r| r.range.start()) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        for i in [idx, idx.saturating_sub(1)] {
+            if let Some(r) = ranges.get(i)
+                && r.range.contains(offset)
+            {
+                return Some(r.realm);
+            }
+        }
+        None
+    }
+
     pub fn set_file_params(&mut self, file_id: FileId, params: Vec<(String, String)>) {
         if !params.is_empty() {
             self.fileparam_index.insert(file_id, params);
@@ -419,6 +454,7 @@ impl LuaIndex for GmodInferIndex {
         self.invalidate_system_aggregate_cache();
         self.realm_file_metadata.remove(&file_id);
         self.gm_method_realm_annotations.remove(&file_id);
+        self.member_realm_ranges.remove(&file_id);
         self.fileparam_index.remove(&file_id);
         self.scoped_class_info.remove(&file_id);
     }
@@ -429,6 +465,7 @@ impl LuaIndex for GmodInferIndex {
         self.invalidate_system_aggregate_cache();
         self.realm_file_metadata.clear();
         self.gm_method_realm_annotations.clear();
+        self.member_realm_ranges.clear();
         self.fileparam_index.clear();
         self.scoped_class_info.clear();
     }
