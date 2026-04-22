@@ -1437,21 +1437,21 @@
     "EmmyrcGmod": {
       "properties": {
         "annotationsPath": {
-          "description": "Path to GMod annotations to load as core library.\nWhen set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).\nSet to explicit path to override, or use `autoLoadAnnotations: false` in .gluarc to disable entirely.",
+          "description": "Override the GMod annotations path. Leave empty to use auto-downloaded annotations.",
           "type": [
             "string",
             "null"
           ]
         },
         "autoDetectGamemodeBase": {
-          "description": "Automatically detect and add the base gamemode as a library when a gamemode\nderives from another (via the `\"base\"` field in the gamemode `.txt` file).\nSet to `false` to disable this detection.",
+          "description": "Automatically add the base gamemode as a library when a gamemode derives from another.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "autoLoadAnnotations": {
-          "description": "Disable auto-loading of annotations (from VSCode or default path).\nThis takes precedence over extension settings.",
+          "description": "Disable auto-loading of GMod annotations.",
           "type": [
             "boolean",
             "null"
@@ -1672,10 +1672,10 @@
           "default": {
             "include": []
           },
-          "description": "Configures additional hook-owner globals beyond the built-in\n`GM` / `GAMEMODE` / `SANDBOX` / `PLUGIN` set."
+          "description": "Additional hook-owner configurations beyond the built-in GM/GAMEMODE/SANDBOX/PLUGIN set."
         },
         "templatePath": {
-          "description": "Path to a folder containing custom GLua scaffolding templates (`.lua` files).\nBuilt-in templates are used as fallback when a custom one is not found.\nAccepts an absolute path or a path relative to the workspace root.",
+          "description": "Path to custom GLua scaffolding templates folder.",
           "type": [
             "string",
             "null"
@@ -1812,7 +1812,7 @@
     "EmmyrcGmodScriptedClassDefinition": {
       "properties": {
         "aliases": {
-          "description": "Additional global names that the runtime exposes for the same singleton\n(e.g. Helix exposes `Schema` as a runtime alias for `SCHEMA`).",
+          "description": "Additional global names for the same class (e.g. Schema as an alias for SCHEMA).",
           "items": {
             "type": "string"
           },
@@ -1843,21 +1843,21 @@
           ]
         },
         "fixedClassName": {
-          "description": "When set, every file matched by this scope's include patterns resolves to\nthis fixed class name instead of deriving a name from the next path segment.\nUse for singleton / global scripted classes like `SCHEMA` in Helix where\nthere is only one class instance for the whole directory tree.",
+          "description": "Use a fixed class name for all matched files instead of deriving one from the path (e.g. SCHEMA).",
           "type": [
             "string",
             "null"
           ]
         },
         "hideFromOutline": {
-          "description": "When `true`, this scope definition is excluded from the outline/class\nexplorer tree view. Useful for global singletons like `Schema` that\nshould not appear as a folder in the explorer because there is only\never one instance.",
+          "description": "Hide this scope from the Class Explorer tree.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "hookOwner": {
-          "description": "Whether this scope's classGlobal should be treated as a hook owner (its method\ndefinitions count as hook entry points, included in hook prefix lists). Defaults to `false`.",
+          "description": "Treat methods on this classGlobal as hook entry points.",
           "type": [
             "boolean",
             "null"
@@ -1882,7 +1882,7 @@
           ]
         },
         "isGlobalSingleton": {
-          "description": "When `true`, the `classGlobal` variable is a workspace-wide singleton that should be\nregistered as a global (accessible from any file), not a per-file local.\nUse for globals like `Schema` in Helix that are set once and persist globally,\nsimilar to how `GM` works.",
+          "description": "Register classGlobal as a workspace-wide singleton, accessible from any file.",
           "type": [
             "boolean",
             "null"
@@ -1926,14 +1926,14 @@
           ]
         },
         "stripFilePrefix": {
-          "description": "When `true`, the `sh_`, `sv_`, and `cl_` realm prefixes are stripped from\nsingle-file class names when the class name is derived from the filename.\nFor example, `sh_administrator.lua` becomes `administrator` instead of\n`sh_administrator`.",
+          "description": "Strip realm prefixes (sh_, sv_, cl_) from class names derived from filenames.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "superTypes": {
-          "description": "Class types that this scope's classGlobal inherits from. Used to resolve\nmember lookups on subclass globals to the parent class (e.g. SCHEMA inherits from GM).",
+          "description": "Class types this classGlobal inherits from.",
           "items": {
             "type": "string"
           },
@@ -2102,7 +2102,7 @@
       "description": "A single entry in `gmod.scriptedOwners.include`.",
       "properties": {
         "aliases": {
-          "description": "Additional names that resolve to the same owner type (e.g. `[\"GAMEMODE\"]`).",
+          "description": "Additional names that resolve to the same owner type.",
           "items": {
             "type": "string"
           },
@@ -2119,7 +2119,7 @@
           ]
         },
         "exclude": {
-          "description": "Glob patterns for files to exclude from this owner.",
+          "description": "Exclude glob patterns for this owner.",
           "items": {
             "type": "string"
           },
@@ -2129,7 +2129,7 @@
           ]
         },
         "fallbackOwners": {
-          "description": "Other owner globals to fall back to when looking up hook docs or completing\nmember access (e.g. `[\"SANDBOX\"]`).",
+          "description": "Fallback owners to check for hook descriptions (e.g. [\"SANDBOX\"]).",
           "items": {
             "type": "string"
           },
@@ -2139,11 +2139,11 @@
           ]
         },
         "global": {
-          "description": "Primary global name (e.g. `\"GM\"`).",
+          "description": "Primary global name.",
           "type": "string"
         },
         "hookOwner": {
-          "description": "Whether methods on this global are hook entry points used when resolving\n`hook.Add` callback parameters.  Defaults to `false`.",
+          "description": "Treat methods on this global as hook entry points.",
           "type": [
             "boolean",
             "null"
@@ -2154,7 +2154,7 @@
           "type": "string"
         },
         "include": {
-          "description": "Glob patterns for files that belong to this owner (required, at least one).",
+          "description": "Include glob patterns for this owner.",
           "items": {
             "type": "string"
           },
@@ -2173,7 +2173,7 @@
       "properties": {
         "include": {
           "default": [],
-          "description": "List of scripted-owner entries.  Empty by default; add entries to describe\nadditional hook-owner globals beyond the built-in\n`GM` / `GAMEMODE` / `SANDBOX` / `PLUGIN` set.",
+          "description": "Additional hook-owner configurations beyond the built-in GM/GAMEMODE/SANDBOX/PLUGIN set.",
           "items": {
             "$ref": "#/$defs/EmmyrcGmodScriptedOwnerEntry"
           },

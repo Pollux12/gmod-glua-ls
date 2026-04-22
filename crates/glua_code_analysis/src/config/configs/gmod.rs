@@ -77,7 +77,7 @@ pub struct EmmyrcGmod {
     pub infer_dynamic_fields: bool,
     #[serde(default = "dynamic_fields_global_default")]
     pub dynamic_fields_global: bool,
-    /// Path to GMod annotations to load as core library.
+    /// Override path to GMod annotations directory. Set to empty to use VSCode downloaded annotations.
     /// When set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).
     /// Set to explicit path to override, or use `autoLoadAnnotations: false` in .gluarc to disable entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,17 +86,17 @@ pub struct EmmyrcGmod {
     /// This takes precedence over extension settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_load_annotations: Option<bool>,
-    /// Path to a folder containing custom GLua scaffolding templates (`.lua` files).
+    /// Path to custom GLua scaffolding templates folder.
     /// Built-in templates are used as fallback when a custom one is not found.
     /// Accepts an absolute path or a path relative to the workspace root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_path: Option<String>,
-    /// Automatically detect and add the base gamemode as a library when a gamemode
+    /// Automatically add base gamemodes as libraries.
     /// derives from another (via the `"base"` field in the gamemode `.txt` file).
     /// Set to `false` to disable this detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_detect_gamemode_base: Option<bool>,
-    /// Configures additional hook-owner globals beyond the built-in
+    /// Additional hook-owner globals beyond GM/GAMEMODE/SANDBOX/PLUGIN.
     /// `GM` / `GAMEMODE` / `SANDBOX` / `PLUGIN` set.
     #[serde(default)]
     pub scripted_owners: EmmyrcGmodScriptedOwners,
@@ -143,13 +143,13 @@ pub struct EmmyrcGmodScriptedClassDefinition {
     /// there is only one class instance for the whole directory tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_class_name: Option<String>,
-    /// When `true`, the `classGlobal` variable is a workspace-wide singleton that should be
+    /// Register the classGlobal as a workspace-wide singleton, not a per-file local.
     /// registered as a global (accessible from any file), not a per-file local.
     /// Use for globals like `Schema` in Helix that are set once and persist globally,
     /// similar to how `GM` works.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_global_singleton: Option<bool>,
-    /// When `true`, the `sh_`, `sv_`, and `cl_` realm prefixes are stripped from
+    /// Strip realm prefixes (sh_, sv_, cl_) from derived class names.
     /// single-file class names when the class name is derived from the filename.
     /// For example, `sh_administrator.lua` becomes `administrator` instead of
     /// `sh_administrator`.
@@ -161,15 +161,15 @@ pub struct EmmyrcGmodScriptedClassDefinition {
     /// ever one instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hide_from_outline: Option<bool>,
-    /// Additional global names that the runtime exposes for the same singleton
+    /// Additional global names for the same singleton.
     /// (e.g. Helix exposes `Schema` as a runtime alias for `SCHEMA`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aliases: Option<Vec<String>>,
-    /// Class types that this scope's classGlobal inherits from. Used to resolve
+    /// Class types that this classGlobal inherits from.
     /// member lookups on subclass globals to the parent class (e.g. SCHEMA inherits from GM).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub super_types: Option<Vec<String>>,
-    /// Whether this scope's classGlobal should be treated as a hook owner (its method
+    /// Treat this classGlobal as a hook owner.
     /// definitions count as hook entry points, included in hook prefix lists). Defaults to `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_owner: Option<bool>,
@@ -208,7 +208,7 @@ pub struct ResolvedGmodScriptedClassDefinition {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub class_global: String,
-    /// When set, every file matched by this scope's include patterns uses this
+    /// Use a single fixed class name for all matched files.
     /// fixed class name rather than one derived from the next path segment.
     /// Used for singleton / global scripted classes like `SCHEMA` in Helix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,13 +224,13 @@ pub struct ResolvedGmodScriptedClassDefinition {
     /// When `true`, this scope is hidden from the outline/class explorer tree.
     #[serde(default)]
     pub hide_from_outline: bool,
-    /// Additional global names that the runtime exposes for the same singleton.
+    /// Additional global names for the same singleton.
     #[serde(default)]
     pub aliases: Vec<String>,
-    /// Class types that this scope's classGlobal inherits from.
+    /// Class types that this classGlobal inherits from.
     #[serde(default)]
     pub super_types: Vec<String>,
-    /// Whether this scope's classGlobal should be treated as a hook owner.
+    /// Treat this classGlobal as a hook owner.
     #[serde(default)]
     pub hook_owner: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -949,25 +949,25 @@ fn matches_scope_patterns(
 pub struct EmmyrcGmodScriptedOwnerEntry {
     /// Unique identifier for this entry (used for duplicate detection).
     pub id: String,
-    /// Primary global name (e.g. `"GM"`).
+    /// Primary global name.
     pub global: String,
-    /// Additional names that resolve to the same owner type (e.g. `["GAMEMODE"]`).
+    /// Additional names that resolve to the same owner type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aliases: Option<Vec<String>>,
-    /// Glob patterns for files that belong to this owner (required, at least one).
+    /// Include glob patterns for this owner.
     pub include: Vec<String>,
-    /// Glob patterns for files to exclude from this owner.
+    /// Exclude glob patterns for this owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Vec<String>>,
-    /// Whether methods on this global are hook entry points used when resolving
+    /// Treat methods on this global as hook entry points.
     /// `hook.Add` callback parameters.  Defaults to `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_owner: Option<bool>,
-    /// Other owner globals to fall back to when looking up hook docs or completing
+    /// Fallback owners for unknown hook descriptions.
     /// member access (e.g. `["SANDBOX"]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_owners: Option<Vec<String>>,
-    /// Set to `true` to suppress this entry without removing it from the config.
+    /// Suppress this entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
 }
@@ -988,7 +988,7 @@ pub struct ResolvedGmodScriptedOwnerDefinition {
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedOwners {
-    /// List of scripted-owner entries.  Empty by default; add entries to describe
+    /// Additional hook-owner configurations.
     /// additional hook-owner globals beyond the built-in
     /// `GM` / `GAMEMODE` / `SANDBOX` / `PLUGIN` set.
     #[serde(default)]
