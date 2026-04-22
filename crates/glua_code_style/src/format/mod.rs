@@ -77,10 +77,8 @@ impl LuaFormatter {
                         context.is_line_first_token = true;
                         continue;
                     }
-                    (Some(TokenExpected::Space(n)), _) => {
-                        if !context.is_line_first_token {
-                            context.text.push_str(&" ".repeat(n));
-                        }
+                    (Some(TokenExpected::Space(n)), _) if !context.is_line_first_token => {
+                        context.text.push_str(&" ".repeat(n));
                     }
                     _ => {}
                 }

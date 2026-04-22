@@ -864,12 +864,11 @@ impl LuaObjectType {
         }
 
         let mut ty = LuaType::Unknown;
-        let mut count = 1;
         let mut fields = self.fields.iter().collect::<Vec<_>>();
 
-        fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+        fields.sort_by_key(|(a, _)| *a);
 
-        for (key, value_type) in fields {
+        for (count, (key, value_type)) in (1..).zip(fields) {
             let idx = match key {
                 LuaMemberKey::Integer(i) => i,
                 _ => {
@@ -880,8 +879,6 @@ impl LuaObjectType {
             if *idx != count {
                 return None;
             }
-
-            count += 1;
 
             ty = TypeOps::Union.apply(db, &ty, value_type);
         }
