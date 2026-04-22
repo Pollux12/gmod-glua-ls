@@ -38,6 +38,7 @@ log.workspace = true
 tokio-util.workspace = true
 rust-i18n.workspace = true
 walkdir.workspace = true
+ignore.workspace = true
 dirs.workspace = true
 wax.workspace = true
 percent-encoding.workspace = true

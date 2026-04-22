@@ -2911,7 +2911,7 @@ fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
     }
 }
 
-/// Collect `---@realm` ranges from every function/local-function decl in `root`.
+/// Collect `---@realm` ranges from func/local-func decls in `root`.
 fn collect_member_realm_ranges(root: &LuaChunk) -> Vec<GmodRealmRange> {
     let mut ranges = Vec::new();
     for func_stat in root.descendants::<LuaFuncStat>() {

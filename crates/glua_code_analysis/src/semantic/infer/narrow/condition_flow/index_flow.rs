@@ -94,9 +94,7 @@ fn maybe_field_exist_narrow(
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
 
-    // If the base type already directly owns the field, the field-existence
-    // check tells us nothing new. Skip subtype expansion to avoid wrongly
-    // narrowing to a subclass override (e.g. Entity -> EFFECT).
+    // Base type already owns field directly: skip subtype expansion (avoids Entity -> EFFECT).
     if matches!(condition_flow, InferConditionFlow::TrueCondition)
         && let LuaType::Ref(type_id) | LuaType::Def(type_id) = &left_type
     {
@@ -287,9 +285,8 @@ fn is_strict_sub_type_of(db: &DbIndex, candidate: &LuaType, possible_base: &LuaT
         && crate::semantic::type_check::is_sub_type_of(db, &candidate_id.clone(), base_id)
 }
 
-/// Drop narrow candidates whose member decls all carry a conflicting
-/// `---@realm`. Only fires for unions of >=2 candidates in Client/Server
-/// scope. Never returns empty.
+/// Drop candidates whose decls all carry conflicting `---@realm`.
+/// Fires only on >=2 candidates in Client/Server scope. Never empty.
 fn filter_candidates_by_caller_realm(
     db: &DbIndex,
     cache: &mut LuaInferCache,

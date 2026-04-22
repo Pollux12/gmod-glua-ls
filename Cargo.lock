@@ -850,6 +850,7 @@ dependencies = [
  "glua_diagnostic_macro",
  "glua_parser",
  "googletest",
+ "ignore",
  "include_dir",
  "internment",
  "itertools 0.14.0",

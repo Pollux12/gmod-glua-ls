@@ -193,8 +193,7 @@ pub struct GmodInferIndex {
     system_aggregate_cache: OnceLock<GmodSystemAggregate>,
     realm_file_metadata: HashMap<FileId, GmodRealmFileMetadata>,
     gm_method_realm_annotations: HashMap<FileId, Vec<(String, GmodRealm)>>,
-    /// `---@realm` ranges over function decls, sorted by start offset.
-    /// Used by narrow + diagnostics for O(log n) realm lookup per member.
+    /// Per-file `---@realm` ranges over function decls (sorted, O(log n) lookup).
     member_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>>,
     /// Pre-indexed @fileparam annotations per file: (param_name_lowercase, type_text)
     fileparam_index: HashMap<FileId, Vec<(String, String)>>,
@@ -392,7 +391,7 @@ impl GmodInferIndex {
         self.gm_method_realm_annotations.iter()
     }
 
-    /// Store per-file member realm ranges. Empty Vec clears. Sorted by start.
+    /// Set per-file member realm ranges (sorted). Empty clears.
     pub fn set_member_realm_ranges(&mut self, file_id: FileId, mut ranges: Vec<GmodRealmRange>) {
         if ranges.is_empty() {
             self.member_realm_ranges.remove(&file_id);
@@ -402,7 +401,7 @@ impl GmodInferIndex {
         self.member_realm_ranges.insert(file_id, ranges);
     }
 
-    /// Look up the `---@realm` covering a member decl at `offset`. O(log n).
+    /// `---@realm` covering decl at `offset`. O(log n).
     pub fn get_member_annotation_realm_at_offset(
         &self,
         file_id: &FileId,
