@@ -132,6 +132,11 @@ pub struct EmmyrcGmodScriptedClassDefinition {
     pub root_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaffold: Option<EmmyrcGmodScriptedClassScaffold>,
+    /// Optional prefix prepended to class names derived from the folder segment.
+    /// For example, gamemodes use `"gamemode_"` so a folder `sandbox` produces the
+    /// class name `gamemode_sandbox`, matching the runtime convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_name_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
 }
@@ -166,6 +171,8 @@ pub struct ResolvedGmodScriptedClassDefinition {
     pub root_dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaffold: Option<EmmyrcGmodScriptedClassScaffold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_name_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +379,25 @@ fn scripted_scope_include_default() -> Vec<EmmyrcGmodScriptedClassScopeEntry> {
             Some("plugins"),
             None,
         )),
+        EmmyrcGmodScriptedClassScopeEntry::Definition({
+            let mut definition = default_scripted_class_definition(
+                "gamemodes",
+                "Gamemodes",
+                &["gamemodes"],
+                &["gamemodes/*/gamemode/**"],
+                &[],
+                "GM",
+                None,
+                Some("folder-library"),
+                Some("gamemodes"),
+                None,
+            );
+            // Runtime convention: gamemode tables live at _G["gamemode_<folder>"],
+            // and DEFINE_BASECLASS("gamemode_sandbox") references that name. Prefix
+            // the class name so it matches the runtime identifier.
+            definition.class_name_prefix = Some("gamemode_".to_string());
+            definition
+        }),
     ]
 }
 
@@ -412,6 +438,7 @@ fn default_scripted_class_definition(
         icon: icon.map(str::to_string),
         root_dir: root_dir.map(str::to_string),
         scaffold,
+        class_name_prefix: None,
         disabled: None,
     })
 }
@@ -501,6 +528,12 @@ fn resolve_scripted_class_definition(
             .scaffold
             .clone()
             .filter(|scaffold| !scaffold.files.is_empty()),
+        class_name_prefix: definition
+            .class_name_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -553,6 +586,7 @@ fn merge_scripted_class_definitions(
                     icon: None,
                     root_dir: None,
                     scaffold: None,
+                    class_name_prefix: None,
                     disabled: None,
                 };
 
@@ -887,6 +921,16 @@ fn merge_scripted_class_definition_override(
             .scaffold
             .clone()
             .or_else(|| base.scaffold.clone()),
+        class_name_prefix: if override_definition.class_name_prefix.is_some() {
+            override_definition
+                .class_name_prefix
+                .as_deref()
+                .map(str::trim)
+                .filter(|prefix| !prefix.is_empty())
+                .map(str::to_string)
+        } else {
+            base.class_name_prefix.clone()
+        },
     }
 }
 
@@ -1017,6 +1061,11 @@ impl EmmyrcGmodScriptedClassScopes {
         if class_name.is_empty() {
             return None;
         }
+
+        let class_name = match definition.class_name_prefix.as_deref() {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}{class_name}"),
+            _ => class_name,
+        };
 
         Some(ResolvedGmodScriptedClassMatch {
             definition,
@@ -1164,7 +1213,7 @@ mod tests {
         let definitions = gmod.scripted_class_scopes.resolved_definitions();
         verify_that!(gmod.enabled, eq(true))?;
         verify_that!(gmod.default_realm, eq(EmmyrcGmodRealm::Shared))?;
-        verify_that!(definitions.len(), eq(5usize))?;
+        verify_that!(definitions.len(), eq(6usize))?;
         verify_that!(definitions[0].id.as_str(), eq("entities"))?;
         verify_that!(definitions[0].class_global.as_str(), eq("ENT"))?;
         verify_that!(
@@ -1173,6 +1222,12 @@ mod tests {
         )?;
         verify_that!(definitions[3].parent_id.as_deref(), eq(Some("weapons")))?;
         verify_that!(definitions[4].scaffold.is_none(), eq(true))?;
+        verify_that!(definitions[5].id.as_str(), eq("gamemodes"))?;
+        verify_that!(definitions[5].class_global.as_str(), eq("GM"))?;
+        verify_that!(
+            definitions[5].class_name_prefix.as_deref(),
+            eq(Some("gamemode_"))
+        )?;
         verify_that!(
             gmod.scripted_class_scopes.legacy_exclude.is_empty(),
             eq(true)

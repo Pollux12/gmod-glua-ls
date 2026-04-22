@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAstNode, LuaAstToken, LuaLocalName, LuaNameExpr};
+    use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaLocalName, LuaNameExpr};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
@@ -19,6 +19,56 @@ mod test {
             .iter()
             .map(|pattern| legacy_scope(pattern))
             .collect()
+    }
+
+    fn index_expr_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        semantic_model
+            .get_root()
+            .descendants::<LuaAst>()
+            .find_map(|node| match node {
+                LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
+                    semantic_model
+                        .get_semantic_info(index_expr.syntax().clone().into())
+                        .map(|info| info.typ)
+                }
+                _ => None,
+            })
+            .expect("expected semantic info for index expr")
+    }
+
+    fn super_types_of(ws: &mut VirtualWorkspace, class_name: &str) -> Vec<LuaType> {
+        let db = ws.get_db_mut();
+        db.get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global(class_name))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn add_gamemode_gm_library(ws: &mut VirtualWorkspace) {
+        let library_root = ws.virtual_url_generator.new_path("__test_library_gm");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("gm.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class GM
+                function GM:SetupMove(ply, mv, cmd) end
+                "#
+                .to_string(),
+            ),
+        );
     }
 
     #[gtest]
@@ -3957,5 +4007,556 @@ mod test {
             member_count_after, 1,
             "single-file reindex should retain the latest assignment"
         );
+    }
+
+    // ---- Gamemode scoped-class tests -------------------------------------------------
+    //
+    // Garry's Mod stores gamemode tables at `_G["gamemode_<folder>"]` at runtime, and
+    // `DEFINE_BASECLASS("gamemode_sandbox")` references that runtime name. The built-in
+    // `gamemodes` scoped-class scope (with `class_name_prefix = "gamemode_"`) is what
+    // gives the `GM` table in a gamemode file a class type.
+
+    #[gtest]
+    fn test_gamemode_scope_assigns_prefixed_class_type_to_gm() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "gamemodes/sandbox/gamemode/init.lua",
+            r#"
+            function GM:SetupMove(ply, mv, cmd) end
+        "#,
+        );
+
+        // The scoped-class detection must produce a `gamemode_sandbox` class (folder
+        // name `sandbox` with the `gamemode_` prefix), not plain `sandbox`.
+        let info = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_scoped_class_info(&file_id)
+            .cloned()
+            .expect("expected scoped-class info for gamemode file");
+        assert_eq!(info.class_name, "gamemode_sandbox");
+        assert_eq!(info.global_name, "GM");
+
+        let class_id = LuaTypeDeclId::global("gamemode_sandbox");
+        assert!(
+            ws.get_db_mut()
+                .get_type_index()
+                .get_type_decl(&class_id)
+                .is_some(),
+            "expected a class decl for gamemode_sandbox"
+        );
+    }
+
+    #[gtest]
+    fn test_gamemode_scope_nested_entities_resolve_to_entity_scope() {
+        // A file under `gamemodes/<name>/gamemode/entities/<ent>/...` must be detected
+        // as the ENT scope (class name = ent folder), not as the outer gamemode scope.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "gamemodes/darkrp/gamemode/entities/entities/my_ent/shared.lua",
+            r#"
+            ENT.Type = "anim"
+        "#,
+        );
+
+        let info = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_scoped_class_info(&file_id)
+            .cloned()
+            .expect("expected scoped-class info for nested entity file");
+        assert_eq!(info.class_name, "my_ent");
+        assert_eq!(info.global_name, "ENT");
+    }
+
+    #[gtest]
+    fn test_derive_gamemode_self_base_field_resolves_without_undefined_field() {
+        // End-to-end repro of the user-reported DarkRP scenario:
+        //   DEFINE_BASECLASS("gamemode_sandbox")
+        //   function GM:SetupMove(...) return self.Sandbox.SetupMove(...) end
+        //
+        // Two things must hold:
+        //   1. `self.Sandbox` resolves to the `gamemode_sandbox` class type
+        //      (so hover / completion / goto all work), not to "unknown".
+        //   2. No `UndefinedField` diagnostic fires on `self.Sandbox.SetupMove`.
+        //
+        // The alias is synthesized by the analyzer from `DEFINE_BASECLASS` +
+        // the scope's `classNamePrefix` (`gamemode_` → stripped short name
+        // `sandbox` → capitalized `Sandbox`), so the user does NOT need to
+        // write `GM.Sandbox = BaseClass` themselves for it to work.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        // Base gamemode: defines `SetupMove` on its GM (→ class `gamemode_sandbox`).
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/player.lua",
+            r#"
+            function GM:SetupMove(ply, mv, cmd) end
+        "#,
+        );
+
+        // Deriving gamemode init: just declares the base class. Notably it does
+        // NOT contain `GM.Sandbox = BaseClass` — the analyzer must synthesize
+        // the alias purely from `DEFINE_BASECLASS` metadata.
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            DEFINE_BASECLASS("gamemode_sandbox")
+        "#,
+        );
+
+        // Method on the deriving gamemode's GM that reaches into `self.Sandbox`.
+        let call_file = ws.def_file(
+            "gamemodes/darkrp/gamemode/modules/base/sh_gamemode_functions.lua",
+            r#"
+            function GM:SetupMove(ply, mv, cmd)
+                return self.Sandbox.SetupMove(self, ply, mv, cmd)
+            end
+        "#,
+        );
+
+        // Assertion 1: `Sandbox` member was synthesized on `gamemode_darkrp`
+        // and points at `LuaType::Ref(gamemode_sandbox)`.
+        let derived_id = LuaTypeDeclId::global("gamemode_darkrp");
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(derived_id);
+        let key = LuaMemberKey::Name("Sandbox".into());
+        let member_item = db
+            .get_member_index()
+            .get_member_item(&owner, &key)
+            .expect("expected synthesized `Sandbox` alias member on gamemode_darkrp");
+        let member_id = match member_item {
+            crate::LuaMemberIndexItem::One(id) => *id,
+            crate::LuaMemberIndexItem::Many(ids) => *ids
+                .first()
+                .expect("expected at least one member id for Sandbox alias"),
+        };
+        let bound = db
+            .get_type_index()
+            .get_type_cache(&member_id.into())
+            .expect("synthesized alias should have a bound type");
+        assert!(
+            matches!(bound.as_type(), LuaType::Ref(id) if id == &LuaTypeDeclId::global("gamemode_sandbox")),
+            "Sandbox alias should be typed as gamemode_sandbox, got {:?}",
+            bound.as_type()
+        );
+
+        // Assertion 2: no UndefinedField diagnostic on `self.Sandbox.SetupMove`.
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(call_file, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let offending = diagnostics
+            .iter()
+            .filter(|d| d.code == undefined_field_code)
+            .collect::<Vec<_>>();
+        assert!(
+            offending.is_empty(),
+            "unexpected undefined-field diagnostics on self.Sandbox.SetupMove: {offending:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_parent_alias_skipped_when_scope_has_no_prefix() {
+        // Scopes without `classNamePrefix` (entities, weapons, etc.) should not
+        // get a parent-name alias — the short-name convention is gamemode-
+        // specific and synthesizing a bogus field for e.g. ENT would be wrong.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/entities/base_thing/init.lua",
+            r#"
+            ENT.Type = "anim"
+        "#,
+        );
+
+        // Derived entity that declares a base class via DEFINE_BASECLASS. The
+        // scope's `classNamePrefix` is absent, so we must not synthesize any
+        // alias member (in particular no `Base_thing` / `Basething`).
+        ws.def_file(
+            "lua/entities/derived_thing/init.lua",
+            r#"
+            DEFINE_BASECLASS("base_thing")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("derived_thing"));
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .unwrap_or_default();
+        let member_names: Vec<String> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(ToString::to_string))
+            .collect();
+        assert!(
+            !member_names.iter().any(
+                |n| n.eq_ignore_ascii_case("base_thing") || n.eq_ignore_ascii_case("basething")
+            ),
+            "no parent-name alias should be synthesized when scope lacks classNamePrefix, got {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_parent_alias_skipped_when_prefix_mismatches() {
+        // If the base class name does not start with the scope's prefix, skip
+        // synthesis silently — the class belongs to a different family and
+        // fabricating an alias would be misleading.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "gamemodes/weirdgame/gamemode/init.lua",
+            r#"
+            DEFINE_BASECLASS("not_a_gamemode_class")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_weirdgame"));
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .unwrap_or_default();
+        let member_names: Vec<String> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(ToString::to_string))
+            .collect();
+        assert!(
+            !member_names.iter().any(|n| n == "Not_a_gamemode_class"),
+            "no alias should be synthesized when prefix does not match the base name, got {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_parent_alias_does_not_shadow_user_assignment() {
+        // If the user explicitly writes `GM.Sandbox = BaseClass` themselves,
+        // that real assignment must take precedence. We should not add a
+        // duplicate synthesized decl that could cause ambiguous hover/goto.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/player.lua",
+            r#"
+            function GM:SetupMove(ply, mv, cmd) end
+        "#,
+        );
+
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            DEFINE_BASECLASS("gamemode_sandbox")
+            GM.Sandbox = BaseClass
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_darkrp"));
+        let key = LuaMemberKey::Name("Sandbox".into());
+        let member_item = db
+            .get_member_index()
+            .get_member_item(&owner, &key)
+            .expect("expected a Sandbox member (user-written) on gamemode_darkrp");
+        // Exactly one member id — the user's explicit assignment. No synthetic
+        // duplicate should have been added on top of it.
+        let count = match member_item {
+            crate::LuaMemberIndexItem::One(_) => 1,
+            crate::LuaMemberIndexItem::Many(ids) => ids.len(),
+        };
+        assert_eq!(
+            count, 1,
+            "explicit user-written `GM.Sandbox = BaseClass` should be the only member decl for `Sandbox`, got {count} entries"
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_phantom_gamemode_base_inherits_gm() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        add_gamemode_gm_library(&mut ws);
+
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            DEFINE_BASECLASS("gamemode_sandbox")
+            GM.Sandbox = BaseClass
+        "#,
+        );
+
+        let call_file = ws.def_file(
+            "gamemodes/darkrp/gamemode/modules/base/sh_gamemode_functions.lua",
+            r#"
+            function GM:SetupMove(ply, mv, cmd)
+                return self.Sandbox.SetupMove(self, ply, mv, cmd)
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let base_class_id = LuaTypeDeclId::global("gamemode_sandbox");
+        assert!(db.get_type_index().get_type_decl(&base_class_id).is_some());
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&base_class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("GM"))));
+
+        assert!(!index_expr_type(&mut ws, call_file, "self.Sandbox.SetupMove").is_unknown());
+    }
+
+    #[gtest]
+    fn test_derive_gamemode_equiv_to_define_baseclass() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        add_gamemode_gm_library(&mut ws);
+
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            DeriveGamemode("sandbox")
+            DEFINE_BASECLASS("gamemode_sandbox")
+            GM.Sandbox = BaseClass
+        "#,
+        );
+
+        let super_types = super_types_of(&mut ws, "gamemode_darkrp");
+        assert!(super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("gamemode_sandbox"))));
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_darkrp"));
+        let key = LuaMemberKey::Name("Sandbox".into());
+        let member_item = db.get_member_index().get_member_item(&owner, &key).unwrap();
+        let count = match member_item {
+            crate::LuaMemberIndexItem::One(_) => 1,
+            crate::LuaMemberIndexItem::Many(ids) => ids.len(),
+        };
+        assert_eq!(count, 1);
+    }
+
+    #[gtest]
+    fn test_derive_gamemode_and_define_baseclass_together() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        add_gamemode_gm_library(&mut ws);
+
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            DeriveGamemode("sandbox")
+            DEFINE_BASECLASS("gamemode_sandbox")
+            GM.Sandbox = BaseClass
+        "#,
+        );
+
+        let super_types = super_types_of(&mut ws, "gamemode_darkrp");
+        let sandbox_ref = LuaType::Ref(LuaTypeDeclId::global("gamemode_sandbox"));
+        assert!(super_types.iter().filter(|ty| *ty == &sandbox_ref).count() == 1);
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_darkrp"));
+        let key = LuaMemberKey::Name("Sandbox".into());
+        assert!(
+            db.get_member_index()
+                .get_member_item(&owner, &key)
+                .is_some()
+        );
+    }
+
+    #[gtest]
+    fn test_derive_gamemode_ignores_non_literal_arg() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            local x = "sandbox"
+            DeriveGamemode(x)
+        "#,
+        );
+
+        let super_types = super_types_of(&mut ws, "gamemode_darkrp");
+        assert!(super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("GM"))));
+        assert!(!super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("gamemode_sandbox"))));
+        assert!(
+            ws.get_db_mut()
+                .get_gmod_class_metadata_index()
+                .get_file_metadata(&file_id)
+                .is_some()
+        );
+    }
+
+    #[gtest]
+    fn test_derive_gamemode_does_not_double_prefix() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        add_gamemode_gm_library(&mut ws);
+
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            DeriveGamemode("gamemode_sandbox")
+        "#,
+        );
+
+        let super_types = super_types_of(&mut ws, "gamemode_darkrp");
+        assert!(super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("gamemode_sandbox"))));
+        assert!(!super_types.contains(&LuaType::Ref(LuaTypeDeclId::global(
+            "gamemode_gamemode_sandbox"
+        ))));
+    }
+
+    #[gtest]
+    fn test_derive_gamemode_outside_gamemode_scope_is_ignored() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/autorun/test.lua",
+            r#"
+            DeriveGamemode("sandbox")
+        "#,
+        );
+
+        assert!(
+            ws.get_db_mut()
+                .get_type_index()
+                .get_type_decl(&LuaTypeDeclId::global("gamemode_sandbox"))
+                .is_none()
+        );
+        assert!(
+            ws.get_db_mut()
+                .get_gmod_class_metadata_index()
+                .get_file_metadata(&file_id)
+                .is_some()
+        );
+    }
+
+    #[gtest]
+    fn test_phantom_gamemode_base_collects_locations_from_multiple_files() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        add_gamemode_gm_library(&mut ws);
+
+        let file_a = ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"DEFINE_BASECLASS("gamemode_sandbox")"#,
+        );
+        let file_b = ws.def_file(
+            "gamemodes/darkrp/gamemode/cl_init.lua",
+            r#"DEFINE_BASECLASS("gamemode_sandbox")"#,
+        );
+
+        let db = ws.get_db_mut();
+        let decl = db
+            .get_type_index()
+            .get_type_decl(&LuaTypeDeclId::global("gamemode_sandbox"))
+            .expect("expected phantom gamemode_sandbox decl");
+        let locations: Vec<_> = decl.get_locations().iter().map(|loc| loc.file_id).collect();
+
+        assert!(locations.contains(&file_a));
+        assert!(locations.contains(&file_b));
+
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("gamemode_sandbox"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("GM"))));
+    }
+
+    #[gtest]
+    fn test_derive_wins_for_inheritance_while_define_wins_for_alias() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        add_gamemode_gm_library(&mut ws);
+
+        let file_id = ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            DeriveGamemode("sandbox")
+            DEFINE_BASECLASS("gamemode_other")
+            GM.Other = BaseClass
+        "#,
+        );
+
+        let derived_supers = super_types_of(&mut ws, "gamemode_darkrp");
+        assert!(derived_supers.contains(&LuaType::Ref(LuaTypeDeclId::global("gamemode_sandbox"))));
+        assert!(!derived_supers.contains(&LuaType::Ref(LuaTypeDeclId::global("gamemode_other"))));
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let baseclass_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("BaseClass"))
+            .expect("expected BaseClass expr");
+        let baseclass_token = baseclass_expr
+            .get_name_token()
+            .expect("expected BaseClass token");
+        let baseclass_info = semantic_model
+            .get_semantic_info(baseclass_token.syntax().clone().into())
+            .expect("expected BaseClass semantic info");
+        assert_eq!(
+            baseclass_info.typ,
+            LuaType::Ref(LuaTypeDeclId::global("gamemode_other"))
+        );
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_darkrp"));
+        let member_item = ws
+            .get_db_mut()
+            .get_member_index()
+            .get_member_item(&owner, &LuaMemberKey::Name("Other".into()))
+            .expect("expected Other alias");
+        let count = match member_item {
+            crate::LuaMemberIndexItem::One(_) => 1,
+            crate::LuaMemberIndexItem::Many(ids) => ids.len(),
+        };
+        assert_eq!(count, 1);
     }
 }

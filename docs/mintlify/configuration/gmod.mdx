@@ -40,11 +40,25 @@ All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These co
 
 ---
 
+## Gamemode inheritance
+
+GLua LS supports gamemode inheritance in two ways.
+
+`DeriveGamemode("...")` keeps inherited `GM` members working inside gamemode code, while `gmod.autoDetectGamemodeBase` loads parent gamemode folders from your gamemode's `<name>.txt` `base` value so parent files are available for completions, definitions, and diagnostics.
+
+This setting only controls the `.txt` file lookup. It does not disable support for `DeriveGamemode("...")`.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Automatically loads parent gamemode folders from the gamemode `.txt` `base` value. Set to `false` to turn this off. |
+
+---
+
 ## Scripted classes
 
 `gmod.scriptedClassScopes.include` defines the scripted class groups used for class analysis, the Class Explorer, and scaffolding.
 
-Built-in groups: `entities`, `weapons`, `effects`, `stools`, `plugins`.
+Built-in groups: `entities`, `weapons`, `effects`, `stools`, `plugins`, `gamemodes`.
 
 Each definition supports:
 
@@ -60,7 +74,10 @@ Each definition supports:
 | `icon` | `string` | VS Code icon ID for Class Explorer display |
 | `rootDir` | `string` | Default root used by the scaffold action |
 | `scaffold.files` | `array` | Scaffold output entries: `{ path, template }` with `{{name}}` variable |
+| `classNamePrefix` | `string` | Optional prefix prepended to the folder-derived class name. Used by the `gamemodes` scope to produce runtime-accurate names like `gamemode_sandbox` |
 | `disabled` | `boolean` | Disable this definition (useful for turning off built-in groups) |
+
+The `gamemodes` group detects files under `gamemodes/<name>/gamemode/**` and types the `GM` global as the class `gamemode_<name>`. This makes `DEFINE_BASECLASS("gamemode_sandbox")` and cross-gamemode field access (for example, `self.Sandbox.SetupMove`) resolve correctly in derived gamemodes.
 
 To **override** a built-in definition, add an entry with its `id` and only the fields to change. To **disable** a built-in group, set `{ "id": "effects", "disabled": true }`.
 
@@ -168,6 +185,7 @@ These settings can also be configured via VS Code's settings (`gluals.*` prefix)
 | VSCode Setting | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|---|
 | `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `boolean` (`boolean \| null` in workspace) | `true` (`null` in workspace) | Auto-download GMod annotations |
+| `gluals.gmod.autoDetectGamemodeBase` | `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Auto-detect base gamemodes from the gamemode `.txt` file |
 | `gluals.gmod.templatePath` | `gmod.templatePath` | `string` | `null` | Custom scaffolding template path |
 | `gluals.gmod.vgui.codeLensEnabled` | `gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI code lens |
 | `gluals.gmod.vgui.inlayHintEnabled` | `gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI inlay hints |

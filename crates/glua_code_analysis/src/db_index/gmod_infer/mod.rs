@@ -180,6 +180,10 @@ impl Default for GmodRealmFileMetadata {
 pub struct GmodScopedClassInfo {
     pub class_name: String,
     pub global_name: String,
+    /// The scope's `classNamePrefix` (if any), cached so downstream synthesis
+    /// (e.g. parent-name alias for gamemodes) can strip it back off without a
+    /// second path scan.
+    pub class_name_prefix: Option<String>,
 }
 
 #[derive(Debug, Default)]

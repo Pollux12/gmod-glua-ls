@@ -41,14 +41,15 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
                 scripted_scope_files.as_ref()
                 && scripted_scope_files.contains(&in_filed_tree.file_id)
             {
-                if let Some((class_name, global_name)) =
-                    super::gmod::get_scripted_class_info_for_file(db, in_filed_tree.file_id)
+                if let Some((class_name, global_name, class_name_prefix)) =
+                    super::gmod::get_scripted_class_info_with_prefix(db, in_filed_tree.file_id)
                 {
                     db.get_gmod_infer_index_mut().set_scoped_class_info(
                         in_filed_tree.file_id,
                         GmodScopedClassInfo {
                             class_name,
                             global_name: global_name.clone(),
+                            class_name_prefix,
                         },
                     );
                     Some(global_name)

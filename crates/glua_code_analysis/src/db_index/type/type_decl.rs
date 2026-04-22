@@ -197,7 +197,25 @@ impl LuaTypeDecl {
     }
 
     pub fn merge_decl(&mut self, other: LuaTypeDecl) {
-        self.locations.extend(other.locations);
+        for location in other.locations {
+            self.add_location(location);
+        }
+    }
+
+    pub fn add_location(&mut self, location: LuaDeclLocation) {
+        // Identity is `(file_id, range)` so multiple distinct declaration sites
+        // within the same file are still preserved (e.g. forward + final
+        // declaration of a scripted class). When the same site is added twice
+        // (e.g. phantom synthesis re-runs after a real declaration is found),
+        // **merge flags** so semantic bits from any pass are not lost.
+        if let Some(existing) = self.locations.iter_mut().find(|existing| {
+            existing.file_id == location.file_id && existing.range == location.range
+        }) {
+            existing.flag |= location.flag;
+            return;
+        }
+
+        self.locations.push(location);
     }
 
     /// 获取枚举字段的类型

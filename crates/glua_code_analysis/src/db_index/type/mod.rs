@@ -99,9 +99,26 @@ impl LuaTypeIndex {
         self.file_types.entry(file_id).or_default().push(id.clone());
 
         if let Some(old_decl) = self.full_name_type_map.get_mut(&id) {
-            old_decl.merge_decl(type_decl);
+            for location in type_decl.get_locations() {
+                old_decl.add_location(location.clone());
+            }
         } else {
             self.full_name_type_map.insert(id, type_decl);
+        }
+    }
+
+    pub fn add_type_decl_location(
+        &mut self,
+        file_id: FileId,
+        decl_id: &LuaTypeDeclId,
+        location: LuaDeclLocation,
+    ) {
+        if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
+            decl.add_location(location);
+            self.file_types
+                .entry(file_id)
+                .or_default()
+                .push(decl_id.clone());
         }
     }
 
@@ -209,6 +226,32 @@ impl LuaTypeIndex {
             .entry(decl_id)
             .or_default()
             .push(InFiled::new(file_id, super_type));
+    }
+
+    pub fn has_super_type_in_file(
+        &self,
+        decl_id: &LuaTypeDeclId,
+        file_id: FileId,
+        super_type: &LuaType,
+    ) -> bool {
+        self.supers.get(decl_id).is_some_and(|supers| {
+            supers
+                .iter()
+                .any(|entry| entry.file_id == file_id && &entry.value == super_type)
+        })
+    }
+
+    pub fn add_super_type_if_missing(
+        &mut self,
+        decl_id: LuaTypeDeclId,
+        file_id: FileId,
+        super_type: LuaType,
+    ) {
+        if self.has_super_type_in_file(&decl_id, file_id, &super_type) {
+            return;
+        }
+
+        self.add_super_type(decl_id, file_id, super_type);
     }
 
     pub fn get_super_types(&self, decl_id: &LuaTypeDeclId) -> Option<Vec<LuaType>> {

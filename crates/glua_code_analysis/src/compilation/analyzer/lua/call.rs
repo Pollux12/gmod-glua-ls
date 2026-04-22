@@ -1310,9 +1310,10 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
     };
 
     // AccessorFunc can be used anywhere (VGUI panels, etc.), not just in scripted class scopes.
-    // DEFINE_BASECLASS also needs to work outside scripted scopes.
+    // DEFINE_BASECLASS / DeriveGamemode also need to work outside scripted scopes.
     // Only NetworkVar/NetworkVarElement are entity-specific and require scripted scope.
     if kind != GmodScriptedClassCallKind::DefineBaseClass
+        && kind != GmodScriptedClassCallKind::DeriveGamemode
         && kind != GmodScriptedClassCallKind::AccessorFunc
         && !analyzer.is_scripted_class_scope
     {

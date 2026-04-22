@@ -12,9 +12,9 @@ use glua_parser::{
 
 use crate::{
     EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodScriptedClassCallKind,
-    GmodScriptedClassCallMetadata, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclTypeKind,
-    LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache,
-    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
+    GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, LuaDecl, LuaDeclExtra, LuaDeclId,
+    LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId,
+    LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -154,6 +154,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     .map(|info| GmodScopedClassMatch {
                         class_name: info.class_name.clone(),
                         global_name: info.global_name.clone(),
+                        class_name_prefix: info.class_name_prefix.clone(),
                     })
                     .or_else(|| {
                         let m = detect_scoped_class_from_path(db, in_filed_tree.file_id)?;
@@ -162,6 +163,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                             GmodScopedClassInfo {
                                 class_name: m.class_name.clone(),
                                 global_name: m.global_name.clone(),
+                                class_name_prefix: m.class_name_prefix.clone(),
                             },
                         );
                         Some(m)
@@ -685,6 +687,10 @@ fn net_send_kind_from_method_name(method_name: &str) -> Option<NetSendKind> {
 pub(crate) struct GmodScopedClassMatch {
     pub global_name: String,
     pub class_name: String,
+    /// The scope's `classNamePrefix` (if any). Used to derive the stripped
+    /// short name for parent-alias synthesis (e.g. `gamemode_sandbox` →
+    /// `sandbox` → `Sandbox`).
+    pub class_name_prefix: Option<String>,
 }
 
 const GMOD_ENT_BASE_TO_ENT: &[&str] = &[
@@ -782,18 +788,33 @@ fn ensure_scoped_class_type_decl(
                 class_decl_id.clone(),
             ),
         );
+    } else if db
+        .get_type_index()
+        .get_type_decl(&class_decl_id)
+        .is_some_and(|decl| {
+            !decl
+                .get_locations()
+                .iter()
+                .any(|loc| loc.file_id == file_id)
+        })
+    {
+        db.get_type_index_mut().add_type_decl_location(
+            file_id,
+            &class_decl_id,
+            LuaDeclLocation {
+                file_id,
+                range,
+                flag: LuaTypeFlag::None.into(),
+            },
+        );
     }
 
     for super_type in scoped_class_super_types(global_name) {
-        let has_super = db
-            .get_type_index()
-            .get_super_types_iter(&class_decl_id)
-            .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-            .unwrap_or(false);
-        if !has_super {
-            db.get_type_index_mut()
-                .add_super_type(class_decl_id.clone(), file_id, super_type);
-        }
+        db.get_type_index_mut().add_super_type_if_missing(
+            class_decl_id.clone(),
+            file_id,
+            super_type,
+        );
     }
     class_decl_id
 }
@@ -858,11 +879,36 @@ fn synthesize_scripted_class_members(
             None => continue,
         };
 
-        // DEFINE_BASECLASS: set super type on the scoped class
         if let Some(ref scope_match) = scope_match {
             let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
-            for call in &metadata.define_baseclass_calls {
-                synthesize_define_baseclass(db, file_id, &class_decl_id, call);
+            if let Some((effective_base_name, is_derive)) = resolve_effective_inheritance_base(
+                &metadata,
+                scope_match.class_name_prefix.as_deref(),
+            ) {
+                synthesize_inheritance_base(
+                    db,
+                    file_id,
+                    &class_decl_id,
+                    &effective_base_name,
+                    is_derive,
+                    scope_match.class_name_prefix.as_deref(),
+                );
+            }
+            if let Some(effective_call) =
+                metadata.define_baseclass_calls.iter().rev().find(|call| {
+                    matches!(
+                        call.literal_args.first(),
+                        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty()
+                    )
+                })
+            {
+                synthesize_define_baseclass_parent_alias(
+                    db,
+                    file_id,
+                    &class_decl_id,
+                    scope_match.class_name_prefix.as_deref(),
+                    effective_call,
+                );
             }
         }
 
@@ -1447,31 +1493,205 @@ fn synthesize_from_wrapper_call(
     );
 }
 
-fn synthesize_define_baseclass(
+fn synthesize_inheritance_base(
     db: &mut DbIndex,
     file_id: FileId,
     class_decl_id: &LuaTypeDeclId,
-    call: &GmodScriptedClassCallMetadata,
+    base_name: &str,
+    is_derive: bool,
+    class_name_prefix: Option<&str>,
 ) {
-    // DEFINE_BASECLASS("base_name") → set super type
-    let base_name = match call.literal_args.first() {
-        Some(Some(GmodClassCallLiteral::String(name))) => name.clone(),
-        _ => return,
-    };
-
     if base_name.is_empty() {
         return;
     }
 
-    let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
-    let has_super = db
-        .get_type_index()
-        .get_super_types_iter(class_decl_id)
-        .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-        .unwrap_or(false);
-    if !has_super {
-        db.get_type_index_mut()
-            .add_super_type(class_decl_id.clone(), file_id, super_type);
+    let effective_base_name = if is_derive {
+        let Some(prefix) = class_name_prefix else {
+            return;
+        };
+        if base_name.starts_with(prefix) {
+            base_name.to_string()
+        } else {
+            format!("{prefix}{base_name}")
+        }
+    } else {
+        base_name.to_string()
+    };
+
+    materialize_scoped_gamemode_base(db, file_id, class_name_prefix, &effective_base_name);
+
+    let super_type = LuaType::Ref(LuaTypeDeclId::global(&effective_base_name));
+    db.get_type_index_mut()
+        .add_super_type_if_missing(class_decl_id.clone(), file_id, super_type);
+}
+
+fn materialize_scoped_gamemode_base(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_name_prefix: Option<&str>,
+    base_name: &str,
+) {
+    let Some("gamemode_") = class_name_prefix else {
+        return;
+    };
+
+    let Some(stripped) = base_name.strip_prefix("gamemode_") else {
+        return;
+    };
+    if stripped.is_empty() {
+        return;
+    }
+
+    let range = rowan::TextRange::default();
+    ensure_scoped_class_type_decl(db, file_id, base_name, "GM", range);
+}
+
+fn resolve_effective_inheritance_call(
+    metadata: &GmodScriptedClassFileMetadata,
+) -> Option<&GmodScriptedClassCallMetadata> {
+    metadata
+        .derive_gamemode_calls
+        .iter()
+        .rev()
+        .find(|call| valid_inheritance_literal(call))
+        .or_else(|| {
+            metadata
+                .define_baseclass_calls
+                .iter()
+                .rev()
+                .find(|call| valid_inheritance_literal(call))
+        })
+}
+
+fn valid_inheritance_literal(call: &GmodScriptedClassCallMetadata) -> bool {
+    matches!(
+        call.literal_args.first(),
+        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty()
+    )
+}
+
+fn resolve_effective_inheritance_base(
+    metadata: &GmodScriptedClassFileMetadata,
+    class_name_prefix: Option<&str>,
+) -> Option<(String, bool)> {
+    let call = resolve_effective_inheritance_call(metadata)?;
+    let base_name = match call.literal_args.first() {
+        Some(Some(GmodClassCallLiteral::String(name))) => name.as_str(),
+        _ => return None,
+    };
+
+    if metadata
+        .derive_gamemode_calls
+        .iter()
+        .any(|candidate| std::ptr::eq(candidate, call))
+    {
+        let prefix = class_name_prefix?;
+        return Some((
+            if base_name.starts_with(prefix) {
+                base_name.to_string()
+            } else {
+                format!("{prefix}{base_name}")
+            },
+            true,
+        ));
+    }
+
+    Some((base_name.to_string(), false))
+}
+
+/// Synthesize a parent-name alias member on a derived scripted class.
+///
+/// In Garry's Mod, derived gamemodes can access their inherited base via a
+/// field named after the parent's short (prefix-stripped) folder name. For
+/// example, a DarkRP gamemode inheriting from Sandbox uses `self.Sandbox` to
+/// reach the base gamemode table. The runtime exposes this field, but the
+/// analyzer would otherwise have no type for it, which breaks hover, goto,
+/// and completion on `self.<ShortParentName>.<member>`.
+///
+/// Rules (mirroring the oracle-approved design):
+/// - Only applies when the scope declares a non-empty `classNamePrefix`.
+/// - The parent class name must start with that prefix, and the remainder
+///   must be non-empty (otherwise we skip silently to avoid bogus aliases
+///   on malformed or cross-scope base names).
+/// - If the derived class already has a member with the alias name (for
+///   example, because the user wrote `GM.Sandbox = BaseClass` themselves),
+///   the explicit field wins and we do not synthesize a duplicate.
+fn synthesize_define_baseclass_parent_alias(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    class_name_prefix: Option<&str>,
+    call: &GmodScriptedClassCallMetadata,
+) {
+    let prefix = match class_name_prefix {
+        Some(p) if !p.is_empty() => p,
+        _ => return,
+    };
+
+    let base_name = match call.literal_args.first() {
+        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name.as_str(),
+        _ => return,
+    };
+
+    // Parent must belong to the same prefix-scoped class family, otherwise
+    // the short-name convention does not apply.
+    let Some(stripped) = base_name.strip_prefix(prefix) else {
+        return;
+    };
+    if stripped.is_empty() {
+        return;
+    }
+
+    let alias_name = capitalize_ascii_first(stripped);
+    if alias_name.is_empty() {
+        return;
+    }
+
+    let owner = LuaMemberOwner::Type(class_decl_id.clone());
+    let member_key = LuaMemberKey::Name(alias_name.as_str().into());
+
+    // If the user already defined this field (e.g. `GM.Sandbox = BaseClass`),
+    // let their definition win — don't shadow it with a synthetic decl.
+    if db
+        .get_member_index()
+        .get_member_item(&owner, &member_key)
+        .is_some()
+    {
+        return;
+    }
+
+    // Prefer the base-name string argument's syntax id for provenance; fall
+    // back to the call itself so hover/goto still lands somewhere useful.
+    let syntax_id = call
+        .args
+        .first()
+        .map(|a| a.syntax_id)
+        .unwrap_or(call.syntax_id);
+
+    let member_id = LuaMemberId::new(syntax_id, file_id);
+    let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
+    db.get_member_index_mut().add_member(owner, member);
+    db.get_type_index_mut().bind_type(
+        member_id.into(),
+        LuaTypeCache::DocType(LuaType::Ref(LuaTypeDeclId::global(base_name))),
+    );
+}
+
+/// Uppercase the first ASCII letter of `s`, leaving the rest untouched.
+/// Non-ASCII leading bytes are preserved as-is (GMod class names are ASCII
+/// in practice, so this keeps the implementation simple and allocation-light).
+fn capitalize_ascii_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out = String::with_capacity(s.len());
+            for c in first.to_uppercase() {
+                out.push(c);
+            }
+            out.extend(chars);
+            out
+        }
+        None => String::new(),
     }
 }
 
@@ -2058,6 +2278,7 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
         .map(|scope_match| GmodScopedClassMatch {
             global_name: scope_match.definition.class_global,
             class_name: scope_match.class_name,
+            class_name_prefix: scope_match.definition.class_name_prefix,
         })
 }
 
@@ -2078,10 +2299,25 @@ pub fn get_gmod_class_name_for_file(db: &DbIndex, file_id: FileId) -> Option<Str
 /// (e.g. `"ENT"`, `"SWEP"`, `"TOOL"`, `"EFFECT"`, `"PLUGIN"`).
 /// Uses cached scoped class info when available, falling back to path detection.
 pub fn get_scripted_class_info_for_file(db: &DbIndex, file_id: FileId) -> Option<(String, String)> {
+    get_scripted_class_info_with_prefix(db, file_id).map(|(c, g, _)| (c, g))
+}
+
+/// Like [`get_scripted_class_info_for_file`] but also returns the scope's
+/// `class_name_prefix`, so callers can correctly strip it to recover the
+/// folder short-name (used for parent-alias synthesis on inherited classes).
+pub(crate) fn get_scripted_class_info_with_prefix(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Option<(String, String, Option<String>)> {
     if let Some(info) = db.get_gmod_infer_index().get_scoped_class_info(&file_id) {
-        return Some((info.class_name.clone(), info.global_name.clone()));
+        return Some((
+            info.class_name.clone(),
+            info.global_name.clone(),
+            info.class_name_prefix.clone(),
+        ));
     }
-    detect_scoped_class_from_path(db, file_id).map(|m| (m.class_name, m.global_name))
+    detect_scoped_class_from_path(db, file_id)
+        .map(|m| (m.class_name, m.global_name, m.class_name_prefix))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

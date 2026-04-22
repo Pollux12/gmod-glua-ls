@@ -1,8 +1,10 @@
 use fern::Dispatch;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, WorkspaceFolder, collect_workspace_files, load_configs, update_code_style,
+    EmmyLibraryItem, EmmyLuaAnalysis, Emmyrc, WorkspaceFolder, collect_workspace_files,
+    detect_gamemode_base_libraries, load_configs, update_code_style,
 };
 use log::LevelFilter;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 fn root_from_configs(config_paths: &[PathBuf], fallback: &Path) -> PathBuf {
@@ -83,6 +85,9 @@ pub async fn load_workspace(
         "Pre processing configurations using root: \"{}\"",
         config_root.display()
     );
+
+    apply_gamemode_base_detection(&mut emmyrc, &cmd_workspace_folders, &main_path);
+
     emmyrc.pre_process_emmyrc(&config_root);
 
     let mut workspace_folders = cmd_workspace_folders
@@ -171,4 +176,206 @@ fn discover_config_files_in_order(root: &Path) -> Vec<PathBuf> {
     .into_iter()
     .filter(|path| path.exists())
     .collect()
+}
+
+/// Auto-detect GMod gamemode base libraries from `<gamemodes>/<name>/<name>.txt`
+/// unless explicitly disabled via `gmod.autoDetectGamemodeBase = false`.
+///
+/// Detection roots are the actual workspace folders (with `main_path` as a
+/// sensible fallback when none were given). `config_root` is intentionally
+/// NOT used as a detection root: when `--config` points outside the project
+/// it would scan the wrong directory.
+///
+/// Detected paths are appended to `emmyrc.workspace.library` as
+/// `EmmyLibraryItem::Path`, deduped against existing entries via canonical
+/// path comparison so relative-vs-absolute equivalents collapse.
+pub(crate) fn apply_gamemode_base_detection(
+    emmyrc: &mut Emmyrc,
+    workspace_folders: &[PathBuf],
+    main_path: &Path,
+) {
+    if matches!(emmyrc.gmod.auto_detect_gamemode_base, Some(false)) {
+        return;
+    }
+
+    let raw_roots: Vec<PathBuf> = if workspace_folders.is_empty() {
+        vec![main_path.to_path_buf()]
+    } else {
+        workspace_folders.to_vec()
+    };
+
+    // Normalize: file path -> parent dir; dedupe by canonical path.
+    let mut seen_canon: HashSet<PathBuf> = HashSet::new();
+    let mut normalized: Vec<PathBuf> = Vec::new();
+    for root in raw_roots {
+        let dir = if root.is_file() {
+            match root.parent() {
+                Some(p) => p.to_path_buf(),
+                None => continue,
+            }
+        } else {
+            root
+        };
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if seen_canon.insert(key) {
+            normalized.push(dir);
+        }
+    }
+
+    for root in &normalized {
+        for detected in detect_gamemode_base_libraries(root) {
+            let detected_str = detected.to_string_lossy().into_owned();
+            let detected_canon = detected.canonicalize().unwrap_or_else(|_| detected.clone());
+            let already_present = emmyrc.workspace.library.iter().any(|item| {
+                let p = PathBuf::from(item.get_path());
+                if p == detected || item.get_path() == &detected_str {
+                    return true;
+                }
+                // canonical equivalence catches relative-vs-absolute cases.
+                p.canonicalize()
+                    .map(|c| c == detected_canon)
+                    .unwrap_or(false)
+            });
+            if already_present {
+                continue;
+            }
+            log::info!(
+                "Auto-detected gamemode base library: {}",
+                detected.display()
+            );
+            emmyrc
+                .workspace
+                .library
+                .push(EmmyLibraryItem::Path(detected_str));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn make_workspace() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "glua_check_gmbase_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_gamemode(root: &Path, name: &str, base: Option<&str>) {
+        let folder = root.join("gamemodes").join(name);
+        fs::create_dir_all(&folder).unwrap();
+        let body = match base {
+            Some(b) => format!("\"{name}\"\n{{\n\t\"base\"\t\"{b}\"\n}}\n"),
+            None => format!("\"{name}\"\n{{\n\t\"title\"\t\"{name}\"\n}}\n"),
+        };
+        fs::write(folder.join(format!("{name}.txt")), body).unwrap();
+    }
+
+    #[test]
+    fn auto_detects_chain_from_workspace_folder() {
+        let root = make_workspace();
+        write_gamemode(&root, "darkrp", Some("sandbox"));
+        write_gamemode(&root, "sandbox", Some("base"));
+        write_gamemode(&root, "base", None);
+
+        let mut emmyrc = Emmyrc::default();
+        apply_gamemode_base_detection(&mut emmyrc, std::slice::from_ref(&root), &root);
+
+        let lib_paths: Vec<String> = emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|i| i.get_path().clone())
+            .collect();
+        assert_eq!(
+            lib_paths.len(),
+            2,
+            "expected sandbox + base, got {lib_paths:?}"
+        );
+        assert!(lib_paths.iter().any(|p| p.ends_with("sandbox")));
+        assert!(lib_paths.iter().any(|p| p.ends_with("base")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skips_detection_when_disabled() {
+        let root = make_workspace();
+        write_gamemode(&root, "darkrp", Some("sandbox"));
+        write_gamemode(&root, "sandbox", None);
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.auto_detect_gamemode_base = Some(false);
+        apply_gamemode_base_detection(&mut emmyrc, std::slice::from_ref(&root), &root);
+
+        assert!(
+            emmyrc.workspace.library.is_empty(),
+            "detection must be a no-op when disabled"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn falls_back_to_main_path_when_no_workspaces() {
+        let root = make_workspace();
+        write_gamemode(&root, "darkrp", Some("sandbox"));
+        write_gamemode(&root, "sandbox", None);
+
+        let mut emmyrc = Emmyrc::default();
+        apply_gamemode_base_detection(&mut emmyrc, &[], &root);
+
+        assert_eq!(emmyrc.workspace.library.len(), 1);
+        assert!(emmyrc.workspace.library[0].get_path().ends_with("sandbox"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handles_file_workspace_path() {
+        let root = make_workspace();
+        write_gamemode(&root, "darkrp", Some("sandbox"));
+        write_gamemode(&root, "sandbox", None);
+        let some_file = root.join("init.lua");
+        fs::write(&some_file, "-- placeholder\n").unwrap();
+
+        let mut emmyrc = Emmyrc::default();
+        apply_gamemode_base_detection(&mut emmyrc, &[some_file], &root);
+
+        assert_eq!(
+            emmyrc.workspace.library.len(),
+            1,
+            "file-path workspace must be normalized to its parent dir"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dedupes_against_existing_library_entry() {
+        let root = make_workspace();
+        write_gamemode(&root, "darkrp", Some("sandbox"));
+        write_gamemode(&root, "sandbox", None);
+        let sandbox_path = root.join("gamemodes").join("sandbox");
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc
+            .workspace
+            .library
+            .push(EmmyLibraryItem::Path(sandbox_path.to_string_lossy().into()));
+        apply_gamemode_base_detection(&mut emmyrc, std::slice::from_ref(&root), &root);
+
+        assert_eq!(
+            emmyrc.workspace.library.len(),
+            1,
+            "must not push a duplicate library entry, got {:?}",
+            emmyrc.workspace.library
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }

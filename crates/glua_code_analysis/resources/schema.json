@@ -1667,6 +1667,20 @@
                   "plugins"
                 ],
                 "rootDir": "plugins"
+              },
+              {
+                "classGlobal": "GM",
+                "classNamePrefix": "gamemode_",
+                "icon": "folder-library",
+                "id": "gamemodes",
+                "include": [
+                  "gamemodes/*/gamemode/**"
+                ],
+                "label": "Gamemodes",
+                "path": [
+                  "gamemodes"
+                ],
+                "rootDir": "gamemodes"
               }
             ]
           }
@@ -1809,6 +1823,13 @@
     "EmmyrcGmodScriptedClassDefinition": {
       "properties": {
         "classGlobal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "classNamePrefix": {
+          "description": "Optional prefix prepended to class names derived from the folder segment.\nFor example, gamemodes use `\"gamemode_\"` so a folder `sandbox` produces the\nclass name `gamemode_sandbox`, matching the runtime convention.",
           "type": [
             "string",
             "null"
@@ -2042,6 +2063,20 @@
                 "plugins"
               ],
               "rootDir": "plugins"
+            },
+            {
+              "classGlobal": "GM",
+              "classNamePrefix": "gamemode_",
+              "icon": "folder-library",
+              "id": "gamemodes",
+              "include": [
+                "gamemodes/*/gamemode/**"
+              ],
+              "label": "Gamemodes",
+              "path": [
+                "gamemodes"
+              ],
+              "rootDir": "gamemodes"
             }
           ],
           "items": {
@@ -2844,6 +2879,20 @@
                 "plugins"
               ],
               "rootDir": "plugins"
+            },
+            {
+              "classGlobal": "GM",
+              "classNamePrefix": "gamemode_",
+              "icon": "folder-library",
+              "id": "gamemodes",
+              "include": [
+                "gamemodes/*/gamemode/**"
+              ],
+              "label": "Gamemodes",
+              "path": [
+                "gamemodes"
+              ],
+              "rootDir": "gamemodes"
             }
           ]
         },

@@ -439,8 +439,10 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
     // Inject GMod annotations path if provided and not explicitly disabled
     inject_gmod_annotations(&client_config, &mut emmyrc);
 
-    // Inject gamemode base libraries if detected and not explicitly disabled
-    inject_gamemode_base_libraries(&client_config, &mut emmyrc);
+    // Inject gamemode base libraries if detected and not explicitly disabled.
+    // For the global merged config we don't have a single workspace root, so
+    // pass `None`; per-root detection happens in `pre_process_emmyrc_for_all_roots`.
+    inject_gamemode_base_libraries(&client_config, &mut emmyrc, None);
 
     let (workspace_diagnostic_configs, workspace_emmyrcs) = pre_process_emmyrc_for_all_roots(
         &mut emmyrc,
@@ -497,7 +499,11 @@ fn pre_process_emmyrc_for_all_roots(
         );
         merge_client_config(client_config, &mut workspace_emmyrc);
         inject_gmod_annotations(client_config, &mut workspace_emmyrc);
-        inject_gamemode_base_libraries(client_config, &mut workspace_emmyrc);
+        inject_gamemode_base_libraries(
+            client_config,
+            &mut workspace_emmyrc,
+            Some(workspace_root.as_path()),
+        );
         workspace_emmyrc.pre_process_emmyrc(workspace_root);
         workspace_configs.push((workspace_root.clone(), workspace_emmyrc, has_local_config));
     }
@@ -831,19 +837,39 @@ fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
 ///
 /// This is controlled by `gmod.autoDetectGamemodeBase` — set to `false` to
 /// disable.
-fn inject_gamemode_base_libraries(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
+///
+/// `workspace_root` is optional: when provided, the server will additionally
+/// scan that root for `gamemodes/<name>/<name>.txt` metadata files and follow
+/// the `"base"` chain to detect parent gamemode folders. This is editor-agnostic
+/// (works for `glua_check`, Neovim, etc.) and complements the VSCode extension's
+/// `gamemodeBaseLibraries` initialization option.
+fn inject_gamemode_base_libraries(
+    client_config: &ClientConfig,
+    emmyrc: &mut Emmyrc,
+    workspace_root: Option<&Path>,
+) {
     // Check if explicitly disabled in config
     if matches!(emmyrc.gmod.auto_detect_gamemode_base, Some(false)) {
         log::info!("Gamemode base auto-detection explicitly disabled in config");
         return;
     }
 
-    if client_config.gamemode_base_libraries.is_empty() {
+    let mut candidate_paths: Vec<String> = client_config.gamemode_base_libraries.to_vec();
+
+    if let Some(root) = workspace_root {
+        for path in glua_code_analysis::detect_gamemode_base_libraries(root) {
+            // Convert to lossy string for comparison/storage; library paths
+            // are stored as strings in `EmmyLibraryItem::Path`.
+            candidate_paths.push(path.to_string_lossy().into_owned());
+        }
+    }
+
+    if candidate_paths.is_empty() {
         return;
     }
 
     use glua_code_analysis::EmmyLibraryItem;
-    for lib_path in &client_config.gamemode_base_libraries {
+    for lib_path in &candidate_paths {
         if emmyrc
             .workspace
             .library

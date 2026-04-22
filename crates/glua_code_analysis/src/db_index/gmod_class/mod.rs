@@ -8,6 +8,7 @@ use crate::FileId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GmodScriptedClassCallKind {
     DefineBaseClass,
+    DeriveGamemode,
     AccessorFunc,
     NetworkVar,
     NetworkVarElement,
@@ -19,6 +20,7 @@ impl GmodScriptedClassCallKind {
     pub fn from_call_name(call_name: &str) -> Option<Self> {
         match call_name {
             "DEFINE_BASECLASS" => Some(Self::DefineBaseClass),
+            "DeriveGamemode" => Some(Self::DeriveGamemode),
             "AccessorFunc" => Some(Self::AccessorFunc),
             "NetworkVar" => Some(Self::NetworkVar),
             "NetworkVarElement" => Some(Self::NetworkVarElement),
@@ -64,6 +66,7 @@ pub struct GmodScriptedClassCallMetadata {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GmodScriptedClassFileMetadata {
     pub define_baseclass_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub derive_gamemode_calls: Vec<GmodScriptedClassCallMetadata>,
     pub accessor_func_calls: Vec<GmodScriptedClassCallMetadata>,
     pub network_var_calls: Vec<GmodScriptedClassCallMetadata>,
     pub network_var_element_calls: Vec<GmodScriptedClassCallMetadata>,
@@ -90,6 +93,7 @@ impl GmodScriptedClassFileMetadata {
     ) -> &mut Vec<GmodScriptedClassCallMetadata> {
         match kind {
             GmodScriptedClassCallKind::DefineBaseClass => &mut self.define_baseclass_calls,
+            GmodScriptedClassCallKind::DeriveGamemode => &mut self.derive_gamemode_calls,
             GmodScriptedClassCallKind::AccessorFunc => &mut self.accessor_func_calls,
             GmodScriptedClassCallKind::NetworkVar => &mut self.network_var_calls,
             GmodScriptedClassCallKind::NetworkVarElement => &mut self.network_var_element_calls,
