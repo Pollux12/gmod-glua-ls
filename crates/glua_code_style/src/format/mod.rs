@@ -55,19 +55,19 @@ impl LuaFormatter {
             if let NodeOrToken::Token(token) = node_or_token {
                 let token_kind = token.kind().to_token();
                 match (context.current_expected.take(), token_kind) {
-                    (Some(TokenExpected::Space(n)), LuaTokenKind::TkWhitespace) => {
-                        if !context.is_line_first_token {
-                            context.text.push_str(&" ".repeat(n));
-                            continue;
-                        }
+                    (Some(TokenExpected::Space(n)), LuaTokenKind::TkWhitespace)
+                        if !context.is_line_first_token =>
+                    {
+                        context.text.push_str(&" ".repeat(n));
+                        continue;
                     }
-                    (Some(TokenExpected::MaxSpace(n)), LuaTokenKind::TkWhitespace) => {
-                        if !context.is_line_first_token {
-                            let white_space_len = token.text().chars().count();
-                            if white_space_len > n {
-                                context.reset_whitespace_to(n);
-                                continue;
-                            }
+                    (Some(TokenExpected::MaxSpace(n)), LuaTokenKind::TkWhitespace)
+                        if !context.is_line_first_token =>
+                    {
+                        let white_space_len = token.text().chars().count();
+                        if white_space_len > n {
+                            context.reset_whitespace_to(n);
+                            continue;
                         }
                     }
                     (_, LuaTokenKind::TkEndOfLine) => {
