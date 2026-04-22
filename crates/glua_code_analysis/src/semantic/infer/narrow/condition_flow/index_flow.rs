@@ -93,6 +93,35 @@ fn maybe_field_exist_narrow(
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+
+    // Bug fix: when the input is a single concrete `Ref`/`Def` that already
+    // directly defines the queried field, the field-existence check is
+    // useless since every value of this type already has the field. Falling
+    // through to class expansion + "direct definer" filtering
+    // can sometimes narrow to a an incorrect override (e.g. `Entity` →
+    // `EFFECT` because `EFFECT` overrides `EndTouch`), which then causes
+    // false-positive realm/type diagnostics.
+    if matches!(condition_flow, InferConditionFlow::TrueCondition)
+        && let LuaType::Ref(type_id) | LuaType::Def(type_id) = &left_type
+    {
+        let index_member = LuaIndexMemberExpr::IndexExpr(index_expr.clone());
+        if let Some(index_key) = index_member.get_index_key()
+            && let Ok(member_key) = LuaMemberKey::from_index_key(db, cache, &index_key)
+        {
+            let member_index = db.get_member_index();
+            let owner = LuaMemberOwner::Type(type_id.clone());
+            let global_owner =
+                LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
+            if member_index.get_member_item(&owner, &member_key).is_some()
+                || member_index
+                    .get_member_item(&global_owner, &member_key)
+                    .is_some()
+            {
+                return Ok(ResultTypeOrContinue::Result(left_type));
+            }
+        }
+    }
+
     let Some(candidates) = collect_field_exist_narrow_candidates(db, &left_type) else {
         // Indexing an Unknown base (e.g. an undefined global like `tmysql.Version`)
         // implies the base is non-nil/non-false at this point — both branches of

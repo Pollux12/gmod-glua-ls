@@ -3973,6 +3973,40 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_field_narrow_does_not_pick_subclass_when_base_directly_defines_field() {
+        // Regression: `Entity` directly defines `EndTouch`. A subclass `EFFECT`
+        // overrides `EndTouch`. When narrowing a value typed as `Entity` via
+        // `if x.EndTouch then`, the result must remain `Entity` and must NOT
+        // collapse to `EFFECT` just because EFFECT is a more direct definer.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field EndTouch fun(self: Entity, entity: Entity)
+
+            ---@class EFFECT : Entity
+            ---@field EndTouch fun(self: EFFECT)
+
+            ---@param ent Entity?
+            local function test(ent)
+                if ent and ent.EndTouch then
+                    a = ent
+                end
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            eq("Entity"),
+            "narrowing Entity via field-existence must not collapse to subclass override: {}",
+            desc
+        );
+    }
+
+    #[gtest]
     fn test_table_index_read_from_typed_registry_is_not_hard_nil() {
         // Regression guard: reading from a typed table by string key should
         // not collapse the local value to `nil`.
