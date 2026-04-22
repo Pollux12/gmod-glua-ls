@@ -69,6 +69,45 @@ mod test {
     }
 
     #[test]
+    fn test_scripted_class_seeded_var_no_unused_diagnostic() {
+        // A gamemode file with no GM method definitions must NOT trigger
+        // "GM is never used" — the GM variable is injected by the LS, not written by the user.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // File with path triggering gamemode scripted-class scope, but no GM usage.
+        assert!(ws.check_file_for(
+            DiagnosticCode::Unused,
+            "gamemodes/test/gamemode/cl_test1.lua",
+            r#"
+                local spawnIconFile = file.Open("test.png", "rb", "GAME")
+                if spawnIconFile then end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_scripted_class_seeded_var_no_redefined_local_diagnostic() {
+        // A gamemode file that declares `local GM = {}` must NOT trigger
+        // "redefined local" against the LS-injected GM seed decl.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedefinedLocal,
+            "gamemodes/test/gamemode/init.lua",
+            r#"
+                local GM = {}
+                function GM:PlayerSpawn(ply) end
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_non_gmod_reports_unused_params() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

@@ -370,7 +370,7 @@ impl<'a> DeclAnalyzer<'a> {
         let file_id = self.get_file_id();
         let synthetic_pos = chunk_range.start();
         let synthetic_range = TextRange::new(synthetic_pos, synthetic_pos);
-        let decl = LuaDecl::new(
+        let mut decl = LuaDecl::new(
             scoped_class_global_name,
             file_id,
             synthetic_range,
@@ -380,6 +380,7 @@ impl<'a> DeclAnalyzer<'a> {
             },
             None,
         );
+        decl.mark_seeded_class_local();
 
         self.add_decl(decl);
         self.seeded_scoped_class_decl = true;

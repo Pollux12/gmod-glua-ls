@@ -74,6 +74,9 @@ fn check_scope_for_redefined_locals(
                 if gmod_enabled && name == "self" {
                     continue;
                 }
+                if decl.is_seeded_class_local() {
+                    continue;
+                }
                 if current_locals.contains_key(&name) {
                     let old_decl = current_locals
                         .get(&name)

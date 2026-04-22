@@ -173,6 +173,33 @@ impl VirtualWorkspace {
         true
     }
 
+    /// Like `check_code_for` but registers the content under a specific file path.
+    /// Useful for testing diagnostics that depend on path-based detection (e.g. scripted classes).
+    /// Returns `true` if no diagnostic of the given code is emitted.
+    pub fn check_file_for(
+        &mut self,
+        diagnostic_code: DiagnosticCode,
+        file_name: &str,
+        content: &str,
+    ) -> bool {
+        self.analysis.diagnostic.enable_only(diagnostic_code);
+        let file_id = self.def_file(file_name, content);
+        let result = self
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new());
+        if let Some(diagnostics) = result {
+            let code_string = Some(NumberOrString::String(
+                diagnostic_code.get_name().to_string(),
+            ));
+            for diagnostic in diagnostics {
+                if diagnostic.code == code_string {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     pub fn check_code_for_namespace(
         &mut self,
         diagnostic_code: DiagnosticCode,

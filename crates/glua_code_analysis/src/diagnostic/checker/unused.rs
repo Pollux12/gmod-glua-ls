@@ -26,6 +26,9 @@ impl Checker for UnusedChecker {
             if decl.is_global() || decl.is_param() && decl.get_name() == "..." {
                 continue;
             }
+            if decl.is_seeded_class_local() {
+                continue;
+            }
             if semantic_model.get_emmyrc().gmod.enabled && decl.is_param() {
                 continue;
             }
