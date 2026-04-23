@@ -4,7 +4,7 @@ mod decl_tree;
 mod scope;
 
 pub use decl::LuaDeclExtra;
-pub use decl::{LocalAttribute, LuaDecl};
+pub use decl::{LocalAttribute, LuaDecl, LuaDeclInitializer};
 pub use decl_id::LuaDeclId;
 pub use decl_tree::{LuaDeclOrMemberId, LuaDeclarationTree};
 pub use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};

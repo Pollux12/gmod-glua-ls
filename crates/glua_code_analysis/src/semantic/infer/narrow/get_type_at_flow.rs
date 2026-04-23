@@ -1008,11 +1008,11 @@ fn try_infer_decl_initializer_type(
         .get_decl(&decl_id)
         .ok_or(InferFailReason::None)?;
 
-    let Some(value_syntax_id) = decl.get_value_syntax_id() else {
+    let Some(initializer) = decl.get_initializer() else {
         return Ok(None);
     };
 
-    let Some(node) = value_syntax_id.to_node_from_root(root.syntax()) else {
+    let Some(node) = initializer.get_expr_syntax_id().to_node_from_root(root.syntax()) else {
         return Ok(None);
     };
 
@@ -1020,11 +1020,6 @@ fn try_infer_decl_initializer_type(
         return Ok(None);
     };
 
-    let expr_type = infer_expr(db, cache, expr.clone())?;
-    let init_type = match expr_type {
-        LuaType::Variadic(variadic) => variadic.get_type(0).cloned(),
-        ty => Some(ty),
-    };
-
-    Ok(init_type)
+    infer_expr_list_value_type_at(db, cache, &[expr], initializer.get_ret_idx())
+        .map(|typ| Some(typ.unwrap_or(LuaType::Nil)))
 }

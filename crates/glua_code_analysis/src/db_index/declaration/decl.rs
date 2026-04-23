@@ -12,12 +12,33 @@ pub struct LuaDecl {
     file_id: FileId,
     range: TextRange,
     expr_id: Option<LuaSyntaxId>,
+    initializer: Option<LuaDeclInitializer>,
     pub extra: LuaDeclExtra,
     /// True when this declaration was synthetically injected by the language server
     /// (e.g. the scoped-class variable `GM`/`ENT`/`SWEP` seeded into gamemode/entity files).
     /// Such decls are not present in the user's source and must be excluded from
     /// diagnostics that rely on user-written variable declarations (e.g. `unused`, `redefined-local`).
     is_seeded_class_local: bool,
+}
+
+#[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]
+pub struct LuaDeclInitializer {
+    expr_id: LuaSyntaxId,
+    ret_idx: usize,
+}
+
+impl LuaDeclInitializer {
+    pub fn new(expr_id: LuaSyntaxId, ret_idx: usize) -> Self {
+        Self { expr_id, ret_idx }
+    }
+
+    pub fn get_expr_syntax_id(&self) -> LuaSyntaxId {
+        self.expr_id
+    }
+
+    pub fn get_ret_idx(&self) -> usize {
+        self.ret_idx
+    }
 }
 
 #[derive(Eq, PartialEq, Hash, Debug, Clone)]
@@ -56,6 +77,7 @@ impl LuaDecl {
             file_id,
             range,
             expr_id,
+            initializer: expr_id.map(|expr_id| LuaDeclInitializer::new(expr_id, 0)),
             extra,
             is_seeded_class_local: false,
         }
@@ -96,6 +118,14 @@ impl LuaDecl {
 
     pub fn get_value_syntax_id(&self) -> Option<LuaSyntaxId> {
         self.expr_id
+    }
+
+    pub fn get_initializer(&self) -> Option<LuaDeclInitializer> {
+        self.initializer
+    }
+
+    pub fn set_initializer(&mut self, initializer: Option<LuaDeclInitializer>) {
+        self.initializer = initializer;
     }
 
     pub fn is_local(&self) -> bool {
