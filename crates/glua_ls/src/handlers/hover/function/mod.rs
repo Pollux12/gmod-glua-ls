@@ -242,6 +242,10 @@ fn merge_preferred_description(
                 existing_description.description = incoming_description.description.clone();
             }
 
+            if existing_description.source.is_none() && incoming_description.source.is_some() {
+                existing_description.source = incoming_description.source.clone();
+            }
+
             if existing_description.tag_content.is_none()
                 && incoming_description.tag_content.is_some()
             {
@@ -249,7 +253,9 @@ fn merge_preferred_description(
             }
 
             if existing_description.description.is_none()
+                && existing_description.source.is_none()
                 && incoming_description.description.is_none()
+                && incoming_description.source.is_none()
                 && existing_description.tag_content.is_none()
                 && incoming_description.tag_content.is_none()
             {

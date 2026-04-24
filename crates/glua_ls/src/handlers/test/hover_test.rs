@@ -692,6 +692,24 @@ mod tests {
     }
 
     #[gtest]
+    fn test_source_tag_renders_clickable_link() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                --- Description
+                ---
+                ---@source https://wiki.facepunch.com/gmod/Entity:SetPos
+                local function te<??>st() end
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal function test()\n```\n\n---\n\nDescription\n\n---\n\n**Source:** <https://wiki.facepunch.com/gmod/Entity:SetPos>".to_string(),
+            },
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_other_tag() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(

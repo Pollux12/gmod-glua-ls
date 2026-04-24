@@ -196,6 +196,7 @@ pub fn infer_prefix_global_name<'a>(
 #[derive(Debug, Clone)]
 pub struct DescriptionInfo {
     pub description: Option<String>,
+    pub source: Option<String>,
     pub tag_content: Option<Vec<(String, String)>>,
     pub realm: Option<GmodRealm>,
     pub explicit_realm: bool,
@@ -205,6 +206,7 @@ impl DescriptionInfo {
     pub fn new() -> Self {
         Self {
             description: None,
+            source: None,
             tag_content: None,
             realm: None,
             explicit_realm: false,
@@ -212,7 +214,10 @@ impl DescriptionInfo {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.description.is_none() && self.tag_content.is_none() && self.realm.is_none()
+        self.description.is_none()
+            && self.source.is_none()
+            && self.tag_content.is_none()
+            && self.realm.is_none()
     }
 }
 
@@ -229,6 +234,7 @@ pub fn extract_description_from_property_owner(
     let mut result = DescriptionInfo::new();
 
     result.description = property.description().map(|detail| detail.to_string());
+    result.source = property.source().map(|source| source.to_string());
     let (realm, explicit_realm) = infer_description_realm(semantic_model, property_owner);
     result.realm = realm;
     result.explicit_realm = explicit_realm;

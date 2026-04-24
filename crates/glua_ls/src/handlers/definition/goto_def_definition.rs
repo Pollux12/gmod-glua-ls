@@ -253,30 +253,36 @@ fn add_instance_table_member_locations(
 }
 
 fn goto_source_location(source: &str) -> Option<Location> {
-    let source_parts = source.split('#').collect::<Vec<_>>();
-    if source_parts.len() == 2 {
-        let uri = source_parts[0];
-        let range = source_parts[1];
-        let range_parts = range.split(':').collect::<Vec<_>>();
-        if range_parts.len() == 2 {
-            let mut line_str = range_parts[0];
-            if line_str.to_ascii_lowercase().starts_with("l") {
-                line_str = &line_str[1..];
-            }
-            let line = line_str.parse::<u32>().ok()?;
-            let col = range_parts[1].parse::<u32>().ok()?;
-            let range = Range {
-                start: Position::new(line, col),
-                end: Position::new(line, col),
-            };
-            return Some(Location {
-                uri: Uri::from_str(uri).ok()?,
-                range,
-            });
-        }
+    if let Some((uri, range_text)) = source.rsplit_once('#')
+        && let Some(range) = parse_source_range(range_text)
+    {
+        return Some(Location {
+            uri: Uri::from_str(uri).ok()?,
+            range,
+        });
     }
 
-    None
+    Some(Location {
+        uri: Uri::from_str(source).ok()?,
+        range: Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 0),
+        },
+    })
+}
+
+fn parse_source_range(range_text: &str) -> Option<Range> {
+    let (mut line_text, col_text) = range_text.split_once(':')?;
+    if line_text.to_ascii_lowercase().starts_with('l') {
+        line_text = &line_text[1..];
+    }
+
+    let line = line_text.parse::<u32>().ok()?;
+    let col = col_text.parse::<u32>().ok()?;
+    Some(Range {
+        start: Position::new(line, col),
+        end: Position::new(line, col),
+    })
 }
 
 pub fn goto_str_tpl_ref_definition(
@@ -626,4 +632,37 @@ fn try_add_accessor_location(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::goto_source_location;
+    use googletest::prelude::*;
+
+    #[gtest]
+    fn test_goto_source_location_supports_plain_uri() -> Result<()> {
+        let location = goto_source_location("https://wiki.facepunch.com/gmod/Entity:SetPos")
+            .ok_or("missing source location")
+            .or_fail()?;
+
+        verify_eq!(
+            location.uri.as_str(),
+            "https://wiki.facepunch.com/gmod/Entity:SetPos"
+        )?;
+        verify_eq!(location.range.start.line, 0)?;
+        verify_eq!(location.range.start.character, 0)?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_source_location_supports_uri_with_range() -> Result<()> {
+        let location = goto_source_location("file:///tmp/test.lua#L41:2")
+            .ok_or("missing source location")
+            .or_fail()?;
+
+        verify_eq!(location.uri.as_str(), "file:///tmp/test.lua")?;
+        verify_eq!(location.range.start.line, 41)?;
+        verify_eq!(location.range.start.character, 2)?;
+        Ok(())
+    }
 }

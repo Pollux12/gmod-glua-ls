@@ -24,6 +24,8 @@ pub struct HoverBuilder<'a> {
     pub signature_overload: Option<Vec<MarkedString>>,
     /// Annotation descriptions, including function parameters and return values
     pub annotation_description: Vec<MarkedString>,
+    /// Dedicated @source annotation rendered as a clickable link in hover.
+    source: Option<String>,
     /// 一些类型的完整追加显示, 通常是 @alias
     pub type_expansion: Option<Vec<String>>,
     /// For `@see` and unknown tags tags
@@ -67,6 +69,7 @@ impl<'a> HoverBuilder<'a> {
             location_path: None,
             signature_overload: None,
             annotation_description: Vec::new(),
+            source: None,
             is_completion,
             trigger_token: token,
             type_expansion: None,
@@ -177,6 +180,7 @@ impl<'a> HoverBuilder<'a> {
         if let Some(desc_info) = type_desc {
             let DescriptionInfo {
                 description,
+                source,
                 tag_content,
                 realm,
                 explicit_realm: _,
@@ -191,6 +195,10 @@ impl<'a> HoverBuilder<'a> {
 
             if let Some(description) = description {
                 self.add_annotation_description(description);
+            }
+
+            if let Some(source) = source {
+                self.source = Some(source);
             }
 
             if let Some(tag_content) = tag_content {
@@ -287,6 +295,10 @@ impl<'a> HoverBuilder<'a> {
             tags.join("\n\n")
         };
 
+        let source_content = self.source.as_deref().map_or_else(String::new, |source| {
+            format!("**Source:** <{}>", source)
+        });
+
         let expansion_content = {
             let mut expansion = Vec::new();
             if let Some(type_expansion) = &self.type_expansion {
@@ -304,6 +316,9 @@ impl<'a> HoverBuilder<'a> {
         }
         if !description_content.is_empty() {
             sections.push(description_content);
+        }
+        if !source_content.is_empty() {
+            sections.push(source_content);
         }
         if !tag_content.is_empty() {
             sections.push(tag_content);

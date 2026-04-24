@@ -7,6 +7,8 @@ description: Redirect Go to Definition to a source URI.
 
 `@source` tells GLuaLS to open a different location when you use **Go to Definition**.
 
+When a symbol with `@source` is shown in hover, GLuaLS also renders the source URI as a clickable Markdown link.
+
 This is mainly useful in generated annotation files that point back to a real source file or external URI.
 
 ---
@@ -15,13 +17,15 @@ This is mainly useful in generated annotation files that point back to a real so
 
 ```lua
 ---@source file:///absolute/path/to/file.lua#41:0
+---@source https://wiki.facepunch.com/gmod/Entity:SetPos
 ```
 
-The current implementation expects a URI followed by `#line:column`.
+`@source` accepts either a bare URI or a URI followed by `#line:column`.
 
 - `file:///...` for local files
 - `https://...` for web links
-- `line` and `column` use zero-based positions
+- A bare URI opens the target at `0:0`
+- `line` and `column` use zero-based positions when present
 - `#l41:0` is also accepted for the line part
 
 ---
@@ -41,3 +45,12 @@ function Player:SetHealth(hp) end
 ```
 
 When you use **Go to Definition** on `Player:SetHealth()`, GLuaLS opens the `@source` target instead of the stub.
+
+For generated wiki annotations, you can also point directly at a page:
+
+```lua
+---@source https://wiki.facepunch.com/gmod/Entity:SetPos
+function Entity:SetPos(pos) end
+```
+
+Hover shows that URI as a clickable **Source** link, and **Go to Definition** opens the page URI directly.
