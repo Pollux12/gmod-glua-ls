@@ -396,6 +396,137 @@ fn _debug_helper_registry(reg: &HelperRegistry) {
     }
 }
 
+/// Per-file function definition lookup. Built once and reused for all
+/// helper-resolution queries against the same file's syntax tree.
+struct FileFunctionMap {
+    /// Function bodies: `function f() end`, `local function f() end`,
+    /// `local f = function() end`, `f = function() end`.
+    bare: HashMap<String, LuaBlock>,
+    /// Method bodies, keyed `"Prefix.Field"`:
+    /// `function M.f() end`, `M.f = function() end`.
+    dotted: HashMap<String, LuaBlock>,
+    /// All top-level function-defining blocks in source order, including
+    /// duplicates and unnamed closures. Lets callers that need to scan every
+    /// function body in the file skip running 4 separate `descendants` walks.
+    all_blocks: Vec<LuaBlock>,
+}
+
+impl FileFunctionMap {
+    fn build(root: &LuaChunk) -> Self {
+        let mut bare: HashMap<String, LuaBlock> = HashMap::new();
+        let mut dotted: HashMap<String, LuaBlock> = HashMap::new();
+        let mut all_blocks: Vec<LuaBlock> = Vec::new();
+        for node in root.syntax().descendants() {
+            if let Some(local_func_stat) = LuaLocalFuncStat::cast(node.clone()) {
+                if let Some(block) = local_func_stat
+                    .get_closure()
+                    .and_then(|c| c.get_block())
+                {
+                    if let Some(local_name) = local_func_stat
+                        .get_local_name()
+                        .and_then(|n| n.get_name_token())
+                    {
+                        bare.entry(local_name.get_name_text().to_string())
+                            .or_insert_with(|| block.clone());
+                    }
+                    all_blocks.push(block);
+                }
+                continue;
+            }
+            if let Some(local_stat) = LuaLocalStat::cast(node.clone()) {
+                let names: Vec<_> = local_stat.get_local_name_list().collect();
+                let values: Vec<_> = local_stat.get_value_exprs().collect();
+                for (idx, value) in values.iter().enumerate() {
+                    let LuaExpr::ClosureExpr(closure) = value else {
+                        continue;
+                    };
+                    let Some(block) = closure.get_block() else {
+                        continue;
+                    };
+                    if let Some(name_token) =
+                        names.get(idx).and_then(|n| n.get_name_token())
+                    {
+                        bare.entry(name_token.get_name_text().to_string())
+                            .or_insert_with(|| block.clone());
+                    }
+                    all_blocks.push(block);
+                }
+                continue;
+            }
+            if let Some(func_stat) = LuaFuncStat::cast(node.clone()) {
+                let Some(block) = func_stat
+                    .get_closure()
+                    .and_then(|c| c.get_block())
+                else {
+                    continue;
+                };
+                match func_stat.get_func_name() {
+                    Some(LuaVarExpr::NameExpr(name_expr)) => {
+                        if let Some(name) = name_expr.get_name_text() {
+                            bare.entry(name).or_insert_with(|| block.clone());
+                        }
+                    }
+                    Some(LuaVarExpr::IndexExpr(index_expr)) => {
+                        if let Some(key) = dotted_global_key(&index_expr) {
+                            dotted.entry(key).or_insert_with(|| block.clone());
+                        }
+                    }
+                    None => {}
+                }
+                all_blocks.push(block);
+                continue;
+            }
+            if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
+                let (vars, values) = assign_stat.get_var_and_expr_list();
+                for (idx, value) in values.iter().enumerate() {
+                    let LuaExpr::ClosureExpr(closure) = value else {
+                        continue;
+                    };
+                    let Some(block) = closure.get_block() else {
+                        continue;
+                    };
+                    if let Some(var) = vars.get(idx) {
+                        match var {
+                            LuaVarExpr::NameExpr(name_expr) => {
+                                if let Some(name) = name_expr.get_name_text() {
+                                    bare.entry(name).or_insert_with(|| block.clone());
+                                }
+                            }
+                            LuaVarExpr::IndexExpr(index_expr) => {
+                                if let Some(key) = dotted_global_key(index_expr) {
+                                    dotted.entry(key).or_insert_with(|| block.clone());
+                                }
+                            }
+                        }
+                    }
+                    all_blocks.push(block);
+                }
+            }
+        }
+        FileFunctionMap {
+            bare,
+            dotted,
+            all_blocks,
+        }
+    }
+}
+
+/// Lazy cache of per-file function maps, keyed by chunk text-range. Used so
+/// that cross-file helper recursion doesn't rebuild the same map repeatedly.
+#[derive(Default)]
+struct LocalFnCache {
+    cache: HashMap<TextRange, FileFunctionMap>,
+}
+
+impl LocalFnCache {
+    fn get(&mut self, root: &LuaChunk) -> &FileFunctionMap {
+        let key = root.syntax().text_range();
+        self.cache
+            .entry(key)
+            .or_insert_with(|| FileFunctionMap::build(root))
+    }
+}
+
 fn dotted_global_key(index_expr: &glua_parser::LuaIndexExpr) -> Option<String> {
     let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
         return None;
@@ -416,13 +547,16 @@ fn collect_hook_metadata(
 ) -> (Vec<(String, GmodRealm)>, Vec<NetReceiveFlow>) {
     let mut gm_method_realms = Vec::new();
     let mut receive_flows = Vec::new();
+    let mut local_fns = LocalFnCache::default();
 
     for call_expr in root.descendants::<LuaCallExpr>() {
         if let Some(site) = collect_hook_call_site(db, call_expr.clone()) {
             db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
         }
 
-        if let Some(receive_flow) = collect_net_receive_flow(&root, &call_expr, helper_registry) {
+        if let Some(receive_flow) =
+            collect_net_receive_flow(&root, &call_expr, helper_registry, &mut local_fns)
+        {
             receive_flows.push(receive_flow);
         }
 
@@ -456,8 +590,13 @@ fn collect_network_flow_metadata(
     receive_flows: Vec<NetReceiveFlow>,
     helper_registry: &HelperRegistry,
 ) {
-    let mut send_flows = collect_net_send_flows(&root, helper_registry);
-    send_flows.extend(collect_wrapped_net_send_flows(&root, helper_registry));
+    let mut local_fns = LocalFnCache::default();
+    let mut send_flows = collect_net_send_flows(&root, helper_registry, &mut local_fns);
+    send_flows.extend(collect_wrapped_net_send_flows(
+        &root,
+        helper_registry,
+        &mut local_fns,
+    ));
     send_flows.sort_by_key(|flow| flow.start_range.start());
 
     let data = crate::db_index::FileNetworkData {
@@ -487,7 +626,11 @@ fn collect_gm_method_realm_annotation(func_stat: &LuaFuncStat) -> Option<(String
     Some((method_name, realm))
 }
 
-fn collect_net_send_flows(root: &LuaChunk, helper_registry: &HelperRegistry) -> Vec<NetSendFlow> {
+fn collect_net_send_flows(
+    root: &LuaChunk,
+    helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
+) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
     for block in root.descendants::<LuaBlock>() {
@@ -527,7 +670,14 @@ fn collect_net_send_flows(root: &LuaChunk, helper_registry: &HelperRegistry) -> 
                     }
                 }
 
-                collect_net_write_ops_from_stat(root, &block, next_stat, &mut writes, helper_registry);
+                collect_net_write_ops_from_stat(
+                    root,
+                    &block,
+                    next_stat,
+                    &mut writes,
+                    helper_registry,
+                    local_fns,
+                );
             }
 
             let Some((send_range, send_kind, send_target)) = send else {
@@ -553,46 +703,21 @@ fn collect_net_send_flows(root: &LuaChunk, helper_registry: &HelperRegistry) -> 
 fn collect_wrapped_net_send_flows(
     root: &LuaChunk,
     helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
-    for func_stat in root.descendants::<LuaFuncStat>() {
-        if let Some(block) = func_stat
-            .get_closure()
-            .and_then(|closure_expr| closure_expr.get_block())
-        {
-            collect_wrapped_net_send_flows_in_function_block(root, &block, &mut flows, helper_registry);
-        }
-    }
-
-    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
-        if let Some(block) = local_func_stat
-            .get_closure()
-            .and_then(|closure_expr| closure_expr.get_block())
-        {
-            collect_wrapped_net_send_flows_in_function_block(root, &block, &mut flows, helper_registry);
-        }
-    }
-
-    for local_stat in root.descendants::<LuaLocalStat>() {
-        for value_expr in local_stat.get_value_exprs() {
-            if let LuaExpr::ClosureExpr(closure_expr) = value_expr
-                && let Some(block) = closure_expr.get_block()
-            {
-                collect_wrapped_net_send_flows_in_function_block(root, &block, &mut flows, helper_registry);
-            }
-        }
-    }
-
-    for assign_stat in root.descendants::<LuaAssignStat>() {
-        let (_, value_exprs) = assign_stat.get_var_and_expr_list();
-        for value_expr in value_exprs {
-            if let LuaExpr::ClosureExpr(closure_expr) = value_expr
-                && let Some(block) = closure_expr.get_block()
-            {
-                collect_wrapped_net_send_flows_in_function_block(root, &block, &mut flows, helper_registry);
-            }
-        }
+    // Snapshot the per-file function blocks so we can borrow `local_fns`
+    // mutably during the recursive collect call below.
+    let blocks: Vec<LuaBlock> = local_fns.get(root).all_blocks.clone();
+    for block in &blocks {
+        collect_wrapped_net_send_flows_in_function_block(
+            root,
+            block,
+            &mut flows,
+            helper_registry,
+            local_fns,
+        );
     }
 
     flows.sort_by_key(|flow| flow.start_range.start());
@@ -604,6 +729,7 @@ fn collect_wrapped_net_send_flows_in_function_block(
     function_block: &LuaBlock,
     flows: &mut Vec<NetSendFlow>,
     helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) {
     for block in function_block
         .syntax()
@@ -652,7 +778,14 @@ fn collect_wrapped_net_send_flows_in_function_block(
                     }
                 }
 
-                collect_net_write_ops_from_stat(root, &block, next_stat, &mut writes, helper_registry);
+                collect_net_write_ops_from_stat(
+                    root,
+                    &block,
+                    next_stat,
+                    &mut writes,
+                    helper_registry,
+                    local_fns,
+                );
             }
 
             if let Some((send_range, send_kind, send_target)) = send {
@@ -695,6 +828,7 @@ fn collect_net_receive_flow(
     root: &LuaChunk,
     call_expr: &LuaCallExpr,
     helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) -> Option<NetReceiveFlow> {
     let method_name = get_exact_net_method_name(call_expr)?;
     if method_name != "Receive" {
@@ -709,10 +843,14 @@ fn collect_net_receive_flow(
         .get_args_list()
         .and_then(|args| args.get_args().nth(1))
     {
-        match resolve_callback_block(root, &callback_expr) {
-            Some(callback_block) => {
-                collect_net_read_ops_from_block(root, callback_block, &mut reads, helper_registry)
-            }
+        match resolve_callback_block(root, &callback_expr, local_fns) {
+            Some(callback_block) => collect_net_read_ops_from_block(
+                root,
+                callback_block,
+                &mut reads,
+                helper_registry,
+                local_fns,
+            ),
             None => {
                 // Inline closure that can't yield a block is malformed — but a
                 // bare name reference we couldn't resolve in the file is the
@@ -740,7 +878,11 @@ fn collect_net_receive_flow(
 /// `local function doRetrieve() ... end` or `local doRetrieve = function() ... end`).
 /// Cross-file references are out of scope — those resolve at semantic-model
 /// time and are not part of the per-file collection pass.
-fn resolve_callback_block(root: &LuaChunk, callback_expr: &LuaExpr) -> Option<LuaBlock> {
+fn resolve_callback_block(
+    root: &LuaChunk,
+    callback_expr: &LuaExpr,
+    local_fns: &mut LocalFnCache,
+) -> Option<LuaBlock> {
     if let LuaExpr::ClosureExpr(closure_expr) = callback_expr {
         return closure_expr.get_block();
     }
@@ -750,66 +892,7 @@ fn resolve_callback_block(root: &LuaChunk, callback_expr: &LuaExpr) -> Option<Lu
     };
     let target_name = name_expr.get_name_text()?;
 
-    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
-        if let Some(local_name) = local_func_stat
-            .get_local_name()
-            .and_then(|n| n.get_name_token())
-            && local_name.get_name_text() == target_name
-            && let Some(block) = local_func_stat
-                .get_closure()
-                .and_then(|closure| closure.get_block())
-        {
-            return Some(block);
-        }
-    }
-
-    for local_stat in root.descendants::<LuaLocalStat>() {
-        let names: Vec<_> = local_stat.get_local_name_list().collect();
-        for (idx, local_name) in names.iter().enumerate() {
-            let Some(name_token) = local_name.get_name_token() else {
-                continue;
-            };
-            if name_token.get_name_text() != target_name {
-                continue;
-            }
-            if let Some(LuaExpr::ClosureExpr(closure_expr)) =
-                local_stat.get_value_exprs().nth(idx)
-                && let Some(block) = closure_expr.get_block()
-            {
-                return Some(block);
-            }
-        }
-    }
-
-    for func_stat in root.descendants::<LuaFuncStat>() {
-        if let Some(LuaVarExpr::NameExpr(name_expr)) = func_stat.get_func_name()
-            && name_expr.get_name_text().as_deref() == Some(target_name.as_str())
-            && let Some(block) = func_stat
-                .get_closure()
-                .and_then(|closure| closure.get_block())
-        {
-            return Some(block);
-        }
-    }
-
-    for assign_stat in root.descendants::<LuaAssignStat>() {
-        let (vars, values) = assign_stat.get_var_and_expr_list();
-        for (idx, var) in vars.iter().enumerate() {
-            let LuaVarExpr::NameExpr(name_expr) = var else {
-                continue;
-            };
-            if name_expr.get_name_text().as_deref() != Some(target_name.as_str()) {
-                continue;
-            }
-            if let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx)
-                && let Some(block) = closure_expr.get_block()
-            {
-                return Some(block);
-            }
-        }
-    }
-
-    None
+    local_fns.get(root).bare.get(&target_name).cloned()
 }
 
 /// Resolve a call expression to a function definition, returning a
@@ -827,13 +910,14 @@ fn resolve_call_to_function_block<'a>(
     root: &'a LuaChunk,
     call_expr: &LuaCallExpr,
     helper_registry: &'a HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) -> Option<(String, LuaBlock, &'a LuaChunk)> {
     let prefix = call_expr.get_prefix_expr()?;
 
     match prefix {
         LuaExpr::NameExpr(name_expr) => {
             let name = name_expr.get_name_text()?;
-            if let Some(block) = resolve_bare_name_function(root, &name) {
+            if let Some(block) = local_fns.get(root).bare.get(&name).cloned() {
                 return Some((name, block, root));
             }
             // Cross-file fallback: a bare-name call may reference a global
@@ -854,7 +938,7 @@ fn resolve_call_to_function_block<'a>(
             };
             let field_text = field_token.get_name_text().to_string();
             let key = format!("{prefix_text}.{field_text}");
-            if let Some(block) = resolve_dotted_function(root, &prefix_text, &field_text) {
+            if let Some(block) = local_fns.get(root).dotted.get(&key).cloned() {
                 return Some((key, block, root));
             }
             helper_registry
@@ -866,132 +950,12 @@ fn resolve_call_to_function_block<'a>(
     }
 }
 
-fn resolve_bare_name_function(root: &LuaChunk, target_name: &str) -> Option<LuaBlock> {
-    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
-        if let Some(local_name) = local_func_stat
-            .get_local_name()
-            .and_then(|n| n.get_name_token())
-            && local_name.get_name_text() == target_name
-            && let Some(block) = local_func_stat
-                .get_closure()
-                .and_then(|closure| closure.get_block())
-        {
-            return Some(block);
-        }
-    }
-
-    for local_stat in root.descendants::<LuaLocalStat>() {
-        let names: Vec<_> = local_stat.get_local_name_list().collect();
-        for (idx, local_name) in names.iter().enumerate() {
-            let Some(name_token) = local_name.get_name_token() else {
-                continue;
-            };
-            if name_token.get_name_text() != target_name {
-                continue;
-            }
-            if let Some(LuaExpr::ClosureExpr(closure_expr)) =
-                local_stat.get_value_exprs().nth(idx)
-                && let Some(block) = closure_expr.get_block()
-            {
-                return Some(block);
-            }
-        }
-    }
-
-    for func_stat in root.descendants::<LuaFuncStat>() {
-        if let Some(LuaVarExpr::NameExpr(name_expr)) = func_stat.get_func_name()
-            && name_expr.get_name_text().as_deref() == Some(target_name)
-            && let Some(block) = func_stat
-                .get_closure()
-                .and_then(|closure| closure.get_block())
-        {
-            return Some(block);
-        }
-    }
-
-    for assign_stat in root.descendants::<LuaAssignStat>() {
-        let (vars, values) = assign_stat.get_var_and_expr_list();
-        for (idx, var) in vars.iter().enumerate() {
-            let LuaVarExpr::NameExpr(name_expr) = var else {
-                continue;
-            };
-            if name_expr.get_name_text().as_deref() != Some(target_name) {
-                continue;
-            }
-            if let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx)
-                && let Some(block) = closure_expr.get_block()
-            {
-                return Some(block);
-            }
-        }
-    }
-
-    None
-}
-
-fn resolve_dotted_function(
-    root: &LuaChunk,
-    prefix_text: &str,
-    field_text: &str,
-) -> Option<LuaBlock> {
-    for func_stat in root.descendants::<LuaFuncStat>() {
-        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
-            continue;
-        };
-        let Some(LuaExpr::NameExpr(name_expr)) = index_expr.get_prefix_expr() else {
-            continue;
-        };
-        if name_expr.get_name_text().as_deref() != Some(prefix_text) {
-            continue;
-        }
-        let Some(LuaIndexKey::Name(field_token)) = index_expr.get_index_key() else {
-            continue;
-        };
-        if field_token.get_name_text() != field_text {
-            continue;
-        }
-        if let Some(block) = func_stat
-            .get_closure()
-            .and_then(|closure| closure.get_block())
-        {
-            return Some(block);
-        }
-    }
-
-    for assign_stat in root.descendants::<LuaAssignStat>() {
-        let (vars, values) = assign_stat.get_var_and_expr_list();
-        for (idx, var) in vars.iter().enumerate() {
-            let LuaVarExpr::IndexExpr(index_expr) = var else {
-                continue;
-            };
-            let Some(LuaExpr::NameExpr(name_expr)) = index_expr.get_prefix_expr() else {
-                continue;
-            };
-            if name_expr.get_name_text().as_deref() != Some(prefix_text) {
-                continue;
-            }
-            let Some(LuaIndexKey::Name(field_token)) = index_expr.get_index_key() else {
-                continue;
-            };
-            if field_token.get_name_text() != field_text {
-                continue;
-            }
-            if let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx)
-                && let Some(block) = closure_expr.get_block()
-            {
-                return Some(block);
-            }
-        }
-    }
-
-    None
-}
-
 fn collect_net_read_ops_from_block(
     root: &LuaChunk,
     block: LuaBlock,
     reads: &mut Vec<NetOpEntry>,
     helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) {
     let mut visited = HashSet::new();
     collect_net_ops_recursive(
@@ -1004,6 +968,7 @@ fn collect_net_read_ops_from_block(
         NetOpDirection::Read,
         helper_registry,
         &[],
+        local_fns,
     );
 }
 
@@ -1013,6 +978,7 @@ fn collect_net_write_ops_from_stat(
     stat: &LuaStat,
     writes: &mut Vec<NetOpEntry>,
     helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) {
     let mut visited = HashSet::new();
     collect_net_ops_recursive(
@@ -1025,6 +991,7 @@ fn collect_net_write_ops_from_stat(
         NetOpDirection::Write,
         helper_registry,
         &[],
+        local_fns,
     );
 }
 
@@ -1058,6 +1025,7 @@ fn collect_net_ops_recursive(
     direction: NetOpDirection,
     helper_registry: &HelperRegistry,
     flow_prefix: &[NetFlowFrame],
+    local_fns: &mut LocalFnCache,
 ) {
     for call_expr in subtree.descendants().filter_map(LuaCallExpr::cast) {
         if is_call_expr_in_nested_closure(enclosing_block, &call_expr) {
@@ -1089,7 +1057,7 @@ fn collect_net_ops_recursive(
         }
 
         let Some((helper_key, helper_block, helper_root)) =
-            resolve_call_to_function_block(root, &call_expr, helper_registry)
+            resolve_call_to_function_block(root, &call_expr, helper_registry, local_fns)
         else {
             continue;
         };
@@ -1117,6 +1085,7 @@ fn collect_net_ops_recursive(
             direction,
             helper_registry,
             &nested_prefix,
+            local_fns,
         );
         visited.remove(&helper_key);
     }
