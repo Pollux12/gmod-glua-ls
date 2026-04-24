@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-use super::{FindMembersResult, LuaMemberInfo, intersect_member_types};
+use super::{FindMembersResult, LuaMemberInfo, intersect_member_types, member_key_as_type};
 use rowan::TextRange;
 
 pub fn find_index_operations(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
@@ -83,10 +83,8 @@ fn find_index_table(db: &DbIndex, table_range: &InFiled<TextRange>) -> FindMembe
         let member_owner = LuaMemberOwner::Element(table_range.clone());
         if let Some(table_members) = db.get_member_index().get_members(&member_owner) {
             for member in table_members {
-                let member_key_type = match member.get_key() {
-                    LuaMemberKey::Name(s) => LuaType::StringConst(s.clone().into()),
-                    LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-                    _ => continue,
+                let Some(member_key_type) = member_key_as_type(member.get_key()) else {
+                    continue;
                 };
 
                 let member_type = db

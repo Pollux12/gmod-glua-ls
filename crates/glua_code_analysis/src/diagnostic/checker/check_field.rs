@@ -9,6 +9,7 @@ use glua_parser::{
 use crate::{
     DbIndex, DiagnosticCode, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaMemberKey,
     LuaMemberOwner, LuaType, SemanticModel, enum_variable_is_param, get_keyof_members,
+    semantic::member_key_matches_type,
 };
 
 use super::{Checker, DiagnosticContext, humanize_lint_type};
@@ -83,7 +84,7 @@ fn check_index_expr(
         .infer_expr(index_expr.get_prefix_expr()?)
         .unwrap_or(LuaType::Unknown);
 
-    if is_invalid_prefix_type(&prefix_typ) {
+    if is_invalid_prefix_type(&prefix_typ, code) {
         return Some(());
     }
 
@@ -187,7 +188,7 @@ fn check_index_expr(
     Some(())
 }
 
-fn is_invalid_prefix_type(typ: &LuaType) -> bool {
+fn is_invalid_prefix_type(typ: &LuaType, code: DiagnosticCode) -> bool {
     let mut current_typ = typ;
     loop {
         match current_typ {
@@ -197,8 +198,8 @@ fn is_invalid_prefix_type(typ: &LuaType) -> bool {
             | LuaType::Never
             | LuaType::SelfInfer
             | LuaType::TplRef(_)
-            | LuaType::StrTplRef(_)
-            | LuaType::TableConst(_) => return true,
+            | LuaType::StrTplRef(_) => return true,
+            LuaType::TableConst(_) => return code == DiagnosticCode::InjectField,
             LuaType::Instance(instance_typ) => {
                 current_typ = instance_typ.get_base();
             }
@@ -471,33 +472,10 @@ pub(super) fn is_valid_member(
                 if context.is_cancelled() {
                     return Some(());
                 }
-                match &info.key {
-                    LuaMemberKey::ExprType(typ) => {
-                        if typ.is_string() {
-                            if key_types
-                                .iter()
-                                .any(|typ| typ.is_string() || typ.is_str_tpl_ref())
-                            {
-                                return Some(());
-                            }
-                        } else if typ.is_integer() && key_types.iter().any(|typ| typ.is_integer()) {
-                            return Some(());
-                        }
+                for key_type in &key_types {
+                    if member_key_matches_type(semantic_model.get_db(), key_type, &info.key) {
+                        return Some(());
                     }
-                    LuaMemberKey::Name(_) => {
-                        if key_types
-                            .iter()
-                            .any(|typ| typ.is_string() || typ.is_str_tpl_ref())
-                        {
-                            return Some(());
-                        }
-                    }
-                    LuaMemberKey::Integer(_) => {
-                        if key_types.iter().any(|typ| typ.is_integer()) {
-                            return Some(());
-                        }
-                    }
-                    _ => {}
                 }
             }
             if members.is_empty() {

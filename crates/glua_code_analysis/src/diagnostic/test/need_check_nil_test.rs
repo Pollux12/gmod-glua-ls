@@ -102,6 +102,18 @@ mod test {
     }
 
     #[test]
+    fn test_plain_table_missing_field_strict_use_prefers_undefined_field_over_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+                local test = {}
+                local value = test.meow + 1
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_886() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(

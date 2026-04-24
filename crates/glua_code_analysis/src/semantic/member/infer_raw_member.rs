@@ -4,12 +4,15 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, GlobalId, InferFailReason, InferGuard, InferGuardRef, LuaGenericType, LuaMemberKey,
-    LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, LuaTypeDeclId, TypeOps,
+    LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, TypeOps,
     check_type_compact,
     semantic::generic::{TypeSubstitutor, instantiate_type_generic},
 };
 
-use super::{RawGetMemberTypeResult, get_buildin_type_map_type_id};
+use super::{
+    RawGetMemberTypeResult, get_buildin_type_map_type_id, member_key_as_type,
+    member_key_matches_type,
+};
 
 pub fn infer_raw_member_type(
     db: &DbIndex,
@@ -26,7 +29,9 @@ fn infer_raw_member_type_guard(
     infer_guard: &InferGuardRef,
 ) -> RawGetMemberTypeResult {
     match prefix_type {
-        LuaType::Table | LuaType::Any | LuaType::Unknown => Ok(LuaType::Any),
+        LuaType::Table => Ok(nullable_any_type()),
+        LuaType::Any => Ok(LuaType::Any),
+        LuaType::Unknown => Err(InferFailReason::FieldNotFound),
         LuaType::TableConst(id) => {
             let owner = LuaMemberOwner::Element(id.clone());
             infer_owner_raw_member_type(db, owner, member_key)
@@ -82,11 +87,45 @@ fn infer_owner_raw_member_type(
     member_owner: LuaMemberOwner,
     member_key: &LuaMemberKey,
 ) -> RawGetMemberTypeResult {
-    let member_item = db
-        .get_member_index()
-        .get_member_item(&member_owner, member_key)
-        .ok_or(InferFailReason::FieldNotFound)?;
-    member_item.resolve_type(db)
+    if let Some(member_item) = db.get_member_index().get_member_item(&member_owner, member_key) {
+        return member_item.resolve_type(db);
+    }
+
+    let Some(access_key_type) = member_key_as_type(member_key) else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+
+    let Some(owner_members) = db.get_member_index().get_members(&member_owner) else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+
+    let mut result_type = LuaType::Unknown;
+    for member in owner_members {
+        if !member_key_matches_type(db, &access_key_type, member.get_key()) {
+            continue;
+        }
+
+        let member_type = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())
+            .map(|it| it.as_type().clone())
+            .unwrap_or(LuaType::Unknown);
+        result_type = TypeOps::Union.apply(db, &result_type, &member_type);
+    }
+
+    if result_type.is_unknown() {
+        return Err(InferFailReason::FieldNotFound);
+    }
+
+    if matches!(access_key_type, LuaType::String | LuaType::Number | LuaType::Integer) {
+        result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
+    }
+
+    Ok(result_type)
+}
+
+fn nullable_any_type() -> LuaType {
+    LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into())
 }
 
 fn infer_custom_type_raw_member_type(

@@ -27,6 +27,7 @@ use crate::{
             narrow::infer_expr_narrow_type,
         },
         member::get_buildin_type_map_type_id,
+        member::member_key_matches_type,
         member::intersect_member_types,
         type_check::{self, check_type_compact},
     },
@@ -178,7 +179,9 @@ pub fn infer_member_by_member_key(
     infer_guard: &InferGuardRef,
 ) -> InferResult {
     match &prefix_type {
-        LuaType::Table | LuaType::Any | LuaType::Unknown => Ok(LuaType::Any),
+        LuaType::Table => Ok(nullable_any_type()),
+        LuaType::Any => Ok(LuaType::Any),
+        LuaType::Unknown => Err(InferFailReason::FieldNotFound),
         LuaType::Nil => Ok(LuaType::Never),
         LuaType::TableConst(id) => infer_table_member(db, cache, id.clone(), index_expr),
         LuaType::String
@@ -278,6 +281,10 @@ fn infer_table_member(
     };
 
     member_item.resolve_type_with_realm(db, &cache.get_file_id())
+}
+
+fn nullable_any_type() -> LuaType {
+    LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into())
 }
 
 fn infer_custom_type_member(
@@ -924,12 +931,7 @@ fn infer_member_by_index_table(
                     members.sort_by(|a, b| a.get_key().cmp(b.get_key()));
                     let mut result_type = LuaType::Unknown;
                     for member in members {
-                        let member_key_type = match member.get_key() {
-                            LuaMemberKey::Name(s) => LuaType::StringConst(s.clone().into()),
-                            LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-                            _ => continue,
-                        };
-                        if check_type_compact(db, &key_type, &member_key_type).is_ok() {
+                        if member_key_matches_type(db, &key_type, member.get_key()) {
                             let member_type = db
                                 .get_type_index()
                                 .get_type_cache(&member.get_id().into())

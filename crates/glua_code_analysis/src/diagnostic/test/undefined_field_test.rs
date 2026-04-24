@@ -826,6 +826,18 @@ mod test {
     }
 
     #[test]
+    fn test_plain_table_missing_field_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local test = {}
+                print(test.meow)
+            "#
+        ));
+    }
+
+    #[test]
     fn test_enum_field_1() {
         let mut ws = VirtualWorkspace::new();
         ws.def(

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use crate::{
     DbIndex, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSemanticDeclId, TypeOps,
     db_index::{LuaType, LuaTypeDeclId},
+    semantic::type_check::check_type_compact,
 };
 pub use find_index::find_index_operations;
 pub use find_members::{
@@ -56,6 +57,28 @@ pub(crate) fn intersect_member_types(db: &DbIndex, left: LuaType, right: LuaType
     } else {
         TypeOps::Intersect.apply(db, &left, &right)
     }
+}
+
+pub(crate) fn member_key_as_type(key: &LuaMemberKey) -> Option<LuaType> {
+    match key {
+        LuaMemberKey::None => None,
+        LuaMemberKey::Integer(i) => Some(LuaType::IntegerConst(*i)),
+        LuaMemberKey::Name(name) => Some(LuaType::StringConst(name.clone().into())),
+        LuaMemberKey::ExprType(typ) => Some(typ.clone()),
+    }
+}
+
+pub(crate) fn member_key_matches_type(
+    db: &DbIndex,
+    access_key_type: &LuaType,
+    member_key: &LuaMemberKey,
+) -> bool {
+    let Some(member_key_type) = member_key_as_type(member_key) else {
+        return false;
+    };
+
+    check_type_compact(db, access_key_type, &member_key_type).is_ok()
+        || check_type_compact(db, &member_key_type, access_key_type).is_ok()
 }
 
 pub fn find_member_origin_owner(

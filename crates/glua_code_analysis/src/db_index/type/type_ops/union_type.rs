@@ -6,6 +6,11 @@ pub fn union_type(db: &DbIndex, source: LuaType, target: LuaType) -> LuaType {
     let real_type = get_real_type(db, &source).unwrap_or(&source);
 
     match (&real_type, &target) {
+        // Preserve explicit nilability for dynamic values. In this type system, bare `any`
+        // is not treated as nullable by diagnostics like NeedCheckNil, so collapsing
+        // `any | nil` to `any` loses important information.
+        (LuaType::Any, right) if right.is_nullable() => nullable_any_type(),
+        (left, LuaType::Any) if left.is_nullable() => nullable_any_type(),
         // ANY | T = ANY
         (LuaType::Any, _) => LuaType::Any,
         (_, LuaType::Any) => LuaType::Any,
@@ -106,4 +111,8 @@ pub fn union_type(db: &DbIndex, source: LuaType, target: LuaType) -> LuaType {
         (left, right) if *left == right => source.clone(),
         _ => LuaType::from_vec(vec![source, target]),
     }
+}
+
+fn nullable_any_type() -> LuaType {
+    LuaType::Union(LuaUnionType::Nullable(LuaType::Any).into())
 }

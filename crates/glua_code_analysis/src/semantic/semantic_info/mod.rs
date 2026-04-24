@@ -16,7 +16,7 @@ pub use resolve_global_decl::resolve_global_decl_id;
 pub use semantic_decl_level::SemanticDeclLevel;
 pub use semantic_guard::SemanticDeclGuard;
 
-use super::{LuaInferCache, infer_bind_value_type, infer_expr};
+use super::{InferFailReason, LuaInferCache, infer_bind_value_type, infer_expr};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticInfo {
@@ -78,7 +78,13 @@ pub fn infer_node_semantic_info(
     match node {
         expr_node if LuaExpr::can_cast(expr_node.kind().into()) => {
             let expr = LuaExpr::cast(expr_node)?;
-            let mut typ = infer_expr(db, cache, expr.clone()).unwrap_or(LuaType::Unknown);
+            let mut typ = match infer_expr(db, cache, expr.clone()) {
+                Ok(typ) => typ,
+                Err(InferFailReason::FieldNotFound) if matches!(expr, LuaExpr::IndexExpr(_)) => {
+                    infer_bind_value_type(db, cache, expr.clone()).unwrap_or(LuaType::Nil)
+                }
+                Err(_) => LuaType::Unknown,
+            };
             if typ.is_unknown()
                 && let Some(bind_typ) = infer_bind_value_type(db, cache, expr.clone())
             {

@@ -99,6 +99,20 @@ mod tests {
             );
         }
         {
+            let type_any = ws.ty("any");
+            let type_nil = ws.ty("nil");
+            let result = TypeOps::Union.apply(ws.get_db_mut(), &type_any, &type_nil);
+            assert_eq!(result, ws.ty("any | nil"));
+            assert!(result.is_nullable());
+        }
+        {
+            let type_any = ws.ty("any");
+            let type_string_nil = ws.ty("string | nil");
+            let result = TypeOps::Union.apply(ws.get_db_mut(), &type_any, &type_string_nil);
+            assert_eq!(result, ws.ty("any | nil"));
+            assert!(result.is_nullable());
+        }
+        {
             let type_number = ws.ty("number");
             let type_integer = ws.ty("integer");
             assert_eq!(

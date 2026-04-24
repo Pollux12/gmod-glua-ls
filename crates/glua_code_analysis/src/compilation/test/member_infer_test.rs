@@ -238,6 +238,21 @@ mod test {
     }
 
     #[gtest]
+    fn test_missing_plain_table_field_is_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        local test = {}
+        A = test.meow
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(ty), "nil");
+    }
+
+    #[gtest]
     fn test_flow_fallback_prefers_latest_dynamic_field_assignment() {
         let mut ws = VirtualWorkspace::new();
 

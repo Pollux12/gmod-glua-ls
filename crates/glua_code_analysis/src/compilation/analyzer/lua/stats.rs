@@ -12,6 +12,7 @@ use crate::{
         unresolve::{UnResolveDecl, UnResolveMember},
     },
     db_index::{LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType},
+    semantic::member_key_matches_type,
 };
 
 use super::LuaAnalyzer;
@@ -221,9 +222,32 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
 
     match analyzer.infer_expr(&prefix_expr.clone()) {
         Ok(prefix_type) => {
-            index_expr.get_index_key()?;
+            let index_key = index_expr.get_index_key()?;
             let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
             let (member_owner, set_owner_only) = resolve_index_expr_member_owner(&prefix_type)?;
+            if analyzer.db.get_member_index().get_member(&member_id).is_none() {
+                let cache = analyzer
+                    .context
+                    .infer_manager
+                    .get_infer_cache(analyzer.file_id);
+                let Ok(member_key) = LuaMemberKey::from_index_key(analyzer.db, cache, &index_key)
+                else {
+                    return Some(());
+                };
+                if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
+                    return Some(());
+                }
+
+                let decl_feature = if analyzer.context.metas.contains(&analyzer.file_id) {
+                    LuaMemberFeature::MetaDefine
+                } else {
+                    LuaMemberFeature::FileDefine
+                };
+                let member = LuaMember::new(member_id, member_key, decl_feature, None);
+                analyzer.db.get_member_index_mut().add_member(member_owner, member);
+                return Some(());
+            }
+
             if set_owner_only {
                 analyzer.db.get_member_index_mut().set_member_owner(
                     member_owner,
@@ -728,16 +752,37 @@ fn find_related_member_ids(
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     let member_key = LuaMemberKey::from_index_key(analyzer.db, cache, &index_key).ok()?;
-    let members = analyzer
-        .db
-        .get_member_index()
-        .get_members_for_owner_key(&owner, &member_key);
+    let members = if member_key.is_expr() {
+        let access_key_type = member_key_as_expr_type(&member_key)?;
+        analyzer
+            .db
+            .get_member_index()
+            .get_members(&owner)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|member| {
+                member_key_matches_type(analyzer.db, access_key_type, member.get_key())
+            })
+            .collect::<Vec<_>>()
+    } else {
+        analyzer
+            .db
+            .get_member_index()
+            .get_members_for_owner_key(&owner, &member_key)
+    };
 
     if members.is_empty() {
         return None;
     }
 
     Some(members.into_iter().map(|member| member.get_id()).collect())
+}
+
+fn member_key_as_expr_type(member_key: &LuaMemberKey) -> Option<&LuaType> {
+    match member_key {
+        LuaMemberKey::ExprType(typ) => Some(typ),
+        _ => None,
+    }
 }
 
 fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwner> {
