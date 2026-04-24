@@ -8,7 +8,7 @@ use crate::{
     LuaDeclExtra, LuaMemberFeature, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaType,
     LuaTypeCache,
     compilation::analyzer::common::bind_type,
-    db_index::{LocalAttribute, LuaDecl, LuaMember, LuaMemberKey},
+    db_index::{LocalAttribute, LuaDecl, LuaDeclInitializer, LuaMember, LuaMemberKey},
 };
 
 use super::{DeclAnalyzer, members::find_index_owner};
@@ -38,8 +38,20 @@ pub fn analyze_local_stat(analyzer: &mut DeclAnalyzer, stat: LuaLocalStat) -> Op
         let file_id = analyzer.get_file_id();
         let range = local_name.get_range();
         let expr_id = value_expr_list.get(index).map(|expr| expr.get_syntax_id());
+        let last_value_index = value_expr_list.len().saturating_sub(1);
+        let initializer = if value_expr_list.is_empty() {
+            None
+        } else if index < last_value_index {
+            value_expr_list
+                .get(index)
+                .map(|expr| LuaDeclInitializer::new(expr.get_syntax_id(), 0))
+        } else {
+            value_expr_list
+                .last()
+                .map(|expr| LuaDeclInitializer::new(expr.get_syntax_id(), index - last_value_index))
+        };
 
-        let decl = LuaDecl::new(
+        let mut decl = LuaDecl::new(
             &name,
             file_id,
             range,
@@ -49,6 +61,7 @@ pub fn analyze_local_stat(analyzer: &mut DeclAnalyzer, stat: LuaLocalStat) -> Op
             },
             expr_id,
         );
+        decl.set_initializer(initializer);
         analyzer.add_decl(decl);
     }
 

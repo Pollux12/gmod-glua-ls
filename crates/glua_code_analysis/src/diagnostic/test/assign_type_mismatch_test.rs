@@ -233,6 +233,44 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_return_local_after_unrelated_branch_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local _, height = get_size()
+
+                local x; if true then x = x end
+
+                ---@type { h: number }
+                local ghost = { h = height }
+
+                ---@return string, number
+                function get_size() return "", 1 end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_three_return_local_after_unrelated_branch_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local _, _, height = get_size()
+
+                local x; if true then x = x end
+
+                ---@type { h: number }
+                local ghost = { h = height }
+
+                ---@return string, boolean, number
+                function get_size() return "", false, 1 end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_193() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for_namespace(
