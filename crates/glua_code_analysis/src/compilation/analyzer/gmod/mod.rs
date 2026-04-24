@@ -342,44 +342,49 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
         };
         let chunk = tree.get_chunk_node();
 
-        for func_stat in chunk.descendants::<LuaFuncStat>() {
-            let Some(func_name) = func_stat.get_func_name() else {
-                continue;
-            };
-            let Some(block) = func_stat
-                .get_closure()
-                .and_then(|closure| closure.get_block())
-            else {
-                continue;
-            };
-
-            let key = match func_name {
-                LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
-                LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(&index_expr),
-            };
-
-            if let Some(key) = key {
-                map.entry(key).or_insert_with(|| (chunk.clone(), block));
-            }
-        }
-
-        for assign_stat in chunk.descendants::<LuaAssignStat>() {
-            let (vars, values) = assign_stat.get_var_and_expr_list();
-            for (idx, var) in vars.iter().enumerate() {
-                let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx) else {
+        // Single descendants walk dispatching by node kind. Avoids two
+        // separate full-file walks for FuncStat and AssignStat.
+        for node in chunk.syntax().descendants() {
+            if let Some(func_stat) = LuaFuncStat::cast(node.clone()) {
+                let Some(func_name) = func_stat.get_func_name() else {
                     continue;
                 };
-                let Some(block) = closure_expr.get_block() else {
+                let Some(block) = func_stat
+                    .get_closure()
+                    .and_then(|closure| closure.get_block())
+                else {
                     continue;
                 };
 
-                let key = match var {
+                let key = match func_name {
                     LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
-                    LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(index_expr),
+                    LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(&index_expr),
                 };
 
                 if let Some(key) = key {
                     map.entry(key).or_insert_with(|| (chunk.clone(), block));
+                }
+                continue;
+            }
+
+            if let Some(assign_stat) = LuaAssignStat::cast(node) {
+                let (vars, values) = assign_stat.get_var_and_expr_list();
+                for (idx, var) in vars.iter().enumerate() {
+                    let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx) else {
+                        continue;
+                    };
+                    let Some(block) = closure_expr.get_block() else {
+                        continue;
+                    };
+
+                    let key = match var {
+                        LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+                        LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(index_expr),
+                    };
+
+                    if let Some(key) = key {
+                        map.entry(key).or_insert_with(|| (chunk.clone(), block));
+                    }
                 }
             }
         }
@@ -549,33 +554,38 @@ fn collect_hook_metadata(
     let mut receive_flows = Vec::new();
     let mut local_fns = LocalFnCache::default();
 
-    for call_expr in root.descendants::<LuaCallExpr>() {
-        if let Some(site) = collect_hook_call_site(db, call_expr.clone()) {
-            db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
+    // Single descendants walk dispatching by node kind. Avoids two separate
+    // O(N) walks for the LuaCallExpr and LuaFuncStat passes.
+    for node in root.syntax().descendants() {
+        if let Some(call_expr) = LuaCallExpr::cast(node.clone()) {
+            if let Some(site) = collect_hook_call_site(db, call_expr.clone()) {
+                db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
+            }
+
+            if let Some(receive_flow) =
+                collect_net_receive_flow(&root, &call_expr, helper_registry, &mut local_fns)
+            {
+                receive_flows.push(receive_flow);
+            }
+
+            collect_system_call_metadata(db, file_id, call_expr);
+            continue;
         }
 
-        if let Some(receive_flow) =
-            collect_net_receive_flow(&root, &call_expr, helper_registry, &mut local_fns)
-        {
-            receive_flows.push(receive_flow);
-        }
+        if let Some(func_stat) = LuaFuncStat::cast(node) {
+            if let Some(site) = collect_hook_method_site(db, func_stat.clone()) {
+                db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
+            }
 
-        collect_system_call_metadata(db, file_id, call_expr);
-    }
-
-    for func_stat in root.descendants::<LuaFuncStat>() {
-        if let Some(site) = collect_hook_method_site(db, func_stat.clone()) {
-            db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
-        }
-
-        if let Some((method_name, realm)) = collect_gm_method_realm_annotation(&func_stat)
-            && !gm_method_realms
-                .iter()
-                .any(|(existing_name, existing_realm)| {
-                    existing_name == &method_name && *existing_realm == realm
-                })
-        {
-            gm_method_realms.push((method_name, realm));
+            if let Some((method_name, realm)) = collect_gm_method_realm_annotation(&func_stat)
+                && !gm_method_realms
+                    .iter()
+                    .any(|(existing_name, existing_realm)| {
+                        existing_name == &method_name && *existing_realm == realm
+                    })
+            {
+                gm_method_realms.push((method_name, realm));
+            }
         }
     }
 
@@ -1922,69 +1932,76 @@ fn synthesize_network_var_wrappers(
 fn collect_network_var_wrappers(root: &LuaChunk, global_name: &str) -> Vec<NetworkVarWrapper> {
     let mut wrappers = Vec::new();
 
-    for func_stat in root.descendants::<LuaFuncStat>() {
-        // Only methods on the entity global: function ENT:MethodName(...)
-        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
-            continue;
-        };
+    // Single descendants walk dispatching by node kind. Avoids two separate
+    // O(N) walks for FuncStat and LocalFuncStat.
+    for node in root.syntax().descendants() {
+        if let Some(func_stat) = LuaFuncStat::cast(node.clone()) {
+            // Only methods on the entity global: function ENT:MethodName(...)
+            let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
+                continue;
+            };
 
-        // Check the prefix is the entity global name
-        let Some(LuaExpr::NameExpr(prefix_name)) = index_expr.get_prefix_expr() else {
-            continue;
-        };
-        let Some(prefix_text) = prefix_name.get_name_text() else {
-            continue;
-        };
-        if prefix_text != global_name {
-            continue;
-        }
+            // Check the prefix is the entity global name
+            let Some(LuaExpr::NameExpr(prefix_name)) = index_expr.get_prefix_expr() else {
+                continue;
+            };
+            let Some(prefix_text) = prefix_name.get_name_text() else {
+                continue;
+            };
+            if prefix_text != global_name {
+                continue;
+            }
 
-        let Some(LuaIndexKey::Name(method_name_token)) = index_expr.get_index_key() else {
-            continue;
-        };
-        let method_name = method_name_token.get_name_text().to_string();
+            let Some(LuaIndexKey::Name(method_name_token)) = index_expr.get_index_key() else {
+                continue;
+            };
+            let method_name = method_name_token.get_name_text().to_string();
 
-        // Skip known call kinds that are already handled directly
-        if GmodScriptedClassCallKind::from_call_name(&method_name).is_some() {
-            continue;
-        }
+            // Skip known call kinds that are already handled directly
+            if GmodScriptedClassCallKind::from_call_name(&method_name).is_some() {
+                continue;
+            }
 
-        let Some(closure) = func_stat.get_closure() else {
-            continue;
-        };
+            let Some(closure) = func_stat.get_closure() else {
+                continue;
+            };
 
-        // Collect parameter names for mapping
-        let param_names: Vec<String> = get_closure_param_names(&closure);
+            // Collect parameter names for mapping
+            let param_names: Vec<String> = get_closure_param_names(&closure);
 
-        // Walk the closure body looking for NetworkVar/NetworkVarElement calls
-        if let Some(wrapper) = find_networkvar_in_closure(&closure, &method_name, &param_names) {
-            wrappers.push(wrapper);
-        }
-    }
-
-    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
-        let Some(local_name) = local_func_stat.get_local_name() else {
-            continue;
-        };
-        let Some(name_token) = local_name.get_name_token() else {
-            continue;
-        };
-        let method_name = name_token.get_name_text().to_string();
-
-        if GmodScriptedClassCallKind::from_call_name(&method_name).is_some() {
+            // Walk the closure body looking for NetworkVar/NetworkVarElement calls
+            if let Some(wrapper) = find_networkvar_in_closure(&closure, &method_name, &param_names)
+            {
+                wrappers.push(wrapper);
+            }
             continue;
         }
 
-        let Some(closure) = local_func_stat.get_closure() else {
-            continue;
-        };
+        if let Some(local_func_stat) = LuaLocalFuncStat::cast(node) {
+            let Some(local_name) = local_func_stat.get_local_name() else {
+                continue;
+            };
+            let Some(name_token) = local_name.get_name_token() else {
+                continue;
+            };
+            let method_name = name_token.get_name_text().to_string();
 
-        let param_names: Vec<String> = get_closure_param_names(&closure);
+            if GmodScriptedClassCallKind::from_call_name(&method_name).is_some() {
+                continue;
+            }
 
-        if let Some(mut wrapper) = find_networkvar_in_closure(&closure, &method_name, &param_names)
-        {
-            wrapper.is_local = true;
-            wrappers.push(wrapper);
+            let Some(closure) = local_func_stat.get_closure() else {
+                continue;
+            };
+
+            let param_names: Vec<String> = get_closure_param_names(&closure);
+
+            if let Some(mut wrapper) =
+                find_networkvar_in_closure(&closure, &method_name, &param_names)
+            {
+                wrapper.is_local = true;
+                wrappers.push(wrapper);
+            }
         }
     }
 
@@ -3646,24 +3663,28 @@ fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
 /// Collect `---@realm` ranges from func/local-func decls in `root`.
 fn collect_member_realm_ranges(root: &LuaChunk) -> Vec<GmodRealmRange> {
     let mut ranges = Vec::new();
-    for func_stat in root.descendants::<LuaFuncStat>() {
-        if let Some(comment) = func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            ranges.push(GmodRealmRange {
-                range: func_stat.get_range(),
-                realm,
-            });
+    // Single descendants walk: FuncStat and LocalFuncStat both contribute.
+    for node in root.syntax().descendants() {
+        if let Some(func_stat) = LuaFuncStat::cast(node.clone()) {
+            if let Some(comment) = func_stat.get_left_comment()
+                && let Some(realm) = realm_from_doc_comment(&comment)
+            {
+                ranges.push(GmodRealmRange {
+                    range: func_stat.get_range(),
+                    realm,
+                });
+            }
+            continue;
         }
-    }
-    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
-        if let Some(comment) = local_func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            ranges.push(GmodRealmRange {
-                range: local_func_stat.get_range(),
-                realm,
-            });
+        if let Some(local_func_stat) = LuaLocalFuncStat::cast(node) {
+            if let Some(comment) = local_func_stat.get_left_comment()
+                && let Some(realm) = realm_from_doc_comment(&comment)
+            {
+                ranges.push(GmodRealmRange {
+                    range: local_func_stat.get_range(),
+                    realm,
+                });
+            }
         }
     }
     ranges
