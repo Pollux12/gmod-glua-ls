@@ -1123,8 +1123,8 @@ pub struct EmmyrcGmodHookMappings {
 pub struct EmmyrcGmodNetwork {
     #[serde(default = "network_enabled_default")]
     pub enabled: bool,
-    #[serde(default)]
-    pub diagnostics: EmmyrcGmodNetworkDiagnostics,
+    #[serde(default = "network_code_lens_default")]
+    pub code_lens_enabled: bool,
     #[serde(default)]
     pub completion: EmmyrcGmodNetworkCompletion,
 }
@@ -1133,45 +1133,16 @@ fn network_enabled_default() -> bool {
     true
 }
 
+fn network_code_lens_default() -> bool {
+    true
+}
+
 impl Default for EmmyrcGmodNetwork {
     fn default() -> Self {
         Self {
             enabled: network_enabled_default(),
-            diagnostics: EmmyrcGmodNetworkDiagnostics::default(),
+            code_lens_enabled: network_code_lens_default(),
             completion: EmmyrcGmodNetworkCompletion::default(),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct EmmyrcGmodNetworkDiagnostics {
-    #[serde(default = "network_type_mismatch_default")]
-    pub type_mismatch: bool,
-    #[serde(default = "network_order_mismatch_default")]
-    pub order_mismatch: bool,
-    #[serde(default = "network_missing_counterpart_default")]
-    pub missing_counterpart: bool,
-}
-
-fn network_type_mismatch_default() -> bool {
-    true
-}
-
-fn network_order_mismatch_default() -> bool {
-    true
-}
-
-fn network_missing_counterpart_default() -> bool {
-    true
-}
-
-impl Default for EmmyrcGmodNetworkDiagnostics {
-    fn default() -> Self {
-        Self {
-            type_mismatch: network_type_mismatch_default(),
-            order_mismatch: network_order_mismatch_default(),
-            missing_counterpart: network_missing_counterpart_default(),
         }
     }
 }
@@ -1236,9 +1207,7 @@ mod tests {
         verify_that!(gmod.hook_mappings.emitter_to_hook.is_empty(), eq(true))?;
         verify_that!(gmod.hook_mappings.method_prefixes.is_empty(), eq(true))?;
         verify_that!(gmod.network.enabled, eq(true))?;
-        verify_that!(gmod.network.diagnostics.type_mismatch, eq(true))?;
-        verify_that!(gmod.network.diagnostics.order_mismatch, eq(true))?;
-        verify_that!(gmod.network.diagnostics.missing_counterpart, eq(true))?;
+        verify_that!(gmod.network.code_lens_enabled, eq(true))?;
         verify_that!(gmod.network.completion.smart_read_suggestions, eq(true))?;
         verify_that!(gmod.network.completion.mismatch_hints, eq(true))?;
         verify_that!(gmod.vgui.code_lens_enabled, eq(true))?;
@@ -1365,11 +1334,6 @@ mod tests {
             r#"{
                 "network": {
                     "enabled": false,
-                    "diagnostics": {
-                        "typeMismatch": false,
-                        "orderMismatch": false,
-                        "missingCounterpart": false
-                    },
                     "completion": {
                         "smartReadSuggestions": false,
                         "mismatchHints": false
@@ -1384,9 +1348,6 @@ mod tests {
         .or_fail()?;
 
         verify_that!(gmod.network.enabled, eq(false))?;
-        verify_that!(gmod.network.diagnostics.type_mismatch, eq(false))?;
-        verify_that!(gmod.network.diagnostics.order_mismatch, eq(false))?;
-        verify_that!(gmod.network.diagnostics.missing_counterpart, eq(false))?;
         verify_that!(gmod.network.completion.smart_read_suggestions, eq(false))?;
         verify_that!(gmod.network.completion.mismatch_hints, eq(false))?;
         verify_that!(gmod.vgui.code_lens_enabled, eq(false))?;

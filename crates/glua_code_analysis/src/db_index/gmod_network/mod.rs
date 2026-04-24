@@ -5,6 +5,13 @@ use rowan::TextRange;
 use super::LuaIndex;
 use crate::FileId;
 
+mod pair;
+
+pub use pair::{
+    expected_receiver_realm, flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
+    pair_senders_for_receive,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NetOpKind {
     WriteEntity,
@@ -175,6 +182,70 @@ impl NetOpKind {
 pub struct NetOpEntry {
     pub kind: NetOpKind,
     pub range: TextRange,
+    /// True if this op is contained inside a conditional/loop control-flow
+    /// statement (if/elseif/else, while, repeat, for, generic-for) relative to
+    /// the enclosing send/receive block. Dynamic ops represent `0..N`
+    /// occurrences of `kind` rather than a single fixed occurrence.
+    pub dynamic: bool,
+    /// Bit-width literal captured from `WriteUInt`/`ReadUInt`/`WriteInt`/`ReadInt`
+    /// calls. `None` when the op kind has no bit-width parameter, or when the
+    /// argument is not a numeric literal (variable, expression, etc.). Surfaced
+    /// in hover so callers can see at a glance how many bits flow on the wire.
+    pub bits: Option<u32>,
+    /// Source text of the value argument for `Write*` ops (the data being sent).
+    /// Empty for `Read*` ops since reads have no value argument. Truncated to a
+    /// short snippet so the hover can show "what is being written" without
+    /// blowing up the popup with multi-line expressions. `None` when the value
+    /// arg is missing, multi-line, or otherwise unsuitable for inline display.
+    pub value_text: Option<String>,
+    /// Stack of enclosing control-flow frames between the send/receive block
+    /// and this op, ordered outer-to-inner. Captured at index time so hover
+    /// can render the actual `if cond then` / `for k, v in pairs(t) do` /
+    /// `while cond do` source text around each op rather than synthesized
+    /// labels — gives developers exact control-flow context.
+    pub flow_path: Vec<NetFlowFrame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NetFlowFrame {
+    pub kind: NetFlowKind,
+    /// Single-line summary of the statement opener: `if cond then`,
+    /// `for i = 1, #items do`, `while running do`, etc. Truncated and
+    /// whitespace-collapsed; `None` when the source isn't suitable for
+    /// inline display (too long, multi-line, etc.).
+    pub header: Option<String>,
+    /// Stable id distinguishing two structurally identical frames at the
+    /// same source span (e.g. two adjacent `if x then ... end` blocks).
+    /// Range start of the statement node — different statements have
+    /// different ranges, so equal `id` means literally the same source frame.
+    pub id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetFlowKind {
+    If,
+    While,
+    For,
+    ForRange,
+    Repeat,
+}
+
+impl NetFlowKind {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            NetFlowKind::If => "if",
+            NetFlowKind::While => "while",
+            NetFlowKind::For => "for",
+            NetFlowKind::ForRange => "for",
+            NetFlowKind::Repeat => "repeat",
+        }
+    }
+
+    /// True when the construct may execute its body more than once.
+    /// Used by hover to label loops as "may repeat" vs ifs as "may not run".
+    pub fn is_loop(self) -> bool {
+        matches!(self, NetFlowKind::While | NetFlowKind::For | NetFlowKind::ForRange | NetFlowKind::Repeat)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +261,19 @@ pub enum NetSendKind {
     PVS,
 }
 
+impl NetSendKind {
+    pub fn to_fn_name(self) -> &'static str {
+        match self {
+            NetSendKind::Send => "net.Send",
+            NetSendKind::Broadcast => "net.Broadcast",
+            NetSendKind::SendToServer => "net.SendToServer",
+            NetSendKind::Omit => "net.SendOmit",
+            NetSendKind::PAS => "net.SendPAS",
+            NetSendKind::PVS => "net.SendPVS",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetSendFlow {
     pub message_name: String,
@@ -197,6 +281,14 @@ pub struct NetSendFlow {
     pub writes: Vec<NetOpEntry>,
     pub send_range: TextRange,
     pub send_kind: NetSendKind,
+    /// Single-line snippet of the first argument to the send call (the
+    /// recipient expression for `net.Send`/`net.SendOmit`/`net.SendPVS`/
+    /// `net.SendPAS`). `None` for `net.Broadcast`/`net.SendToServer` (no
+    /// recipient arg) or when the source is not suitable for inline display
+    /// (multi-line, too long, missing, etc.). Surfaced in the code lens so
+    /// developers can see at a glance who the message is targeted at without
+    /// jumping to the call site.
+    pub send_target: Option<String>,
     /// True if this flow was found inside a function body (helper wrapper).
     /// Partial wrapped flows are used for counterpart existence checks only.
     pub is_wrapped: bool,
@@ -207,6 +299,12 @@ pub struct NetReceiveFlow {
     pub message_name: String,
     pub receive_range: TextRange,
     pub reads: Vec<NetOpEntry>,
+    /// True when the callback body could not be resolved (e.g. the second
+    /// argument is a name reference to a function defined in another file).
+    /// Opaque flows are still recorded for counterpart presence checks but
+    /// must be skipped for read/write mismatch diagnostics — we cannot
+    /// inspect their reads, so any count comparison would be unreliable.
+    pub reads_opaque: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -372,6 +470,7 @@ mod tests {
             writes: Vec::new(),
             send_range: range(start + 10),
             send_kind: NetSendKind::Broadcast,
+            send_target: None,
             is_wrapped: false,
         }
     }
@@ -381,6 +480,7 @@ mod tests {
             message_name: message_name.to_string(),
             receive_range: range(start),
             reads: Vec::new(),
+            reads_opaque: false,
         }
     }
 

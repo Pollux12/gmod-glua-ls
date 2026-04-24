@@ -142,6 +142,8 @@ pub enum DiagnosticCode {
     GmodNetReadWriteOrderMismatch,
     /// gmod-net-missing-network-counterpart
     GmodNetMissingNetworkCounterpart,
+    /// gmod-net-read-write-bits-mismatch
+    GmodNetReadWriteBitsMismatch,
     /// gmod-duplicate-system-registration
     GmodDuplicateSystemRegistration,
     #[serde(other)]
@@ -184,6 +186,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::GmodNetReadWriteTypeMismatch => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodNetReadWriteOrderMismatch => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodNetMissingNetworkCounterpart => DiagnosticSeverity::WARNING,
+        DiagnosticCode::GmodNetReadWriteBitsMismatch => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodDuplicateSystemRegistration => DiagnosticSeverity::HINT,
         _ => DiagnosticSeverity::WARNING,
     }
@@ -218,6 +221,7 @@ pub fn is_code_default_enable(code: &DiagnosticCode, level: LuaLanguageLevel) ->
         DiagnosticCode::GmodNetReadWriteTypeMismatch => true,
         DiagnosticCode::GmodNetReadWriteOrderMismatch => true,
         DiagnosticCode::GmodNetMissingNetworkCounterpart => true,
+        DiagnosticCode::GmodNetReadWriteBitsMismatch => true,
         DiagnosticCode::GmodInvalidHookName => true,
 
         // neovim-code-style

@@ -132,11 +132,12 @@ To **override** a built-in definition, add an entry with its `id` and only the f
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `gmod.network.enabled` | `boolean` | `true` | Enable all network flow analysis |
-| `gmod.network.diagnostics.typeMismatch` | `boolean` | `true` | Warn when read type doesn't match written type |
-| `gmod.network.diagnostics.orderMismatch` | `boolean` | `true` | Warn when read order doesn't match written order |
-| `gmod.network.diagnostics.missingCounterpart` | `boolean` | `true` | Warn when net message is missing read/write in other realm |
 | `gmod.network.completion.smartReadSuggestions` | `boolean` | `true` | Suggest net.Read* calls in expected order inside receive callbacks |
 | `gmod.network.completion.mismatchHints` | `boolean` | `true` | Annotate suggestions with hints when expected read doesn't match current |
+
+<Note>
+To disable individual network diagnostics, use the primary `diagnostics.disable` list with the relevant code name (e.g. `"gmod-net-read-write-type-mismatch"`). See the [Diagnostics configuration](/configuration/diagnostics) page for the full list of network diagnostic codes and severity options.
+</Note>
 
 ### Example
 
@@ -144,13 +145,11 @@ To **override** a built-in definition, add an entry with its `id` and only the f
 {
   "gmod": {
     "network": {
-      "enabled": true,
-      "diagnostics": {
-        "typeMismatch": true,
-        "orderMismatch": true,
-        "missingCounterpart": true
-      }
+      "enabled": true
     }
+  },
+  "diagnostics": {
+    "disable": ["gmod-net-read-write-bits-mismatch"]
   }
 }
 ```
@@ -189,4 +188,3 @@ These settings can also be configured via VS Code's settings (`gluals.*` prefix)
 | `gluals.gmod.templatePath` | `gmod.templatePath` | `string` | `null` | Custom scaffolding template path |
 | `gluals.gmod.vgui.codeLensEnabled` | `gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI code lens |
 | `gluals.gmod.vgui.inlayHintEnabled` | `gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI inlay hints |
-

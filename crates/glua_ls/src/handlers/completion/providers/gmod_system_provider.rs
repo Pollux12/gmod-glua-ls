@@ -212,7 +212,7 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
             entry
                 .kind
                 .to_read_counterpart()
-                .map(|read_kind| (entry.kind, read_kind))
+                .map(|read_kind| (entry.kind, read_kind, entry.bits))
         })
         .collect();
     if remaining_expected_reads.is_empty() {
@@ -228,7 +228,7 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         .mismatch_hints
     {
         if let Some(actual_kind) = current_read {
-            if let Some((_, expected_kind)) = remaining_expected_reads.first() {
+            if let Some((_, expected_kind, _)) = remaining_expected_reads.first() {
                 if actual_kind != *expected_kind {
                     Some(format!(
                         " [hint: current read is {}, expected {}]",
@@ -248,7 +248,9 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         None
     };
 
-    for (index, (write_kind, read_kind)) in remaining_expected_reads.into_iter().enumerate() {
+    for (index, (write_kind, read_kind, write_bits)) in
+        remaining_expected_reads.into_iter().enumerate()
+    {
         let mut detail = format!(
             "Expected read (matches {} in {} send)",
             write_kind.to_fn_name(),
@@ -260,15 +262,41 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
             detail.push_str(marker);
         }
 
+        // For ReadUInt/ReadInt, fill in the bit-width literal automatically
+        // when the matching writer used a literal we can read. When unknown,
+        // leave a snippet placeholder so the user knows they must specify it.
+        let needs_bits = matches!(
+            read_kind,
+            glua_code_analysis::NetOpKind::ReadUInt | glua_code_analysis::NetOpKind::ReadInt
+        );
+        let (insert_text, insert_text_format) = if needs_bits {
+            match write_bits {
+                Some(bits) => (
+                    format!("{}({bits})", read_kind.to_fn_name()),
+                    Some(InsertTextFormat::PLAIN_TEXT),
+                ),
+                None => (
+                    format!("{}(${{1:bits}})", read_kind.to_fn_name()),
+                    Some(InsertTextFormat::SNIPPET),
+                ),
+            }
+        } else {
+            (
+                read_kind.to_fn_name().to_string(),
+                Some(InsertTextFormat::PLAIN_TEXT),
+            )
+        };
+
         let _ = builder.add_completion_item(CompletionItem {
             label: read_kind.to_fn_name().to_string(),
             kind: Some(lsp_types::CompletionItemKind::FUNCTION),
             detail: Some(detail),
             sort_text: Some(format!("000_gmod_net_read_{index:03}")),
-            insert_text: Some(read_kind.to_fn_name().to_string()),
+            insert_text: Some(insert_text.clone()),
+            insert_text_format,
             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                 range: replace_range.clone(),
-                new_text: read_kind.to_fn_name().to_string(),
+                new_text: insert_text,
             })),
             ..Default::default()
         });

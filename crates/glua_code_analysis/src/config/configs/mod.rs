@@ -22,9 +22,9 @@ pub use completion::{EmmyrcCompletion, EmmyrcFilenameConvention};
 pub use diagnostics::{DiagnosticSeveritySetting, EmmyrcDiagnostic};
 pub use doc::{DocSyntax, EmmyrcDoc};
 pub use document_color::EmmyrcDocumentColor;
-pub use gmod::{
-    EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodNetwork, EmmyrcGmodNetworkCompletion,
-    EmmyrcGmodNetworkDiagnostics, EmmyrcGmodOutline, EmmyrcGmodOutlineVerbosity, EmmyrcGmodRealm,
+pub use gmod::
+    {EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodNetwork, EmmyrcGmodNetworkCompletion,
+    EmmyrcGmodOutline, EmmyrcGmodOutlineVerbosity, EmmyrcGmodRealm,
     EmmyrcGmodScriptedClassDefinition, EmmyrcGmodScriptedClassScaffold,
     EmmyrcGmodScriptedClassScaffoldFile, EmmyrcGmodScriptedClassScopeEntry,
     EmmyrcGmodScriptedClassScopes, ResolvedGmodScriptedClassDefinition,

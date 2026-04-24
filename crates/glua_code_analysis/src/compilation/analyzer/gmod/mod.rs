@@ -6,8 +6,10 @@ use std::{
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk,
     LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
-    LuaDocTagFileparam, LuaDocTagRealm, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexKey,
-    LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaStat, LuaSyntaxNode, LuaVarExpr, PathTrait,
+    LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
+    LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
+    LuaLocalFuncStat, LuaLocalStat, LuaRepeatStat, LuaStat, LuaSyntaxNode, LuaVarExpr,
+    LuaWhileStat, NumberResult, PathTrait,
 };
 
 use crate::{
@@ -21,8 +23,8 @@ use crate::{
         GmodConcommandSiteMetadata, GmodHookKind, GmodHookNameIssue, GmodHookSiteMetadata,
         GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata, GmodRealm, GmodRealmFileMetadata,
         GmodRealmRange, GmodScopedClassInfo, GmodTimerKind, GmodTimerSiteMetadata,
-        LuaDependencyKind, LuaMemberOwner, NetOpEntry, NetOpKind, NetReceiveFlow, NetSendFlow,
-        NetSendKind,
+        LuaDependencyKind, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind,
+        NetReceiveFlow, NetSendFlow, NetSendKind,
     },
     profile::Profile,
 };
@@ -111,6 +113,18 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let mut t_netflow = std::time::Duration::ZERO;
         let mut t_scoped = std::time::Duration::ZERO;
         let mut t_realm = std::time::Duration::ZERO;
+
+        // Build a workspace-global registry of helper functions so that
+        // net.Read/Write expansion can follow helpers defined in *other* files
+        // (DarkRP-style shared helpers like `DarkRP.writeNetDarkRPVarRemoval`).
+        // Same-file resolution still takes priority — the registry is only
+        // consulted as a fallback.
+        //
+        // Sources from the VFS rather than `tree_list` because per-file
+        // incremental analysis (`update_file_by_uri`) only places the changed
+        // file in `tree_list`, but helpers can live in any file.
+        let helper_registry = build_helper_registry(db);
+
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
 
@@ -124,7 +138,12 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
 
             let s = std::time::Instant::now();
             let (gm_method_realms, receive_flows) = if keywords.needs_hook_metadata() {
-                collect_hook_metadata(db, in_filed_tree.file_id, in_filed_tree.value.clone())
+                collect_hook_metadata(
+                    db,
+                    in_filed_tree.file_id,
+                    in_filed_tree.value.clone(),
+                    &helper_registry,
+                )
             } else {
                 (Vec::new(), Vec::new())
             };
@@ -137,6 +156,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     in_filed_tree.file_id,
                     in_filed_tree.value.clone(),
                     receive_flows,
+                    &helper_registry,
                 );
             }
             t_netflow += s.elapsed();
@@ -283,10 +303,116 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
     }
 }
 
+/// Workspace-global registry of helper function definitions, used as a
+/// fallback when same-file helper resolution doesn't find a definition.
+///
+/// Keyed by:
+/// - bare-name globals: `"helperFn"` for `function helperFn() end` or
+///   `helperFn = function() end` at module top-level
+/// - dotted globals: `"Module.fn"` for `function Module.fn() end` or
+///   `Module.fn = function() end`
+///
+/// Locals are intentionally excluded — they can only be referenced from
+/// within their defining file, so the same-file lookup already covers them.
+///
+/// The chunk that owns each helper body is stored alongside the block so
+/// that further nested helper calls inside the body can be resolved against
+/// the owning file's tree (preserving local-shadows-global semantics in
+/// each step of the walk).
+struct HelperRegistry {
+    map: HashMap<String, (LuaChunk, LuaBlock)>,
+}
+
+fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
+    let mut map: HashMap<String, (LuaChunk, LuaBlock)> = HashMap::new();
+
+    let vfs = db.get_vfs();
+    for file_id in vfs.get_all_file_ids() {
+        // Skip files that obviously can't contain net helper bodies. Any
+        // helper that wraps a net write/read must contain `net.` literally,
+        // so this prunes the vast majority of files cheaply.
+        let Some(content) = vfs.get_file_content(&file_id) else {
+            continue;
+        };
+        if !content.contains("net.") {
+            continue;
+        }
+        let Some(tree) = vfs.get_syntax_tree(&file_id) else {
+            continue;
+        };
+        let chunk = tree.get_chunk_node();
+
+        for func_stat in chunk.descendants::<LuaFuncStat>() {
+            let Some(func_name) = func_stat.get_func_name() else {
+                continue;
+            };
+            let Some(block) = func_stat
+                .get_closure()
+                .and_then(|closure| closure.get_block())
+            else {
+                continue;
+            };
+
+            let key = match func_name {
+                LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+                LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(&index_expr),
+            };
+
+            if let Some(key) = key {
+                map.entry(key).or_insert_with(|| (chunk.clone(), block));
+            }
+        }
+
+        for assign_stat in chunk.descendants::<LuaAssignStat>() {
+            let (vars, values) = assign_stat.get_var_and_expr_list();
+            for (idx, var) in vars.iter().enumerate() {
+                let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx) else {
+                    continue;
+                };
+                let Some(block) = closure_expr.get_block() else {
+                    continue;
+                };
+
+                let key = match var {
+                    LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+                    LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(index_expr),
+                };
+
+                if let Some(key) = key {
+                    map.entry(key).or_insert_with(|| (chunk.clone(), block));
+                }
+            }
+        }
+    }
+
+    HelperRegistry { map }
+}
+
+#[allow(dead_code)]
+fn _debug_helper_registry(reg: &HelperRegistry) {
+    eprintln!("HelperRegistry has {} entries:", reg.map.len());
+    for k in reg.map.keys() {
+        eprintln!("  - {k}");
+    }
+}
+
+fn dotted_global_key(index_expr: &glua_parser::LuaIndexExpr) -> Option<String> {
+    let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let prefix_text = prefix_name.get_name_text()?;
+    let LuaIndexKey::Name(field_token) = index_expr.get_index_key()? else {
+        return None;
+    };
+    let field_text = field_token.get_name_text();
+    Some(format!("{prefix_text}.{field_text}"))
+}
+
 fn collect_hook_metadata(
     db: &mut DbIndex,
     file_id: FileId,
     root: LuaChunk,
+    helper_registry: &HelperRegistry,
 ) -> (Vec<(String, GmodRealm)>, Vec<NetReceiveFlow>) {
     let mut gm_method_realms = Vec::new();
     let mut receive_flows = Vec::new();
@@ -296,7 +422,7 @@ fn collect_hook_metadata(
             db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
         }
 
-        if let Some(receive_flow) = collect_net_receive_flow(&call_expr) {
+        if let Some(receive_flow) = collect_net_receive_flow(&root, &call_expr, helper_registry) {
             receive_flows.push(receive_flow);
         }
 
@@ -328,9 +454,10 @@ fn collect_network_flow_metadata(
     file_id: FileId,
     root: LuaChunk,
     receive_flows: Vec<NetReceiveFlow>,
+    helper_registry: &HelperRegistry,
 ) {
-    let mut send_flows = collect_net_send_flows(&root);
-    send_flows.extend(collect_wrapped_net_send_flows(&root));
+    let mut send_flows = collect_net_send_flows(&root, helper_registry);
+    send_flows.extend(collect_wrapped_net_send_flows(&root, helper_registry));
     send_flows.sort_by_key(|flow| flow.start_range.start());
 
     let data = crate::db_index::FileNetworkData {
@@ -360,7 +487,7 @@ fn collect_gm_method_realm_annotation(func_stat: &LuaFuncStat) -> Option<(String
     Some((method_name, realm))
 }
 
-fn collect_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
+fn collect_net_send_flows(root: &LuaChunk, helper_registry: &HelperRegistry) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
     for block in root.descendants::<LuaBlock>() {
@@ -394,25 +521,26 @@ fn collect_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
                     }
 
                     if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
-                        send = Some((next_call_expr.get_range(), send_kind));
+                        let target = extract_send_target_text(&next_call_expr, send_kind);
+                        send = Some((next_call_expr.get_range(), send_kind, target));
                         break;
                     }
                 }
 
-                collect_net_write_ops_from_stat(&block, next_stat, &mut writes);
+                collect_net_write_ops_from_stat(root, &block, next_stat, &mut writes, helper_registry);
             }
 
-            let Some((send_range, send_kind)) = send else {
+            let Some((send_range, send_kind, send_target)) = send else {
                 continue;
             };
 
-            writes.sort_by_key(|entry| entry.range.start());
             flows.push(NetSendFlow {
                 message_name,
                 start_range: call_expr.get_range(),
                 writes,
                 send_range,
                 send_kind,
+                send_target,
                 is_wrapped: false,
             });
         }
@@ -422,7 +550,10 @@ fn collect_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
     flows
 }
 
-fn collect_wrapped_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
+fn collect_wrapped_net_send_flows(
+    root: &LuaChunk,
+    helper_registry: &HelperRegistry,
+) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
     for func_stat in root.descendants::<LuaFuncStat>() {
@@ -430,7 +561,7 @@ fn collect_wrapped_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
             .get_closure()
             .and_then(|closure_expr| closure_expr.get_block())
         {
-            collect_wrapped_net_send_flows_in_function_block(&block, &mut flows);
+            collect_wrapped_net_send_flows_in_function_block(root, &block, &mut flows, helper_registry);
         }
     }
 
@@ -439,7 +570,7 @@ fn collect_wrapped_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
             .get_closure()
             .and_then(|closure_expr| closure_expr.get_block())
         {
-            collect_wrapped_net_send_flows_in_function_block(&block, &mut flows);
+            collect_wrapped_net_send_flows_in_function_block(root, &block, &mut flows, helper_registry);
         }
     }
 
@@ -448,7 +579,7 @@ fn collect_wrapped_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
             if let LuaExpr::ClosureExpr(closure_expr) = value_expr
                 && let Some(block) = closure_expr.get_block()
             {
-                collect_wrapped_net_send_flows_in_function_block(&block, &mut flows);
+                collect_wrapped_net_send_flows_in_function_block(root, &block, &mut flows, helper_registry);
             }
         }
     }
@@ -459,7 +590,7 @@ fn collect_wrapped_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
             if let LuaExpr::ClosureExpr(closure_expr) = value_expr
                 && let Some(block) = closure_expr.get_block()
             {
-                collect_wrapped_net_send_flows_in_function_block(&block, &mut flows);
+                collect_wrapped_net_send_flows_in_function_block(root, &block, &mut flows, helper_registry);
             }
         }
     }
@@ -469,8 +600,10 @@ fn collect_wrapped_net_send_flows(root: &LuaChunk) -> Vec<NetSendFlow> {
 }
 
 fn collect_wrapped_net_send_flows_in_function_block(
+    root: &LuaChunk,
     function_block: &LuaBlock,
     flows: &mut Vec<NetSendFlow>,
+    helper_registry: &HelperRegistry,
 ) {
     for block in function_block
         .syntax()
@@ -513,23 +646,23 @@ fn collect_wrapped_net_send_flows_in_function_block(
                     }
 
                     if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
-                        send = Some((next_call_expr.get_range(), send_kind));
+                        let target = extract_send_target_text(&next_call_expr, send_kind);
+                        send = Some((next_call_expr.get_range(), send_kind, target));
                         break;
                     }
                 }
 
-                collect_net_write_ops_from_stat(&block, next_stat, &mut writes);
+                collect_net_write_ops_from_stat(root, &block, next_stat, &mut writes, helper_registry);
             }
 
-            writes.sort_by_key(|entry| entry.range.start());
-
-            if let Some((send_range, send_kind)) = send {
+            if let Some((send_range, send_kind, send_target)) = send {
                 flows.push(NetSendFlow {
                     message_name,
                     start_range: call_expr.get_range(),
                     writes,
                     send_range,
                     send_kind,
+                    send_target,
                     is_wrapped: true,
                 });
                 continue;
@@ -543,6 +676,7 @@ fn collect_wrapped_net_send_flows_in_function_block(
                 writes: Vec::new(),
                 send_range: call_expr.get_range(),
                 send_kind: NetSendKind::Broadcast,
+                send_target: None,
                 is_wrapped: true,
             });
         }
@@ -557,7 +691,11 @@ fn is_block_in_nested_closure(function_block: &LuaBlock, candidate_block: &LuaBl
         .any(|node| LuaClosureExpr::can_cast(node.kind().into()))
 }
 
-fn collect_net_receive_flow(call_expr: &LuaCallExpr) -> Option<NetReceiveFlow> {
+fn collect_net_receive_flow(
+    root: &LuaChunk,
+    call_expr: &LuaCallExpr,
+    helper_registry: &HelperRegistry,
+) -> Option<NetReceiveFlow> {
     let method_name = get_exact_net_method_name(call_expr)?;
     if method_name != "Receive" {
         return None;
@@ -566,63 +704,603 @@ fn collect_net_receive_flow(call_expr: &LuaCallExpr) -> Option<NetReceiveFlow> {
     let message_name = extract_static_string_arg_value(call_expr, 0)?;
 
     let mut reads = Vec::new();
+    let mut reads_opaque = false;
     if let Some(callback_expr) = call_expr
         .get_args_list()
         .and_then(|args| args.get_args().nth(1))
-        && let LuaExpr::ClosureExpr(closure_expr) = callback_expr
-        && let Some(callback_block) = closure_expr.get_block()
     {
-        collect_net_read_ops_from_block(callback_block, &mut reads);
+        match resolve_callback_block(root, &callback_expr) {
+            Some(callback_block) => {
+                collect_net_read_ops_from_block(root, callback_block, &mut reads, helper_registry)
+            }
+            None => {
+                // Inline closure that can't yield a block is malformed — but a
+                // bare name reference we couldn't resolve in the file is the
+                // common case (callback defined elsewhere). Mark opaque so the
+                // mismatch checker skips this flow without losing the
+                // counterpart record.
+                if !matches!(callback_expr, LuaExpr::ClosureExpr(_)) {
+                    reads_opaque = true;
+                }
+            }
+        }
     }
 
-    reads.sort_by_key(|entry| entry.range.start());
     Some(NetReceiveFlow {
         message_name,
         receive_range: call_expr.get_range(),
         reads,
+        reads_opaque,
     })
 }
 
-fn collect_net_read_ops_from_block(block: LuaBlock, reads: &mut Vec<NetOpEntry>) {
-    for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
-        if is_call_expr_in_nested_closure(&block, &call_expr) {
-            continue;
-        }
+/// Resolve the callback block for a `net.Receive` second argument. Handles
+/// inline closures (`function() ... end`) and same-file local/global function
+/// references (`net.Receive("Msg", doRetrieve)` paired with
+/// `local function doRetrieve() ... end` or `local doRetrieve = function() ... end`).
+/// Cross-file references are out of scope — those resolve at semantic-model
+/// time and are not part of the per-file collection pass.
+fn resolve_callback_block(root: &LuaChunk, callback_expr: &LuaExpr) -> Option<LuaBlock> {
+    if let LuaExpr::ClosureExpr(closure_expr) = callback_expr {
+        return closure_expr.get_block();
+    }
 
-        let Some(method_name) = get_exact_net_method_name(&call_expr) else {
+    let LuaExpr::NameExpr(name_expr) = callback_expr else {
+        return None;
+    };
+    let target_name = name_expr.get_name_text()?;
+
+    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
+        if let Some(local_name) = local_func_stat
+            .get_local_name()
+            .and_then(|n| n.get_name_token())
+            && local_name.get_name_text() == target_name
+            && let Some(block) = local_func_stat
+                .get_closure()
+                .and_then(|closure| closure.get_block())
+        {
+            return Some(block);
+        }
+    }
+
+    for local_stat in root.descendants::<LuaLocalStat>() {
+        let names: Vec<_> = local_stat.get_local_name_list().collect();
+        for (idx, local_name) in names.iter().enumerate() {
+            let Some(name_token) = local_name.get_name_token() else {
+                continue;
+            };
+            if name_token.get_name_text() != target_name {
+                continue;
+            }
+            if let Some(LuaExpr::ClosureExpr(closure_expr)) =
+                local_stat.get_value_exprs().nth(idx)
+                && let Some(block) = closure_expr.get_block()
+            {
+                return Some(block);
+            }
+        }
+    }
+
+    for func_stat in root.descendants::<LuaFuncStat>() {
+        if let Some(LuaVarExpr::NameExpr(name_expr)) = func_stat.get_func_name()
+            && name_expr.get_name_text().as_deref() == Some(target_name.as_str())
+            && let Some(block) = func_stat
+                .get_closure()
+                .and_then(|closure| closure.get_block())
+        {
+            return Some(block);
+        }
+    }
+
+    for assign_stat in root.descendants::<LuaAssignStat>() {
+        let (vars, values) = assign_stat.get_var_and_expr_list();
+        for (idx, var) in vars.iter().enumerate() {
+            let LuaVarExpr::NameExpr(name_expr) = var else {
+                continue;
+            };
+            if name_expr.get_name_text().as_deref() != Some(target_name.as_str()) {
+                continue;
+            }
+            if let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx)
+                && let Some(block) = closure_expr.get_block()
+            {
+                return Some(block);
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve a call expression to a function definition, returning a
+/// stable string key (used for cycle detection), the function body block,
+/// and the chunk that owns the body (which becomes the new `root` for
+/// further nested helper resolution within that body).
+///
+/// Same-file resolution takes priority. If that fails, falls back to a
+/// workspace-global helper registry (cross-file helpers) — DarkRP-style
+/// `Module.fn` helpers defined in shared files are the motivating case.
+///
+/// Handles bare-name calls (`helperFn(...)`) and dotted calls
+/// (`Module.fn(...)`). Method calls (`obj:method(...)`) are out of scope.
+fn resolve_call_to_function_block<'a>(
+    root: &'a LuaChunk,
+    call_expr: &LuaCallExpr,
+    helper_registry: &'a HelperRegistry,
+) -> Option<(String, LuaBlock, &'a LuaChunk)> {
+    let prefix = call_expr.get_prefix_expr()?;
+
+    match prefix {
+        LuaExpr::NameExpr(name_expr) => {
+            let name = name_expr.get_name_text()?;
+            if let Some(block) = resolve_bare_name_function(root, &name) {
+                return Some((name, block, root));
+            }
+            // Cross-file fallback: a bare-name call may reference a global
+            // function defined in another file (less common than dotted
+            // helpers, but supported for symmetry).
+            helper_registry
+                .map
+                .get(&name)
+                .map(|(chunk, block)| (name.clone(), block.clone(), chunk))
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
+                return None;
+            };
+            let prefix_text = prefix_name.get_name_text()?;
+            let LuaIndexKey::Name(field_token) = index_expr.get_index_key()? else {
+                return None;
+            };
+            let field_text = field_token.get_name_text().to_string();
+            let key = format!("{prefix_text}.{field_text}");
+            if let Some(block) = resolve_dotted_function(root, &prefix_text, &field_text) {
+                return Some((key, block, root));
+            }
+            helper_registry
+                .map
+                .get(&key)
+                .map(|(chunk, block)| (key.clone(), block.clone(), chunk))
+        }
+        _ => None,
+    }
+}
+
+fn resolve_bare_name_function(root: &LuaChunk, target_name: &str) -> Option<LuaBlock> {
+    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
+        if let Some(local_name) = local_func_stat
+            .get_local_name()
+            .and_then(|n| n.get_name_token())
+            && local_name.get_name_text() == target_name
+            && let Some(block) = local_func_stat
+                .get_closure()
+                .and_then(|closure| closure.get_block())
+        {
+            return Some(block);
+        }
+    }
+
+    for local_stat in root.descendants::<LuaLocalStat>() {
+        let names: Vec<_> = local_stat.get_local_name_list().collect();
+        for (idx, local_name) in names.iter().enumerate() {
+            let Some(name_token) = local_name.get_name_token() else {
+                continue;
+            };
+            if name_token.get_name_text() != target_name {
+                continue;
+            }
+            if let Some(LuaExpr::ClosureExpr(closure_expr)) =
+                local_stat.get_value_exprs().nth(idx)
+                && let Some(block) = closure_expr.get_block()
+            {
+                return Some(block);
+            }
+        }
+    }
+
+    for func_stat in root.descendants::<LuaFuncStat>() {
+        if let Some(LuaVarExpr::NameExpr(name_expr)) = func_stat.get_func_name()
+            && name_expr.get_name_text().as_deref() == Some(target_name)
+            && let Some(block) = func_stat
+                .get_closure()
+                .and_then(|closure| closure.get_block())
+        {
+            return Some(block);
+        }
+    }
+
+    for assign_stat in root.descendants::<LuaAssignStat>() {
+        let (vars, values) = assign_stat.get_var_and_expr_list();
+        for (idx, var) in vars.iter().enumerate() {
+            let LuaVarExpr::NameExpr(name_expr) = var else {
+                continue;
+            };
+            if name_expr.get_name_text().as_deref() != Some(target_name) {
+                continue;
+            }
+            if let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx)
+                && let Some(block) = closure_expr.get_block()
+            {
+                return Some(block);
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_dotted_function(
+    root: &LuaChunk,
+    prefix_text: &str,
+    field_text: &str,
+) -> Option<LuaBlock> {
+    for func_stat in root.descendants::<LuaFuncStat>() {
+        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
             continue;
         };
-
-        if let Some(op_kind) = NetOpKind::from_fn_name(method_name.as_str())
-            && op_kind.is_read()
+        let Some(LuaExpr::NameExpr(name_expr)) = index_expr.get_prefix_expr() else {
+            continue;
+        };
+        if name_expr.get_name_text().as_deref() != Some(prefix_text) {
+            continue;
+        }
+        let Some(LuaIndexKey::Name(field_token)) = index_expr.get_index_key() else {
+            continue;
+        };
+        if field_token.get_name_text() != field_text {
+            continue;
+        }
+        if let Some(block) = func_stat
+            .get_closure()
+            .and_then(|closure| closure.get_block())
         {
-            reads.push(NetOpEntry {
-                kind: op_kind,
-                range: call_expr.get_range(),
-            });
+            return Some(block);
+        }
+    }
+
+    for assign_stat in root.descendants::<LuaAssignStat>() {
+        let (vars, values) = assign_stat.get_var_and_expr_list();
+        for (idx, var) in vars.iter().enumerate() {
+            let LuaVarExpr::IndexExpr(index_expr) = var else {
+                continue;
+            };
+            let Some(LuaExpr::NameExpr(name_expr)) = index_expr.get_prefix_expr() else {
+                continue;
+            };
+            if name_expr.get_name_text().as_deref() != Some(prefix_text) {
+                continue;
+            }
+            let Some(LuaIndexKey::Name(field_token)) = index_expr.get_index_key() else {
+                continue;
+            };
+            if field_token.get_name_text() != field_text {
+                continue;
+            }
+            if let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx)
+                && let Some(block) = closure_expr.get_block()
+            {
+                return Some(block);
+            }
+        }
+    }
+
+    None
+}
+
+fn collect_net_read_ops_from_block(
+    root: &LuaChunk,
+    block: LuaBlock,
+    reads: &mut Vec<NetOpEntry>,
+    helper_registry: &HelperRegistry,
+) {
+    let mut visited = HashSet::new();
+    collect_net_ops_recursive(
+        root,
+        &block,
+        block.syntax(),
+        reads,
+        &mut visited,
+        false,
+        NetOpDirection::Read,
+        helper_registry,
+        &[],
+    );
+}
+
+fn collect_net_write_ops_from_stat(
+    root: &LuaChunk,
+    block: &LuaBlock,
+    stat: &LuaStat,
+    writes: &mut Vec<NetOpEntry>,
+    helper_registry: &HelperRegistry,
+) {
+    let mut visited = HashSet::new();
+    collect_net_ops_recursive(
+        root,
+        block,
+        stat.syntax(),
+        writes,
+        &mut visited,
+        false,
+        NetOpDirection::Write,
+        helper_registry,
+        &[],
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetOpDirection {
+    Read,
+    Write,
+}
+
+impl NetOpDirection {
+    fn matches(self, kind: NetOpKind) -> bool {
+        match self {
+            NetOpDirection::Read => kind.is_read(),
+            NetOpDirection::Write => kind.is_write(),
         }
     }
 }
 
-fn collect_net_write_ops_from_stat(block: &LuaBlock, stat: &LuaStat, writes: &mut Vec<NetOpEntry>) {
-    for call_expr in stat.syntax().descendants().filter_map(LuaCallExpr::cast) {
-        if is_call_expr_in_nested_closure(block, &call_expr) {
+/// Walk `subtree` for net.Read*/Write* call expressions, treating non-net
+/// calls that resolve to a same-file function as helper expansions: we recurse
+/// into the helper body so writes/reads it performs participate in the
+/// outer flow. Cycles are guarded via `visited`, and dynamic-context propagates
+/// from the call site into the helper body.
+fn collect_net_ops_recursive(
+    root: &LuaChunk,
+    enclosing_block: &LuaBlock,
+    subtree: &LuaSyntaxNode,
+    out: &mut Vec<NetOpEntry>,
+    visited: &mut HashSet<String>,
+    force_dynamic: bool,
+    direction: NetOpDirection,
+    helper_registry: &HelperRegistry,
+    flow_prefix: &[NetFlowFrame],
+) {
+    for call_expr in subtree.descendants().filter_map(LuaCallExpr::cast) {
+        if is_call_expr_in_nested_closure(enclosing_block, &call_expr) {
             continue;
         }
 
-        let Some(method_name) = get_exact_net_method_name(&call_expr) else {
+        if let Some(method_name) = get_exact_net_method_name(&call_expr) {
+            if let Some(op_kind) = NetOpKind::from_fn_name(method_name.as_str())
+                && direction.matches(op_kind)
+            {
+                let dynamic = force_dynamic
+                    || is_call_expr_in_dynamic_control_flow(enclosing_block, &call_expr);
+                let bits = extract_bit_width_arg(&call_expr, op_kind);
+                let value_text = extract_write_value_text(&call_expr, op_kind);
+                let local_path = extract_flow_path(enclosing_block, &call_expr);
+                let mut flow_path = Vec::with_capacity(flow_prefix.len() + local_path.len());
+                flow_path.extend_from_slice(flow_prefix);
+                flow_path.extend(local_path);
+                out.push(NetOpEntry {
+                    kind: op_kind,
+                    range: call_expr.get_range(),
+                    dynamic,
+                    bits,
+                    value_text,
+                    flow_path,
+                });
+            }
+            continue;
+        }
+
+        let Some((helper_key, helper_block, helper_root)) =
+            resolve_call_to_function_block(root, &call_expr, helper_registry)
+        else {
             continue;
         };
 
-        if let Some(op_kind) = NetOpKind::from_fn_name(method_name.as_str())
-            && op_kind.is_write()
-        {
-            writes.push(NetOpEntry {
-                kind: op_kind,
-                range: call_expr.get_range(),
-            });
+        if !visited.insert(helper_key.clone()) {
+            continue;
         }
+
+        let helper_force_dynamic = force_dynamic
+            || is_call_expr_in_dynamic_control_flow(enclosing_block, &call_expr);
+        // Carry the call-site's flow context into the helper so reads/writes
+        // performed inside the helper appear under the correct outer
+        // `for`/`if`/`while` frames in hover.
+        let local_path = extract_flow_path(enclosing_block, &call_expr);
+        let mut nested_prefix = Vec::with_capacity(flow_prefix.len() + local_path.len());
+        nested_prefix.extend_from_slice(flow_prefix);
+        nested_prefix.extend(local_path);
+        collect_net_ops_recursive(
+            helper_root,
+            &helper_block,
+            helper_block.syntax(),
+            out,
+            visited,
+            helper_force_dynamic,
+            direction,
+            helper_registry,
+            &nested_prefix,
+        );
+        visited.remove(&helper_key);
     }
+}
+
+fn is_call_expr_in_dynamic_control_flow(block: &LuaBlock, call_expr: &LuaCallExpr) -> bool {
+    call_expr
+        .syntax()
+        .ancestors()
+        .take_while(|node| node != block.syntax())
+        .any(|node| {
+            let kind = node.kind().into();
+            LuaIfStat::can_cast(kind)
+                || LuaWhileStat::can_cast(kind)
+                || LuaForStat::can_cast(kind)
+                || LuaForRangeStat::can_cast(kind)
+                || LuaRepeatStat::can_cast(kind)
+        })
+}
+
+/// Walks ancestors from `call_expr` up to (but not including) `block`,
+/// collecting one `NetFlowFrame` per enclosing if/while/for/repeat. Frames
+/// are returned outer-to-inner so the renderer can nest them naturally.
+///
+/// `if`/`elseif`/`else` are folded into a single frame per if-chain branch:
+/// when the op lives inside an `elseif cond then ... end` clause, that frame
+/// records `elseif cond then` (instead of the outer `if cond then`) so the
+/// developer sees the actual branch the op is gated by. Same for `else`. The
+/// frame's id is the clause's source range so two ops in different branches
+/// of the same if are distinct frames (different patterns can result).
+///
+/// The header text is a single-line trimmed summary of the statement opener
+/// (e.g. `if cond then`, `for i = 1, #items do`). Multi-line headers and
+/// excessively long ones are stored as `None` to keep hover popups compact.
+fn extract_flow_path(block: &LuaBlock, call_expr: &LuaCallExpr) -> Vec<NetFlowFrame> {
+    let mut frames: Vec<NetFlowFrame> = Vec::new();
+    // When set, the next ancestor (which we know is the parent LuaIfStat of
+    // an elseif/else clause we just captured) should be skipped so we don't
+    // double-count the if-chain.
+    let mut skip_parent_if = false;
+    for node in call_expr
+        .syntax()
+        .ancestors()
+        .take_while(|node| node != block.syntax())
+    {
+        let kind = node.kind().into();
+
+        if skip_parent_if && LuaIfStat::can_cast(kind) {
+            skip_parent_if = false;
+            continue;
+        }
+
+        if LuaElseIfClauseStat::can_cast(kind) {
+            let header = extract_branch_header(&node, BranchKind::ElseIf);
+            frames.push(NetFlowFrame {
+                kind: NetFlowKind::If,
+                header,
+                id: u32::from(node.text_range().start()),
+            });
+            skip_parent_if = true;
+            continue;
+        }
+        if LuaElseClauseStat::can_cast(kind) {
+            frames.push(NetFlowFrame {
+                kind: NetFlowKind::If,
+                header: Some("else".to_string()),
+                id: u32::from(node.text_range().start()),
+            });
+            skip_parent_if = true;
+            continue;
+        }
+
+        let flow_kind = if LuaIfStat::can_cast(kind) {
+            NetFlowKind::If
+        } else if LuaWhileStat::can_cast(kind) {
+            NetFlowKind::While
+        } else if LuaForStat::can_cast(kind) {
+            NetFlowKind::For
+        } else if LuaForRangeStat::can_cast(kind) {
+            NetFlowKind::ForRange
+        } else if LuaRepeatStat::can_cast(kind) {
+            NetFlowKind::Repeat
+        } else {
+            continue;
+        };
+        let header = extract_flow_header(&node, flow_kind);
+        let id: u32 = u32::from(node.text_range().start());
+        frames.push(NetFlowFrame {
+            kind: flow_kind,
+            header,
+            id,
+        });
+    }
+    // ancestors() yields inner-to-outer; flip so outer is first.
+    frames.reverse();
+    frames
+}
+
+#[derive(Clone, Copy)]
+enum BranchKind {
+    ElseIf,
+}
+
+/// Pulls the header text for an `elseif cond then` clause from source.
+fn extract_branch_header(node: &LuaSyntaxNode, kind: BranchKind) -> Option<String> {
+    const MAX_HEADER_LEN: usize = 80;
+    let full = node.text().to_string();
+    let trimmed = full.trim_start();
+    let nl_idx = trimmed.find('\n').unwrap_or(trimmed.len());
+    let first_line = &trimmed[..nl_idx];
+    let bytes = first_line.as_bytes();
+    let _ = kind;
+    // Locate the standalone `then` keyword and slice through it.
+    let mut from = 0usize;
+    let term_end = loop {
+        let rel = first_line[from..].find("then")?;
+        let abs = from + rel;
+        let end = abs + 4;
+        let left_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+        let right_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            break end;
+        }
+        from = end;
+    };
+    let collapsed: String = first_line[..term_end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() || collapsed.len() > MAX_HEADER_LEN {
+        return None;
+    }
+    Some(collapsed)
+}
+
+/// Pulls a compact single-line summary of a control-flow statement's opener
+/// straight from the source — e.g. `if foo > 0 then`, `for i = 1, n do`.
+/// Returns `None` for multi-line or oversized headers; the renderer falls
+/// back to a generic label in that case.
+fn extract_flow_header(stat_node: &LuaSyntaxNode, kind: NetFlowKind) -> Option<String> {
+    const MAX_HEADER_LEN: usize = 80;
+    let full = stat_node.text().to_string();
+    let header_raw = match kind {
+        NetFlowKind::Repeat => {
+            // `repeat` itself has no condition until `until` at the end.
+            "repeat".to_string()
+        }
+        _ => {
+            // Take from start through the first `then` or `do`, whichever
+            // marks the opener's end. Everything after is the body.
+            let terminator = match kind {
+                NetFlowKind::If => "then",
+                _ => "do",
+            };
+            let trimmed = full.trim_start();
+            // Find terminator on the first line containing it. If the opener
+            // breaks across lines (e.g. condition split over multiple lines)
+            // we bail to keep the hover compact.
+            let nl_idx = trimmed.find('\n').unwrap_or(trimmed.len());
+            let first_line_slice = &trimmed[..nl_idx];
+            // Terminator must be a standalone keyword: preceded by whitespace
+            // (not mid-identifier) or appear at start of line, and bounded by
+            // a non-alphanumeric char on the right (or be at end-of-line).
+            let bytes = first_line_slice.as_bytes();
+            let mut search_from = 0usize;
+            let term_end = loop {
+                let rel = first_line_slice[search_from..].find(terminator)?;
+                let abs = search_from + rel;
+                let end = abs + terminator.len();
+                let left_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+                let right_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+                if left_ok && right_ok {
+                    break end;
+                }
+                search_from = end;
+            };
+            first_line_slice[..term_end].to_string()
+        }
+    };
+    let collapsed: String = header_raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() || collapsed.len() > MAX_HEADER_LEN {
+        return None;
+    }
+    Some(collapsed)
 }
 
 fn is_call_expr_in_nested_closure(block: &LuaBlock, call_expr: &LuaCallExpr) -> bool {
@@ -661,6 +1339,66 @@ fn get_exact_net_method_name(call_expr: &LuaCallExpr) -> Option<String> {
     Some(method_name_token.get_name_text().to_string())
 }
 
+/// Extracts the static bit-width literal from `WriteUInt`/`WriteInt`/`ReadUInt`/`ReadInt`.
+/// Returns `None` for op kinds without a bit-width parameter, or when the bits arg is
+/// not an integer literal (variable, expression, runtime computation). We deliberately
+/// only capture literals — anything else is unknowable at index time and would produce
+/// false-positive mismatches if compared.
+/// Captures a short snippet of the value-arg source text for a `Write*` op so
+/// hover can display *what* is being written (e.g. `net.WriteString("hi")`
+/// instead of just `net.WriteString`). Returns `None` for read ops, when the
+/// arg is missing, when it spans multiple lines, or when it's too long to
+/// render inline — robustness over completeness; we'd rather show the bare
+/// op name than blow up the hover popup with a 200-char expression.
+fn extract_write_value_text(call_expr: &LuaCallExpr, op_kind: NetOpKind) -> Option<String> {
+    if !op_kind.is_write() {
+        return None;
+    }
+
+    const MAX_INLINE_LEN: usize = 40;
+
+    let arg_expr = call_expr.get_args_list()?.get_args().next()?;
+    let raw = arg_expr.syntax().text().to_string();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return None;
+    }
+    if trimmed.len() > MAX_INLINE_LEN {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn extract_bit_width_arg(call_expr: &LuaCallExpr, op_kind: NetOpKind) -> Option<u32> {
+    let arg_idx = match op_kind {
+        NetOpKind::WriteUInt | NetOpKind::WriteInt => 1,
+        NetOpKind::ReadUInt | NetOpKind::ReadInt => 0,
+        _ => return None,
+    };
+
+    let arg_expr = call_expr.get_args_list()?.get_args().nth(arg_idx)?;
+    let LuaExpr::LiteralExpr(literal_expr) = arg_expr else {
+        return None;
+    };
+    let LuaLiteralToken::Number(number_token) = literal_expr.get_literal()? else {
+        return None;
+    };
+
+    let value = match number_token.get_number_value() {
+        NumberResult::Int(v) if v > 0 => v as u64,
+        NumberResult::Uint(v) if v > 0 => v,
+        _ => return None,
+    };
+
+    if value > u32::MAX as u64 {
+        return None;
+    }
+    Some(value as u32)
+}
+
 fn extract_static_string_arg_value(call_expr: &LuaCallExpr, arg_idx: usize) -> Option<String> {
     let arg_expr = call_expr.get_args_list()?.get_args().nth(arg_idx)?;
     let LuaExpr::LiteralExpr(literal_expr) = arg_expr else {
@@ -684,6 +1422,31 @@ fn net_send_kind_from_method_name(method_name: &str) -> Option<NetSendKind> {
         "SendPVS" => Some(NetSendKind::PVS),
         _ => None,
     }
+}
+
+/// Captures the recipient argument of a `net.Send*` call as a single-line
+/// snippet for display in code lens. Returns `None` for kinds with no
+/// recipient (`Broadcast`, `SendToServer`) or when the source is multi-line,
+/// too long, or otherwise unsuitable for inline display. Cheap: only inspects
+/// the first arg's source text.
+fn extract_send_target_text(call_expr: &LuaCallExpr, send_kind: NetSendKind) -> Option<String> {
+    match send_kind {
+        NetSendKind::Broadcast | NetSendKind::SendToServer => return None,
+        _ => {}
+    }
+
+    const MAX_INLINE_LEN: usize = 40;
+
+    let arg_expr = call_expr.get_args_list()?.get_args().next()?;
+    let raw = arg_expr.syntax().text().to_string();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+        return None;
+    }
+    if trimmed.len() > MAX_INLINE_LEN {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 #[derive(Debug, Clone)]

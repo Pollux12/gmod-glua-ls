@@ -14,7 +14,7 @@ pub use configs::{
     EmmyrcCodeLens, EmmyrcCompletion, EmmyrcDiagnostic, EmmyrcDoc, EmmyrcDocumentColor,
     EmmyrcExternalTool, EmmyrcFilenameConvention, EmmyrcFormatConfigPrecedence, EmmyrcFormatPreset,
     EmmyrcFormatStyleOverrides, EmmyrcGmod, EmmyrcGmodHookMappings, EmmyrcGmodNetwork,
-    EmmyrcGmodNetworkCompletion, EmmyrcGmodNetworkDiagnostics, EmmyrcGmodOutline,
+    EmmyrcGmodNetworkCompletion, EmmyrcGmodOutline,
     EmmyrcGmodOutlineVerbosity, EmmyrcGmodRealm, EmmyrcGmodScriptedClassDefinition,
     EmmyrcGmodScriptedClassScaffold, EmmyrcGmodScriptedClassScaffoldFile,
     EmmyrcGmodScriptedClassScopeEntry, EmmyrcGmodScriptedClassScopes, EmmyrcHover, EmmyrcInlayHint,

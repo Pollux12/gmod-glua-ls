@@ -149,6 +149,7 @@ Codes marked **Off** are disabled by default and require `enables` to activate.
 | `gmod-net-missing-network-counterpart` | On | Warning | `net.Start` block with no `net.Receive` in the opposite realm (or vice versa) |
 | `gmod-net-read-write-order-mismatch` | On | Warning | `net.Read*` order doesn't match `net.Write*` order |
 | `gmod-net-read-write-type-mismatch` | On | Warning | `net.Read*` type doesn't match corresponding `net.Write*` type |
+| `gmod-net-read-write-bits-mismatch` | On | Warning | Literal bit-width differs between a matched write/read pair (e.g. `WriteUInt(8)` vs `ReadUInt(16)`) |
 | `gmod-unknown-net-message` | On | Warning | Unregistered net message identifier |
 | `gmod-duplicate-system-registration` | On | Hint | Duplicate registration for `net.Receive`, `concommand.Add`, `timer.Create`, etc. |
 

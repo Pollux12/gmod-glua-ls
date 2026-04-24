@@ -329,6 +329,11 @@
           "type": "string"
         },
         {
+          "const": "gmod-net-read-write-bits-mismatch",
+          "description": "gmod-net-read-write-bits-mismatch",
+          "type": "string"
+        },
+        {
           "const": "gmod-duplicate-system-registration",
           "description": "gmod-duplicate-system-registration",
           "type": "string"
@@ -1534,14 +1539,10 @@
         "network": {
           "$ref": "#/$defs/EmmyrcGmodNetwork",
           "default": {
+            "codeLensEnabled": true,
             "completion": {
               "mismatchHints": true,
               "smartReadSuggestions": true
-            },
-            "diagnostics": {
-              "missingCounterpart": true,
-              "orderMismatch": true,
-              "typeMismatch": true
             },
             "enabled": true
           }
@@ -1730,19 +1731,15 @@
     },
     "EmmyrcGmodNetwork": {
       "properties": {
+        "codeLensEnabled": {
+          "default": true,
+          "type": "boolean"
+        },
         "completion": {
           "$ref": "#/$defs/EmmyrcGmodNetworkCompletion",
           "default": {
             "mismatchHints": true,
             "smartReadSuggestions": true
-          }
-        },
-        "diagnostics": {
-          "$ref": "#/$defs/EmmyrcGmodNetworkDiagnostics",
-          "default": {
-            "missingCounterpart": true,
-            "orderMismatch": true,
-            "typeMismatch": true
           }
         },
         "enabled": {
@@ -1759,23 +1756,6 @@
           "type": "boolean"
         },
         "smartReadSuggestions": {
-          "default": true,
-          "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
-    "EmmyrcGmodNetworkDiagnostics": {
-      "properties": {
-        "missingCounterpart": {
-          "default": true,
-          "type": "boolean"
-        },
-        "orderMismatch": {
-          "default": true,
-          "type": "boolean"
-        },
-        "typeMismatch": {
           "default": true,
           "type": "boolean"
         }
@@ -2752,14 +2732,10 @@
         },
         "inferDynamicFields": true,
         "network": {
+          "codeLensEnabled": true,
           "completion": {
             "mismatchHints": true,
             "smartReadSuggestions": true
-          },
-          "diagnostics": {
-            "missingCounterpart": true,
-            "orderMismatch": true,
-            "typeMismatch": true
           },
           "enabled": true
         },

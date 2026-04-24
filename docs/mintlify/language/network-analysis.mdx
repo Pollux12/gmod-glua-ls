@@ -77,6 +77,7 @@ The order in which reads occur must match the write order. GLuaLS analyzes the s
 | `gmod-net-missing-network-counterpart` | A sender or receiver exists, but no matching counterpart with the same message name was found |
 | `gmod-net-read-write-type-mismatch` | `net.Read*` type doesn't match the `net.Write*` type for the same sequence position |
 | `gmod-net-read-write-order-mismatch` | The order of reads doesn't match the order of writes |
+| `gmod-net-read-write-bits-mismatch` | Literal bit-width argument differs between a matched `net.WriteUInt`/`net.ReadUInt` (or similar) pair |
 
 ---
 
@@ -96,9 +97,7 @@ Network analysis works across files. Messages registered in one file, sent in a 
 
 Most network flow checks are configured under `gmod.network`.
 
-You can disable the network flow diagnostics with `gmod.network.enabled`, or tune specific checks with `gmod.network.diagnostics.*`.
-
-The missing `util.AddNetworkString` check is separate. If you want to silence a specific diagnostic code entirely, use the global `diagnostics.disable` setting.
+You can disable all network flow analysis with `gmod.network.enabled`. To silence individual diagnostic codes, use `diagnostics.disable` with the relevant code name (e.g. `"gmod-net-read-write-type-mismatch"`).
 
 See the [GMod settings](/configuration/gmod#network-analysis) for the full reference on network-related configuration options.
 
