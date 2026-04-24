@@ -68,6 +68,7 @@ pub async fn on_resolve_code_lens_handler(
 pub enum CodeLensData {
     Member(LuaMemberId),
     DeclId(LuaDeclId),
+    NetMessage(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

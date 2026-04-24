@@ -65,6 +65,61 @@ pub fn resolve_code_lens(
                 data: None,
             })
         }
+        CodeLensData::NetMessage(message_name) => {
+            let db = compilation.get_db();
+            let network_index = db.get_gmod_network_index();
+            let send_flows = network_index.get_send_flows_for_message(&message_name);
+            let receive_flows = network_index.get_receive_flows_for_message(&message_name);
+            let vfs = db.get_vfs();
+            let mut locations: Vec<Location> = Vec::new();
+            let mut sender_count = 0usize;
+            for (file_id, flow) in &send_flows {
+                let Some(uri) = vfs.get_uri(file_id) else {
+                    continue;
+                };
+                let Some(document) = vfs.get_document(file_id) else {
+                    continue;
+                };
+                let Some(range) = document.to_lsp_range(flow.start_range) else {
+                    continue;
+                };
+                locations.push(Location::new(uri, range));
+                sender_count += 1;
+            }
+            let mut receiver_count = 0usize;
+            for (file_id, flow) in &receive_flows {
+                let Some(uri) = vfs.get_uri(file_id) else {
+                    continue;
+                };
+                let Some(document) = vfs.get_document(file_id) else {
+                    continue;
+                };
+                let Some(range) = document.to_lsp_range(flow.receive_range) else {
+                    continue;
+                };
+                locations.push(Location::new(uri, range));
+                receiver_count += 1;
+            }
+            let total = sender_count + receiver_count;
+            let usage_count = total.saturating_sub(1);
+            let lens_uri = data
+                .uri
+                .clone()
+                .or_else(|| locations.first().map(|loc| loc.uri.clone()))?;
+            let title = format_net_usages_title(usage_count, sender_count, receiver_count);
+            let command = make_command_with_title(
+                lens_uri,
+                code_lens.range,
+                title,
+                client_id,
+                locations,
+            );
+            Some(CodeLens {
+                range: code_lens.range,
+                command: Some(command),
+                data: None,
+            })
+        }
     }
 }
 
@@ -97,6 +152,16 @@ fn make_usage_command(
         ref_count,
         if ref_count == 1 { "" } else { "s" }
     );
+    make_command_with_title(uri, range, title, client_id, refs)
+}
+
+fn make_command_with_title(
+    uri: Uri,
+    range: Range,
+    title: String,
+    client_id: ClientId,
+    refs: Vec<Location>,
+) -> Command {
     let args = vec![
         serde_json::to_value(uri).unwrap(),
         serde_json::to_value(range.start).unwrap(),
@@ -108,4 +173,21 @@ fn make_usage_command(
         command: get_command_name(client_id).to_string(),
         arguments: Some(args),
     }
+}
+
+fn format_net_usages_title(
+    usage_count: usize,
+    sender_count: usize,
+    receiver_count: usize,
+) -> String {
+    let usage_word = if usage_count == 1 { "usage" } else { "usages" };
+    let sender_word = if sender_count == 1 { "sender" } else { "senders" };
+    let receiver_word = if receiver_count == 1 {
+        "receiver"
+    } else {
+        "receivers"
+    };
+    format!(
+        "{usage_count} {usage_word} ({sender_count} {sender_word}, {receiver_count} {receiver_word})"
+    )
 }
