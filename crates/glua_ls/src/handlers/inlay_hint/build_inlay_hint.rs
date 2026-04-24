@@ -1388,3 +1388,4 @@ fn build_control_flow_closing_end_hint(
 
     Some(())
 }
+

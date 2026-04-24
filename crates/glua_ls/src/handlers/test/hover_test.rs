@@ -1691,4 +1691,342 @@ mod tests {
         );
         Ok(())
     }
+
+    fn enable_gmod_workspace() -> ProviderVirtualWorkspace {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws
+    }
+
+    fn extract_hover_markdown(
+        ws: &ProviderVirtualWorkspace,
+        file_id: glua_code_analysis::FileId,
+        position: lsp_types::Position,
+    ) -> String {
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .expect("expected hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("expected HoverContents::Markup");
+        };
+        markup.value
+    }
+
+    #[gtest]
+    fn test_hover_net_message_on_net_start_shows_send_and_receive_patterns() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/client/recv.lua",
+            r#"
+                net.Receive("MyMessage", function()
+                    local id = net.ReadUInt(16)
+                    local name = net.ReadString()
+                end)
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                util.AddNetworkString("MyMessage")
+                net.Start("MyMes<??>sage")
+                net.WriteUInt(1, 16)
+                net.WriteString("hello")
+                net.Send(Entity(1))
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/server/send.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("(net) \"MyMessage\""),
+            "expected typed header, got: {value}"
+        );
+        assert!(value.contains("**Senders**"), "got: {value}");
+        assert!(value.contains("**Receivers**"), "got: {value}");
+        assert!(value.contains("net.WriteUInt(1, 16)"), "got: {value}");
+        assert!(value.contains("net.WriteString(\"hello\")"), "got: {value}");
+        assert!(value.contains("net.ReadUInt(16)"), "got: {value}");
+        assert!(value.contains("net.ReadString"), "got: {value}");
+        // File names should appear as clickable links pointing to a line.
+        assert!(
+            value.contains("send.lua") && value.contains("recv.lua"),
+            "expected file names in links, got: {value}"
+        );
+        assert!(
+            value.contains("#L"),
+            "expected #L<line> in clickable links, got: {value}"
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_on_net_receive_shows_info() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+                util.AddNetworkString("Ping")
+                net.Start("Ping")
+                net.WriteString("hi")
+                net.Send(Entity(1))
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                net.Receive("Pin<??>g", function()
+                    local s = net.ReadString()
+                end)
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/client/recv.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("(net) \"Ping\""),
+            "expected typed header, got: {value}"
+        );
+        assert!(value.contains("**Senders**"), "got: {value}");
+        assert!(value.contains("**Receivers**"), "got: {value}");
+        assert!(value.contains("net.WriteString"), "got: {value}");
+        assert!(value.contains("net.ReadString"), "got: {value}");
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_on_util_add_network_string_shows_info() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+                net.Start("Registered")
+                net.WriteFloat(0.5)
+                net.Send(Entity(1))
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                util.AddNetworkString("Regis<??>tered")
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/server/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("(net) \"Registered\""),
+            "expected typed header, got: {value}"
+        );
+        assert!(value.contains("**Senders**"), "got: {value}");
+        assert!(value.contains("net.WriteFloat"), "got: {value}");
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_groups_distinct_send_patterns() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/server/send_a.lua",
+            r#"
+                net.Start("MultiPattern")
+                net.WriteUInt(1, 16)
+                net.WriteString("a")
+                net.Send(Entity(1))
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/send_b.lua",
+            r#"
+                net.Start("MultiPattern")
+                net.WriteFloat(0.5)
+                net.Send(Entity(1))
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                net.Receive("MultiPa<??>ttern", function() end)
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/client/recv.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("net.WriteUInt"),
+            "expected first pattern entry, got: {value}"
+        );
+        assert!(
+            value.contains("net.WriteString"),
+            "expected first pattern entry, got: {value}"
+        );
+        assert!(
+            value.contains("net.WriteFloat"),
+            "expected second pattern entry, got: {value}"
+        );
+        // Two distinct send patterns should produce a multi-pattern Senders section.
+        assert!(
+            value.contains("across 2 patterns"),
+            "expected multi-pattern label, got: {value}"
+        );
+        assert!(
+            value.contains("Pattern A") && value.contains("Pattern B"),
+            "expected Pattern A and B labels, got: {value}"
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_marks_dynamic_writes() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                net.Start("DynLoop<??>")
+                for _ = 1, 3 do
+                    net.WriteString("x")
+                end
+                net.Send(Entity(1))
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/server/send.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("net.WriteString")
+                && value.contains("for _ = 1, 3 do")
+                && value.contains("end"),
+            "expected WriteString nested under the `for ... do` source frame, got: {value}"
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_nested_loops_via_named_callback() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local function InitVars(len)
+                    local plyCount = net.ReadUInt(8)
+                    for i = 1, plyCount, 1 do
+                        local userID = net.ReadUInt(16)
+                        local varCount = net.ReadUInt(8)
+                        for j = 1, varCount, 1 do
+                            local v = net.ReadString()
+                        end
+                    end
+                end
+                net.Receive("NestedVars<??>", InitVars)
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/client/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("net.ReadUInt") && value.contains("net.ReadString"),
+            "expected reads from both loop levels, got: {value}"
+        );
+        assert!(
+            value.contains("for i = 1, plyCount, 1 do")
+                && value.contains("for j = 1, varCount, 1 do"),
+            "expected both for-loop headers, got: {value}"
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_helper_call_inherits_outer_flow() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local function readPair()
+                    local k = net.ReadString()
+                    local v = net.ReadString()
+                end
+                local function recv(len)
+                    local n = net.ReadUInt(8)
+                    for i = 1, n, 1 do
+                        readPair()
+                    end
+                end
+                net.Receive("HelperLoop<??>", recv)
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/client/helper.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        // Reads inside readPair() should appear inside a Lua code fence that
+        // follows a styled scope-open row for the outer for-loop — the
+        // helper-recursion flow_path-prefix fix carries the call site's loop
+        // into the helper body's reads.
+        assert!(
+            value.contains("net.ReadString") && value.contains("for i = 1, n, 1 do"),
+            "expected ReadString and outer for-loop header both rendered, got: {value}"
+        );
+        let Some(header_idx) = value.find("for i = 1, n, 1 do") else {
+            panic!("expected for-loop scope row, got: {value}");
+        };
+        let Some(read_idx) = value.find("net.ReadString") else {
+            panic!("expected ReadString rendered, got: {value}");
+        };
+        assert!(
+            read_idx > header_idx,
+            "expected ReadString rendered after the for-loop scope-open row, got: {value}"
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_no_counterpart_indexed_message() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                util.AddNetworkString("Lonely<??>")
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/server/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("(net) \"Lonely\""),
+            "expected typed header even with no usages, got: {value}"
+        );
+        assert!(
+            value.contains("no recorded usages")
+                || value.contains("No payload patterns indexed"),
+            "expected an empty-state hint, got: {value}"
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_does_not_trigger_for_unrelated_string() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local x = "Hel<??>lo"
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/server/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position);
+        if let Some(hover) = hover {
+            let HoverContents::Markup(markup) = hover.contents else {
+                return Ok(());
+            };
+            assert!(
+                !markup.value.contains("(net)"),
+                "unrelated string hover should not show net-message info, got: {}",
+                markup.value
+            );
+        }
+        Ok(())
+    }
 }

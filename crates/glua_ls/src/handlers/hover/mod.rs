@@ -5,6 +5,7 @@ mod hover_builder;
 mod humanize_type_decl;
 mod humanize_types;
 mod keyword_hover;
+mod net_hover;
 mod realm_badge;
 
 use super::RegisterCapabilities;
@@ -168,6 +169,14 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
             )
         }
         _ => {
+            if let Some(net_hover) = net_hover::hover_gmod_net_message_string(
+                analysis,
+                &semantic_model,
+                &token,
+            ) {
+                return Some(net_hover);
+            }
+
             if let Some(hook_hover) = hover_gmod_hook_name_string(
                 analysis,
                 &semantic_model,
