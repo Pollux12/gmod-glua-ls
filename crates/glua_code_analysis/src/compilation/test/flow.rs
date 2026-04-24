@@ -2751,6 +2751,29 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_multi_return_local_slot_is_not_treated_as_uninitialized() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@return string, number
+            local function get_size()
+                return "", 1
+            end
+
+            local _, height = get_size()
+            if true then
+                height = height
+            end
+            a = height
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(desc, eq("number"));
+    }
+
+    #[gtest]
     fn test_isfunction_narrows_uninitialized_local() {
         // After isfunction(testFunc), testFunc should be non-nil (callable without need-check-nil)
         let mut ws = VirtualWorkspace::new();

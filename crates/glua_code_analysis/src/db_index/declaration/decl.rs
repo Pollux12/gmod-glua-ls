@@ -124,6 +124,10 @@ impl LuaDecl {
         self.initializer
     }
 
+    pub fn has_initializer(&self) -> bool {
+        self.initializer.is_some()
+    }
+
     pub fn set_initializer(&mut self, initializer: Option<LuaDeclInitializer>) {
         self.initializer = initializer;
     }

@@ -906,7 +906,7 @@ fn resolve_cached_decl_type(
         return Ok(Some(type_cache.as_type().clone()));
     }
 
-    if decl.get_value_syntax_id().is_some() {
+    if decl.has_initializer() {
         return Err(InferFailReason::UnResolveDeclType(decl_id));
     }
 

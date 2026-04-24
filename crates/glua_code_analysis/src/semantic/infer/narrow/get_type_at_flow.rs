@@ -478,7 +478,7 @@ fn should_treat_unresolved_decl_as_nil(db: &DbIndex, decl_id: crate::LuaDeclId) 
         return false;
     }
 
-    if decl.get_value_syntax_id().is_some() {
+    if decl.has_initializer() {
         return false;
     }
 
@@ -497,7 +497,7 @@ fn should_defer_uninitialized_local_decl_type(db: &DbIndex, decl_id: crate::LuaD
         return false;
     }
 
-    if decl.get_value_syntax_id().is_some() {
+    if decl.has_initializer() {
         return false;
     }
 
@@ -1020,6 +1020,12 @@ fn try_infer_decl_initializer_type(
         return Ok(None);
     };
 
-    infer_expr_list_value_type_at(db, cache, &[expr], initializer.get_ret_idx())
-        .map(|typ| Some(typ.unwrap_or(LuaType::Nil)))
+    let ret_idx = initializer.get_ret_idx();
+    let init_type = match infer_expr(db, cache, expr)? {
+        LuaType::Variadic(variadic) => variadic.get_type(ret_idx).cloned().unwrap_or(LuaType::Nil),
+        ty if ret_idx == 0 => ty,
+        _ => LuaType::Nil,
+    };
+
+    Ok(Some(init_type))
 }
