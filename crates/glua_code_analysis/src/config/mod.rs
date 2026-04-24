@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::pre_process::PreProcessContext;
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
+#[schemars(title = "GLuaLS Configuration")]
 #[serde(rename_all = "camelCase")]
 pub struct Emmyrc {
     #[serde(rename = "$schema")]
