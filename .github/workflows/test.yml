@@ -15,6 +15,30 @@ env:
   CLICOLOR: 1
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.clippy.toml'
+              - 'rustfmt.toml'
+              - 'crates/**'
+              - 'tools/**'
+              - 'vendor/emmylua_codestyle/**'
+              - '.github/workflows/test.yml'
+
   clippy:
     name: Clippy Lint Check
     runs-on: ubuntu-latest
@@ -41,6 +65,32 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run Tests
         run: cargo test
+
+  macos-check:
+    name: Experimental macOS cargo check (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Check macOS binaries
+        run: cargo check -p glua_ls -p glua_check --target ${{ matrix.target }}
 
   check-schema:
     name: Check schema generation
