@@ -14,6 +14,7 @@ pub struct TypeCheckContext<'db> {
     pub db: &'db DbIndex,
     pub level: TypeCheckCheckLevel,
     pub table_member_checked: Option<HashSet<LuaMemberKey>>,
+    pub skip_excess_property_checks: bool,
 }
 
 impl<'db> TypeCheckContext<'db> {
@@ -23,6 +24,7 @@ impl<'db> TypeCheckContext<'db> {
             db,
             level,
             table_member_checked: None,
+            skip_excess_property_checks: false,
         }
     }
 

@@ -290,7 +290,9 @@ fn check_object_type_compact_table_const(
         }
     }
 
-    if source_fields.is_empty() && source_object.get_index_access().is_empty() {
+    if context.skip_excess_property_checks
+        || source_fields.is_empty() && source_object.get_index_access().is_empty()
+    {
         return Ok(());
     }
 

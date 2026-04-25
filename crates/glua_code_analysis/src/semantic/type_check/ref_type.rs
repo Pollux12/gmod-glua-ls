@@ -353,7 +353,9 @@ fn check_ref_type_compact_table(
         }
     }
 
-    if let Some(all_source_members) = find_members(context.db, &LuaType::Ref(source_type_id.clone()))
+    if !context.skip_excess_property_checks
+        && let Some(all_source_members) =
+            find_members(context.db, &LuaType::Ref(source_type_id.clone()))
         && !all_source_members.is_empty()
     {
         for table_key in table_member_map.keys() {

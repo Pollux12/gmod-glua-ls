@@ -13,8 +13,8 @@ use table_generic_check::check_table_generic_type_compact;
 use tuple_type_check::check_tuple_type_compact;
 
 use crate::{
-    LuaType, LuaUnionType, TypeSubstitutor,
-    semantic::type_check::type_check_context::TypeCheckContext,
+    LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, TypeSubstitutor,
+    semantic::{member::find_members, type_check::type_check_context::TypeCheckContext},
 };
 
 use super::{
@@ -101,6 +101,14 @@ pub fn check_complex_type_compact(
             }
         }
         LuaType::Union(union_type) => {
+            if matches!(compact_type, LuaType::TableConst(_)) {
+                return check_union_type_compact_table_const(
+                    context,
+                    union_type,
+                    compact_type,
+                    check_guard.next_level()?,
+                );
+            }
             if let LuaType::Union(compact_union) = compact_type {
                 return check_union_type_compact_union(
                     context,
@@ -179,4 +187,210 @@ fn check_union_type_compact_union(
     }
 
     Ok(())
+}
+
+fn check_union_type_compact_table_const(
+    context: &mut TypeCheckContext,
+    source_union: &LuaUnionType,
+    compact_type: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    let union_targets = source_union.into_vec();
+    let table_members = table_const_members(context, compact_type);
+    let narrowed_targets = narrow_union_targets_by_table_literals(
+        context,
+        &union_targets,
+        &table_members,
+        check_guard,
+    )?;
+
+    check_table_const_excess_against_targets(
+        context,
+        &narrowed_targets,
+        &table_members,
+        check_guard,
+    )?;
+
+    for sub_type in narrowed_targets {
+        let mut branch_context = context.clone();
+        branch_context.skip_excess_property_checks = true;
+        match check_general_type_compact(
+            &mut branch_context,
+            &sub_type,
+            compact_type,
+            check_guard.next_level()?,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.is_type_not_match() => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(TypeCheckFailReason::TypeNotMatch)
+}
+
+fn table_const_members(
+    context: &TypeCheckContext,
+    compact_type: &LuaType,
+) -> Vec<(LuaMemberKey, LuaType)> {
+    let LuaType::TableConst(table_range) = compact_type else {
+        return Vec::new();
+    };
+
+    let member_owner = LuaMemberOwner::Element(table_range.clone());
+    let member_index = context.db.get_member_index();
+    let Some(members) = member_index.get_members(&member_owner) else {
+        return Vec::new();
+    };
+
+    let type_index = context.db.get_type_index();
+    members
+        .iter()
+        .filter_map(|member| {
+            type_index
+                .get_type_cache(&member.get_id().into())
+                .map(|cache| (member.get_key().clone(), cache.as_type().clone()))
+        })
+        .collect()
+}
+
+fn narrow_union_targets_by_table_literals(
+    context: &mut TypeCheckContext,
+    union_targets: &[LuaType],
+    table_members: &[(LuaMemberKey, LuaType)],
+    check_guard: TypeCheckGuard,
+) -> Result<Vec<LuaType>, TypeCheckFailReason> {
+    let mut narrowed_targets = Vec::new();
+    let mut rejected = false;
+
+    for target in union_targets {
+        let Some(target_members) = find_members(context.db, target) else {
+            narrowed_targets.push(target.clone());
+            continue;
+        };
+
+        let mut compatible = true;
+        for (table_key, table_type) in table_members {
+            if !is_discriminant_type(table_type) {
+                continue;
+            }
+
+            let Some(target_member) = target_members
+                .iter()
+                .find(|target_member| &target_member.key == table_key)
+            else {
+                continue;
+            };
+
+            if !is_discriminant_type(&target_member.typ) {
+                continue;
+            }
+
+            let mut check_context = context.clone();
+            match check_general_type_compact(
+                &mut check_context,
+                &target_member.typ,
+                table_type,
+                check_guard.next_level()?,
+            ) {
+                Ok(_) => {}
+                Err(err) if err.is_type_not_match() => {
+                    compatible = false;
+                    rejected = true;
+                    break;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        if compatible {
+            narrowed_targets.push(target.clone());
+        }
+    }
+
+    if rejected && !narrowed_targets.is_empty() {
+        Ok(narrowed_targets)
+    } else {
+        Ok(union_targets.to_vec())
+    }
+}
+
+fn check_table_const_excess_against_targets(
+    context: &mut TypeCheckContext,
+    targets: &[LuaType],
+    table_members: &[(LuaMemberKey, LuaType)],
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    let target_members = targets
+        .iter()
+        .filter_map(|target| find_members(context.db, target))
+        .flatten()
+        .collect::<Vec<_>>();
+
+    if target_members.is_empty() {
+        return Ok(());
+    }
+
+    for (table_key, _) in table_members {
+        if target_members
+            .iter()
+            .any(|target_member| &target_member.key == table_key)
+        {
+            continue;
+        }
+
+        let Some(table_key_type) = member_key_type_for_index(table_key) else {
+            continue;
+        };
+
+        let mut accepted_by_index = false;
+        for target_member in &target_members {
+            let LuaMemberKey::ExprType(index_key_type) = &target_member.key else {
+                continue;
+            };
+            match check_general_type_compact(
+                context,
+                index_key_type,
+                &table_key_type,
+                check_guard.next_level()?,
+            ) {
+                Ok(_) => {
+                    accepted_by_index = true;
+                    break;
+                }
+                Err(err) if err.is_type_not_match() => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        if accepted_by_index {
+            continue;
+        }
+
+        return Err(TypeCheckFailReason::TypeNotMatch);
+    }
+
+    Ok(())
+}
+
+fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {
+    match member_key {
+        LuaMemberKey::Integer(i) => Some(LuaType::IntegerConst(*i)),
+        LuaMemberKey::Name(name) => Some(LuaType::StringConst(name.clone().into())),
+        LuaMemberKey::ExprType(typ) => Some(typ.clone()),
+        LuaMemberKey::None => None,
+    }
+}
+
+fn is_discriminant_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::StringConst(_)
+        | LuaType::DocStringConst(_)
+        | LuaType::IntegerConst(_)
+        | LuaType::DocIntegerConst(_)
+        | LuaType::BooleanConst(_)
+        | LuaType::DocBooleanConst(_) => true,
+        LuaType::Union(union) => union.into_vec().iter().all(is_discriminant_type),
+        _ => false,
+    }
 }

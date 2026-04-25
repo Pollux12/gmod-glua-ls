@@ -162,6 +162,26 @@ mod test {
     }
 
     #[test]
+    fn test_fresh_table_literal_excess_uses_union_target_properties() {
+        let mut ws = VirtualWorkspace::new();
+
+        let union_ty = ws.ty("{ a: integer } | { b: integer }");
+        let both_literal_ty = ws.expr_ty("{ a = 1, b = 2 }");
+        assert!(ws.check_type(&union_ty, &both_literal_ty));
+
+        let extra_literal_ty = ws.expr_ty("{ a = 1, c = 3 }");
+        assert!(!ws.check_type(&union_ty, &extra_literal_ty));
+
+        let discriminated_union_ty =
+            ws.ty("{ kind: 'a', a: integer } | { kind: 'b', b: integer }");
+        let matched_discriminant_literal_ty = ws.expr_ty("{ kind = 'a', a = 1, b = 2 }");
+        assert!(!ws.check_type(
+            &discriminated_union_ty,
+            &matched_discriminant_literal_ty
+        ));
+    }
+
+    #[test]
     fn test_array_types() {
         let mut ws = VirtualWorkspace::new();
 
