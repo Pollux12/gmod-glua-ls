@@ -293,8 +293,16 @@ pub fn instantiate_generic(
 ) -> LuaType {
     let generic_params = generic.get_params();
     let mut new_params = Vec::new();
+    let mut new_params_with_structural = Vec::new();
     for param in generic_params {
         let new_param = instantiate_type_generic(db, param, substitutor);
+        let structural_param = match param {
+            LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => {
+                substitutor.get_structural_type(tpl.get_tpl_id()).cloned()
+            }
+            _ => None,
+        };
+        new_params_with_structural.push((new_param.clone(), structural_param));
         new_params.push(new_param);
     }
 
@@ -309,7 +317,10 @@ pub fn instantiate_generic(
         && let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id)
         && type_decl.is_alias()
     {
-        let new_substitutor = TypeSubstitutor::from_alias(new_params.clone(), type_decl_id.clone());
+        let new_substitutor = TypeSubstitutor::from_alias_with_structural(
+            new_params_with_structural,
+            type_decl_id.clone(),
+        );
         if let Some(origin) = type_decl.get_alias_origin(db, Some(&new_substitutor)) {
             return origin;
         }
@@ -584,23 +595,18 @@ fn collect_infer_assignments(
         LuaType::ConditionalInfer(name) => {
             insert_infer_assignment(assignments, name.as_str(), source)
         }
-        LuaType::Generic(pattern_generic) => {
-            if let LuaType::Generic(source_generic) = source {
-                let pattern_params = pattern_generic.get_params();
-                let source_params = source_generic.get_params();
-                if pattern_params.len() != source_params.len() {
-                    return false;
-                }
-                for (pattern_param, source_param) in pattern_params.iter().zip(source_params) {
-                    if !collect_infer_assignments(db, source_param, pattern_param, assignments) {
-                        return false;
-                    }
-                }
-                true
-            } else {
-                false
+        LuaType::Generic(pattern_generic) => match source {
+            LuaType::Generic(source_generic) => collect_infer_from_generic_to_generic(
+                db,
+                source_generic,
+                pattern_generic,
+                assignments,
+            ),
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                collect_infer_from_ref_to_generic(db, type_id, pattern_generic, assignments)
             }
-        }
+            _ => false,
+        },
         LuaType::DocFunction(pattern_func) => {
             match source {
                 LuaType::DocFunction(source_func) => {
@@ -771,6 +777,114 @@ fn collect_infer_assignments(
             }
         }
     }
+}
+
+fn collect_infer_from_generic_to_generic(
+    db: &DbIndex,
+    source_generic: &LuaGenericType,
+    pattern_generic: &LuaGenericType,
+    assignments: &mut HashMap<String, LuaType>,
+) -> bool {
+    if source_generic.get_base_type_id_ref() == pattern_generic.get_base_type_id_ref() {
+        return collect_infer_from_generic_params(
+            db,
+            source_generic.get_params(),
+            pattern_generic.get_params(),
+            assignments,
+        );
+    }
+
+    if let Some(source_decl) = db
+        .get_type_index()
+        .get_type_decl(source_generic.get_base_type_id_ref())
+        && source_decl.is_alias()
+    {
+        let substitutor = TypeSubstitutor::from_alias(
+            source_generic.get_params().clone(),
+            source_generic.get_base_type_id_ref().clone(),
+        );
+        if let Some(alias_origin) = source_decl.get_alias_origin(db, Some(&substitutor)) {
+            let mut candidate_assignments = assignments.clone();
+            if collect_infer_assignments(
+                db,
+                &alias_origin,
+                &LuaType::Generic(pattern_generic.clone().into()),
+                &mut candidate_assignments,
+            ) {
+                *assignments = candidate_assignments;
+                return true;
+            }
+        }
+    }
+
+    if let Some(super_types) = db
+        .get_type_index()
+        .get_super_types(source_generic.get_base_type_id_ref())
+    {
+        let substitutor = TypeSubstitutor::from_type_array(source_generic.get_params().clone());
+        for super_type in super_types {
+            let super_type = instantiate_type_generic(db, &super_type, &substitutor);
+            let mut candidate_assignments = assignments.clone();
+            if collect_infer_assignments(
+                db,
+                &super_type,
+                &LuaType::Generic(pattern_generic.clone().into()),
+                &mut candidate_assignments,
+            ) {
+                *assignments = candidate_assignments;
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn collect_infer_from_ref_to_generic(
+    db: &DbIndex,
+    source_type_id: &LuaTypeDeclId,
+    pattern_generic: &LuaGenericType,
+    assignments: &mut HashMap<String, LuaType>,
+) -> bool {
+    let Some(super_types) = db.get_type_index().get_super_types(source_type_id) else {
+        return false;
+    };
+
+    for super_type in super_types {
+        let mut candidate_assignments = assignments.clone();
+        if collect_infer_assignments(
+            db,
+            &super_type,
+            &LuaType::Generic(pattern_generic.clone().into()),
+            &mut candidate_assignments,
+        ) {
+            *assignments = candidate_assignments;
+            return true;
+        }
+    }
+
+    false
+}
+
+fn collect_infer_from_generic_params(
+    db: &DbIndex,
+    source_params: &[LuaType],
+    pattern_params: &[LuaType],
+    assignments: &mut HashMap<String, LuaType>,
+) -> bool {
+    if pattern_params.len() != source_params.len() {
+        return false;
+    }
+
+    let mut candidate_assignments = assignments.clone();
+    for (pattern_param, source_param) in pattern_params.iter().zip(source_params) {
+        if !collect_infer_assignments(db, source_param, pattern_param, &mut candidate_assignments) {
+            return false;
+        }
+    }
+
+    *assignments = candidate_assignments;
+    true
 }
 
 /// Match object literal to object pattern, extracting infer types from fields

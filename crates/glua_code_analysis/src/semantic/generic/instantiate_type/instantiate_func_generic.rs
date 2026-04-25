@@ -1,13 +1,17 @@
-use std::{collections::HashSet, ops::Deref, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Deref,
+    sync::Arc,
+};
 
 use glua_parser::{LuaAstNode, LuaDocTypeList};
-use glua_parser::{LuaCallExpr, LuaExpr};
+use glua_parser::{LuaCallExpr, LuaExpr, LuaIndexKey, LuaTableExpr, NumberResult};
 use internment::ArcIntern;
 
 use crate::{
     DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaFunctionType, LuaGenericType,
     TypeVisitTrait,
-    db_index::{DbIndex, LuaType},
+    db_index::{DbIndex, LuaMemberKey, LuaObjectType, LuaType},
     infer_doc_type,
     semantic::{
         LuaInferCache,
@@ -161,12 +165,12 @@ fn infer_generic_types_from_call(
             continue;
         }
 
-        let arg_type = match infer_expr(db, context.cache, call_arg_expr.clone()) {
+        let arg_type = match infer_generic_arg_type(db, context.cache, call_arg_expr.clone()) {
             Ok(t) => t,
-            Err(InferFailReason::FieldNotFound) => LuaType::Nil, // 对于未找到的字段, 我们认为是 nil 以执行后续推断
+            Err(InferFailReason::FieldNotFound) => GenericArgType::from_raw(LuaType::Nil), // 对于未找到的字段, 我们认为是 nil 以执行后续推断
             Err(e) => return Err(e),
         };
-        match (func_param_type, &arg_type) {
+        match (func_param_type, &arg_type.raw) {
             (LuaType::Variadic(variadic), _) => {
                 let mut arg_types = vec![];
                 for arg_expr in &arg_exprs[i..] {
@@ -186,7 +190,7 @@ fn infer_generic_types_from_call(
                 break;
             }
             _ => {
-                tpl_pattern_match(context, func_param_type, &arg_type)?;
+                tpl_pattern_match_generic_arg(context, func_param_type, &arg_type)?;
             }
         }
     }
@@ -200,6 +204,128 @@ fn infer_generic_types_from_call(
     }
 
     Ok(())
+}
+
+fn infer_generic_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+) -> Result<GenericArgType, InferFailReason> {
+    let raw = infer_expr(db, cache, expr.clone())?;
+    let structural = if let LuaExpr::TableExpr(table) = &expr
+        && table.is_object()
+    {
+        Some(infer_object_table_arg_type(db, cache, table.clone())?)
+    } else {
+        None
+    };
+
+    Ok(GenericArgType { raw, structural })
+}
+
+struct GenericArgType {
+    raw: LuaType,
+    structural: Option<LuaType>,
+}
+
+impl GenericArgType {
+    fn from_raw(raw: LuaType) -> Self {
+        Self {
+            raw,
+            structural: None,
+        }
+    }
+
+    fn match_type(&self) -> &LuaType {
+        self.structural.as_ref().unwrap_or(&self.raw)
+    }
+}
+
+fn tpl_pattern_match_generic_arg(
+    context: &mut TplContext,
+    pattern: &LuaType,
+    target: &GenericArgType,
+) -> Result<(), InferFailReason> {
+    match pattern {
+        LuaType::TplRef(tpl) if tpl.get_tpl_id().is_func() => {
+            insert_generic_arg(context, tpl.get_tpl_id(), target, true);
+        }
+        LuaType::ConstTplRef(tpl) if tpl.get_tpl_id().is_func() => {
+            insert_generic_arg(context, tpl.get_tpl_id(), target, false);
+        }
+        _ => tpl_pattern_match(context, pattern, target.match_type())?,
+    }
+
+    Ok(())
+}
+
+fn insert_generic_arg(
+    context: &mut TplContext,
+    tpl_id: GenericTplId,
+    target: &GenericArgType,
+    decay: bool,
+) {
+    if let Some(structural) = &target.structural {
+        context.substitutor.insert_type_with_structural(
+            tpl_id,
+            target.raw.clone(),
+            structural.clone(),
+            decay,
+        );
+    } else {
+        context
+            .substitutor
+            .insert_type(tpl_id, target.raw.clone(), decay);
+    }
+}
+
+fn infer_object_table_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table: LuaTableExpr,
+) -> Result<LuaType, InferFailReason> {
+    let mut fields = HashMap::new();
+
+    for field in table.get_fields() {
+        let Some(field_key) = field.get_field_key() else {
+            continue;
+        };
+        let member_key = match field_key {
+            LuaIndexKey::Name(name) => LuaMemberKey::Name(name.get_name_text().into()),
+            LuaIndexKey::String(str) => LuaMemberKey::Name(str.get_value().into()),
+            LuaIndexKey::Integer(i) => match i.get_number_value() {
+                NumberResult::Int(idx) => LuaMemberKey::Integer(idx),
+                _ => continue,
+            },
+            LuaIndexKey::Idx(idx) => LuaMemberKey::Integer(idx as i64),
+            LuaIndexKey::Expr(expr) => match infer_expr(db, cache, expr) {
+                Ok(LuaType::StringConst(s) | LuaType::DocStringConst(s)) => {
+                    LuaMemberKey::Name((*s).clone())
+                }
+                Ok(LuaType::IntegerConst(i) | LuaType::DocIntegerConst(i)) => {
+                    LuaMemberKey::Integer(i)
+                }
+                Ok(typ) => LuaMemberKey::ExprType(typ),
+                Err(InferFailReason::FieldNotFound) => continue,
+                Err(reason) => return Err(reason),
+            },
+        };
+
+        let Some(value_expr) = field.get_value_expr() else {
+            continue;
+        };
+        let value_type = match infer_expr(db, cache, value_expr) {
+            Ok(LuaType::Def(ref_id)) => LuaType::Ref(ref_id),
+            Ok(other) => other,
+            Err(InferFailReason::FieldNotFound) => LuaType::Unknown,
+            Err(reason) => return Err(reason),
+        };
+        fields.insert(member_key, value_type);
+    }
+
+    Ok(LuaType::Object(
+        LuaObjectType::new_with_fields(fields, Vec::new()).into(),
+    ))
 }
 
 pub fn build_self_type(db: &DbIndex, self_type: &LuaType) -> LuaType {

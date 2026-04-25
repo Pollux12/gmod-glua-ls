@@ -438,6 +438,207 @@ mod test {
     }
 
     #[test]
+    fn test_mapped_infer_from_generic_function_table_literal() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+
+            ---@alias InferShape<T> { [K in keyof T]: T[K] extends Schema<infer U> and U or unknown; }
+
+            ---@return Schema<string>
+            function mk_string() end
+
+            ---@return Schema<number>
+            function mk_number() end
+
+            ---@generic T
+            ---@param schema T
+            ---@return InferShape<T>
+            function object(schema) end
+
+            result = object({
+                name = mk_string(),
+                age = mk_number(),
+            })
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        let age_ty = ws.expr_ty("result.age");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+        assert_eq!(ws.humanize_type(age_ty), "number");
+    }
+
+    #[test]
+    fn test_mapped_infer_from_generic_function_table_variable() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+
+            ---@alias InferShape<T> { [K in keyof T]: T[K] extends Schema<infer U> and U or unknown; }
+
+            ---@return Schema<string>
+            function mk_string() end
+
+            ---@return Schema<number>
+            function mk_number() end
+
+            ---@generic T
+            ---@param schema T
+            ---@return InferShape<T>
+            function object(schema) end
+
+            local shape = {
+                name = mk_string(),
+                age = mk_number(),
+            }
+            result = object(shape)
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        let age_ty = ws.expr_ty("result.age");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+        assert_eq!(ws.humanize_type(age_ty), "number");
+    }
+
+    #[test]
+    fn test_builder_schema_parse_preserves_table_literal_field_types() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+            ---@field parse fun(self: Schema<T>, value: unknown): T
+
+            ---@alias InferShape<T> { [K in keyof T]: T[K] extends Schema<infer U> and U or unknown; }
+
+            ---@return Schema<string>
+            function mk_string() end
+
+            ---@return Schema<number>
+            function mk_number() end
+
+            ---@generic T
+            ---@param schema T
+            ---@return Schema<InferShape<T>>
+            function object(schema) end
+
+            local schema = object({
+                name = mk_string(),
+                age = mk_number(),
+            })
+
+            result = schema:parse({})
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        let age_ty = ws.expr_ty("result.age");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+        assert_eq!(ws.humanize_type(age_ty), "number");
+    }
+
+    #[test]
+    fn test_zod_like_builder_schema_parse_preserves_nested_shape() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+            ---@field parse fun(self: Schema<T>, value: unknown): T
+            ---@field optional fun(self: Schema<T>): OptionalSchema<T|nil>
+            ---@class ObjectSchema<T>: Schema<T>
+            ---@class ArraySchema<T>: Schema<T[]>
+            ---@class OptionalSchema<T>: Schema<T>
+
+            ---@alias InferShape<T> { [K in keyof T]: T[K] extends ArraySchema<infer U> and U[] or T[K] extends ObjectSchema<infer U> and U or T[K] extends OptionalSchema<infer U> and U or T[K] extends Schema<infer U> and U or unknown; }
+
+            ---@return Schema<string>
+            function mk_string() end
+
+            ---@return Schema<number>
+            function mk_number() end
+
+            ---@return Schema<boolean>
+            function mk_boolean() end
+
+            ---@generic T
+            ---@param schema T
+            ---@return ObjectSchema<InferShape<T>>
+            function object(schema) end
+
+            ---@generic T
+            ---@param schema Schema<T>
+            ---@return ArraySchema<T>
+            function array(schema) end
+
+            schema = object({
+                name = mk_string(),
+                age = mk_number(),
+                admin = mk_boolean(),
+                tags = array(mk_string()),
+                profile = object({
+                    id = mk_string(),
+                    score = mk_number():optional(),
+                }),
+            })
+
+            parsed = schema:parse({})
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("parsed.name");
+        let age_ty = ws.expr_ty("parsed.age");
+        let admin_ty = ws.expr_ty("parsed.admin");
+        let tags_ty = ws.expr_ty("parsed.tags");
+        let profile_ty = ws.expr_ty("parsed.profile");
+        let id_ty = ws.expr_ty("parsed.profile.id");
+        let score_ty = ws.expr_ty("parsed.profile.score");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+        assert_eq!(ws.humanize_type(age_ty), "number");
+        assert_eq!(ws.humanize_type(admin_ty), "boolean");
+        assert_eq!(ws.humanize_type(tags_ty), "string[]");
+        assert_eq!(
+            ws.humanize_type(profile_ty),
+            "{ id: string, score: number? }"
+        );
+        assert_eq!(ws.humanize_type(id_ty), "string");
+        assert_eq!(ws.humanize_type(score_ty), "number?");
+    }
+
+    #[test]
+    fn test_generic_identity_object_literal_still_allows_later_field_inference() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T
+            function identity(value) end
+
+            result = identity({ name = "abc" })
+            "#,
+        );
+        ws.def(
+            r#"
+            function add_field()
+                result.age = 1
+            end
+            value = result.age
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "1");
+    }
+
+    #[test]
     fn test_infer_new_constructor() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
