@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     DbIndex, GenericTplId, LuaGenericType, LuaType, LuaTypeDeclId, LuaUnionType,
-    semantic::type_check::check_type_compact,
+    semantic::type_check::{check_type_compact, is_sub_type_of},
 };
 
 #[derive(Debug, Clone)]
@@ -214,22 +214,19 @@ impl TypeSubstitutor {
             Some(_) => return,
         };
         let had_inference = self.type_inferences.contains_key(&tpl_id);
-        let include_existing_type = self
-            .type_inferences
-            .get(&tpl_id)
-            .is_none_or(|inference| !priority.is_higher_than(inference.priority()));
+        let include_existing_type = !had_inference
+            && existing_type.is_some()
+            && self
+                .type_inferences
+                .get(&tpl_id)
+                .is_none_or(|inference| !priority.is_higher_than(inference.priority()));
 
         let inference = self
             .type_inferences
             .entry(tpl_id)
             .or_insert_with(TypeInferenceInfo::new);
         if include_existing_type && let Some(existing) = existing_type {
-            let existing_variance = if had_inference {
-                variance
-            } else {
-                InferenceVariance::Covariant
-            };
-            inference.add_candidate(existing, priority, existing_variance);
+            inference.add_candidate(existing, priority, InferenceVariance::Covariant);
         }
         inference.add_candidate(value, priority, variance);
 
@@ -429,9 +426,13 @@ impl TypeInferenceInfo {
     }
 
     fn prefer_covariant_candidate(&self, db: &DbIndex, covariant: &SubstitutorTypeValue) -> bool {
-        self.contra_candidates.iter().any(|candidate| {
-            check_type_compact(db, covariant.default(), candidate.default()).is_ok()
-        })
+        if matches!(covariant.default(), LuaType::Any | LuaType::Never) {
+            return false;
+        }
+
+        self.contra_candidates
+            .iter()
+            .any(|candidate| candidate_assignable_to(db, covariant.default(), candidate.default()))
     }
 
     fn inferred(&self) -> Option<&SubstitutorTypeValue> {
@@ -627,6 +628,39 @@ fn common_subtype_candidate_type(db: &DbIndex, left: LuaType, right: LuaType) ->
     }
 
     left
+}
+
+fn candidate_assignable_to(db: &DbIndex, source: &LuaType, target: &LuaType) -> bool {
+    if source == target {
+        return true;
+    }
+
+    match (source, target) {
+        (
+            LuaType::Ref(source_id) | LuaType::Def(source_id),
+            LuaType::Ref(target_id) | LuaType::Def(target_id),
+        ) => is_sub_type_of(db, source_id, target_id),
+        (LuaType::Generic(source_generic), LuaType::Ref(target_id) | LuaType::Def(target_id)) => {
+            let source_id = source_generic.get_base_type_id_ref();
+            source_id == target_id || is_sub_type_of(db, source_id, target_id)
+        }
+        (LuaType::Ref(source_id) | LuaType::Def(source_id), LuaType::Generic(target_generic)) => {
+            let target_id = target_generic.get_base_type_id_ref();
+            source_id == target_id || is_sub_type_of(db, source_id, target_id)
+        }
+        (LuaType::Generic(source_generic), LuaType::Generic(target_generic)) => {
+            source_generic.get_base_type_id_ref() == target_generic.get_base_type_id_ref()
+                && source_generic.get_params().len() == target_generic.get_params().len()
+                && source_generic
+                    .get_params()
+                    .iter()
+                    .zip(target_generic.get_params().iter())
+                    .all(|(source_param, target_param)| {
+                        candidate_assignable_to(db, source_param, target_param)
+                    })
+        }
+        _ => check_type_compact(db, source, target).is_ok(),
+    }
 }
 
 fn common_nominal_supertype(db: &DbIndex, left: &LuaType, right: &LuaType) -> Option<LuaType> {

@@ -267,6 +267,92 @@ mod test {
     }
 
     #[test]
+    fn test_generic_mixed_function_candidates_prefer_covariant_subtype() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+
+            ---@generic T
+            ---@param value T
+            ---@param callback fun(value: T)
+            ---@return T
+            function use_callback(value, callback) end
+
+            ---@type Dog
+            local dog
+
+            ---@param value Animal
+            local function accepts_animal(value) end
+
+            result = use_callback(dog, accepts_animal)
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        let expected = ws.ty("Dog");
+        assert_eq!(result_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_mixed_function_candidates_prefer_contravariant_subtype() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+
+            ---@generic T
+            ---@param value T
+            ---@param callback fun(value: T)
+            ---@return T
+            function use_callback(value, callback) end
+
+            ---@type Animal
+            local animal
+
+            ---@param value Dog
+            local function accepts_dog(value) end
+
+            result = use_callback(animal, accepts_dog)
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        let expected = ws.ty("Dog");
+        assert_eq!(result_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_mixed_function_candidates_ignore_any_covariant() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Dog
+
+            ---@generic T
+            ---@param value T
+            ---@param callback fun(value: T)
+            ---@return T
+            function use_callback(value, callback) end
+
+            ---@type any
+            local value
+
+            ---@param value Dog
+            local function accepts_dog(value) end
+
+            result = use_callback(value, accepts_dog)
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        let expected = ws.ty("Dog");
+        assert_eq!(result_ty, expected);
+    }
+
+    #[test]
     fn test_generic_return_infers_from_local_doc_context() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
