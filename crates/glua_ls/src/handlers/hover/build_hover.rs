@@ -797,6 +797,16 @@ fn adjust_semantic_decls(
         semantic_decls.push(item);
         return Some(());
     }
+
+    if is_function(current_type)
+        && !current_type.contain_tpl()
+        && semantic_decls.iter().any(|(_, typ)| typ.contain_tpl())
+    {
+        semantic_decls.clear();
+        semantic_decls.push((current_semantic_decl_id.clone(), current_type.clone()));
+        return Some(());
+    }
+
     // semantic_decls 是追溯最初定义的结果, 不包含当前内容
     let current_len = semantic_decls.len();
     if current_len == 0 {

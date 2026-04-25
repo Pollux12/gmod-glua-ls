@@ -624,13 +624,28 @@ fn infer_table_type_doc_function(
                 return infer_doc_function(db, cache, &func, call_expr, args_count);
             }
             LuaType::Signature(signature_id) => {
-                return infer_signature_doc_function(
-                    db,
-                    cache,
-                    signature_id,
-                    call_expr,
-                    args_count,
-                );
+                let signature = db
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .ok_or(InferFailReason::None)?;
+                if !signature.is_resolve_return() {
+                    return Err(InferFailReason::UnResolveSignatureReturn(signature_id));
+                }
+
+                let signature_params = signature.get_type_params();
+                let has_call_self_param = args_count
+                    .is_some_and(|args_count| signature_params.len() == args_count + 1)
+                    || signature_params
+                        .first()
+                        .is_some_and(|(name, _)| name == "_" || name == "self");
+                let operator_func = if has_call_self_param {
+                    signature.to_call_operator_func_type()
+                } else {
+                    signature.to_doc_func_type()
+                };
+                let call_operator_func =
+                    apply_signature_return_kinds_to_function(signature, operator_func.as_ref());
+                return infer_doc_function(db, cache, &call_operator_func, call_expr, args_count);
             }
             _ => {}
         }

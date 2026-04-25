@@ -211,7 +211,7 @@ mod test {
     }
 
     #[test]
-    fn test_generic_direct_candidates_use_common_supertype() {
+    fn test_generic_direct_candidates_use_union() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
             r#"
@@ -234,12 +234,12 @@ mod test {
         );
 
         let animal_ty = ws.expr_ty("animal");
-        let expected = ws.ty("Animal");
+        let expected = ws.ty("Dog|Cat");
         assert_eq!(animal_ty, expected);
     }
 
     #[test]
-    fn test_generic_direct_candidates_preserve_generic_common_supertype() {
+    fn test_generic_direct_candidates_use_union_for_generic_subclasses() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
             r#"
@@ -262,7 +262,7 @@ mod test {
         );
 
         let box_ty = ws.expr_ty("box");
-        let expected = ws.ty("Box<string|number>");
+        let expected = ws.ty("StringBox|NumberBox");
         assert_eq!(box_ty, expected);
     }
 
@@ -296,7 +296,7 @@ mod test {
     }
 
     #[test]
-    fn test_generic_function_return_candidates_use_common_supertype() {
+    fn test_generic_function_return_candidates_use_union() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
             r#"
@@ -321,7 +321,7 @@ mod test {
         );
 
         let animal_ty = ws.expr_ty("animal");
-        let expected = ws.ty("Animal");
+        let expected = ws.ty("Dog|Cat");
         assert_eq!(animal_ty, expected);
     }
 

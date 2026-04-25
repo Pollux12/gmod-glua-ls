@@ -190,7 +190,7 @@ mod test {
         "#,
         );
 
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
             ---@type Holder<string>, NumberHolder

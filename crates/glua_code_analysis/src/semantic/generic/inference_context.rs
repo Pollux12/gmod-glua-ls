@@ -26,6 +26,15 @@ impl InferencePriority {
         )
     }
 
+    pub fn implies_covariant_candidate_combination(self) -> bool {
+        matches!(
+            self,
+            InferencePriority::Direct
+                | InferencePriority::ContextualReturn
+                | InferencePriority::MappedTypeConstraint
+        )
+    }
+
     fn rank(self) -> u16 {
         match self {
             InferencePriority::None | InferencePriority::Direct => 0,

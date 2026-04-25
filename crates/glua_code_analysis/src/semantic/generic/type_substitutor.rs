@@ -393,7 +393,7 @@ impl TypeInferenceInfo {
         let mut inferred = first.clone();
         let combine_candidates = self
             .priority
-            .is_some_and(InferencePriority::implies_candidate_combination);
+            .is_some_and(InferencePriority::implies_covariant_candidate_combination);
         for candidate in rest {
             if combine_candidates {
                 inferred.union_with(candidate.clone());

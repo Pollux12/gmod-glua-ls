@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc, vec};
 use glua_code_analysis::{
     AsyncState, DbIndex, InferGuard, LuaDocReturnInfo, LuaFunctionType, LuaMember, LuaMemberOwner,
     LuaSemanticDeclId, LuaType, RenderLevel, ReturnTypeKind, TypeSubstitutor, VariadicType,
-    humanize_type, infer_call_expr_func, instantiate_doc_function,
+    humanize_type, infer_call_expr_func, instantiate_type_generic,
     try_extract_signature_id_from_field,
 };
 
@@ -137,8 +137,8 @@ fn build_function_define_hover(
         };
 
         if let Some(substitutor) = &builder.substitutor {
-            if let Some(lua_func) = hover_instantiate_function_type(db, &typ, substitutor) {
-                typ = LuaType::DocFunction(lua_func);
+            if let Some(instantiated) = hover_instantiate_function_type(db, &typ, substitutor) {
+                typ = instantiated;
             }
         }
 
@@ -675,19 +675,16 @@ fn hover_instantiate_function_type(
     db: &DbIndex,
     typ: &LuaType,
     substitutor: &TypeSubstitutor,
-) -> Option<Arc<LuaFunctionType>> {
+) -> Option<LuaType> {
     if !typ.contain_tpl() {
         return None;
     }
-    match typ {
-        LuaType::DocFunction(f) => {
-            if let LuaType::DocFunction(f) = instantiate_doc_function(db, f, substitutor) {
-                Some(f)
-            } else {
-                None
-            }
-        }
-        _ => None,
+
+    let instantiated = instantiate_type_generic(db, typ, substitutor);
+    if is_function(&instantiated) {
+        Some(instantiated)
+    } else {
+        None
     }
 }
 

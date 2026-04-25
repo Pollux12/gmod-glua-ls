@@ -1,6 +1,6 @@
 use glua_code_analysis::{
-    GenericTplId, GmodRealm, LuaCompilation, LuaMember, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-    RenderLevel, SemanticModel, TypeSubstitutor,
+    GmodRealm, LuaCompilation, LuaMember, LuaMemberOwner, LuaSemanticDeclId, LuaType, RenderLevel,
+    SemanticModel, TypeSubstitutor,
 };
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaLocalName, LuaLocalStat, LuaSyntaxKind, LuaSyntaxToken,
@@ -407,12 +407,12 @@ pub fn substitutor_form_expr(
         let prefix_type = semantic_model
             .infer_expr(index_expr.get_prefix_expr()?)
             .ok()?;
-        let mut substitutor = TypeSubstitutor::new();
         if let LuaType::Generic(generic) = prefix_type {
-            for (i, param) in generic.get_params().iter().enumerate() {
-                substitutor.insert_type(GenericTplId::Type(i as u32), param.clone(), true);
-            }
-            return Some(substitutor);
+            return Some(TypeSubstitutor::from_type_array_for_type(
+                semantic_model.get_db(),
+                generic.get_base_type_id_ref(),
+                generic.get_params().clone(),
+            ));
         } else {
             return None;
         }

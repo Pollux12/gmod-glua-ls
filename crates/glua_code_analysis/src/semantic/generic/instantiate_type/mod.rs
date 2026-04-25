@@ -74,6 +74,22 @@ pub fn instantiate_type_generic(
     }
 }
 
+pub fn instantiate_type_generic_preserve_unresolved(
+    db: &DbIndex,
+    ty: &LuaType,
+    substitutor: &TypeSubstitutor,
+) -> LuaType {
+    match ty {
+        LuaType::DocFunction(doc_func) => {
+            instantiate_doc_function_with_unresolved(db, doc_func, substitutor)
+        }
+        LuaType::Variadic(variadic) => {
+            instantiate_variadic_type_preserve_unresolved(db, variadic, substitutor)
+        }
+        _ => instantiate_type_generic(db, ty, substitutor),
+    }
+}
+
 fn instantiate_array(db: &DbIndex, base: &LuaType, substitutor: &TypeSubstitutor) -> LuaType {
     let base = instantiate_type_generic(db, base, substitutor);
     LuaType::Array(LuaArrayType::from_base_type(base).into())
@@ -123,6 +139,23 @@ pub fn instantiate_doc_function(
     doc_func: &LuaFunctionType,
     substitutor: &TypeSubstitutor,
 ) -> LuaType {
+    instantiate_doc_function_inner(db, doc_func, substitutor, false)
+}
+
+fn instantiate_doc_function_with_unresolved(
+    db: &DbIndex,
+    doc_func: &LuaFunctionType,
+    substitutor: &TypeSubstitutor,
+) -> LuaType {
+    instantiate_doc_function_inner(db, doc_func, substitutor, true)
+}
+
+fn instantiate_doc_function_inner(
+    db: &DbIndex,
+    doc_func: &LuaFunctionType,
+    substitutor: &TypeSubstitutor,
+    preserve_unresolved: bool,
+) -> LuaType {
     let tpl_func_params = doc_func.get_params();
     let tpl_ret = doc_func.get_ret();
     let async_state = doc_func.get_async_state();
@@ -159,7 +192,7 @@ pub fn instantiate_doc_function(
                                     new_params.push((
                                         "...".to_string(),
                                         Some(LuaType::Variadic(
-                                            VariadicType::Base(LuaType::Any).into(),
+                                            VariadicType::Base(resolved_type.clone()).into(),
                                         )),
                                     ));
                                 }
@@ -176,15 +209,25 @@ pub fn instantiate_doc_function(
                                     }
                                 }
                                 _ => {
-                                    is_variadic = true;
-                                    new_params.push((
-                                        "...".to_string(),
-                                        Some(LuaType::Variadic(
-                                            VariadicType::Base(LuaType::Any).into(),
-                                        )),
-                                    ));
+                                    if preserve_unresolved {
+                                        new_params.push((
+                                            origin_param.0.clone(),
+                                            Some(origin_param_type.clone()),
+                                        ));
+                                    } else {
+                                        is_variadic = true;
+                                        new_params.push((
+                                            "...".to_string(),
+                                            Some(LuaType::Variadic(
+                                                VariadicType::Base(LuaType::Any).into(),
+                                            )),
+                                        ));
+                                    }
                                 }
                             }
+                        } else if preserve_unresolved {
+                            new_params
+                                .push((origin_param.0.clone(), Some(origin_param_type.clone())));
                         }
                     }
                     LuaType::Generic(generic) => {
@@ -206,13 +249,21 @@ pub fn instantiate_doc_function(
                 VariadicType::Multi(_) => (),
             },
             _ => {
-                let new_type = instantiate_type_generic(db, origin_param_type, substitutor);
+                let new_type = if preserve_unresolved {
+                    instantiate_type_generic_preserve_unresolved(db, origin_param_type, substitutor)
+                } else {
+                    instantiate_type_generic(db, origin_param_type, substitutor)
+                };
                 new_params.push((origin_param.0.clone(), Some(new_type)));
             }
         }
     }
 
-    let mut inst_ret_type = instantiate_type_generic(db, tpl_ret, substitutor);
+    let mut inst_ret_type = if preserve_unresolved {
+        instantiate_type_generic_preserve_unresolved(db, tpl_ret, substitutor)
+    } else {
+        instantiate_type_generic(db, tpl_ret, substitutor)
+    };
     // 对于可变返回值, 如果实例化是 tuple, 那么我们将展开 tuple
     if let LuaType::Variadic(_) = &&tpl_ret
         && let LuaType::Tuple(tuple) = &inst_ret_type
@@ -465,6 +516,50 @@ fn instantiate_variadic_type(
     }
 
     LuaType::Variadic(variadic.clone().into())
+}
+
+fn instantiate_variadic_type_preserve_unresolved(
+    db: &DbIndex,
+    variadic: &VariadicType,
+    substitutor: &TypeSubstitutor,
+) -> LuaType {
+    match variadic {
+        VariadicType::Base(base) => match base {
+            LuaType::TplRef(tpl) => match substitutor.get(tpl.get_tpl_id()) {
+                Some(SubstitutorValue::None) | None => {
+                    return LuaType::Variadic(variadic.clone().into());
+                }
+                _ => {}
+            },
+            LuaType::Generic(generic) => {
+                return instantiate_generic(db, generic, substitutor);
+            }
+            _ => {}
+        },
+        VariadicType::Multi(types) => {
+            if types.iter().any(|it| it.contain_tpl()) {
+                let mut new_types = Vec::new();
+                for t in types {
+                    let t = instantiate_type_generic_preserve_unresolved(db, t, substitutor);
+                    match t {
+                        LuaType::Never => {}
+                        LuaType::Variadic(variadic) => match variadic.deref() {
+                            VariadicType::Base(base) => new_types.push(base.clone()),
+                            VariadicType::Multi(multi) => {
+                                for mt in multi {
+                                    new_types.push(mt.clone());
+                                }
+                            }
+                        },
+                        _ => new_types.push(t),
+                    }
+                }
+                return LuaType::Variadic(VariadicType::Multi(new_types).into());
+            }
+        }
+    }
+
+    instantiate_variadic_type(db, variadic, substitutor)
 }
 
 fn instantiate_conditional(
