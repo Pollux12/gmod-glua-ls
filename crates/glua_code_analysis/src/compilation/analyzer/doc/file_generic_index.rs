@@ -149,7 +149,7 @@ impl FileGenericIndex {
             if let Some(params) = self.generic_params.get(*params_id)
                 && let Some((id, param)) = params.params.get(name)
             {
-                let tpl_id = param.tpl_id.unwrap_or_else(|| {
+                let tpl_id = param.tpl_id.unwrap_or({
                     if params.is_func {
                         GenericTplId::Func(*id as u32)
                     } else {
