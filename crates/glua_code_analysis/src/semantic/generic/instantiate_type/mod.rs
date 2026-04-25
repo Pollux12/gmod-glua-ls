@@ -821,8 +821,10 @@ fn collect_infer_from_generic_source(
             infer_guard,
         ),
         LuaType::Union(union) => {
+            let mut matched = false;
+            let mut union_assignments = assignments.clone();
             for member in union.into_vec() {
-                let mut branch_assignments = assignments.clone();
+                let mut branch_assignments = union_assignments.clone();
                 if collect_infer_from_generic_source(
                     db,
                     &member,
@@ -830,11 +832,15 @@ fn collect_infer_from_generic_source(
                     &mut branch_assignments,
                     &infer_guard.fork(),
                 ) {
-                    *assignments = branch_assignments;
-                    return true;
+                    union_assignments = branch_assignments;
+                    matched = true;
                 }
             }
-            false
+
+            if matched {
+                *assignments = union_assignments;
+            }
+            matched
         }
         _ => false,
     }
