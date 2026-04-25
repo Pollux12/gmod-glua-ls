@@ -70,6 +70,65 @@ mod test {
     }
 
     #[test]
+    fn test_generic_callback_variadic_middle_keeps_fixed_suffix() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param cb fun(head: string, ...: T..., tail: boolean)
+            ---@return fun(...: T...)
+            function drop_edges(cb) end
+
+            ---@param head string
+            ---@param amount integer
+            ---@param label string
+            ---@param tail boolean
+            local function source(head, amount, label, tail) end
+
+            callback = drop_edges(source)
+            "#,
+        );
+
+        let callback_ty = ws.expr_ty("callback");
+        let expected = ws.ty("fun(amount: integer, label: string)");
+        assert_eq!(callback_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_call_variadic_middle_keeps_fixed_suffix() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class CollectMiddle
+            ---@overload fun<T>(head: string, ...: T..., tail: boolean): T...
+            local collect_middle = {}
+
+            first, second, third = collect_middle("head", 1, "two", true)
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("first"), ws.ty("integer"));
+        assert_eq!(ws.expr_ty("second"), ws.ty("string"));
+        assert_eq!(ws.expr_ty("third"), ws.ty("nil"));
+    }
+
+    #[test]
+    fn test_generic_call_variadic_middle_continues_into_generic_suffix() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class CollectTail
+            ---@overload fun<T, U>(head: string, ...: T..., tail: U): U
+            local collect_tail = {}
+
+            tail = collect_tail("head", 1, "two", true)
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("tail"), ws.ty("boolean"));
+    }
+
+    #[test]
     fn test_generic_params() {
         let mut ws = VirtualWorkspace::new();
         ws.def(

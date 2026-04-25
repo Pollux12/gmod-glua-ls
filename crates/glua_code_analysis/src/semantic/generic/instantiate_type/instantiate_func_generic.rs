@@ -160,8 +160,14 @@ fn infer_generic_types_from_call(
         || func_params
             .iter()
             .any(|(_, ty)| type_needs_structural_table_arg(db, ty, 0));
+    let mut arg_offset = 0isize;
     for i in 0..func_params.len() {
-        if i >= arg_exprs.len() {
+        let arg_index = i as isize + arg_offset;
+        if arg_index < 0 {
+            continue;
+        }
+        let arg_index = arg_index as usize;
+        if arg_index >= arg_exprs.len() {
             break;
         }
 
@@ -174,14 +180,39 @@ fn infer_generic_types_from_call(
             break;
         }
 
-        let call_arg_expr = &arg_exprs[i];
         if !func_param_type.contain_tpl() {
             continue;
         }
 
-        if !func_param_type.is_variadic()
-            && check_expr_can_later_infer(context, func_param_type, call_arg_expr)?
-        {
+        match func_param_type {
+            LuaType::Variadic(variadic) => {
+                let mut rest_arg_exprs = &arg_exprs[arg_index..];
+                let is_last_param = i + 1 == func_params.len();
+                if !is_last_param {
+                    let suffix_len = func_params.len() - i - 1;
+                    let rest_len = rest_arg_exprs.len().saturating_sub(suffix_len);
+                    rest_arg_exprs = &rest_arg_exprs[..rest_len];
+                    arg_offset += rest_len as isize - 1;
+                }
+
+                let mut arg_types = vec![];
+                for arg_expr in rest_arg_exprs {
+                    let arg_type =
+                        infer_generic_arg_type(db, context, arg_expr, use_inline_table_object)?;
+                    arg_types.push(arg_type);
+                }
+                variadic_tpl_pattern_match(context, variadic, &arg_types)?;
+                if is_last_param {
+                    break;
+                }
+
+                continue;
+            }
+            _ => {}
+        }
+
+        let call_arg_expr = &arg_exprs[arg_index];
+        if check_expr_can_later_infer(context, func_param_type, call_arg_expr)? {
             // 如果参数不能被后续推断, 那么我们先不处理
             unresolve_tpls.push((func_param_type.clone(), call_arg_expr.clone()));
             continue;
@@ -193,18 +224,8 @@ fn infer_generic_types_from_call(
                 Err(InferFailReason::FieldNotFound) => LuaType::Nil, // 对于未找到的字段, 我们认为是 nil 以执行后续推断
                 Err(e) => return Err(e),
             };
-        match (func_param_type, &arg_type) {
-            (LuaType::Variadic(variadic), _) => {
-                let mut arg_types = vec![];
-                for arg_expr in &arg_exprs[i..] {
-                    let arg_type =
-                        infer_generic_arg_type(db, context, arg_expr, use_inline_table_object)?;
-                    arg_types.push(arg_type);
-                }
-                variadic_tpl_pattern_match(context, variadic, &arg_types)?;
-                break;
-            }
-            (_, LuaType::Variadic(variadic)) => {
+        match &arg_type {
+            LuaType::Variadic(variadic) => {
                 let func_param_types = func_params[i..]
                     .iter()
                     .map(|(_, t)| t)
