@@ -109,12 +109,45 @@ mod test {
             function choose(first, second) end
 
             value = choose("name", 1)
+            other = choose("name", "other")
             "#,
         );
 
         let value_ty = ws.expr_ty("value");
         let expected = ws.ty("string|integer");
         assert_eq!(value_ty, expected);
+
+        let other_ty = ws.expr_ty("other");
+        let expected = ws.ty("string");
+        assert_eq!(other_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_literal_widening_keeps_raw_type_for_conditional() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@alias IsName<T> T extends "name" and true or false
+
+            ---@generic T
+            ---@param value T
+            ---@return T
+            function identity(value) end
+
+            ---@generic T
+            ---@param value T
+            ---@return IsName<T>
+            function is_name(value) end
+
+            widened = identity("name")
+            matched = is_name("name")
+            "#,
+        );
+
+        let widened_ty = ws.expr_ty("widened");
+        let matched_ty = ws.expr_ty("matched");
+        assert_eq!(ws.humanize_type(widened_ty), "string");
+        assert_eq!(ws.humanize_type(matched_ty), "true");
     }
 
     #[test]
