@@ -111,6 +111,57 @@ mod test {
     }
 
     #[test]
+    fn test_bare_table_does_not_satisfy_required_structural_members() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+        ---@class Empty
+
+        ---@class Person
+        ---@field name string
+        "#,
+        );
+
+        let table_ty = ws.ty("table");
+
+        let empty_ty = ws.ty("Empty");
+        assert!(ws.check_type(&empty_ty, &table_ty));
+
+        let person_ty = ws.ty("Person");
+        assert!(!ws.check_type(&person_ty, &table_ty));
+
+        let object_ty = ws.ty("{ name: string }");
+        assert!(!ws.check_type(&object_ty, &table_ty));
+
+        let intersection_ty = ws.ty("{ name: string } & { age: integer }");
+        assert!(!ws.check_type(&intersection_ty, &table_ty));
+    }
+
+    #[test]
+    fn test_fresh_table_literal_reports_excess_structural_members() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+        ---@class Person
+        ---@field name string
+        "#,
+        );
+
+        let named_object_ty = ws.ty("{ name: string }");
+        let widened_extra_object_ty = ws.ty("{ name: string, age: integer }");
+        assert!(ws.check_type(&named_object_ty, &widened_extra_object_ty));
+
+        let extra_literal_ty = ws.expr_ty("{ name = 'Ada', age = 1 }");
+        assert!(!ws.check_type(&named_object_ty, &extra_literal_ty));
+
+        let empty_object_ty = ws.ty("{}");
+        assert!(ws.check_type(&empty_object_ty, &extra_literal_ty));
+
+        let person_ty = ws.ty("Person");
+        assert!(!ws.check_type(&person_ty, &extra_literal_ty));
+    }
+
+    #[test]
     fn test_array_types() {
         let mut ws = VirtualWorkspace::new();
 

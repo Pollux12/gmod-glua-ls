@@ -174,6 +174,32 @@ fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {
     }
 }
 
+fn object_index_accepts_member_key(
+    context: &mut TypeCheckContext,
+    source_object: &LuaObjectType,
+    member_key: &LuaMemberKey,
+    check_guard: TypeCheckGuard,
+) -> Result<bool, TypeCheckFailReason> {
+    let Some(member_key_type) = member_key_type_for_index(member_key) else {
+        return Ok(false);
+    };
+
+    for (key_type, _) in source_object.get_index_access() {
+        match check_general_type_compact(
+            context,
+            key_type,
+            &member_key_type,
+            check_guard.next_level()?,
+        ) {
+            Ok(_) => return Ok(true),
+            Err(err) if err.is_type_not_match() => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(false)
+}
+
 fn check_object_type_compact_table_const(
     context: &mut TypeCheckContext,
     source_object: &LuaObjectType,
@@ -209,61 +235,76 @@ fn check_object_type_compact_table_const(
         check_member_value(context, key, None, source_type, &member_type, check_guard)?;
     }
 
-    if source_object.get_index_access().is_empty() {
+    // 检查索引访问字段
+    let members = member_index.get_members(&member_owner).unwrap_or_default();
+    if !source_object.get_index_access().is_empty() {
+        for (key_type, source_type) in source_object.get_index_access() {
+            for member in &members {
+                let member = *member;
+                if source_fields.contains_key(member.get_key()) {
+                    continue;
+                }
+                let Some(member_key_type) = member_key_type_for_index(member.get_key()) else {
+                    continue;
+                };
+
+                let key_match = match check_general_type_compact(
+                    context,
+                    key_type,
+                    &member_key_type,
+                    check_guard.next_level()?,
+                ) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        if err.is_type_not_match() {
+                            false
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                };
+
+                if !key_match {
+                    continue;
+                }
+
+                let member_type = match context
+                    .db
+                    .get_type_index()
+                    .get_type_cache(&member.get_id().into())
+                {
+                    Some(cache) => cache.as_type(),
+                    None => continue,
+                };
+
+                check_member_value(
+                    context,
+                    member.get_key(),
+                    Some(&member_key_type),
+                    source_type,
+                    member_type,
+                    check_guard,
+                )?;
+                break;
+            }
+        }
+    }
+
+    if source_fields.is_empty() && source_object.get_index_access().is_empty() {
         return Ok(());
     }
 
-    // 检查索引访问字段
-    let members = member_index.get_members(&member_owner).unwrap_or_default();
-    for (key_type, source_type) in source_object.get_index_access() {
-        for member in &members {
-            let member = *member;
-            if source_fields.contains_key(member.get_key()) {
-                continue;
-            }
-            let Some(member_key_type) = member_key_type_for_index(member.get_key()) else {
-                continue;
-            };
-
-            let key_match = match check_general_type_compact(
-                context,
-                key_type,
-                &member_key_type,
-                check_guard.next_level()?,
-            ) {
-                Ok(_) => true,
-                Err(err) => {
-                    if err.is_type_not_match() {
-                        false
-                    } else {
-                        return Err(err);
-                    }
-                }
-            };
-
-            if !key_match {
-                continue;
-            }
-
-            let member_type = match context
-                .db
-                .get_type_index()
-                .get_type_cache(&member.get_id().into())
-            {
-                Some(cache) => cache.as_type(),
-                None => continue,
-            };
-
-            check_member_value(
-                context,
-                member.get_key(),
-                Some(&member_key_type),
-                source_type,
-                member_type,
-                check_guard,
-            )?;
-            break;
+    for member in members {
+        if source_fields.contains_key(member.get_key()) {
+            continue;
         }
+        if object_index_accepts_member_key(context, source_object, member.get_key(), check_guard)? {
+            continue;
+        }
+
+        return Err(TypeCheckFailReason::TypeNotMatchWithReason(
+            t!("unknown member %{key}", key = member.get_key().to_path()).to_string(),
+        ));
     }
 
     Ok(())

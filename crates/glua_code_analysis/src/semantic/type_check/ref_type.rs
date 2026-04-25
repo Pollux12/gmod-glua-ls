@@ -268,7 +268,8 @@ fn check_ref_type_compact_table(
         return Ok(()); // empty member donot need check
     };
 
-    for source_member in source_type_members {
+    for source_member in &source_type_members {
+        let source_member = *source_member;
         if !is_required_structural_member(Some(source_member.get_feature())) {
             continue;
         }
@@ -352,7 +353,63 @@ fn check_ref_type_compact_table(
         }
     }
 
+    if let Some(all_source_members) = find_members(context.db, &LuaType::Ref(source_type_id.clone()))
+        && !all_source_members.is_empty()
+    {
+        for table_key in table_member_map.keys() {
+            if all_source_members
+                .iter()
+                .any(|source_member| &source_member.key == table_key)
+            {
+                continue;
+            }
+
+            let Some(table_key_type) = member_key_type_for_index(table_key) else {
+                continue;
+            };
+            let mut accepted_by_index = false;
+            for source_member in &all_source_members {
+                let LuaMemberKey::ExprType(index_key_type) = &source_member.key else {
+                    continue;
+                };
+                match check_general_type_compact(
+                    context,
+                    index_key_type,
+                    &table_key_type,
+                    check_guard.next_level()?,
+                ) {
+                    Ok(_) => {
+                        accepted_by_index = true;
+                        break;
+                    }
+                    Err(err) if err.is_type_not_match() => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            if accepted_by_index {
+                continue;
+            }
+
+            if !context.detail {
+                return Err(TypeCheckFailReason::TypeNotMatch);
+            }
+
+            return Err(TypeCheckFailReason::TypeNotMatchWithReason(
+                t!("unknown member %{name}, in table", name = table_key.to_path()).to_string(),
+            ));
+        }
+    }
+
     Ok(())
+}
+
+fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {
+    match member_key {
+        LuaMemberKey::Integer(i) => Some(LuaType::IntegerConst(*i)),
+        LuaMemberKey::Name(name) => Some(LuaType::StringConst(name.clone().into())),
+        LuaMemberKey::ExprType(typ) => Some(typ.clone()),
+        LuaMemberKey::None => None,
+    }
 }
 
 fn check_ref_type_compact_object(

@@ -15,12 +15,24 @@ pub fn check_intersection_type_compact(
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
     match compact_type {
-        LuaType::TableConst(range) => check_intersection_type_compact_table(
-            context,
-            source_intersection,
-            LuaMemberOwner::Element(range.clone()),
-            check_guard.next_level()?,
-        ),
+        LuaType::TableConst(range) => {
+            if let Some(object_type) = intersection_to_object(context.db, source_intersection) {
+                let object_type = LuaType::Object(Arc::new(object_type));
+                check_general_type_compact(
+                    context,
+                    &object_type,
+                    compact_type,
+                    check_guard.next_level()?,
+                )
+            } else {
+                check_intersection_type_compact_table(
+                    context,
+                    source_intersection,
+                    LuaMemberOwner::Element(range.clone()),
+                    check_guard.next_level()?,
+                )
+            }
+        }
         LuaType::Def(_) | LuaType::Ref(_) => {
             if let Some(object_type) = intersection_to_object(context.db, source_intersection) {
                 let object_type = LuaType::Object(Arc::new(object_type));
