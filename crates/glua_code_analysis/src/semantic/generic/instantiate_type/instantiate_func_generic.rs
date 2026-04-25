@@ -16,7 +16,7 @@ use crate::{
     semantic::{
         LuaInferCache,
         generic::{
-            instantiate_type::instantiate_doc_function,
+            instantiate_type::{instantiate_doc_function, instantiate_type_generic},
             tpl_context::TplContext,
             tpl_pattern::{
                 multi_param_tpl_pattern_match_multi_return, tpl_pattern_match,
@@ -229,6 +229,11 @@ fn infer_generic_types_from_call(
 
     if !context.substitutor.is_infer_all_tpl() {
         for (func_param_type, call_arg_expr) in unresolve_tpls {
+            let func_param_type = if matches!(call_arg_expr, LuaExpr::ClosureExpr(_)) {
+                instantiate_type_generic(db, &func_param_type, context.substitutor)
+            } else {
+                func_param_type
+            };
             let closure_type =
                 infer_generic_arg_type(db, context, &call_arg_expr, use_inline_table_object)?;
 

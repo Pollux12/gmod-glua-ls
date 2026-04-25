@@ -502,6 +502,201 @@ mod test {
     }
 
     #[test]
+    fn test_generic_receiver_method_return_context_flows_into_callback_param() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class WrappedArray<T>
+            ---@field map fun<U>(self: WrappedArray<T>, cb: fun(value: T): U): WrappedArray<U>
+
+            ---@type WrappedArray<string>
+            local array = {}
+
+            ---@type WrappedArray<number>
+            local mapped = array:map(function(value)
+                receiver_seen = value
+                return 1
+            end)
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("WrappedArray<number>");
+        assert_eq!(call_ty, expected);
+
+        let seen_ty = ws.expr_ty("receiver_seen");
+        assert_eq!(seen_ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_generic_combinator_uses_first_arg_to_type_callback_params() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Collection<T, U>
+            local Collection = {}
+
+            ---@generic T, U, V
+            ---@param c Collection<T, U>
+            ---@param cb fun(x: T, y: U): V
+            ---@return Collection<T, V>
+            function map(c, cb)
+            end
+
+            ---@type Collection<number, string>
+            local collection = {}
+
+            local result = map(collection, function(x, y)
+                combinator_x = x
+                combinator_y = y
+                return y
+            end)
+            "#,
+        );
+
+        let tree = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("Tree must exist");
+        let call_expr = tree
+            .get_chunk_node()
+            .descendants::<LuaCallExpr>()
+            .last()
+            .expect("call expression must exist");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        assert_eq!(call_ty, ws.ty("Collection<number, string>"));
+
+        let x_ty = ws.expr_ty("combinator_x");
+        let y_ty = ws.expr_ty("combinator_y");
+        assert_eq!(x_ty, ws.ty("number"));
+        assert_eq!(y_ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_generic_field_combinator_uses_first_arg_to_type_callback_params() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Collection<T, U>
+            local Collection = {}
+
+            ---@class Combinators
+            ---@field map fun<T, U, V>(c: Collection<T, U>, cb: fun(x: T, y: U): V): Collection<T, V>
+
+            ---@type Combinators
+            local combinators = {}
+
+            ---@type Collection<number, string>
+            local collection = {}
+
+            local result = combinators.map(collection, function(x, y)
+                field_combinator_x = x
+                field_combinator_y = y
+                return y
+            end)
+            "#,
+        );
+
+        let tree = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("Tree must exist");
+        let call_expr = tree
+            .get_chunk_node()
+            .descendants::<LuaCallExpr>()
+            .last()
+            .expect("call expression must exist");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        assert_eq!(call_ty, ws.ty("Collection<number, string>"));
+
+        let x_ty = ws.expr_ty("field_combinator_x");
+        let y_ty = ws.expr_ty("field_combinator_y");
+        assert_eq!(x_ty, ws.ty("number"));
+        assert_eq!(y_ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_generic_field_combinator_prefers_specific_overload() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Collection<T, U>
+            local Collection = {}
+
+            ---@class Combinators
+            ---@field map (fun<T, U, V>(c: Collection<T, U>, cb: fun(x: T, y: U): V): Collection<T, V>) | (fun<T, U>(c: Collection<T, U>, cb: fun(x: T, y: U): any): Collection<any, any>)
+
+            ---@type Combinators
+            local combinators = {}
+
+            ---@type Collection<number, string>
+            local collection = {}
+
+            local result = combinators.map(collection, function(x, y)
+                overloaded_combinator_x = x
+                overloaded_combinator_y = y
+                return y
+            end)
+            "#,
+        );
+
+        let tree = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("Tree must exist");
+        let call_expr = tree
+            .get_chunk_node()
+            .descendants::<LuaCallExpr>()
+            .last()
+            .expect("call expression must exist");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        assert_eq!(call_ty, ws.ty("Collection<number, string>"));
+
+        let x_ty = ws.expr_ty("overloaded_combinator_x");
+        let y_ty = ws.expr_ty("overloaded_combinator_y");
+        assert_eq!(x_ty, ws.ty("number"));
+        assert_eq!(y_ty, ws.ty("string"));
+    }
+
+    #[test]
     fn test_issue_646() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
