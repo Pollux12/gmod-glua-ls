@@ -590,6 +590,31 @@ mod test {
     }
 
     #[test]
+    fn test_conditional_infer_combines_repeated_candidates() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Pair<A, B>
+            ---@alias InferPair<T> T extends Pair<infer U, infer U> and U or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return InferPair<T>
+            function infer_pair(value) end
+
+            ---@type Pair<string, number>
+            local pair
+
+            value = infer_pair(pair)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "(string|number)");
+    }
+
+    #[test]
     fn test_generic_identity_table_literal_still_allows_later_field_inference() {
         let mut ws = VirtualWorkspace::new();
 

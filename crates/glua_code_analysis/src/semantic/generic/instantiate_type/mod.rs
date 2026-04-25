@@ -17,7 +17,7 @@ use crate::{
     semantic::type_check::{TypeCheckCheckLevel, check_type_compact_with_level},
 };
 
-use super::type_substitutor::{SubstitutorValue, TypeSubstitutor};
+use super::type_substitutor::{SubstitutorValue, TypeSubstitutor, union_candidate_type};
 use crate::TypeVisitTrait;
 use crate::semantic::member::find_members_with_key;
 pub use instantiate_func_generic::{build_self_type, infer_self_type, instantiate_func_generic};
@@ -1144,7 +1144,9 @@ fn insert_infer_assignment(
     ty: &LuaType,
 ) -> bool {
     if let Some(existing) = assignments.get(name) {
-        existing == ty
+        let inferred = union_candidate_type(existing.clone(), ty.clone());
+        assignments.insert(name.to_string(), inferred);
+        true
     } else {
         assignments.insert(name.to_string(), ty.clone());
         true

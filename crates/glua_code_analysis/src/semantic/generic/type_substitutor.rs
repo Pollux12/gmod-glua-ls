@@ -325,7 +325,7 @@ fn into_ref_type(ty: LuaType) -> LuaType {
     }
 }
 
-fn union_candidate_type(left: LuaType, right: LuaType) -> LuaType {
+pub(super) fn union_candidate_type(left: LuaType, right: LuaType) -> LuaType {
     if left == right {
         return left;
     }
