@@ -1285,6 +1285,104 @@ mod test {
     }
 
     #[test]
+    fn test_reverse_mapped_infer_from_reducer_table_variable() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Action
+            ---@field type string
+
+            ---@alias Reducer<S> fun(state: S, action: Action): S
+            ---@alias Reducers<S> { [K in keyof S]: Reducer<S[K]>; }
+
+            ---@generic S
+            ---@param reducers Reducers<S>
+            ---@return Reducer<S>
+            function combine_reducers(reducers) end
+
+            ---@param state string
+            ---@param action Action
+            ---@return string
+            local function name(state, action)
+                return "dummy"
+            end
+
+            local reducers = {
+                name = name,
+            }
+
+            local reducer = combine_reducers(reducers)
+            result = reducer(nil, nil).name
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        assert_eq!(ws.humanize_type(result_ty), "string");
+    }
+
+    #[test]
+    fn test_reverse_mapped_infer_with_rawget_alias() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@alias std.RawGet<T, K> unknown
+            ---@alias RawMirror<T> { [K in keyof T]: std.RawGet<T, K>; }
+
+            ---@generic T
+            ---@param values RawMirror<T>
+            ---@return T
+            function raw_unmirror(values) end
+
+            result = raw_unmirror({
+                name = "Ada",
+                age = 42,
+            })
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        let age_ty = ws.expr_ty("result.age");
+        assert_eq!(ws.humanize_type(name_ty), "\"Ada\"");
+        assert_eq!(ws.humanize_type(age_ty), "42");
+    }
+
+    #[test]
+    fn test_reverse_mapped_infer_through_generic_wrapper() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@field value T
+
+            ---@alias Boxified<T> { [K in keyof T]: Box<T[K]>; }
+
+            ---@generic T
+            ---@param value T
+            ---@return Box<T>
+            function box(value) end
+
+            ---@generic T
+            ---@param obj Boxified<T>
+            ---@return T
+            function unboxify(obj) end
+
+            result = unboxify({
+                is_perfect = box(true),
+                weight = box(42),
+            })
+            "#,
+        );
+
+        let is_perfect_ty = ws.expr_ty("result.is_perfect");
+        let weight_ty = ws.expr_ty("result.weight");
+        assert_eq!(ws.humanize_type(is_perfect_ty), "boolean");
+        assert_eq!(ws.humanize_type(weight_ty), "integer");
+    }
+
+    #[test]
     fn test_mapped_inference_is_lower_priority_than_direct_inference() {
         let mut ws = VirtualWorkspace::new();
 
