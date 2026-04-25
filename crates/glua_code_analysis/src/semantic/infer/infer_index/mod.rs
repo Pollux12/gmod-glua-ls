@@ -764,21 +764,28 @@ fn infer_generic_member(
     let base_type = generic_type.get_base_type();
 
     let generic_params = generic_type.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
+    let substitutor = if let LuaType::Ref(base_type_decl_id) = &base_type {
+        TypeSubstitutor::from_type_decl(db, generic_params.clone(), base_type_decl_id.clone())
+    } else {
+        TypeSubstitutor::from_type_array(generic_params.clone())
+    };
 
     if let LuaType::Ref(base_type_decl_id) = &base_type {
         let type_index = db.get_type_index();
         if let Some(type_decl) = type_index.get_type_decl(base_type_decl_id)
             && type_decl.is_alias()
-            && let Some(origin_type) = type_decl.get_alias_origin(db, Some(&substitutor))
         {
-            return infer_member_by_member_key(
-                db,
-                cache,
-                &origin_type,
-                index_expr,
-                &infer_guard.fork(),
-            );
+            let alias_substitutor =
+                TypeSubstitutor::from_alias(db, generic_params.clone(), base_type_decl_id.clone());
+            if let Some(origin_type) = type_decl.get_alias_origin(db, Some(&alias_substitutor)) {
+                return infer_member_by_member_key(
+                    db,
+                    cache,
+                    &origin_type,
+                    index_expr,
+                    &infer_guard.fork(),
+                );
+            }
         }
 
         let result = infer_generic_members_from_super_generics(
@@ -1135,12 +1142,15 @@ fn infer_member_by_index_generic(
         return Err(InferFailReason::None);
     };
     let generic_params = generic.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
+    let substitutor =
+        TypeSubstitutor::from_type_decl(db, generic_params.clone(), type_decl_id.clone());
     let type_index = db.get_type_index();
     let type_decl = type_index
         .get_type_decl(&type_decl_id)
         .ok_or(InferFailReason::None)?;
     if type_decl.is_alias() {
+        let substitutor =
+            TypeSubstitutor::from_alias(db, generic_params.clone(), type_decl_id.clone());
         if let Some(origin_type) = type_decl.get_alias_origin(db, Some(&substitutor)) {
             return infer_member_by_operator(
                 db,

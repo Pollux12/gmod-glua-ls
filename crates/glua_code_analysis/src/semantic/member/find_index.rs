@@ -308,13 +308,16 @@ fn find_index_generic(
     };
 
     let generic_params = generic.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
+    let substitutor =
+        TypeSubstitutor::from_type_decl(db, generic_params.clone(), type_decl_id.clone());
     let type_index = db.get_type_index();
     let type_decl = type_index.get_type_decl(&type_decl_id)?;
 
     if type_decl.is_alias() {
-        if let Some(origin_type) = type_decl.get_alias_origin(db, Some(&substitutor)) {
-            let instantiated_type = instantiate_type_generic(db, &origin_type, &substitutor);
+        let alias_substitutor =
+            TypeSubstitutor::from_alias(db, generic_params.clone(), type_decl_id.clone());
+        if let Some(origin_type) = type_decl.get_alias_origin(db, Some(&alias_substitutor)) {
+            let instantiated_type = instantiate_type_generic(db, &origin_type, &alias_substitutor);
             return find_index_operations_guard(db, &instantiated_type, infer_guard);
         }
         return None;

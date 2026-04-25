@@ -552,7 +552,8 @@ fn humanize_generic_type(db: &DbIndex, generic: &LuaGenericType, level: RenderLe
         RenderLevel::Documentation | RenderLevel::CustomDetailed(_) | RenderLevel::Detailed
     ) && type_decl.is_alias()
     {
-        let substituor = TypeSubstitutor::from_type_array(generic.get_params().clone());
+        let substituor =
+            TypeSubstitutor::from_alias(db, generic.get_params().clone(), base_id.clone());
         if let Some(origin_type) = type_decl.get_alias_origin(db, Some(&substituor)) {
             // prevent infinite recursion
             let origin_type_str = humanize_type(db, &origin_type, level.next_level());

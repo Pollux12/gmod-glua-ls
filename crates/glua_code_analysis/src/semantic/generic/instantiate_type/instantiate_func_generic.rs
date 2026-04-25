@@ -1,13 +1,17 @@
-use std::{collections::HashSet, ops::Deref, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Deref,
+    sync::Arc,
+};
 
 use glua_parser::{LuaAstNode, LuaDocTypeList};
-use glua_parser::{LuaCallExpr, LuaExpr};
+use glua_parser::{LuaCallExpr, LuaExpr, LuaIndexKey, LuaTableExpr, NumberResult};
 use internment::ArcIntern;
 
 use crate::{
     DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaFunctionType, LuaGenericType,
-    TypeVisitTrait,
-    db_index::{DbIndex, LuaType},
+    TypeVisitTrait, VariadicType,
+    db_index::{DbIndex, LuaMemberKey, LuaObjectType, LuaType},
     infer_doc_type,
     semantic::{
         LuaInferCache,
@@ -15,7 +19,7 @@ use crate::{
             instantiate_type::instantiate_doc_function,
             tpl_context::TplContext,
             tpl_pattern::{
-                multi_param_tpl_pattern_match_multi_return, tpl_pattern_match,
+                escape_alias, multi_param_tpl_pattern_match_multi_return, tpl_pattern_match,
                 variadic_tpl_pattern_match,
             },
         },
@@ -161,19 +165,19 @@ fn infer_generic_types_from_call(
             continue;
         }
 
-        let arg_type = match infer_expr(db, context.cache, call_arg_expr.clone()) {
+        let arg_type = match infer_generic_arg_type(db, context.cache, call_arg_expr.clone()) {
             Ok(t) => t,
-            Err(InferFailReason::FieldNotFound) => LuaType::Nil, // 对于未找到的字段, 我们认为是 nil 以执行后续推断
+            Err(InferFailReason::FieldNotFound) => GenericArgType::from_raw(LuaType::Nil), // 对于未找到的字段, 我们认为是 nil 以执行后续推断
             Err(e) => return Err(e),
         };
-        match (func_param_type, &arg_type) {
+        match (func_param_type, &arg_type.raw) {
             (LuaType::Variadic(variadic), _) => {
                 let mut arg_types = vec![];
                 for arg_expr in &arg_exprs[i..] {
-                    let arg_type = infer_expr(db, context.cache, arg_expr.clone())?;
+                    let arg_type = infer_generic_arg_type(db, context.cache, arg_expr.clone())?;
                     arg_types.push(arg_type);
                 }
-                variadic_tpl_pattern_match(context, variadic, &arg_types)?;
+                variadic_tpl_pattern_match_generic_args(context, variadic, &arg_types)?;
                 break;
             }
             (_, LuaType::Variadic(variadic)) => {
@@ -186,7 +190,7 @@ fn infer_generic_types_from_call(
                 break;
             }
             _ => {
-                tpl_pattern_match(context, func_param_type, &arg_type)?;
+                tpl_pattern_match_generic_arg(context, func_param_type, &arg_type)?;
             }
         }
     }
@@ -200,6 +204,213 @@ fn infer_generic_types_from_call(
     }
 
     Ok(())
+}
+
+fn infer_generic_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+) -> Result<GenericArgType, InferFailReason> {
+    let raw = infer_expr(db, cache, expr.clone())?;
+    let structural = if let LuaExpr::TableExpr(table) = &expr
+        && table.is_object()
+    {
+        Some(infer_object_table_arg_type(db, cache, table.clone())?)
+    } else {
+        None
+    };
+
+    Ok(GenericArgType { raw, structural })
+}
+
+struct GenericArgType {
+    raw: LuaType,
+    structural: Option<LuaType>,
+}
+
+impl GenericArgType {
+    fn from_raw(raw: LuaType) -> Self {
+        Self {
+            raw,
+            structural: None,
+        }
+    }
+
+    fn match_type(&self) -> &LuaType {
+        self.structural.as_ref().unwrap_or(&self.raw)
+    }
+}
+
+fn tpl_pattern_match_generic_arg(
+    context: &mut TplContext,
+    pattern: &LuaType,
+    target: &GenericArgType,
+) -> Result<(), InferFailReason> {
+    if !pattern.contain_tpl() {
+        return Ok(());
+    }
+
+    match pattern {
+        LuaType::TplRef(tpl) if tpl.get_tpl_id().is_func() => {
+            insert_generic_arg(context, tpl.get_tpl_id(), target, true);
+        }
+        LuaType::ConstTplRef(tpl) if tpl.get_tpl_id().is_func() => {
+            insert_generic_arg(context, tpl.get_tpl_id(), target, false);
+        }
+        LuaType::Union(union) => {
+            let union_types = union.into_vec();
+            let mut error_count = 0;
+            let mut last_error = InferFailReason::None;
+            for union_type in &union_types {
+                match tpl_pattern_match_generic_arg(context, union_type, target) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error_count += 1;
+                        last_error = e;
+                    }
+                }
+            }
+
+            if error_count == union_types.len() {
+                return Err(last_error);
+            }
+        }
+        _ => tpl_pattern_match(context, pattern, target.match_type())?,
+    }
+
+    Ok(())
+}
+
+fn variadic_tpl_pattern_match_generic_args(
+    context: &mut TplContext,
+    tpl: &VariadicType,
+    target_rest_types: &[GenericArgType],
+) -> Result<(), InferFailReason> {
+    let raw_target_types = || {
+        target_rest_types
+            .iter()
+            .map(|target| target.raw.clone())
+            .collect::<Vec<_>>()
+    };
+
+    match tpl {
+        VariadicType::Base(base) => match base {
+            LuaType::TplRef(tpl_ref) => match target_rest_types {
+                [] => {
+                    context
+                        .substitutor
+                        .insert_type(tpl_ref.get_tpl_id(), LuaType::Nil, true);
+                }
+                [target] if !matches!(target.raw, LuaType::Variadic(_)) => {
+                    insert_generic_arg(context, tpl_ref.get_tpl_id(), target, true);
+                }
+                _ => variadic_tpl_pattern_match(context, tpl, &raw_target_types())?,
+            },
+            LuaType::ConstTplRef(tpl_ref) => match target_rest_types {
+                [] => {
+                    context
+                        .substitutor
+                        .insert_type(tpl_ref.get_tpl_id(), LuaType::Nil, false);
+                }
+                [target] if !matches!(target.raw, LuaType::Variadic(_)) => {
+                    insert_generic_arg(context, tpl_ref.get_tpl_id(), target, false);
+                }
+                _ => variadic_tpl_pattern_match(context, tpl, &raw_target_types())?,
+            },
+            _ => variadic_tpl_pattern_match(context, tpl, &raw_target_types())?,
+        },
+        VariadicType::Multi(multi) => {
+            for (i, ret_type) in multi.iter().enumerate() {
+                match ret_type {
+                    LuaType::Variadic(inner) => {
+                        if i < target_rest_types.len() {
+                            variadic_tpl_pattern_match_generic_args(
+                                context,
+                                inner,
+                                &target_rest_types[i..],
+                            )?;
+                        }
+
+                        break;
+                    }
+                    _ => {
+                        let Some(target) = target_rest_types.get(i) else {
+                            break;
+                        };
+                        tpl_pattern_match_generic_arg(context, ret_type, target)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn insert_generic_arg(
+    context: &mut TplContext,
+    tpl_id: GenericTplId,
+    target: &GenericArgType,
+    decay: bool,
+) {
+    let raw = escape_alias(context.db, &target.raw);
+    if let Some(structural) = &target.structural {
+        context
+            .substitutor
+            .insert_type_with_structural(tpl_id, raw, structural.clone(), decay);
+    } else {
+        context.substitutor.insert_type(tpl_id, raw, decay);
+    }
+}
+
+fn infer_object_table_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table: LuaTableExpr,
+) -> Result<LuaType, InferFailReason> {
+    // Structural inference is a best-effort sidecar; the raw TableConst remains authoritative.
+    let mut fields = HashMap::new();
+
+    for field in table.get_fields() {
+        let Some(field_key) = field.get_field_key() else {
+            continue;
+        };
+        let member_key = match field_key {
+            LuaIndexKey::Name(name) => LuaMemberKey::Name(name.get_name_text().into()),
+            LuaIndexKey::String(str) => LuaMemberKey::Name(str.get_value().into()),
+            LuaIndexKey::Integer(i) => match i.get_number_value() {
+                NumberResult::Int(idx) => LuaMemberKey::Integer(idx),
+                _ => continue,
+            },
+            LuaIndexKey::Idx(idx) => LuaMemberKey::Integer(idx as i64),
+            LuaIndexKey::Expr(expr) => match infer_expr(db, cache, expr) {
+                Ok(LuaType::StringConst(s) | LuaType::DocStringConst(s)) => {
+                    LuaMemberKey::Name((*s).clone())
+                }
+                Ok(LuaType::IntegerConst(i) | LuaType::DocIntegerConst(i)) => {
+                    LuaMemberKey::Integer(i)
+                }
+                Ok(typ) => LuaMemberKey::ExprType(typ),
+                Err(InferFailReason::FieldNotFound) => continue,
+                Err(reason) => return Err(reason),
+            },
+        };
+
+        let Some(value_expr) = field.get_value_expr() else {
+            continue;
+        };
+        let value_type = match infer_expr(db, cache, value_expr) {
+            Ok(LuaType::Def(ref_id)) => LuaType::Ref(ref_id),
+            Ok(other) => other,
+            Err(InferFailReason::FieldNotFound) => LuaType::Unknown,
+            Err(reason) => return Err(reason),
+        };
+        fields.insert(member_key, value_type);
+    }
+
+    Ok(LuaType::Object(
+        LuaObjectType::new_with_fields(fields, Vec::new()).into(),
+    ))
 }
 
 pub fn build_self_type(db: &DbIndex, self_type: &LuaType) -> LuaType {

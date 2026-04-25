@@ -451,13 +451,14 @@ fn infer_generic_type_doc_function(
     let type_id = generic.get_base_type_id();
     infer_guard.check(&type_id)?;
     let generic_params = generic.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
+    let substitutor = TypeSubstitutor::from_type_decl(db, generic_params.clone(), type_id.clone());
 
     let type_decl = db
         .get_type_index()
         .get_type_decl(&type_id)
         .ok_or_else(|| InferFailReason::UnResolveTypeDecl(type_id.clone()))?;
     if type_decl.is_alias() {
+        let substitutor = TypeSubstitutor::from_alias(db, generic_params.clone(), type_id.clone());
         let origin_type = type_decl
             .get_alias_origin(db, Some(&substitutor))
             .ok_or(InferFailReason::None)?;

@@ -43,7 +43,9 @@ pub fn instantiate_alias_call(
                 return LuaType::Unknown;
             }
 
-            let members = get_keyof_members(db, &operands[0]).unwrap_or_default();
+            let owner = resolve_structural_operand(operand_exprs.first(), substitutor)
+                .unwrap_or_else(|| operands[0].clone());
+            let members = get_keyof_members(db, &owner).unwrap_or_default();
             let member_key_types = members
                 .iter()
                 .filter_map(|m| match &m.key {
@@ -76,20 +78,24 @@ pub fn instantiate_alias_call(
                 return LuaType::Unknown;
             }
 
+            let owner = resolve_structural_operand(operand_exprs.first(), substitutor)
+                .unwrap_or_else(|| operands[0].clone());
             let key = resolve_literal_operand(operand_exprs.get(1), substitutor)
                 .unwrap_or_else(|| operands[1].clone());
 
-            instantiate_rawget_call(db, &operands[0], &key)
+            instantiate_rawget_call(db, &owner, &key)
         }
         LuaAliasCallKind::Index => {
             if operands.len() != 2 {
                 return LuaType::Unknown;
             }
 
+            let owner = resolve_structural_operand(operand_exprs.first(), substitutor)
+                .unwrap_or_else(|| operands[0].clone());
             let key = resolve_literal_operand(operand_exprs.get(1), substitutor)
                 .unwrap_or_else(|| operands[1].clone());
 
-            instantiate_index_call(db, &operands[0], &key)
+            instantiate_index_call(db, &owner, &key)
         }
         LuaAliasCallKind::Merge => instantiate_merge_call(db, &operands),
     }
@@ -131,6 +137,18 @@ fn resolve_literal_operand(
     match operand {
         Some(LuaType::TplRef(tpl_ref)) | Some(LuaType::ConstTplRef(tpl_ref)) => {
             substitutor.get_raw_type(tpl_ref.get_tpl_id()).cloned()
+        }
+        _ => None,
+    }
+}
+
+fn resolve_structural_operand(
+    operand: Option<&LuaType>,
+    substitutor: &TypeSubstitutor,
+) -> Option<LuaType> {
+    match operand {
+        Some(LuaType::TplRef(tpl_ref)) | Some(LuaType::ConstTplRef(tpl_ref)) => {
+            substitutor.get_structural_type(tpl_ref.get_tpl_id()).cloned()
         }
         _ => None,
     }

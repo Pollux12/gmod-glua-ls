@@ -275,14 +275,19 @@ fn infer_generic_raw_member_type(
 ) -> RawGetMemberTypeResult {
     let base_ref_id = generic_type.get_base_type_id_ref();
     let generic_params = generic_type.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
+    let substitutor =
+        TypeSubstitutor::from_type_decl(db, generic_params.clone(), base_ref_id.clone());
     let type_decl = db
         .get_type_index()
         .get_type_decl(&base_ref_id)
         .ok_or(InferFailReason::None)?;
 
-    if let Some(origin) = type_decl.get_alias_origin(db, Some(&substitutor)) {
-        return infer_raw_member_type(db, &origin, member_key);
+    if type_decl.is_alias() {
+        let alias_substitutor =
+            TypeSubstitutor::from_alias(db, generic_params.clone(), base_ref_id.clone());
+        if let Some(origin) = type_decl.get_alias_origin(db, Some(&alias_substitutor)) {
+            return infer_raw_member_type(db, &origin, member_key);
+        }
     }
 
     let base_ref_type = LuaType::Ref(base_ref_id.clone());

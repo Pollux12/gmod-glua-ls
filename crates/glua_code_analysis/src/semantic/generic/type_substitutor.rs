@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::tpl_pattern::constant_decay;
-use crate::{GenericTplId, LuaType, LuaTypeDeclId};
+use crate::{DbIndex, GenericTplId, LuaType, LuaTypeDeclId};
 
 #[derive(Debug, Clone)]
 pub struct TypeSubstitutor {
@@ -40,17 +40,73 @@ impl TypeSubstitutor {
         }
     }
 
-    pub fn from_alias(type_array: Vec<LuaType>, alias_type_id: LuaTypeDeclId) -> Self {
+    pub fn from_type_decl(
+        db: &DbIndex,
+        type_array: Vec<LuaType>,
+        type_decl_id: LuaTypeDeclId,
+    ) -> Self {
+        let type_array = type_array.into_iter().map(|ty| (ty, None)).collect();
+        Self::from_decl_generic_params(db, type_array, type_decl_id, None)
+    }
+
+    pub fn from_alias(
+        db: &DbIndex,
+        type_array: Vec<LuaType>,
+        alias_type_id: LuaTypeDeclId,
+    ) -> Self {
+        let type_array = type_array.into_iter().map(|ty| (ty, None)).collect();
+        Self::from_decl_generic_params(db, type_array, alias_type_id.clone(), Some(alias_type_id))
+    }
+
+    pub fn from_alias_with_structural(
+        db: &DbIndex,
+        type_array: Vec<(LuaType, Option<LuaType>)>,
+        alias_type_id: LuaTypeDeclId,
+    ) -> Self {
+        Self::from_decl_generic_params(db, type_array, alias_type_id.clone(), Some(alias_type_id))
+    }
+
+    fn from_decl_generic_params(
+        db: &DbIndex,
+        type_array: Vec<(LuaType, Option<LuaType>)>,
+        type_decl_id: LuaTypeDeclId,
+        alias_type_id: Option<LuaTypeDeclId>,
+    ) -> Self {
         let mut tpl_replace_map = HashMap::new();
-        for (i, ty) in type_array.into_iter().enumerate() {
-            tpl_replace_map.insert(
-                GenericTplId::Type(i as u32),
-                SubstitutorValue::Type(SubstitutorTypeValue::new(ty, true)),
-            );
+        // Prefer the declaration's stored template ids over positional Type(0),
+        // Type(1), ... ids. Alias generics can be declared inside another
+        // generic scope, so positional ids alone may accidentally substitute an
+        // outer or shadowed template that happens to share the same index.
+        let decl_tpl_ids = db
+            .get_type_index()
+            .get_generic_params(&type_decl_id)
+            .and_then(|generic_params| {
+                let mut tpl_ids = Vec::with_capacity(type_array.len());
+                for param in generic_params.iter().take(type_array.len()) {
+                    tpl_ids.push(param.tpl_id?);
+                }
+
+                (tpl_ids.len() == type_array.len()).then_some(tpl_ids)
+            });
+
+        if let Some(tpl_ids) = decl_tpl_ids {
+            for (tpl_id, (ty, structural)) in tpl_ids.into_iter().zip(type_array) {
+                tpl_replace_map.insert(tpl_id, substitutor_type_value(ty, structural, true));
+            }
+        } else {
+            // Older/incomplete indexes may not carry template ids yet. Keep the
+            // historical positional behavior as a fallback for those cases.
+            for (i, (ty, structural)) in type_array.into_iter().enumerate() {
+                tpl_replace_map.insert(
+                    GenericTplId::Type(i as u32),
+                    substitutor_type_value(ty, structural, true),
+                );
+            }
         }
+
         Self {
             tpl_replace_map,
-            alias_type_id: Some(alias_type_id),
+            alias_type_id,
             self_type: None,
         }
     }
@@ -74,6 +130,19 @@ impl TypeSubstitutor {
 
     pub fn insert_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
         self.insert_type_value(tpl_id, SubstitutorTypeValue::new(replace_type, decay));
+    }
+
+    pub fn insert_type_with_structural(
+        &mut self,
+        tpl_id: GenericTplId,
+        replace_type: LuaType,
+        structural_type: LuaType,
+        decay: bool,
+    ) {
+        self.insert_type_value(
+            tpl_id,
+            SubstitutorTypeValue::new_with_structural(replace_type, structural_type, decay),
+        );
     }
 
     fn insert_type_value(&mut self, tpl_id: GenericTplId, value: SubstitutorTypeValue) {
@@ -136,6 +205,13 @@ impl TypeSubstitutor {
         }
     }
 
+    pub fn get_structural_type(&self, tpl_id: GenericTplId) -> Option<&LuaType> {
+        match self.tpl_replace_map.get(&tpl_id) {
+            Some(SubstitutorValue::Type(ty)) => ty.structural(),
+            _ => None,
+        }
+    }
+
     pub fn check_recursion(&self, type_id: &LuaTypeDeclId) -> bool {
         if let Some(alias_type_id) = &self.alias_type_id
             && alias_type_id == type_id
@@ -159,6 +235,7 @@ impl TypeSubstitutor {
 pub struct SubstitutorTypeValue {
     raw: LuaType,
     default: LuaType,
+    structural: Option<LuaType>,
 }
 
 impl SubstitutorTypeValue {
@@ -169,7 +246,17 @@ impl SubstitutorTypeValue {
         } else {
             raw.clone()
         };
-        Self { raw, default }
+        Self {
+            raw,
+            default,
+            structural: None,
+        }
+    }
+
+    pub fn new_with_structural(raw: LuaType, structural: LuaType, decay: bool) -> Self {
+        let mut value = Self::new(raw, decay);
+        value.structural = Some(into_ref_type(structural));
+        value
     }
 
     pub fn raw(&self) -> &LuaType {
@@ -178,6 +265,10 @@ impl SubstitutorTypeValue {
 
     pub fn default(&self) -> &LuaType {
         &self.default
+    }
+
+    pub fn structural(&self) -> Option<&LuaType> {
+        self.structural.as_ref()
     }
 }
 
@@ -194,6 +285,18 @@ impl SubstitutorValue {
     pub fn is_none(&self) -> bool {
         matches!(self, SubstitutorValue::None)
     }
+}
+
+fn substitutor_type_value(
+    ty: LuaType,
+    structural: Option<LuaType>,
+    decay: bool,
+) -> SubstitutorValue {
+    let value = match structural {
+        Some(structural) => SubstitutorTypeValue::new_with_structural(ty, structural, decay),
+        None => SubstitutorTypeValue::new(ty, decay),
+    };
+    SubstitutorValue::Type(value)
 }
 
 fn into_ref_type(ty: LuaType) -> LuaType {

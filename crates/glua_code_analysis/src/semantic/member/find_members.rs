@@ -694,11 +694,17 @@ fn find_generic_members(
         .iter()
         .map(|param| ctx.instantiate_type(db, param))
         .collect();
-    let substitutor = TypeSubstitutor::from_type_array(instantiated_params);
     let type_decl = db.get_type_index().get_type_decl(&base_ref_id)?;
+    let substitutor = if type_decl.is_alias() {
+        TypeSubstitutor::from_alias(db, instantiated_params, base_ref_id.clone())
+    } else {
+        TypeSubstitutor::from_type_decl(db, instantiated_params, base_ref_id.clone())
+    };
     let ctx_with_substitutor = ctx.with_substitutor(substitutor.clone());
-    if let Some(origin) = type_decl.get_alias_origin(db, Some(&substitutor)) {
-        return find_members_guard(db, &origin, &ctx_with_substitutor, filter);
+    if type_decl.is_alias() {
+        if let Some(origin) = type_decl.get_alias_origin(db, Some(&substitutor)) {
+            return find_members_guard(db, &origin, &ctx_with_substitutor, filter);
+        }
     }
 
     find_members_guard(
