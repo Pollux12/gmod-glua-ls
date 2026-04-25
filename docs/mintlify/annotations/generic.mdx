@@ -139,15 +139,32 @@ Common string-template forms:
 
 ---
 
-## Explicit generic call arguments
+## Force a generic type at a call
 
-When inference is unclear, pass generics at the call site:
+Most calls infer generic types automatically. If GLuaLS cannot infer the type you want, add a type hint directly after the function name:
 
 ```lua
----@overload fun<T>(value: T): T
-local function callGeneric(value)
+---@generic T
+---@param value T
+---@return T
+local function identity(value)
     return value
 end
 
-local forced = callGeneric--[[@<number | string>]](1)
+local forced = identity--[[@<string | number>]](1)
 ```
+
+`forced` is treated as `string | number`.
+
+This also works with generic overloads:
+
+```lua
+---@overload fun<T>(value: T): T
+local function identity(value)
+    return value
+end
+
+local forced = identity--[[@<string>]](1)
+```
+
+Use this only when normal inference is not enough. For most code, `@generic`, `@param`, and `@return` are easier to read.
