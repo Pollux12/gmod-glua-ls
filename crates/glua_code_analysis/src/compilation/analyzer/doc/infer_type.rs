@@ -777,9 +777,21 @@ fn infer_conditional_type(
             let scope_id = analyzer
                 .generic_index
                 .add_generic_scope(vec![true_range], false);
-            analyzer
+            let infer_params = analyzer
                 .generic_index
-                .append_generic_params(scope_id, infer_params.clone());
+                .append_generic_params(scope_id, infer_params);
+            let condition_type = infer_type(analyzer, condition);
+            let true_type = infer_type(analyzer, when_true);
+            let false_type = infer_type(analyzer, when_false);
+
+            return LuaConditionalType::new(
+                condition_type,
+                true_type,
+                false_type,
+                infer_params,
+                cond_type.has_new().unwrap_or(false),
+            )
+            .into();
         }
 
         // 处理条件和分支类型
@@ -829,11 +841,10 @@ fn infer_mapped_type(
     let scope_id = analyzer
         .generic_index
         .add_generic_scope(vec![mapped_type.get_range()], false);
-    analyzer
+    let param = analyzer
         .generic_index
-        .append_generic_param(scope_id, param.clone());
-    let position = mapped_type.get_range().start();
-    let (id, _) = analyzer.generic_index.find_generic(position, name)?;
+        .append_generic_param(scope_id, param)?;
+    let id = param.tpl_id?;
 
     let doc_type = mapped_type.get_value_type()?;
     let value_type = infer_type(analyzer, doc_type);

@@ -1,4 +1,8 @@
-use std::{collections::HashSet, ops::Deref, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Deref,
+    sync::Arc,
+};
 
 use glua_parser::{LuaAstNode, LuaDocTypeList};
 use glua_parser::{LuaCallExpr, LuaExpr};
@@ -6,7 +10,7 @@ use internment::ArcIntern;
 
 use crate::{
     DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaFunctionType, LuaGenericType,
-    TypeVisitTrait,
+    LuaMemberKey, LuaObjectType, TypeVisitTrait,
     db_index::{DbIndex, LuaType},
     infer_doc_type,
     semantic::{
@@ -138,6 +142,7 @@ fn infer_generic_types_from_call(
     }
 
     let mut unresolve_tpls = vec![];
+    let use_inline_table_object = type_needs_structural_table_arg(db, func.get_ret(), 0);
     for i in 0..func_params.len() {
         if i >= arg_exprs.len() {
             break;
@@ -161,16 +166,18 @@ fn infer_generic_types_from_call(
             continue;
         }
 
-        let arg_type = match infer_expr(db, context.cache, call_arg_expr.clone()) {
-            Ok(t) => t,
-            Err(InferFailReason::FieldNotFound) => LuaType::Nil, // 对于未找到的字段, 我们认为是 nil 以执行后续推断
-            Err(e) => return Err(e),
-        };
+        let arg_type =
+            match infer_generic_arg_type(db, context, call_arg_expr, use_inline_table_object) {
+                Ok(t) => t,
+                Err(InferFailReason::FieldNotFound) => LuaType::Nil, // 对于未找到的字段, 我们认为是 nil 以执行后续推断
+                Err(e) => return Err(e),
+            };
         match (func_param_type, &arg_type) {
             (LuaType::Variadic(variadic), _) => {
                 let mut arg_types = vec![];
                 for arg_expr in &arg_exprs[i..] {
-                    let arg_type = infer_expr(db, context.cache, arg_expr.clone())?;
+                    let arg_type =
+                        infer_generic_arg_type(db, context, arg_expr, use_inline_table_object)?;
                     arg_types.push(arg_type);
                 }
                 variadic_tpl_pattern_match(context, variadic, &arg_types)?;
@@ -193,13 +200,102 @@ fn infer_generic_types_from_call(
 
     if !context.substitutor.is_infer_all_tpl() {
         for (func_param_type, call_arg_expr) in unresolve_tpls {
-            let closure_type = infer_expr(db, context.cache, call_arg_expr)?;
+            let closure_type =
+                infer_generic_arg_type(db, context, &call_arg_expr, use_inline_table_object)?;
 
             tpl_pattern_match(context, &func_param_type, &closure_type)?;
         }
     }
 
     Ok(())
+}
+
+fn infer_generic_arg_type(
+    db: &DbIndex,
+    context: &mut TplContext,
+    arg_expr: &LuaExpr,
+    use_inline_table_object: bool,
+) -> Result<LuaType, InferFailReason> {
+    if use_inline_table_object
+        && let LuaExpr::TableExpr(table_expr) = arg_expr
+        && !table_expr.is_array()
+        && !table_expr.is_empty()
+    {
+        let mut fields = HashMap::new();
+        for field in table_expr.get_fields() {
+            let field_key = field.get_field_key().ok_or(InferFailReason::None)?;
+            let member_key = LuaMemberKey::from_index_key(db, context.cache, &field_key)?;
+            if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
+                continue;
+            }
+
+            let value_expr = field.get_value_expr().ok_or(InferFailReason::None)?;
+            let value_type = infer_expr(db, context.cache, value_expr)?;
+            let value_type = match value_type {
+                LuaType::Variadic(multi) => multi.get_type(0).cloned().unwrap_or(LuaType::Nil),
+                LuaType::Def(ref_id) => LuaType::Ref(ref_id),
+                other => other,
+            };
+            fields.insert(member_key, value_type);
+        }
+
+        if !fields.is_empty() {
+            return Ok(LuaType::Object(
+                LuaObjectType::new_with_fields(fields, Vec::new()).into(),
+            ));
+        }
+    }
+
+    infer_expr(db, context.cache, arg_expr.clone())
+}
+
+fn type_needs_structural_table_arg(db: &DbIndex, typ: &LuaType, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+
+    let mut needs_structural_table_arg = false;
+    typ.visit_type(&mut |visited| {
+        if needs_structural_table_arg {
+            return;
+        }
+
+        match visited {
+            LuaType::Mapped(_) | LuaType::Conditional(_) | LuaType::Call(_) => {
+                needs_structural_table_arg = true;
+            }
+            LuaType::Generic(generic) => {
+                let type_id = generic.get_base_type_id();
+                let Some(type_decl) = db.get_type_index().get_type_decl(&type_id) else {
+                    return;
+                };
+                if !type_decl.is_alias() {
+                    return;
+                }
+
+                if let Some(origin) = type_decl.get_alias_ref() {
+                    needs_structural_table_arg =
+                        type_needs_structural_table_arg(db, origin, depth + 1);
+                }
+            }
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                let Some(type_decl) = db.get_type_index().get_type_decl(type_id) else {
+                    return;
+                };
+                if !type_decl.is_alias() {
+                    return;
+                }
+
+                if let Some(origin) = type_decl.get_alias_ref() {
+                    needs_structural_table_arg =
+                        type_needs_structural_table_arg(db, origin, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    });
+
+    needs_structural_table_arg
 }
 
 pub fn build_self_type(db: &DbIndex, self_type: &LuaType) -> LuaType {

@@ -22,9 +22,8 @@ impl FileGenericIndex {
 
     pub fn add_generic_scope(&mut self, ranges: Vec<TextRange>, is_func: bool) -> GenericParamId {
         let params_index = self.generic_params.len();
-        let start = self.get_start(&ranges).unwrap_or(0);
         self.generic_params
-            .push(TagGenericParams::new(is_func, start));
+            .push(TagGenericParams::new(is_func, params_index as u32));
         let params_id = GenericParamId::new(params_index);
         let root_node_ids: Vec<_> = self.root_node_ids.clone();
         for range in ranges {
@@ -51,40 +50,29 @@ impl FileGenericIndex {
         params_id
     }
 
-    pub fn append_generic_param(&mut self, scope_id: GenericParamId, param: GenericParam) {
-        if let Some(scope) = self.generic_params.get_mut(scope_id.id) {
-            scope.insert_param(param);
-        }
-    }
-
-    pub fn append_generic_params(&mut self, scope_id: GenericParamId, params: Vec<GenericParam>) {
-        for param in params {
-            self.append_generic_param(scope_id, param);
-        }
-    }
-
-    pub fn set_param_constraint(
+    pub fn append_generic_param(
         &mut self,
         scope_id: GenericParamId,
-        name: &str,
-        constraint: Option<LuaType>,
-    ) {
-        if let Some(scope) = self.generic_params.get_mut(scope_id.id)
-            && let Some((_idx, stored_param)) = scope.params.get_mut(name)
-        {
-            stored_param.type_constraint = constraint;
+        param: GenericParam,
+    ) -> Option<GenericParam> {
+        if let Some(scope) = self.generic_params.get_mut(scope_id.id) {
+            return Some(scope.insert_param(param));
         }
+        None
     }
 
-    fn get_start(&self, ranges: &[TextRange]) -> Option<usize> {
-        let params_ids = self.find_generic_params(ranges.first()?.start())?;
-        let mut start = 0;
-        for params_id in params_ids.iter() {
-            if let Some(params) = self.generic_params.get(*params_id) {
-                start += params.params.len();
+    pub fn append_generic_params(
+        &mut self,
+        scope_id: GenericParamId,
+        params: Vec<GenericParam>,
+    ) -> Vec<GenericParam> {
+        let mut assigned_params = Vec::new();
+        for param in params {
+            if let Some(param) = self.append_generic_param(scope_id, param) {
+                assigned_params.push(param);
             }
         }
-        Some(start)
+        assigned_params
     }
 
     fn try_add_range_to_effect_node(
@@ -140,11 +128,7 @@ impl FileGenericIndex {
             if let Some(params) = self.generic_params.get(*params_id)
                 && let Some((id, param)) = params.params.get(name)
             {
-                let tpl_id = if params.is_func {
-                    GenericTplId::Func(*id as u32)
-                } else {
-                    GenericTplId::Type(*id as u32)
-                };
+                let tpl_id = param.tpl_id.unwrap_or_else(|| params.tpl_id_for_idx(*id));
                 return Some((tpl_id, param.type_constraint.clone()));
             }
         }
@@ -221,22 +205,34 @@ impl GenericEffectId {
 pub struct TagGenericParams {
     params: HashMap<String, (usize, GenericParam)>,
     is_func: bool,
+    scope_id: u32,
     next_index: usize,
 }
 
 impl TagGenericParams {
-    pub fn new(is_func: bool, start: usize) -> Self {
+    pub fn new(is_func: bool, scope_id: u32) -> Self {
         Self {
             params: HashMap::new(),
             is_func,
-            next_index: start,
+            scope_id,
+            next_index: 0,
         }
     }
 
-    fn insert_param(&mut self, param: GenericParam) {
+    fn insert_param(&mut self, param: GenericParam) -> GenericParam {
         let current_index = self.next_index;
         self.next_index += 1;
+        let param = param.with_tpl_id(self.tpl_id_for_idx(current_index));
         self.params
-            .insert(param.name.to_string(), (current_index, param));
+            .insert(param.name.to_string(), (current_index, param.clone()));
+        param
+    }
+
+    fn tpl_id_for_idx(&self, idx: usize) -> GenericTplId {
+        if self.is_func {
+            GenericTplId::Func(idx as u32)
+        } else {
+            GenericTplId::scoped_type(self.scope_id, idx as u32)
+        }
     }
 }

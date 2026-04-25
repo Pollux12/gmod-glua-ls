@@ -451,7 +451,8 @@ fn infer_generic_type_doc_function(
     let type_id = generic.get_base_type_id();
     infer_guard.check(&type_id)?;
     let generic_params = generic.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
+    let substitutor =
+        TypeSubstitutor::from_type_array_for_type(db, &type_id, generic_params.clone());
 
     let type_decl = db
         .get_type_index()

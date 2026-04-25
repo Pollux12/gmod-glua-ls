@@ -319,7 +319,22 @@ fn instantiate_index_call(db: &DbIndex, owner: &LuaType, key: &LuaType) -> LuaTy
     }
 
     if let Some(member_key) = key_type_to_member_key(key) {
-        infer_raw_member_type(db, owner, &member_key).unwrap_or(LuaType::Never)
+        infer_raw_member_type(db, owner, &member_key).unwrap_or_else(|_| {
+            find_members(db, owner)
+                .and_then(|members| {
+                    let mut result = LuaType::Unknown;
+                    let mut found = false;
+                    for member in members {
+                        if member.key == member_key {
+                            result = TypeOps::Union.apply(db, &result, &member.typ);
+                            found = true;
+                        }
+                    }
+
+                    found.then_some(result)
+                })
+                .unwrap_or(LuaType::Never)
+        })
     } else {
         LuaType::Never
     }

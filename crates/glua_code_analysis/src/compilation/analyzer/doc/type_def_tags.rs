@@ -35,13 +35,12 @@ pub fn analyze_class(analyzer: &mut DocAnalyzer, tag: LuaDocTagClass) -> Option<
     analyzer.current_type_id = Some(class_decl_id.clone());
     if let Some(generic_params) = tag.get_generic_decl() {
         let generic_params = get_generic_params(analyzer, generic_params);
+        let generic_params = add_generic_index(analyzer, generic_params, &tag);
 
         analyzer
             .db
             .get_type_index_mut()
             .add_generic_params(class_decl_id.clone(), generic_params.clone());
-
-        add_generic_index(analyzer, generic_params, &tag);
     }
 
     if let Some(supers) = tag.get_supers() {
@@ -144,16 +143,15 @@ pub fn analyze_alias(analyzer: &mut DocAnalyzer, tag: LuaDocTagAlias) -> Option<
 
     if let Some(generic_params) = tag.get_generic_decl_list() {
         let generic_params = get_generic_params(analyzer, generic_params);
-
+        let range = tag.get_range();
+        let scope_id = analyzer.generic_index.add_generic_scope(vec![range], false);
+        let generic_params = analyzer
+            .generic_index
+            .append_generic_params(scope_id, generic_params);
         analyzer
             .db
             .get_type_index_mut()
-            .add_generic_params(alias_decl_id.clone(), generic_params.clone());
-        let range = analyzer.comment.get_range();
-        let scope_id = analyzer.generic_index.add_generic_scope(vec![range], false);
-        analyzer
-            .generic_index
-            .append_generic_params(scope_id, generic_params);
+            .add_generic_params(alias_decl_id.clone(), generic_params);
     }
 
     let origin_type = infer_type(analyzer, tag.get_type()?);
@@ -221,7 +219,7 @@ fn add_generic_index(
     analyzer: &mut DocAnalyzer,
     generic_params: Vec<GenericParam>,
     tag: &LuaDocTagClass,
-) {
+) -> Vec<GenericParam> {
     let mut ranges = Vec::new();
     ranges.push(tag.get_effective_range());
     if let Some(comment_owner) = analyzer.comment.get_owner() {
@@ -245,7 +243,7 @@ fn add_generic_index(
     let scope_id = analyzer.generic_index.add_generic_scope(ranges, false);
     analyzer
         .generic_index
-        .append_generic_params(scope_id, generic_params);
+        .append_generic_params(scope_id, generic_params)
 }
 
 fn get_local_stat_reference_ranges(
@@ -351,18 +349,13 @@ pub fn analyze_func_generic(analyzer: &mut DocAnalyzer, tag: LuaDocTagGeneric) -
             };
             let name_text = name_token.get_name_text().to_string();
             let smol_name = SmolStr::new(name_text.as_str());
-            analyzer
-                .generic_index
-                .append_generic_param(scope_id, GenericParam::new(smol_name.clone(), None, None));
-
             let type_ref = param
                 .get_type()
                 .map(|type_ref| infer_type(analyzer, type_ref));
 
-            analyzer.generic_index.set_param_constraint(
+            analyzer.generic_index.append_generic_param(
                 scope_id,
-                name_text.as_str(),
-                type_ref.clone(),
+                GenericParam::new(smol_name.clone(), type_ref.clone(), None),
             );
 
             param_info.push(Arc::new(LuaGenericParamInfo::new(

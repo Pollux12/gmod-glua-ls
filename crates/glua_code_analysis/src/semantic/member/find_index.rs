@@ -308,7 +308,8 @@ fn find_index_generic(
     };
 
     let generic_params = generic.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
+    let substitutor =
+        TypeSubstitutor::from_type_array_for_type(db, &type_decl_id, generic_params.clone());
     let type_index = db.get_type_index();
     let type_decl = type_index.get_type_decl(&type_decl_id)?;
 

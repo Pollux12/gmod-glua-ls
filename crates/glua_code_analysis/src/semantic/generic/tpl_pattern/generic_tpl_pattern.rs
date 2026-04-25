@@ -48,7 +48,8 @@ fn generic_tpl_pattern_match_inner(
                 .get_type_decl(target_base)
                 .ok_or(InferFailReason::None)?;
             if target_decl.is_alias() {
-                let substitutor = TypeSubstitutor::from_alias(
+                let substitutor = TypeSubstitutor::from_alias_for_type(
+                    context.db,
                     target_generic.get_params().clone(),
                     target_base.clone(),
                 );
@@ -67,8 +68,11 @@ fn generic_tpl_pattern_match_inner(
             {
                 for mut super_type in super_types {
                     if super_type.contain_tpl() {
-                        let substitutor =
-                            TypeSubstitutor::from_type_array(target_generic.get_params().clone());
+                        let substitutor = TypeSubstitutor::from_type_array_for_type(
+                            context.db,
+                            target_base,
+                            target_generic.get_params().clone(),
+                        );
                         super_type =
                             instantiate_type_generic(context.db, &super_type, &substitutor);
                     }

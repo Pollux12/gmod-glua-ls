@@ -694,7 +694,8 @@ fn find_generic_members(
         .iter()
         .map(|param| ctx.instantiate_type(db, param))
         .collect();
-    let substitutor = TypeSubstitutor::from_type_array(instantiated_params);
+    let substitutor =
+        TypeSubstitutor::from_type_array_for_type(db, base_ref_id, instantiated_params);
     let type_decl = db.get_type_index().get_type_decl(&base_ref_id)?;
     let ctx_with_substitutor = ctx.with_substitutor(substitutor.clone());
     if let Some(origin) = type_decl.get_alias_origin(db, Some(&substitutor)) {

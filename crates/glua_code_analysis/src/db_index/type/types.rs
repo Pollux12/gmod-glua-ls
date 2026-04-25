@@ -1322,6 +1322,7 @@ impl LuaInstanceType {
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum GenericTplId {
     Type(u32),
+    ScopedType { scope: u32, idx: u32 },
     Func(u32),
 }
 
@@ -1329,6 +1330,7 @@ impl GenericTplId {
     pub fn get_idx(&self) -> usize {
         match self {
             GenericTplId::Type(idx) => *idx as usize,
+            GenericTplId::ScopedType { idx, .. } => *idx as usize,
             GenericTplId::Func(idx) => *idx as usize,
         }
     }
@@ -1338,14 +1340,24 @@ impl GenericTplId {
     }
 
     pub fn is_type(&self) -> bool {
-        matches!(self, GenericTplId::Type(_))
+        matches!(
+            self,
+            GenericTplId::Type(_) | GenericTplId::ScopedType { .. }
+        )
     }
 
     pub fn with_idx(&self, idx: u32) -> Self {
         match self {
             GenericTplId::Type(_) => GenericTplId::Type(idx),
+            GenericTplId::ScopedType { scope, .. } => {
+                GenericTplId::ScopedType { scope: *scope, idx }
+            }
             GenericTplId::Func(_) => GenericTplId::Func(idx),
         }
+    }
+
+    pub fn scoped_type(scope: u32, idx: u32) -> Self {
+        GenericTplId::ScopedType { scope, idx }
     }
 }
 

@@ -24,8 +24,11 @@ pub fn check_generic_type_compact(
         .get_type_decl(&source_generic.get_base_type_id())
         && decl.is_alias()
     {
-        let substitutor =
-            TypeSubstitutor::from_alias(source_generic.get_params().clone(), base_id.clone());
+        let substitutor = TypeSubstitutor::from_alias_for_type(
+            context.db,
+            source_generic.get_params().clone(),
+            base_id.clone(),
+        );
         if let Some(alias_origin) = decl.get_alias_origin(context.db, Some(&substitutor)) {
             return check_general_type_compact(
                 context,
@@ -61,8 +64,11 @@ pub fn check_generic_type_compact(
             {
                 for mut super_type in supers {
                     if super_type.contain_tpl() {
-                        let substitutor =
-                            TypeSubstitutor::from_type_array(compact_generic.get_params().clone());
+                        let substitutor = TypeSubstitutor::from_type_array_for_type(
+                            context.db,
+                            &compact_generic.get_base_type_id(),
+                            compact_generic.get_params().clone(),
+                        );
                         super_type =
                             instantiate_type_generic(context.db, &super_type, &substitutor);
                     }

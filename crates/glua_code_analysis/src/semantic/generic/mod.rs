@@ -69,7 +69,7 @@ pub fn get_tpl_ref_extend_type(
                     }
                     None
                 }
-                GenericTplId::Type(tpl_id) => {
+                GenericTplId::Type(tpl_id) | GenericTplId::ScopedType { idx: tpl_id, .. } => {
                     if let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_decl {
                         let decl = db.get_decl_index().get_decl(&decl_id)?;
                         match decl.extra {

@@ -396,7 +396,12 @@ fn find_generic_member(
     let base_type = generic_type.get_base_type();
 
     let generic_params = generic_type.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
+    let substitutor = match &base_type {
+        LuaType::Ref(base_type_decl_id) => {
+            TypeSubstitutor::from_type_array_for_type(db, base_type_decl_id, generic_params.clone())
+        }
+        _ => TypeSubstitutor::from_type_array(generic_params.clone()),
+    };
     if let LuaType::Ref(base_type_decl_id) = &base_type {
         let result = index_generic_members_from_super_generics(
             db,
@@ -769,7 +774,8 @@ fn find_member_by_index_generic(
         return Err(InferFailReason::None);
     };
     let generic_params = generic.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
+    let substitutor =
+        TypeSubstitutor::from_type_array_for_type(db, &type_decl_id, generic_params.clone());
     let type_index = db.get_type_index();
     let type_decl = type_index
         .get_type_decl(&type_decl_id)

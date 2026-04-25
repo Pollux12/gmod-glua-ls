@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::tpl_pattern::constant_decay;
-use crate::{GenericTplId, LuaType, LuaTypeDeclId};
+use crate::{DbIndex, GenericTplId, LuaType, LuaTypeDeclId};
 
 #[derive(Debug, Clone)]
 pub struct TypeSubstitutor {
@@ -40,6 +40,16 @@ impl TypeSubstitutor {
         }
     }
 
+    pub fn from_type_array_for_type(
+        db: &DbIndex,
+        type_decl_id: &LuaTypeDeclId,
+        type_array: Vec<LuaType>,
+    ) -> Self {
+        let mut substitutor = Self::from_type_array(type_array.clone());
+        substitutor.insert_decl_type_params(db, type_decl_id, type_array);
+        substitutor
+    }
+
     pub fn from_alias(type_array: Vec<LuaType>, alias_type_id: LuaTypeDeclId) -> Self {
         let mut tpl_replace_map = HashMap::new();
         for (i, ty) in type_array.into_iter().enumerate() {
@@ -52,6 +62,40 @@ impl TypeSubstitutor {
             tpl_replace_map,
             alias_type_id: Some(alias_type_id),
             self_type: None,
+        }
+    }
+
+    pub fn from_alias_for_type(
+        db: &DbIndex,
+        type_array: Vec<LuaType>,
+        alias_type_id: LuaTypeDeclId,
+    ) -> Self {
+        let mut substitutor = Self::from_type_array_for_type(db, &alias_type_id, type_array);
+        substitutor.alias_type_id = Some(alias_type_id);
+        substitutor
+    }
+
+    fn insert_decl_type_params(
+        &mut self,
+        db: &DbIndex,
+        type_decl_id: &LuaTypeDeclId,
+        type_array: Vec<LuaType>,
+    ) {
+        let Some(generic_params) = db.get_type_index().get_generic_params(type_decl_id) else {
+            return;
+        };
+
+        for (i, generic_param) in generic_params.iter().enumerate() {
+            let Some(tpl_id) = generic_param.tpl_id else {
+                continue;
+            };
+            let Some(ty) = type_array.get(i) else {
+                continue;
+            };
+            self.tpl_replace_map.insert(
+                tpl_id,
+                SubstitutorValue::Type(SubstitutorTypeValue::new(ty.clone(), true)),
+            );
         }
     }
 
