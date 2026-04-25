@@ -155,10 +155,6 @@ fn check_ref_class(
             if is_sub_type_of(context.db, id, source_id) {
                 return Ok(());
             }
-            // 这不是正确的逻辑. 但不假设超类会自动转换为子类, 则会过于严格
-            if is_sub_type_of(context.db, source_id, id) {
-                return Ok(());
-            }
 
             // `compact`为枚举时的额外处理
             if let Some(compact_decl) = context.db.get_type_index().get_type_decl(id)

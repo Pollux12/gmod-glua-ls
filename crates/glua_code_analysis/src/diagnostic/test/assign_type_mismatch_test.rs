@@ -606,7 +606,7 @@ local b = a
             "#
         ));
 
-        assert!(ws.check_code_for_namespace(
+        assert!(!ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
 ---@class A
@@ -732,7 +732,7 @@ return t
         config.strict.array_index = true;
         ws.analysis.update_config(config.into());
 
-        assert!(ws.check_code_for_namespace(
+        assert!(!ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
             ---@class A

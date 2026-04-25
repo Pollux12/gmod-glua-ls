@@ -171,6 +171,47 @@ mod test {
     }
 
     #[test]
+    fn test_nominal_subtyping_is_directional() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+        ---@class Base
+
+        ---@class Derived: Base
+
+        ---@param value Base
+        function takes_base(value) end
+
+        ---@param value Derived
+        function takes_derived(value) end
+        "#,
+        );
+
+        let base = ws.ty("Base");
+        let derived = ws.ty("Derived");
+        assert!(ws.check_type(&base, &derived));
+        assert!(!ws.check_type(&derived, &base));
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@type Derived
+            local derived
+            takes_base(derived)
+        "#
+        ));
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@type Base
+            local base
+            takes_derived(base)
+        "#
+        ));
+    }
+
+    #[test]
     fn test_issue_790() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
