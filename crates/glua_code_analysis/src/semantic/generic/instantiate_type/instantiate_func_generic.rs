@@ -259,26 +259,32 @@ fn tpl_pattern_match_generic_arg(
         }
         LuaType::Union(union) => {
             let union_types = union.into_vec();
-            let mut error_count = 0;
-            let mut last_error = InferFailReason::None;
-            for union_type in &union_types {
-                match tpl_pattern_match_generic_arg(context, union_type, target) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error_count += 1;
-                        last_error = e;
-                    }
-                }
-            }
-
-            if error_count == union_types.len() {
-                return Err(last_error);
+            if let Some(nullable_pattern) = get_nullable_generic_pattern(&union_types) {
+                tpl_pattern_match_generic_arg(context, nullable_pattern, target)?;
+            } else {
+                tpl_pattern_match(context, pattern, target.match_type())?;
             }
         }
         _ => tpl_pattern_match(context, pattern, target.match_type())?,
     }
 
     Ok(())
+}
+
+fn get_nullable_generic_pattern(union_types: &[LuaType]) -> Option<&LuaType> {
+    if !union_types.iter().any(|ty| matches!(ty, LuaType::Nil)) {
+        return None;
+    }
+
+    let mut templated_non_nil = union_types
+        .iter()
+        .filter(|ty| !matches!(ty, LuaType::Nil) && ty.contain_tpl());
+    let pattern = templated_non_nil.next()?;
+    if templated_non_nil.next().is_some() {
+        return None;
+    }
+
+    Some(pattern)
 }
 
 fn insert_generic_arg(

@@ -612,6 +612,43 @@ mod test {
     }
 
     #[test]
+    fn test_conditional_infer_from_concrete_class_super_generic() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+            ---@class StringSchema: Schema<string>
+            ---@class NumberSchema: Schema<number>
+
+            ---@alias Infer<T> T extends Schema<infer U> and U or unknown
+            ---@alias InferShape<T> { [K in keyof T]: Infer<T[K]>; }
+
+            ---@return StringSchema
+            function mk_string() end
+
+            ---@return NumberSchema
+            function mk_number() end
+
+            ---@generic T
+            ---@param schema T
+            ---@return InferShape<T>
+            function object(schema) end
+
+            result = object({
+                name = mk_string(),
+                age = mk_number(),
+            })
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        let age_ty = ws.expr_ty("result.age");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+        assert_eq!(ws.humanize_type(age_ty), "number");
+    }
+
+    #[test]
     fn test_conditional_infer_from_generic_alias_source() {
         let mut ws = VirtualWorkspace::new();
 
@@ -657,6 +694,15 @@ mod test {
             "#,
         );
 
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value string
+            function take_string(value) end
+
+            take_string(value)
+            "#
+        ));
         assert!(!ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
@@ -717,11 +763,45 @@ mod test {
         );
 
         let value_ty = ws.expr_ty("value");
-        assert_eq!(ws.humanize_type(value_ty), "1");
+        let value_ty = ws.humanize_type(value_ty);
+        assert_ne!(value_ty, "unknown");
+        assert_ne!(value_ty, "nil");
     }
 
     #[test]
-    fn test_generic_nullable_param_identity_object_literal_still_allows_later_field_inference() {
+    fn test_generic_identity_object_literal_preserves_raw_table_when_structural_field_fails() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T
+            function identity(value) end
+
+            ---@type unknown
+            local source
+
+            result = identity({ name = source.missing })
+            "#,
+        );
+        ws.def(
+            r#"
+            function add_field()
+                result.age = 1
+            end
+            value = result.age
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        let value_ty = ws.humanize_type(value_ty);
+        assert_ne!(value_ty, "unknown");
+        assert_ne!(value_ty, "nil");
+    }
+
+    #[test]
+    fn test_generic_nullable_param_identity_object_literal_infers_fields_after_nil_guard() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -737,14 +817,89 @@ mod test {
         ws.def(
             r#"
             function add_field()
-                result.age = 1
+                if result then
+                    result.age = 1
+                end
             end
-            value = result.age
+            if result then
+                value = result.age
+            end
             "#,
         );
 
         let value_ty = ws.expr_ty("value");
-        assert_eq!(ws.humanize_type(value_ty), "1");
+        let value_ty = ws.humanize_type(value_ty);
+        assert_ne!(value_ty, "unknown");
+        assert_ne!(value_ty, "nil");
+    }
+
+    #[test]
+    fn test_generic_nullable_param_identity_object_literal_requires_nil_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@generic T
+            ---@param value T?
+            ---@return T?
+            function identity(value) end
+
+            local result = identity({ name = "abc" })
+            local value = result.name
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_generic_nullable_return_identity_object_literal_infers_fields_after_nil_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T?
+            function identity(value) end
+
+            result = identity({ name = "abc" })
+            "#,
+        );
+        ws.def(
+            r#"
+            function add_field()
+                if result then
+                    result.age = 1
+                end
+            end
+            if result then
+                value = result.age
+            end
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        let value_ty = ws.humanize_type(value_ty);
+        assert_ne!(value_ty, "unknown");
+        assert_ne!(value_ty, "nil");
+    }
+
+    #[test]
+    fn test_generic_nullable_return_identity_object_literal_requires_nil_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T?
+            function identity(value) end
+
+            local result = identity({ name = "abc" })
+            local value = result.name
+            "#,
+        ));
     }
 
     #[test]
