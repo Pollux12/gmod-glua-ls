@@ -1555,6 +1555,81 @@ mod test {
     }
 
     #[test]
+    fn test_reverse_mapped_collects_full_candidates_after_first_mapped_candidate() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@field value T
+
+            ---@alias Boxified<T> { [K in keyof T]: Box<T[K]>; }
+
+            ---@generic T
+            ---@param value T
+            ---@return Box<T>
+            function box(value) end
+
+            ---@generic T
+            ---@param first Boxified<T>
+            ---@param second Boxified<T>
+            ---@return T
+            function merge_boxified(first, second) end
+
+            local first = {
+                value = box("first"),
+            }
+
+            local second = {
+                value = box(42),
+            }
+
+            result = merge_boxified(first, second)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("result.value");
+        assert_eq!(ws.humanize_type(value_ty), "(string|integer)");
+    }
+
+    #[test]
+    fn test_inline_reverse_mapped_partial_does_not_block_later_full_candidate() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@field value T
+
+            ---@alias Boxified<T> { [K in keyof T]: Box<T[K]>; }
+
+            ---@generic T
+            ---@param value T
+            ---@return Box<T>
+            function box(value) end
+
+            ---@generic T
+            ---@param partial Boxified<T>
+            ---@param full Boxified<T>
+            ---@return T
+            function prefer_full(partial, full) end
+
+            result = prefer_full({
+                stale = box("partial"),
+                skipped = true,
+            }, {
+                fresh = box(42),
+            })
+            "#,
+        );
+
+        let stale_ty = ws.expr_ty("result.stale");
+        let fresh_ty = ws.expr_ty("result.fresh");
+        assert_eq!(ws.humanize_type(stale_ty), "nil");
+        assert_eq!(ws.humanize_type(fresh_ty), "integer");
+    }
+
+    #[test]
     fn test_mapped_inference_is_lower_priority_than_direct_inference() {
         let mut ws = VirtualWorkspace::new();
 
