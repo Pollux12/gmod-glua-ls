@@ -14,6 +14,7 @@ pub use closure::analyze_return_point;
 use for_range_stat::analyze_for_range_stat;
 pub use for_range_stat::infer_for_range_iter_expr_func;
 pub use func_body::LuaReturnPoint;
+pub use func_body::analyze_func_body_returns;
 use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;

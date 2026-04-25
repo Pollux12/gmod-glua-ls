@@ -1448,11 +1448,19 @@ fn func_tpl_pattern_match_doc_func(
 
     let tpl_return = tpl_func.get_ret();
     let target_return = target_func.get_ret();
-    context.with_inference_priority(InferencePriority::Direct, true, |context| {
+    let priority = active_inference_priority(context);
+    context.with_inference_priority(priority, true, |context| {
         return_type_pattern_match_target_type(context, tpl_return, target_return)
     })?;
 
     Ok(())
+}
+
+fn active_inference_priority(context: &TplContext) -> InferencePriority {
+    match context.substitutor.priority() {
+        InferencePriority::None => InferencePriority::Direct,
+        priority => priority,
+    }
 }
 
 fn param_type_list_pattern_match_type_list(
@@ -1525,7 +1533,7 @@ fn param_type_list_pattern_match_type_list(
                     None => break,
                 };
                 context.with_inference_priority_and_variance(
-                    InferencePriority::Direct,
+                    active_inference_priority(context),
                     true,
                     InferenceVariance::Contravariant,
                     |context| tpl_pattern_match(context, &source, &target),

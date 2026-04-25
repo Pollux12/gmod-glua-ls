@@ -4,13 +4,14 @@ use std::{
     sync::Arc,
 };
 
-use glua_parser::{LuaAstNode, LuaDocTypeList};
+use glua_parser::{LuaAstNode, LuaClosureExpr, LuaDocTypeList};
 use glua_parser::{LuaCallExpr, LuaExpr};
 use internment::ArcIntern;
 
 use crate::{
     DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaFunctionType, LuaGenericType,
-    LuaMemberKey, LuaObjectType, TypeVisitTrait,
+    LuaMemberKey, LuaObjectType, TypeOps, TypeVisitTrait, VariadicType,
+    compilation::analyzer::{LuaReturnPoint, analyze_func_body_returns},
     db_index::{DbIndex, LuaType},
     infer_doc_type,
     semantic::{
@@ -255,9 +256,13 @@ fn infer_generic_types_from_call(
         })?;
     }
 
-    if !context.substitutor.is_infer_all_tpl() {
+    if !unresolve_tpls.is_empty()
+        && (!context.substitutor.is_infer_all_tpl() || contextual_return_hint.is_some())
+    {
         for (func_param_type, call_arg_expr) in unresolve_tpls {
-            let func_param_type = if matches!(call_arg_expr, LuaExpr::ClosureExpr(_)) {
+            let is_closure_arg = matches!(call_arg_expr, LuaExpr::ClosureExpr(_));
+            let original_func_param_type = func_param_type.clone();
+            let func_param_type = if is_closure_arg {
                 instantiate_type_generic_preserve_unresolved(
                     db,
                     &func_param_type,
@@ -269,11 +274,210 @@ fn infer_generic_types_from_call(
             let closure_type =
                 infer_generic_arg_type(db, context, &call_arg_expr, use_inline_table_object)?;
 
-            tpl_pattern_match(context, &func_param_type, &closure_type)?;
+            context.with_inference_priority(InferencePriority::Direct, true, |context| {
+                tpl_pattern_match(context, &func_param_type, &closure_type)
+            })?;
+
+            if is_closure_arg && original_func_param_type.contain_tpl() {
+                let direct_closure_type = infer_closure_body_function_type(
+                    db,
+                    context,
+                    &func_param_type,
+                    &call_arg_expr,
+                    true,
+                )
+                .unwrap_or_else(|| closure_type.clone());
+                context.with_inference_priority(InferencePriority::Direct, true, |context| {
+                    tpl_pattern_match(context, &original_func_param_type, &direct_closure_type)
+                })?;
+            }
         }
     }
 
     Ok(())
+}
+
+fn infer_closure_body_function_type(
+    db: &DbIndex,
+    context: &mut TplContext,
+    expected_type: &LuaType,
+    call_arg_expr: &LuaExpr,
+    use_inline_table_object: bool,
+) -> Option<LuaType> {
+    let LuaExpr::ClosureExpr(closure) = call_arg_expr else {
+        return None;
+    };
+    let expected_func = match expected_type {
+        LuaType::DocFunction(func) => func.clone(),
+        LuaType::Signature(sig_id) => context
+            .db
+            .get_signature_index()
+            .get(sig_id)?
+            .to_doc_func_type(),
+        _ => return None,
+    };
+    let closure_param_types = closure_param_type_map(closure, expected_func.as_ref());
+    let return_type = infer_closure_body_return_type(
+        db,
+        context,
+        closure.clone(),
+        use_inline_table_object,
+        &closure_param_types,
+    )?;
+    if return_type.is_unknown() {
+        return None;
+    }
+
+    Some(LuaType::DocFunction(
+        LuaFunctionType::new(
+            expected_func.get_async_state(),
+            expected_func.is_colon_define(),
+            expected_func.is_variadic(),
+            expected_func.get_params().to_vec(),
+            return_type,
+        )
+        .into(),
+    ))
+}
+
+fn infer_closure_body_return_type(
+    db: &DbIndex,
+    context: &mut TplContext,
+    closure: LuaClosureExpr,
+    use_inline_table_object: bool,
+    closure_param_types: &HashMap<String, LuaType>,
+) -> Option<LuaType> {
+    let block = closure.get_block()?;
+    let return_points = analyze_func_body_returns(block);
+    let mut return_type = LuaType::Unknown;
+    for point in return_points {
+        let point_type = infer_closure_return_point_type(
+            db,
+            context,
+            point,
+            use_inline_table_object,
+            closure_param_types,
+        )
+        .ok()?;
+        return_type = if return_type.is_unknown() {
+            point_type
+        } else {
+            TypeOps::Union.apply(db, &return_type, &point_type)
+        };
+    }
+
+    Some(return_type)
+}
+
+fn infer_closure_return_point_type(
+    db: &DbIndex,
+    context: &mut TplContext,
+    point: LuaReturnPoint,
+    use_inline_table_object: bool,
+    closure_param_types: &HashMap<String, LuaType>,
+) -> Result<LuaType, InferFailReason> {
+    match point {
+        LuaReturnPoint::Expr(expr) => infer_generic_arg_type_with_closure_params(
+            db,
+            context,
+            &expr,
+            use_inline_table_object,
+            Some(closure_param_types),
+        ),
+        LuaReturnPoint::MuliExpr(exprs) => {
+            let mut types = Vec::new();
+            for expr in exprs {
+                types.push(infer_generic_arg_type_with_closure_params(
+                    db,
+                    context,
+                    &expr,
+                    use_inline_table_object,
+                    Some(closure_param_types),
+                )?);
+            }
+            Ok(LuaType::Variadic(VariadicType::Multi(types).into()))
+        }
+        LuaReturnPoint::Nil => Ok(LuaType::Nil),
+        LuaReturnPoint::Error => Ok(LuaType::Unknown),
+    }
+}
+
+fn closure_param_type_map(
+    closure: &LuaClosureExpr,
+    expected_func: &LuaFunctionType,
+) -> HashMap<String, LuaType> {
+    let mut param_types = HashMap::new();
+    let Some(params_list) = closure.get_params_list() else {
+        return param_types;
+    };
+
+    for (index, param) in params_list.get_params().enumerate() {
+        let Some(name_token) = param.get_name_token() else {
+            continue;
+        };
+        let Some((_, Some(expected_type))) = expected_func.get_params().get(index) else {
+            continue;
+        };
+        param_types.insert(
+            name_token.get_name_text().to_string(),
+            expected_type.clone(),
+        );
+    }
+
+    param_types
+}
+
+fn infer_generic_arg_type_with_closure_params(
+    db: &DbIndex,
+    context: &mut TplContext,
+    arg_expr: &LuaExpr,
+    use_inline_table_object: bool,
+    closure_param_types: Option<&HashMap<String, LuaType>>,
+) -> Result<LuaType, InferFailReason> {
+    if let LuaExpr::NameExpr(name_expr) = arg_expr
+        && let Some(name) = name_expr.get_name_text()
+        && let Some(param_type) = closure_param_types.and_then(|param_types| param_types.get(&name))
+    {
+        return Ok(param_type.clone());
+    }
+
+    if use_inline_table_object
+        && let LuaExpr::TableExpr(table_expr) = arg_expr
+        && !table_expr.is_array()
+        && !table_expr.is_empty()
+    {
+        let mut fields = HashMap::new();
+        for field in table_expr.get_fields() {
+            let field_key = field.get_field_key().ok_or(InferFailReason::None)?;
+            let member_key = LuaMemberKey::from_index_key(db, context.cache, &field_key)?;
+            if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
+                continue;
+            }
+
+            let value_expr = field.get_value_expr().ok_or(InferFailReason::None)?;
+            let value_type = infer_generic_arg_type_with_closure_params(
+                db,
+                context,
+                &value_expr,
+                use_inline_table_object,
+                closure_param_types,
+            )?;
+            let value_type = match value_type {
+                LuaType::Variadic(multi) => multi.get_type(0).cloned().unwrap_or(LuaType::Nil),
+                LuaType::Def(ref_id) => LuaType::Ref(ref_id),
+                other => other,
+            };
+            fields.insert(member_key, value_type);
+        }
+
+        if !fields.is_empty() {
+            return Ok(LuaType::Object(
+                LuaObjectType::new_with_fields(fields, Vec::new()).into(),
+            ));
+        }
+    }
+
+    infer_expr(db, context.cache, arg_expr.clone())
 }
 
 fn is_direct_type_candidate(typ: &LuaType) -> bool {
@@ -303,37 +507,7 @@ fn infer_generic_arg_type(
     arg_expr: &LuaExpr,
     use_inline_table_object: bool,
 ) -> Result<LuaType, InferFailReason> {
-    if use_inline_table_object
-        && let LuaExpr::TableExpr(table_expr) = arg_expr
-        && !table_expr.is_array()
-        && !table_expr.is_empty()
-    {
-        let mut fields = HashMap::new();
-        for field in table_expr.get_fields() {
-            let field_key = field.get_field_key().ok_or(InferFailReason::None)?;
-            let member_key = LuaMemberKey::from_index_key(db, context.cache, &field_key)?;
-            if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
-                continue;
-            }
-
-            let value_expr = field.get_value_expr().ok_or(InferFailReason::None)?;
-            let value_type = infer_expr(db, context.cache, value_expr)?;
-            let value_type = match value_type {
-                LuaType::Variadic(multi) => multi.get_type(0).cloned().unwrap_or(LuaType::Nil),
-                LuaType::Def(ref_id) => LuaType::Ref(ref_id),
-                other => other,
-            };
-            fields.insert(member_key, value_type);
-        }
-
-        if !fields.is_empty() {
-            return Ok(LuaType::Object(
-                LuaObjectType::new_with_fields(fields, Vec::new()).into(),
-            ));
-        }
-    }
-
-    infer_expr(db, context.cache, arg_expr.clone())
+    infer_generic_arg_type_with_closure_params(db, context, arg_expr, use_inline_table_object, None)
 }
 
 fn type_needs_structural_table_arg(db: &DbIndex, typ: &LuaType, depth: usize) -> bool {

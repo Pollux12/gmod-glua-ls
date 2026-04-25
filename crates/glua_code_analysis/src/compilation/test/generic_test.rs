@@ -615,10 +615,112 @@ mod test {
         let call_ty = semantic_model
             .infer_expr(LuaExpr::CallExpr(call_expr))
             .expect("Call type must resolve");
-        let expected = ws.ty("fun(value: string): number");
+        let expected = ws.ty("fun(value: string): integer");
         assert_eq!(call_ty, expected);
 
         let seen_ty = ws.expr_ty("seen");
+        assert_eq!(seen_ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_generic_array_map_return_context_flows_into_callback_param() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@alias ValueBox<T> { value: T }
+
+            ---@generic T, U
+            ---@param cb fun(value: T): U
+            ---@return fun(values: T[]): U[]
+            function array_map(cb) end
+
+            ---@type fun(values: string[]): ValueBox<string>[]
+            local mapped = array_map(function(value)
+                array_map_seen = value
+                return { value = value }
+            end)
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("fun(values: string[]): { value: string }[]");
+        assert_eq!(call_ty, expected);
+
+        let seen_ty = ws.expr_ty("array_map_seen");
+        assert_eq!(seen_ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_generic_array_map_generic_return_context_preserves_contextual_type_param() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@alias ValueBox<T> { value: T }
+
+            ---@generic T, U
+            ---@param cb fun(value: T): U
+            ---@return fun(values: T[]): U[]
+            function array_map(cb) end
+
+            ---@type fun<A>(values: A[]): ValueBox<A>[]
+            local mapped = array_map(function(value)
+                return { value = value }
+            end)
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("fun<A>(values: A[]): { value: A }[]");
+        assert_eq!(call_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_array_map_callback_return_overrides_contextual_return_candidate() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@generic T, U
+            ---@param cb fun(value: T): U
+            ---@return fun(values: T[]): U[]
+            function array_map(cb) end
+
+            ---@type fun(values: string[]): number[]
+            local mapped = array_map(function(value)
+                array_map_priority_seen = value
+                return "text"
+            end)
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("fun(values: string[]): string[]");
+        assert_eq!(call_ty, expected);
+
+        let seen_ty = ws.expr_ty("array_map_priority_seen");
         assert_eq!(seen_ty, ws.ty("string"));
     }
 
@@ -676,7 +778,7 @@ mod test {
         let call_ty = semantic_model
             .infer_expr(LuaExpr::CallExpr(call_expr))
             .expect("Call type must resolve");
-        let expected = ws.ty("fun(value: string): number");
+        let expected = ws.ty("fun(value: string): integer");
         assert_eq!(call_ty, expected);
 
         let seen_ty = ws.expr_ty("overloaded_seen");
@@ -709,7 +811,7 @@ mod test {
         let call_ty = semantic_model
             .infer_expr(LuaExpr::CallExpr(call_expr))
             .expect("Call type must resolve");
-        let expected = ws.ty("fun(value: string): number");
+        let expected = ws.ty("fun(value: string): integer");
         assert_eq!(call_ty, expected);
 
         let seen_ty = ws.expr_ty("union_seen");
@@ -757,7 +859,7 @@ mod test {
         let call_ty = semantic_model
             .infer_expr(LuaExpr::CallExpr(call_expr))
             .expect("Call type must resolve");
-        let expected = ws.ty("fun(value: string): number");
+        let expected = ws.ty("fun(value: string): integer");
         assert_eq!(call_ty, expected);
 
         let seen_ty = ws.expr_ty("metatable_seen");
@@ -792,7 +894,7 @@ mod test {
         let call_ty = semantic_model
             .infer_expr(LuaExpr::CallExpr(call_expr))
             .expect("Call type must resolve");
-        assert_eq!(call_ty, ws.ty("number[]"));
+        assert_eq!(call_ty, ws.ty("integer[]"));
 
         let seen_ty = ws.expr_ty("callable_overload_seen");
         assert_eq!(seen_ty, ws.ty("string"));
@@ -826,7 +928,7 @@ mod test {
         let call_ty = semantic_model
             .infer_expr(LuaExpr::CallExpr(call_expr))
             .expect("Call type must resolve");
-        let expected = ws.ty("WrappedArray<number>");
+        let expected = ws.ty("WrappedArray<integer>");
         assert_eq!(call_ty, expected);
 
         let seen_ty = ws.expr_ty("receiver_seen");

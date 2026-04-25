@@ -8,6 +8,8 @@ mod infer_cache_manager;
 mod lua;
 pub(crate) mod unresolve;
 
+pub(crate) use lua::{LuaReturnPoint, analyze_func_body_returns};
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
