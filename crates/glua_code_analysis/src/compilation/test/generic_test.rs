@@ -615,6 +615,43 @@ mod test {
     }
 
     #[test]
+    fn test_conditional_infer_generic_params_use_independent_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@class Source<T>: Box<T>
+            ---@class Pair<A, B>
+
+            ---@alias ExtractFirst<T> T extends Pair<Box<infer A>, Box<infer B>> and A or unknown
+            ---@alias ExtractSecond<T> T extends Pair<Box<infer A>, Box<infer B>> and B or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return ExtractFirst<T>
+            function extract_first(value) end
+
+            ---@generic T
+            ---@param value T
+            ---@return ExtractSecond<T>
+            function extract_second(value) end
+
+            ---@type Pair<Source<string>, Source<number>>
+            local pair
+
+            first = extract_first(pair)
+            second = extract_second(pair)
+            "#,
+        );
+
+        let first_ty = ws.expr_ty("first");
+        let second_ty = ws.expr_ty("second");
+        assert_eq!(ws.humanize_type(first_ty), "string");
+        assert_eq!(ws.humanize_type(second_ty), "number");
+    }
+
+    #[test]
     fn test_generic_identity_table_literal_still_allows_later_field_inference() {
         let mut ws = VirtualWorkspace::new();
 

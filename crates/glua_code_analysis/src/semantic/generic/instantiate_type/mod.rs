@@ -983,7 +983,7 @@ fn collect_infer_from_matching_generic_params(
             source_param,
             pattern_param,
             &mut branch_assignments,
-            infer_guard,
+            &infer_guard.fork(),
         ) {
             return false;
         }
