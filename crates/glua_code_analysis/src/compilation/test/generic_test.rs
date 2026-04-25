@@ -530,6 +530,37 @@ mod test {
     }
 
     #[test]
+    fn test_generic_return_context_combines_repeated_candidates() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Dog
+            ---@class Cat
+            ---@class Pair<A, B>
+
+            ---@generic T
+            ---@return Pair<T, T>
+            function make_pair() end
+
+            ---@type Pair<Dog, Cat>
+            local pair = make_pair()
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("Pair<Dog|Cat, Dog|Cat>");
+        assert_eq!(call_ty, expected);
+    }
+
+    #[test]
     fn test_generic_return_context_flows_into_callback_param() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(

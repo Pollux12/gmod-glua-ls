@@ -21,8 +21,8 @@ use crate::{
     InferGuardRef,
     semantic::{
         generic::{
-            InferenceContext, TplContext, TypeSubstitutor, get_tpl_ref_extend_type,
-            instantiate_doc_function, tpl_pattern_match,
+            InferenceContext, InferencePriority, TplContext, TypeSubstitutor,
+            get_tpl_ref_extend_type, instantiate_doc_function, tpl_pattern_match,
         },
         infer::narrow::get_type_at_call_expr_inline_cast,
         infer_expr_semantic_decl,
@@ -892,7 +892,11 @@ fn infer_contextual_return_type(
             substitutor: &mut inference,
             call_expr: Some(call_expr.clone()),
         };
-        tpl_pattern_match(&mut context, ret_type, &return_hint).ok()?;
+        context
+            .with_inference_priority(InferencePriority::ContextualReturn, true, |context| {
+                tpl_pattern_match(context, ret_type, &return_hint)
+            })
+            .ok()?;
     }
 
     let instantiated = instantiate_type_generic(db, ret_type, inference.substitutor());

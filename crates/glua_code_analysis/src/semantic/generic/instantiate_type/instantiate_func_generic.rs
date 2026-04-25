@@ -248,7 +248,9 @@ fn infer_generic_types_from_call(
         && func.get_ret().contain_tpl()
         && !context.substitutor.is_infer_all_tpl()
     {
-        tpl_pattern_match(context, func.get_ret(), return_hint)?;
+        context.with_inference_priority(InferencePriority::ContextualReturn, true, |context| {
+            tpl_pattern_match(context, func.get_ret(), return_hint)
+        })?;
     }
 
     if !context.substitutor.is_infer_all_tpl() {
