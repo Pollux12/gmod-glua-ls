@@ -308,9 +308,13 @@ fn find_index_generic(
     };
 
     let generic_params = generic.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
     let type_index = db.get_type_index();
     let type_decl = type_index.get_type_decl(&type_decl_id)?;
+    let substitutor = if type_decl.is_alias() {
+        TypeSubstitutor::from_alias(db, generic_params.clone(), type_decl_id.clone())
+    } else {
+        TypeSubstitutor::from_type_decl(db, generic_params.clone(), type_decl_id.clone())
+    };
 
     if type_decl.is_alias() {
         if let Some(origin_type) = type_decl.get_alias_origin(db, Some(&substitutor)) {

@@ -612,6 +612,88 @@ mod test {
     }
 
     #[test]
+    fn test_conditional_infer_from_generic_alias_source() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+            ---@alias Wrapped<T> Schema<T>
+            ---@alias Infer<T> T extends Schema<infer U> and U or unknown
+
+            ---@generic T
+            ---@param schema T
+            ---@return Infer<T>
+            function infer(schema) end
+
+            ---@type Wrapped<string>
+            local wrapped
+
+            value = infer(wrapped)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "string");
+    }
+
+    #[test]
+    fn test_conditional_infer_instantiates_nested_generic_super_with_decl_tpl_id() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Pair<A, B>
+
+            ---@generic Outer
+            function setup()
+                ---@class Nested<Inner>: Pair<Outer, Inner>
+            end
+
+            ---@alias ExtractInner<T> T extends Pair<any, infer U> and U or unknown
+
+            ---@type ExtractInner<Nested<string>>
+            value = nil
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value number
+            function take_number(value) end
+
+            take_number(value)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nested_generic_super_member_instantiates_decl_tpl_id() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Base<T>
+            ---@field value T
+
+            ---@generic Outer
+            function setup()
+                ---@class Nested<Inner>: Base<Inner>
+            end
+
+            ---@type Nested<string>
+            local nested
+
+            value = nested.value
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "string");
+    }
+
+    #[test]
     fn test_generic_identity_object_literal_still_allows_later_field_inference() {
         let mut ws = VirtualWorkspace::new();
 

@@ -51,16 +51,25 @@ impl FileGenericIndex {
         params_id
     }
 
-    pub fn append_generic_param(&mut self, scope_id: GenericParamId, param: GenericParam) {
-        if let Some(scope) = self.generic_params.get_mut(scope_id.id) {
-            scope.insert_param(param);
-        }
+    pub fn append_generic_param(
+        &mut self,
+        scope_id: GenericParamId,
+        param: GenericParam,
+    ) -> Option<GenericParam> {
+        self.generic_params
+            .get_mut(scope_id.id)
+            .map(|scope| scope.insert_param(param))
     }
 
-    pub fn append_generic_params(&mut self, scope_id: GenericParamId, params: Vec<GenericParam>) {
-        for param in params {
-            self.append_generic_param(scope_id, param);
-        }
+    pub fn append_generic_params(
+        &mut self,
+        scope_id: GenericParamId,
+        params: Vec<GenericParam>,
+    ) -> Vec<GenericParam> {
+        params
+            .into_iter()
+            .filter_map(|param| self.append_generic_param(scope_id, param))
+            .collect()
     }
 
     pub fn set_param_constraint(
@@ -140,11 +149,13 @@ impl FileGenericIndex {
             if let Some(params) = self.generic_params.get(*params_id)
                 && let Some((id, param)) = params.params.get(name)
             {
-                let tpl_id = if params.is_func {
-                    GenericTplId::Func(*id as u32)
-                } else {
-                    GenericTplId::Type(*id as u32)
-                };
+                let tpl_id = param.tpl_id.unwrap_or({
+                    if params.is_func {
+                        GenericTplId::Func(*id as u32)
+                    } else {
+                        GenericTplId::Type(*id as u32)
+                    }
+                });
                 return Some((tpl_id, param.type_constraint.clone()));
             }
         }
@@ -233,10 +244,17 @@ impl TagGenericParams {
         }
     }
 
-    fn insert_param(&mut self, param: GenericParam) {
+    fn insert_param(&mut self, param: GenericParam) -> GenericParam {
         let current_index = self.next_index;
         self.next_index += 1;
+        let tpl_id = if self.is_func {
+            GenericTplId::Func(current_index as u32)
+        } else {
+            GenericTplId::Type(current_index as u32)
+        };
+        let param = param.with_tpl_id(tpl_id);
         self.params
-            .insert(param.name.to_string(), (current_index, param));
+            .insert(param.name.to_string(), (current_index, param.clone()));
+        param
     }
 }

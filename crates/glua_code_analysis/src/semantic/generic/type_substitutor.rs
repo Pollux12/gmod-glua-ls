@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::tpl_pattern::constant_decay;
-use crate::{GenericTplId, LuaType, LuaTypeDeclId};
+use crate::{DbIndex, GenericTplId, LuaType, LuaTypeDeclId};
 
 #[derive(Debug, Clone)]
 pub struct TypeSubstitutor {
@@ -40,25 +40,70 @@ impl TypeSubstitutor {
         }
     }
 
-    pub fn from_alias(type_array: Vec<LuaType>, alias_type_id: LuaTypeDeclId) -> Self {
+    pub fn from_type_decl(
+        db: &DbIndex,
+        type_array: Vec<LuaType>,
+        type_decl_id: LuaTypeDeclId,
+    ) -> Self {
         let type_array = type_array.into_iter().map(|ty| (ty, None)).collect();
-        Self::from_alias_with_structural(type_array, alias_type_id)
+        Self::from_decl_generic_params(db, type_array, type_decl_id, None)
+    }
+
+    pub fn from_alias(
+        db: &DbIndex,
+        type_array: Vec<LuaType>,
+        alias_type_id: LuaTypeDeclId,
+    ) -> Self {
+        let type_array = type_array.into_iter().map(|ty| (ty, None)).collect();
+        Self::from_decl_generic_params(db, type_array, alias_type_id.clone(), Some(alias_type_id))
     }
 
     pub fn from_alias_with_structural(
+        db: &DbIndex,
         type_array: Vec<(LuaType, Option<LuaType>)>,
         alias_type_id: LuaTypeDeclId,
     ) -> Self {
+        Self::from_decl_generic_params(db, type_array, alias_type_id.clone(), Some(alias_type_id))
+    }
+
+    fn from_decl_generic_params(
+        db: &DbIndex,
+        type_array: Vec<(LuaType, Option<LuaType>)>,
+        type_decl_id: LuaTypeDeclId,
+        alias_type_id: Option<LuaTypeDeclId>,
+    ) -> Self {
         let mut tpl_replace_map = HashMap::new();
-        for (i, (ty, structural)) in type_array.into_iter().enumerate() {
-            tpl_replace_map.insert(
-                GenericTplId::Type(i as u32),
-                SubstitutorValue::Type(substitutor_type_value(ty, structural, true)),
-            );
+        let decl_tpl_ids = db
+            .get_type_index()
+            .get_generic_params(&type_decl_id)
+            .and_then(|generic_params| {
+                let mut tpl_ids = Vec::with_capacity(type_array.len());
+                for param in generic_params.iter().take(type_array.len()) {
+                    tpl_ids.push(param.tpl_id?);
+                }
+
+                (tpl_ids.len() == type_array.len()).then_some(tpl_ids)
+            });
+
+        if let Some(tpl_ids) = decl_tpl_ids {
+            for (tpl_id, (ty, structural)) in tpl_ids.into_iter().zip(type_array) {
+                tpl_replace_map.insert(
+                    tpl_id,
+                    SubstitutorValue::Type(substitutor_type_value(ty, structural, true)),
+                );
+            }
+        } else {
+            for (i, (ty, structural)) in type_array.into_iter().enumerate() {
+                tpl_replace_map.insert(
+                    GenericTplId::Type(i as u32),
+                    SubstitutorValue::Type(substitutor_type_value(ty, structural, true)),
+                );
+            }
         }
+
         Self {
             tpl_replace_map,
-            alias_type_id: Some(alias_type_id),
+            alias_type_id,
             self_type: None,
         }
     }

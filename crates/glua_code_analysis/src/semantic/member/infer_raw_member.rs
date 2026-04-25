@@ -87,7 +87,10 @@ fn infer_owner_raw_member_type(
     member_owner: LuaMemberOwner,
     member_key: &LuaMemberKey,
 ) -> RawGetMemberTypeResult {
-    if let Some(member_item) = db.get_member_index().get_member_item(&member_owner, member_key) {
+    if let Some(member_item) = db
+        .get_member_index()
+        .get_member_item(&member_owner, member_key)
+    {
         return member_item.resolve_type(db);
     }
 
@@ -117,7 +120,10 @@ fn infer_owner_raw_member_type(
         return Err(InferFailReason::FieldNotFound);
     }
 
-    if matches!(access_key_type, LuaType::String | LuaType::Number | LuaType::Integer) {
+    if matches!(
+        access_key_type,
+        LuaType::String | LuaType::Number | LuaType::Integer
+    ) {
         result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
     }
 
@@ -275,11 +281,15 @@ fn infer_generic_raw_member_type(
 ) -> RawGetMemberTypeResult {
     let base_ref_id = generic_type.get_base_type_id_ref();
     let generic_params = generic_type.get_params();
-    let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
     let type_decl = db
         .get_type_index()
         .get_type_decl(&base_ref_id)
         .ok_or(InferFailReason::None)?;
+    let substitutor = if type_decl.is_alias() {
+        TypeSubstitutor::from_alias(db, generic_params.clone(), base_ref_id.clone())
+    } else {
+        TypeSubstitutor::from_type_decl(db, generic_params.clone(), base_ref_id.clone())
+    };
 
     if let Some(origin) = type_decl.get_alias_origin(db, Some(&substitutor)) {
         return infer_raw_member_type(db, &origin, member_key);

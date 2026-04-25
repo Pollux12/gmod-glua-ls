@@ -337,8 +337,9 @@ pub fn build_self_type(db: &DbIndex, self_type: &LuaType) -> LuaType {
                     if let Some(t) = &generic_param.type_constraint {
                         params.push(t.clone());
                     } else {
+                        let tpl_id = generic_param.tpl_id.unwrap_or(GenericTplId::Type(i as u32));
                         params.push(LuaType::TplRef(Arc::new(GenericTpl::new(
-                            GenericTplId::Type(i as u32),
+                            tpl_id,
                             ArcIntern::new(generic_param.name.clone()),
                             None,
                         ))));

@@ -318,6 +318,7 @@ pub fn instantiate_generic(
         && type_decl.is_alias()
     {
         let new_substitutor = TypeSubstitutor::from_alias_with_structural(
+            db,
             new_params_with_structural,
             type_decl_id.clone(),
         );
@@ -800,6 +801,7 @@ fn collect_infer_from_generic_to_generic(
         && source_decl.is_alias()
     {
         let substitutor = TypeSubstitutor::from_alias(
+            db,
             source_generic.get_params().clone(),
             source_generic.get_base_type_id_ref().clone(),
         );
@@ -821,7 +823,11 @@ fn collect_infer_from_generic_to_generic(
         .get_type_index()
         .get_super_types(source_generic.get_base_type_id_ref())
     {
-        let substitutor = TypeSubstitutor::from_type_array(source_generic.get_params().clone());
+        let substitutor = TypeSubstitutor::from_type_decl(
+            db,
+            source_generic.get_params().clone(),
+            source_generic.get_base_type_id_ref().clone(),
+        );
         for super_type in super_types {
             let super_type = instantiate_type_generic(db, &super_type, &substitutor);
             let mut candidate_assignments = assignments.clone();
