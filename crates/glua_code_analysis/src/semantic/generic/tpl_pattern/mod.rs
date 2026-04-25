@@ -9,10 +9,10 @@ use rowan::NodeOrToken;
 use smol_str::SmolStr;
 
 use crate::{
-    GenericTplId, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaArrayType,
-    LuaFunctionType, LuaMappedType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner, LuaObjectType,
-    LuaSemanticDeclId, LuaTupleType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel, VariadicType,
-    check_type_compact,
+    GenericTplId, InferFailReason, InferencePriority, LuaAliasCallKind, LuaAliasCallType,
+    LuaArrayType, LuaFunctionType, LuaMappedType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
+    LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel,
+    VariadicType, check_type_compact,
     db_index::{DbIndex, LuaGenericType, LuaType},
     infer_node_semantic_decl,
     semantic::{
@@ -542,10 +542,16 @@ fn mapped_tpl_pattern_match(
     }
 
     if !fields.is_empty() {
-        context.substitutor.insert_type(
-            source_tpl_id,
-            LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into()),
+        context.with_inference_priority(
+            InferencePriority::HomomorphicMappedType,
             true,
+            |context| {
+                context.substitutor.insert_type(
+                    source_tpl_id,
+                    LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into()),
+                    true,
+                );
+            },
         );
     }
 

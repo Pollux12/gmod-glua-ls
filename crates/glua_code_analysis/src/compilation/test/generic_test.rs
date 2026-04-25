@@ -1285,6 +1285,30 @@ mod test {
     }
 
     #[test]
+    fn test_mapped_inference_is_lower_priority_than_direct_inference() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@alias Mirror<T> { [K in keyof T]: T[K]; }
+
+            ---@generic T
+            ---@param secondary Mirror<T>
+            ---@param primary T
+            ---@return T
+            function mapped_then_direct(secondary, primary) end
+
+            result = mapped_then_direct({ x = 1 }, { x = "direct", y = "name" })
+            "#,
+        );
+
+        let x_ty = ws.expr_ty("result.x");
+        let y_ty = ws.expr_ty("result.y");
+        assert_eq!(ws.humanize_type(x_ty), "\"direct\"");
+        assert_eq!(ws.humanize_type(y_ty), "\"name\"");
+    }
+
+    #[test]
     fn test_conditional_infer_from_concrete_class_super_generic() {
         let mut ws = VirtualWorkspace::new();
 
