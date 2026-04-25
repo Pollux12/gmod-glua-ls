@@ -15,6 +15,30 @@ env:
   CLICOLOR: 1
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.clippy.toml'
+              - 'rustfmt.toml'
+              - 'crates/**'
+              - 'tools/**'
+              - 'vendor/emmylua_codestyle/**'
+              - '.github/workflows/test.yml'
+
   clippy:
     name: Clippy Lint Check
     runs-on: ubuntu-latest
@@ -44,6 +68,8 @@ jobs:
 
   macos-check:
     name: Experimental macOS cargo check (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ${{ matrix.runner }}
     continue-on-error: true
     strategy:
