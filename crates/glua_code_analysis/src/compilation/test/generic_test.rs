@@ -697,6 +697,110 @@ mod test {
     }
 
     #[test]
+    fn test_generic_field_combinator_infers_from_named_callback() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Collection<T>
+            local Collection = {}
+
+            ---@class Combinators
+            ---@field map (fun<T, U>(c: Collection<T>, cb: fun(x: T): U): Collection<U>) | (fun<T>(c: Collection<T>, cb: fun(x: T): any): Collection<any>)
+
+            ---@type Combinators
+            local combinators = {}
+
+            ---@type Collection<number>
+            local collection = {}
+
+            ---@param value number
+            ---@return string
+            local function stringify(value)
+                named_callback_seen = value
+                return ""
+            end
+
+            local result = combinators.map(collection, stringify)
+            "#,
+        );
+
+        let tree = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("Tree must exist");
+        let call_expr = tree
+            .get_chunk_node()
+            .descendants::<LuaCallExpr>()
+            .last()
+            .expect("call expression must exist");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        assert_eq!(call_ty, ws.ty("Collection<string>"));
+
+        let seen_ty = ws.expr_ty("named_callback_seen");
+        assert_eq!(seen_ty, ws.ty("number"));
+    }
+
+    #[test]
+    fn test_generic_field_combinator_uses_explicit_type_args_for_callback() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Collection<T>
+            local Collection = {}
+
+            ---@class Combinators
+            ---@field map (fun<T, U>(c: Collection<T>, cb: fun(x: T): U): Collection<U>) | (fun<T>(c: Collection<T>, cb: fun(x: T): any): Collection<any>)
+
+            ---@type Combinators
+            local combinators = {}
+
+            ---@type Collection<number>
+            local collection = {}
+
+            local result = combinators.map--[[@<number, string>]](collection, function(value)
+                explicit_callback_seen = value
+                return ""
+            end)
+            "#,
+        );
+
+        let tree = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("Tree must exist");
+        let call_expr = tree
+            .get_chunk_node()
+            .descendants::<LuaCallExpr>()
+            .last()
+            .expect("call expression must exist");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        assert_eq!(call_ty, ws.ty("Collection<string>"));
+
+        let seen_ty = ws.expr_ty("explicit_callback_seen");
+        assert_eq!(seen_ty, ws.ty("number"));
+    }
+
+    #[test]
     fn test_issue_646() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
