@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::{DiagnosticCode, VirtualWorkspace};
+    use glua_parser::{LuaCallExpr, LuaExpr};
 
     #[test]
     fn test_issue_586() {
@@ -204,6 +205,33 @@ mod test {
         let box_ty = ws.expr_ty("box");
         let expected = ws.ty("Box<string|number>");
         assert_eq!(box_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_return_infers_from_local_doc_context() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@generic T
+            ---@return T
+            function make() end
+
+            ---@type string
+            local value = make()
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("string");
+        assert_eq!(call_ty, expected);
     }
 
     #[test]

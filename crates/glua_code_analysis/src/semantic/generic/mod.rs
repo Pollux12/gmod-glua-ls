@@ -13,6 +13,7 @@ use glua_parser::LuaExpr;
 pub use instantiate_type::*;
 use rowan::NodeOrToken;
 pub use tpl_context::TplContext;
+pub(crate) use tpl_pattern::tpl_pattern_match;
 pub use tpl_pattern::tpl_pattern_match_args;
 pub use type_substitutor::TypeSubstitutor;
 

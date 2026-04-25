@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaSyntaxKind};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaLocalStat, LuaSyntaxKind};
 use rowan::TextRange;
 
 use super::{
@@ -9,14 +9,18 @@ use super::{
 };
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
 use crate::{
-    CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType, LuaInstanceType,
-    LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature, LuaSignatureId,
-    LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, ReturnTypeKind, VariadicType,
+    CacheEntry, DbIndex, InFiled, LuaArrayType, LuaDeclId, LuaFunctionType, LuaGenericType,
+    LuaInstanceType, LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature,
+    LuaSignatureId, LuaTupleType, LuaType, LuaTypeCache, LuaTypeDeclId, LuaUnionType,
+    ReturnTypeKind, VariadicType,
 };
 use crate::{
     InferGuardRef,
     semantic::{
-        generic::{TypeSubstitutor, get_tpl_ref_extend_type, instantiate_doc_function},
+        generic::{
+            TplContext, TypeSubstitutor, get_tpl_ref_extend_type, instantiate_doc_function,
+            tpl_pattern_match,
+        },
         infer::narrow::get_type_at_call_expr_inline_cast,
         infer_expr_semantic_decl,
     },
@@ -776,7 +780,7 @@ pub fn infer_call_expr(
 
     let prefix_expr = call_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
     let prefix_type = infer_expr(db, cache, prefix_expr)?;
-    let ret_type = infer_call_expr_func(
+    let call_func = infer_call_expr_func(
         db,
         cache,
         call_expr.clone(),
@@ -784,8 +788,14 @@ pub fn infer_call_expr(
         &InferGuard::new(),
         None,
     )?
-    .get_ret()
     .clone();
+    let mut ret_type = call_func.get_ret().clone();
+    if ret_type.contain_tpl()
+        && let Some(context_ret_type) =
+            infer_contextual_return_type(db, cache, &call_expr, call_func.as_ref())
+    {
+        ret_type = context_ret_type;
+    }
 
     if let Some(tree) = db.get_flow_index().get_flow_tree(&cache.get_file_id())
         && let Some(flow_id) = tree.get_flow_id(call_expr.get_syntax_id())
@@ -796,6 +806,60 @@ pub fn infer_call_expr(
     }
 
     Ok(ret_type)
+}
+
+fn infer_contextual_return_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    call_func: &LuaFunctionType,
+) -> Option<LuaType> {
+    let return_hint = get_contextual_return_hint(db, cache, call_expr)?;
+    let ret_type = call_func.get_ret();
+    if !ret_type.contain_tpl() {
+        return None;
+    }
+
+    let mut substitutor = TypeSubstitutor::new();
+    let mut context = TplContext {
+        db,
+        cache,
+        substitutor: &mut substitutor,
+        call_expr: Some(call_expr.clone()),
+    };
+    tpl_pattern_match(&mut context, ret_type, &return_hint).ok()?;
+
+    let instantiated = instantiate_type_generic(db, ret_type, &substitutor);
+    if &instantiated == ret_type {
+        None
+    } else {
+        Some(instantiated)
+    }
+}
+
+fn get_contextual_return_hint(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaType> {
+    get_local_contextual_return_hint(db, cache, call_expr)
+}
+
+fn get_local_contextual_return_hint(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaType> {
+    let local_stat = call_expr.get_parent::<LuaLocalStat>()?;
+    let value_index = local_stat
+        .get_value_exprs()
+        .position(|expr| expr.syntax() == call_expr.syntax())?;
+    let local_name = local_stat.get_local_name_list().nth(value_index)?;
+    let decl_id = LuaDeclId::new(cache.get_file_id(), local_name.get_position());
+    match db.get_type_index().get_type_cache(&decl_id.into())? {
+        LuaTypeCache::DocType(typ) => Some(typ.clone()),
+        _ => None,
+    }
 }
 
 fn check_can_infer(
