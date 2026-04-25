@@ -1032,6 +1032,61 @@ mod test {
     }
 
     #[test]
+    fn test_generic_tuple_callbacks_share_intra_expression_inference() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@alias Producer<T> fun(): T
+            ---@alias Consumer<T> fun(value: T)
+
+            ---@generic T
+            ---@param callbacks [Producer<T>, Consumer<T>]
+            function use_callbacks(callbacks) end
+
+            use_callbacks({
+                function()
+                    return 1
+                end,
+                function(value)
+                    tuple_callback_seen = value
+                end,
+            })
+            "#,
+        );
+
+        let seen_ty = ws.expr_ty("tuple_callback_seen");
+        assert_eq!(seen_ty, ws.ty("integer"));
+    }
+
+    #[test]
+    fn test_generic_object_callbacks_share_intra_expression_inference() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@alias Producer<T> fun(): T
+            ---@alias Consumer<T> fun(value: T)
+            ---@alias CallbackPair<T> { produce: Producer<T>, consume: Consumer<T> }
+
+            ---@generic T
+            ---@param callbacks CallbackPair<T>
+            function use_callbacks(callbacks) end
+
+            use_callbacks({
+                produce = function()
+                    return "value"
+                end,
+                consume = function(value)
+                    object_callback_seen = value
+                end,
+            })
+            "#,
+        );
+
+        let seen_ty = ws.expr_ty("object_callback_seen");
+        assert_eq!(seen_ty, ws.ty("string"));
+    }
+
+    #[test]
     fn test_generic_combinator_uses_first_arg_to_type_callback_params() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
