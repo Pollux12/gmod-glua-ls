@@ -2010,3 +2010,26 @@ fn test_doc_string_union_with_legacy_wrapped_literals_stays_strict() {
         "#
     ));
 }
+
+#[test]
+fn test_array_of_derived_class_keeps_declared_child_fields() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class BaseItem
+        ---@field id string
+
+        ---@class DerivedItem : BaseItem
+        ---@field kind? string
+
+        ---@type DerivedItem[]
+        local items = {
+            {
+                id = "first",
+                kind = "visible",
+            },
+        }
+        "#
+    ));
+}

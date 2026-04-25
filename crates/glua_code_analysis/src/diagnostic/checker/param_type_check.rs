@@ -1,4 +1,6 @@
-use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr};
+use glua_parser::{
+    LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaTableExpr,
+};
 use rowan::TextRange;
 
 use crate::{
@@ -103,7 +105,17 @@ fn check_call_expr(
                     continue;
                 }
             }
-            let result = semantic_model.type_check_detail(&check_type, arg_type);
+            let arg_expr = match (colon_call, colon_define) {
+                (true, false) if idx == 0 => None,
+                (true, false) => arg_exprs.get(idx - 1),
+                _ => arg_exprs.get(idx),
+            };
+
+            let result = if arg_expr.map(is_fresh_table_expr).unwrap_or(false) {
+                semantic_model.type_check_detail(&check_type, arg_type)
+            } else {
+                semantic_model.type_check_detail_no_excess(&check_type, arg_type)
+            };
             if result.is_err() {
                 // `never` and `SelfInfer` indicate type inference limitations, skip the diagnostic.
                 // When the original param was SelfInfer and the arg is a class/ref/def type,
@@ -149,12 +161,6 @@ fn check_call_expr(
                     }
                 }
 
-                let arg_expr = match (colon_call, colon_define) {
-                    (true, false) if idx == 0 => None,
-                    (true, false) => arg_exprs.get(idx - 1),
-                    _ => arg_exprs.get(idx),
-                };
-
                 try_add_diagnostic(
                     context,
                     semantic_model,
@@ -169,6 +175,10 @@ fn check_call_expr(
     }
 
     Some(())
+}
+
+fn is_fresh_table_expr(expr: &LuaExpr) -> bool {
+    LuaTableExpr::cast(expr.syntax().clone()).is_some()
 }
 
 fn check_variadic_param_match_args(

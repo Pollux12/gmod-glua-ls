@@ -30,6 +30,43 @@ mod test {
     }
 
     #[test]
+    fn test_local_table_field_assigned_in_function_body_not_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+                local a = {}
+                function f()
+                    a.customValue = 1
+                end
+                print(a.customValue)
+                fieldTypeProbe = a.customValue
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == undefined_field_code)
+            .collect();
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected undefined-field diagnostics: {undefined_fields:#?}"
+        );
+
+        let field_ty = ws.expr_ty("fieldTypeProbe");
+        let integer_ty = ws.ty("integer");
+        assert!(ws.check_type(&field_ty, &integer_ty));
+        assert_eq!(ws.humanize_type(field_ty), "1");
+    }
+
+    #[test]
     fn test_numeric_for_index_expr_on_inferred_setmetatable_table() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(

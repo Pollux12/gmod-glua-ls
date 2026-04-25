@@ -2316,4 +2316,132 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn test_open_class_param_allows_extra_fresh_table_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class OpenOptions
+            ---@field mode string
+
+            ---@param options OpenOptions
+            local function useOptions(options) end
+
+            useOptions({
+                mode = "fast",
+                extra = 1,
+            })
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_open_class_param_allows_extra_nonfresh_table_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class OpenOptionsFromVariable
+            ---@field mode string
+
+            ---@param options OpenOptionsFromVariable
+            local function useOptions(options) end
+
+            local options = {
+                mode = "fast",
+                extra = 1,
+            }
+
+            useOptions(options)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_exact_class_param_rejects_extra_fresh_table_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class (exact) ExactOptions
+            ---@field mode string
+
+            ---@param options ExactOptions
+            local function useOptions(options) end
+
+            useOptions({
+                mode = "fast",
+                extra = 1,
+            })
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_structural_object_param_rejects_extra_fresh_table_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param options { mode: string }
+            local function useOptions(options) end
+
+            useOptions({
+                mode = "fast",
+                extra = 1,
+            })
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_structural_object_param_allows_extra_nonfresh_table_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param options { mode: string }
+            local function useOptions(options) end
+
+            local options = {
+                mode = "fast",
+                extra = 1,
+            }
+
+            useOptions(options)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_broad_table_union_member_accepts_returned_object() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param options { camera?: "2D"|table }
+            local function render(options) end
+
+            local function makeCamera()
+                return {
+                    x = 0,
+                    y = 0,
+                    mode = "3D",
+                }
+            end
+
+            render({
+                camera = makeCamera(),
+            })
+        "#
+        ));
+    }
 }

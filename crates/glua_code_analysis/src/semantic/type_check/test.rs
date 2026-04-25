@@ -117,7 +117,7 @@ mod test {
             r#"
         ---@class Empty
 
-        ---@class Person
+        ---@class (exact) Person
         ---@field name string
         "#,
         );
@@ -142,7 +142,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         ws.def(
             r#"
-        ---@class Person
+        ---@class (exact) Person
         ---@field name string
         "#,
         );
@@ -172,13 +172,9 @@ mod test {
         let extra_literal_ty = ws.expr_ty("{ a = 1, c = 3 }");
         assert!(!ws.check_type(&union_ty, &extra_literal_ty));
 
-        let discriminated_union_ty =
-            ws.ty("{ kind: 'a', a: integer } | { kind: 'b', b: integer }");
+        let discriminated_union_ty = ws.ty("{ kind: 'a', a: integer } | { kind: 'b', b: integer }");
         let matched_discriminant_literal_ty = ws.expr_ty("{ kind = 'a', a = 1, b = 2 }");
-        assert!(!ws.check_type(
-            &discriminated_union_ty,
-            &matched_discriminant_literal_ty
-        ));
+        assert!(!ws.check_type(&discriminated_union_ty, &matched_discriminant_literal_ty));
     }
 
     #[test]

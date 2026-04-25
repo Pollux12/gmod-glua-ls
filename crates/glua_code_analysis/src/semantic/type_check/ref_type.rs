@@ -4,6 +4,7 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, LuaTypeCache, LuaTypeDecl,
     LuaTypeDeclId, RenderLevel, humanize_type,
     semantic::{
+        LuaMemberInfo,
         member::find_members,
         type_check::{
             intersection_utils::intersection_to_object, type_check_context::TypeCheckContext,
@@ -344,8 +345,10 @@ fn check_ref_type_compact_table(
                 .clone(),
         );
         for super_type in supers {
+            let mut super_context = context.clone();
+            super_context.skip_excess_property_checks = true;
             check_general_type_compact(
-                context,
+                &mut super_context,
                 &super_type,
                 &table_type,
                 check_guard.next_level()?,
@@ -354,6 +357,7 @@ fn check_ref_type_compact_table(
     }
 
     if !context.skip_excess_property_checks
+        && ref_requires_excess_property_checks(context, source_type_id)
         && let Some(all_source_members) =
             find_members(context.db, &LuaType::Ref(source_type_id.clone()))
         && !all_source_members.is_empty()
@@ -397,12 +401,28 @@ fn check_ref_type_compact_table(
             }
 
             return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                t!("unknown member %{name}, in table", name = table_key.to_path()).to_string(),
+                t!(
+                    "unknown member %{name}, in table",
+                    name = table_key.to_path()
+                )
+                .to_string(),
             ));
         }
     }
 
     Ok(())
+}
+
+fn ref_requires_excess_property_checks(
+    context: &TypeCheckContext,
+    type_id: &LuaTypeDeclId,
+) -> bool {
+    context
+        .db
+        .get_type_index()
+        .get_type_decl(type_id)
+        .map(|decl| decl.is_exact())
+        .unwrap_or(false)
 }
 
 fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {
@@ -475,7 +495,72 @@ fn check_ref_type_compact_object(
         context.mark_key_checked(key);
     }
 
+    if !context.skip_excess_property_checks
+        && ref_requires_excess_property_checks(context, source_type_id)
+    {
+        let Some(all_source_members) =
+            find_members(context.db, &LuaType::Ref(source_type_id.clone()))
+        else {
+            return Ok(());
+        };
+
+        for actual_key in object_type.get_fields().keys() {
+            if all_source_members
+                .iter()
+                .any(|source_member| &source_member.key == actual_key)
+            {
+                continue;
+            }
+
+            if member_key_accepted_by_index(context, &all_source_members, actual_key, check_guard)?
+            {
+                continue;
+            }
+
+            if !context.detail {
+                return Err(TypeCheckFailReason::TypeNotMatch);
+            }
+
+            return Err(TypeCheckFailReason::TypeNotMatchWithReason(
+                t!(
+                    "unknown member %{name}, in table",
+                    name = actual_key.to_path()
+                )
+                .to_string(),
+            ));
+        }
+    }
+
     Ok(())
+}
+
+fn member_key_accepted_by_index(
+    context: &mut TypeCheckContext,
+    source_members: &[LuaMemberInfo],
+    table_key: &LuaMemberKey,
+    check_guard: TypeCheckGuard,
+) -> Result<bool, TypeCheckFailReason> {
+    let Some(table_key_type) = member_key_type_for_index(table_key) else {
+        return Ok(false);
+    };
+
+    for source_member in source_members {
+        let LuaMemberKey::ExprType(index_key_type) = &source_member.key else {
+            continue;
+        };
+        match check_general_type_compact(
+            context,
+            index_key_type,
+            &table_key_type,
+            check_guard.next_level()?,
+        ) {
+            Ok(_) => return Ok(true),
+            Err(err) if err.is_type_not_match() => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(false)
 }
 
 fn get_object_field_type<'a>(

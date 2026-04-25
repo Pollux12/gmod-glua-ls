@@ -55,6 +55,17 @@ pub fn check_type_compact_detail(
     check_general_type_compact(&mut context, source, compact_type, guard)
 }
 
+pub fn check_type_compact_detail_no_excess(
+    db: &DbIndex,
+    source: &LuaType,
+    compact_type: &LuaType,
+) -> TypeCheckResult {
+    let guard = TypeCheckGuard::new();
+    let mut context = TypeCheckContext::new(db, true, TypeCheckCheckLevel::Normal);
+    context.skip_excess_property_checks = true;
+    check_general_type_compact(&mut context, source, compact_type, guard)
+}
+
 pub fn check_type_compact_with_level(
     db: &DbIndex,
     source: &LuaType,

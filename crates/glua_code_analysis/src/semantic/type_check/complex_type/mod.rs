@@ -321,6 +321,13 @@ fn check_table_const_excess_against_targets(
     table_members: &[(LuaMemberKey, LuaType)],
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
+    if targets
+        .iter()
+        .any(|target| target_allows_unknown_properties(context, target))
+    {
+        return Ok(());
+    }
+
     let target_members = targets
         .iter()
         .filter_map(|target| find_members(context.db, target))
@@ -371,6 +378,24 @@ fn check_table_const_excess_against_targets(
     }
 
     Ok(())
+}
+
+fn target_allows_unknown_properties(context: &TypeCheckContext, target: &LuaType) -> bool {
+    match target {
+        LuaType::Any | LuaType::Unknown | LuaType::Table | LuaType::TableGeneric(_) => true,
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => context
+            .db
+            .get_type_index()
+            .get_type_decl(type_id)
+            .map(|decl| !decl.is_exact())
+            .unwrap_or(true),
+        LuaType::TableOf(_) | LuaType::Generic(_) | LuaType::Instance(_) => true,
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .any(|typ| target_allows_unknown_properties(context, typ)),
+        _ => false,
+    }
 }
 
 fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {

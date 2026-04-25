@@ -125,6 +125,7 @@ fn check_name_expr(
         &value_type,
         false,
         source_is_inferred,
+        expr.as_ref().map(is_fresh_table_expr).unwrap_or(false),
     );
     let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
@@ -175,6 +176,7 @@ fn check_index_expr(
         &value_type,
         true,
         source_is_inferred,
+        expr.as_ref().map(is_fresh_table_expr).unwrap_or(false),
     );
     let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
@@ -464,6 +466,10 @@ fn check_local_stat(
             &value_type,
             false,
             false,
+            value_exprs
+                .get(idx)
+                .map(is_fresh_table_expr)
+                .unwrap_or(false),
         );
         if let Some(expr) = value_exprs.get(idx) {
             check_table_expr(
@@ -603,6 +609,7 @@ fn check_table_expr_content(
             &expr_type,
             allow_nil,
             source_is_inferred,
+            true,
         ) {
             has_diagnostic = has_diagnostic || result;
         }
@@ -631,6 +638,10 @@ fn should_check_nested_table_fields(source_type: &LuaType) -> bool {
             .any(should_check_nested_table_fields),
         _ => false,
     }
+}
+
+fn is_fresh_table_expr(expr: &LuaExpr) -> bool {
+    LuaTableExpr::cast(expr.syntax().clone()).is_some()
 }
 
 fn check_table_last_variadic_type(
@@ -662,6 +673,7 @@ fn check_table_last_variadic_type(
                     expr_type,
                     false,
                     false,
+                    true,
                 ) && result
                 {
                     return Some(true);
@@ -681,6 +693,7 @@ fn check_assign_type_mismatch(
     value_type: &LuaType,
     allow_nil: bool,
     source_is_inferred: bool,
+    is_fresh_table_expr: bool,
 ) -> Option<bool> {
     let source_type = source_type.unwrap_or(&LuaType::Any);
     // 如果一致, 则不进行类型检查
@@ -719,7 +732,11 @@ fn check_assign_type_mismatch(
         _ => {}
     }
 
-    let result = semantic_model.type_check_detail(source_type, value_type);
+    let result = if is_fresh_table_expr {
+        semantic_model.type_check_detail(source_type, value_type)
+    } else {
+        semantic_model.type_check_detail_no_excess(source_type, value_type)
+    };
     if result.is_err() {
         add_type_check_diagnostic(
             context,
