@@ -1453,6 +1453,67 @@ mod test {
     }
 
     #[test]
+    fn test_reverse_mapped_infer_through_tuple_source() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@field value T
+
+            ---@alias Boxified<T> { [K in keyof T]: Box<T[K]>; }
+
+            ---@generic T
+            ---@param value T
+            ---@return Box<T>
+            function box(value) end
+
+            ---@generic T
+            ---@param values Boxified<T>
+            ---@return T
+            function unboxify(values) end
+
+            result = unboxify({
+                box(1),
+                box("two"),
+            })
+            "#,
+        );
+
+        let first_ty = ws.expr_ty("result[1]");
+        let second_ty = ws.expr_ty("result[2]");
+        assert_eq!(ws.humanize_type(first_ty), "integer");
+        assert_eq!(ws.humanize_type(second_ty), "string");
+    }
+
+    #[test]
+    fn test_reverse_mapped_infer_through_array_source() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@field value T
+
+            ---@alias Boxified<T> { [K in keyof T]: Box<T[K]>; }
+
+            ---@generic T
+            ---@param values Boxified<T>
+            ---@return T
+            function unboxify(values) end
+
+            ---@type Box<number>[]
+            local values
+
+            result = unboxify(values)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("result[1]");
+        assert_eq!(ws.humanize_type(value_ty), "number");
+    }
+
+    #[test]
     fn test_mapped_inference_is_lower_priority_than_direct_inference() {
         let mut ws = VirtualWorkspace::new();
 

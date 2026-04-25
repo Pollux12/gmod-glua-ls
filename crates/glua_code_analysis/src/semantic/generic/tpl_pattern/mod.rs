@@ -11,8 +11,8 @@ use smol_str::SmolStr;
 use crate::{
     GenericTplId, InferFailReason, InferencePriority, LuaAliasCallKind, LuaAliasCallType,
     LuaArrayType, LuaFunctionType, LuaMappedType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
-    LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel,
-    TypeOps, VariadicType, check_type_compact,
+    LuaObjectType, LuaSemanticDeclId, LuaTupleStatus, LuaTupleType, LuaTypeDeclId, LuaUnionType,
+    SemanticDeclLevel, TypeOps, VariadicType, check_type_compact,
     db_index::{DbIndex, LuaGenericType, LuaType},
     infer_node_semantic_decl,
     semantic::{
@@ -560,13 +560,14 @@ fn mapped_tpl_pattern_match(
     }
 
     if !fields.is_empty() {
+        let source_type = reverse_mapped_source_type(fields);
         context.with_inference_priority(
             InferencePriority::HomomorphicMappedType,
             true,
             |context| {
                 context.substitutor.insert_type(
                     source_info.source_tpl_id,
-                    LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into()),
+                    source_type,
                     true,
                 );
             },
@@ -586,6 +587,61 @@ fn reverse_mapped_source_field_type(
     }
 
     target_type
+}
+
+fn reverse_mapped_source_type(fields: HashMap<LuaMemberKey, LuaType>) -> LuaType {
+    if let Some(array_type) = reverse_mapped_array_source_type(&fields) {
+        return array_type;
+    }
+
+    if let Some(tuple_type) = reverse_mapped_tuple_source_type(&fields) {
+        return tuple_type;
+    }
+
+    LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into())
+}
+
+fn reverse_mapped_array_source_type(fields: &HashMap<LuaMemberKey, LuaType>) -> Option<LuaType> {
+    if fields.len() != 1 {
+        return None;
+    }
+
+    let (key, value) = fields.iter().next()?;
+    match key {
+        LuaMemberKey::ExprType(LuaType::Integer | LuaType::Number) => Some(LuaType::Array(
+            LuaArrayType::from_base_type(value.clone()).into(),
+        )),
+        _ => None,
+    }
+}
+
+fn reverse_mapped_tuple_source_type(fields: &HashMap<LuaMemberKey, LuaType>) -> Option<LuaType> {
+    let mut members = Vec::with_capacity(fields.len());
+    for (key, value) in fields {
+        let LuaMemberKey::Integer(index) = key else {
+            return None;
+        };
+        if *index <= 0 {
+            return None;
+        }
+
+        members.push((*index as usize, value.clone()));
+    }
+
+    members.sort_by_key(|(index, _)| *index);
+    for (offset, (index, _)) in members.iter().enumerate() {
+        if *index != offset + 1 {
+            return None;
+        }
+    }
+
+    Some(LuaType::Tuple(
+        LuaTupleType::new(
+            members.into_iter().map(|(_, value)| value).collect(),
+            LuaTupleStatus::InferResolve,
+        )
+        .into(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -639,6 +695,16 @@ fn mapped_target_fields(
             .get_fields()
             .iter()
             .map(|(key, ty)| (key.clone(), ty.clone()))
+            .collect()),
+        LuaType::Array(target_array) => Ok(vec![(
+            LuaMemberKey::ExprType(LuaType::Integer),
+            target_array.get_base().clone(),
+        )]),
+        LuaType::Tuple(target_tuple) => Ok(target_tuple
+            .get_types()
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (LuaMemberKey::Integer((index + 1) as i64), ty.clone()))
             .collect()),
         LuaType::TableConst(_) | LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
             let members = get_member_map(context.db, target).ok_or(InferFailReason::None)?;
