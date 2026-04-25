@@ -4,7 +4,10 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaLocalStat, LuaSyntaxKind}
 use rowan::TextRange;
 
 use super::{
-    super::{InferGuard, LuaInferCache, instantiate_type_generic, resolve_signature},
+    super::{
+        InferGuard, LuaInferCache, instantiate_type_generic, resolve_signature,
+        resolve_signature_with_context,
+    },
     InferFailReason, InferResult, infer_bind_value_type,
 };
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
@@ -313,7 +316,17 @@ fn infer_generic_doc_function_union(
         })
         .collect::<Vec<_>>();
 
-    resolve_signature(db, cache, overloads, call_expr.clone(), false, args_count)
+    let is_generic = overloads.iter().any(|func| func.contain_tpl());
+    let contextual_return_hint = get_contextual_return_hint(db, cache, &call_expr);
+    resolve_signature_with_context(
+        db,
+        cache,
+        overloads,
+        call_expr.clone(),
+        is_generic,
+        args_count,
+        contextual_return_hint,
+    )
 }
 
 fn infer_signature_doc_function(
@@ -369,13 +382,15 @@ fn infer_signature_doc_function(
             &fake_doc_function,
         ));
 
-        resolve_signature(
+        let contextual_return_hint = get_contextual_return_hint(db, cache, &call_expr);
+        resolve_signature_with_context(
             db,
             cache,
             new_overloads,
             call_expr.clone(),
             is_generic,
             args_count,
+            contextual_return_hint,
         )
     }
 }
@@ -415,6 +430,7 @@ fn infer_type_doc_function(
         .get_operators(&type_id.clone().into(), LuaOperatorMetaMethod::Call)
         .ok_or(InferFailReason::UnResolveOperatorCall)?;
     let mut overloads = Vec::new();
+    let contextual_return_hint = get_contextual_return_hint(db, cache, &call_expr);
     for overload_id in operator_ids {
         let operator = operator_index
             .get_operator(overload_id)
@@ -431,7 +447,13 @@ fn infer_type_doc_function(
                         overloads.push(f);
                     }
                 } else if f.contain_tpl() {
-                    let result = instantiate_func_generic(db, cache, &f, call_expr.clone())?;
+                    let result = instantiate_func_generic_with_context(
+                        db,
+                        cache,
+                        &f,
+                        call_expr.clone(),
+                        contextual_return_hint.clone(),
+                    )?;
                     overloads.push(Arc::new(result));
                 } else {
                     overloads.push(f.clone());
@@ -497,6 +519,7 @@ fn infer_generic_type_doc_function(
         .get_operators(&type_id.into(), LuaOperatorMetaMethod::Call)
         .ok_or(InferFailReason::None)?;
     let mut overloads = Vec::new();
+    let contextual_return_hint = get_contextual_return_hint(db, cache, &call_expr);
     for overload_id in operator_ids {
         let operator = operator_index
             .get_operator(overload_id)
@@ -506,7 +529,18 @@ fn infer_generic_type_doc_function(
             LuaType::DocFunction(_) => {
                 let new_f = instantiate_type_generic(db, &func, &substitutor);
                 if let LuaType::DocFunction(f) = new_f {
-                    overloads.push(f.clone());
+                    if f.contain_tpl() {
+                        let result = instantiate_func_generic_with_context(
+                            db,
+                            cache,
+                            &f,
+                            call_expr.clone(),
+                            contextual_return_hint.clone(),
+                        )?;
+                        overloads.push(Arc::new(result));
+                    } else {
+                        overloads.push(f.clone());
+                    }
                 }
             }
             LuaType::Signature(signature_id) => {
@@ -603,6 +637,7 @@ fn infer_union(
     // 此时一般是 signature + doc_function 的联合体
     let mut all_overloads = Vec::new();
     let mut base_signatures = Vec::new();
+    let contextual_return_hint = get_contextual_return_hint(db, cache, &call_expr);
 
     for ty in union.into_vec() {
         match ty {
@@ -614,11 +649,12 @@ fn infer_union(
                             .overloads
                             .iter()
                             .map(|func| {
-                                Ok(Arc::new(instantiate_func_generic(
+                                Ok(Arc::new(instantiate_func_generic_with_context(
                                     db,
                                     cache,
                                     func,
                                     call_expr.clone(),
+                                    contextual_return_hint.clone(),
                                 )?))
                             })
                             .collect::<Result<Vec<_>, _>>()?
@@ -636,11 +672,12 @@ fn infer_union(
                         signature.get_return_type(),
                     );
                     if signature.is_generic() {
-                        fake_doc_function = instantiate_func_generic(
+                        fake_doc_function = instantiate_func_generic_with_context(
                             db,
                             cache,
                             &fake_doc_function,
                             call_expr.clone(),
+                            contextual_return_hint.clone(),
                         )?;
                     }
                     base_signatures.push(apply_signature_return_kinds_to_function(
@@ -651,11 +688,12 @@ fn infer_union(
             }
             LuaType::DocFunction(func) => {
                 let func_to_push = if func.contain_tpl() {
-                    Arc::new(instantiate_func_generic(
+                    Arc::new(instantiate_func_generic_with_context(
                         db,
                         cache,
                         &func,
                         call_expr.clone(),
+                        contextual_return_hint.clone(),
                     )?)
                 } else {
                     func.clone()

@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     LuaInferCache,
-    generic::instantiate_func_generic,
+    generic::{instantiate_func_generic, instantiate_func_generic_with_context},
     infer::{InferCallFuncResult, InferFailReason},
 };
 
@@ -26,6 +26,18 @@ pub fn resolve_signature(
     is_generic: bool,
     arg_count: Option<usize>,
 ) -> InferCallFuncResult {
+    resolve_signature_with_context(db, cache, overloads, call_expr, is_generic, arg_count, None)
+}
+
+pub fn resolve_signature_with_context(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    overloads: Vec<Arc<LuaFunctionType>>,
+    call_expr: LuaCallExpr,
+    is_generic: bool,
+    arg_count: Option<usize>,
+    contextual_return_hint: Option<LuaType>,
+) -> InferCallFuncResult {
     let args = call_expr.get_args_list().ok_or(InferFailReason::None)?;
     let expr_types = infer_expr_list_types(
         db,
@@ -34,7 +46,15 @@ pub fn resolve_signature(
         arg_count,
     );
     if is_generic {
-        resolve_signature_by_generic(db, cache, overloads, call_expr, expr_types, arg_count)
+        resolve_signature_by_generic(
+            db,
+            cache,
+            overloads,
+            call_expr,
+            expr_types,
+            arg_count,
+            contextual_return_hint.as_ref(),
+        )
     } else {
         resolve_signature_by_args(
             db,
@@ -53,10 +73,21 @@ fn resolve_signature_by_generic(
     call_expr: LuaCallExpr,
     expr_types: Vec<LuaType>,
     arg_count: Option<usize>,
+    contextual_return_hint: Option<&LuaType>,
 ) -> InferCallFuncResult {
     let mut instantiate_funcs = Vec::new();
     for func in overloads {
-        let instantiate_func = instantiate_func_generic(db, cache, &func, call_expr.clone())?;
+        let instantiate_func = if contextual_return_hint.is_some() {
+            instantiate_func_generic_with_context(
+                db,
+                cache,
+                &func,
+                call_expr.clone(),
+                contextual_return_hint.cloned(),
+            )?
+        } else {
+            instantiate_func_generic(db, cache, &func, call_expr.clone())?
+        };
         instantiate_funcs.push(Arc::new(instantiate_func));
     }
     resolve_signature_by_args(
