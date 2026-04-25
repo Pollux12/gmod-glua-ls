@@ -766,6 +766,28 @@ mod test {
     }
 
     #[test]
+    fn test_contextual_generic_function_member_assignment_does_not_type_closure_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class GenericHolder
+            ---@field f fun<T>(value: T): T
+
+            ---@type GenericHolder
+            local holder = {}
+
+            holder.f = function(value)
+                contextual_generic_member_seen = value
+                return value
+            end
+            "#,
+        );
+
+        let seen_ty = ws.expr_ty("contextual_generic_member_seen");
+        assert_eq!(seen_ty, ws.ty("unknown"));
+    }
+
+    #[test]
     fn test_generic_return_context_does_not_override_arg_inference() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
@@ -973,6 +995,39 @@ mod test {
         assert_eq!(call_ty, expected);
 
         let seen_ty = ws.expr_ty("receiver_seen");
+        assert_eq!(seen_ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_generic_method_call_infers_callback_return_without_context() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class WrappedArray<T>
+            ---@field map fun<U>(self: WrappedArray<T>, iterator: fun(value: T): U): U[]
+
+            ---@type WrappedArray<string>
+            local array = {}
+
+            local mapped = array:map(function(value)
+                method_map_seen = value
+                return 1
+            end)
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        assert_eq!(call_ty, ws.ty("integer[]"));
+
+        let seen_ty = ws.expr_ty("method_map_seen");
         assert_eq!(seen_ty, ws.ty("string"));
     }
 
@@ -1238,6 +1293,35 @@ mod test {
 
         let seen_ty = ws.expr_ty("explicit_callback_seen");
         assert_eq!(seen_ty, ws.ty("number"));
+    }
+
+    #[test]
+    fn test_generic_combinator_explicit_type_args_check_callback_return() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Collection<T, U>
+            local Collection = {}
+
+            ---@class Combinators
+            ---@field map fun<T, U, V>(c: Collection<T, U>, cb: fun(x: T, y: U): V): Collection<T, V>
+
+            ---@type Combinators
+            local combinators = {}
+
+            ---@type Collection<number, string>
+            local collection = {}
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local result = combinators.map--[[@<number, string, boolean>]](collection, function(x, y)
+                return ""
+            end)
+            "#,
+        ));
     }
 
     #[test]
