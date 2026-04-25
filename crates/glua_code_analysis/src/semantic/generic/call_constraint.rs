@@ -4,7 +4,8 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr};
 
 use crate::{
     DbIndex, DocTypeInferContext, GenericTplId, LuaFunctionType, LuaSemanticDeclId, LuaType,
-    SemanticDeclLevel, SemanticModel, TypeOps, TypeSubstitutor, VariadicType, infer_doc_type,
+    SemanticDeclLevel, SemanticModel, TypeOps, TypeSubstitutor, TypeVisitTrait, VariadicType,
+    infer_doc_type,
 };
 
 // 泛型约束上下文
@@ -27,9 +28,14 @@ pub fn build_call_constraint_context(
     if let Some(type_list) = call_expr.get_call_generic_type_list() {
         let doc_ctx =
             DocTypeInferContext::new(semantic_model.get_db(), semantic_model.get_file_id());
+        let explicit_tpl_ids = sorted_func_tpl_ids(&doc_func);
         for (idx, doc_type) in type_list.get_types().enumerate() {
             let ty = infer_doc_type(doc_ctx, &doc_type);
-            substitutor.insert_type(GenericTplId::Func(idx as u32), ty, true);
+            let tpl_id = explicit_tpl_ids
+                .get(idx)
+                .copied()
+                .unwrap_or(GenericTplId::Func(idx as u32));
+            substitutor.insert_type(tpl_id, ty, true);
         }
     }
 
@@ -54,6 +60,27 @@ pub fn build_call_constraint_context(
         },
         doc_func,
     ))
+}
+
+fn sorted_func_tpl_ids(doc_func: &LuaFunctionType) -> Vec<GenericTplId> {
+    let mut tpl_ids = Vec::new();
+    doc_func.visit_type(&mut |ty| match ty {
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => {
+            if tpl.get_tpl_id().is_func() {
+                tpl_ids.push(tpl.get_tpl_id());
+            }
+        }
+        LuaType::StrTplRef(tpl) => {
+            if tpl.get_tpl_id().is_func() {
+                tpl_ids.push(tpl.get_tpl_id());
+            }
+        }
+        _ => {}
+    });
+
+    tpl_ids.sort_by_key(GenericTplId::get_idx);
+    tpl_ids.dedup();
+    tpl_ids
 }
 
 // 将推导结果转换为更易比较的形式

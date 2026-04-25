@@ -75,11 +75,12 @@ pub fn instantiate_func_generic(
         call_expr: Some(call_expr.clone()),
     };
     if !generic_tpls.is_empty() {
+        let explicit_tpl_ids = sorted_func_tpl_ids(&generic_tpls);
         context.substitutor.add_need_infer_tpls(generic_tpls);
 
         if let Some(type_list) = call_expr.get_call_generic_type_list() {
             // 如果使用了`obj:abc--[[@<string>]]("abc")`强制指定了泛型, 那么我们只需要直接应用
-            apply_call_generic_type_list(db, file_id, &mut context, &type_list);
+            apply_call_generic_type_list(db, file_id, &mut context, &type_list, &explicit_tpl_ids);
         } else {
             // 如果没有指定泛型, 则需要从调用参数中推断
             infer_generic_types_from_call(
@@ -109,14 +110,27 @@ fn apply_call_generic_type_list(
     file_id: FileId,
     context: &mut TplContext,
     type_list: &LuaDocTypeList,
+    explicit_tpl_ids: &[GenericTplId],
 ) {
     let doc_ctx = DocTypeInferContext::new(db, file_id);
     for (i, doc_type) in type_list.get_types().enumerate() {
         let typ = infer_doc_type(doc_ctx, &doc_type);
-        context
-            .substitutor
-            .insert_type(GenericTplId::Func(i as u32), typ, true);
+        let tpl_id = explicit_tpl_ids
+            .get(i)
+            .copied()
+            .unwrap_or(GenericTplId::Func(i as u32));
+        context.substitutor.insert_type(tpl_id, typ, true);
     }
+}
+
+fn sorted_func_tpl_ids(generic_tpls: &HashSet<GenericTplId>) -> Vec<GenericTplId> {
+    let mut tpl_ids = generic_tpls
+        .iter()
+        .copied()
+        .filter(GenericTplId::is_func)
+        .collect::<Vec<_>>();
+    tpl_ids.sort_by_key(GenericTplId::get_idx);
+    tpl_ids
 }
 
 fn infer_generic_types_from_call(
@@ -262,7 +276,7 @@ fn tpl_pattern_match_generic_arg(
             if let Some(nullable_pattern) = get_nullable_generic_pattern(&union_types) {
                 tpl_pattern_match_generic_arg(context, nullable_pattern, target)?;
             } else {
-                tpl_pattern_match(context, pattern, target.match_type())?;
+                tpl_pattern_match(context, pattern, &target.raw)?;
             }
         }
         _ => tpl_pattern_match(context, pattern, target.match_type())?,
@@ -272,6 +286,10 @@ fn tpl_pattern_match_generic_arg(
 }
 
 fn get_nullable_generic_pattern(union_types: &[LuaType]) -> Option<&LuaType> {
+    if union_types.len() != 2 {
+        return None;
+    }
+
     if !union_types.iter().any(|ty| matches!(ty, LuaType::Nil)) {
         return None;
     }
@@ -281,6 +299,13 @@ fn get_nullable_generic_pattern(union_types: &[LuaType]) -> Option<&LuaType> {
         .filter(|ty| !matches!(ty, LuaType::Nil) && ty.contain_tpl());
     let pattern = templated_non_nil.next()?;
     if templated_non_nil.next().is_some() {
+        return None;
+    }
+
+    if !matches!(
+        pattern,
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) if tpl.get_tpl_id().is_func()
+    ) {
         return None;
     }
 
@@ -345,6 +370,7 @@ fn infer_object_table_arg_type(
         let value_type = match infer_expr(db, cache, value_expr) {
             Ok(LuaType::Def(ref_id)) => LuaType::Ref(ref_id),
             Ok(other) => other,
+            // This structural view is advisory; normal analysis still owns diagnostics.
             Err(InferFailReason::FieldNotFound) => LuaType::Unknown,
             Err(reason) => return Err(reason),
         };

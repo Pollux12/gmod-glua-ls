@@ -675,6 +675,29 @@ mod test {
     }
 
     #[test]
+    fn test_explicit_generic_call_uses_decl_tpl_id_for_nested_function() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic Outer
+            function setup()
+                ---@generic Inner
+                ---@param value Inner
+                ---@return Inner
+                function identity(value) end
+            end
+
+            setup()
+            value = identity--[[@<string>]](1)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "string");
+    }
+
+    #[test]
     fn test_conditional_infer_instantiates_nested_generic_super_with_decl_tpl_id() {
         let mut ws = VirtualWorkspace::new();
 
@@ -737,6 +760,34 @@ mod test {
 
         let value_ty = ws.expr_ty("value");
         assert_eq!(ws.humanize_type(value_ty), "string");
+    }
+
+    #[test]
+    fn test_union_param_with_concrete_branch_does_not_use_nullable_generic_shape_fast_path() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+
+            ---@alias InferShape<T> { [K in keyof T]: T[K] extends Schema<infer U> and U or unknown; }
+
+            ---@return Schema<string>
+            function mk_string() end
+
+            ---@generic T
+            ---@param schema T|string|nil
+            ---@return InferShape<T>
+            function object(schema) end
+
+            result = object({
+                name = mk_string(),
+            })
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        assert_eq!(ws.humanize_type(name_ty), "unknown");
     }
 
     #[test]
