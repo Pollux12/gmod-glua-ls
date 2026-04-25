@@ -721,6 +721,33 @@ mod test {
     }
 
     #[test]
+    fn test_generic_nullable_param_identity_object_literal_still_allows_later_field_inference() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T?
+            ---@return T?
+            function identity(value) end
+
+            result = identity({ name = "abc" })
+            "#,
+        );
+        ws.def(
+            r#"
+            function add_field()
+                result.age = 1
+            end
+            value = result.age
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "1");
+    }
+
+    #[test]
     fn test_infer_new_constructor() {
         let mut ws = VirtualWorkspace::new();
         ws.def(

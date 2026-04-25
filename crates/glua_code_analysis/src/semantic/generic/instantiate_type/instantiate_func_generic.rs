@@ -246,12 +246,34 @@ fn tpl_pattern_match_generic_arg(
     pattern: &LuaType,
     target: &GenericArgType,
 ) -> Result<(), InferFailReason> {
+    if !pattern.contain_tpl() {
+        return Ok(());
+    }
+
     match pattern {
         LuaType::TplRef(tpl) if tpl.get_tpl_id().is_func() => {
             insert_generic_arg(context, tpl.get_tpl_id(), target, true);
         }
         LuaType::ConstTplRef(tpl) if tpl.get_tpl_id().is_func() => {
             insert_generic_arg(context, tpl.get_tpl_id(), target, false);
+        }
+        LuaType::Union(union) => {
+            let union_types = union.into_vec();
+            let mut error_count = 0;
+            let mut last_error = InferFailReason::None;
+            for union_type in &union_types {
+                match tpl_pattern_match_generic_arg(context, union_type, target) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error_count += 1;
+                        last_error = e;
+                    }
+                }
+            }
+
+            if error_count == union_types.len() {
+                return Err(last_error);
+            }
         }
         _ => tpl_pattern_match(context, pattern, target.match_type())?,
     }
