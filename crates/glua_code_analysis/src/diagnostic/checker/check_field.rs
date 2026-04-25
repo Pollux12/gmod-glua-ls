@@ -200,6 +200,12 @@ fn is_invalid_prefix_type(typ: &LuaType, code: DiagnosticCode) -> bool {
             | LuaType::TplRef(_)
             | LuaType::StrTplRef(_) => return true,
             LuaType::TableConst(_) => return code == DiagnosticCode::InjectField,
+            LuaType::Union(union) => {
+                return union
+                    .into_vec()
+                    .iter()
+                    .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ, code));
+            }
             LuaType::Instance(instance_typ) => {
                 current_typ = instance_typ.get_base();
             }
@@ -287,16 +293,21 @@ pub(super) fn is_valid_member(
             )
             .ok()?;
             let owner = LuaMemberOwner::Element(id.clone());
-            if infer_owner_raw_member_type_with_realm(
+            match infer_owner_raw_member_type_with_realm(
                 semantic_model.get_db(),
                 owner,
                 &key,
                 semantic_model.get_file_id(),
                 Some(index_expr.get_position()),
-            )
-            .is_ok()
-            {
-                return Some(());
+            ) {
+                Ok(_) => return Some(()),
+                Err(InferFailReason::FieldNotFound)
+                    if code == DiagnosticCode::UndefinedField
+                        && is_doc_tag_table_const(semantic_model, id) =>
+                {
+                    return Some(());
+                }
+                Err(_) => {}
             }
         }
         // In GMod mode, strings support numeric byte indexing (e.g. `str[2]`, `str[i]`).
@@ -510,6 +521,26 @@ pub(super) fn is_valid_member(
     }
 
     None
+}
+
+fn is_doc_tag_table_const(
+    semantic_model: &SemanticModel,
+    id: &crate::InFiled<rowan::TextRange>,
+) -> bool {
+    let Some(root) = semantic_model.get_root_by_file_id(id.file_id) else {
+        return false;
+    };
+
+    root.descendants::<glua_parser::LuaDocType>()
+        .any(|doc_type| {
+            doc_type.get_range() == id.value
+                && doc_type.syntax().parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind().into(),
+                        LuaSyntaxKind::DocTagAs | LuaSyntaxKind::DocTagType
+                    )
+                })
+        })
 }
 
 /// 检查枚举类型的自引用

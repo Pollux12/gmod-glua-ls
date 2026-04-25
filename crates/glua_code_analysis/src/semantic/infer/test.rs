@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, LuaType, LuaUnionType, VirtualWorkspace};
     use glua_parser::{LuaAstNode, LuaExpr, LuaNameExpr};
 
     fn infer_last_name_expr_type(
@@ -467,6 +467,80 @@ mod test {
         "#;
 
         assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[test]
+    fn test_annotated_table_index_infers_nullable_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@type table
+            local keys
+            local var = keys[1]
+            print(var)
+        "#;
+
+        let ty = infer_last_name_expr_type(&mut ws, code, "var");
+        let expected =
+            LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into());
+
+        assert!(
+            ws.check_type(&ty, &expected),
+            "expected nullable any, got {}",
+            ws.humanize_type(ty.clone())
+        );
+        assert!(!ty.is_nil(), "got nil");
+        assert!(!ty.is_unknown(), "got unknown");
+    }
+
+    #[test]
+    fn test_annotated_table_index_has_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@type table
+            local keys
+            local var = keys[1]
+            print(var)
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[test]
+    fn test_annotated_table_nil_union_index_infers_nullable_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@type table|nil
+            local keys
+            local var = keys[1]
+            print(var)
+        "#;
+
+        let ty = infer_last_name_expr_type(&mut ws, code, "var");
+        let expected =
+            LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into());
+
+        assert!(
+            ws.check_type(&ty, &expected),
+            "expected nullable any, got {}",
+            ws.humanize_type(ty.clone())
+        );
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[test]
+    fn test_annotated_table_assigned_member_keeps_specific_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            GG = {} --- @type table
+            function GG.fun() end
+            F = GG.fun
+        "#,
+        );
+
+        let ty = ws.expr_ty("F");
+
+        assert!(matches!(ty, LuaType::Signature(_)), "got: {ty:?}");
     }
 
     #[test]
