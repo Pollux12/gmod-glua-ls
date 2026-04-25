@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, GlobalId, InferFailReason, InferGuard, InferGuardRef, LuaGenericType, LuaMemberKey,
-    LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, TypeOps,
-    check_type_compact,
+    DbIndex, FileId, GlobalId, InferFailReason, InferGuard, InferGuardRef, LuaGenericType,
+    LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType,
+    LuaTypeDeclId, LuaUnionType, TypeOps, check_type_compact,
     semantic::generic::{TypeSubstitutor, instantiate_type_generic},
 };
 
@@ -87,7 +88,10 @@ fn infer_owner_raw_member_type(
     member_owner: LuaMemberOwner,
     member_key: &LuaMemberKey,
 ) -> RawGetMemberTypeResult {
-    if let Some(member_item) = db.get_member_index().get_member_item(&member_owner, member_key) {
+    if let Some(member_item) = db
+        .get_member_index()
+        .get_member_item(&member_owner, member_key)
+    {
         return member_item.resolve_type(db);
     }
 
@@ -117,11 +121,77 @@ fn infer_owner_raw_member_type(
         return Err(InferFailReason::FieldNotFound);
     }
 
-    if matches!(access_key_type, LuaType::String | LuaType::Number | LuaType::Integer) {
+    if matches!(
+        access_key_type,
+        LuaType::String | LuaType::Number | LuaType::Integer
+    ) {
         result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
     }
 
     Ok(result_type)
+}
+
+pub(crate) fn infer_owner_raw_member_type_with_realm(
+    db: &DbIndex,
+    member_owner: LuaMemberOwner,
+    member_key: &LuaMemberKey,
+    caller_file_id: FileId,
+    caller_position: Option<TextSize>,
+) -> RawGetMemberTypeResult {
+    if let Some(member_item) = db
+        .get_member_index()
+        .get_member_item(&member_owner, member_key)
+    {
+        return resolve_member_item_with_realm(db, member_item, caller_file_id, caller_position);
+    }
+
+    let Some(access_key_type) = member_key_as_type(member_key) else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+
+    let Some(owner_members) = db.get_member_index().get_members(&member_owner) else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+
+    let mut result_type = LuaType::Unknown;
+    for member in owner_members {
+        if !member_key_matches_type(db, &access_key_type, member.get_key()) {
+            continue;
+        }
+
+        let member_item = LuaMemberIndexItem::One(member.get_id());
+        if let Ok(member_type) =
+            resolve_member_item_with_realm(db, &member_item, caller_file_id, caller_position)
+        {
+            result_type = TypeOps::Union.apply(db, &result_type, &member_type);
+        }
+    }
+
+    if result_type.is_unknown() {
+        return Err(InferFailReason::FieldNotFound);
+    }
+
+    if matches!(
+        access_key_type,
+        LuaType::String | LuaType::Number | LuaType::Integer
+    ) {
+        result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
+    }
+
+    Ok(result_type)
+}
+
+fn resolve_member_item_with_realm(
+    db: &DbIndex,
+    member_item: &LuaMemberIndexItem,
+    caller_file_id: FileId,
+    caller_position: Option<TextSize>,
+) -> RawGetMemberTypeResult {
+    if let Some(pos) = caller_position {
+        member_item.resolve_type_with_realm_at_offset(db, &caller_file_id, pos)
+    } else {
+        member_item.resolve_type_with_realm(db, &caller_file_id)
+    }
 }
 
 fn nullable_any_type() -> LuaType {

@@ -452,4 +452,41 @@ mod test {
 
         assert_eq!(ws.expr_ty("multistatements"), ws.ty("nil"));
     }
+
+    #[test]
+    fn test_inferred_collection_index_has_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            local keys = {}
+
+            for key in pairs({"a", "b", "c", "d"}) do
+                keys[#keys + 1] = key
+            end
+
+            print(keys[1])
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[test]
+    fn test_inferred_collection_index_in_client_realm_has_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            local keys = {}
+
+            for key in pairs({"a", "b", "c", "d"}) do
+                keys[#keys + 1] = key
+            end
+
+            if CLIENT then
+                A = keys[1]
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let ty = infer_last_name_expr_type(&mut ws, code, "A");
+        assert!(!ty.is_unknown());
+    }
 }

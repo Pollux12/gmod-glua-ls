@@ -26,6 +26,7 @@ use lsp_types::Uri;
 pub use member::LuaMemberInfo;
 pub use member::find_index_operations;
 pub use member::get_member_map;
+pub(crate) use member::infer_owner_raw_member_type_with_realm;
 pub(crate) use member::member_key_matches_type;
 use member::{find_member_origin_owner, find_members};
 use reference::is_reference_to;

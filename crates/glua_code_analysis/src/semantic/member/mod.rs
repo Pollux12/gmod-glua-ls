@@ -21,6 +21,7 @@ pub use get_member_map::{
     get_member_map_in_workspace_for_file_at_offset,
 };
 use glua_parser::{LuaAssignStat, LuaAstNode, LuaSyntaxKind, LuaTableExpr, LuaTableField};
+pub(crate) use infer_raw_member::infer_owner_raw_member_type_with_realm;
 pub use infer_raw_member::infer_raw_member_type;
 
 use super::{

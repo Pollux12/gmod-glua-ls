@@ -253,6 +253,35 @@ mod test {
     }
 
     #[gtest]
+    fn test_inferred_collection_integer_index_returns_element_union() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+        local keys = {}
+
+        for key in pairs({"a", "b", "c", "d"}) do
+            keys[#keys + 1] = key
+        end
+
+        A = keys[1]
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        let expected = LuaType::Union(
+            LuaUnionType::from_vec(vec![
+                LuaType::IntegerConst(1),
+                LuaType::IntegerConst(2),
+                LuaType::IntegerConst(3),
+                LuaType::IntegerConst(4),
+            ])
+            .into(),
+        );
+        assert_that!(ws.check_type(&ty, &expected), eq(true));
+    }
+
+    #[gtest]
     fn test_flow_fallback_prefers_latest_dynamic_field_assignment() {
         let mut ws = VirtualWorkspace::new();
 

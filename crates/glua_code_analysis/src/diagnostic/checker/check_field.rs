@@ -9,7 +9,7 @@ use glua_parser::{
 use crate::{
     DbIndex, DiagnosticCode, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaMemberKey,
     LuaMemberOwner, LuaType, SemanticModel, enum_variable_is_param, get_keyof_members,
-    semantic::member_key_matches_type,
+    semantic::{infer_owner_raw_member_type_with_realm, member_key_matches_type},
 };
 
 use super::{Checker, DiagnosticContext, humanize_lint_type};
@@ -277,6 +277,26 @@ pub(super) fn is_valid_member(
                     Err(_) => return Some(()),
                     _ => {}
                 }
+            }
+        }
+        LuaType::TableConst(id) => {
+            let key = LuaMemberKey::from_index_key(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                index_key,
+            )
+            .ok()?;
+            let owner = LuaMemberOwner::Element(id.clone());
+            if infer_owner_raw_member_type_with_realm(
+                semantic_model.get_db(),
+                owner,
+                &key,
+                semantic_model.get_file_id(),
+                Some(index_expr.get_position()),
+            )
+            .is_ok()
+            {
+                return Some(());
             }
         }
         // In GMod mode, strings support numeric byte indexing (e.g. `str[2]`, `str[i]`).

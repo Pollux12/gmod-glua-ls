@@ -27,8 +27,9 @@ use crate::{
             narrow::infer_expr_narrow_type,
         },
         member::get_buildin_type_map_type_id,
-        member::member_key_matches_type,
+        member::infer_owner_raw_member_type_with_realm,
         member::intersect_member_types,
+        member::member_key_matches_type,
         type_check::{self, check_type_compact},
     },
 };
@@ -275,12 +276,17 @@ fn infer_table_member(
     let owner = LuaMemberOwner::Element(inst);
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
-    let member_item = match db.get_member_index().get_member_item(&owner, &key) {
-        Some(member_item) => member_item,
-        None => return Err(InferFailReason::FieldNotFound),
-    };
+    if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
+        return member_item.resolve_type_with_realm(db, &cache.get_file_id());
+    }
 
-    member_item.resolve_type_with_realm(db, &cache.get_file_id())
+    infer_owner_raw_member_type_with_realm(
+        db,
+        owner,
+        &key,
+        cache.get_file_id(),
+        Some(index_expr.get_position()),
+    )
 }
 
 fn nullable_any_type() -> LuaType {
