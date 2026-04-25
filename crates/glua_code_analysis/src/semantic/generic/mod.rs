@@ -1,4 +1,5 @@
 mod call_constraint;
+mod inference_context;
 mod instantiate_type;
 mod test;
 mod tpl_context;
@@ -10,6 +11,7 @@ pub use call_constraint::{
 };
 use glua_parser::LuaAstNode;
 use glua_parser::LuaExpr;
+pub use inference_context::{InferenceContext, InferencePriority};
 pub use instantiate_type::*;
 use rowan::NodeOrToken;
 pub use tpl_context::TplContext;

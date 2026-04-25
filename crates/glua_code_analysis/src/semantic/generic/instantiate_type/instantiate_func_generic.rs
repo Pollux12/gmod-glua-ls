@@ -29,7 +29,7 @@ use crate::{
 };
 use crate::{LuaMemberOwner, LuaSemanticDeclId, SemanticDeclLevel, infer_node_semantic_decl};
 
-use super::TypeSubstitutor;
+use crate::InferenceContext;
 
 pub fn instantiate_func_generic(
     db: &DbIndex,
@@ -77,38 +77,40 @@ pub fn instantiate_func_generic_with_context(
         .ok_or(InferFailReason::None)?
         .get_args()
         .collect::<Vec<_>>();
-    let mut substitutor = TypeSubstitutor::new();
-    let mut context = TplContext {
-        db,
-        cache,
-        substitutor: &mut substitutor,
-        call_expr: Some(call_expr.clone()),
-    };
-    if !generic_tpls.is_empty() {
-        context.substitutor.add_need_infer_tpls(generic_tpls);
+    let mut inference = InferenceContext::new();
+    {
+        let mut context = TplContext {
+            db,
+            cache,
+            substitutor: &mut inference,
+            call_expr: Some(call_expr.clone()),
+        };
+        if !generic_tpls.is_empty() {
+            context.substitutor.add_need_infer_tpls(generic_tpls);
 
-        if let Some(type_list) = call_expr.get_call_generic_type_list() {
-            // 如果使用了`obj:abc--[[@<string>]]("abc")`强制指定了泛型, 那么我们只需要直接应用
-            apply_call_generic_type_list(db, file_id, &mut context, &type_list);
-        } else {
-            // 如果没有指定泛型, 则需要从调用参数中推断
-            infer_generic_types_from_call(
-                db,
-                &mut context,
-                func,
-                &call_expr,
-                &mut func_params,
-                &arg_exprs,
-                contextual_return_hint.as_ref(),
-            )?;
+            if let Some(type_list) = call_expr.get_call_generic_type_list() {
+                // 如果使用了`obj:abc--[[@<string>]]("abc")`强制指定了泛型, 那么我们只需要直接应用
+                apply_call_generic_type_list(db, file_id, &mut context, &type_list);
+            } else {
+                // 如果没有指定泛型, 则需要从调用参数中推断
+                infer_generic_types_from_call(
+                    db,
+                    &mut context,
+                    func,
+                    &call_expr,
+                    &mut func_params,
+                    &arg_exprs,
+                    contextual_return_hint.as_ref(),
+                )?;
+            }
         }
     }
 
     if contain_self && let Some(self_type) = infer_self_type(db, cache, &call_expr) {
-        substitutor.add_self_type(self_type);
+        inference.add_self_type(self_type);
     }
 
-    if let LuaType::DocFunction(f) = instantiate_doc_function(db, func, &substitutor) {
+    if let LuaType::DocFunction(f) = instantiate_doc_function(db, func, inference.substitutor()) {
         Ok(f.deref().clone())
     } else {
         Ok(func.clone())

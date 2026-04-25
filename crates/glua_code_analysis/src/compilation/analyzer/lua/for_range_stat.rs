@@ -1,8 +1,8 @@
 use glua_parser::{LuaAstToken, LuaExpr, LuaForRangeStat};
 
 use crate::{
-    DbIndex, InferFailReason, LuaDeclId, LuaInferCache, LuaOperatorMetaMethod, LuaType,
-    LuaTypeCache, TplContext, TypeOps, TypeSubstitutor, VariadicType,
+    DbIndex, InferFailReason, InferenceContext, LuaDeclId, LuaInferCache, LuaOperatorMetaMethod,
+    LuaType, LuaTypeCache, TplContext, TypeOps, VariadicType,
     compilation::analyzer::unresolve::UnResolveIterVar, infer_expr, instantiate_doc_function,
     tpl_pattern_match_args,
 };
@@ -144,23 +144,25 @@ pub fn infer_for_range_iter_expr_func(
     let Some(status_param) = status_param else {
         return Ok(doc_function.get_variadic_ret());
     };
-    let mut substitutor = TypeSubstitutor::new();
-    let mut context = TplContext {
-        db,
-        cache,
-        substitutor: &mut substitutor,
-        call_expr: None,
-    };
+    let mut inference = InferenceContext::new();
     let params = doc_function
         .get_params()
         .iter()
         .map(|(_, opt_ty)| opt_ty.clone().unwrap_or(LuaType::Any))
         .collect::<Vec<_>>();
 
-    tpl_pattern_match_args(&mut context, &params, &[status_param])?;
+    {
+        let mut context = TplContext {
+            db,
+            cache,
+            substitutor: &mut inference,
+            call_expr: None,
+        };
+        tpl_pattern_match_args(&mut context, &params, &[status_param])?;
+    }
 
     let instantiate_func = if let LuaType::DocFunction(f) =
-        instantiate_doc_function(db, &doc_function, &substitutor)
+        instantiate_doc_function(db, &doc_function, inference.substitutor())
     {
         f
     } else {

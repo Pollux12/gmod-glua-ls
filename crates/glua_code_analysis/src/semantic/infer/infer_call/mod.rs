@@ -21,8 +21,8 @@ use crate::{
     InferGuardRef,
     semantic::{
         generic::{
-            TplContext, TypeSubstitutor, get_tpl_ref_extend_type, instantiate_doc_function,
-            tpl_pattern_match,
+            InferenceContext, TplContext, TypeSubstitutor, get_tpl_ref_extend_type,
+            instantiate_doc_function, tpl_pattern_match,
         },
         infer::narrow::get_type_at_call_expr_inline_cast,
         infer_expr_semantic_decl,
@@ -624,7 +624,13 @@ fn infer_table_type_doc_function(
                 return infer_doc_function(db, cache, &func, call_expr, args_count);
             }
             LuaType::Signature(signature_id) => {
-                return infer_signature_doc_function(db, cache, signature_id, call_expr, args_count);
+                return infer_signature_doc_function(
+                    db,
+                    cache,
+                    signature_id,
+                    call_expr,
+                    args_count,
+                );
             }
             _ => {}
         }
@@ -878,16 +884,18 @@ fn infer_contextual_return_type(
         return None;
     }
 
-    let mut substitutor = TypeSubstitutor::new();
-    let mut context = TplContext {
-        db,
-        cache,
-        substitutor: &mut substitutor,
-        call_expr: Some(call_expr.clone()),
-    };
-    tpl_pattern_match(&mut context, ret_type, &return_hint).ok()?;
+    let mut inference = InferenceContext::new();
+    {
+        let mut context = TplContext {
+            db,
+            cache,
+            substitutor: &mut inference,
+            call_expr: Some(call_expr.clone()),
+        };
+        tpl_pattern_match(&mut context, ret_type, &return_hint).ok()?;
+    }
 
-    let instantiated = instantiate_type_generic(db, ret_type, &substitutor);
+    let instantiated = instantiate_type_generic(db, ret_type, inference.substitutor());
     if &instantiated == ret_type {
         None
     } else {
