@@ -196,11 +196,11 @@ fn infer_generic_types_from_call(
             _ => {
                 let previous = context
                     .substitutor
-                    .set_union_type_candidates_enabled(collect_more_candidates);
+                    .set_type_candidate_collection_enabled(collect_more_candidates);
                 tpl_pattern_match(context, func_param_type, &arg_type)?;
                 context
                     .substitutor
-                    .set_union_type_candidates_enabled(previous);
+                    .set_type_candidate_collection_enabled(previous);
             }
         }
     }

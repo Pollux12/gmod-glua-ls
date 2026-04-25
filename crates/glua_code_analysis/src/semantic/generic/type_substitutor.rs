@@ -6,9 +6,10 @@ use crate::{DbIndex, GenericTplId, LuaType, LuaTypeDeclId, LuaUnionType};
 #[derive(Debug, Clone)]
 pub struct TypeSubstitutor {
     tpl_replace_map: HashMap<GenericTplId, SubstitutorValue>,
+    type_inferences: HashMap<GenericTplId, TypeInferenceInfo>,
     alias_type_id: Option<LuaTypeDeclId>,
     self_type: Option<LuaType>,
-    union_type_candidates: bool,
+    collect_type_candidates: bool,
 }
 
 impl Default for TypeSubstitutor {
@@ -21,9 +22,10 @@ impl TypeSubstitutor {
     pub fn new() -> Self {
         Self {
             tpl_replace_map: HashMap::new(),
+            type_inferences: HashMap::new(),
             alias_type_id: None,
             self_type: None,
-            union_type_candidates: false,
+            collect_type_candidates: false,
         }
     }
 
@@ -37,9 +39,10 @@ impl TypeSubstitutor {
         }
         Self {
             tpl_replace_map,
+            type_inferences: HashMap::new(),
             alias_type_id: None,
             self_type: None,
-            union_type_candidates: false,
+            collect_type_candidates: false,
         }
     }
 
@@ -63,9 +66,10 @@ impl TypeSubstitutor {
         }
         Self {
             tpl_replace_map,
+            type_inferences: HashMap::new(),
             alias_type_id: Some(alias_type_id),
             self_type: None,
-            union_type_candidates: false,
+            collect_type_candidates: false,
         }
     }
 
@@ -111,9 +115,9 @@ impl TypeSubstitutor {
         }
     }
 
-    pub fn set_union_type_candidates_enabled(&mut self, enabled: bool) -> bool {
-        let previous = self.union_type_candidates;
-        self.union_type_candidates = enabled;
+    pub fn set_type_candidate_collection_enabled(&mut self, enabled: bool) -> bool {
+        let previous = self.collect_type_candidates;
+        self.collect_type_candidates = enabled;
         previous
     }
 
@@ -131,10 +135,8 @@ impl TypeSubstitutor {
     }
 
     fn insert_type_value(&mut self, tpl_id: GenericTplId, value: SubstitutorTypeValue) {
-        if self.union_type_candidates
-            && let Some(SubstitutorValue::Type(existing)) = self.tpl_replace_map.get_mut(&tpl_id)
-        {
-            existing.union_with(value);
+        if self.collect_type_candidates {
+            self.insert_type_candidate(tpl_id, value);
             return;
         }
 
@@ -144,6 +146,28 @@ impl TypeSubstitutor {
 
         self.tpl_replace_map
             .insert(tpl_id, SubstitutorValue::Type(value));
+    }
+
+    fn insert_type_candidate(&mut self, tpl_id: GenericTplId, value: SubstitutorTypeValue) {
+        let existing_type = match self.tpl_replace_map.get(&tpl_id) {
+            Some(SubstitutorValue::Type(existing)) => Some(existing.clone()),
+            Some(SubstitutorValue::None) | None => None,
+            Some(_) => return,
+        };
+
+        let inference = self
+            .type_inferences
+            .entry(tpl_id)
+            .or_insert_with(TypeInferenceInfo::new);
+        if let Some(existing) = existing_type {
+            inference.add_candidate(existing);
+        }
+        inference.add_candidate(value);
+
+        if let Some(inferred) = inference.inferred() {
+            self.tpl_replace_map
+                .insert(tpl_id, SubstitutorValue::Type(inferred.clone()));
+        }
     }
 
     fn can_insert_type(&self, tpl_id: GenericTplId) -> bool {
@@ -217,6 +241,38 @@ impl TypeSubstitutor {
 }
 
 #[derive(Debug, Clone)]
+struct TypeInferenceInfo {
+    candidates: Vec<SubstitutorTypeValue>,
+    inferred: Option<SubstitutorTypeValue>,
+}
+
+impl TypeInferenceInfo {
+    fn new() -> Self {
+        Self {
+            candidates: Vec::new(),
+            inferred: None,
+        }
+    }
+
+    fn add_candidate(&mut self, candidate: SubstitutorTypeValue) {
+        if self.candidates.contains(&candidate) {
+            return;
+        }
+
+        if let Some(inferred) = &mut self.inferred {
+            inferred.union_with(candidate.clone());
+        } else {
+            self.inferred = Some(candidate.clone());
+        }
+        self.candidates.push(candidate);
+    }
+
+    fn inferred(&self) -> Option<&SubstitutorTypeValue> {
+        self.inferred.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubstitutorTypeValue {
     raw: LuaType,
     default: LuaType,
