@@ -148,11 +148,12 @@ fn infer_generic_types_from_call(
             break;
         }
 
-        if context.substitutor.is_infer_all_tpl() {
+        let (_, func_param_type) = &func_params[i];
+        let collect_more_candidates = is_direct_type_candidate(func_param_type);
+        if context.substitutor.is_infer_all_tpl() && !collect_more_candidates {
             break;
         }
 
-        let (_, func_param_type) = &func_params[i];
         let call_arg_expr = &arg_exprs[i];
         if !func_param_type.contain_tpl() {
             continue;
@@ -193,7 +194,13 @@ fn infer_generic_types_from_call(
                 break;
             }
             _ => {
+                let previous = context
+                    .substitutor
+                    .set_union_type_candidates_enabled(collect_more_candidates);
                 tpl_pattern_match(context, func_param_type, &arg_type)?;
+                context
+                    .substitutor
+                    .set_union_type_candidates_enabled(previous);
             }
         }
     }
@@ -208,6 +215,13 @@ fn infer_generic_types_from_call(
     }
 
     Ok(())
+}
+
+fn is_direct_type_candidate(typ: &LuaType) -> bool {
+    matches!(
+        typ,
+        LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_)
+    )
 }
 
 fn infer_generic_arg_type(

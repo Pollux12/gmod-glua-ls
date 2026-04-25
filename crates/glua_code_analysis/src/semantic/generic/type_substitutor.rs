@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
 use super::tpl_pattern::constant_decay;
-use crate::{DbIndex, GenericTplId, LuaType, LuaTypeDeclId};
+use crate::{DbIndex, GenericTplId, LuaType, LuaTypeDeclId, LuaUnionType};
 
 #[derive(Debug, Clone)]
 pub struct TypeSubstitutor {
     tpl_replace_map: HashMap<GenericTplId, SubstitutorValue>,
     alias_type_id: Option<LuaTypeDeclId>,
     self_type: Option<LuaType>,
+    union_type_candidates: bool,
 }
 
 impl Default for TypeSubstitutor {
@@ -22,6 +23,7 @@ impl TypeSubstitutor {
             tpl_replace_map: HashMap::new(),
             alias_type_id: None,
             self_type: None,
+            union_type_candidates: false,
         }
     }
 
@@ -37,6 +39,7 @@ impl TypeSubstitutor {
             tpl_replace_map,
             alias_type_id: None,
             self_type: None,
+            union_type_candidates: false,
         }
     }
 
@@ -62,6 +65,7 @@ impl TypeSubstitutor {
             tpl_replace_map,
             alias_type_id: Some(alias_type_id),
             self_type: None,
+            union_type_candidates: false,
         }
     }
 
@@ -107,6 +111,12 @@ impl TypeSubstitutor {
         }
     }
 
+    pub fn set_union_type_candidates_enabled(&mut self, enabled: bool) -> bool {
+        let previous = self.union_type_candidates;
+        self.union_type_candidates = enabled;
+        previous
+    }
+
     pub fn is_infer_all_tpl(&self) -> bool {
         for value in self.tpl_replace_map.values() {
             if let SubstitutorValue::None = value {
@@ -121,6 +131,13 @@ impl TypeSubstitutor {
     }
 
     fn insert_type_value(&mut self, tpl_id: GenericTplId, value: SubstitutorTypeValue) {
+        if self.union_type_candidates
+            && let Some(SubstitutorValue::Type(existing)) = self.tpl_replace_map.get_mut(&tpl_id)
+        {
+            existing.union_with(value);
+            return;
+        }
+
         if !self.can_insert_type(tpl_id) {
             return;
         }
@@ -223,6 +240,11 @@ impl SubstitutorTypeValue {
     pub fn default(&self) -> &LuaType {
         &self.default
     }
+
+    fn union_with(&mut self, other: SubstitutorTypeValue) {
+        self.raw = union_candidate_type(self.raw.clone(), other.raw);
+        self.default = union_candidate_type(self.default.clone(), other.default);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -245,4 +267,77 @@ fn into_ref_type(ty: LuaType) -> LuaType {
         LuaType::Def(type_decl_id) => LuaType::Ref(type_decl_id),
         _ => ty,
     }
+}
+
+fn union_candidate_type(left: LuaType, right: LuaType) -> LuaType {
+    if left == right {
+        return left;
+    }
+
+    match (&left, &right) {
+        (LuaType::Any, right) if right.is_nullable() => nullable_any_type(),
+        (left, LuaType::Any) if left.is_nullable() => nullable_any_type(),
+        (LuaType::Any, _) | (_, LuaType::Any) => LuaType::Any,
+        (LuaType::Never, _) => right,
+        (_, LuaType::Never) => left,
+        (LuaType::Unknown, _) => right,
+        (_, LuaType::Unknown) => left,
+        (LuaType::Integer, LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_))
+        | (LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_), LuaType::Integer) => {
+            LuaType::Integer
+        }
+        (LuaType::Number, right) if right.is_number() => LuaType::Number,
+        (left, LuaType::Number) if left.is_number() => LuaType::Number,
+        (LuaType::String, LuaType::StringConst(_) | LuaType::DocStringConst(_))
+        | (LuaType::StringConst(_) | LuaType::DocStringConst(_), LuaType::String) => {
+            LuaType::String
+        }
+        (LuaType::Boolean, LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_))
+        | (LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_), LuaType::Boolean) => {
+            LuaType::Boolean
+        }
+        (LuaType::BooleanConst(left), LuaType::BooleanConst(right)) => {
+            if left == right {
+                LuaType::BooleanConst(*left)
+            } else {
+                LuaType::Boolean
+            }
+        }
+        (LuaType::DocBooleanConst(left), LuaType::DocBooleanConst(right)) => {
+            if left == right {
+                LuaType::DocBooleanConst(*left)
+            } else {
+                LuaType::Boolean
+            }
+        }
+        (LuaType::Table, LuaType::TableConst(_)) | (LuaType::TableConst(_), LuaType::Table) => {
+            LuaType::Table
+        }
+        (LuaType::Function, LuaType::DocFunction(_) | LuaType::Signature(_))
+        | (LuaType::DocFunction(_) | LuaType::Signature(_), LuaType::Function) => LuaType::Function,
+        (LuaType::Union(left_union), right) if !right.is_union() => {
+            let mut types = left_union.into_vec();
+            if !types.contains(right) {
+                types.push(right.clone());
+            }
+            LuaType::from_vec(types)
+        }
+        (left, LuaType::Union(right_union)) if !left.is_union() => {
+            let mut types = right_union.into_vec();
+            if !types.contains(left) {
+                types.push(left.clone());
+            }
+            LuaType::from_vec(types)
+        }
+        (LuaType::Union(left_union), LuaType::Union(right_union)) => {
+            let mut types = left_union.into_vec();
+            types.extend(right_union.into_vec());
+            LuaType::from_vec(types)
+        }
+        _ => LuaType::from_vec(vec![left, right]),
+    }
+}
+
+fn nullable_any_type() -> LuaType {
+    LuaType::Union(LuaUnionType::Nullable(LuaType::Any).into())
 }

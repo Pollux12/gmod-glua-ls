@@ -98,6 +98,26 @@ mod test {
     }
 
     #[test]
+    fn test_generic_inference_combines_multiple_candidates() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param first T
+            ---@param second T
+            ---@return T
+            function choose(first, second) end
+
+            value = choose("name", 1)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        let expected = ws.ty("string|integer");
+        assert_eq!(value_ty, expected);
+    }
+
+    #[test]
     fn test_issue_646() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
