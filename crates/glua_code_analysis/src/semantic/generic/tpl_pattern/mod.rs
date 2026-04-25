@@ -519,14 +519,17 @@ fn mapped_tpl_pattern_match(
 
     let mut fields = HashMap::new();
     let mut key_types = Vec::new();
+    let mut saw_uninferred_field = false;
     for (member_key, target_type) in target_fields {
         let Some(key_type) = member_key_to_key_type(&member_key) else {
+            saw_uninferred_field = true;
             continue;
         };
 
         key_types.push(key_type.clone());
         let target_type = reverse_mapped_source_field_type(context, mapped, target_type);
         if target_type == LuaType::Never {
+            saw_uninferred_field = true;
             continue;
         }
 
@@ -542,6 +545,7 @@ fn mapped_tpl_pattern_match(
         );
 
         if inferred.is_empty() {
+            saw_uninferred_field = true;
             continue;
         }
 
@@ -561,8 +565,13 @@ fn mapped_tpl_pattern_match(
 
     if !fields.is_empty() {
         let source_type = reverse_mapped_source_type(fields);
+        let priority = if saw_uninferred_field {
+            InferencePriority::PartialHomomorphicMappedType
+        } else {
+            InferencePriority::HomomorphicMappedType
+        };
         context.with_inference_priority(
-            InferencePriority::HomomorphicMappedType,
+            priority,
             true,
             |context| {
                 context.substitutor.insert_type(

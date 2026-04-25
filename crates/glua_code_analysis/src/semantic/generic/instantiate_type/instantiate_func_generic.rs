@@ -164,7 +164,10 @@ fn infer_generic_types_from_call(
 
         let (_, func_param_type) = &func_params[i];
         let collect_more_candidates = is_direct_type_candidate(func_param_type);
-        if context.substitutor.is_infer_all_tpl() && !collect_more_candidates {
+        if context.substitutor.is_infer_all_tpl()
+            && !collect_more_candidates
+            && !context.substitutor.has_non_direct_type_inferences()
+        {
             break;
         }
 

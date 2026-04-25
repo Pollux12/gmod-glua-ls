@@ -145,6 +145,15 @@ impl TypeSubstitutor {
         true
     }
 
+    pub fn has_non_direct_type_inferences(&self) -> bool {
+        self.type_inferences.values().any(|inference| {
+            !matches!(
+                inference.priority(),
+                InferencePriority::None | InferencePriority::Direct
+            )
+        })
+    }
+
     pub fn insert_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
         self.insert_type_with_priority(tpl_id, replace_type, decay, InferencePriority::Direct);
     }
