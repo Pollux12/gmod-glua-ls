@@ -725,6 +725,47 @@ mod test {
     }
 
     #[test]
+    fn test_contextual_generic_function_field_does_not_type_closure_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class GenericCallable
+            ---@field f fun<T>(value: T): T
+
+            ---@type GenericCallable
+            local callable = {
+                f = function(value)
+                    contextual_generic_field_seen = value
+                    return value
+                end
+            }
+            "#,
+        );
+
+        let seen_ty = ws.expr_ty("contextual_generic_field_seen");
+        assert_eq!(seen_ty, ws.ty("unknown"));
+    }
+
+    #[test]
+    fn test_contextual_generic_function_arg_does_not_type_closure_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param callback fun<T>(value: T): T
+            local function use_generic_callback(callback) end
+
+            use_generic_callback(function(value)
+                contextual_generic_arg_seen = value
+                return value
+            end)
+            "#,
+        );
+
+        let seen_ty = ws.expr_ty("contextual_generic_arg_seen");
+        assert_eq!(seen_ty, ws.ty("unknown"));
+    }
+
+    #[test]
     fn test_generic_return_context_does_not_override_arg_inference() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
