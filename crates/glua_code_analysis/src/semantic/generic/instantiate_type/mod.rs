@@ -27,6 +27,8 @@ pub use instantiate_func_generic::{
 pub use instantiate_special_generic::get_keyof_members;
 pub use instantiate_special_generic::instantiate_alias_call;
 
+const MAX_CONDITIONAL_INFER_DEPTH: usize = 64;
+
 pub fn instantiate_type_generic(
     db: &DbIndex,
     ty: &LuaType,
@@ -595,6 +597,20 @@ fn collect_infer_assignments(
     pattern: &LuaType,
     assignments: &mut HashMap<String, LuaType>,
 ) -> bool {
+    collect_infer_assignments_inner(db, source, pattern, assignments, 0)
+}
+
+fn collect_infer_assignments_inner(
+    db: &DbIndex,
+    source: &LuaType,
+    pattern: &LuaType,
+    assignments: &mut HashMap<String, LuaType>,
+    depth: usize,
+) -> bool {
+    if depth >= MAX_CONDITIONAL_INFER_DEPTH {
+        return false;
+    }
+
     match pattern {
         LuaType::ConditionalInfer(name) => {
             insert_infer_assignment(assignments, name.as_str(), source)
@@ -605,10 +621,15 @@ fn collect_infer_assignments(
                 source_generic,
                 pattern_generic,
                 assignments,
+                depth + 1,
             ),
-            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
-                collect_infer_from_ref_to_generic(db, type_id, pattern_generic, assignments)
-            }
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => collect_infer_from_ref_to_generic(
+                db,
+                type_id,
+                pattern_generic,
+                assignments,
+                depth + 1,
+            ),
             _ => false,
         },
         LuaType::DocFunction(pattern_func) => {
@@ -636,11 +657,12 @@ fn collect_infer_assignments(
                         if let Some((_, source_param)) = source_params.get(i) {
                             match (source_param, pattern_param) {
                                 (Some(source_ty), Some(pattern_ty)) => {
-                                    if !collect_infer_assignments(
+                                    if !collect_infer_assignments_inner(
                                         db,
                                         source_ty,
                                         pattern_ty,
                                         assignments,
+                                        depth + 1,
                                     ) {
                                         return false;
                                     }
@@ -702,7 +724,13 @@ fn collect_infer_assignments(
                                     ),
                                 };
 
-                                if !collect_infer_assignments(db, &ty, pattern_ty, assignments) {
+                                if !collect_infer_assignments_inner(
+                                    db,
+                                    &ty,
+                                    pattern_ty,
+                                    assignments,
+                                    depth + 1,
+                                ) {
                                     return false;
                                 }
                             }
@@ -713,11 +741,12 @@ fn collect_infer_assignments(
                     let pattern_ret = pattern_func.get_ret();
                     if contains_conditional_infer(pattern_ret) {
                         // 如果返回值也包含 infer, 继续与来源返回值进行匹配
-                        collect_infer_assignments(
+                        collect_infer_assignments_inner(
                             db,
                             source_func.get_ret(),
                             pattern_ret,
                             assignments,
+                            depth + 1,
                         )
                     } else {
                         true
@@ -726,11 +755,12 @@ fn collect_infer_assignments(
                 LuaType::Signature(id) => {
                     if let Some(signature) = db.get_signature_index().get(id) {
                         let source_func = signature.to_doc_func_type();
-                        collect_infer_assignments(
+                        collect_infer_assignments_inner(
                             db,
                             &LuaType::DocFunction(source_func),
                             pattern,
                             assignments,
+                            depth + 1,
                         )
                     } else {
                         false
@@ -741,7 +771,13 @@ fn collect_infer_assignments(
                         if type_decl.is_alias()
                             && let Some(origin) = type_decl.get_alias_origin(db, None)
                         {
-                            return collect_infer_assignments(db, &origin, &pattern, assignments);
+                            return collect_infer_assignments_inner(
+                                db,
+                                &origin,
+                                pattern,
+                                assignments,
+                                depth + 1,
+                            );
                         }
                     }
                     false
@@ -751,26 +787,39 @@ fn collect_infer_assignments(
         }
         LuaType::Array(array) => {
             if let LuaType::Array(source_array) = source {
-                collect_infer_assignments(
+                collect_infer_assignments_inner(
                     db,
                     source_array.get_base(),
                     array.get_base(),
                     assignments,
+                    depth + 1,
                 )
             } else {
                 false
             }
         }
         LuaType::Object(pattern_object) => match source {
-            LuaType::Object(source_object) => {
-                collect_infer_from_object_to_object(db, source_object, pattern_object, assignments)
-            }
-            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
-                collect_infer_from_class_to_object(db, type_id, pattern_object, assignments)
-            }
-            LuaType::TableConst(table_id) => {
-                collect_infer_from_table_to_object(db, table_id, pattern_object, assignments)
-            }
+            LuaType::Object(source_object) => collect_infer_from_object_to_object(
+                db,
+                source_object,
+                pattern_object,
+                assignments,
+                depth + 1,
+            ),
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => collect_infer_from_class_to_object(
+                db,
+                type_id,
+                pattern_object,
+                assignments,
+                depth + 1,
+            ),
+            LuaType::TableConst(table_id) => collect_infer_from_table_to_object(
+                db,
+                table_id,
+                pattern_object,
+                assignments,
+                depth + 1,
+            ),
             _ => false,
         },
         _ => {
@@ -788,6 +837,7 @@ fn collect_infer_from_generic_to_generic(
     source_generic: &LuaGenericType,
     pattern_generic: &LuaGenericType,
     assignments: &mut HashMap<String, LuaType>,
+    depth: usize,
 ) -> bool {
     if source_generic.get_base_type_id_ref() == pattern_generic.get_base_type_id_ref() {
         return collect_infer_from_generic_params(
@@ -795,6 +845,7 @@ fn collect_infer_from_generic_to_generic(
             source_generic.get_params(),
             pattern_generic.get_params(),
             assignments,
+            depth + 1,
         );
     }
 
@@ -810,11 +861,12 @@ fn collect_infer_from_generic_to_generic(
         );
         if let Some(alias_origin) = source_decl.get_alias_origin(db, Some(&substitutor)) {
             let mut candidate_assignments = assignments.clone();
-            if collect_infer_assignments(
+            if collect_infer_assignments_inner(
                 db,
                 &alias_origin,
                 &LuaType::Generic(pattern_generic.clone().into()),
                 &mut candidate_assignments,
+                depth + 1,
             ) {
                 *assignments = candidate_assignments;
                 return true;
@@ -834,11 +886,12 @@ fn collect_infer_from_generic_to_generic(
         for super_type in super_types {
             let super_type = instantiate_type_generic(db, &super_type, &substitutor);
             let mut candidate_assignments = assignments.clone();
-            if collect_infer_assignments(
+            if collect_infer_assignments_inner(
                 db,
                 &super_type,
                 &LuaType::Generic(pattern_generic.clone().into()),
                 &mut candidate_assignments,
+                depth + 1,
             ) {
                 *assignments = candidate_assignments;
                 return true;
@@ -854,6 +907,7 @@ fn collect_infer_from_ref_to_generic(
     source_type_id: &LuaTypeDeclId,
     pattern_generic: &LuaGenericType,
     assignments: &mut HashMap<String, LuaType>,
+    depth: usize,
 ) -> bool {
     let Some(super_types) = db.get_type_index().get_super_types(source_type_id) else {
         return false;
@@ -861,11 +915,12 @@ fn collect_infer_from_ref_to_generic(
 
     for super_type in super_types {
         let mut candidate_assignments = assignments.clone();
-        if collect_infer_assignments(
+        if collect_infer_assignments_inner(
             db,
             &super_type,
             &LuaType::Generic(pattern_generic.clone().into()),
             &mut candidate_assignments,
+            depth + 1,
         ) {
             *assignments = candidate_assignments;
             return true;
@@ -880,6 +935,7 @@ fn collect_infer_from_generic_params(
     source_params: &[LuaType],
     pattern_params: &[LuaType],
     assignments: &mut HashMap<String, LuaType>,
+    depth: usize,
 ) -> bool {
     if pattern_params.len() != source_params.len() {
         return false;
@@ -887,7 +943,13 @@ fn collect_infer_from_generic_params(
 
     let mut candidate_assignments = assignments.clone();
     for (pattern_param, source_param) in pattern_params.iter().zip(source_params) {
-        if !collect_infer_assignments(db, source_param, pattern_param, &mut candidate_assignments) {
+        if !collect_infer_assignments_inner(
+            db,
+            source_param,
+            pattern_param,
+            &mut candidate_assignments,
+            depth + 1,
+        ) {
             return false;
         }
     }
@@ -902,13 +964,20 @@ fn collect_infer_from_object_to_object(
     source_object: &LuaObjectType,
     pattern_object: &LuaObjectType,
     assignments: &mut HashMap<String, LuaType>,
+    depth: usize,
 ) -> bool {
     let source_fields = source_object.get_fields();
     let pattern_fields = pattern_object.get_fields();
 
     for (key, pattern_field_ty) in pattern_fields {
         if let Some(source_field_ty) = source_fields.get(key) {
-            if !collect_infer_assignments(db, source_field_ty, pattern_field_ty, assignments) {
+            if !collect_infer_assignments_inner(
+                db,
+                source_field_ty,
+                pattern_field_ty,
+                assignments,
+                depth + 1,
+            ) {
                 return false;
             }
         } else if contains_conditional_infer(pattern_field_ty) {
@@ -926,6 +995,7 @@ fn collect_infer_from_class_to_object(
     type_id: &LuaTypeDeclId,
     pattern_object: &LuaObjectType,
     assignments: &mut HashMap<String, LuaType>,
+    depth: usize,
 ) -> bool {
     let pattern_fields = pattern_object.get_fields();
     let source_type = LuaType::Ref(type_id.clone());
@@ -933,7 +1003,13 @@ fn collect_infer_from_class_to_object(
     for (key, pattern_field_ty) in pattern_fields {
         if let Some(member_infos) = find_members_with_key(db, &source_type, key.clone(), false) {
             if let Some(member_info) = member_infos.first() {
-                if !collect_infer_assignments(db, &member_info.typ, pattern_field_ty, assignments) {
+                if !collect_infer_assignments_inner(
+                    db,
+                    &member_info.typ,
+                    pattern_field_ty,
+                    assignments,
+                    depth + 1,
+                ) {
                     return false;
                 }
             } else if contains_conditional_infer(pattern_field_ty) {
@@ -953,6 +1029,7 @@ fn collect_infer_from_table_to_object(
     table_id: &crate::InFiled<rowan::TextRange>,
     pattern_object: &LuaObjectType,
     assignments: &mut HashMap<String, LuaType>,
+    depth: usize,
 ) -> bool {
     let pattern_fields = pattern_object.get_fields();
     let source_type = LuaType::TableConst(table_id.clone());
@@ -960,7 +1037,13 @@ fn collect_infer_from_table_to_object(
     for (key, pattern_field_ty) in pattern_fields {
         if let Some(member_infos) = find_members_with_key(db, &source_type, key.clone(), false) {
             if let Some(member_info) = member_infos.first() {
-                if !collect_infer_assignments(db, &member_info.typ, pattern_field_ty, assignments) {
+                if !collect_infer_assignments_inner(
+                    db,
+                    &member_info.typ,
+                    pattern_field_ty,
+                    assignments,
+                    depth + 1,
+                ) {
                     return false;
                 }
             } else if contains_conditional_infer(pattern_field_ty) {
