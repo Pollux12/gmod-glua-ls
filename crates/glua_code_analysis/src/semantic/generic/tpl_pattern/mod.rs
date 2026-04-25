@@ -560,20 +560,31 @@ fn mapped_tpl_pattern_match(
 
 fn mapped_source_tpl_id(mapped: &LuaMappedType) -> Option<GenericTplId> {
     let constraint = mapped.param.1.type_constraint.as_ref()?;
-    let LuaType::Call(alias_call) = constraint else {
-        return None;
-    };
+    mapped_source_tpl_id_from_constraint(constraint, 0)
+}
 
-    if alias_call.get_call_kind() != LuaAliasCallKind::KeyOf {
-        return None;
-    }
-
-    let operands = alias_call.get_operands();
-    if operands.len() != 1 {
+fn mapped_source_tpl_id_from_constraint(
+    constraint: &LuaType,
+    depth: usize,
+) -> Option<GenericTplId> {
+    if depth > 8 {
         return None;
     }
 
-    tpl_id_from_type(&operands[0])
+    match constraint {
+        LuaType::Call(alias_call) if alias_call.get_call_kind() == LuaAliasCallKind::KeyOf => {
+            let operands = alias_call.get_operands();
+            if operands.len() != 1 {
+                return None;
+            }
+
+            tpl_id_from_type(&operands[0])
+        }
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => tpl
+            .get_constraint()
+            .and_then(|constraint| mapped_source_tpl_id_from_constraint(constraint, depth + 1)),
+        _ => None,
+    }
 }
 
 fn mapped_target_fields(

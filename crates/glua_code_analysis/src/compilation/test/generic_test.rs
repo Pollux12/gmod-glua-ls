@@ -1349,6 +1349,29 @@ mod test {
     }
 
     #[test]
+    fn test_reverse_mapped_infer_through_pick_key_constraint() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@alias Pick<T, K extends keyof T> { [P in K]: T[P]; }
+
+            ---@generic T, K extends keyof T
+            ---@param values Pick<T, K>
+            ---@return T
+            function restore_pick(values) end
+
+            result = restore_pick({
+                name = "Ada",
+            })
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        assert_eq!(ws.humanize_type(name_ty), "\"Ada\"");
+    }
+
+    #[test]
     fn test_reverse_mapped_infer_through_generic_wrapper() {
         let mut ws = VirtualWorkspace::new();
 
