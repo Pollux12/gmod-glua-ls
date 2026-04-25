@@ -1395,6 +1395,30 @@ mod test {
     }
 
     #[test]
+    fn test_reverse_mapped_partial_strips_optional_from_source_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@alias Partial<T> { [P in keyof T]?: T[P]; }
+
+            ---@generic T
+            ---@param values Partial<T>
+            ---@return T
+            function restore_partial(values) end
+
+            ---@type {name?: string}
+            local values
+
+            result = restore_partial(values)
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+    }
+
+    #[test]
     fn test_reverse_mapped_infer_through_generic_wrapper() {
         let mut ws = VirtualWorkspace::new();
 

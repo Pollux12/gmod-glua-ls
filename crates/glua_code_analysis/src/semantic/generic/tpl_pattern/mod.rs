@@ -12,7 +12,7 @@ use crate::{
     GenericTplId, InferFailReason, InferencePriority, LuaAliasCallKind, LuaAliasCallType,
     LuaArrayType, LuaFunctionType, LuaMappedType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
     LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel,
-    VariadicType, check_type_compact,
+    TypeOps, VariadicType, check_type_compact,
     db_index::{DbIndex, LuaGenericType, LuaType},
     infer_node_semantic_decl,
     semantic::{
@@ -525,6 +525,11 @@ fn mapped_tpl_pattern_match(
         };
 
         key_types.push(key_type.clone());
+        let target_type = reverse_mapped_source_field_type(context, mapped, target_type);
+        if target_type == LuaType::Never {
+            continue;
+        }
+
         let mut inferred = Vec::new();
         collect_reverse_mapped_field_inferences(
             context,
@@ -569,6 +574,18 @@ fn mapped_tpl_pattern_match(
     }
 
     Ok(())
+}
+
+fn reverse_mapped_source_field_type(
+    context: &TplContext,
+    mapped: &LuaMappedType,
+    target_type: LuaType,
+) -> LuaType {
+    if mapped.is_optional {
+        return TypeOps::Remove.apply(context.db, &target_type, &LuaType::Nil);
+    }
+
+    target_type
 }
 
 #[derive(Debug, Clone, Copy)]
