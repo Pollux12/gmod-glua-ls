@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::{DiagnosticCode, VirtualWorkspace};
-    use glua_parser::{LuaCallExpr, LuaExpr};
+    use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr};
 
     #[test]
     fn test_issue_586() {
@@ -450,6 +450,54 @@ mod test {
         assert_eq!(call_ty, expected);
 
         let seen_ty = ws.expr_ty("union_seen");
+        assert_eq!(seen_ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_generic_metatable_call_return_context_flows_into_callback_param() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@generic T, U
+            ---@param cb fun(value: T): U
+            ---@return fun(value: T): U
+            function meta(cb)
+            end
+
+            local wrapper = setmetatable({}, { __call = meta })
+
+            ---@type fun(value: string): number
+            local mapped = wrapper(function(value)
+                metatable_seen = value
+                return 1
+            end)
+            "#,
+        );
+
+        let tree = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("Tree must exist");
+        let call_expr = tree
+            .get_chunk_node()
+            .descendants::<LuaCallExpr>()
+            .last()
+            .expect("Call expression must exist");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("fun(value: string): number");
+        assert_eq!(call_ty, expected);
+
+        let seen_ty = ws.expr_ty("metatable_seen");
         assert_eq!(seen_ty, ws.ty("string"));
     }
 

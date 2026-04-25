@@ -91,8 +91,16 @@ pub fn infer_call_expr_func(
             infer_guard,
             args_count,
         ),
-        LuaType::Instance(inst) => infer_instance_type_doc_function(db, inst),
-        LuaType::TableConst(meta_table) => infer_table_type_doc_function(db, meta_table.clone()),
+        LuaType::Instance(inst) => {
+            infer_instance_type_doc_function(db, cache, inst, call_expr.clone(), args_count)
+        }
+        LuaType::TableConst(meta_table) => infer_table_type_doc_function(
+            db,
+            cache,
+            meta_table.clone(),
+            call_expr.clone(),
+            args_count,
+        ),
         LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_) => infer_tpl_ref_call(
             db,
             cache,
@@ -568,21 +576,30 @@ fn infer_generic_type_doc_function(
 
 fn infer_instance_type_doc_function(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     instance: &LuaInstanceType,
+    call_expr: LuaCallExpr,
+    args_count: Option<usize>,
 ) -> InferCallFuncResult {
     let base = instance.get_base();
     let base_table = match &base {
         LuaType::TableConst(meta_table) => meta_table.clone(),
         LuaType::Instance(inst) => {
-            return infer_instance_type_doc_function(db, inst);
+            return infer_instance_type_doc_function(db, cache, inst, call_expr, args_count);
         }
         _ => return Err(InferFailReason::None),
     };
 
-    infer_table_type_doc_function(db, base_table)
+    infer_table_type_doc_function(db, cache, base_table, call_expr, args_count)
 }
 
-fn infer_table_type_doc_function(db: &DbIndex, table: InFiled<TextRange>) -> InferCallFuncResult {
+fn infer_table_type_doc_function(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table: InFiled<TextRange>,
+    call_expr: LuaCallExpr,
+    args_count: Option<usize>,
+) -> InferCallFuncResult {
     let meta_table = db
         .get_metatable_index()
         .get(&table)
@@ -604,21 +621,10 @@ fn infer_table_type_doc_function(db: &DbIndex, table: InFiled<TextRange>) -> Inf
         let func = operator.get_operator_func(db);
         match func {
             LuaType::DocFunction(func) => {
-                return Ok(func);
+                return infer_doc_function(db, cache, &func, call_expr, args_count);
             }
             LuaType::Signature(signature_id) => {
-                let signature = db
-                    .get_signature_index()
-                    .get(&signature_id)
-                    .ok_or(InferFailReason::None)?;
-                if !signature.is_resolve_return() {
-                    return Err(InferFailReason::UnResolveSignatureReturn(signature_id));
-                }
-
-                return Ok(apply_signature_return_kinds_to_function(
-                    signature,
-                    signature.to_call_operator_func_type().as_ref(),
-                ));
+                return infer_signature_doc_function(db, cache, signature_id, call_expr, args_count);
             }
             _ => {}
         }
