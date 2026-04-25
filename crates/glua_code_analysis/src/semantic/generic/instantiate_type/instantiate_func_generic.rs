@@ -37,6 +37,16 @@ pub fn instantiate_func_generic(
     func: &LuaFunctionType,
     call_expr: LuaCallExpr,
 ) -> Result<LuaFunctionType, InferFailReason> {
+    instantiate_func_generic_with_context(db, cache, func, call_expr, None)
+}
+
+pub fn instantiate_func_generic_with_context(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    func: &LuaFunctionType,
+    call_expr: LuaCallExpr,
+    contextual_return_hint: Option<LuaType>,
+) -> Result<LuaFunctionType, InferFailReason> {
     let file_id = cache.get_file_id().clone();
     let mut generic_tpls = HashSet::new();
     let mut contain_self = false;
@@ -89,6 +99,7 @@ pub fn instantiate_func_generic(
                 &call_expr,
                 &mut func_params,
                 &arg_exprs,
+                contextual_return_hint.as_ref(),
             )?;
         }
     }
@@ -126,6 +137,7 @@ fn infer_generic_types_from_call(
     call_expr: &LuaCallExpr,
     func_params: &mut Vec<(String, LuaType)>,
     arg_exprs: &[LuaExpr],
+    contextual_return_hint: Option<&LuaType>,
 ) -> Result<(), InferFailReason> {
     let colon_call = call_expr.is_colon_call();
     let colon_define = func.is_colon_define();
@@ -206,6 +218,13 @@ fn infer_generic_types_from_call(
                     .set_type_candidate_collection_enabled(previous);
             }
         }
+    }
+
+    if let Some(return_hint) = contextual_return_hint
+        && func.get_ret().contain_tpl()
+        && !context.substitutor.is_infer_all_tpl()
+    {
+        tpl_pattern_match(context, func.get_ret(), return_hint)?;
     }
 
     if !context.substitutor.is_infer_all_tpl() {

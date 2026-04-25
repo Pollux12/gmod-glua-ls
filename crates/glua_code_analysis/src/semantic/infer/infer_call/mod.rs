@@ -27,7 +27,7 @@ use crate::{
 };
 use crate::{
     SemanticDeclGuard, SemanticDeclLevel, build_self_type, infer_self_type,
-    instantiate_func_generic, semantic::infer_expr,
+    instantiate_func_generic, instantiate_func_generic_with_context, semantic::infer_expr,
 };
 use infer_require::infer_require_call;
 use infer_setmetatable::infer_setmetatable_call;
@@ -264,7 +264,14 @@ fn infer_doc_function(
     _: Option<usize>,
 ) -> InferCallFuncResult {
     if func.contain_tpl() {
-        let result = instantiate_func_generic(db, cache, func, call_expr.clone())?;
+        let contextual_return_hint = get_contextual_return_hint(db, cache, &call_expr);
+        let result = instantiate_func_generic_with_context(
+            db,
+            cache,
+            func,
+            call_expr.clone(),
+            contextual_return_hint,
+        )?;
         return Ok(Arc::new(result));
     }
 
@@ -334,7 +341,14 @@ fn infer_signature_doc_function(
             signature.get_return_type(),
         );
         if is_generic {
-            fake_doc_function = instantiate_func_generic(db, cache, &fake_doc_function, call_expr)?;
+            let contextual_return_hint = get_contextual_return_hint(db, cache, &call_expr);
+            fake_doc_function = instantiate_func_generic_with_context(
+                db,
+                cache,
+                &fake_doc_function,
+                call_expr,
+                contextual_return_hint,
+            )?;
         }
 
         Ok(apply_signature_return_kinds_to_function(

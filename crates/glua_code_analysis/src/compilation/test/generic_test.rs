@@ -326,6 +326,68 @@ mod test {
     }
 
     #[test]
+    fn test_generic_return_context_flows_into_callback_param() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@generic T, U
+            ---@param cb fun(value: T): U
+            ---@return fun(value: T): U
+            function wrap(cb) end
+
+            ---@type fun(value: string): number
+            local mapped = wrap(function(value)
+                seen = value
+                return 1
+            end)
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("fun(value: string): number");
+        assert_eq!(call_ty, expected);
+
+        let seen_ty = ws.expr_ty("seen");
+        assert_eq!(seen_ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_generic_return_context_does_not_override_arg_inference() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T
+            function id(value) end
+
+            ---@type string
+            local value = id(1)
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("integer");
+        assert_eq!(call_ty, expected);
+    }
+
+    #[test]
     fn test_issue_646() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
