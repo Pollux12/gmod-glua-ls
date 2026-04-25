@@ -198,6 +198,9 @@ fn infer_generic_types_from_call(
                     .substitutor
                     .set_type_candidate_collection_enabled(collect_more_candidates);
                 tpl_pattern_match(context, func_param_type, &arg_type)?;
+                if collect_more_candidates {
+                    context.substitutor.normalize_type_inferences(db);
+                }
                 context
                     .substitutor
                     .set_type_candidate_collection_enabled(previous);

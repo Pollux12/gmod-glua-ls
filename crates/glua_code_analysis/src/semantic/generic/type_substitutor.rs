@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use super::tpl_pattern::constant_decay;
-use crate::{DbIndex, GenericTplId, LuaType, LuaTypeDeclId, LuaUnionType};
+use crate::{
+    DbIndex, GenericTplId, LuaGenericType, LuaType, LuaTypeDeclId, LuaUnionType,
+    semantic::type_check::check_type_compact,
+};
 
 #[derive(Debug, Clone)]
 pub struct TypeSubstitutor {
@@ -119,6 +122,16 @@ impl TypeSubstitutor {
         let previous = self.collect_type_candidates;
         self.collect_type_candidates = enabled;
         previous
+    }
+
+    pub fn normalize_type_inferences(&mut self, db: &DbIndex) {
+        for (tpl_id, inference) in self.type_inferences.iter_mut() {
+            inference.normalize_with_common_supertype(db);
+            if let Some(inferred) = inference.inferred() {
+                self.tpl_replace_map
+                    .insert(*tpl_id, SubstitutorValue::Type(inferred.clone()));
+            }
+        }
     }
 
     pub fn is_infer_all_tpl(&self) -> bool {
@@ -267,6 +280,20 @@ impl TypeInferenceInfo {
         self.candidates.push(candidate);
     }
 
+    fn normalize_with_common_supertype(&mut self, db: &DbIndex) {
+        let Some((first, rest)) = self.candidates.split_first() else {
+            self.inferred = None;
+            return;
+        };
+
+        let mut inferred = first.clone();
+        for candidate in rest {
+            inferred.combine_with_common_supertype(db, candidate.clone());
+        }
+
+        self.inferred = Some(inferred);
+    }
+
     fn inferred(&self) -> Option<&SubstitutorTypeValue> {
         self.inferred.as_ref()
     }
@@ -300,6 +327,11 @@ impl SubstitutorTypeValue {
     fn union_with(&mut self, other: SubstitutorTypeValue) {
         self.raw = union_candidate_type(self.raw.clone(), other.raw);
         self.default = union_candidate_type(self.default.clone(), other.default);
+    }
+
+    fn combine_with_common_supertype(&mut self, db: &DbIndex, other: SubstitutorTypeValue) {
+        self.raw = common_candidate_type(db, self.raw.clone(), other.raw);
+        self.default = common_candidate_type(db, self.default.clone(), other.default);
     }
 }
 
@@ -392,6 +424,64 @@ pub(super) fn union_candidate_type(left: LuaType, right: LuaType) -> LuaType {
         }
         _ => LuaType::from_vec(vec![left, right]),
     }
+}
+
+fn common_candidate_type(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
+    if left == right {
+        return left;
+    }
+
+    match (&left, &right) {
+        (LuaType::Any, right) if right.is_nullable() => return nullable_any_type(),
+        (left, LuaType::Any) if left.is_nullable() => return nullable_any_type(),
+        (LuaType::Any, _) | (_, LuaType::Any) => return LuaType::Any,
+        (LuaType::Never, _) => return right,
+        (_, LuaType::Never) => return left,
+        (LuaType::Unknown, _) => return right,
+        (_, LuaType::Unknown) => return left,
+        _ => {}
+    }
+
+    if check_type_compact(db, &left, &right).is_ok() {
+        return right;
+    }
+
+    if check_type_compact(db, &right, &left).is_ok() {
+        return left;
+    }
+
+    if let Some(common) = common_nominal_supertype(db, &left, &right) {
+        return common;
+    }
+
+    union_candidate_type(left, right)
+}
+
+fn common_nominal_supertype(db: &DbIndex, left: &LuaType, right: &LuaType) -> Option<LuaType> {
+    let left_supers = nominal_super_types_with_self(db, left)?;
+    let right_supers = nominal_super_types_with_self(db, right)?;
+
+    left_supers
+        .into_iter()
+        .find(|candidate| right_supers.contains(candidate))
+}
+
+fn nominal_super_types_with_self(db: &DbIndex, ty: &LuaType) -> Option<Vec<LuaType>> {
+    match ty {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            Some(type_id.collect_super_types_with_self(db, LuaType::Ref(type_id.clone())))
+        }
+        LuaType::Generic(generic) => generic_super_types_with_self(db, generic),
+        _ => None,
+    }
+}
+
+fn generic_super_types_with_self(db: &DbIndex, generic: &LuaGenericType) -> Option<Vec<LuaType>> {
+    let base_type_id = generic.get_base_type_id_ref();
+    let mut super_types =
+        base_type_id.collect_super_types_with_self(db, LuaType::Ref(base_type_id.clone()));
+    super_types.insert(0, LuaType::Generic(generic.clone().into()));
+    Some(super_types)
 }
 
 fn nullable_any_type() -> LuaType {

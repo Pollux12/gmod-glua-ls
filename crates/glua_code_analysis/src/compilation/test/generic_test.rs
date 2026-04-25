@@ -151,6 +151,34 @@ mod test {
     }
 
     #[test]
+    fn test_generic_direct_candidates_use_common_supertype() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+            ---@class Cat: Animal
+
+            ---@generic T
+            ---@param first T
+            ---@param second T
+            ---@return T
+            function choose(first, second) end
+
+            ---@type Dog
+            local dog
+            ---@type Cat
+            local cat
+            animal = choose(dog, cat)
+            "#,
+        );
+
+        let animal_ty = ws.expr_ty("animal");
+        let expected = ws.ty("Animal");
+        assert_eq!(animal_ty, expected);
+    }
+
+    #[test]
     fn test_issue_646() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
