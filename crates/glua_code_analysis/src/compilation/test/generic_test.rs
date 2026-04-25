@@ -753,6 +753,40 @@ mod test {
     }
 
     #[test]
+    fn test_conditional_infer_pattern_union_does_not_use_naked_fallback_after_structural_match() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@alias ExtractA<T> T extends (Box<infer A>|infer B) and A or unknown
+            ---@alias ExtractB<T> T extends (Box<infer A>|infer B) and B or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return ExtractA<T>
+            function extract_a(value) end
+
+            ---@generic T
+            ---@param value T
+            ---@return ExtractB<T>
+            function extract_b(value) end
+
+            ---@type Box<string>
+            local source
+
+            a = extract_a(source)
+            b = extract_b(source)
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let b_ty = ws.expr_ty("b");
+        assert_eq!(ws.humanize_type(a_ty), "string");
+        assert_eq!(ws.humanize_type(b_ty), "unknown");
+    }
+
+    #[test]
     fn test_generic_identity_table_literal_still_allows_later_field_inference() {
         let mut ws = VirtualWorkspace::new();
 

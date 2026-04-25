@@ -833,7 +833,7 @@ fn collect_infer_to_union(
 
     let mut matched = false;
     let mut union_assignments = assignments.clone();
-    let mut structural_infer_names = HashSet::new();
+    let mut structural_matched = false;
     let pattern_members = pattern_union.into_vec();
 
     for member in pattern_members
@@ -848,27 +848,26 @@ fn collect_infer_to_union(
             &mut branch_assignments,
             &infer_guard.fork(),
         ) {
-            collect_conditional_infer_names(member, &mut structural_infer_names);
             union_assignments = branch_assignments;
+            structural_matched = true;
             matched = true;
         }
     }
 
-    for member in pattern_members
-        .iter()
-        .filter(|member| is_naked_conditional_infer(member))
-    {
-        let LuaType::ConditionalInfer(name) = member else {
-            continue;
-        };
-        if structural_infer_names.contains(name.as_str()) {
-            continue;
-        }
+    if !structural_matched {
+        for member in pattern_members
+            .iter()
+            .filter(|member| is_naked_conditional_infer(member))
+        {
+            let LuaType::ConditionalInfer(name) = member else {
+                continue;
+            };
 
-        let mut branch_assignments = union_assignments.clone();
-        if insert_infer_assignment(&mut branch_assignments, name.as_str(), source) {
-            union_assignments = branch_assignments;
-            matched = true;
+            let mut branch_assignments = union_assignments.clone();
+            if insert_infer_assignment(&mut branch_assignments, name.as_str(), source) {
+                union_assignments = branch_assignments;
+                matched = true;
+            }
         }
     }
 
@@ -880,14 +879,6 @@ fn collect_infer_to_union(
 
 fn is_naked_conditional_infer(ty: &LuaType) -> bool {
     matches!(ty, LuaType::ConditionalInfer(_))
-}
-
-fn collect_conditional_infer_names(ty: &LuaType, names: &mut HashSet<String>) {
-    ty.visit_type(&mut |inner| {
-        if let LuaType::ConditionalInfer(name) = inner {
-            names.insert(name.as_str().to_string());
-        }
-    });
 }
 
 fn collect_infer_from_generic_source(
