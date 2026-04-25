@@ -233,7 +233,6 @@ fn check_ref_class(
             if let Some(base_type_id) = get_base_type_id(compact_type) {
                 if source_id == &base_type_id
                     || is_sub_type_of(context.db, &base_type_id, source_id)
-                    || is_sub_type_of(context.db, source_id, &base_type_id)
                 {
                     Ok(())
                 } else {

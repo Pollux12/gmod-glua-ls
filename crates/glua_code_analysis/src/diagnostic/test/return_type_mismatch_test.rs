@@ -346,7 +346,8 @@ mod tests {
     fn test_supper() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
-        assert!(ws.check_code_for(
+        // Integer literals are not implicitly branded as key.
+        assert!(!ws.check_code_for(
             DiagnosticCode::ReturnTypeMismatch,
             r#"
                 ---@class key: integer

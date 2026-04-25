@@ -743,9 +743,9 @@ return t
                 "#
         ));
 
-        // 允许接受父类.
-        // TODO: 接受父类时应该检查是否具有子类的所有非可空成员.
-        assert!(ws.check_code_for_namespace(
+        // Primitive-backed classes behave like branded primitive subtypes:
+        // the branded class is assignable to its primitive base, but not vice versa.
+        assert!(!ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
             ---@class Option: string

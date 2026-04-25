@@ -212,6 +212,28 @@ mod test {
     }
 
     #[test]
+    fn test_primitive_subtyping_is_directional() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+        ---@class UserId: string
+
+        ---@class UnitKey: integer
+        "#,
+        );
+
+        let string_ty = ws.ty("string");
+        let user_id_ty = ws.ty("UserId");
+        assert!(ws.check_type(&string_ty, &user_id_ty));
+        assert!(!ws.check_type(&user_id_ty, &string_ty));
+
+        let integer_ty = ws.ty("integer");
+        let unit_key_ty = ws.ty("UnitKey");
+        assert!(ws.check_type(&integer_ty, &unit_key_ty));
+        assert!(!ws.check_type(&unit_key_ty, &integer_ty));
+    }
+
+    #[test]
     fn test_issue_790() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
