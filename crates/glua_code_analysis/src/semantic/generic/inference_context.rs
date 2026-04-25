@@ -103,21 +103,22 @@ impl InferenceContext {
         self.variance
     }
 
-    pub fn insert_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
+    fn record_inferred_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
         let value = SubstitutorTypeValue::new(replace_type, decay);
         if self.collect_type_candidates {
             self.insert_type_candidate(tpl_id, value, self.priority, self.variance);
         } else {
-            self.substitutor.insert_type_value(tpl_id, value);
+            self.substitutor.set_fixed_type_value(tpl_id, value);
         }
     }
 
     pub fn infer_type(&mut self, tpl_id: GenericTplId, candidate: LuaType, decay: bool) {
-        self.insert_type(tpl_id, candidate, decay);
+        self.record_inferred_type(tpl_id, candidate, decay);
     }
 
     pub fn set_explicit_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
-        self.insert_type(tpl_id, replace_type, decay);
+        self.substitutor
+            .set_fixed_type_value(tpl_id, SubstitutorTypeValue::new(replace_type, decay));
     }
 
     pub fn infer_params(&mut self, tpl_id: GenericTplId, params: Vec<(String, Option<LuaType>)>) {

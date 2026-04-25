@@ -633,7 +633,7 @@ fn instantiate_conditional(
                     let tpl_id_map = resolve_infer_tpl_ids(conditional, substitutor, &infer_names);
                     for (name, ty) in infer_assignments.iter() {
                         if let Some(tpl_id) = tpl_id_map.get(name.as_str()) {
-                            true_substitutor.insert_type(*tpl_id, ty.clone(), true);
+                            true_substitutor.set_fixed_type(*tpl_id, ty.clone(), true);
                         }
                     }
                 }
@@ -1445,7 +1445,7 @@ fn instantiate_mapped_value(
     replacement: &LuaType,
 ) -> LuaType {
     let mut local_substitutor = substitutor.clone();
-    local_substitutor.insert_type(tpl_id, replacement.clone(), true);
+    local_substitutor.set_fixed_type(tpl_id, replacement.clone(), true);
     let mut result = instantiate_type_generic(db, &mapped.value, &local_substitutor);
     // 根据 readonly 和 optional 属性进行处理
     if mapped.is_optional {

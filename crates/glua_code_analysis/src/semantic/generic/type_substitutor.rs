@@ -119,11 +119,20 @@ impl TypeSubstitutor {
         true
     }
 
-    pub fn insert_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
-        self.insert_type_value(tpl_id, SubstitutorTypeValue::new(replace_type, decay));
+    pub(super) fn set_fixed_type(
+        &mut self,
+        tpl_id: GenericTplId,
+        replace_type: LuaType,
+        decay: bool,
+    ) {
+        self.set_fixed_type_value(tpl_id, SubstitutorTypeValue::new(replace_type, decay));
     }
 
-    pub(super) fn insert_type_value(&mut self, tpl_id: GenericTplId, value: SubstitutorTypeValue) {
+    pub(super) fn set_fixed_type_value(
+        &mut self,
+        tpl_id: GenericTplId,
+        value: SubstitutorTypeValue,
+    ) {
         if !self.can_insert_type(tpl_id) {
             return;
         }
