@@ -508,7 +508,7 @@ fn mapped_tpl_pattern_match(
     mapped: &LuaMappedType,
     target: &LuaType,
 ) -> TplPatternMatchResult {
-    let Some(source_tpl_id) = mapped_source_tpl_id(mapped) else {
+    let Some(source_info) = mapped_source_info(mapped) else {
         return Ok(());
     };
 
@@ -518,17 +518,19 @@ fn mapped_tpl_pattern_match(
     }
 
     let mut fields = HashMap::new();
+    let mut key_types = Vec::new();
     for (member_key, target_type) in target_fields {
         let Some(key_type) = member_key_to_key_type(&member_key) else {
             continue;
         };
 
+        key_types.push(key_type.clone());
         let mut inferred = Vec::new();
         collect_reverse_mapped_field_inferences(
             context,
             &mapped.value,
             &target_type,
-            source_tpl_id,
+            source_info.source_tpl_id,
             mapped.param.0,
             &key_type,
             &mut inferred,
@@ -541,13 +543,24 @@ fn mapped_tpl_pattern_match(
         fields.insert(member_key, LuaType::from_vec(inferred));
     }
 
+    if let Some(key_constraint_tpl_id) = source_info.key_constraint_tpl_id
+        && !key_types.is_empty()
+    {
+        let key_type = LuaType::from_vec(key_types);
+        context.with_inference_priority(InferencePriority::MappedTypeConstraint, true, |context| {
+            context
+                .substitutor
+                .insert_type(key_constraint_tpl_id, key_type, false);
+        });
+    }
+
     if !fields.is_empty() {
         context.with_inference_priority(
             InferencePriority::HomomorphicMappedType,
             true,
             |context| {
                 context.substitutor.insert_type(
-                    source_tpl_id,
+                    source_info.source_tpl_id,
                     LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into()),
                     true,
                 );
@@ -558,15 +571,21 @@ fn mapped_tpl_pattern_match(
     Ok(())
 }
 
-fn mapped_source_tpl_id(mapped: &LuaMappedType) -> Option<GenericTplId> {
-    let constraint = mapped.param.1.type_constraint.as_ref()?;
-    mapped_source_tpl_id_from_constraint(constraint, 0)
+#[derive(Debug, Clone, Copy)]
+struct MappedSourceInfo {
+    source_tpl_id: GenericTplId,
+    key_constraint_tpl_id: Option<GenericTplId>,
 }
 
-fn mapped_source_tpl_id_from_constraint(
+fn mapped_source_info(mapped: &LuaMappedType) -> Option<MappedSourceInfo> {
+    let constraint = mapped.param.1.type_constraint.as_ref()?;
+    mapped_source_info_from_constraint(constraint, 0)
+}
+
+fn mapped_source_info_from_constraint(
     constraint: &LuaType,
     depth: usize,
-) -> Option<GenericTplId> {
+) -> Option<MappedSourceInfo> {
     if depth > 8 {
         return None;
     }
@@ -578,11 +597,18 @@ fn mapped_source_tpl_id_from_constraint(
                 return None;
             }
 
-            tpl_id_from_type(&operands[0])
+            Some(MappedSourceInfo {
+                source_tpl_id: tpl_id_from_type(&operands[0])?,
+                key_constraint_tpl_id: None,
+            })
         }
-        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => tpl
-            .get_constraint()
-            .and_then(|constraint| mapped_source_tpl_id_from_constraint(constraint, depth + 1)),
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => {
+            let mut info = tpl
+                .get_constraint()
+                .and_then(|constraint| mapped_source_info_from_constraint(constraint, depth + 1))?;
+            info.key_constraint_tpl_id = Some(tpl.get_tpl_id());
+            Some(info)
+        }
         _ => None,
     }
 }
