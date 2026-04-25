@@ -1,7 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
 use super::TypeSubstitutor;
-use crate::DbIndex;
+use crate::{DbIndex, GenericTplId, LuaType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferencePriority {
@@ -12,6 +12,30 @@ pub enum InferencePriority {
     PartialHomomorphicMappedType,
     MappedTypeConstraint,
     NakedUnionFallback,
+}
+
+impl InferencePriority {
+    pub fn is_higher_than(self, other: Self) -> bool {
+        self.rank() < other.rank()
+    }
+
+    pub fn implies_candidate_combination(self) -> bool {
+        matches!(
+            self,
+            InferencePriority::ContextualReturn | InferencePriority::MappedTypeConstraint
+        )
+    }
+
+    fn rank(self) -> u16 {
+        match self {
+            InferencePriority::None | InferencePriority::Direct => 0,
+            InferencePriority::NakedUnionFallback => 1,
+            InferencePriority::HomomorphicMappedType => 8,
+            InferencePriority::PartialHomomorphicMappedType => 16,
+            InferencePriority::MappedTypeConstraint => 32,
+            InferencePriority::ContextualReturn => 128,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +86,11 @@ impl InferenceContext {
 
     pub fn priority(&self) -> InferencePriority {
         self.priority
+    }
+
+    pub fn insert_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
+        self.substitutor
+            .insert_type_with_priority(tpl_id, replace_type, decay, self.priority);
     }
 
     pub(super) fn begin_candidate_collection(

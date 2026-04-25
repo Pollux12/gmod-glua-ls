@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use super::{instantiate_type::instantiate_type_generic, tpl_pattern::constant_decay};
+use super::{
+    InferencePriority, instantiate_type::instantiate_type_generic, tpl_pattern::constant_decay,
+};
 use crate::{
     DbIndex, GenericTplId, LuaGenericType, LuaType, LuaTypeDeclId, LuaUnionType,
     semantic::type_check::check_type_compact,
@@ -144,12 +146,31 @@ impl TypeSubstitutor {
     }
 
     pub fn insert_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
-        self.insert_type_value(tpl_id, SubstitutorTypeValue::new(replace_type, decay));
+        self.insert_type_with_priority(tpl_id, replace_type, decay, InferencePriority::Direct);
     }
 
-    fn insert_type_value(&mut self, tpl_id: GenericTplId, value: SubstitutorTypeValue) {
+    pub(super) fn insert_type_with_priority(
+        &mut self,
+        tpl_id: GenericTplId,
+        replace_type: LuaType,
+        decay: bool,
+        priority: InferencePriority,
+    ) {
+        self.insert_type_value(
+            tpl_id,
+            SubstitutorTypeValue::new(replace_type, decay),
+            priority,
+        );
+    }
+
+    fn insert_type_value(
+        &mut self,
+        tpl_id: GenericTplId,
+        value: SubstitutorTypeValue,
+        priority: InferencePriority,
+    ) {
         if self.collect_type_candidates {
-            self.insert_type_candidate(tpl_id, value);
+            self.insert_type_candidate(tpl_id, value, priority);
             return;
         }
 
@@ -161,21 +182,30 @@ impl TypeSubstitutor {
             .insert(tpl_id, SubstitutorValue::Type(value));
     }
 
-    fn insert_type_candidate(&mut self, tpl_id: GenericTplId, value: SubstitutorTypeValue) {
+    fn insert_type_candidate(
+        &mut self,
+        tpl_id: GenericTplId,
+        value: SubstitutorTypeValue,
+        priority: InferencePriority,
+    ) {
         let existing_type = match self.tpl_replace_map.get(&tpl_id) {
             Some(SubstitutorValue::Type(existing)) => Some(existing.clone()),
             Some(SubstitutorValue::None) | None => None,
             Some(_) => return,
         };
+        let include_existing_type = self
+            .type_inferences
+            .get(&tpl_id)
+            .is_none_or(|inference| !priority.is_higher_than(inference.priority()));
 
         let inference = self
             .type_inferences
             .entry(tpl_id)
             .or_insert_with(TypeInferenceInfo::new);
-        if let Some(existing) = existing_type {
-            inference.add_candidate(existing);
+        if include_existing_type && let Some(existing) = existing_type {
+            inference.add_candidate(existing, priority);
         }
-        inference.add_candidate(value);
+        inference.add_candidate(value, priority);
 
         if let Some(inferred) = inference.inferred() {
             self.tpl_replace_map
@@ -257,6 +287,7 @@ impl TypeSubstitutor {
 struct TypeInferenceInfo {
     candidates: Vec<SubstitutorTypeValue>,
     inferred: Option<SubstitutorTypeValue>,
+    priority: Option<InferencePriority>,
 }
 
 impl TypeInferenceInfo {
@@ -264,10 +295,26 @@ impl TypeInferenceInfo {
         Self {
             candidates: Vec::new(),
             inferred: None,
+            priority: None,
         }
     }
 
-    fn add_candidate(&mut self, candidate: SubstitutorTypeValue) {
+    fn add_candidate(&mut self, candidate: SubstitutorTypeValue, priority: InferencePriority) {
+        match self.priority {
+            Some(existing) if priority.is_higher_than(existing) => {
+                self.candidates.clear();
+                self.inferred = None;
+                self.priority = Some(priority);
+            }
+            Some(existing) if existing.is_higher_than(priority) => {
+                return;
+            }
+            Some(_) => {}
+            None => {
+                self.priority = Some(priority);
+            }
+        }
+
         if self.candidates.contains(&candidate) {
             return;
         }
@@ -287,8 +334,15 @@ impl TypeInferenceInfo {
         };
 
         let mut inferred = first.clone();
+        let combine_candidates = self
+            .priority
+            .is_some_and(InferencePriority::implies_candidate_combination);
         for candidate in rest {
-            inferred.combine_with_common_supertype(db, candidate.clone());
+            if combine_candidates {
+                inferred.union_with(candidate.clone());
+            } else {
+                inferred.combine_with_common_supertype(db, candidate.clone());
+            }
         }
 
         self.inferred = Some(inferred);
@@ -296,6 +350,10 @@ impl TypeInferenceInfo {
 
     fn inferred(&self) -> Option<&SubstitutorTypeValue> {
         self.inferred.as_ref()
+    }
+
+    fn priority(&self) -> InferencePriority {
+        self.priority.unwrap_or(InferencePriority::Direct)
     }
 }
 
