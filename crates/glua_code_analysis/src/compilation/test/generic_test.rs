@@ -502,6 +502,40 @@ mod test {
     }
 
     #[test]
+    fn test_generic_callable_overload_return_context_flows_into_callback_param() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class WrappedArray<T>
+            ---@overload fun<U>(iterator: fun(value: T): U): U[]
+
+            ---@type WrappedArray<string>
+            local array = {}
+
+            ---@type number[]
+            local mapped = array(function(value)
+                callable_overload_seen = value
+                return 1
+            end)
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        assert_eq!(call_ty, ws.ty("number[]"));
+
+        let seen_ty = ws.expr_ty("callable_overload_seen");
+        assert_eq!(seen_ty, ws.ty("string"));
+    }
+
+    #[test]
     fn test_generic_receiver_method_return_context_flows_into_callback_param() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
@@ -1207,6 +1241,47 @@ mod test {
         let age_ty = ws.expr_ty("result.age");
         assert_eq!(ws.humanize_type(name_ty), "string");
         assert_eq!(ws.humanize_type(age_ty), "number");
+    }
+
+    #[test]
+    fn test_reverse_mapped_infer_from_reducer_table_literal() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Action
+            ---@field type string
+
+            ---@alias Reducer<S> fun(state: S, action: Action): S
+            ---@alias Reducers<S> { [K in keyof S]: Reducer<S[K]>; }
+
+            ---@generic S
+            ---@param reducers Reducers<S>
+            ---@return Reducer<S>
+            function combine_reducers(reducers) end
+
+            ---@param state string
+            ---@param action Action
+            ---@return string
+            local function test_inner(state, action)
+                return "dummy"
+            end
+
+            local test = combine_reducers({
+                test_inner = test_inner,
+            })
+
+            local test_outer = combine_reducers({
+                test = test,
+            })
+
+            local state = test_outer(nil, nil)
+            result = state.test.test_inner
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        assert_eq!(ws.humanize_type(result_ty), "string");
     }
 
     #[test]

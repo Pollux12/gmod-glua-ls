@@ -9,7 +9,8 @@ use rowan::NodeOrToken;
 use smol_str::SmolStr;
 
 use crate::{
-    InferFailReason, LuaFunctionType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner, LuaObjectType,
+    GenericTplId, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaArrayType,
+    LuaFunctionType, LuaMappedType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner, LuaObjectType,
     LuaSemanticDeclId, LuaTupleType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel, VariadicType,
     check_type_compact,
     db_index::{DbIndex, LuaGenericType, LuaType},
@@ -218,10 +219,191 @@ pub fn tpl_pattern_match(
         LuaType::Object(obj) => {
             object_tpl_pattern_match(context, obj, &target)?;
         }
+        LuaType::Mapped(mapped) => {
+            mapped_tpl_pattern_match(context, mapped, &target)?;
+        }
         _ => {}
     }
 
     Ok(())
+}
+
+pub(super) fn try_expand_generic_alias_for_pattern(
+    db: &DbIndex,
+    generic: &LuaGenericType,
+) -> Option<LuaType> {
+    let base = generic.get_base_type_id_ref();
+    let type_decl = db.get_type_index().get_type_decl(base)?;
+    if !type_decl.is_alias() {
+        return None;
+    }
+
+    let origin = type_decl.get_alias_ref()?;
+    let substitutor =
+        TypeSubstitutor::from_alias_for_type(db, generic.get_params().clone(), base.clone());
+    Some(instantiate_type_for_pattern(db, origin, &substitutor))
+}
+
+fn instantiate_type_for_pattern(
+    db: &DbIndex,
+    ty: &LuaType,
+    substitutor: &TypeSubstitutor,
+) -> LuaType {
+    match ty {
+        LuaType::Array(array_type) => LuaType::Array(
+            LuaArrayType::from_base_type(instantiate_type_for_pattern(
+                db,
+                array_type.get_base(),
+                substitutor,
+            ))
+            .into(),
+        ),
+        LuaType::Tuple(tuple) => LuaType::Tuple(
+            LuaTupleType::new(
+                tuple
+                    .get_types()
+                    .iter()
+                    .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                    .collect(),
+                tuple.status,
+            )
+            .into(),
+        ),
+        LuaType::DocFunction(doc_func) => {
+            let params = doc_func
+                .get_params()
+                .iter()
+                .map(|(name, ty)| {
+                    (
+                        name.clone(),
+                        ty.as_ref()
+                            .map(|ty| instantiate_type_for_pattern(db, ty, substitutor)),
+                    )
+                })
+                .collect();
+            let ret = instantiate_type_for_pattern(db, doc_func.get_ret(), substitutor);
+            LuaType::DocFunction(
+                LuaFunctionType::new(
+                    doc_func.get_async_state(),
+                    doc_func.is_colon_define(),
+                    doc_func.is_variadic(),
+                    params,
+                    ret,
+                )
+                .into(),
+            )
+        }
+        LuaType::Object(object) => {
+            let fields = object
+                .get_fields()
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        instantiate_type_for_pattern(db, value, substitutor),
+                    )
+                })
+                .collect();
+            let index_access = object
+                .get_index_access()
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        instantiate_type_for_pattern(db, key, substitutor),
+                        instantiate_type_for_pattern(db, value, substitutor),
+                    )
+                })
+                .collect();
+            LuaType::Object(LuaObjectType::new_with_fields(fields, index_access).into())
+        }
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .into_vec()
+                .into_iter()
+                .map(|ty| instantiate_type_for_pattern(db, &ty, substitutor))
+                .collect(),
+        ),
+        LuaType::Generic(generic) => LuaType::Generic(
+            LuaGenericType::new(
+                generic.get_base_type_id(),
+                generic
+                    .get_params()
+                    .iter()
+                    .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                    .collect(),
+            )
+            .into(),
+        ),
+        LuaType::TableGeneric(params) => LuaType::TableGeneric(
+            params
+                .iter()
+                .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => {
+            match substitutor.get(tpl.get_tpl_id()) {
+                Some(SubstitutorValue::Type(ty)) => ty.default().clone(),
+                Some(SubstitutorValue::MultiTypes(types)) => {
+                    LuaType::Variadic(VariadicType::Multi(types.clone()).into())
+                }
+                Some(SubstitutorValue::MultiBase(base)) => base.clone(),
+                Some(SubstitutorValue::Params(params)) => params
+                    .first()
+                    .and_then(|(_, ty)| ty.clone())
+                    .unwrap_or(LuaType::Unknown),
+                _ => ty.clone(),
+            }
+        }
+        LuaType::Variadic(variadic) => LuaType::Variadic(
+            match variadic.deref() {
+                VariadicType::Base(base) => {
+                    VariadicType::Base(instantiate_type_for_pattern(db, base, substitutor))
+                }
+                VariadicType::Multi(types) => VariadicType::Multi(
+                    types
+                        .iter()
+                        .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                        .collect(),
+                ),
+            }
+            .into(),
+        ),
+        LuaType::Call(alias_call) => LuaType::Call(
+            LuaAliasCallType::new(
+                alias_call.get_call_kind(),
+                alias_call
+                    .get_operands()
+                    .iter()
+                    .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                    .collect(),
+            )
+            .into(),
+        ),
+        LuaType::Mapped(mapped) => {
+            let mut param = mapped.param.1.clone();
+            param.type_constraint = param
+                .type_constraint
+                .as_ref()
+                .map(|ty| instantiate_type_for_pattern(db, ty, substitutor));
+            LuaType::Mapped(
+                LuaMappedType::new(
+                    (mapped.param.0, param),
+                    instantiate_type_for_pattern(db, &mapped.value, substitutor),
+                    mapped.is_readonly,
+                    mapped.is_optional,
+                )
+                .into(),
+            )
+        }
+        LuaType::TypeGuard(inner) => {
+            LuaType::TypeGuard(instantiate_type_for_pattern(db, inner, substitutor).into())
+        }
+        LuaType::TableOf(inner) => {
+            LuaType::TableOf(instantiate_type_for_pattern(db, inner, substitutor).into())
+        }
+        _ => ty.clone(),
+    }
 }
 
 pub fn constant_decay(typ: LuaType) -> LuaType {
@@ -319,6 +501,425 @@ fn object_tpl_pattern_match_member_owner_match(
     }
 
     Ok(())
+}
+
+fn mapped_tpl_pattern_match(
+    context: &mut TplContext,
+    mapped: &LuaMappedType,
+    target: &LuaType,
+) -> TplPatternMatchResult {
+    let Some(source_tpl_id) = mapped_source_tpl_id(mapped) else {
+        return Ok(());
+    };
+
+    let target_fields = mapped_target_fields(context, target)?;
+    if target_fields.is_empty() {
+        return Ok(());
+    }
+
+    let mut fields = HashMap::new();
+    for (member_key, target_type) in target_fields {
+        let Some(key_type) = member_key_to_key_type(&member_key) else {
+            continue;
+        };
+
+        let mut inferred = Vec::new();
+        collect_reverse_mapped_field_inferences(
+            context,
+            &mapped.value,
+            &target_type,
+            source_tpl_id,
+            mapped.param.0,
+            &key_type,
+            &mut inferred,
+        );
+
+        if inferred.is_empty() {
+            continue;
+        }
+
+        fields.insert(member_key, LuaType::from_vec(inferred));
+    }
+
+    if !fields.is_empty() {
+        context.substitutor.insert_type(
+            source_tpl_id,
+            LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into()),
+            true,
+        );
+    }
+
+    Ok(())
+}
+
+fn mapped_source_tpl_id(mapped: &LuaMappedType) -> Option<GenericTplId> {
+    let constraint = mapped.param.1.type_constraint.as_ref()?;
+    let LuaType::Call(alias_call) = constraint else {
+        return None;
+    };
+
+    if alias_call.get_call_kind() != LuaAliasCallKind::KeyOf {
+        return None;
+    }
+
+    let operands = alias_call.get_operands();
+    if operands.len() != 1 {
+        return None;
+    }
+
+    tpl_id_from_type(&operands[0])
+}
+
+fn mapped_target_fields(
+    context: &TplContext,
+    target: &LuaType,
+) -> Result<Vec<(LuaMemberKey, LuaType)>, InferFailReason> {
+    match target {
+        LuaType::Object(target_object) => Ok(target_object
+            .get_fields()
+            .iter()
+            .map(|(key, ty)| (key.clone(), ty.clone()))
+            .collect()),
+        LuaType::TableConst(_) | LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
+            let members = get_member_map(context.db, target).ok_or(InferFailReason::None)?;
+            let mut fields = Vec::new();
+            for (key, infos) in members {
+                let resolve_type = member_infos_to_type(&infos)?;
+                fields.push((key, resolve_type));
+            }
+            Ok(fields)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn member_infos_to_type(infos: &[LuaMemberInfo]) -> Result<LuaType, InferFailReason> {
+    let resolve_type = match infos.len() {
+        0 => LuaType::Any,
+        1 => infos[0].typ.clone(),
+        _ => LuaType::from_vec(infos.iter().map(|info| info.typ.clone()).collect()),
+    };
+
+    if resolve_type.is_unknown()
+        && !infos.is_empty()
+        && let Some(LuaSemanticDeclId::Member(member_id)) = &infos[0].property_owner_id
+    {
+        return Err(InferFailReason::UnResolveMemberType(*member_id));
+    }
+
+    Ok(resolve_type)
+}
+
+fn member_key_to_key_type(key: &LuaMemberKey) -> Option<LuaType> {
+    match key {
+        LuaMemberKey::Integer(i) => Some(LuaType::IntegerConst(*i)),
+        LuaMemberKey::Name(s) => Some(LuaType::StringConst(s.clone().into())),
+        LuaMemberKey::ExprType(ty) => Some(ty.clone()),
+        _ => None,
+    }
+}
+
+fn tpl_id_from_type(ty: &LuaType) -> Option<GenericTplId> {
+    match ty {
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => Some(tpl.get_tpl_id()),
+        _ => None,
+    }
+}
+
+fn collect_reverse_mapped_field_inferences(
+    context: &TplContext,
+    pattern: &LuaType,
+    target: &LuaType,
+    source_tpl_id: GenericTplId,
+    mapped_key_tpl_id: GenericTplId,
+    key_type: &LuaType,
+    inferred: &mut Vec<LuaType>,
+) -> bool {
+    let target = escape_alias(context.db, target);
+    match pattern {
+        LuaType::Call(alias_call)
+            if mapped_index_call_matches(
+                alias_call,
+                source_tpl_id,
+                mapped_key_tpl_id,
+                key_type,
+            ) =>
+        {
+            inferred.push(target);
+            true
+        }
+        LuaType::Call(pattern_call) => {
+            let LuaType::Call(target_call) = &target else {
+                return false;
+            };
+            if pattern_call.get_call_kind() != target_call.get_call_kind()
+                || pattern_call.get_operands().len() != target_call.get_operands().len()
+            {
+                return false;
+            }
+
+            let mut matched = false;
+            for (pattern_operand, target_operand) in pattern_call
+                .get_operands()
+                .iter()
+                .zip(target_call.get_operands().iter())
+            {
+                matched |= collect_reverse_mapped_field_inferences(
+                    context,
+                    pattern_operand,
+                    target_operand,
+                    source_tpl_id,
+                    mapped_key_tpl_id,
+                    key_type,
+                    inferred,
+                );
+            }
+            matched
+        }
+        LuaType::Generic(pattern_generic) => {
+            if let Some(expanded) =
+                try_expand_generic_alias_for_pattern(context.db, pattern_generic)
+            {
+                return collect_reverse_mapped_field_inferences(
+                    context,
+                    &expanded,
+                    &target,
+                    source_tpl_id,
+                    mapped_key_tpl_id,
+                    key_type,
+                    inferred,
+                );
+            }
+
+            let LuaType::Generic(target_generic) = &target else {
+                return false;
+            };
+            if pattern_generic.get_base_type_id_ref() != target_generic.get_base_type_id_ref() {
+                return false;
+            }
+
+            let mut matched = false;
+            for (pattern_param, target_param) in pattern_generic
+                .get_params()
+                .iter()
+                .zip(target_generic.get_params().iter())
+            {
+                matched |= collect_reverse_mapped_field_inferences(
+                    context,
+                    pattern_param,
+                    target_param,
+                    source_tpl_id,
+                    mapped_key_tpl_id,
+                    key_type,
+                    inferred,
+                );
+            }
+            matched
+        }
+        LuaType::DocFunction(pattern_func) => collect_reverse_mapped_function_inferences(
+            context,
+            pattern_func,
+            &target,
+            source_tpl_id,
+            mapped_key_tpl_id,
+            key_type,
+            inferred,
+        ),
+        LuaType::Array(pattern_array) => {
+            let LuaType::Array(target_array) = &target else {
+                return false;
+            };
+            collect_reverse_mapped_field_inferences(
+                context,
+                pattern_array.get_base(),
+                target_array.get_base(),
+                source_tpl_id,
+                mapped_key_tpl_id,
+                key_type,
+                inferred,
+            )
+        }
+        LuaType::Tuple(pattern_tuple) => {
+            let LuaType::Tuple(target_tuple) = &target else {
+                return false;
+            };
+            let mut matched = false;
+            for (pattern_ty, target_ty) in pattern_tuple
+                .get_types()
+                .iter()
+                .zip(target_tuple.get_types().iter())
+            {
+                matched |= collect_reverse_mapped_field_inferences(
+                    context,
+                    pattern_ty,
+                    target_ty,
+                    source_tpl_id,
+                    mapped_key_tpl_id,
+                    key_type,
+                    inferred,
+                );
+            }
+            matched
+        }
+        LuaType::Object(pattern_object) => {
+            let LuaType::Object(target_object) = &target else {
+                return false;
+            };
+            let mut matched = false;
+            for (field_key, pattern_ty) in pattern_object.get_fields() {
+                if let Some(target_ty) = target_object.get_fields().get(field_key) {
+                    matched |= collect_reverse_mapped_field_inferences(
+                        context,
+                        pattern_ty,
+                        target_ty,
+                        source_tpl_id,
+                        mapped_key_tpl_id,
+                        key_type,
+                        inferred,
+                    );
+                }
+            }
+            matched
+        }
+        LuaType::TableGeneric(pattern_params) => {
+            let LuaType::TableGeneric(target_params) = &target else {
+                return false;
+            };
+            let mut matched = false;
+            for (pattern_param, target_param) in pattern_params.iter().zip(target_params.iter()) {
+                matched |= collect_reverse_mapped_field_inferences(
+                    context,
+                    pattern_param,
+                    target_param,
+                    source_tpl_id,
+                    mapped_key_tpl_id,
+                    key_type,
+                    inferred,
+                );
+            }
+            matched
+        }
+        LuaType::Union(pattern_union) => {
+            let mut matched = false;
+            for pattern_ty in pattern_union.into_vec() {
+                matched |= collect_reverse_mapped_field_inferences(
+                    context,
+                    &pattern_ty,
+                    &target,
+                    source_tpl_id,
+                    mapped_key_tpl_id,
+                    key_type,
+                    inferred,
+                );
+            }
+            matched
+        }
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            let Some(type_decl) = context.db.get_type_index().get_type_decl(type_id) else {
+                return false;
+            };
+            let Some(origin) = type_decl.get_alias_ref() else {
+                return false;
+            };
+            collect_reverse_mapped_field_inferences(
+                context,
+                origin,
+                &target,
+                source_tpl_id,
+                mapped_key_tpl_id,
+                key_type,
+                inferred,
+            )
+        }
+        _ => false,
+    }
+}
+
+fn collect_reverse_mapped_function_inferences(
+    context: &TplContext,
+    pattern_func: &LuaFunctionType,
+    target: &LuaType,
+    source_tpl_id: GenericTplId,
+    mapped_key_tpl_id: GenericTplId,
+    key_type: &LuaType,
+    inferred: &mut Vec<LuaType>,
+) -> bool {
+    let target_func = match target {
+        LuaType::DocFunction(func) => Some(func.clone()),
+        LuaType::Signature(signature_id) => context
+            .db
+            .get_signature_index()
+            .get(signature_id)
+            .map(|signature| signature.to_doc_func_type()),
+        _ => None,
+    };
+    let Some(target_func) = target_func else {
+        return false;
+    };
+
+    let mut pattern_params = pattern_func.get_params().to_vec();
+    if pattern_func.is_colon_define() {
+        pattern_params.insert(0, ("self".to_string(), Some(LuaType::Any)));
+    }
+
+    let mut target_params = target_func.get_params().to_vec();
+    if target_func.is_colon_define() {
+        target_params.insert(0, ("self".to_string(), Some(LuaType::Any)));
+    }
+
+    let mut matched = false;
+    for ((_, pattern_param), (_, target_param)) in pattern_params.iter().zip(target_params.iter()) {
+        let Some(pattern_param) = pattern_param else {
+            continue;
+        };
+        let target_param = target_param.as_ref().unwrap_or(&LuaType::Any);
+        matched |= collect_reverse_mapped_field_inferences(
+            context,
+            pattern_param,
+            target_param,
+            source_tpl_id,
+            mapped_key_tpl_id,
+            key_type,
+            inferred,
+        );
+    }
+
+    matched |= collect_reverse_mapped_field_inferences(
+        context,
+        pattern_func.get_ret(),
+        target_func.get_ret(),
+        source_tpl_id,
+        mapped_key_tpl_id,
+        key_type,
+        inferred,
+    );
+
+    matched
+}
+
+fn mapped_index_call_matches(
+    alias_call: &LuaAliasCallType,
+    source_tpl_id: GenericTplId,
+    mapped_key_tpl_id: GenericTplId,
+    key_type: &LuaType,
+) -> bool {
+    if !matches!(
+        alias_call.get_call_kind(),
+        LuaAliasCallKind::Index | LuaAliasCallKind::RawGet
+    ) {
+        return false;
+    }
+
+    let operands = alias_call.get_operands();
+    if operands.len() != 2 || tpl_id_from_type(&operands[0]) != Some(source_tpl_id) {
+        return false;
+    }
+
+    if tpl_id_from_type(&operands[1]) == Some(mapped_key_tpl_id) {
+        return true;
+    }
+
+    &operands[1] == key_type
 }
 
 fn array_tpl_pattern_match(
