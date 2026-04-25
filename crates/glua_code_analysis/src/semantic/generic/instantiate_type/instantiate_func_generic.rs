@@ -52,16 +52,24 @@ pub fn instantiate_func_generic_with_context(
 ) -> Result<LuaFunctionType, InferFailReason> {
     let file_id = cache.get_file_id().clone();
     let mut generic_tpls = HashSet::new();
+    let mut generic_tpl_constraints = HashMap::new();
     let mut contain_self = false;
     func.visit_type(&mut |t| match t {
         LuaType::TplRef(generic_tpl) | LuaType::ConstTplRef(generic_tpl) => {
             let tpl_id = generic_tpl.get_tpl_id();
             if tpl_id.is_func() {
                 generic_tpls.insert(tpl_id);
+                if let Some(constraint) = generic_tpl.get_constraint() {
+                    generic_tpl_constraints.insert(tpl_id, constraint.clone());
+                }
             }
         }
         LuaType::StrTplRef(str_tpl) => {
-            generic_tpls.insert(str_tpl.get_tpl_id());
+            let tpl_id = str_tpl.get_tpl_id();
+            generic_tpls.insert(tpl_id);
+            if let Some(constraint) = str_tpl.get_constraint() {
+                generic_tpl_constraints.insert(tpl_id, constraint.clone());
+            }
         }
         LuaType::SelfInfer => {
             contain_self = true;
@@ -90,6 +98,9 @@ pub fn instantiate_func_generic_with_context(
         };
         if !generic_tpls.is_empty() {
             context.inference.add_pending_type_parameters(generic_tpls);
+            for (tpl_id, constraint) in generic_tpl_constraints {
+                context.inference.add_type_constraint(tpl_id, constraint);
+            }
 
             if let Some(type_list) = call_expr.get_call_generic_type_list() {
                 // 如果使用了`obj:abc--[[@<string>]]("abc")`强制指定了泛型, 那么我们只需要直接应用

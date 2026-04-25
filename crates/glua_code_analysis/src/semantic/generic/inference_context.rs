@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    type_substitutor::{candidate_assignable_to, SubstitutorTypeValue, SubstitutorValue},
     TypeSubstitutor,
+    instantiate_type::instantiate_type_generic,
+    type_substitutor::{SubstitutorTypeValue, SubstitutorValue, candidate_assignable_to},
 };
 use crate::{DbIndex, GenericTplId, LuaType};
 
@@ -51,6 +52,7 @@ pub enum InferenceVariance {
 pub struct InferenceContext {
     substitutor: TypeSubstitutor,
     type_inferences: HashMap<GenericTplId, TypeInferenceInfo>,
+    type_constraints: HashMap<GenericTplId, LuaType>,
     collect_type_candidates: bool,
     priority: InferencePriority,
     variance: InferenceVariance,
@@ -75,6 +77,7 @@ impl InferenceContext {
         Self {
             substitutor: TypeSubstitutor::new(),
             type_inferences: HashMap::new(),
+            type_constraints: HashMap::new(),
             collect_type_candidates: false,
             priority: InferencePriority::None,
             variance: InferenceVariance::Covariant,
@@ -85,6 +88,7 @@ impl InferenceContext {
         Self {
             substitutor,
             type_inferences: HashMap::new(),
+            type_constraints: HashMap::new(),
             collect_type_candidates: false,
             priority: InferencePriority::None,
             variance: InferenceVariance::Covariant,
@@ -135,6 +139,10 @@ impl InferenceContext {
 
     pub fn add_pending_type_parameters(&mut self, tpl_ids: HashSet<GenericTplId>) {
         self.substitutor.add_need_infer_tpls(tpl_ids);
+    }
+
+    pub fn add_type_constraint(&mut self, tpl_id: GenericTplId, constraint: LuaType) {
+        self.type_constraints.entry(tpl_id).or_insert(constraint);
     }
 
     pub fn is_fully_inferred(&self) -> bool {
@@ -237,11 +245,27 @@ impl InferenceContext {
     }
 
     fn normalize_type_inferences(&mut self, db: &DbIndex) {
-        for (tpl_id, inference) in self.type_inferences.iter_mut() {
-            inference.normalize_with_common_supertype(db);
+        let mut tpl_ids = self.type_inferences.keys().copied().collect::<Vec<_>>();
+        tpl_ids.sort_by_key(|tpl_id| {
+            let kind = match tpl_id {
+                GenericTplId::Type(_) => 0,
+                GenericTplId::ScopedType { .. } => 1,
+                GenericTplId::Func(_) => 2,
+            };
+            (kind, tpl_id.get_idx())
+        });
+        for tpl_id in tpl_ids {
+            let constraint = self
+                .type_constraints
+                .get(&tpl_id)
+                .map(|constraint| instantiate_type_generic(db, constraint, &self.substitutor));
+            let Some(inference) = self.type_inferences.get_mut(&tpl_id) else {
+                continue;
+            };
+            inference.normalize_with_common_supertype(db, constraint.as_ref());
             if let Some(inferred) = inference.inferred() {
                 self.substitutor
-                    .set_inferred_type_value(*tpl_id, inferred.clone());
+                    .set_inferred_type_value(tpl_id, inferred.clone());
             }
         }
     }
@@ -304,26 +328,32 @@ impl TypeInferenceInfo {
         candidates.push(candidate);
     }
 
-    fn normalize_with_common_supertype(&mut self, db: &DbIndex) {
-        self.inferred = self.infer_candidate(db);
+    fn normalize_with_common_supertype(&mut self, db: &DbIndex, constraint: Option<&LuaType>) {
+        self.inferred = self.infer_candidate(db, constraint);
     }
 
-    fn infer_candidate(&self, db: &DbIndex) -> Option<SubstitutorTypeValue> {
+    fn infer_candidate(
+        &self,
+        db: &DbIndex,
+        constraint: Option<&LuaType>,
+    ) -> Option<SubstitutorTypeValue> {
         let covariant = self.infer_covariant_candidate(db);
         let contravariant = self.infer_contravariant_candidate(db);
 
-        match (covariant, contravariant) {
+        let (preferred, fallback) = match (covariant, contravariant) {
             (Some(covariant), Some(contravariant)) => {
                 if self.prefer_covariant_candidate(db, &covariant) {
-                    Some(covariant)
+                    (Some(covariant), Some(contravariant))
                 } else {
-                    Some(contravariant)
+                    (Some(contravariant), Some(covariant))
                 }
             }
-            (Some(covariant), None) => Some(covariant),
-            (None, Some(contravariant)) => Some(contravariant),
-            (None, None) => None,
-        }
+            (Some(covariant), None) => (Some(covariant), None),
+            (None, Some(contravariant)) => (Some(contravariant), None),
+            (None, None) => (None, None),
+        };
+
+        self.apply_constraint(db, preferred, fallback, constraint)
     }
 
     fn infer_covariant_candidate(&self, db: &DbIndex) -> Option<SubstitutorTypeValue> {
@@ -376,6 +406,32 @@ impl TypeInferenceInfo {
             .any(|candidate| candidate_assignable_to(db, covariant.default(), candidate.default()))
     }
 
+    fn apply_constraint(
+        &self,
+        db: &DbIndex,
+        preferred: Option<SubstitutorTypeValue>,
+        fallback: Option<SubstitutorTypeValue>,
+        constraint: Option<&LuaType>,
+    ) -> Option<SubstitutorTypeValue> {
+        let Some(constraint) = constraint else {
+            return preferred;
+        };
+
+        if let Some(candidate) = preferred
+            && candidate_satisfies_constraint(db, &candidate, constraint)
+        {
+            return Some(candidate);
+        }
+
+        if let Some(candidate) = fallback
+            && candidate_satisfies_constraint(db, &candidate, constraint)
+        {
+            return Some(candidate);
+        }
+
+        Some(SubstitutorTypeValue::new(constraint.clone(), false))
+    }
+
     fn inferred(&self) -> Option<&SubstitutorTypeValue> {
         self.inferred.as_ref()
     }
@@ -383,4 +439,56 @@ impl TypeInferenceInfo {
     fn priority(&self) -> InferencePriority {
         self.priority.unwrap_or(InferencePriority::Direct)
     }
+}
+
+fn candidate_satisfies_constraint(
+    db: &DbIndex,
+    candidate: &SubstitutorTypeValue,
+    constraint: &LuaType,
+) -> bool {
+    candidate_type_satisfies_constraint(db, candidate.raw(), constraint)
+        || candidate_type_satisfies_constraint(db, candidate.default(), constraint)
+}
+
+fn candidate_type_satisfies_constraint(
+    db: &DbIndex,
+    candidate: &LuaType,
+    constraint: &LuaType,
+) -> bool {
+    if candidate_is_pending_str_tpl_ref(db, candidate, constraint) {
+        return true;
+    }
+
+    if candidate_assignable_to(db, candidate, constraint) {
+        return true;
+    }
+
+    if let LuaType::Tuple(tuple) = constraint {
+        return tuple
+            .get_types()
+            .iter()
+            .any(|member| candidate_assignable_to(db, candidate, member));
+    }
+
+    false
+}
+
+fn candidate_is_pending_str_tpl_ref(
+    db: &DbIndex,
+    candidate: &LuaType,
+    constraint: &LuaType,
+) -> bool {
+    let LuaType::Ref(candidate_id) = candidate else {
+        return false;
+    };
+    if db.get_type_index().get_type_decl(candidate_id).is_some() {
+        return false;
+    }
+
+    let (LuaType::Ref(constraint_id) | LuaType::Def(constraint_id)) = constraint else {
+        return false;
+    };
+    db.get_type_index()
+        .get_type_decl(constraint_id)
+        .is_some_and(|decl| decl.is_class())
 }
