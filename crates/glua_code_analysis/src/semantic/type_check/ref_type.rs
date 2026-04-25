@@ -227,10 +227,7 @@ fn check_ref_class(
         }
         LuaType::Generic(generic) => {
             let base_type_id = generic.get_base_type_id();
-            if source_id == &base_type_id
-                || is_sub_type_of(context.db, &base_type_id, source_id)
-                || is_sub_type_of(context.db, source_id, &base_type_id)
-            {
+            if source_id == &base_type_id || is_sub_type_of(context.db, &base_type_id, source_id) {
                 Ok(())
             } else {
                 Err(TypeCheckFailReason::TypeNotMatch)

@@ -190,7 +190,15 @@ mod test {
         "#,
         );
 
-        assert!(ws.check_code_for(
+        let holder_string = ws.ty("Holder<string>");
+        let string_holder_with_table = ws.ty("StringHolderWith<table>");
+        let number_holder = ws.ty("NumberHolder");
+        assert!(ws.check_type(&holder_string, &string_holder_with_table));
+        assert!(!ws.check_type(&string_holder_with_table, &holder_string));
+        assert!(!ws.check_type(&holder_string, &number_holder));
+        assert!(!ws.check_type(&number_holder, &holder_string));
+
+        assert!(!ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
             ---@type Holder<string>, NumberHolder

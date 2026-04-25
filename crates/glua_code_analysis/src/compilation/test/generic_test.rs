@@ -158,7 +158,7 @@ mod test {
     }
 
     #[test]
-    fn test_generic_inference_combines_multiple_candidates() {
+    fn test_generic_inference_keeps_leftmost_conflicting_direct_candidate() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
             r#"
@@ -174,8 +174,9 @@ mod test {
         );
 
         let value_ty = ws.expr_ty("value");
-        let expected = ws.ty("string|integer");
+        let expected = ws.ty("string");
         assert_eq!(value_ty, expected);
+        assert!(!ws.check_code_for(DiagnosticCode::ParamTypeMismatch, r#"choose("name", 1)"#));
 
         let other_ty = ws.expr_ty("other");
         let expected = ws.ty("string");
@@ -211,7 +212,7 @@ mod test {
     }
 
     #[test]
-    fn test_generic_direct_candidates_use_union() {
+    fn test_generic_direct_conflicting_nominal_candidates_keep_leftmost() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
             r#"
@@ -234,12 +235,12 @@ mod test {
         );
 
         let animal_ty = ws.expr_ty("animal");
-        let expected = ws.ty("Dog|Cat");
+        let expected = ws.ty("Dog");
         assert_eq!(animal_ty, expected);
     }
 
     #[test]
-    fn test_generic_direct_candidates_use_union_for_generic_subclasses() {
+    fn test_generic_direct_conflicting_generic_subclasses_keep_leftmost() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
             r#"
@@ -262,8 +263,35 @@ mod test {
         );
 
         let box_ty = ws.expr_ty("box");
-        let expected = ws.ty("StringBox|NumberBox");
+        let expected = ws.ty("StringBox");
         assert_eq!(box_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_direct_subtype_candidate_uses_supertype_candidate() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+
+            ---@generic T
+            ---@param first T
+            ---@param second T
+            ---@return T
+            function choose(first, second) end
+
+            ---@type Animal
+            local animal
+            ---@type Dog
+            local dog
+            result = choose(animal, dog)
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        let expected = ws.ty("Animal");
+        assert_eq!(result_ty, expected);
     }
 
     #[test]
@@ -296,7 +324,7 @@ mod test {
     }
 
     #[test]
-    fn test_generic_function_return_candidates_use_union() {
+    fn test_generic_function_return_conflicting_candidates_keep_leftmost() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
             r#"
@@ -321,7 +349,7 @@ mod test {
         );
 
         let animal_ty = ws.expr_ty("animal");
-        let expected = ws.ty("Dog|Cat");
+        let expected = ws.ty("Dog");
         assert_eq!(animal_ty, expected);
     }
 
