@@ -6,7 +6,7 @@ use crate::{DbIndex, InferenceContext, InferencePriority, InferenceVariance, Lua
 pub struct TplContext<'a> {
     pub db: &'a DbIndex,
     pub cache: &'a mut LuaInferCache,
-    pub substitutor: &'a mut InferenceContext,
+    pub inference: &'a mut InferenceContext,
     pub call_expr: Option<LuaCallExpr>,
 }
 
@@ -32,11 +32,11 @@ impl TplContext<'_> {
         variance: InferenceVariance,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let state =
-            self.substitutor
-                .begin_candidate_collection(collect_candidates, priority, variance);
+        let state = self
+            .inference
+            .begin_candidate_collection(collect_candidates, priority, variance);
         let result = f(self);
-        self.substitutor.finish_candidate_collection(self.db, state);
+        self.inference.finish_candidate_collection(self.db, state);
         result
     }
 }

@@ -1,6 +1,9 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    collections::HashSet,
+    ops::{Deref, DerefMut},
+};
 
-use super::TypeSubstitutor;
+use super::{type_substitutor::SubstitutorValue, TypeSubstitutor};
 use crate::{DbIndex, GenericTplId, LuaType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +113,50 @@ impl InferenceContext {
             self.priority,
             self.variance,
         );
+    }
+
+    pub fn infer_type(&mut self, tpl_id: GenericTplId, candidate: LuaType, decay: bool) {
+        self.insert_type(tpl_id, candidate, decay);
+    }
+
+    pub fn set_explicit_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
+        self.insert_type(tpl_id, replace_type, decay);
+    }
+
+    pub fn infer_params(&mut self, tpl_id: GenericTplId, params: Vec<(String, Option<LuaType>)>) {
+        self.substitutor.insert_params(tpl_id, params);
+    }
+
+    pub fn infer_multi_types(&mut self, tpl_id: GenericTplId, types: Vec<LuaType>) {
+        self.substitutor.insert_multi_types(tpl_id, types);
+    }
+
+    pub fn infer_multi_base(&mut self, tpl_id: GenericTplId, type_base: LuaType) {
+        self.substitutor.insert_multi_base(tpl_id, type_base);
+    }
+
+    pub fn add_pending_type_parameters(&mut self, tpl_ids: HashSet<GenericTplId>) {
+        self.substitutor.add_need_infer_tpls(tpl_ids);
+    }
+
+    pub fn is_fully_inferred(&self) -> bool {
+        self.substitutor.is_infer_all_tpl()
+    }
+
+    pub fn has_non_direct_type_inferences(&self) -> bool {
+        self.substitutor.has_non_direct_type_inferences()
+    }
+
+    pub fn add_self_type(&mut self, self_type: LuaType) {
+        self.substitutor.add_self_type(self_type);
+    }
+
+    pub fn get_self_type(&self) -> Option<&LuaType> {
+        self.substitutor.get_self_type()
+    }
+
+    pub fn get(&self, tpl_id: GenericTplId) -> Option<&SubstitutorValue> {
+        self.substitutor.get(tpl_id)
     }
 
     pub(super) fn begin_candidate_collection(

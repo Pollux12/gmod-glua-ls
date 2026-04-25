@@ -155,7 +155,7 @@ pub fn infer_for_range_iter_expr_func(
         let mut context = TplContext {
             db,
             cache,
-            substitutor: &mut inference,
+            inference: &mut inference,
             call_expr: None,
         };
         tpl_pattern_match_args(&mut context, &params, &[status_param])?;

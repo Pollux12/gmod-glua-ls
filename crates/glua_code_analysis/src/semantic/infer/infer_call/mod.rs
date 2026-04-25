@@ -904,7 +904,7 @@ fn infer_contextual_return_type(
         let mut context = TplContext {
             db,
             cache,
-            substitutor: &mut inference,
+            inference: &mut inference,
             call_expr: Some(call_expr.clone()),
         };
         context

@@ -85,11 +85,11 @@ pub fn instantiate_func_generic_with_context(
         let mut context = TplContext {
             db,
             cache,
-            substitutor: &mut inference,
+            inference: &mut inference,
             call_expr: Some(call_expr.clone()),
         };
         if !generic_tpls.is_empty() {
-            context.substitutor.add_need_infer_tpls(generic_tpls);
+            context.inference.add_pending_type_parameters(generic_tpls);
 
             if let Some(type_list) = call_expr.get_call_generic_type_list() {
                 // 如果使用了`obj:abc--[[@<string>]]("abc")`强制指定了泛型, 那么我们只需要直接应用
@@ -130,8 +130,8 @@ fn apply_call_generic_type_list(
     for (i, doc_type) in type_list.get_types().enumerate() {
         let typ = infer_doc_type(doc_ctx, &doc_type);
         context
-            .substitutor
-            .insert_type(GenericTplId::Func(i as u32), typ, true);
+            .inference
+            .set_explicit_type(GenericTplId::Func(i as u32), typ, true);
     }
 }
 
@@ -176,9 +176,9 @@ fn infer_generic_types_from_call(
 
         let (_, func_param_type) = &func_params[i];
         let collect_more_candidates = is_direct_type_candidate(func_param_type);
-        if context.substitutor.is_infer_all_tpl()
+        if context.inference.is_fully_inferred()
             && !collect_more_candidates
-            && !context.substitutor.has_non_direct_type_inferences()
+            && !context.inference.has_non_direct_type_inferences()
         {
             break;
         }
@@ -249,7 +249,7 @@ fn infer_generic_types_from_call(
 
     if let Some(return_hint) = contextual_return_hint
         && func.get_ret().contain_tpl()
-        && !context.substitutor.is_infer_all_tpl()
+        && !context.inference.is_fully_inferred()
     {
         context.with_inference_priority(InferencePriority::ContextualReturn, true, |context| {
             tpl_pattern_match(context, func.get_ret(), return_hint)
@@ -257,7 +257,7 @@ fn infer_generic_types_from_call(
     }
 
     if !unresolve_tpls.is_empty()
-        && (!context.substitutor.is_infer_all_tpl() || contextual_return_hint.is_some())
+        && (!context.inference.is_fully_inferred() || contextual_return_hint.is_some())
     {
         for (func_param_type, call_arg_expr) in unresolve_tpls {
             let is_closure_arg = matches!(call_arg_expr, LuaExpr::ClosureExpr(_));
@@ -266,7 +266,7 @@ fn infer_generic_types_from_call(
                 instantiate_type_generic_preserve_unresolved(
                     db,
                     &func_param_type,
-                    context.substitutor,
+                    context.inference.substitutor(),
                 )
             } else {
                 func_param_type
