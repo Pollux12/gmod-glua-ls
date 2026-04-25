@@ -438,6 +438,616 @@ mod test {
     }
 
     #[test]
+    fn test_mapped_infer_from_generic_function_table_literal() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+
+            ---@alias InferShape<T> { [K in keyof T]: T[K] extends Schema<infer U> and U or unknown; }
+
+            ---@return Schema<string>
+            function mk_string() end
+
+            ---@return Schema<number>
+            function mk_number() end
+
+            ---@generic T
+            ---@param schema T
+            ---@return InferShape<T>
+            function object(schema) end
+
+            result = object({
+                name = mk_string(),
+                age = mk_number(),
+            })
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        let age_ty = ws.expr_ty("result.age");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+        assert_eq!(ws.humanize_type(age_ty), "number");
+    }
+
+    #[test]
+    fn test_mapped_infer_from_generic_function_table_variable() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+
+            ---@alias InferShape<T> { [K in keyof T]: T[K] extends Schema<infer U> and U or unknown; }
+
+            ---@return Schema<string>
+            function mk_string() end
+
+            ---@return Schema<number>
+            function mk_number() end
+
+            ---@generic T
+            ---@param schema T
+            ---@return InferShape<T>
+            function object(schema) end
+
+            local shape = {
+                name = mk_string(),
+                age = mk_number(),
+            }
+            result = object(shape)
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        let age_ty = ws.expr_ty("result.age");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+        assert_eq!(ws.humanize_type(age_ty), "number");
+    }
+
+    #[test]
+    fn test_conditional_infer_from_concrete_class_super_generic() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+            ---@class StringSchema: Schema<string>
+            ---@class NumberSchema: Schema<number>
+
+            ---@alias Infer<T> T extends Schema<infer U> and U or unknown
+            ---@alias InferShape<T> { [K in keyof T]: Infer<T[K]>; }
+
+            ---@return StringSchema
+            function mk_string() end
+
+            ---@return NumberSchema
+            function mk_number() end
+
+            ---@generic T
+            ---@param schema T
+            ---@return InferShape<T>
+            function object(schema) end
+
+            result = object({
+                name = mk_string(),
+                age = mk_number(),
+            })
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("result.name");
+        let age_ty = ws.expr_ty("result.age");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+        assert_eq!(ws.humanize_type(age_ty), "number");
+    }
+
+    #[test]
+    fn test_conditional_infer_from_generic_alias_source() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+            ---@alias Wrapped<T> Schema<T>
+            ---@alias Infer<T> T extends Schema<infer U> and U or unknown
+
+            ---@generic T
+            ---@param schema T
+            ---@return Infer<T>
+            function infer(schema) end
+
+            ---@type Wrapped<string>
+            local wrapped
+
+            value = infer(wrapped)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "string");
+    }
+
+    #[test]
+    fn test_generic_identity_table_literal_still_allows_later_field_inference() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T
+            function identity(value) end
+
+            local result = identity({})
+            result.name = "abc"
+            value = result.name
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "\"abc\"");
+    }
+
+    #[test]
+    fn test_generic_identity_object_literal_still_allows_later_field_inference() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T
+            function identity(value) end
+
+            result = identity({ name = "abc" })
+            "#,
+        );
+        ws.def(
+            r#"
+            function add_field()
+                result.age = 1
+            end
+            value = result.age
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "1");
+    }
+
+    #[test]
+    fn test_generic_identity_object_literal_preserves_raw_table_when_structural_field_fails() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T
+            function identity(value) end
+
+            ---@type unknown
+            local source
+
+            result = identity({ name = source.missing })
+            "#,
+        );
+        ws.def(
+            r#"
+            function add_field()
+                result.age = 1
+            end
+            value = result.age
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "1");
+    }
+
+    #[test]
+    fn test_generic_identity_object_literal_preserves_raw_table_when_structural_key_fails() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T
+            function identity(value) end
+
+            result = identity({ [missing_key] = "abc" })
+            "#,
+        );
+        ws.def(
+            r#"
+            function add_field()
+                result.age = 1
+            end
+            value = result.age
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "1");
+    }
+
+    #[test]
+    fn test_generic_nullable_identity_object_literal_still_allows_later_field_inference() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T?
+            function identity(value) end
+
+            result = identity({ name = "abc" })
+            "#,
+        );
+        ws.def(
+            r#"
+            function add_field()
+                result.age = 1
+            end
+            value = result.age
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "1");
+    }
+
+    #[test]
+    fn test_generic_nullable_param_identity_object_literal_still_allows_later_field_inference() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T?
+            ---@return T?
+            function identity(value) end
+
+            result = identity({ name = "abc" })
+            "#,
+        );
+        ws.def(
+            r#"
+            function add_field()
+                result.age = 1
+            end
+            value = result.age
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "1");
+    }
+
+    #[test]
+    fn test_alias_generic_does_not_replace_shadowed_mapped_key() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@alias Shadow<T> { [T in "name"]: T; }
+
+            ---@type Shadow<number>
+            local shadow
+
+            shadowName = shadow.name
+            "#,
+        );
+
+        let shadow_name_ty = ws.expr_ty("shadowName");
+        assert_eq!(ws.humanize_type(shadow_name_ty), "string");
+    }
+
+    #[test]
+    fn test_conditional_infer_requires_generic_base_match() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+            ---@field parse fun(self: Schema<T>, value: unknown): T
+            ---@class ObjectSchema<T>: Schema<T>
+            ---@class ArraySchema<T>: Schema<T[]>
+            ---@class OptionalSchema<T>: Schema<T>
+
+            ---@alias InferShape<T> { [K in keyof T]: T[K] extends ArraySchema<infer U> and U[] or T[K] extends ObjectSchema<infer U> and U or T[K] extends OptionalSchema<infer U> and U or T[K] extends Schema<infer U> and U or unknown; }
+
+            ---@return Schema<string>
+            function mk_string() end
+
+            ---@return Schema<number>
+            function mk_number() end
+
+            ---@return Schema<boolean>
+            function mk_boolean() end
+
+            ---@generic T
+            ---@param schema T
+            ---@return ObjectSchema<InferShape<T>>
+            function object(schema) end
+
+            ---@generic T
+            ---@param schema Schema<T>
+            ---@return ArraySchema<T>
+            function array(schema) end
+
+            ---@generic T
+            ---@param schema Schema<T>
+            ---@return OptionalSchema<T|nil>
+            function optional(schema) end
+
+            ---@generic T
+            ---@param schema T
+            ---@return InferShape<T>
+            function infer_shape(schema) end
+
+            schema = object({
+                name = mk_string(),
+                age = mk_number(),
+                admin = mk_boolean(),
+                tags = array(mk_string()),
+                profile = object({
+                    id = mk_string(),
+                    score = optional(mk_number()),
+                }),
+            })
+
+            parsed = schema:parse({})
+            "#,
+        );
+
+        let name_ty = ws.expr_ty("parsed.name");
+        let age_ty = ws.expr_ty("parsed.age");
+        let admin_ty = ws.expr_ty("parsed.admin");
+        let profile_ty = ws.expr_ty("parsed.profile");
+        let id_ty = ws.expr_ty("parsed.profile.id");
+        let score_ty = ws.expr_ty("parsed.profile.score");
+        let tags_ty = ws.expr_ty("parsed.tags");
+        assert_eq!(ws.humanize_type(name_ty), "string");
+        assert_eq!(ws.humanize_type(age_ty), "number");
+        assert_eq!(ws.humanize_type(admin_ty), "boolean");
+        assert_eq!(
+            ws.humanize_type(profile_ty),
+            "{ id: string, score: number? }"
+        );
+        assert_eq!(ws.humanize_type(id_ty), "string");
+        assert_eq!(ws.humanize_type(score_ty), "number?");
+        assert_eq!(ws.humanize_type(tags_ty), "string[]");
+    }
+
+    #[test]
+    fn test_builder_namespace_method_chain_and_variable_shape_infer_parse_result() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Schema<T>
+            ---@field parse fun(self: Schema<T>, value: unknown): T
+            ---@field optional fun(self: Schema<T>): OptionalSchema<T|nil>
+            ---@class StringSchema: Schema<string>
+            ---@class NumberSchema: Schema<number>
+            ---@class BooleanSchema: Schema<boolean>
+            ---@class ObjectSchema<T>: Schema<T>
+            ---@class ArraySchema<T>: Schema<T[]>
+            ---@class OptionalSchema<T>: Schema<T>
+
+            ---@alias InferShape<T> { [K in keyof T]: T[K] extends ArraySchema<infer U> and U[] or T[K] extends ObjectSchema<infer U> and U or T[K] extends OptionalSchema<infer U> and U or T[K] extends Schema<infer U> and U or unknown; }
+
+            ---@class Z
+            ---@field string fun(): StringSchema
+            ---@field number fun(): NumberSchema
+            ---@field boolean fun(): BooleanSchema
+            ---@field array fun<T>(schema: Schema<T>): ArraySchema<T>
+            ---@field object fun<T>(shape: T): ObjectSchema<InferShape<T>>
+
+            ---@type Z
+            local z
+
+            local inline_schema = z.object({
+                name = z.string(),
+                age = z.number(),
+                admin = z.boolean(),
+                tags = z.array(z.string()),
+                profile = z.object({
+                    id = z.string(),
+                    score = z.number():optional(),
+                }),
+            })
+            parsed_inline = inline_schema:parse({})
+
+            local shape = {
+                profile = z.object({
+                    id = z.string(),
+                    score = z.number():optional(),
+                }),
+            }
+            local variable_schema = z.object(shape)
+            parsed_variable = variable_schema:parse({})
+            "#,
+        );
+
+        let inline_name_ty = ws.expr_ty("parsed_inline.name");
+        let inline_age_ty = ws.expr_ty("parsed_inline.age");
+        let inline_admin_ty = ws.expr_ty("parsed_inline.admin");
+        let inline_tags_ty = ws.expr_ty("parsed_inline.tags");
+        let inline_profile_ty = ws.expr_ty("parsed_inline.profile");
+        let inline_id_ty = ws.expr_ty("parsed_inline.profile.id");
+        let inline_score_ty = ws.expr_ty("parsed_inline.profile.score");
+        let variable_id_ty = ws.expr_ty("parsed_variable.profile.id");
+        let variable_score_ty = ws.expr_ty("parsed_variable.profile.score");
+        assert_eq!(ws.humanize_type(inline_name_ty), "string");
+        assert_eq!(ws.humanize_type(inline_age_ty), "number");
+        assert_eq!(ws.humanize_type(inline_admin_ty), "boolean");
+        assert_eq!(ws.humanize_type(inline_tags_ty), "string[]");
+        assert_eq!(
+            ws.humanize_type(inline_profile_ty),
+            "{ id: string, score: number? }"
+        );
+        assert_eq!(ws.humanize_type(inline_id_ty), "string");
+        assert_eq!(ws.humanize_type(inline_score_ty), "number?");
+        assert_eq!(ws.humanize_type(variable_id_ty), "string");
+        assert_eq!(ws.humanize_type(variable_score_ty), "number?");
+    }
+
+    #[test]
+    fn test_conditional_infer_handles_cyclic_concrete_supers() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Target<T>
+            ---@class A: B
+            ---@class B: A
+
+            ---@alias Extract<T> T extends Target<infer U> and U or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return Extract<T>
+            function extract(value) end
+
+            ---@type A
+            local source
+
+            value = extract(source)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "unknown");
+    }
+
+    #[test]
+    fn test_conditional_infer_handles_cyclic_generic_supers() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Target<T>
+            ---@class A<T>: B<T>
+            ---@class B<T>: A<T>
+
+            ---@alias Extract<T> T extends Target<infer U> and U or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return Extract<T>
+            function extract(value) end
+
+            ---@type A<string>
+            local source
+
+            value = extract(source)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "unknown");
+    }
+
+    #[test]
+    fn test_conditional_infer_function_return_uses_independent_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Target<T>
+            ---@class Source<T>: Target<T>
+
+            ---@alias ExtractArg<F> F extends (fun(...: Target<infer A>): Target<infer B>) and A or unknown
+            ---@alias ExtractRet<F> F extends (fun(...: Target<infer A>): Target<infer B>) and B or unknown
+
+            ---@generic F
+            ---@param f F
+            ---@return ExtractArg<F>
+            function extract_arg(f) end
+
+            ---@generic F
+            ---@param f F
+            ---@return ExtractRet<F>
+            function extract_ret(f) end
+
+            ---@param ... Source<string>
+            ---@return Source<number>
+            function fn(...) end
+
+            arg = extract_arg(fn)
+            ret = extract_ret(fn)
+            "#,
+        );
+
+        let arg_ty = ws.expr_ty("arg");
+        let ret_ty = ws.expr_ty("ret");
+        assert_eq!(ws.humanize_type(arg_ty), "string");
+        assert_eq!(ws.humanize_type(ret_ty), "number");
+    }
+
+    #[test]
+    fn test_conditional_infer_instantiates_nested_generic_super_with_decl_tpl_id() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Pair<A, B>
+
+            ---@generic Outer
+            function setup()
+                ---@class Nested<Inner>: Pair<Outer, Inner>
+            end
+
+            ---@alias ExtractInner<T> T extends Pair<any, infer U> and U or unknown
+
+            ---@type ExtractInner<Nested<string>>
+            value = nil
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value number
+            function take_number(value) end
+
+            take_number(value)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_nested_generic_super_member_instantiates_decl_tpl_id() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Base<T>
+            ---@field value T
+
+            ---@generic Outer
+            function setup()
+                ---@class Nested<Inner>: Base<Inner>
+            end
+
+            ---@type Nested<string>
+            local nested
+
+            value = nested.value
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "string");
+    }
+
+    #[test]
     fn test_infer_new_constructor() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
