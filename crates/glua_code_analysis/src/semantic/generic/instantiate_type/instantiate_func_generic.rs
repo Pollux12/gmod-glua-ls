@@ -29,7 +29,7 @@ use crate::{
 };
 use crate::{LuaMemberOwner, LuaSemanticDeclId, SemanticDeclLevel, infer_node_semantic_decl};
 
-use crate::InferenceContext;
+use crate::{InferenceContext, InferencePriority};
 
 pub fn instantiate_func_generic(
     db: &DbIndex,
@@ -208,16 +208,11 @@ fn infer_generic_types_from_call(
                 break;
             }
             _ => {
-                let previous = context
-                    .substitutor
-                    .set_type_candidate_collection_enabled(collect_more_candidates);
-                tpl_pattern_match(context, func_param_type, &arg_type)?;
-                if collect_more_candidates {
-                    context.substitutor.normalize_type_inferences(db);
-                }
-                context
-                    .substitutor
-                    .set_type_candidate_collection_enabled(previous);
+                context.with_inference_priority(
+                    InferencePriority::Direct,
+                    collect_more_candidates,
+                    |context| tpl_pattern_match(context, func_param_type, &arg_type),
+                )?;
             }
         }
     }

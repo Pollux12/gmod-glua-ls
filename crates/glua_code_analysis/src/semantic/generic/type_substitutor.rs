@@ -118,13 +118,13 @@ impl TypeSubstitutor {
         }
     }
 
-    pub fn set_type_candidate_collection_enabled(&mut self, enabled: bool) -> bool {
+    pub(super) fn set_type_candidate_collection_enabled(&mut self, enabled: bool) -> bool {
         let previous = self.collect_type_candidates;
         self.collect_type_candidates = enabled;
         previous
     }
 
-    pub fn normalize_type_inferences(&mut self, db: &DbIndex) {
+    pub(super) fn normalize_type_inferences(&mut self, db: &DbIndex) {
         for (tpl_id, inference) in self.type_inferences.iter_mut() {
             inference.normalize_with_common_supertype(db);
             if let Some(inferred) = inference.inferred() {
