@@ -677,6 +677,32 @@ mod test {
     }
 
     #[test]
+    fn test_conditional_infer_collects_from_matching_pattern_union_members() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Left<T>
+            ---@class Right<T>
+            ---@alias Extract<T> T extends (Left<infer U>|Right<infer U>) and U or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return Extract<T>
+            function extract(value) end
+
+            ---@type Left<string>|Right<number>
+            local source
+
+            value = extract(source)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "(string|number)");
+    }
+
+    #[test]
     fn test_generic_identity_table_literal_still_allows_later_field_inference() {
         let mut ws = VirtualWorkspace::new();
 

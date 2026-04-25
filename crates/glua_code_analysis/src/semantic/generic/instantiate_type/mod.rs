@@ -595,6 +595,9 @@ fn collect_infer_assignments_inner(
         LuaType::ConditionalInfer(name) => {
             insert_infer_assignment(assignments, name.as_str(), source)
         }
+        LuaType::Union(pattern_union) => {
+            collect_infer_to_union(db, source, pattern_union, assignments, infer_guard)
+        }
         LuaType::Generic(pattern_generic) => {
             collect_infer_from_generic_source(db, source, pattern_generic, assignments, infer_guard)
         }
@@ -796,6 +799,35 @@ fn collect_infer_assignments_inner(
             }
         }
     }
+}
+
+fn collect_infer_to_union(
+    db: &DbIndex,
+    source: &LuaType,
+    pattern_union: &LuaUnionType,
+    assignments: &mut HashMap<String, LuaType>,
+    infer_guard: &InferGuardRef,
+) -> bool {
+    let mut matched = false;
+    let mut union_assignments = assignments.clone();
+    for member in pattern_union.into_vec() {
+        let mut branch_assignments = union_assignments.clone();
+        if collect_infer_assignments_inner(
+            db,
+            source,
+            &member,
+            &mut branch_assignments,
+            &infer_guard.fork(),
+        ) {
+            union_assignments = branch_assignments;
+            matched = true;
+        }
+    }
+
+    if matched {
+        *assignments = union_assignments;
+    }
+    matched
 }
 
 fn collect_infer_from_generic_source(
