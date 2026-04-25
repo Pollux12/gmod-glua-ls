@@ -248,10 +248,24 @@ fn infer_generic_types_from_call(
 }
 
 fn is_direct_type_candidate(typ: &LuaType) -> bool {
-    matches!(
-        typ,
-        LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_)
-    )
+    match typ {
+        LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_) => true,
+        LuaType::DocFunction(func) => {
+            func.get_params()
+                .iter()
+                .filter_map(|(_, ty)| ty.as_ref())
+                .any(is_direct_type_candidate)
+                || is_direct_type_candidate(func.get_ret())
+        }
+        LuaType::Variadic(variadic) => match variadic.deref() {
+            crate::VariadicType::Base(base) => is_direct_type_candidate(base),
+            crate::VariadicType::Multi(types) => types.iter().any(is_direct_type_candidate),
+        },
+        LuaType::Array(array) => is_direct_type_candidate(array.get_base()),
+        LuaType::Tuple(tuple) => tuple.get_types().iter().any(is_direct_type_candidate),
+        LuaType::Generic(generic) => generic.get_params().iter().any(is_direct_type_candidate),
+        _ => false,
+    }
 }
 
 fn infer_generic_arg_type(

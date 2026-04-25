@@ -9,10 +9,10 @@ use rowan::NodeOrToken;
 use smol_str::SmolStr;
 
 use crate::{
-    GenericTplId, InferFailReason, InferencePriority, LuaAliasCallKind, LuaAliasCallType,
-    LuaArrayType, LuaFunctionType, LuaMappedType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
-    LuaObjectType, LuaSemanticDeclId, LuaTupleStatus, LuaTupleType, LuaTypeDeclId, LuaUnionType,
-    SemanticDeclLevel, TypeOps, VariadicType, check_type_compact,
+    GenericTplId, InferFailReason, InferencePriority, InferenceVariance, LuaAliasCallKind,
+    LuaAliasCallType, LuaArrayType, LuaFunctionType, LuaMappedType, LuaMemberInfo, LuaMemberKey,
+    LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleStatus, LuaTupleType, LuaTypeDeclId,
+    LuaUnionType, SemanticDeclLevel, TypeOps, VariadicType, check_type_compact,
     db_index::{DbIndex, LuaGenericType, LuaType},
     infer_node_semantic_decl,
     semantic::{
@@ -522,7 +522,12 @@ fn mapped_tpl_pattern_match(
     if let Some(source_info) = source_info {
         homomorphic_mapped_tpl_pattern_match(context, mapped, target_fields, source_info)?;
     } else if let Some(key_constraint_tpl_id) = key_constraint_tpl_id {
-        constrained_mapped_tpl_pattern_match(context, mapped, target_fields, key_constraint_tpl_id)?;
+        constrained_mapped_tpl_pattern_match(
+            context,
+            mapped,
+            target_fields,
+            key_constraint_tpl_id,
+        )?;
     }
 
     Ok(())
@@ -587,17 +592,11 @@ fn homomorphic_mapped_tpl_pattern_match(
         } else {
             InferencePriority::HomomorphicMappedType
         };
-        context.with_inference_priority(
-            priority,
-            true,
-            |context| {
-                context.substitutor.insert_type(
-                    source_info.source_tpl_id,
-                    source_type,
-                    true,
-                );
-            },
-        );
+        context.with_inference_priority(priority, true, |context| {
+            context
+                .substitutor
+                .insert_type(source_info.source_tpl_id, source_type, true);
+        });
     }
 
     Ok(())
@@ -643,13 +642,9 @@ fn constrained_mapped_tpl_pattern_match(
 
 fn mapped_inference_value_type(ty: LuaType) -> LuaType {
     match ty {
-        LuaType::Union(union) => LuaType::from_vec(
-            union
-                .into_vec()
-                .into_iter()
-                .map(constant_decay)
-                .collect(),
-        ),
+        LuaType::Union(union) => {
+            LuaType::from_vec(union.into_vec().into_iter().map(constant_decay).collect())
+        }
         _ => constant_decay(ty),
     }
 }
@@ -1453,7 +1448,9 @@ fn func_tpl_pattern_match_doc_func(
 
     let tpl_return = tpl_func.get_ret();
     let target_return = target_func.get_ret();
-    return_type_pattern_match_target_type(context, tpl_return, target_return)?;
+    context.with_inference_priority(InferencePriority::Direct, true, |context| {
+        return_type_pattern_match_target_type(context, tpl_return, target_return)
+    })?;
 
     Ok(())
 }
@@ -1527,7 +1524,12 @@ fn param_type_list_pattern_match_type_list(
                     Some(t) => t.1.clone().unwrap_or(LuaType::Any),
                     None => break,
                 };
-                tpl_pattern_match(context, &source, &target)?;
+                context.with_inference_priority_and_variance(
+                    InferencePriority::Direct,
+                    true,
+                    InferenceVariance::Contravariant,
+                    |context| tpl_pattern_match(context, &source, &target),
+                )?;
             }
         }
     }

@@ -208,6 +208,65 @@ mod test {
     }
 
     #[test]
+    fn test_generic_function_parameter_candidates_use_common_subtype() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+
+            ---@generic T
+            ---@param first fun(value: T)
+            ---@param second fun(value: T)
+            ---@return T
+            function choose_callback_value(first, second) end
+
+            ---@param value Animal
+            local function accepts_animal(value) end
+
+            ---@param value Dog
+            local function accepts_dog(value) end
+
+            dog = choose_callback_value(accepts_animal, accepts_dog)
+            "#,
+        );
+
+        let dog_ty = ws.expr_ty("dog");
+        let expected = ws.ty("Dog");
+        assert_eq!(dog_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_function_return_candidates_use_common_supertype() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+            ---@class Cat: Animal
+
+            ---@generic T
+            ---@param first fun(): T
+            ---@param second fun(): T
+            ---@return T
+            function choose_producer_value(first, second) end
+
+            ---@return Dog
+            local function make_dog() end
+
+            ---@return Cat
+            local function make_cat() end
+
+            animal = choose_producer_value(make_dog, make_cat)
+            "#,
+        );
+
+        let animal_ty = ws.expr_ty("animal");
+        let expected = ws.ty("Animal");
+        assert_eq!(animal_ty, expected);
+    }
+
+    #[test]
     fn test_generic_return_infers_from_local_doc_context() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(

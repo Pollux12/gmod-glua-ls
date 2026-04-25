@@ -11,7 +11,7 @@ pub use call_constraint::{
 };
 use glua_parser::LuaAstNode;
 use glua_parser::LuaExpr;
-pub use inference_context::{InferenceContext, InferencePriority};
+pub use inference_context::{InferenceContext, InferencePriority, InferenceVariance};
 pub use instantiate_type::*;
 use rowan::NodeOrToken;
 pub use tpl_context::TplContext;

@@ -1,6 +1,6 @@
 use glua_parser::LuaCallExpr;
 
-use crate::{DbIndex, InferenceContext, InferencePriority, LuaInferCache};
+use crate::{DbIndex, InferenceContext, InferencePriority, InferenceVariance, LuaInferCache};
 
 #[derive(Debug)]
 pub struct TplContext<'a> {
@@ -17,9 +17,24 @@ impl TplContext<'_> {
         collect_candidates: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let state = self
-            .substitutor
-            .begin_candidate_collection(collect_candidates, priority);
+        self.with_inference_priority_and_variance(
+            priority,
+            collect_candidates,
+            InferenceVariance::Covariant,
+            f,
+        )
+    }
+
+    pub fn with_inference_priority_and_variance<R>(
+        &mut self,
+        priority: InferencePriority,
+        collect_candidates: bool,
+        variance: InferenceVariance,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let state =
+            self.substitutor
+                .begin_candidate_collection(collect_candidates, priority, variance);
         let result = f(self);
         self.substitutor.finish_candidate_collection(self.db, state);
         result
