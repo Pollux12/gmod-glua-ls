@@ -1,10 +1,11 @@
-use std::{ops::Deref, sync::Arc};
+use std::{collections::HashSet, ops::Deref, sync::Arc};
 
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr};
 
 use crate::{
-    DbIndex, DocTypeInferContext, GenericTplId, LuaFunctionType, LuaSemanticDeclId, LuaType,
-    SemanticDeclLevel, SemanticModel, TypeOps, TypeSubstitutor, VariadicType, infer_doc_type,
+    DbIndex, DocTypeInferContext, GenericTplId, InferenceContext, InferencePriority,
+    InferenceVariance, LuaFunctionType, LuaSemanticDeclId, LuaType, SemanticDeclLevel,
+    SemanticModel, TypeOps, TypeSubstitutor, VariadicType, infer_doc_type,
 };
 
 // 泛型约束上下文
@@ -21,7 +22,8 @@ pub fn build_call_constraint_context(
     let doc_func = infer_call_doc_function(semantic_model, call_expr)?;
     let mut params = doc_func.get_params().to_vec();
     let mut arg_infos = get_arg_infos(semantic_model, call_expr)?;
-    let mut substitutor = TypeSubstitutor::new();
+    let mut inference = InferenceContext::new();
+    let mut explicit_tpl_ids = HashSet::new();
 
     // 读取显式传入的泛型实参
     if let Some(type_list) = call_expr.get_call_generic_type_list() {
@@ -29,7 +31,9 @@ pub fn build_call_constraint_context(
             DocTypeInferContext::new(semantic_model.get_db(), semantic_model.get_file_id());
         for (idx, doc_type) in type_list.get_types().enumerate() {
             let ty = infer_doc_type(doc_ctx, &doc_type);
-            substitutor.insert_type(GenericTplId::Func(idx as u32), ty, true);
+            let tpl_id = GenericTplId::Func(idx as u32);
+            explicit_tpl_ids.insert(tpl_id);
+            inference.set_explicit_type(tpl_id, ty, true);
         }
     }
 
@@ -44,13 +48,19 @@ pub fn build_call_constraint_context(
         }
     }
 
-    collect_generic_assignments(&mut substitutor, &params, &arg_infos);
+    collect_generic_assignments(
+        semantic_model.get_db(),
+        &mut inference,
+        &params,
+        &arg_infos,
+        &explicit_tpl_ids,
+    );
 
     Some((
         CallConstraintContext {
             params,
             arg_infos,
-            substitutor,
+            substitutor: inference.substitutor().clone(),
         },
         doc_func,
     ))
@@ -66,10 +76,17 @@ pub fn normalize_constraint_type(db: &DbIndex, ty: LuaType) -> LuaType {
 
 // 收集各个参数对应的泛型推导
 fn collect_generic_assignments(
-    substitutor: &mut TypeSubstitutor,
+    db: &DbIndex,
+    inference: &mut InferenceContext,
     params: &[(String, Option<LuaType>)],
     arg_infos: &[LuaType],
+    explicit_tpl_ids: &HashSet<GenericTplId>,
 ) {
+    let state = inference.begin_candidate_collection(
+        true,
+        InferencePriority::Direct,
+        InferenceVariance::Covariant,
+    );
     for (idx, (_, param_type)) in params.iter().enumerate() {
         let Some(param_type) = param_type else {
             continue;
@@ -77,29 +94,40 @@ fn collect_generic_assignments(
         let Some(arg_type) = arg_infos.get(idx) else {
             continue;
         };
-        record_generic_assignment(param_type, arg_type, substitutor);
+        record_generic_assignment(param_type, arg_type, inference, explicit_tpl_ids);
     }
+    inference.finish_candidate_collection(db, state);
 }
 
 // 实际写入泛型替换表
 fn record_generic_assignment(
     param_type: &LuaType,
     arg_type: &LuaType,
-    substitutor: &mut TypeSubstitutor,
+    inference: &mut InferenceContext,
+    explicit_tpl_ids: &HashSet<GenericTplId>,
 ) {
     match param_type {
         LuaType::TplRef(tpl_ref) => {
-            substitutor.insert_type(tpl_ref.get_tpl_id(), arg_type.clone(), true);
+            let tpl_id = tpl_ref.get_tpl_id();
+            if !explicit_tpl_ids.contains(&tpl_id) {
+                inference.infer_type(tpl_id, arg_type.clone(), true);
+            }
         }
         LuaType::ConstTplRef(tpl_ref) => {
-            substitutor.insert_type(tpl_ref.get_tpl_id(), arg_type.clone(), false);
+            let tpl_id = tpl_ref.get_tpl_id();
+            if !explicit_tpl_ids.contains(&tpl_id) {
+                inference.infer_type(tpl_id, arg_type.clone(), false);
+            }
         }
         LuaType::StrTplRef(str_tpl_ref) => {
-            substitutor.insert_type(str_tpl_ref.get_tpl_id(), arg_type.clone(), true);
+            let tpl_id = str_tpl_ref.get_tpl_id();
+            if !explicit_tpl_ids.contains(&tpl_id) {
+                inference.infer_type(tpl_id, arg_type.clone(), true);
+            }
         }
         LuaType::Variadic(variadic) => {
             if let Some(inner) = variadic.get_type(0) {
-                record_generic_assignment(inner, arg_type, substitutor);
+                record_generic_assignment(inner, arg_type, inference, explicit_tpl_ids);
             }
         }
         _ => {}

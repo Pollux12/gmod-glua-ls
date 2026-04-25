@@ -1,9 +1,9 @@
-use std::{
-    collections::HashSet,
-    ops::{Deref, DerefMut},
-};
+use std::collections::{HashMap, HashSet};
 
-use super::{type_substitutor::SubstitutorValue, TypeSubstitutor};
+use super::{
+    type_substitutor::{candidate_assignable_to, SubstitutorTypeValue, SubstitutorValue},
+    TypeSubstitutor,
+};
 use crate::{DbIndex, GenericTplId, LuaType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,8 @@ pub enum InferenceVariance {
 #[derive(Debug, Clone)]
 pub struct InferenceContext {
     substitutor: TypeSubstitutor,
+    type_inferences: HashMap<GenericTplId, TypeInferenceInfo>,
+    collect_type_candidates: bool,
     priority: InferencePriority,
     variance: InferenceVariance,
 }
@@ -72,6 +74,8 @@ impl InferenceContext {
     pub fn new() -> Self {
         Self {
             substitutor: TypeSubstitutor::new(),
+            type_inferences: HashMap::new(),
+            collect_type_candidates: false,
             priority: InferencePriority::None,
             variance: InferenceVariance::Covariant,
         }
@@ -80,21 +84,15 @@ impl InferenceContext {
     pub fn from_substitutor(substitutor: TypeSubstitutor) -> Self {
         Self {
             substitutor,
+            type_inferences: HashMap::new(),
+            collect_type_candidates: false,
             priority: InferencePriority::None,
             variance: InferenceVariance::Covariant,
         }
     }
 
-    pub fn into_substitutor(self) -> TypeSubstitutor {
-        self.substitutor
-    }
-
     pub fn substitutor(&self) -> &TypeSubstitutor {
         &self.substitutor
-    }
-
-    pub fn substitutor_mut(&mut self) -> &mut TypeSubstitutor {
-        &mut self.substitutor
     }
 
     pub fn priority(&self) -> InferencePriority {
@@ -106,13 +104,12 @@ impl InferenceContext {
     }
 
     pub fn insert_type(&mut self, tpl_id: GenericTplId, replace_type: LuaType, decay: bool) {
-        self.substitutor.insert_type_with_priority(
-            tpl_id,
-            replace_type,
-            decay,
-            self.priority,
-            self.variance,
-        );
+        let value = SubstitutorTypeValue::new(replace_type, decay);
+        if self.collect_type_candidates {
+            self.insert_type_candidate(tpl_id, value, self.priority, self.variance);
+        } else {
+            self.substitutor.insert_type_value(tpl_id, value);
+        }
     }
 
     pub fn infer_type(&mut self, tpl_id: GenericTplId, candidate: LuaType, decay: bool) {
@@ -144,7 +141,12 @@ impl InferenceContext {
     }
 
     pub fn has_non_direct_type_inferences(&self) -> bool {
-        self.substitutor.has_non_direct_type_inferences()
+        self.type_inferences.values().any(|inference| {
+            !matches!(
+                inference.priority(),
+                InferencePriority::None | InferencePriority::Direct
+            )
+        })
     }
 
     pub fn add_self_type(&mut self, self_type: LuaType) {
@@ -167,9 +169,8 @@ impl InferenceContext {
     ) -> CandidateCollectionState {
         let previous_priority = self.priority;
         let previous_variance = self.variance;
-        let previous_enabled = self
-            .substitutor
-            .set_type_candidate_collection_enabled(enabled);
+        let previous_enabled = self.collect_type_candidates;
+        self.collect_type_candidates = enabled;
         self.priority = if enabled {
             priority
         } else {
@@ -195,26 +196,190 @@ impl InferenceContext {
         state: CandidateCollectionState,
     ) {
         if state.enabled {
-            self.substitutor.normalize_type_inferences(db);
+            self.normalize_type_inferences(db);
         }
 
-        self.substitutor
-            .set_type_candidate_collection_enabled(state.previous_enabled);
+        self.collect_type_candidates = state.previous_enabled;
         self.priority = state.previous_priority;
         self.variance = state.previous_variance;
     }
-}
 
-impl Deref for InferenceContext {
-    type Target = TypeSubstitutor;
+    fn insert_type_candidate(
+        &mut self,
+        tpl_id: GenericTplId,
+        value: SubstitutorTypeValue,
+        priority: InferencePriority,
+        variance: InferenceVariance,
+    ) {
+        let existing_type = match self.substitutor.get(tpl_id) {
+            Some(SubstitutorValue::Type(existing)) => Some(existing.clone()),
+            Some(SubstitutorValue::None) | None => None,
+            Some(_) => return,
+        };
+        let include_existing_type =
+            !self.type_inferences.contains_key(&tpl_id) && existing_type.is_some();
 
-    fn deref(&self) -> &Self::Target {
-        &self.substitutor
+        let inference = self
+            .type_inferences
+            .entry(tpl_id)
+            .or_insert_with(TypeInferenceInfo::new);
+
+        if include_existing_type && let Some(existing) = existing_type {
+            inference.add_candidate(existing, priority, InferenceVariance::Covariant);
+        }
+
+        inference.add_candidate(value, priority, variance);
+        if let Some(inferred) = inference.inferred() {
+            self.substitutor
+                .set_inferred_type_value(tpl_id, inferred.clone());
+        }
+    }
+
+    fn normalize_type_inferences(&mut self, db: &DbIndex) {
+        for (tpl_id, inference) in self.type_inferences.iter_mut() {
+            inference.normalize_with_common_supertype(db);
+            if let Some(inferred) = inference.inferred() {
+                self.substitutor
+                    .set_inferred_type_value(*tpl_id, inferred.clone());
+            }
+        }
     }
 }
 
-impl DerefMut for InferenceContext {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.substitutor
+#[derive(Debug, Clone)]
+struct TypeInferenceInfo {
+    candidates: Vec<SubstitutorTypeValue>,
+    contra_candidates: Vec<SubstitutorTypeValue>,
+    inferred: Option<SubstitutorTypeValue>,
+    priority: Option<InferencePriority>,
+}
+
+impl TypeInferenceInfo {
+    fn new() -> Self {
+        Self {
+            candidates: Vec::new(),
+            contra_candidates: Vec::new(),
+            inferred: None,
+            priority: None,
+        }
+    }
+
+    fn add_candidate(
+        &mut self,
+        candidate: SubstitutorTypeValue,
+        priority: InferencePriority,
+        variance: InferenceVariance,
+    ) {
+        match self.priority {
+            Some(existing) if priority.is_higher_than(existing) => {
+                self.candidates.clear();
+                self.contra_candidates.clear();
+                self.inferred = None;
+                self.priority = Some(priority);
+            }
+            Some(existing) if existing.is_higher_than(priority) => {
+                return;
+            }
+            Some(_) => {}
+            None => {
+                self.priority = Some(priority);
+            }
+        }
+
+        let candidates = match variance {
+            InferenceVariance::Covariant => &mut self.candidates,
+            InferenceVariance::Contravariant => &mut self.contra_candidates,
+        };
+
+        if candidates.contains(&candidate) {
+            return;
+        }
+
+        if let Some(inferred) = &mut self.inferred {
+            inferred.union_with(candidate.clone());
+        } else {
+            self.inferred = Some(candidate.clone());
+        }
+        candidates.push(candidate);
+    }
+
+    fn normalize_with_common_supertype(&mut self, db: &DbIndex) {
+        self.inferred = self.infer_candidate(db);
+    }
+
+    fn infer_candidate(&self, db: &DbIndex) -> Option<SubstitutorTypeValue> {
+        let covariant = self.infer_covariant_candidate(db);
+        let contravariant = self.infer_contravariant_candidate(db);
+
+        match (covariant, contravariant) {
+            (Some(covariant), Some(contravariant)) => {
+                if self.prefer_covariant_candidate(db, &covariant) {
+                    Some(covariant)
+                } else {
+                    Some(contravariant)
+                }
+            }
+            (Some(covariant), None) => Some(covariant),
+            (None, Some(contravariant)) => Some(contravariant),
+            (None, None) => None,
+        }
+    }
+
+    fn infer_covariant_candidate(&self, db: &DbIndex) -> Option<SubstitutorTypeValue> {
+        let Some((first, rest)) = self.candidates.split_first() else {
+            return None;
+        };
+
+        let mut inferred = first.clone();
+        let combine_candidates = self
+            .priority
+            .is_some_and(InferencePriority::implies_candidate_combination);
+        for candidate in rest {
+            if combine_candidates {
+                inferred.union_with(candidate.clone());
+            } else {
+                inferred.combine_with_common_supertype(db, candidate.clone());
+            }
+        }
+
+        Some(inferred)
+    }
+
+    fn infer_contravariant_candidate(&self, db: &DbIndex) -> Option<SubstitutorTypeValue> {
+        let Some((first, rest)) = self.contra_candidates.split_first() else {
+            return None;
+        };
+
+        let mut inferred = first.clone();
+        let combine_candidates = self
+            .priority
+            .is_some_and(InferencePriority::implies_candidate_combination);
+        for candidate in rest {
+            if combine_candidates {
+                inferred.union_with(candidate.clone());
+            } else {
+                inferred.combine_with_common_subtype(db, candidate.clone());
+            }
+        }
+
+        Some(inferred)
+    }
+
+    fn prefer_covariant_candidate(&self, db: &DbIndex, covariant: &SubstitutorTypeValue) -> bool {
+        if matches!(covariant.default(), LuaType::Any | LuaType::Never) {
+            return false;
+        }
+
+        self.contra_candidates
+            .iter()
+            .any(|candidate| candidate_assignable_to(db, covariant.default(), candidate.default()))
+    }
+
+    fn inferred(&self) -> Option<&SubstitutorTypeValue> {
+        self.inferred.as_ref()
+    }
+
+    fn priority(&self) -> InferencePriority {
+        self.priority.unwrap_or(InferencePriority::Direct)
     }
 }
