@@ -348,9 +348,10 @@ pub fn analyze_func_generic(analyzer: &mut DocAnalyzer, tag: LuaDocTagGeneric) -
             };
             let name_text = name_token.get_name_text().to_string();
             let smol_name = SmolStr::new(name_text.as_str());
-            let _ = analyzer
+            let tpl_id = analyzer
                 .generic_index
-                .append_generic_param(scope_id, GenericParam::new(smol_name.clone(), None, None));
+                .append_generic_param(scope_id, GenericParam::new(smol_name.clone(), None, None))
+                .and_then(|param| param.tpl_id);
 
             let type_ref = param
                 .get_type()
@@ -363,7 +364,7 @@ pub fn analyze_func_generic(analyzer: &mut DocAnalyzer, tag: LuaDocTagGeneric) -
             );
 
             param_info.push(Arc::new(LuaGenericParamInfo::new(
-                name_text, type_ref, None,
+                name_text, type_ref, None, tpl_id,
             )));
         }
     }

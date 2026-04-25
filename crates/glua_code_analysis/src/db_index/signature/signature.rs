@@ -11,7 +11,7 @@ use crate::{
     FileId,
     db_index::{LuaFunctionType, LuaType},
 };
-use crate::{LuaAttributeUse, SemanticModel, VariadicType, first_param_may_not_self};
+use crate::{GenericTplId, LuaAttributeUse, SemanticModel, VariadicType, first_param_may_not_self};
 
 #[derive(Debug)]
 pub struct LuaSignature {
@@ -348,6 +348,7 @@ pub struct LuaGenericParamInfo {
     pub name: String,
     pub constraint: Option<LuaType>,
     pub attributes: Option<Vec<LuaAttributeUse>>,
+    pub tpl_id: Option<GenericTplId>,
 }
 
 impl LuaGenericParamInfo {
@@ -355,11 +356,13 @@ impl LuaGenericParamInfo {
         name: String,
         constraint: Option<LuaType>,
         attributes: Option<Vec<LuaAttributeUse>>,
+        tpl_id: Option<GenericTplId>,
     ) -> Self {
         Self {
             name,
             constraint,
             attributes,
+            tpl_id,
         }
     }
 }

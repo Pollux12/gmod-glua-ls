@@ -60,7 +60,7 @@ pub use infer::InferFailReason;
 pub use infer::infer_call_expr_func;
 pub(crate) use infer::infer_expr;
 pub use infer::infer_param;
-use overload_resolve::resolve_signature;
+use overload_resolve::{resolve_signature, resolve_signature_with_generic_params};
 pub use semantic_info::SemanticDeclLevel;
 pub use type_check::{TypeCheckFailReason, TypeCheckResult};
 

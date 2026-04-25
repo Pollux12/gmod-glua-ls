@@ -3,9 +3,9 @@ use std::{ops::Deref, sync::Arc};
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr};
 
 use crate::{
-    DbIndex, DocTypeInferContext, GenericTplId, LuaFunctionType, LuaSemanticDeclId, LuaType,
-    SemanticDeclLevel, SemanticModel, TypeOps, TypeSubstitutor, TypeVisitTrait, VariadicType,
-    infer_doc_type,
+    DbIndex, DocTypeInferContext, GenericTplId, LuaFunctionType, LuaGenericParamInfo,
+    LuaSemanticDeclId, LuaType, SemanticDeclLevel, SemanticModel, TypeOps, TypeSubstitutor,
+    TypeVisitTrait, VariadicType, infer_doc_type,
 };
 
 // 泛型约束上下文
@@ -19,7 +19,7 @@ pub fn build_call_constraint_context(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
 ) -> Option<(CallConstraintContext, Arc<LuaFunctionType>)> {
-    let doc_func = infer_call_doc_function(semantic_model, call_expr)?;
+    let (doc_func, declared_tpl_ids) = infer_call_doc_function(semantic_model, call_expr)?;
     let mut params = doc_func.get_params().to_vec();
     let mut arg_infos = get_arg_infos(semantic_model, call_expr)?;
     let mut substitutor = TypeSubstitutor::new();
@@ -28,7 +28,13 @@ pub fn build_call_constraint_context(
     if let Some(type_list) = call_expr.get_call_generic_type_list() {
         let doc_ctx =
             DocTypeInferContext::new(semantic_model.get_db(), semantic_model.get_file_id());
-        let explicit_tpl_ids = sorted_func_tpl_ids(&doc_func);
+        let fallback_tpl_ids;
+        let explicit_tpl_ids = if let Some(declared_tpl_ids) = declared_tpl_ids.as_ref() {
+            declared_tpl_ids
+        } else {
+            fallback_tpl_ids = sorted_func_tpl_ids(&doc_func);
+            &fallback_tpl_ids
+        };
         for (idx, doc_type) in type_list.get_types().enumerate() {
             let ty = infer_doc_type(doc_ctx, &doc_type);
             let tpl_id = explicit_tpl_ids
@@ -81,6 +87,14 @@ fn sorted_func_tpl_ids(doc_func: &LuaFunctionType) -> Vec<GenericTplId> {
     tpl_ids.sort_by_key(GenericTplId::get_idx);
     tpl_ids.dedup();
     tpl_ids
+}
+
+fn declared_func_tpl_ids(generic_params: &[Arc<LuaGenericParamInfo>]) -> Vec<GenericTplId> {
+    generic_params
+        .iter()
+        .enumerate()
+        .map(|(idx, param)| param.tpl_id.unwrap_or(GenericTplId::Func(idx as u32)))
+        .collect()
 }
 
 // 将推导结果转换为更易比较的形式
@@ -224,7 +238,7 @@ fn get_arg_infos(semantic_model: &SemanticModel, call_expr: &LuaCallExpr) -> Opt
 fn infer_call_doc_function(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
-) -> Option<Arc<LuaFunctionType>> {
+) -> Option<(Arc<LuaFunctionType>, Option<Vec<GenericTplId>>)> {
     let prefix_expr = call_expr.get_prefix_expr()?.clone();
     let function = semantic_model.infer_expr(prefix_expr).ok()?;
     match function {
@@ -233,9 +247,12 @@ fn infer_call_doc_function(
                 .get_db()
                 .get_signature_index()
                 .get(&signature_id)?;
-            Some(signature.to_doc_func_type())
+            Some((
+                signature.to_doc_func_type(),
+                Some(declared_func_tpl_ids(&signature.generic_params)),
+            ))
         }
-        LuaType::DocFunction(func) => Some(func),
+        LuaType::DocFunction(func) => Some((func, None)),
         _ => None,
     }
 }

@@ -9,8 +9,8 @@ use glua_parser::{LuaCallExpr, LuaExpr, LuaIndexKey, LuaTableExpr, NumberResult}
 use internment::ArcIntern;
 
 use crate::{
-    DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaFunctionType, LuaGenericType,
-    TypeVisitTrait,
+    DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaFunctionType, LuaGenericParamInfo,
+    LuaGenericType, TypeVisitTrait,
     db_index::{DbIndex, LuaMemberKey, LuaObjectType, LuaType},
     infer_doc_type,
     semantic::{
@@ -36,6 +36,16 @@ pub fn instantiate_func_generic(
     cache: &mut LuaInferCache,
     func: &LuaFunctionType,
     call_expr: LuaCallExpr,
+) -> Result<LuaFunctionType, InferFailReason> {
+    instantiate_func_generic_with_params(db, cache, func, call_expr, None)
+}
+
+pub fn instantiate_func_generic_with_params(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    func: &LuaFunctionType,
+    call_expr: LuaCallExpr,
+    generic_params: Option<&[Arc<LuaGenericParamInfo>]>,
 ) -> Result<LuaFunctionType, InferFailReason> {
     let file_id = cache.get_file_id().clone();
     let mut generic_tpls = HashSet::new();
@@ -75,7 +85,8 @@ pub fn instantiate_func_generic(
         call_expr: Some(call_expr.clone()),
     };
     if !generic_tpls.is_empty() {
-        let explicit_tpl_ids = sorted_func_tpl_ids(&generic_tpls);
+        let explicit_tpl_ids = declared_func_tpl_ids(generic_params)
+            .unwrap_or_else(|| sorted_func_tpl_ids(&generic_tpls));
         context.substitutor.add_need_infer_tpls(generic_tpls);
 
         if let Some(type_list) = call_expr.get_call_generic_type_list() {
@@ -131,6 +142,23 @@ fn sorted_func_tpl_ids(generic_tpls: &HashSet<GenericTplId>) -> Vec<GenericTplId
         .collect::<Vec<_>>();
     tpl_ids.sort_by_key(GenericTplId::get_idx);
     tpl_ids
+}
+
+fn declared_func_tpl_ids(
+    generic_params: Option<&[Arc<LuaGenericParamInfo>]>,
+) -> Option<Vec<GenericTplId>> {
+    let generic_params = generic_params?;
+    if generic_params.is_empty() {
+        return None;
+    }
+
+    Some(
+        generic_params
+            .iter()
+            .enumerate()
+            .map(|(idx, param)| param.tpl_id.unwrap_or(GenericTplId::Func(idx as u32)))
+            .collect(),
+    )
 }
 
 fn infer_generic_types_from_call(

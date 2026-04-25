@@ -698,6 +698,51 @@ mod test {
     }
 
     #[test]
+    fn test_explicit_generic_call_uses_declared_generic_order_with_unused_param() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic Unused, Used
+            ---@param value Used
+            ---@return Used
+            function identity(value) end
+
+            value = identity--[[@<string, number>]]("not a number")
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "number");
+    }
+
+    #[test]
+    fn test_explicit_generic_call_ignores_captured_outer_generic_order() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic Outer
+            function setup()
+                ---@generic Inner
+                ---@param outer Outer
+                ---@param value Inner
+                ---@return Inner
+                function identity(outer, value) end
+            end
+
+            setup()
+            ---@type boolean
+            local outer
+            value = identity--[[@<string>]](outer, 1)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "string");
+    }
+
+    #[test]
     fn test_conditional_infer_instantiates_nested_generic_super_with_decl_tpl_id() {
         let mut ws = VirtualWorkspace::new();
 

@@ -4,7 +4,10 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaSyntaxKind};
 use rowan::TextRange;
 
 use super::{
-    super::{InferGuard, LuaInferCache, instantiate_type_generic, resolve_signature},
+    super::{
+        InferGuard, LuaInferCache, instantiate_type_generic, resolve_signature,
+        resolve_signature_with_generic_params,
+    },
     InferFailReason, InferResult,
 };
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
@@ -23,7 +26,7 @@ use crate::{
 };
 use crate::{
     SemanticDeclGuard, SemanticDeclLevel, build_self_type, infer_self_type,
-    instantiate_func_generic, semantic::infer_expr,
+    instantiate_func_generic, instantiate_func_generic_with_params, semantic::infer_expr,
 };
 use infer_require::infer_require_call;
 use infer_setmetatable::infer_setmetatable_call;
@@ -330,7 +333,13 @@ fn infer_signature_doc_function(
             signature.get_return_type(),
         );
         if is_generic {
-            fake_doc_function = instantiate_func_generic(db, cache, &fake_doc_function, call_expr)?;
+            fake_doc_function = instantiate_func_generic_with_params(
+                db,
+                cache,
+                &fake_doc_function,
+                call_expr,
+                Some(&signature.generic_params),
+            )?;
         }
 
         Ok(apply_signature_return_kinds_to_function(
@@ -351,13 +360,14 @@ fn infer_signature_doc_function(
             &fake_doc_function,
         ));
 
-        resolve_signature(
+        resolve_signature_with_generic_params(
             db,
             cache,
             new_overloads,
             call_expr.clone(),
             is_generic,
             args_count,
+            Some(&signature.generic_params),
         )
     }
 }
