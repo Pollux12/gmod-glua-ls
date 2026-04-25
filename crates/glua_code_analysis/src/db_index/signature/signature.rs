@@ -356,13 +356,17 @@ impl LuaGenericParamInfo {
         name: String,
         constraint: Option<LuaType>,
         attributes: Option<Vec<LuaAttributeUse>>,
-        tpl_id: Option<GenericTplId>,
     ) -> Self {
         Self {
             name,
             constraint,
             attributes,
-            tpl_id,
+            tpl_id: None,
         }
+    }
+
+    pub fn with_tpl_id(mut self, tpl_id: Option<GenericTplId>) -> Self {
+        self.tpl_id = tpl_id;
+        self
     }
 }

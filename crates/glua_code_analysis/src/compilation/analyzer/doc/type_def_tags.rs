@@ -363,9 +363,9 @@ pub fn analyze_func_generic(analyzer: &mut DocAnalyzer, tag: LuaDocTagGeneric) -
                 type_ref.clone(),
             );
 
-            param_info.push(Arc::new(LuaGenericParamInfo::new(
-                name_text, type_ref, None, tpl_id,
-            )));
+            param_info.push(Arc::new(
+                LuaGenericParamInfo::new(name_text, type_ref, None).with_tpl_id(tpl_id),
+            ));
         }
     }
 
