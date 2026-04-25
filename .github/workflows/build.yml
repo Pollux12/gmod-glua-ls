@@ -50,7 +50,7 @@ jobs:
               - 'vendor/emmylua_codestyle/**'
               - '.github/workflows/build.yml'
 
-  # Lightweight dev builds for every push/PR — Linux x64 and Windows x64 only.
+  # Lightweight dev builds for every push/PR — Linux x64, Windows x64, and experimental macOS.
   build-dev:
     name: Dev Build (${{ matrix.platform }})
     needs: changes
@@ -61,6 +61,8 @@ jobs:
         include:
           - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu,  platform: linux-x64  }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,    platform: win32-x64  }
+          - { os: macos-13,       target: x86_64-apple-darwin,        platform: darwin-x64-experimental  }
+          - { os: macos-14,       target: aarch64-apple-darwin,       platform: darwin-arm64-experimental  }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +99,8 @@ jobs:
           path: ${{ github.workspace }}/artifact/
 
   # Full release builds — only runs on tag pushes.
-  # Produces the assets consumed by the VSCode extension (win32-x64 zip, linux glibc 2.17 tar.gz).
+  # Produces the assets consumed by the VSCode extension (win32-x64 zip, linux glibc 2.17 tar.gz)
+  # plus experimental macOS artifacts.
   build-release:
     name: Release Build (${{ matrix.platform }} / ${{ matrix.crate }})
     if: startsWith(github.ref, 'refs/tags/')
@@ -108,9 +111,14 @@ jobs:
           - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: general,  crate: glua_ls, output: glua_ls }
           - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: zigbuild, crate: glua_ls, output: glua_ls, glibc: 2.17 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   platform: win32-x64, cross: general,  crate: glua_ls, output: glua_ls }
+          - { os: macos-13,       target: x86_64-apple-darwin,       platform: darwin-x64-experimental, cross: general, crate: glua_ls, output: glua_ls }
+          - { os: macos-14,       target: aarch64-apple-darwin,      platform: darwin-arm64-experimental, cross: general, crate: glua_ls, output: glua_ls }
           - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: general,  crate: glua_check, output: glua_check }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   platform: win32-x64, cross: general,  crate: glua_check, output: glua_check }
+          - { os: macos-13,       target: x86_64-apple-darwin,       platform: darwin-x64-experimental, cross: general, crate: glua_check, output: glua_check }
+          - { os: macos-14,       target: aarch64-apple-darwin,      platform: darwin-arm64-experimental, cross: general, crate: glua_check, output: glua_check }
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ contains(matrix.platform, 'darwin') }}
     steps:
       - name: Preflight stable-release secrets
         shell: bash
@@ -287,6 +295,27 @@ jobs:
           tar -zcvf glua_ls-linux-x64.tar.gz        -C glua_ls-linux-x64        glua_ls
           tar -zcvf glua_ls-linux-x64-glibc.2.17.tar.gz -C glua_ls-linux-x64-glibc.2.17 glua_ls
           tar -zcvf glua_check-linux-x64.tar.gz     -C glua_check-linux-x64     glua_check
+      - name: Add execute permission and compress (experimental macOS)
+        run: |
+          package_macos_artifact() {
+            local artifact_dir="$1"
+            local binary_name="$2"
+            local archive_name="$3"
+            local binary_path="${artifact_dir}/${binary_name}"
+
+            if [[ ! -f "${binary_path}" ]]; then
+              echo "::warning::Skipping missing experimental macOS artifact: ${binary_path}"
+              return 0
+            fi
+
+            chmod +x "${binary_path}"
+            tar -zcvf "${archive_name}" -C "${artifact_dir}" "${binary_name}"
+          }
+
+          package_macos_artifact glua_ls-darwin-x64-experimental glua_ls glua_ls-darwin-x64-experimental.tar.gz
+          package_macos_artifact glua_ls-darwin-arm64-experimental glua_ls glua_ls-darwin-arm64-experimental.tar.gz
+          package_macos_artifact glua_check-darwin-x64-experimental glua_check glua_check-darwin-x64-experimental.tar.gz
+          package_macos_artifact glua_check-darwin-arm64-experimental glua_check glua_check-darwin-arm64-experimental.tar.gz
       - name: Compress (Windows)
         run: |
           cd glua_ls-win32-x64
@@ -346,16 +375,36 @@ jobs:
             "glua_ls-linux-x64.tar.gz"
             "glua_ls-linux-x64-glibc.2.17.tar.gz"
             "glua_check-linux-x64.tar.gz"
+            "glua_ls-darwin-x64-experimental.tar.gz"
+            "glua_ls-darwin-arm64-experimental.tar.gz"
+            "glua_check-darwin-x64-experimental.tar.gz"
+            "glua_check-darwin-arm64-experimental.tar.gz"
           )
+
+          upload_assets=()
+          for asset in "${assets[@]}"; do
+            if [[ -f "$asset" ]]; then
+              upload_assets+=("$asset")
+              continue
+            fi
+
+            if [[ "$asset" == *darwin* ]]; then
+              echo "::warning::Skipping missing experimental macOS release asset: $asset"
+              continue
+            fi
+
+            echo "Required release asset is missing: $asset" >&2
+            exit 1
+          done
 
           if draft_state="$(gh release view "$tag_ref" --repo "$repo" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
             if [ "$draft_state" = "true" ]; then
-              gh release upload "$tag_ref" --repo "$repo" "${assets[@]}" --clobber
+              gh release upload "$tag_ref" --repo "$repo" "${upload_assets[@]}" --clobber
               gh release edit "$tag_ref" --repo "$repo" --draft=false --title "$title" "${release_flags[@]}"
             else
               echo "Release '$tag_ref' already exists and is published. Immutable releases cannot be modified; publish a new tag instead." >&2
               exit 1
             fi
           else
-            gh release create "$tag_ref" --repo "$repo" "${assets[@]}" --verify-tag --title "$title" "${release_flags[@]}" --generate-notes
+            gh release create "$tag_ref" --repo "$repo" "${upload_assets[@]}" --verify-tag --title "$title" "${release_flags[@]}" --generate-notes
           fi
