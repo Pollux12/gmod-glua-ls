@@ -808,17 +808,65 @@ fn collect_infer_to_union(
     assignments: &mut HashMap<String, LuaType>,
     infer_guard: &InferGuardRef,
 ) -> bool {
+    if let LuaType::Union(source_union) = source {
+        let mut matched = false;
+        let mut union_assignments = assignments.clone();
+        for source_member in source_union.into_vec() {
+            let mut branch_assignments = union_assignments.clone();
+            if collect_infer_to_union(
+                db,
+                &source_member,
+                pattern_union,
+                &mut branch_assignments,
+                &infer_guard.fork(),
+            ) {
+                union_assignments = branch_assignments;
+                matched = true;
+            }
+        }
+
+        if matched {
+            *assignments = union_assignments;
+        }
+        return matched;
+    }
+
     let mut matched = false;
     let mut union_assignments = assignments.clone();
-    for member in pattern_union.into_vec() {
+    let mut structural_infer_names = HashSet::new();
+    let pattern_members = pattern_union.into_vec();
+
+    for member in pattern_members
+        .iter()
+        .filter(|member| !is_naked_conditional_infer(member))
+    {
         let mut branch_assignments = union_assignments.clone();
         if collect_infer_assignments_inner(
             db,
             source,
-            &member,
+            member,
             &mut branch_assignments,
             &infer_guard.fork(),
         ) {
+            collect_conditional_infer_names(member, &mut structural_infer_names);
+            union_assignments = branch_assignments;
+            matched = true;
+        }
+    }
+
+    for member in pattern_members
+        .iter()
+        .filter(|member| is_naked_conditional_infer(member))
+    {
+        let LuaType::ConditionalInfer(name) = member else {
+            continue;
+        };
+        if structural_infer_names.contains(name.as_str()) {
+            continue;
+        }
+
+        let mut branch_assignments = union_assignments.clone();
+        if insert_infer_assignment(&mut branch_assignments, name.as_str(), source) {
             union_assignments = branch_assignments;
             matched = true;
         }
@@ -828,6 +876,18 @@ fn collect_infer_to_union(
         *assignments = union_assignments;
     }
     matched
+}
+
+fn is_naked_conditional_infer(ty: &LuaType) -> bool {
+    matches!(ty, LuaType::ConditionalInfer(_))
+}
+
+fn collect_conditional_infer_names(ty: &LuaType, names: &mut HashSet<String>) {
+    ty.visit_type(&mut |inner| {
+        if let LuaType::ConditionalInfer(name) = inner {
+            names.insert(name.as_str().to_string());
+        }
+    });
 }
 
 fn collect_infer_from_generic_source(

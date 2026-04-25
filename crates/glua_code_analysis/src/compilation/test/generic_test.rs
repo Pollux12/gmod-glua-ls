@@ -703,6 +703,56 @@ mod test {
     }
 
     #[test]
+    fn test_conditional_infer_pattern_union_prefers_structural_match_over_naked_infer() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@alias Extract<T> T extends (Box<infer U>|infer U) and U or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return Extract<T>
+            function extract(value) end
+
+            ---@type Box<string>
+            local source
+
+            value = extract(source)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "string");
+    }
+
+    #[test]
+    fn test_conditional_infer_pattern_union_uses_naked_infer_for_unmatched_source_member() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@alias Extract<T> T extends (Box<infer U>|infer U) and U or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return Extract<T>
+            function extract(value) end
+
+            ---@type Box<string>|number
+            local source
+
+            value = extract(source)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(ws.humanize_type(value_ty), "(string|number)");
+    }
+
+    #[test]
     fn test_generic_identity_table_literal_still_allows_later_field_inference() {
         let mut ws = VirtualWorkspace::new();
 
