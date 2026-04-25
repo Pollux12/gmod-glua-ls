@@ -5,7 +5,7 @@ use rowan::TextRange;
 
 use super::{
     super::{InferGuard, LuaInferCache, instantiate_type_generic, resolve_signature},
-    InferFailReason, InferResult,
+    InferFailReason, InferResult, infer_bind_value_type,
 };
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
 use crate::{
@@ -839,10 +839,11 @@ fn infer_contextual_return_type(
 
 fn get_contextual_return_hint(
     db: &DbIndex,
-    cache: &LuaInferCache,
+    cache: &mut LuaInferCache,
     call_expr: &LuaCallExpr,
 ) -> Option<LuaType> {
     get_local_contextual_return_hint(db, cache, call_expr)
+        .or_else(|| infer_bind_value_type(db, cache, LuaExpr::CallExpr(call_expr.clone())))
 }
 
 fn get_local_contextual_return_hint(

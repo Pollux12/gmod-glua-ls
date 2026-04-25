@@ -235,6 +235,97 @@ mod test {
     }
 
     #[test]
+    fn test_generic_return_infers_from_assignment_doc_context() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@generic T
+            ---@return T
+            function make() end
+
+            ---@type string
+            local value
+            value = make()
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("string");
+        assert_eq!(call_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_return_infers_from_member_doc_context() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Holder
+            ---@field value string
+
+            ---@generic T
+            ---@return T
+            function make() end
+
+            ---@type Holder
+            local holder = {}
+            holder.value = make()
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("string");
+        assert_eq!(call_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_return_infers_from_table_field_doc_context() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Holder
+            ---@field value string
+
+            ---@generic T
+            ---@return T
+            function make() end
+
+            ---@type Holder
+            local holder = {
+                value = make()
+            }
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("string");
+        assert_eq!(call_ty, expected);
+    }
+
+    #[test]
     fn test_issue_646() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
