@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use super::tpl_pattern::constant_decay;
+use super::{instantiate_type::instantiate_type_generic, tpl_pattern::constant_decay};
 use crate::{
     DbIndex, GenericTplId, LuaGenericType, LuaType, LuaTypeDeclId, LuaUnionType,
     semantic::type_check::check_type_compact,
@@ -461,27 +461,138 @@ fn common_nominal_supertype(db: &DbIndex, left: &LuaType, right: &LuaType) -> Op
     let left_supers = nominal_super_types_with_self(db, left)?;
     let right_supers = nominal_super_types_with_self(db, right)?;
 
-    left_supers
-        .into_iter()
-        .find(|candidate| right_supers.contains(candidate))
+    for left_candidate in &left_supers {
+        for right_candidate in &right_supers {
+            if let Some(common) = common_generic_candidate_type(db, left_candidate, right_candidate)
+            {
+                return Some(common);
+            }
+
+            if left_candidate == right_candidate {
+                return Some(left_candidate.clone());
+            }
+        }
+    }
+
+    None
 }
 
 fn nominal_super_types_with_self(db: &DbIndex, ty: &LuaType) -> Option<Vec<LuaType>> {
+    let mut super_types = Vec::new();
+    let mut visited = HashSet::new();
+
     match ty {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => {
-            Some(type_id.collect_super_types_with_self(db, LuaType::Ref(type_id.clone())))
+            push_nominal_super_type(&mut super_types, LuaType::Ref(type_id.clone()));
+            collect_decl_super_types(db, type_id, None, &mut super_types, &mut visited);
+            Some(super_types)
         }
-        LuaType::Generic(generic) => generic_super_types_with_self(db, generic),
+        LuaType::Generic(generic) => {
+            push_nominal_super_type(&mut super_types, LuaType::Generic(generic.clone().into()));
+
+            let base_type_id = generic.get_base_type_id_ref();
+            let substitutor = TypeSubstitutor::from_type_array_for_type(
+                db,
+                base_type_id,
+                generic.get_params().clone(),
+            );
+            collect_decl_super_types(
+                db,
+                base_type_id,
+                Some(&substitutor),
+                &mut super_types,
+                &mut visited,
+            );
+            Some(super_types)
+        }
         _ => None,
     }
 }
 
-fn generic_super_types_with_self(db: &DbIndex, generic: &LuaGenericType) -> Option<Vec<LuaType>> {
-    let base_type_id = generic.get_base_type_id_ref();
-    let mut super_types =
-        base_type_id.collect_super_types_with_self(db, LuaType::Ref(base_type_id.clone()));
-    super_types.insert(0, LuaType::Generic(generic.clone().into()));
-    Some(super_types)
+fn collect_decl_super_types(
+    db: &DbIndex,
+    type_id: &LuaTypeDeclId,
+    substitutor: Option<&TypeSubstitutor>,
+    super_types: &mut Vec<LuaType>,
+    visited: &mut HashSet<LuaTypeDeclId>,
+) {
+    if !visited.insert(type_id.clone()) {
+        return;
+    }
+
+    let Some(decl_super_types) = db.get_type_index().get_super_types(type_id) else {
+        return;
+    };
+
+    for super_type in decl_super_types {
+        let instantiated_super = match substitutor {
+            Some(substitutor) => instantiate_type_generic(db, &super_type, substitutor),
+            None => super_type,
+        };
+
+        push_nominal_super_type(super_types, instantiated_super.clone());
+
+        match instantiated_super {
+            LuaType::Ref(super_type_id) | LuaType::Def(super_type_id) => {
+                collect_decl_super_types(db, &super_type_id, None, super_types, visited);
+            }
+            LuaType::Generic(generic) => {
+                let base_type_id = generic.get_base_type_id_ref();
+                let substitutor = TypeSubstitutor::from_type_array_for_type(
+                    db,
+                    base_type_id,
+                    generic.get_params().clone(),
+                );
+                collect_decl_super_types(
+                    db,
+                    base_type_id,
+                    Some(&substitutor),
+                    super_types,
+                    visited,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_nominal_super_type(super_types: &mut Vec<LuaType>, ty: LuaType) {
+    if !super_types.contains(&ty) {
+        super_types.push(ty.clone());
+    }
+
+    if let LuaType::Generic(generic) = ty {
+        let base = LuaType::Ref(generic.get_base_type_id());
+        if !super_types.contains(&base) {
+            super_types.push(base);
+        }
+    }
+}
+
+fn common_generic_candidate_type(db: &DbIndex, left: &LuaType, right: &LuaType) -> Option<LuaType> {
+    let (LuaType::Generic(left_generic), LuaType::Generic(right_generic)) = (left, right) else {
+        return None;
+    };
+
+    if left_generic.get_base_type_id_ref() != right_generic.get_base_type_id_ref() {
+        return None;
+    }
+
+    let left_params = left_generic.get_params();
+    let right_params = right_generic.get_params();
+    if left_params.len() != right_params.len() {
+        return None;
+    }
+
+    let params = left_params
+        .iter()
+        .zip(right_params.iter())
+        .map(|(left_param, right_param)| {
+            common_candidate_type(db, left_param.clone(), right_param.clone())
+        })
+        .collect();
+
+    Some(LuaGenericType::new(left_generic.get_base_type_id(), params).into())
 }
 
 fn nullable_any_type() -> LuaType {

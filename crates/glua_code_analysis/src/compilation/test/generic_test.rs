@@ -179,6 +179,34 @@ mod test {
     }
 
     #[test]
+    fn test_generic_direct_candidates_preserve_generic_common_supertype() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Box<T>
+            ---@class StringBox: Box<string>
+            ---@class NumberBox: Box<number>
+
+            ---@generic T
+            ---@param first T
+            ---@param second T
+            ---@return T
+            function choose(first, second) end
+
+            ---@type StringBox
+            local string_box
+            ---@type NumberBox
+            local number_box
+            box = choose(string_box, number_box)
+            "#,
+        );
+
+        let box_ty = ws.expr_ty("box");
+        let expected = ws.ty("Box<string|number>");
+        assert_eq!(box_ty, expected);
+    }
+
+    #[test]
     fn test_issue_646() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
