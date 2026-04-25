@@ -1395,6 +1395,83 @@ mod test {
     }
 
     #[test]
+    fn test_mapped_type_parameter_constraint_infers_value_union() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@alias ValueRecord<K extends string, V> { [P in K]: V; }
+
+            ---@generic K extends string, V
+            ---@param values ValueRecord<K, V>
+            ---@return V
+            function record_value(values) end
+
+            result = record_value({
+                name = "Ada",
+                age = 42,
+            })
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("result");
+        let value_ty = ws.humanize_type(value_ty);
+        assert!(
+            matches!(value_ty.as_str(), "(integer|string)" | "(string|integer)"),
+            "{value_ty}"
+        );
+    }
+
+    #[test]
+    fn test_mapped_type_parameter_constraint_infers_key_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@alias ValueRecord<K extends string, V> { [P in K]: V; }
+
+            ---@generic K extends string, V
+            ---@param values ValueRecord<K, V>
+            ---@return K
+            function record_key(values) end
+
+            key = record_key({
+                name = "Ada",
+            })
+            "#,
+        );
+
+        let key_ty = ws.expr_ty("key");
+        assert_eq!(ws.humanize_type(key_ty), "\"name\"");
+    }
+
+    #[test]
+    fn test_table_generic_index_infers_from_structural_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@generic V
+            ---@param values table<string, V>
+            ---@return V
+            function table_value(values) end
+
+            result = table_value({
+                name = "Ada",
+                age = 42,
+            })
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("result");
+        let value_ty = ws.humanize_type(value_ty);
+        assert!(
+            matches!(value_ty.as_str(), "(integer|string)" | "(string|integer)"),
+            "{value_ty}"
+        );
+    }
+
+    #[test]
     fn test_reverse_mapped_partial_strips_optional_from_source_field() {
         let mut ws = VirtualWorkspace::new();
 

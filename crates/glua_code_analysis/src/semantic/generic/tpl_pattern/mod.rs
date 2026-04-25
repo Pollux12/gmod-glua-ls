@@ -508,15 +508,32 @@ fn mapped_tpl_pattern_match(
     mapped: &LuaMappedType,
     target: &LuaType,
 ) -> TplPatternMatchResult {
-    let Some(source_info) = mapped_source_info(mapped) else {
+    let source_info = mapped_source_info(mapped);
+    let key_constraint_tpl_id = mapped_key_constraint_tpl_id(mapped);
+    if source_info.is_none() && key_constraint_tpl_id.is_none() {
         return Ok(());
-    };
+    }
 
     let target_fields = mapped_target_fields(context, target)?;
     if target_fields.is_empty() {
         return Ok(());
     }
 
+    if let Some(source_info) = source_info {
+        homomorphic_mapped_tpl_pattern_match(context, mapped, target_fields, source_info)?;
+    } else if let Some(key_constraint_tpl_id) = key_constraint_tpl_id {
+        constrained_mapped_tpl_pattern_match(context, mapped, target_fields, key_constraint_tpl_id)?;
+    }
+
+    Ok(())
+}
+
+fn homomorphic_mapped_tpl_pattern_match(
+    context: &mut TplContext,
+    mapped: &LuaMappedType,
+    target_fields: Vec<(LuaMemberKey, LuaType)>,
+    source_info: MappedSourceInfo,
+) -> TplPatternMatchResult {
     let mut fields = HashMap::new();
     let mut key_types = Vec::new();
     let mut saw_uninferred_field = false;
@@ -584,6 +601,57 @@ fn mapped_tpl_pattern_match(
     }
 
     Ok(())
+}
+
+fn constrained_mapped_tpl_pattern_match(
+    context: &mut TplContext,
+    mapped: &LuaMappedType,
+    target_fields: Vec<(LuaMemberKey, LuaType)>,
+    key_constraint_tpl_id: GenericTplId,
+) -> TplPatternMatchResult {
+    let mut key_types = Vec::new();
+    let mut prop_types = Vec::new();
+    for (member_key, target_type) in target_fields {
+        if let Some(key_type) = member_key_to_key_type(&member_key) {
+            key_types.push(key_type);
+        }
+
+        let target_type = reverse_mapped_source_field_type(context, mapped, target_type);
+        if target_type != LuaType::Never {
+            prop_types.push(mapped_inference_value_type(target_type));
+        }
+    }
+
+    if !key_types.is_empty() {
+        let key_type = LuaType::from_vec(key_types);
+        context.with_inference_priority(InferencePriority::MappedTypeConstraint, true, |context| {
+            context
+                .substitutor
+                .insert_type(key_constraint_tpl_id, key_type, false);
+        });
+    }
+
+    if !prop_types.is_empty() {
+        let prop_type = LuaType::from_vec(prop_types);
+        context.with_inference_priority(InferencePriority::Direct, true, |context| {
+            tpl_pattern_match(context, &mapped.value, &prop_type)
+        })?;
+    }
+
+    Ok(())
+}
+
+fn mapped_inference_value_type(ty: LuaType) -> LuaType {
+    match ty {
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .into_vec()
+                .into_iter()
+                .map(constant_decay)
+                .collect(),
+        ),
+        _ => constant_decay(ty),
+    }
 }
 
 fn reverse_mapped_source_field_type(
@@ -662,6 +730,11 @@ struct MappedSourceInfo {
 fn mapped_source_info(mapped: &LuaMappedType) -> Option<MappedSourceInfo> {
     let constraint = mapped.param.1.type_constraint.as_ref()?;
     mapped_source_info_from_constraint(constraint, 0)
+}
+
+fn mapped_key_constraint_tpl_id(mapped: &LuaMappedType) -> Option<GenericTplId> {
+    let constraint = mapped.param.1.type_constraint.as_ref()?;
+    tpl_id_from_type(constraint)
 }
 
 fn mapped_source_info_from_constraint(
@@ -1174,11 +1247,11 @@ fn table_generic_tpl_pattern_match(
                     }
                     _ => {}
                 };
-                values.push(v.clone());
+                values.push(mapped_inference_value_type(v.clone()));
             }
             for (k, v) in obj.get_index_access() {
                 keys.push(k.clone());
-                values.push(v.clone());
+                values.push(mapped_inference_value_type(v.clone()));
             }
 
             let key_type = LuaType::Union(LuaUnionType::from_vec(keys).into());
@@ -1243,7 +1316,7 @@ fn table_generic_tpl_pattern_member_owner_match(
         };
 
         if !target_key_type.is_generic()
-            && check_type_compact(context.db, &target_key_type, &key_type).is_err()
+            && !is_table_generic_key_match(context.db, &target_key_type, &key_type)
         {
             continue;
         }
@@ -1262,7 +1335,7 @@ fn table_generic_tpl_pattern_member_owner_match(
             }
         };
 
-        values.push(resolve_type);
+        values.push(mapped_inference_value_type(resolve_type));
     }
 
     if keys.is_empty() {
@@ -1277,9 +1350,9 @@ fn table_generic_tpl_pattern_member_owner_match(
                     LuaMemberKey::ExprType(typ) => typ.clone(),
                     _ => return,
                 };
-                if check_type_compact(context.db, &target_key_type, &key_type).is_ok() {
+                if is_table_generic_key_match(context.db, &target_key_type, &key_type) {
                     keys.push(key_type);
-                    values.push(m.typ.clone());
+                    values.push(mapped_inference_value_type(m.typ.clone()));
                 }
             });
     }
@@ -1298,6 +1371,10 @@ fn table_generic_tpl_pattern_member_owner_match(
     tpl_pattern_match(context, &table_generic_params[1], &value_type)?;
 
     Ok(())
+}
+
+fn is_table_generic_key_match(db: &DbIndex, target_key_type: &LuaType, key_type: &LuaType) -> bool {
+    check_type_compact(db, key_type, target_key_type).is_ok()
 }
 
 fn union_tpl_pattern_match(

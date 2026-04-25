@@ -156,7 +156,10 @@ fn infer_generic_types_from_call(
     }
 
     let mut unresolve_tpls = vec![];
-    let use_inline_table_object = type_needs_structural_table_arg(db, func.get_ret(), 0);
+    let use_inline_table_object = type_needs_structural_table_arg(db, func.get_ret(), 0)
+        || func_params
+            .iter()
+            .any(|(_, ty)| type_needs_structural_table_arg(db, ty, 0));
     for i in 0..func_params.len() {
         if i >= arg_exprs.len() {
             break;
@@ -302,7 +305,10 @@ fn type_needs_structural_table_arg(db: &DbIndex, typ: &LuaType, depth: usize) ->
         }
 
         match visited {
-            LuaType::Mapped(_) | LuaType::Conditional(_) | LuaType::Call(_) => {
+            LuaType::Mapped(_)
+            | LuaType::TableGeneric(_)
+            | LuaType::Conditional(_)
+            | LuaType::Call(_) => {
                 needs_structural_table_arg = true;
             }
             LuaType::Generic(generic) => {
