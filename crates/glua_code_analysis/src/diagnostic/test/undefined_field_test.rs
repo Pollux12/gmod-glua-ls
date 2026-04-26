@@ -1028,6 +1028,147 @@ mod test {
     }
 
     #[test]
+    fn test_boolean_equality_context_for_custom_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class Params
+                Params = {}
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type Params
+                local params
+                local is_front = params.isFrontWheel == true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_equality_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_front = params.isFrontWheel == true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_inequality_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_not_front = params.isFrontWheel ~= true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_and_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_front = params.isFrontWheel and true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_or_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_front = params.isFrontWheel or false
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_not_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_not_front = not params.isFrontWheel
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_equality_context_for_string_keyed_generic_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type table<string, boolean>
+                local params = {}
+                local is_front = params.isFrontWheel == true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_direct_dot_access_for_string_keyed_generic_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type table<string, boolean>
+                local params = {}
+                local is_front = params.isFrontWheel
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_direct_dot_access_for_integer_keyed_generic_table_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type table<integer, boolean>
+                local params = {}
+                local is_front = params.isFrontWheel
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_equality_context_for_integer_keyed_generic_table_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type table<integer, boolean>
+                local params = {}
+                local is_front = params.isFrontWheel == true
+            "#
+        ));
+    }
+
+    #[test]
     fn test_nil_safe_equality_does_not_suppress_member_calls() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
