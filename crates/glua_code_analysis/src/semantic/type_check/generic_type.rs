@@ -1,13 +1,15 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    LuaGenericType, LuaMemberOwner, LuaType, LuaTypeCache, LuaTypeDeclId, RenderLevel,
-    TypeSubstitutor, humanize_type, instantiate_type_generic,
-    semantic::{member::find_members, type_check::type_check_context::TypeCheckContext},
+    LuaGenericType, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeCache,
+    LuaTypeDeclId, RenderLevel, TypeSubstitutor, humanize_type, instantiate_type_generic,
+    semantic::{
+        LuaMemberInfo, member::find_members, type_check::type_check_context::TypeCheckContext,
+    },
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_required_structural_member,
+    TypeCheckResult, check_general_type_compact, is_required_structural_property,
     type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
 };
 
@@ -162,14 +164,14 @@ fn check_generic_type_compact_table(
     // 提前计算下一级检查守卫
     let next_guard = check_guard.next_level()?;
 
-    for source_member in source_type_members {
-        if !is_required_structural_member(source_member.feature) {
+    for source_member in &source_type_members {
+        if !is_required_structural_property(source_member.feature, &source_member.key) {
             continue;
         }
-        let source_member_type = source_member.typ;
-        let key = source_member.key;
+        let source_member_type = &source_member.typ;
+        let key = &source_member.key;
 
-        match table_member_map.get(&key) {
+        match table_member_map.get(key) {
             Some(table_member_id) => {
                 let table_member = member_index
                     .get_member(table_member_id)
@@ -183,7 +185,7 @@ fn check_generic_type_compact_table(
 
                 if let Err(err) = check_general_type_compact(
                     context,
-                    &source_member_type,
+                    source_member_type,
                     table_member_type,
                     next_guard,
                 ) && err.is_type_not_match()
@@ -196,7 +198,7 @@ fn check_generic_type_compact_table(
                             "member %{name} type not match, expect %{expect}, got %{got}",
                             name = key.to_path(),
                             expect =
-                                humanize_type(context.db, &source_member_type, RenderLevel::Simple),
+                                humanize_type(context.db, source_member_type, RenderLevel::Simple),
                             got = humanize_type(context.db, table_member_type, RenderLevel::Simple)
                         )
                         .to_string(),
@@ -216,6 +218,13 @@ fn check_generic_type_compact_table(
         }
     }
 
+    check_generic_index_members_against_table(
+        context,
+        &source_type_members,
+        &table_member_map,
+        next_guard,
+    )?;
+
     // 检查超类型
     let source_base_id = source_generic.get_base_type_id();
     if let Some(supers) = context.db.get_type_index().get_super_types(&source_base_id) {
@@ -227,6 +236,113 @@ fn check_generic_type_compact_table(
         for super_type in supers {
             check_general_type_compact(context, &super_type, &table_type, next_guard)?;
         }
+    }
+
+    Ok(())
+}
+
+fn check_generic_index_members_against_table(
+    context: &mut TypeCheckContext,
+    source_type_members: &[LuaMemberInfo],
+    table_member_map: &HashMap<LuaMemberKey, LuaMemberId>,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    let member_index = context.db.get_member_index();
+
+    for (table_key, table_member_id) in table_member_map {
+        let Some(table_key_type) = member_key_type_for_index(table_key) else {
+            continue;
+        };
+
+        for source_member in source_type_members {
+            let LuaMemberKey::ExprType(index_key_type) = &source_member.key else {
+                continue;
+            };
+
+            if !index_key_matches(context, index_key_type, &table_key_type, check_guard)? {
+                continue;
+            }
+
+            let table_member = member_index
+                .get_member(table_member_id)
+                .ok_or(TypeCheckFailReason::TypeNotMatch)?;
+            let table_member_type = context
+                .db
+                .get_type_index()
+                .get_type_cache(&table_member.get_id().into())
+                .unwrap_or(&LuaTypeCache::InferType(LuaType::Any))
+                .as_type();
+
+            check_index_member_value(
+                context,
+                table_key,
+                &source_member.typ,
+                table_member_type,
+                check_guard,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {
+    match member_key {
+        LuaMemberKey::Integer(i) => Some(LuaType::IntegerConst(*i)),
+        LuaMemberKey::Name(name) => Some(LuaType::StringConst(name.clone().into())),
+        LuaMemberKey::ExprType(typ) => Some(typ.clone()),
+        LuaMemberKey::None => None,
+    }
+}
+
+fn index_key_matches(
+    context: &mut TypeCheckContext,
+    index_key_type: &LuaType,
+    actual_key_type: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> Result<bool, TypeCheckFailReason> {
+    match check_general_type_compact(
+        context,
+        index_key_type,
+        actual_key_type,
+        check_guard.next_level()?,
+    ) {
+        Ok(_) => Ok(true),
+        Err(err) if err.is_type_not_match() => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn check_index_member_value(
+    context: &mut TypeCheckContext,
+    key: &LuaMemberKey,
+    source_member_type: &LuaType,
+    actual_member_type: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    if let Err(err) = check_general_type_compact(
+        context,
+        source_member_type,
+        actual_member_type,
+        check_guard.next_level()?,
+    ) {
+        if !err.is_type_not_match() {
+            return Err(err);
+        }
+
+        if !context.detail {
+            return Err(TypeCheckFailReason::TypeNotMatch);
+        }
+
+        return Err(TypeCheckFailReason::TypeNotMatchWithReason(
+            t!(
+                "member %{name} type not match, expect %{expect}, got %{got}",
+                name = key.to_path(),
+                expect = humanize_type(context.db, source_member_type, RenderLevel::Simple),
+                got = humanize_type(context.db, actual_member_type, RenderLevel::Simple)
+            )
+            .to_string(),
+        ));
     }
 
     Ok(())

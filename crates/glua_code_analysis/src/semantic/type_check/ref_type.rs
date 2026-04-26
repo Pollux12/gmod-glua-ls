@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::{
-    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, RenderLevel, humanize_type,
+    LuaMember, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType,
+    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, RenderLevel, humanize_type,
     semantic::{
         LuaMemberInfo,
         member::find_members,
@@ -13,7 +13,7 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_required_structural_member, is_sub_type_of,
+    TypeCheckResult, check_general_type_compact, is_required_structural_property, is_sub_type_of,
     sub_type::get_base_type_id, type_check_fail_reason::TypeCheckFailReason,
     type_check_guard::TypeCheckGuard,
 };
@@ -271,7 +271,10 @@ fn check_ref_type_compact_table(
 
     for source_member in &source_type_members {
         let source_member = *source_member;
-        if !is_required_structural_member(Some(source_member.get_feature())) {
+        if !is_required_structural_property(
+            Some(source_member.get_feature()),
+            source_member.get_key(),
+        ) {
             continue;
         }
         let source_member_type = context
@@ -335,6 +338,13 @@ fn check_ref_type_compact_table(
 
         context.mark_key_checked(key.clone());
     }
+
+    check_ref_index_members_against_table(
+        context,
+        &source_type_members,
+        &table_member_map,
+        check_guard,
+    )?;
 
     // 检查超类型
     if let Some(supers) = context.db.get_type_index().get_super_types(source_type_id) {
@@ -434,6 +444,58 @@ fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {
     }
 }
 
+fn check_ref_index_members_against_table(
+    context: &mut TypeCheckContext,
+    source_type_members: &[&LuaMember],
+    table_member_map: &HashMap<LuaMemberKey, LuaMemberId>,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    let member_index = context.db.get_member_index();
+
+    for (table_key, table_member_id) in table_member_map {
+        let Some(table_key_type) = member_key_type_for_index(table_key) else {
+            continue;
+        };
+
+        for source_member in source_type_members {
+            let LuaMemberKey::ExprType(index_key_type) = source_member.get_key() else {
+                continue;
+            };
+
+            if !index_key_matches(context, index_key_type, &table_key_type, check_guard)? {
+                continue;
+            }
+
+            let source_member_type = context
+                .db
+                .get_type_index()
+                .get_type_cache(&source_member.get_id().into())
+                .unwrap_or(&LuaTypeCache::InferType(LuaType::Any))
+                .as_type();
+            let table_member = member_index
+                .get_member(table_member_id)
+                .ok_or(TypeCheckFailReason::TypeNotMatch)?;
+            let table_member_type = context
+                .db
+                .get_type_index()
+                .get_type_cache(&table_member.get_id().into())
+                .unwrap_or(&LuaTypeCache::InferType(LuaType::Any))
+                .as_type();
+
+            check_index_member_value(
+                context,
+                table_key,
+                None,
+                source_member_type,
+                table_member_type,
+                check_guard,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 fn check_ref_type_compact_object(
     context: &mut TypeCheckContext,
     object_type: &LuaObjectType,
@@ -446,21 +508,21 @@ fn check_ref_type_compact_object(
         return Ok(());
     };
 
-    for source_member in source_type_members {
-        if !is_required_structural_member(source_member.feature) {
+    for source_member in &source_type_members {
+        if !is_required_structural_property(source_member.feature, &source_member.key) {
             continue;
         }
-        let source_member_type = source_member.typ;
-        let key = source_member.key;
-        if context.is_key_checked(&key) {
+        let source_member_type = &source_member.typ;
+        let key = &source_member.key;
+        if context.is_key_checked(key) {
             continue;
         }
 
-        match get_object_field_type(object_type, &key) {
+        match get_object_field_type(object_type, key) {
             Some(field_type) => {
                 if let Err(err) = check_general_type_compact(
                     context,
-                    &source_member_type,
+                    source_member_type,
                     field_type,
                     check_guard.next_level()?,
                 ) && err.is_type_not_match()
@@ -474,7 +536,7 @@ fn check_ref_type_compact_object(
                             "member %{name} type not match, expect %{expect}, got %{got}",
                             name = key.to_path(),
                             expect =
-                                humanize_type(context.db, &source_member_type, RenderLevel::Simple),
+                                humanize_type(context.db, source_member_type, RenderLevel::Simple),
                             got = humanize_type(context.db, field_type, RenderLevel::Simple)
                         )
                         .to_string(),
@@ -492,8 +554,15 @@ fn check_ref_type_compact_object(
             _ => {} // Optional member not found, continue
         }
 
-        context.mark_key_checked(key);
+        context.mark_key_checked(key.clone());
     }
+
+    check_ref_index_members_against_object(
+        context,
+        &source_type_members,
+        object_type,
+        check_guard,
+    )?;
 
     if !context.skip_excess_property_checks
         && ref_requires_excess_property_checks(context, source_type_id)
@@ -534,6 +603,123 @@ fn check_ref_type_compact_object(
     Ok(())
 }
 
+fn check_ref_index_members_against_object(
+    context: &mut TypeCheckContext,
+    source_type_members: &[LuaMemberInfo],
+    object_type: &LuaObjectType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    for (actual_key, actual_type) in object_type.get_fields() {
+        let Some(actual_key_type) = member_key_type_for_index(actual_key) else {
+            continue;
+        };
+
+        for source_member in source_type_members {
+            let LuaMemberKey::ExprType(index_key_type) = &source_member.key else {
+                continue;
+            };
+
+            if !index_key_matches(context, index_key_type, &actual_key_type, check_guard)? {
+                continue;
+            }
+
+            check_index_member_value(
+                context,
+                actual_key,
+                None,
+                &source_member.typ,
+                actual_type,
+                check_guard,
+            )?;
+        }
+    }
+
+    for (actual_key_type, actual_type) in object_type.get_index_access() {
+        for source_member in source_type_members {
+            let LuaMemberKey::ExprType(index_key_type) = &source_member.key else {
+                continue;
+            };
+
+            if !index_key_matches(context, index_key_type, actual_key_type, check_guard)? {
+                continue;
+            }
+
+            let display_key = LuaMemberKey::ExprType(actual_key_type.clone());
+            check_index_member_value(
+                context,
+                &display_key,
+                Some(actual_key_type),
+                &source_member.typ,
+                actual_type,
+                check_guard,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn index_key_matches(
+    context: &mut TypeCheckContext,
+    index_key_type: &LuaType,
+    actual_key_type: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> Result<bool, TypeCheckFailReason> {
+    match check_general_type_compact(
+        context,
+        index_key_type,
+        actual_key_type,
+        check_guard.next_level()?,
+    ) {
+        Ok(_) => Ok(true),
+        Err(err) if err.is_type_not_match() => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn check_index_member_value(
+    context: &mut TypeCheckContext,
+    key: &LuaMemberKey,
+    key_type_for_display: Option<&LuaType>,
+    source_member_type: &LuaType,
+    actual_member_type: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    if let Err(err) = check_general_type_compact(
+        context,
+        source_member_type,
+        actual_member_type,
+        check_guard.next_level()?,
+    ) {
+        if !err.is_type_not_match() {
+            return Err(err);
+        }
+
+        if !context.detail {
+            return Err(TypeCheckFailReason::TypeNotMatch);
+        }
+
+        let mut key_display = key.to_path();
+        if key_display.is_empty()
+            && let Some(key_type_for_display) = key_type_for_display
+        {
+            key_display = humanize_type(context.db, key_type_for_display, RenderLevel::Simple);
+        }
+
+        return Err(TypeCheckFailReason::TypeNotMatchWithReason(
+            t!(
+                "member %{name} type not match, expect %{expect}, got %{got}",
+                name = key_display,
+                expect = humanize_type(context.db, source_member_type, RenderLevel::Simple),
+                got = humanize_type(context.db, actual_member_type, RenderLevel::Simple)
+            )
+            .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn member_key_accepted_by_index(
     context: &mut TypeCheckContext,
     source_members: &[LuaMemberInfo],
@@ -548,15 +734,8 @@ fn member_key_accepted_by_index(
         let LuaMemberKey::ExprType(index_key_type) = &source_member.key else {
             continue;
         };
-        match check_general_type_compact(
-            context,
-            index_key_type,
-            &table_key_type,
-            check_guard.next_level()?,
-        ) {
-            Ok(_) => return Ok(true),
-            Err(err) if err.is_type_not_match() => {}
-            Err(err) => return Err(err),
+        if index_key_matches(context, index_key_type, &table_key_type, check_guard)? {
+            return Ok(true);
         }
     }
 

@@ -21,7 +21,7 @@ pub use type_check_fail_reason::TypeCheckFailReason;
 use type_check_guard::TypeCheckGuard;
 
 use crate::{
-    LuaMemberFeature, LuaUnionType,
+    LuaMemberFeature, LuaMemberKey, LuaUnionType,
     db_index::{DbIndex, LuaType},
     semantic::type_check::type_check_context::TypeCheckContext,
 };
@@ -34,6 +34,13 @@ fn is_required_structural_member(feature: Option<LuaMemberFeature>) -> bool {
         feature,
         Some(LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl)
     )
+}
+
+fn is_required_structural_property(feature: Option<LuaMemberFeature>, key: &LuaMemberKey) -> bool {
+    // TS keeps index signatures out of the required property list. Our computed
+    // member keys play the same role in relation checks: they accept matching
+    // source keys, but are not standalone required fields.
+    is_required_structural_member(feature) && !matches!(key, LuaMemberKey::ExprType(_))
 }
 
 pub fn check_type_compact(

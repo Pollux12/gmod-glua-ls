@@ -2383,6 +2383,49 @@ mod test {
     }
 
     #[test]
+    fn test_exact_class_dynamic_key_member_is_not_required_for_fresh_table_param() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@alias DisplayMode
+            ---| "compact"
+            ---| "expanded"
+
+            ---@class (exact) RenderOptions
+            ---@field size? integer
+            ---@field weight? number
+            ---@field mode? DisplayMode
+
+            ---@param baseOptions RenderOptions?
+            ---@return RenderOptions
+            local function copyOptions(baseOptions)
+                ---@type RenderOptions
+                local options = {}
+
+                if baseOptions ~= nil then
+                    for key, value in pairs(baseOptions) do
+                        options[key] = value
+                    end
+                end
+
+                return options
+            end
+
+            ---@param options? RenderOptions
+            local function render(options) end
+
+            render({
+                mode = "expanded",
+                size = 1,
+                weight = 0,
+            })
+        "#
+        ));
+    }
+
+    #[test]
     fn test_structural_object_param_rejects_extra_fresh_table_fields() {
         let mut ws = VirtualWorkspace::new();
 

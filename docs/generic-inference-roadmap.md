@@ -38,15 +38,6 @@ Implemented behavior:
 - Same-list generic constraints now see later params, e.g. `T: U, U`.
 - Inline comments now mark the TS-Go-inspired inference rules without copying TS-Go comments verbatim.
 
-Last full generic verification:
-
-```bash
-cargo test -q -p glua_code_analysis
-# 1438 passed after 0dd5e96c
-```
-
-`1691d06b` was comment-only after that.
-
 ## Architecture State
 
 Current architecture is intentionally TS-inspired, not a full TS engine port.
@@ -88,9 +79,13 @@ Current side step:
 - Anonymous structural object targets and `(exact)` class targets keep fresh literal excess checks.
 - Non-fresh expressions use a no-excess relation path.
 - Superclass checks do not treat derived-class fields as excess.
-- `/workspaces/gmod/garrysmod` returned to the old 200-diagnostic local baseline.
+- Computed/index-like members now follow the TS split more closely:
+  - `LuaMemberKey::ExprType` is not treated as a required property;
+  - matching actual keys and index signatures are still checked against its value type;
+  - this mirrors the TS-Go separation between normal properties and `IndexInfo`.
+- Current workspace `glua_check` on `/workspaces/gmod/garrysmod` no longer reports the options `param-type-mismatch` false positive; the current local result is 4 warnings and 200 hints.
 
-Later: relation-engine work should become a separate refactor with a real freshness model, not part of the first generic inference phase.
+Later: relation-engine work should become a separate refactor with a real freshness/index-info model, not part of the first generic inference phase.
 
 ## Next Generic Work
 
@@ -112,6 +107,7 @@ Reason:
 
 - Generic inference is now mostly TS-like for current Lua needs.
 - Remaining warnings/regressions are more likely relation/assignability/freshness issues than generic inference issues.
+- The recent computed/index-like member fix is intentionally scoped; a cleaner long-term design would model TS-like index signatures explicitly instead of letting them live as ordinary members.
 - TS-like generic behavior will be easier to trust once assignability and excess/freshness behavior is more principled.
 
 Alternative next stage: audit `/workspaces/gmod/garrysmod` on the current checker and classify any new diagnostics against the new generic/relation behavior.
