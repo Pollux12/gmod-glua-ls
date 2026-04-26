@@ -254,6 +254,8 @@ impl InferenceContext {
             };
             (kind, tpl_id.get_idx())
         });
+        let inference_snapshot = self.type_inferences.clone();
+        let constraint_snapshot = self.type_constraints.clone();
         for tpl_id in tpl_ids {
             let constraint = self
                 .type_constraints
@@ -262,7 +264,13 @@ impl InferenceContext {
             let Some(inference) = self.type_inferences.get_mut(&tpl_id) else {
                 continue;
             };
-            inference.normalize_with_common_supertype(db, constraint.as_ref());
+            inference.normalize_with_common_supertype(
+                db,
+                tpl_id,
+                constraint.as_ref(),
+                &inference_snapshot,
+                &constraint_snapshot,
+            );
             if let Some(inferred) = inference.inferred() {
                 self.substitutor
                     .set_inferred_type_value(tpl_id, inferred.clone());
@@ -328,21 +336,38 @@ impl TypeInferenceInfo {
         candidates.push(candidate);
     }
 
-    fn normalize_with_common_supertype(&mut self, db: &DbIndex, constraint: Option<&LuaType>) {
-        self.inferred = self.infer_candidate(db, constraint);
+    fn normalize_with_common_supertype(
+        &mut self,
+        db: &DbIndex,
+        tpl_id: GenericTplId,
+        constraint: Option<&LuaType>,
+        all_inferences: &HashMap<GenericTplId, TypeInferenceInfo>,
+        all_constraints: &HashMap<GenericTplId, LuaType>,
+    ) {
+        self.inferred =
+            self.infer_candidate(db, tpl_id, constraint, all_inferences, all_constraints);
     }
 
     fn infer_candidate(
         &self,
         db: &DbIndex,
+        tpl_id: GenericTplId,
         constraint: Option<&LuaType>,
+        all_inferences: &HashMap<GenericTplId, TypeInferenceInfo>,
+        all_constraints: &HashMap<GenericTplId, LuaType>,
     ) -> Option<SubstitutorTypeValue> {
         let covariant = self.infer_covariant_candidate(db);
         let contravariant = self.infer_contravariant_candidate(db);
 
         let (preferred, fallback) = match (covariant, contravariant) {
             (Some(covariant), Some(contravariant)) => {
-                if self.prefer_covariant_candidate(db, &covariant) {
+                if self.prefer_covariant_candidate(
+                    db,
+                    tpl_id,
+                    &covariant,
+                    all_inferences,
+                    all_constraints,
+                ) {
                     (Some(covariant), Some(contravariant))
                 } else {
                     (Some(contravariant), Some(covariant))
@@ -396,14 +421,30 @@ impl TypeInferenceInfo {
         Some(inferred)
     }
 
-    fn prefer_covariant_candidate(&self, db: &DbIndex, covariant: &SubstitutorTypeValue) -> bool {
+    fn prefer_covariant_candidate(
+        &self,
+        db: &DbIndex,
+        tpl_id: GenericTplId,
+        covariant: &SubstitutorTypeValue,
+        all_inferences: &HashMap<GenericTplId, TypeInferenceInfo>,
+        all_constraints: &HashMap<GenericTplId, LuaType>,
+    ) -> bool {
         if matches!(covariant.default(), LuaType::Any | LuaType::Never) {
             return false;
         }
 
-        self.contra_candidates
+        let assignable_to_contra = self
+            .contra_candidates
             .iter()
-            .any(|candidate| candidate_assignable_to(db, covariant.default(), candidate.default()))
+            .any(|candidate| candidate_assignable_to(db, covariant.default(), candidate.default()));
+        assignable_to_contra
+            && dependent_constraint_candidates_accept_covariant(
+                db,
+                tpl_id,
+                covariant,
+                all_inferences,
+                all_constraints,
+            )
     }
 
     fn apply_constraint(
@@ -417,10 +458,15 @@ impl TypeInferenceInfo {
             return preferred;
         };
 
-        if let Some(candidate) = preferred
-            && candidate_satisfies_constraint(db, &candidate, constraint)
-        {
-            return Some(candidate);
+        if let Some(candidate) = preferred {
+            if candidate_satisfies_constraint(db, &candidate, constraint) {
+                return Some(candidate);
+            }
+            if self.priority() == InferencePriority::ContextualReturn
+                && let Some(filtered) = filter_candidate_by_constraint(db, &candidate, constraint)
+            {
+                return Some(filtered);
+            }
         }
 
         if let Some(candidate) = fallback
@@ -448,6 +494,76 @@ fn candidate_satisfies_constraint(
 ) -> bool {
     candidate_type_satisfies_constraint(db, candidate.raw(), constraint)
         || candidate_type_satisfies_constraint(db, candidate.default(), constraint)
+}
+
+fn filter_candidate_by_constraint(
+    db: &DbIndex,
+    candidate: &SubstitutorTypeValue,
+    constraint: &LuaType,
+) -> Option<SubstitutorTypeValue> {
+    let raw = filter_type_by_constraint(db, candidate.raw(), constraint)?;
+    let default = filter_type_by_constraint(db, candidate.default(), constraint)
+        .unwrap_or_else(|| raw.clone());
+    Some(SubstitutorTypeValue::with_raw_default(raw, default))
+}
+
+fn filter_type_by_constraint(
+    db: &DbIndex,
+    candidate: &LuaType,
+    constraint: &LuaType,
+) -> Option<LuaType> {
+    if candidate_type_satisfies_constraint(db, candidate, constraint) {
+        return Some(candidate.clone());
+    }
+
+    match candidate {
+        LuaType::Union(union) => {
+            let filtered = union
+                .into_vec()
+                .into_iter()
+                .filter(|member| candidate_type_satisfies_constraint(db, member, constraint))
+                .collect::<Vec<_>>();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(LuaType::from_vec(filtered))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn dependent_constraint_candidates_accept_covariant(
+    db: &DbIndex,
+    tpl_id: GenericTplId,
+    covariant: &SubstitutorTypeValue,
+    all_inferences: &HashMap<GenericTplId, TypeInferenceInfo>,
+    all_constraints: &HashMap<GenericTplId, LuaType>,
+) -> bool {
+    all_inferences.iter().all(|(other_tpl_id, inference)| {
+        if *other_tpl_id == tpl_id {
+            return true;
+        }
+
+        let Some(constraint) = all_constraints.get(other_tpl_id) else {
+            return true;
+        };
+        if !constraint_is_direct_tpl_ref(constraint, tpl_id) {
+            return true;
+        }
+
+        inference
+            .candidates
+            .iter()
+            .all(|candidate| candidate_satisfies_constraint(db, candidate, covariant.default()))
+    })
+}
+
+fn constraint_is_direct_tpl_ref(constraint: &LuaType, tpl_id: GenericTplId) -> bool {
+    match constraint {
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => tpl.get_tpl_id() == tpl_id,
+        _ => false,
+    }
 }
 
 fn candidate_type_satisfies_constraint(

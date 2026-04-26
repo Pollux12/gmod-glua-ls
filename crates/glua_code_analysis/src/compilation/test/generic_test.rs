@@ -440,6 +440,40 @@ mod test {
     }
 
     #[test]
+    fn test_generic_mixed_candidates_use_contra_when_dependent_constraint_conflicts() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+            ---@class Cat: Animal
+
+            ---@generic T, U: T
+            ---@param value T
+            ---@param callback fun(value: T)
+            ---@param other U
+            ---@return T
+            function use_related(value, callback, other) end
+
+            ---@type Dog
+            local dog
+
+            ---@param value Animal
+            local function accepts_animal(value) end
+
+            ---@type Cat
+            local cat
+
+            result = use_related(dog, accepts_animal, cat)
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        let expected = ws.ty("Animal");
+        assert_eq!(result_ty, expected);
+    }
+
+    #[test]
     fn test_generic_return_infers_from_local_doc_context() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
@@ -826,6 +860,33 @@ mod test {
 
             ---@type integer
             local value = make_string()
+            "#,
+        );
+
+        let call_expr = ws.get_node::<LuaCallExpr>(file_id);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let call_ty = semantic_model
+            .infer_expr(LuaExpr::CallExpr(call_expr))
+            .expect("Call type must resolve");
+        let expected = ws.ty("string");
+        assert_eq!(call_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_return_context_filters_union_by_type_constraint() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@generic T: string|number
+            ---@return T
+            function make_value() end
+
+            ---@type string|boolean
+            local value = make_value()
             "#,
         );
 

@@ -237,6 +237,13 @@ impl SubstitutorTypeValue {
         Self { raw, default }
     }
 
+    pub(super) fn with_raw_default(raw: LuaType, default: LuaType) -> Self {
+        Self {
+            raw: into_ref_type(raw),
+            default: into_ref_type(default),
+        }
+    }
+
     pub fn raw(&self) -> &LuaType {
         &self.raw
     }
