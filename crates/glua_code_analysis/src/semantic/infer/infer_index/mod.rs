@@ -278,7 +278,11 @@ fn infer_table_member(
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
-        return member_item.resolve_type_with_realm(db, &cache.get_file_id());
+        return member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            index_expr.get_position(),
+        );
     }
 
     match infer_owner_raw_member_type_with_realm(
@@ -301,17 +305,27 @@ fn is_doc_tag_table_const(db: &DbIndex, inst: &InFiled<TextRange>) -> bool {
         return false;
     };
 
-    root.get_chunk_node()
-        .descendants::<LuaDocType>()
-        .any(|doc_type| {
-            doc_type.get_range() == inst.value
-                && doc_type.syntax().parent().is_some_and(|parent| {
-                    matches!(
-                        parent.kind().into(),
-                        LuaSyntaxKind::DocTagAs | LuaSyntaxKind::DocTagType
-                    )
-                })
-        })
+    let range = inst.value;
+    let mut node = match root.get_red_root().covering_element(range) {
+        rowan::NodeOrToken::Node(node) => Some(node),
+        rowan::NodeOrToken::Token(token) => token.parent(),
+    };
+
+    while let Some(current) = node {
+        if !current.text_range().contains_range(range) {
+            return false;
+        }
+        if current.text_range() == range && LuaDocType::can_cast(current.kind().into()) {
+            return current.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind().into(),
+                    LuaSyntaxKind::DocTagAs | LuaSyntaxKind::DocTagType
+                )
+            });
+        }
+        node = current.parent();
+    }
+    false
 }
 
 fn nullable_any_type() -> LuaType {

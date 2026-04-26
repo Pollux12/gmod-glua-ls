@@ -531,16 +531,29 @@ fn is_doc_tag_table_const(
         return false;
     };
 
-    root.descendants::<glua_parser::LuaDocType>()
-        .any(|doc_type| {
-            doc_type.get_range() == id.value
-                && doc_type.syntax().parent().is_some_and(|parent| {
-                    matches!(
-                        parent.kind().into(),
-                        LuaSyntaxKind::DocTagAs | LuaSyntaxKind::DocTagType
-                    )
-                })
-        })
+    let range = id.value;
+    let mut node = match root.syntax().covering_element(range) {
+        rowan::NodeOrToken::Node(node) => Some(node),
+        rowan::NodeOrToken::Token(token) => token.parent(),
+    };
+
+    while let Some(current) = node {
+        if !current.text_range().contains_range(range) {
+            return false;
+        }
+        if current.text_range() == range
+            && glua_parser::LuaDocType::can_cast(current.kind().into())
+        {
+            return current.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind().into(),
+                    LuaSyntaxKind::DocTagAs | LuaSyntaxKind::DocTagType
+                )
+            });
+        }
+        node = current.parent();
+    }
+    false
 }
 
 /// 检查枚举类型的自引用

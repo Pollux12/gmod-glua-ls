@@ -2,7 +2,7 @@ use glua_parser::{
     BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexExpr,
 };
 
-use crate::{DiagnosticCode, LuaType, SemanticModel};
+use crate::{DiagnosticCode, LuaType, LuaUnionType, SemanticModel};
 
 use super::{Checker, DiagnosticContext};
 
@@ -108,10 +108,7 @@ fn is_opaque_nullable_any(ty: &LuaType) -> bool {
         return false;
     };
 
-    let members = union.into_vec();
-    members.len() == 2
-        && members.iter().any(|member| matches!(member, LuaType::Any))
-        && members.iter().any(|member| matches!(member, LuaType::Nil))
+    matches!(union.as_ref(), LuaUnionType::Nullable(LuaType::Any))
 }
 
 fn check_binary_expr(
