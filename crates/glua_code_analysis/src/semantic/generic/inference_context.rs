@@ -31,6 +31,8 @@ impl InferencePriority {
     }
 
     fn rank(self) -> u16 {
+        // Mirrors TS inference priorities: direct candidates win, reverse
+        // mapped candidates are weaker, and contextual return is speculative.
         match self {
             InferencePriority::None | InferencePriority::Direct => 0,
             InferencePriority::NakedUnionFallback => 1,
@@ -257,6 +259,8 @@ impl InferenceContext {
         let inference_snapshot = self.type_inferences.clone();
         let constraint_snapshot = self.type_constraints.clone();
         for tpl_id in tpl_ids {
+            // TS-Go getInferredType instantiates type-parameter constraints
+            // with the current non-fixing mapper before checking candidates.
             let constraint = self
                 .type_constraints
                 .get(&tpl_id)
@@ -359,6 +363,9 @@ impl TypeInferenceInfo {
         let covariant = self.infer_covariant_candidate(db);
         let contravariant = self.infer_contravariant_candidate(db);
 
+        // TS-Go preferCovariantType: prefer covariant only when it is useful,
+        // assignable to a contra candidate, and doesn't break dependent
+        // constraints from other type parameters.
         let (preferred, fallback) = match (covariant, contravariant) {
             (Some(covariant), Some(contravariant)) => {
                 if self.prefer_covariant_candidate(
@@ -462,6 +469,8 @@ impl TypeInferenceInfo {
             if candidate_satisfies_constraint(db, &candidate, constraint) {
                 return Some(candidate);
             }
+            // TS-Go lets pure return-type inference filter a speculative union
+            // by the constraint before falling back to the constraint itself.
             if self.priority() == InferencePriority::ContextualReturn
                 && let Some(filtered) = filter_candidate_by_constraint(db, &candidate, constraint)
             {
@@ -540,6 +549,8 @@ fn dependent_constraint_candidates_accept_covariant(
     all_inferences: &HashMap<GenericTplId, TypeInferenceInfo>,
     all_constraints: &HashMap<GenericTplId, LuaType>,
 ) -> bool {
+    // TS-Go blocks a covariant choice when another type parameter constrained
+    // to this one has candidates that would stop satisfying that constraint.
     all_inferences.iter().all(|(other_tpl_id, inference)| {
         if *other_tpl_id == tpl_id {
             return true;

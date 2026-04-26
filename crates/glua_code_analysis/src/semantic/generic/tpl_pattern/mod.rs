@@ -578,6 +578,8 @@ fn homomorphic_mapped_tpl_pattern_match(
     if let Some(key_constraint_tpl_id) = source_info.key_constraint_tpl_id
         && !key_types.is_empty()
     {
+        // TS-Go first infers source keys into the mapped key parameter
+        // before using an extended keyof constraint such as Pick<T, K>.
         let key_type = LuaType::from_vec(key_types);
         context.with_inference_priority(InferencePriority::MappedTypeConstraint, true, |context| {
             context
@@ -588,6 +590,8 @@ fn homomorphic_mapped_tpl_pattern_match(
 
     if !fields.is_empty() {
         let source_type = reverse_mapped_source_type(fields);
+        // TS-Go gives partial reverse mapped results a weaker priority so a
+        // later complete/direct inference can replace them.
         let priority = if saw_uninferred_field {
             InferencePriority::PartialHomomorphicMappedType
         } else {
@@ -624,6 +628,8 @@ fn constrained_mapped_tpl_pattern_match(
 
     if !key_types.is_empty() {
         let key_type = LuaType::from_vec(key_types);
+        // For { [P in K]: V }, infer keyof(source) into K before inferring
+        // property values into V.
         context.with_inference_priority(InferencePriority::MappedTypeConstraint, true, |context| {
             context
                 .inference
@@ -1450,6 +1456,8 @@ fn func_tpl_pattern_match_doc_func(
     let tpl_return = tpl_func.get_ret();
     let target_return = target_func.get_ret();
     let priority = active_inference_priority(context);
+    // Function returns are covariant; keep the caller's active priority
+    // (direct, contextual return, mapped, etc.) while matching them.
     context.with_inference_priority(priority, true, |context| {
         return_type_pattern_match_target_type(context, tpl_return, target_return)
     })?;
@@ -1533,6 +1541,8 @@ fn param_type_list_pattern_match_type_list(
                     Some(t) => t.1.clone().unwrap_or(LuaType::Any),
                     None => break,
                 };
+                // Function parameters are contravariant, matching TS-Go's
+                // separate contraCandidates bucket.
                 context.with_inference_priority_and_variance(
                     active_inference_priority(context),
                     true,
@@ -1583,11 +1593,9 @@ fn return_type_pattern_match_target_type(
                                 }
                                 LuaType::TplRef(tpl_ref) => {
                                     let tpl_id = tpl_ref.get_tpl_id();
-                                    context.inference.infer_type(
-                                        tpl_id,
-                                        target_base.clone(),
-                                        true,
-                                    );
+                                    context
+                                        .inference
+                                        .infer_type(tpl_id, target_base.clone(), true);
                                 }
                                 _ => {}
                             }
@@ -1708,11 +1716,9 @@ pub fn variadic_tpl_pattern_match(
                         context.inference.infer_type(tpl_id, LuaType::Nil, false);
                     }
                     1 => {
-                        context.inference.infer_type(
-                            tpl_id,
-                            target_rest_types[0].clone(),
-                            false,
-                        );
+                        context
+                            .inference
+                            .infer_type(tpl_id, target_rest_types[0].clone(), false);
                     }
                     _ => {
                         context

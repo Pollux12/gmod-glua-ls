@@ -262,6 +262,8 @@ fn infer_generic_types_from_call(
         && func.get_ret().contain_tpl()
         && !context.inference.is_fully_inferred()
     {
+        // TS-Go infers from a call's contextual type into the generic return
+        // type at a lower priority than ordinary argument inference.
         context.with_inference_priority(InferencePriority::ContextualReturn, true, |context| {
             tpl_pattern_match(context, func.get_ret(), return_hint)
         })?;
@@ -273,6 +275,8 @@ fn infer_generic_types_from_call(
         for (func_param_type, call_arg_expr) in unresolve_tpls {
             let is_closure_arg = matches!(call_arg_expr, LuaExpr::ClosureExpr(_));
             let original_func_param_type = func_param_type.clone();
+            // Context-sensitive closure arguments are delayed until earlier
+            // arguments and contextual return hints have produced candidates.
             let func_param_type = if is_closure_arg {
                 instantiate_type_generic_preserve_unresolved(
                     db,

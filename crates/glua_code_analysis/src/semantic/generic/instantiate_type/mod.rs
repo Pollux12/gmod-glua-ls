@@ -586,6 +586,9 @@ fn instantiate_conditional(
         }
         let right_origin = &alias_call.get_operands()[1];
         let right = instantiate_type_generic(db, right_origin, substitutor);
+        // TS-Go getInferredTypeParameterConstraint: in Foo<T, U extends T>,
+        // Foo<number, infer B> constrains B to number, and Foo<Q, infer B>
+        // constrains B through the outer mapper for Q.
         let infer_constraints = collect_conditional_infer_constraints(db, &right);
         // 如果存在 new 标记与左侧为类定义, 那么我们需要的是他的构造函数签名
         if conditional.has_new
@@ -700,6 +703,8 @@ fn collect_conditional_infer_constraints_inner(
                     generic.get_params().clone(),
                 );
                 for (i, pattern_param) in generic.get_params().iter().enumerate() {
+                    // If infer sits directly in a generic argument, inherit the
+                    // declared constraint from that generic parameter.
                     if let LuaType::ConditionalInfer(name) = pattern_param
                         && let Some(declared_constraint) = generic_params
                             .get(i)
@@ -837,6 +842,8 @@ fn insert_conditional_infer_constraint(
 }
 
 fn is_self_conditional_infer(ty: &LuaType, name: &str) -> bool {
+    // TS-Go discards constraints that instantiate back to the same infer
+    // parameter, e.g. Foo<infer X, infer X> where U extends T.
     matches!(ty, LuaType::ConditionalInfer(infer_name) if infer_name.as_str() == name)
 }
 
@@ -851,6 +858,9 @@ fn apply_conditional_infer_constraints(
 
     let assignments_snapshot = assignments.clone();
     for (name, constraint) in constraints {
+        // This is a narrow nonFixingMapper-shaped substitution: constraints
+        // may reference another infer parameter, so resolve through the
+        // assignments collected from the same conditional pattern.
         let constraint = substitute_conditional_infer_names(constraint, &assignments_snapshot);
         if contains_conditional_infer(&constraint) {
             continue;
