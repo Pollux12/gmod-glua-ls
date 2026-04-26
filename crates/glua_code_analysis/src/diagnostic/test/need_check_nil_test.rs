@@ -154,6 +154,154 @@ mod test {
     }
 
     #[gtest]
+    fn test_unchecked_nil_access_for_opaque_table_chained_index() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@type table
+            local tbl = {}
+            print(tbl.someKey.test)
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(false)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_unchecked_nil_access_for_opaque_table_member_call() {
+        let mut ws = VirtualWorkspace::new();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::UncheckedNilAccess,
+                r#"
+                ---@type table
+                local tbl = {}
+                tbl.someKey()
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_unchecked_nil_access_for_opaque_table_method_call() {
+        let mut ws = VirtualWorkspace::new();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::UncheckedNilAccess,
+                r#"
+                ---@type table
+                local tbl = {}
+                tbl:someMethod()
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_direct_opaque_table_member_read_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::UncheckedNilAccess,
+                r#"
+                ---@type table
+                local tbl = {}
+                local x = tbl.someKey
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_nullable_table_access_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@type table|nil
+            local x
+            print(x.foo)
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(false)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_nullable_any_name_prefix_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@type any?
+            local x
+            print(x.foo)
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(false)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_nullable_entity_method_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+            "#,
+        );
+        let code = r#"
+            ---@type Entity?
+            local ent
+            ent:GetPos()
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_truthy_opaque_table_member_narrows_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::UncheckedNilAccess,
+                r#"
+                ---@type table
+                local tbl = {}
+                if tbl.someKey then
+                    print(tbl.someKey.test)
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_isvalid_narrows_nil_from_nullable_type() {
         // Bug repro: IsValid(maybe) should narrow away nil in the true branch
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
