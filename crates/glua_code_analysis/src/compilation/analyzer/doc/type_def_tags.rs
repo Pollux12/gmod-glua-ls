@@ -34,7 +34,6 @@ pub fn analyze_class(analyzer: &mut DocAnalyzer, tag: LuaDocTagClass) -> Option<
     let class_decl_id = class_decl.get_id();
     analyzer.current_type_id = Some(class_decl_id.clone());
     if let Some(generic_params) = tag.get_generic_decl() {
-        let generic_params = get_generic_params(analyzer, generic_params);
         let generic_params = add_generic_index(analyzer, generic_params, &tag);
 
         analyzer
@@ -142,12 +141,9 @@ pub fn analyze_alias(analyzer: &mut DocAnalyzer, tag: LuaDocTagAlias) -> Option<
     };
 
     if let Some(generic_params) = tag.get_generic_decl_list() {
-        let generic_params = get_generic_params(analyzer, generic_params);
         let range = tag.get_range();
         let scope_id = analyzer.generic_index.add_generic_scope(vec![range], false);
-        let generic_params = analyzer
-            .generic_index
-            .append_generic_params(scope_id, generic_params);
+        let generic_params = append_generic_params_with_scope(analyzer, scope_id, generic_params);
         analyzer
             .db
             .get_type_index_mut()
@@ -194,12 +190,25 @@ pub fn analyze_attribute(analyzer: &mut DocAnalyzer, tag: LuaDocTagAttribute) ->
     Some(())
 }
 
-fn get_generic_params(
+fn append_generic_params_with_scope(
     analyzer: &mut DocAnalyzer,
+    scope_id: super::file_generic_index::GenericParamId,
     params: LuaDocGenericDeclList,
 ) -> Vec<GenericParam> {
     let mut params_result = Vec::new();
-    for param in params.get_generic_decl() {
+    let generic_decls = params.get_generic_decl().collect::<Vec<_>>();
+    for param in generic_decls.iter() {
+        let name = if let Some(param) = param.get_name_token() {
+            SmolStr::new(param.get_name_text())
+        } else {
+            continue;
+        };
+        analyzer
+            .generic_index
+            .append_generic_param(scope_id, GenericParam::new(name, None, None));
+    }
+
+    for param in generic_decls {
         let name = if let Some(param) = param.get_name_token() {
             SmolStr::new(param.get_name_text())
         } else {
@@ -209,7 +218,12 @@ fn get_generic_params(
             .get_type()
             .map(|type_ref| infer_type(analyzer, type_ref));
 
-        params_result.push(GenericParam::new(name, type_ref, None));
+        if let Some(param) = analyzer
+            .generic_index
+            .update_generic_param_constraint(scope_id, &name, type_ref)
+        {
+            params_result.push(param);
+        }
     }
 
     params_result
@@ -217,7 +231,7 @@ fn get_generic_params(
 
 fn add_generic_index(
     analyzer: &mut DocAnalyzer,
-    generic_params: Vec<GenericParam>,
+    generic_params: LuaDocGenericDeclList,
     tag: &LuaDocTagClass,
 ) -> Vec<GenericParam> {
     let mut ranges = Vec::new();
@@ -241,9 +255,7 @@ fn add_generic_index(
     }
 
     let scope_id = analyzer.generic_index.add_generic_scope(ranges, false);
-    analyzer
-        .generic_index
-        .append_generic_params(scope_id, generic_params)
+    append_generic_params_with_scope(analyzer, scope_id, generic_params)
 }
 
 fn get_local_stat_reference_ranges(
@@ -343,19 +355,31 @@ pub fn analyze_func_generic(analyzer: &mut DocAnalyzer, tag: LuaDocTagGeneric) -
 
     let mut param_info = Vec::new();
     if let Some(params_list) = tag.get_generic_decl_list() {
-        for param in params_list.get_generic_decl() {
+        let generic_decls = params_list.get_generic_decl().collect::<Vec<_>>();
+        for param in generic_decls.iter() {
             let Some(name_token) = param.get_name_token() else {
                 continue;
             };
             let name_text = name_token.get_name_text().to_string();
             let smol_name = SmolStr::new(name_text.as_str());
+            analyzer
+                .generic_index
+                .append_generic_param(scope_id, GenericParam::new(smol_name, None, None));
+        }
+
+        for param in generic_decls {
+            let Some(name_token) = param.get_name_token() else {
+                continue;
+            };
+            let name_text = name_token.get_name_text().to_string();
             let type_ref = param
                 .get_type()
                 .map(|type_ref| infer_type(analyzer, type_ref));
 
-            analyzer.generic_index.append_generic_param(
+            analyzer.generic_index.update_generic_param_constraint(
                 scope_id,
-                GenericParam::new(smol_name.clone(), type_ref.clone(), None),
+                &name_text,
+                type_ref.clone(),
             );
 
             param_info.push(Arc::new(LuaGenericParamInfo::new(

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, GenericTplId, LuaType, LuaTypeDeclId, VirtualWorkspace};
     use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr};
 
     #[test]
@@ -471,6 +471,83 @@ mod test {
         let result_ty = ws.expr_ty("result");
         let expected = ws.ty("Animal");
         assert_eq!(result_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_dependent_constraint_can_reference_later_type_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+
+            ---@generic T: U, U
+            ---@param value T
+            ---@param upper U
+            ---@return T
+            function keep_specific(value, upper) end
+
+            ---@type Dog
+            local dog
+
+            ---@type Animal
+            local animal
+
+            result = keep_specific(dog, animal)
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        let expected = ws.ty("Dog");
+        assert_eq!(result_ty, expected);
+    }
+
+    #[test]
+    fn test_class_generic_constraint_can_reference_later_type_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Pair<T: U, U>
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let generic_params = db
+            .get_type_index()
+            .get_generic_params(&LuaTypeDeclId::global("Pair"))
+            .expect("Pair generic params must exist");
+        let constraint = generic_params[0]
+            .type_constraint
+            .as_ref()
+            .expect("T constraint must exist");
+        assert!(matches!(
+            constraint,
+            LuaType::TplRef(tpl) if tpl.get_tpl_id() == GenericTplId::scoped_type(0, 1)
+        ));
+    }
+
+    #[test]
+    fn test_alias_generic_constraint_can_reference_later_type_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@alias PairAlias<T: U, U> { value: T, upper: U }
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let generic_params = db
+            .get_type_index()
+            .get_generic_params(&LuaTypeDeclId::global("PairAlias"))
+            .expect("PairAlias generic params must exist");
+        let constraint = generic_params[0]
+            .type_constraint
+            .as_ref()
+            .expect("T constraint must exist");
+        assert!(matches!(
+            constraint,
+            LuaType::TplRef(tpl) if tpl.get_tpl_id() == GenericTplId::scoped_type(0, 1)
+        ));
     }
 
     #[test]

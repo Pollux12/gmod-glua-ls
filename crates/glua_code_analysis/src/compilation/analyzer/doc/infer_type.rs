@@ -583,29 +583,38 @@ fn register_inline_func_generics(
     func: &LuaDocFuncType,
     generic_list: LuaDocGenericDeclList,
 ) {
-    let mut generics = Vec::new();
-    for param in generic_list.get_generic_decl() {
-        let Some(name_token) = param.get_name_token() else {
-            continue;
-        };
-
-        let constraint = param.get_type().map(|ty| infer_type(analyzer, ty));
-        generics.push(GenericParam::new(
-            SmolStr::new(name_token.get_name_text()),
-            constraint,
-            None,
-        ));
-    }
-    if generics.is_empty() {
+    let generic_decls = generic_list.get_generic_decl().collect::<Vec<_>>();
+    if generic_decls.is_empty() {
         return;
     }
 
     let scope_id = analyzer
         .generic_index
         .add_generic_scope(vec![func.get_range()], true);
-    analyzer
-        .generic_index
-        .append_generic_params(scope_id, generics);
+
+    for param in generic_decls.iter() {
+        let Some(name_token) = param.get_name_token() else {
+            continue;
+        };
+
+        analyzer.generic_index.append_generic_param(
+            scope_id,
+            GenericParam::new(SmolStr::new(name_token.get_name_text()), None, None),
+        );
+    }
+
+    for param in generic_decls {
+        let Some(name_token) = param.get_name_token() else {
+            continue;
+        };
+
+        let constraint = param.get_type().map(|ty| infer_type(analyzer, ty));
+        analyzer.generic_index.update_generic_param_constraint(
+            scope_id,
+            name_token.get_name_text(),
+            constraint,
+        );
+    }
 }
 
 fn get_colon_define(analyzer: &mut DocAnalyzer) -> Option<bool> {

@@ -75,6 +75,16 @@ impl FileGenericIndex {
         assigned_params
     }
 
+    pub fn update_generic_param_constraint(
+        &mut self,
+        scope_id: GenericParamId,
+        name: &str,
+        constraint: Option<LuaType>,
+    ) -> Option<GenericParam> {
+        let scope = self.generic_params.get_mut(scope_id.id)?;
+        scope.update_param_constraint(name, constraint)
+    }
+
     fn try_add_range_to_effect_node(
         &mut self,
         range: TextRange,
@@ -226,6 +236,16 @@ impl TagGenericParams {
         self.params
             .insert(param.name.to_string(), (current_index, param.clone()));
         param
+    }
+
+    fn update_param_constraint(
+        &mut self,
+        name: &str,
+        constraint: Option<LuaType>,
+    ) -> Option<GenericParam> {
+        let (_, param) = self.params.get_mut(name)?;
+        param.type_constraint = constraint;
+        Some(param.clone())
     }
 
     fn tpl_id_for_idx(&self, idx: usize) -> GenericTplId {
