@@ -104,7 +104,8 @@ fn maybe_field_exist_narrow(
         {
             let member_index = db.get_member_index();
             let owner = LuaMemberOwner::Type(type_id.clone());
-            let global_owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
+            let global_owner =
+                LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
             if member_index.get_member_item(&owner, &member_key).is_some()
                 || member_index
                     .get_member_item(&global_owner, &member_key)
@@ -318,7 +319,8 @@ fn filter_candidates_by_caller_realm(
                 _ => return true,
             };
             let owner = LuaMemberOwner::Type(type_id.clone());
-            let global_owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
+            let global_owner =
+                LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
             let mut decls = member_index.get_members_for_owner_key(&owner, &key);
             decls.extend(member_index.get_members_for_owner_key(&global_owner, &key));
             if decls.is_empty() {
