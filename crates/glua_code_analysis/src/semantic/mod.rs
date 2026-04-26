@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{
-    LuaCallExpr, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaNameExpr, LuaParseError,
-    LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr,
+    LuaAstNode, LuaCallExpr, LuaChunk, LuaDocType, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaNameExpr,
+    LuaParseError, LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr,
 };
 pub use infer::infer_index_expr;
 use infer::{infer_bind_value_type, infer_expr_list_types};
@@ -77,6 +77,30 @@ pub(crate) fn unwrap_paren_to_name_expr(expr: &LuaExpr) -> Option<LuaNameExpr> {
         LuaExpr::ParenExpr(paren_expr) => unwrap_paren_to_name_expr(&paren_expr.get_expr()?),
         _ => None,
     }
+}
+
+pub(crate) fn is_doc_tag_table_const(root: &LuaSyntaxNode, range: TextRange) -> bool {
+    let mut node = match root.covering_element(range) {
+        NodeOrToken::Node(node) => Some(node),
+        NodeOrToken::Token(token) => token.parent(),
+    };
+
+    while let Some(current) = node {
+        if !current.text_range().contains_range(range) {
+            return false;
+        }
+        if current.text_range() == range && LuaDocType::can_cast(current.kind().into()) {
+            return current.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind().into(),
+                    LuaSyntaxKind::DocTagAs | LuaSyntaxKind::DocTagType
+                )
+            });
+        }
+        node = current.parent();
+    }
+
+    false
 }
 
 #[derive(Debug)]

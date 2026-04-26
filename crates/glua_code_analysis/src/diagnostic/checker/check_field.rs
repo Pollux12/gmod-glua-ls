@@ -8,8 +8,11 @@ use glua_parser::{
 
 use crate::{
     DbIndex, DiagnosticCode, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaMemberKey,
-    LuaMemberOwner, LuaType, SemanticModel, enum_variable_is_param, get_keyof_members,
-    semantic::{infer_owner_raw_member_type_with_realm, member_key_matches_type},
+    LuaMemberOwner, LuaType, LuaUnionType, SemanticModel, enum_variable_is_param,
+    get_keyof_members,
+    semantic::{
+        infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
+    },
 };
 
 use super::{Checker, DiagnosticContext, humanize_lint_type};
@@ -201,10 +204,14 @@ fn is_invalid_prefix_type(typ: &LuaType, code: DiagnosticCode) -> bool {
             | LuaType::StrTplRef(_) => return true,
             LuaType::TableConst(_) => return code == DiagnosticCode::InjectField,
             LuaType::Union(union) => {
-                return union
-                    .into_vec()
-                    .iter()
-                    .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ, code));
+                return match union.as_ref() {
+                    LuaUnionType::Nullable(typ) => {
+                        typ.is_nil() || is_invalid_prefix_type(typ, code)
+                    }
+                    LuaUnionType::Multi(types) => types
+                        .iter()
+                        .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ, code)),
+                };
             }
             LuaType::Instance(instance_typ) => {
                 current_typ = instance_typ.get_base();
@@ -303,7 +310,7 @@ pub(super) fn is_valid_member(
                 Ok(_) => return Some(()),
                 Err(InferFailReason::FieldNotFound)
                     if code == DiagnosticCode::UndefinedField
-                        && is_doc_tag_table_const(semantic_model, id) =>
+                        && is_table_const_from_doc_tag(semantic_model, id) =>
                 {
                     return Some(());
                 }
@@ -523,7 +530,7 @@ pub(super) fn is_valid_member(
     None
 }
 
-fn is_doc_tag_table_const(
+fn is_table_const_from_doc_tag(
     semantic_model: &SemanticModel,
     id: &crate::InFiled<rowan::TextRange>,
 ) -> bool {
@@ -531,29 +538,7 @@ fn is_doc_tag_table_const(
         return false;
     };
 
-    let range = id.value;
-    let mut node = match root.syntax().covering_element(range) {
-        rowan::NodeOrToken::Node(node) => Some(node),
-        rowan::NodeOrToken::Token(token) => token.parent(),
-    };
-
-    while let Some(current) = node {
-        if !current.text_range().contains_range(range) {
-            return false;
-        }
-        if current.text_range() == range
-            && glua_parser::LuaDocType::can_cast(current.kind().into())
-        {
-            return current.parent().is_some_and(|parent| {
-                matches!(
-                    parent.kind().into(),
-                    LuaSyntaxKind::DocTagAs | LuaSyntaxKind::DocTagType
-                )
-            });
-        }
-        node = current.parent();
-    }
-    false
+    is_doc_tag_table_const(root.syntax(), id.value)
 }
 
 /// 检查枚举类型的自引用

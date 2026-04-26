@@ -3,8 +3,7 @@ mod infer_array;
 use std::collections::HashSet;
 
 use glua_parser::{
-    LuaAstNode, LuaDocType, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaSyntaxKind,
-    NumberResult, PathTrait,
+    LuaAstNode, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, NumberResult, PathTrait,
 };
 use internment::ArcIntern;
 use rowan::TextRange;
@@ -27,6 +26,7 @@ use crate::{
             infer_name::get_name_expr_var_ref_id,
             narrow::infer_expr_narrow_type,
         },
+        is_doc_tag_table_const,
         member::get_buildin_type_map_type_id,
         member::infer_owner_raw_member_type_with_realm,
         member::intersect_member_types,
@@ -293,39 +293,19 @@ fn infer_table_member(
         Some(index_expr.get_position()),
     ) {
         Ok(typ) => Ok(typ),
-        Err(InferFailReason::FieldNotFound) if is_doc_tag_table_const(db, &inst) => {
+        Err(InferFailReason::FieldNotFound) if is_table_const_from_doc_tag(db, &inst) => {
             Ok(nullable_any_type())
         }
         Err(err) => Err(err),
     }
 }
 
-fn is_doc_tag_table_const(db: &DbIndex, inst: &InFiled<TextRange>) -> bool {
+fn is_table_const_from_doc_tag(db: &DbIndex, inst: &InFiled<TextRange>) -> bool {
     let Some(root) = db.get_vfs().get_syntax_tree(&inst.file_id) else {
         return false;
     };
 
-    let range = inst.value;
-    let mut node = match root.get_red_root().covering_element(range) {
-        rowan::NodeOrToken::Node(node) => Some(node),
-        rowan::NodeOrToken::Token(token) => token.parent(),
-    };
-
-    while let Some(current) = node {
-        if !current.text_range().contains_range(range) {
-            return false;
-        }
-        if current.text_range() == range && LuaDocType::can_cast(current.kind().into()) {
-            return current.parent().is_some_and(|parent| {
-                matches!(
-                    parent.kind().into(),
-                    LuaSyntaxKind::DocTagAs | LuaSyntaxKind::DocTagType
-                )
-            });
-        }
-        node = current.parent();
-    }
-    false
+    is_doc_tag_table_const(&root.get_red_root(), inst.value)
 }
 
 fn nullable_any_type() -> LuaType {

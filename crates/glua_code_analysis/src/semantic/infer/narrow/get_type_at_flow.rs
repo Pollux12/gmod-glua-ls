@@ -1012,7 +1012,10 @@ fn try_infer_decl_initializer_type(
         return Ok(None);
     };
 
-    let Some(node) = initializer.get_expr_syntax_id().to_node_from_root(root.syntax()) else {
+    let Some(node) = initializer
+        .get_expr_syntax_id()
+        .to_node_from_root(root.syntax())
+    else {
         return Ok(None);
     };
 
