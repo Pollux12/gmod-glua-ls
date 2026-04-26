@@ -535,9 +535,12 @@ impl TypeVisitTrait for LuaType {
                     param.visit_type(f);
                 }
             }
+            LuaType::Instance(inst) => inst.visit_type(f),
             LuaType::MultiLineUnion(inner) => inner.visit_type(f),
             LuaType::TypeGuard(inner) => inner.visit_type(f),
+            LuaType::DocAttribute(attribute) => attribute.visit_type(f),
             LuaType::Conditional(inner) => inner.visit_type(f),
+            LuaType::Mapped(mapped) => mapped.visit_type(f),
             LuaType::TableOf(inner) => inner.visit_type(f),
             _ => {}
         }
@@ -1627,6 +1630,18 @@ pub struct LuaMappedType {
     pub value: LuaType,
     pub is_readonly: bool,
     pub is_optional: bool,
+}
+
+impl TypeVisitTrait for LuaMappedType {
+    fn visit_type<F>(&self, f: &mut F)
+    where
+        F: FnMut(&LuaType),
+    {
+        if let Some(constraint) = &self.param.1.type_constraint {
+            constraint.visit_type(f);
+        }
+        self.value.visit_type(f);
+    }
 }
 
 impl LuaMappedType {

@@ -503,6 +503,64 @@ mod test {
     }
 
     #[test]
+    fn test_generic_dependent_constraint_instantiates_later_type_param_through_alias() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+            ---@alias Upper<T> T
+
+            ---@generic T: Upper<U>, U
+            ---@param value T
+            ---@param upper U
+            ---@return T
+            function keep_specific(value, upper) end
+
+            ---@type Dog
+            local dog
+
+            ---@type Animal
+            local animal
+
+            result = keep_specific(dog, animal)
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        let expected = ws.ty("Dog");
+        assert_eq!(result_ty, expected);
+    }
+
+    #[test]
+    fn test_generic_constraint_falls_back_to_instantiated_alias_constraint() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@alias Upper<T> T
+
+            ---@generic T: Upper<U>, U
+            ---@param value T
+            ---@param upper U
+            ---@return T
+            function constrained(value, upper) end
+
+            ---@type string
+            local text
+
+            ---@type integer
+            local count
+
+            result = constrained(text, count)
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        let expected = ws.ty("integer");
+        assert_eq!(result_ty, expected);
+    }
+
+    #[test]
     fn test_class_generic_constraint_can_reference_later_type_param() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
@@ -2526,6 +2584,85 @@ mod test {
 
         let value_ty = ws.expr_ty("value");
         assert_eq!(ws.humanize_type(value_ty), "(string|number)");
+    }
+
+    #[test]
+    fn test_conditional_infer_uses_generic_type_parameter_constraint() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Pair<T, U: T>
+            ---@alias InferSecond<T> T extends Pair<integer, infer U> and U or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return InferSecond<T>
+            function infer_second(value) end
+
+            ---@type Pair<integer, string>
+            local pair
+
+            value = infer_second(pair)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(value_ty, ws.ty("integer"));
+    }
+
+    #[test]
+    fn test_conditional_infer_constraint_uses_outer_mapper() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Pair<T, U: T>
+            ---@alias InferSecond<Q, T> T extends Pair<Q, infer U> and U or unknown
+
+            ---@generic Q, T
+            ---@param value T
+            ---@param upper Q
+            ---@return InferSecond<Q, T>
+            function infer_second(value, upper) end
+
+            ---@type Pair<integer, string>
+            local pair
+
+            ---@type integer
+            local count
+
+            value = infer_second(pair, count)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(value_ty, ws.ty("integer"));
+    }
+
+    #[test]
+    fn test_conditional_infer_constraint_can_reference_other_infer_param() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Pair<T, U: T>
+            ---@alias InferSecond<T> T extends Pair<infer A, infer B> and B or unknown
+
+            ---@generic T
+            ---@param value T
+            ---@return InferSecond<T>
+            function infer_second(value) end
+
+            ---@type Pair<integer, string>
+            local pair
+
+            value = infer_second(pair)
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("value");
+        assert_eq!(value_ty, ws.ty("integer"));
     }
 
     #[test]

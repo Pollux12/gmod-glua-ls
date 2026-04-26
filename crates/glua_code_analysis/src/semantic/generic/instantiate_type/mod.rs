@@ -11,8 +11,8 @@ use crate::{
     LuaConditionalType, LuaInstanceType, LuaMappedType, LuaMemberKey, LuaOperatorMetaMethod,
     LuaSignatureId, LuaTupleStatus, LuaTypeDeclId, TypeOps, check_type_compact,
     db_index::{
-        LuaFunctionType, LuaGenericType, LuaIntersectionType, LuaObjectType, LuaTupleType, LuaType,
-        LuaUnionType, VariadicType,
+        LuaAliasCallType, LuaAttributeType, LuaFunctionType, LuaGenericType, LuaIntersectionType,
+        LuaMultiLineUnion, LuaObjectType, LuaTupleType, LuaType, LuaUnionType, VariadicType,
     },
     semantic::type_check::{TypeCheckCheckLevel, check_type_compact_with_level},
 };
@@ -586,6 +586,7 @@ fn instantiate_conditional(
         }
         let right_origin = &alias_call.get_operands()[1];
         let right = instantiate_type_generic(db, right_origin, substitutor);
+        let infer_constraints = collect_conditional_infer_constraints(db, &right);
         // 如果存在 new 标记与左侧为类定义, 那么我们需要的是他的构造函数签名
         if conditional.has_new
             && let LuaType::Ref(id) | LuaType::Def(id) = &left
@@ -604,6 +605,7 @@ fn instantiate_conditional(
         if contains_conditional_infer(&right)
             && collect_infer_assignments(db, &left, &right, &mut infer_assignments)
         {
+            apply_conditional_infer_constraints(db, &mut infer_assignments, &infer_constraints);
             condition_result = Some(true);
         } else {
             condition_result = Some(
@@ -670,6 +672,408 @@ fn contains_conditional_infer(ty: &LuaType) -> bool {
         }
     });
     found
+}
+
+fn collect_conditional_infer_constraints(
+    db: &DbIndex,
+    pattern: &LuaType,
+) -> HashMap<String, LuaType> {
+    let mut constraints = HashMap::new();
+    collect_conditional_infer_constraints_inner(db, pattern, &mut constraints);
+    constraints
+}
+
+fn collect_conditional_infer_constraints_inner(
+    db: &DbIndex,
+    pattern: &LuaType,
+    constraints: &mut HashMap<String, LuaType>,
+) {
+    match pattern {
+        LuaType::Generic(generic) => {
+            if let Some(generic_params) = db
+                .get_type_index()
+                .get_generic_params(generic.get_base_type_id_ref())
+            {
+                let substitutor = TypeSubstitutor::from_type_array_for_type(
+                    db,
+                    generic.get_base_type_id_ref(),
+                    generic.get_params().clone(),
+                );
+                for (i, pattern_param) in generic.get_params().iter().enumerate() {
+                    if let LuaType::ConditionalInfer(name) = pattern_param
+                        && let Some(declared_constraint) = generic_params
+                            .get(i)
+                            .and_then(|param| param.type_constraint.as_ref())
+                    {
+                        let constraint =
+                            instantiate_type_generic(db, declared_constraint, &substitutor);
+                        if !is_self_conditional_infer(&constraint, name.as_str()) {
+                            insert_conditional_infer_constraint(
+                                constraints,
+                                name.as_str(),
+                                constraint,
+                            );
+                        }
+                    }
+                }
+            }
+
+            for param in generic.get_params() {
+                collect_conditional_infer_constraints_inner(db, param, constraints);
+            }
+        }
+        LuaType::Array(array) => {
+            collect_conditional_infer_constraints_inner(db, array.get_base(), constraints);
+        }
+        LuaType::Tuple(tuple) => {
+            for ty in tuple.get_types() {
+                collect_conditional_infer_constraints_inner(db, ty, constraints);
+            }
+        }
+        LuaType::DocFunction(func) => {
+            for (_, param) in func.get_params() {
+                if let Some(param) = param {
+                    collect_conditional_infer_constraints_inner(db, param, constraints);
+                }
+            }
+            collect_conditional_infer_constraints_inner(db, func.get_ret(), constraints);
+        }
+        LuaType::Object(object) => {
+            for ty in object.get_fields().values() {
+                collect_conditional_infer_constraints_inner(db, ty, constraints);
+            }
+            for (key, value) in object.get_index_access() {
+                collect_conditional_infer_constraints_inner(db, key, constraints);
+                collect_conditional_infer_constraints_inner(db, value, constraints);
+            }
+        }
+        LuaType::Union(union) => {
+            for ty in union.into_vec() {
+                collect_conditional_infer_constraints_inner(db, &ty, constraints);
+            }
+        }
+        LuaType::Intersection(intersection) => {
+            for ty in intersection.get_types() {
+                collect_conditional_infer_constraints_inner(db, ty, constraints);
+            }
+        }
+        LuaType::TableGeneric(params) => {
+            for param in params.iter() {
+                collect_conditional_infer_constraints_inner(db, param, constraints);
+            }
+        }
+        LuaType::Variadic(variadic) => match variadic.deref() {
+            VariadicType::Base(base) => {
+                collect_conditional_infer_constraints_inner(db, base, constraints);
+            }
+            VariadicType::Multi(types) => {
+                for ty in types {
+                    collect_conditional_infer_constraints_inner(db, ty, constraints);
+                }
+            }
+        },
+        LuaType::Call(call) => {
+            for operand in call.get_operands() {
+                collect_conditional_infer_constraints_inner(db, operand, constraints);
+            }
+        }
+        LuaType::MultiLineUnion(union) => {
+            for (ty, _) in union.get_unions() {
+                collect_conditional_infer_constraints_inner(db, ty, constraints);
+            }
+        }
+        LuaType::TypeGuard(inner) => {
+            collect_conditional_infer_constraints_inner(db, inner, constraints);
+        }
+        LuaType::TableOf(inner) => {
+            collect_conditional_infer_constraints_inner(db, inner, constraints);
+        }
+        LuaType::Conditional(conditional) => {
+            collect_conditional_infer_constraints_inner(
+                db,
+                conditional.get_condition(),
+                constraints,
+            );
+            collect_conditional_infer_constraints_inner(
+                db,
+                conditional.get_true_type(),
+                constraints,
+            );
+            collect_conditional_infer_constraints_inner(
+                db,
+                conditional.get_false_type(),
+                constraints,
+            );
+        }
+        LuaType::Mapped(mapped) => {
+            if let Some(constraint) = &mapped.param.1.type_constraint {
+                collect_conditional_infer_constraints_inner(db, constraint, constraints);
+            }
+            collect_conditional_infer_constraints_inner(db, &mapped.value, constraints);
+        }
+        _ => {}
+    }
+}
+
+fn insert_conditional_infer_constraint(
+    constraints: &mut HashMap<String, LuaType>,
+    name: &str,
+    constraint: LuaType,
+) {
+    if let Some(existing) = constraints.get_mut(name) {
+        if *existing == constraint {
+            return;
+        }
+
+        let mut types = match existing {
+            LuaType::Intersection(intersection) => intersection.into_types(),
+            _ => vec![existing.clone()],
+        };
+        types.push(constraint);
+        *existing = LuaType::Intersection(LuaIntersectionType::new(types).into());
+    } else {
+        constraints.insert(name.to_string(), constraint);
+    }
+}
+
+fn is_self_conditional_infer(ty: &LuaType, name: &str) -> bool {
+    matches!(ty, LuaType::ConditionalInfer(infer_name) if infer_name.as_str() == name)
+}
+
+fn apply_conditional_infer_constraints(
+    db: &DbIndex,
+    assignments: &mut HashMap<String, LuaType>,
+    constraints: &HashMap<String, LuaType>,
+) {
+    if constraints.is_empty() {
+        return;
+    }
+
+    let assignments_snapshot = assignments.clone();
+    for (name, constraint) in constraints {
+        let constraint = substitute_conditional_infer_names(constraint, &assignments_snapshot);
+        if contains_conditional_infer(&constraint) {
+            continue;
+        }
+
+        let Some(candidate) = assignments.get(name).cloned() else {
+            assignments.insert(name.clone(), constraint);
+            continue;
+        };
+
+        if check_type_compact_with_level(
+            db,
+            &constraint,
+            &candidate,
+            TypeCheckCheckLevel::GenericConditional,
+        )
+        .is_err()
+        {
+            assignments.insert(name.clone(), constraint);
+        }
+    }
+}
+
+fn substitute_conditional_infer_names(
+    ty: &LuaType,
+    assignments: &HashMap<String, LuaType>,
+) -> LuaType {
+    match ty {
+        LuaType::ConditionalInfer(name) => assignments
+            .get(name.as_str())
+            .cloned()
+            .unwrap_or_else(|| ty.clone()),
+        LuaType::Array(array) => LuaType::Array(
+            LuaArrayType::new(
+                substitute_conditional_infer_names(array.get_base(), assignments),
+                array.get_len().clone(),
+            )
+            .into(),
+        ),
+        LuaType::Tuple(tuple) => LuaType::Tuple(
+            LuaTupleType::new(
+                tuple
+                    .get_types()
+                    .iter()
+                    .map(|ty| substitute_conditional_infer_names(ty, assignments))
+                    .collect(),
+                tuple.status,
+            )
+            .into(),
+        ),
+        LuaType::DocFunction(func) => LuaType::DocFunction(
+            LuaFunctionType::new(
+                func.get_async_state(),
+                func.is_colon_define(),
+                func.is_variadic(),
+                func.get_params()
+                    .iter()
+                    .map(|(name, ty)| {
+                        (
+                            name.clone(),
+                            ty.as_ref()
+                                .map(|ty| substitute_conditional_infer_names(ty, assignments)),
+                        )
+                    })
+                    .collect(),
+                substitute_conditional_infer_names(func.get_ret(), assignments),
+            )
+            .into(),
+        ),
+        LuaType::Object(object) => {
+            let fields = object
+                .get_fields()
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        substitute_conditional_infer_names(value, assignments),
+                    )
+                })
+                .collect();
+            let index_access = object
+                .get_index_access()
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        substitute_conditional_infer_names(key, assignments),
+                        substitute_conditional_infer_names(value, assignments),
+                    )
+                })
+                .collect();
+            LuaType::Object(LuaObjectType::new_with_fields(fields, index_access).into())
+        }
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .into_vec()
+                .into_iter()
+                .map(|ty| substitute_conditional_infer_names(&ty, assignments))
+                .collect(),
+        ),
+        LuaType::Intersection(intersection) => LuaType::Intersection(
+            LuaIntersectionType::new(
+                intersection
+                    .get_types()
+                    .iter()
+                    .map(|ty| substitute_conditional_infer_names(ty, assignments))
+                    .collect(),
+            )
+            .into(),
+        ),
+        LuaType::Generic(generic) => LuaType::Generic(
+            LuaGenericType::new(
+                generic.get_base_type_id(),
+                generic
+                    .get_params()
+                    .iter()
+                    .map(|ty| substitute_conditional_infer_names(ty, assignments))
+                    .collect(),
+            )
+            .into(),
+        ),
+        LuaType::TableGeneric(params) => LuaType::TableGeneric(
+            params
+                .iter()
+                .map(|ty| substitute_conditional_infer_names(ty, assignments))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        LuaType::Variadic(variadic) => LuaType::Variadic(
+            match variadic.deref() {
+                VariadicType::Base(base) => {
+                    VariadicType::Base(substitute_conditional_infer_names(base, assignments))
+                }
+                VariadicType::Multi(types) => VariadicType::Multi(
+                    types
+                        .iter()
+                        .map(|ty| substitute_conditional_infer_names(ty, assignments))
+                        .collect(),
+                ),
+            }
+            .into(),
+        ),
+        LuaType::Instance(inst) => LuaType::Instance(
+            LuaInstanceType::new(
+                substitute_conditional_infer_names(inst.get_base(), assignments),
+                inst.get_range().clone(),
+            )
+            .into(),
+        ),
+        LuaType::Call(call) => LuaType::Call(
+            LuaAliasCallType::new(
+                call.get_call_kind(),
+                call.get_operands()
+                    .iter()
+                    .map(|ty| substitute_conditional_infer_names(ty, assignments))
+                    .collect(),
+            )
+            .into(),
+        ),
+        LuaType::MultiLineUnion(union) => LuaType::MultiLineUnion(
+            LuaMultiLineUnion::new(
+                union
+                    .get_unions()
+                    .iter()
+                    .map(|(ty, description)| {
+                        (
+                            substitute_conditional_infer_names(ty, assignments),
+                            description.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+            .into(),
+        ),
+        LuaType::TypeGuard(inner) => {
+            LuaType::TypeGuard(substitute_conditional_infer_names(inner, assignments).into())
+        }
+        LuaType::DocAttribute(attribute) => LuaType::DocAttribute(
+            LuaAttributeType::new(
+                attribute
+                    .get_params()
+                    .iter()
+                    .map(|(name, ty)| {
+                        (
+                            name.clone(),
+                            ty.as_ref()
+                                .map(|ty| substitute_conditional_infer_names(ty, assignments)),
+                        )
+                    })
+                    .collect(),
+            )
+            .into(),
+        ),
+        LuaType::Conditional(conditional) => LuaType::Conditional(
+            LuaConditionalType::new(
+                substitute_conditional_infer_names(conditional.get_condition(), assignments),
+                substitute_conditional_infer_names(conditional.get_true_type(), assignments),
+                substitute_conditional_infer_names(conditional.get_false_type(), assignments),
+                conditional.get_infer_params().to_vec(),
+                conditional.has_new,
+            )
+            .into(),
+        ),
+        LuaType::Mapped(mapped) => {
+            let mut param = mapped.param.1.clone();
+            param.type_constraint = param
+                .type_constraint
+                .as_ref()
+                .map(|ty| substitute_conditional_infer_names(ty, assignments));
+            LuaType::Mapped(
+                LuaMappedType::new(
+                    (mapped.param.0, param),
+                    substitute_conditional_infer_names(&mapped.value, assignments),
+                    mapped.is_readonly,
+                    mapped.is_optional,
+                )
+                .into(),
+            )
+        }
+        LuaType::TableOf(inner) => {
+            LuaType::TableOf(substitute_conditional_infer_names(inner, assignments).into())
+        }
+        _ => ty.clone(),
+    }
 }
 
 // 尝试将`pattern`中的每个`infer`名称映射到`source`内部对应的类型, 当结构不兼容或发现冲突的赋值时, 返回`false`
