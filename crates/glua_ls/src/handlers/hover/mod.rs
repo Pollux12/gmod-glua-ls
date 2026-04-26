@@ -169,11 +169,9 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
             )
         }
         _ => {
-            if let Some(net_hover) = net_hover::hover_gmod_net_message_string(
-                analysis,
-                &semantic_model,
-                &token,
-            ) {
+            if let Some(net_hover) =
+                net_hover::hover_gmod_net_message_string(analysis, &semantic_model, &token)
+            {
                 return Some(net_hover);
             }
 

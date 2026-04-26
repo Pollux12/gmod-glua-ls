@@ -158,7 +158,10 @@ fn render_side_section(
 
     if groups.len() == 1 {
         let group = &groups[0];
-        out.push_str(&format!("{icon} **{label}** · {}\n\n", group.locations.len()));
+        out.push_str(&format!(
+            "{icon} **{label}** · {}\n\n",
+            group.locations.len()
+        ));
         out.push_str(&render_location_links(analysis, &group.locations));
         out.push_str("\n\n");
         out.push_str(&render_pattern_block(direction, &group.pattern));
@@ -232,9 +235,7 @@ fn render_pattern_block(direction: OpDirection, pattern: &[PatternEntry]) -> Str
                 open_loop_nums.pop();
                 counters.pop();
             }
-            planned.push(PlannedRow::Close {
-                depth: close_depth,
-            });
+            planned.push(PlannedRow::Close { depth: close_depth });
         }
         while open_stack.len() < new_path.len() {
             let next_idx = open_stack.len();
@@ -563,10 +564,12 @@ fn group_send_flows_by_pattern(flows: &[(FileId, &NetSendFlow)]) -> Vec<PatternG
             continue;
         }
         let pattern = pattern_from_ops(&flow.writes);
-        let entry = groups.entry(pattern.clone()).or_insert_with(|| PatternGroup {
-            pattern: pattern.clone(),
-            locations: Vec::new(),
-        });
+        let entry = groups
+            .entry(pattern.clone())
+            .or_insert_with(|| PatternGroup {
+                pattern: pattern.clone(),
+                locations: Vec::new(),
+            });
         entry.locations.push((*file_id, flow.start_range));
     }
     let mut sorted: Vec<_> = groups.into_values().collect();
@@ -581,10 +584,12 @@ fn group_receive_flows_by_pattern(flows: &[(FileId, &NetReceiveFlow)]) -> Vec<Pa
             continue;
         }
         let pattern = pattern_from_ops(&flow.reads);
-        let entry = groups.entry(pattern.clone()).or_insert_with(|| PatternGroup {
-            pattern: pattern.clone(),
-            locations: Vec::new(),
-        });
+        let entry = groups
+            .entry(pattern.clone())
+            .or_insert_with(|| PatternGroup {
+                pattern: pattern.clone(),
+                locations: Vec::new(),
+            });
         entry.locations.push((*file_id, flow.receive_range));
     }
     let mut sorted: Vec<_> = groups.into_values().collect();

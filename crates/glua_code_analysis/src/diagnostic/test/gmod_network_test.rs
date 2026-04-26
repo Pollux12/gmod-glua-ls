@@ -328,8 +328,7 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.diagnostics.disable =
-            vec![DiagnosticCode::GmodNetReadWriteTypeMismatch];
+        emmyrc.diagnostics.disable = vec![DiagnosticCode::GmodNetReadWriteTypeMismatch];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -362,8 +361,7 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.diagnostics.disable =
-            vec![DiagnosticCode::GmodNetMissingNetworkCounterpart];
+        emmyrc.diagnostics.disable = vec![DiagnosticCode::GmodNetMissingNetworkCounterpart];
         ws.update_emmyrc(emmyrc);
 
         let server_file_id = ws.def_file(

@@ -107,13 +107,8 @@ pub fn resolve_code_lens(
                 .clone()
                 .or_else(|| locations.first().map(|loc| loc.uri.clone()))?;
             let title = format_net_usages_title(usage_count, sender_count, receiver_count);
-            let command = make_command_with_title(
-                lens_uri,
-                code_lens.range,
-                title,
-                client_id,
-                locations,
-            );
+            let command =
+                make_command_with_title(lens_uri, code_lens.range, title, client_id, locations);
             Some(CodeLens {
                 range: code_lens.range,
                 command: Some(command),
@@ -181,7 +176,11 @@ fn format_net_usages_title(
     receiver_count: usize,
 ) -> String {
     let usage_word = if usage_count == 1 { "usage" } else { "usages" };
-    let sender_word = if sender_count == 1 { "sender" } else { "senders" };
+    let sender_word = if sender_count == 1 {
+        "sender"
+    } else {
+        "senders"
+    };
     let receiver_word = if receiver_count == 1 {
         "receiver"
     } else {

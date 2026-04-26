@@ -295,9 +295,10 @@ impl<'a> HoverBuilder<'a> {
             tags.join("\n\n")
         };
 
-        let source_content = self.source.as_deref().map_or_else(String::new, |source| {
-            format!("**Source:** <{}>", source)
-        });
+        let source_content = self
+            .source
+            .as_deref()
+            .map_or_else(String::new, |source| format!("**Source:** <{}>", source));
 
         let expansion_content = {
             let mut expansion = Vec::new();

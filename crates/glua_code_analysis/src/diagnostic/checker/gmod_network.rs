@@ -1,7 +1,6 @@
 use crate::{
-    DiagnosticCode, GmodRealm, NetOpKind, NetReceiveFlow, NetSendFlow,
-    SemanticModel, expected_receiver_realm, flows_can_match, is_opposite_strict_realm_pair,
-    is_strict_realm,
+    DiagnosticCode, GmodRealm, NetOpKind, NetReceiveFlow, NetSendFlow, SemanticModel,
+    expected_receiver_realm, flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -271,17 +270,15 @@ fn first_mismatch_diagnostic(
     send_flow: &NetSendFlow,
     receive_flow: &NetReceiveFlow,
 ) -> Option<(DiagnosticCode, rowan::TextRange, String)> {
-    let has_dynamic = send_flow.writes.iter().any(|w| w.dynamic)
-        || receive_flow.reads.iter().any(|r| r.dynamic);
+    let has_dynamic =
+        send_flow.writes.iter().any(|w| w.dynamic) || receive_flow.reads.iter().any(|r| r.dynamic);
 
     // Count mismatch is meaningless when either side contains dynamic ops
     // (their effective count is variable). The DP-based matcher already
     // rejected this pair, so the failure is a real structural mismatch — but
     // emitting a precise position is unreliable, so we fall through to the
     // per-position type/order checks below and skip the raw count message.
-    if !has_dynamic
-        && send_flow.writes.len() != receive_flow.reads.len()
-    {
+    if !has_dynamic && send_flow.writes.len() != receive_flow.reads.len() {
         return Some((
             DiagnosticCode::GmodNetReadWriteOrderMismatch,
             receive_flow.receive_range,

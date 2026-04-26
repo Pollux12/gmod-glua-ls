@@ -423,10 +423,7 @@ impl FileFunctionMap {
         let mut all_blocks: Vec<LuaBlock> = Vec::new();
         for node in root.syntax().descendants() {
             if let Some(local_func_stat) = LuaLocalFuncStat::cast(node.clone()) {
-                if let Some(block) = local_func_stat
-                    .get_closure()
-                    .and_then(|c| c.get_block())
-                {
+                if let Some(block) = local_func_stat.get_closure().and_then(|c| c.get_block()) {
                     if let Some(local_name) = local_func_stat
                         .get_local_name()
                         .and_then(|n| n.get_name_token())
@@ -448,9 +445,7 @@ impl FileFunctionMap {
                     let Some(block) = closure.get_block() else {
                         continue;
                     };
-                    if let Some(name_token) =
-                        names.get(idx).and_then(|n| n.get_name_token())
-                    {
+                    if let Some(name_token) = names.get(idx).and_then(|n| n.get_name_token()) {
                         bare.entry(name_token.get_name_text().to_string())
                             .or_insert_with(|| block.clone());
                     }
@@ -459,10 +454,7 @@ impl FileFunctionMap {
                 continue;
             }
             if let Some(func_stat) = LuaFuncStat::cast(node.clone()) {
-                let Some(block) = func_stat
-                    .get_closure()
-                    .and_then(|c| c.get_block())
-                else {
+                let Some(block) = func_stat.get_closure().and_then(|c| c.get_block()) else {
                     continue;
                 };
                 match func_stat.get_func_name() {
@@ -1076,8 +1068,8 @@ fn collect_net_ops_recursive(
             continue;
         }
 
-        let helper_force_dynamic = force_dynamic
-            || is_call_expr_in_dynamic_control_flow(enclosing_block, &call_expr);
+        let helper_force_dynamic =
+            force_dynamic || is_call_expr_in_dynamic_control_flow(enclosing_block, &call_expr);
         // Carry the call-site's flow context into the helper so reads/writes
         // performed inside the helper appear under the correct outer
         // `for`/`if`/`while` frames in hover.

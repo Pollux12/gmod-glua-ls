@@ -225,7 +225,12 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
             let index_key = index_expr.get_index_key()?;
             let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
             let (member_owner, set_owner_only) = resolve_index_expr_member_owner(&prefix_type)?;
-            if analyzer.db.get_member_index().get_member(&member_id).is_none() {
+            if analyzer
+                .db
+                .get_member_index()
+                .get_member(&member_id)
+                .is_none()
+            {
                 let cache = analyzer
                     .context
                     .infer_manager
@@ -244,7 +249,10 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
                     LuaMemberFeature::FileDefine
                 };
                 let member = LuaMember::new(member_id, member_key, decl_feature, None);
-                analyzer.db.get_member_index_mut().add_member(member_owner, member);
+                analyzer
+                    .db
+                    .get_member_index_mut()
+                    .add_member(member_owner, member);
                 return Some(());
             }
 

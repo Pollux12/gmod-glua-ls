@@ -244,7 +244,10 @@ impl NetFlowKind {
     /// True when the construct may execute its body more than once.
     /// Used by hover to label loops as "may repeat" vs ifs as "may not run".
     pub fn is_loop(self) -> bool {
-        matches!(self, NetFlowKind::While | NetFlowKind::For | NetFlowKind::ForRange | NetFlowKind::Repeat)
+        matches!(
+            self,
+            NetFlowKind::While | NetFlowKind::For | NetFlowKind::ForRange | NetFlowKind::Repeat
+        )
     }
 }
 
