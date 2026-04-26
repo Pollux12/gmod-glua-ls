@@ -467,21 +467,19 @@ fn nullable_any_type() -> LuaType {
 }
 
 fn literal_types_with_same_base(left: &LuaType, right: &LuaType) -> bool {
-    match (left, right) {
+    matches!(
+        (left, right),
         (
             LuaType::StringConst(_) | LuaType::DocStringConst(_),
             LuaType::StringConst(_) | LuaType::DocStringConst(_),
-        )
-        | (
+        ) | (
             LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) | LuaType::FloatConst(_),
             LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) | LuaType::FloatConst(_),
+        ) | (
+            LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_),
+            LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_),
         )
-        | (
-            LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_),
-            LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_),
-        ) => true,
-        _ => false,
-    }
+    )
 }
 
 fn object_or_array_literal_candidate(ty: &LuaType) -> bool {

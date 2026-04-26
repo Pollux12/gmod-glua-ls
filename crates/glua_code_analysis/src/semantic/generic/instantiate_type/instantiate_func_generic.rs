@@ -198,31 +198,28 @@ fn infer_generic_types_from_call(
             continue;
         }
 
-        match func_param_type {
-            LuaType::Variadic(variadic) => {
-                let mut rest_arg_exprs = &arg_exprs[arg_index..];
-                let is_last_param = i + 1 == func_params.len();
-                if !is_last_param {
-                    let suffix_len = func_params.len() - i - 1;
-                    let rest_len = rest_arg_exprs.len().saturating_sub(suffix_len);
-                    rest_arg_exprs = &rest_arg_exprs[..rest_len];
-                    arg_offset += rest_len as isize - 1;
-                }
-
-                let mut arg_types = vec![];
-                for arg_expr in rest_arg_exprs {
-                    let arg_type =
-                        infer_generic_arg_type(db, context, arg_expr, use_inline_table_object)?;
-                    arg_types.push(arg_type);
-                }
-                variadic_tpl_pattern_match(context, variadic, &arg_types)?;
-                if is_last_param {
-                    break;
-                }
-
-                continue;
+        if let LuaType::Variadic(variadic) = func_param_type {
+            let mut rest_arg_exprs = &arg_exprs[arg_index..];
+            let is_last_param = i + 1 == func_params.len();
+            if !is_last_param {
+                let suffix_len = func_params.len() - i - 1;
+                let rest_len = rest_arg_exprs.len().saturating_sub(suffix_len);
+                rest_arg_exprs = &rest_arg_exprs[..rest_len];
+                arg_offset += rest_len as isize - 1;
             }
-            _ => {}
+
+            let mut arg_types = vec![];
+            for arg_expr in rest_arg_exprs {
+                let arg_type =
+                    infer_generic_arg_type(db, context, arg_expr, use_inline_table_object)?;
+                arg_types.push(arg_type);
+            }
+            variadic_tpl_pattern_match(context, variadic, &arg_types)?;
+            if is_last_param {
+                break;
+            }
+
+            continue;
         }
 
         let call_arg_expr = &arg_exprs[arg_index];

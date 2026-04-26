@@ -242,18 +242,13 @@ pub(super) fn try_expand_generic_alias_for_pattern(
     let origin = type_decl.get_alias_ref()?;
     let substitutor =
         TypeSubstitutor::from_alias_for_type(db, generic.get_params().clone(), base.clone());
-    Some(instantiate_type_for_pattern(db, origin, &substitutor))
+    Some(instantiate_type_for_pattern(origin, &substitutor))
 }
 
-fn instantiate_type_for_pattern(
-    db: &DbIndex,
-    ty: &LuaType,
-    substitutor: &TypeSubstitutor,
-) -> LuaType {
+fn instantiate_type_for_pattern(ty: &LuaType, substitutor: &TypeSubstitutor) -> LuaType {
     match ty {
         LuaType::Array(array_type) => LuaType::Array(
             LuaArrayType::from_base_type(instantiate_type_for_pattern(
-                db,
                 array_type.get_base(),
                 substitutor,
             ))
@@ -264,7 +259,7 @@ fn instantiate_type_for_pattern(
                 tuple
                     .get_types()
                     .iter()
-                    .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                    .map(|ty| instantiate_type_for_pattern(ty, substitutor))
                     .collect(),
                 tuple.status,
             )
@@ -278,11 +273,11 @@ fn instantiate_type_for_pattern(
                     (
                         name.clone(),
                         ty.as_ref()
-                            .map(|ty| instantiate_type_for_pattern(db, ty, substitutor)),
+                            .map(|ty| instantiate_type_for_pattern(ty, substitutor)),
                     )
                 })
                 .collect();
-            let ret = instantiate_type_for_pattern(db, doc_func.get_ret(), substitutor);
+            let ret = instantiate_type_for_pattern(doc_func.get_ret(), substitutor);
             LuaType::DocFunction(
                 LuaFunctionType::new(
                     doc_func.get_async_state(),
@@ -301,7 +296,7 @@ fn instantiate_type_for_pattern(
                 .map(|(key, value)| {
                     (
                         key.clone(),
-                        instantiate_type_for_pattern(db, value, substitutor),
+                        instantiate_type_for_pattern(value, substitutor),
                     )
                 })
                 .collect();
@@ -310,8 +305,8 @@ fn instantiate_type_for_pattern(
                 .iter()
                 .map(|(key, value)| {
                     (
-                        instantiate_type_for_pattern(db, key, substitutor),
-                        instantiate_type_for_pattern(db, value, substitutor),
+                        instantiate_type_for_pattern(key, substitutor),
+                        instantiate_type_for_pattern(value, substitutor),
                     )
                 })
                 .collect();
@@ -321,7 +316,7 @@ fn instantiate_type_for_pattern(
             union
                 .into_vec()
                 .into_iter()
-                .map(|ty| instantiate_type_for_pattern(db, &ty, substitutor))
+                .map(|ty| instantiate_type_for_pattern(&ty, substitutor))
                 .collect(),
         ),
         LuaType::Generic(generic) => LuaType::Generic(
@@ -330,7 +325,7 @@ fn instantiate_type_for_pattern(
                 generic
                     .get_params()
                     .iter()
-                    .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                    .map(|ty| instantiate_type_for_pattern(ty, substitutor))
                     .collect(),
             )
             .into(),
@@ -338,7 +333,7 @@ fn instantiate_type_for_pattern(
         LuaType::TableGeneric(params) => LuaType::TableGeneric(
             params
                 .iter()
-                .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                .map(|ty| instantiate_type_for_pattern(ty, substitutor))
                 .collect::<Vec<_>>()
                 .into(),
         ),
@@ -359,12 +354,12 @@ fn instantiate_type_for_pattern(
         LuaType::Variadic(variadic) => LuaType::Variadic(
             match variadic.deref() {
                 VariadicType::Base(base) => {
-                    VariadicType::Base(instantiate_type_for_pattern(db, base, substitutor))
+                    VariadicType::Base(instantiate_type_for_pattern(base, substitutor))
                 }
                 VariadicType::Multi(types) => VariadicType::Multi(
                     types
                         .iter()
-                        .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                        .map(|ty| instantiate_type_for_pattern(ty, substitutor))
                         .collect(),
                 ),
             }
@@ -376,7 +371,7 @@ fn instantiate_type_for_pattern(
                 alias_call
                     .get_operands()
                     .iter()
-                    .map(|ty| instantiate_type_for_pattern(db, ty, substitutor))
+                    .map(|ty| instantiate_type_for_pattern(ty, substitutor))
                     .collect(),
             )
             .into(),
@@ -386,11 +381,11 @@ fn instantiate_type_for_pattern(
             param.type_constraint = param
                 .type_constraint
                 .as_ref()
-                .map(|ty| instantiate_type_for_pattern(db, ty, substitutor));
+                .map(|ty| instantiate_type_for_pattern(ty, substitutor));
             LuaType::Mapped(
                 LuaMappedType::new(
                     (mapped.param.0, param),
-                    instantiate_type_for_pattern(db, &mapped.value, substitutor),
+                    instantiate_type_for_pattern(&mapped.value, substitutor),
                     mapped.is_readonly,
                     mapped.is_optional,
                 )
@@ -398,10 +393,10 @@ fn instantiate_type_for_pattern(
             )
         }
         LuaType::TypeGuard(inner) => {
-            LuaType::TypeGuard(instantiate_type_for_pattern(db, inner, substitutor).into())
+            LuaType::TypeGuard(instantiate_type_for_pattern(inner, substitutor).into())
         }
         LuaType::TableOf(inner) => {
-            LuaType::TableOf(instantiate_type_for_pattern(db, inner, substitutor).into())
+            LuaType::TableOf(instantiate_type_for_pattern(inner, substitutor).into())
         }
         _ => ty.clone(),
     }

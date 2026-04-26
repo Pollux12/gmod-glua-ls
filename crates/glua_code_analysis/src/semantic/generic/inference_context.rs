@@ -389,9 +389,7 @@ impl TypeInferenceInfo {
     }
 
     fn infer_covariant_candidate(&self, db: &DbIndex) -> Option<SubstitutorTypeValue> {
-        let Some((first, rest)) = self.candidates.split_first() else {
-            return None;
-        };
+        let (first, rest) = self.candidates.split_first()?;
 
         let mut inferred = first.clone();
         let combine_candidates = self
@@ -409,9 +407,7 @@ impl TypeInferenceInfo {
     }
 
     fn infer_contravariant_candidate(&self, db: &DbIndex) -> Option<SubstitutorTypeValue> {
-        let Some((first, rest)) = self.contra_candidates.split_first() else {
-            return None;
-        };
+        let (first, rest) = self.contra_candidates.split_first()?;
 
         let mut inferred = first.clone();
         let combine_candidates = self
