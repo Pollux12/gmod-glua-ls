@@ -93,11 +93,20 @@ pub fn get_type_at_flow(
             // Don't cache — this is a transient cycle-detection signal.
         }
         Err(reason) => {
-            let entry = CacheEntry::Error(reason.clone());
-            for &fid in &visited_flow_ids {
-                cache
-                    .flow_node_cache
-                    .insert((var_ref_id.clone(), fid, query_realm), entry.clone());
+            let should_cache = match reason {
+                InferFailReason::UnResolveDeclType(_) => {
+                    cache.get_config().analysis_phase.is_diagnostics()
+                }
+                _ => true,
+            };
+
+            if should_cache {
+                let entry = CacheEntry::Error(reason.clone());
+                for &fid in &visited_flow_ids {
+                    cache
+                        .flow_node_cache
+                        .insert((var_ref_id.clone(), fid, query_realm), entry.clone());
+                }
             }
         }
     }

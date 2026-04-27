@@ -237,6 +237,9 @@ fn should_apply_resolved_return_docs(
     signature: &LuaSignature,
     return_docs: &[LuaDocReturnInfo],
 ) -> bool {
+    let current_return = signature.get_return_type();
+    let new_return = return_docs_to_type(return_docs);
+
     if signature.resolve_return == SignatureReturnStatus::UnResolve {
         return true;
     }
@@ -245,8 +248,9 @@ fn should_apply_resolved_return_docs(
         return false;
     }
 
-    let current_return = signature.get_return_type();
-    let new_return = return_docs_to_type(return_docs);
+    if current_return.is_unknown() && new_return.is_any() {
+        return true; // Allow upgrading Unknown to Any
+    }
 
     (current_return.is_unknown() || current_return.is_any())
         && !(new_return.is_unknown() || new_return.is_any())

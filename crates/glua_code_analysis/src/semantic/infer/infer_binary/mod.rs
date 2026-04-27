@@ -159,7 +159,7 @@ fn infer_binary_custom_operator(
                 || left.is_unknown()
                 || right.is_unknown();
             if has_ambiguous_operand || left.is_custom_type() || right.is_custom_type() {
-                Ok(LuaType::Unknown)
+                Ok(LuaType::Any)
             } else {
                 Ok(LuaType::Number)
             }

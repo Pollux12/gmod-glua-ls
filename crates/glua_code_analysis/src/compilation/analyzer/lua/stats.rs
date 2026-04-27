@@ -136,6 +136,20 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                             }
                         }
                         return Some(());
+                    } else {
+                        // Single-return or non-variadic evaluated to a single value,
+                        // so extra slots receive `any` (legacy convention) instead of unknown.
+                        for i in expr_count..name_count {
+                            let name = name_list.get(i)?;
+                            let position = name.get_position();
+                            let decl_id = LuaDeclId::new(analyzer.file_id, position);
+                            bind_type(
+                                analyzer.db,
+                                decl_id.into(),
+                                LuaTypeCache::InferType(LuaType::Any),
+                            );
+                        }
+                        return Some(());
                     }
                 }
                 Err(reason) => {
@@ -388,6 +402,18 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                             type_owner,
                             &last_expr_type,
                             i - expr_count + 1,
+                        );
+                    }
+                } else {
+                    for i in expr_count..var_count {
+                        let var = var_list.get(i)?;
+                        let type_owner = get_var_owner(analyzer, var.clone());
+                        set_index_expr_owner(analyzer, var.clone());
+                        assign_merge_type_owner_and_expr_type(
+                            analyzer,
+                            type_owner,
+                            &LuaType::Any,
+                            0, // Any doesn't need indexing
                         );
                     }
                 }
