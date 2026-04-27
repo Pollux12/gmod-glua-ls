@@ -135,27 +135,6 @@ mod test {
     }
 
     #[test]
-    fn test_issue_107() {
-        let mut ws = VirtualWorkspace::new();
-        assert!(ws.check_code_for(
-            DiagnosticCode::NeedCheckNil,
-            r#"
-        ---@type {bar?: fun():string}
-        local props
-        if props.bar then
-            local foo = props.bar()
-        end
-
-        if type(props.bar) == 'function' then
-            local foo = props.bar()
-        end
-
-        local foo = props.bar and props.bar() or nil
-        "#
-        ));
-    }
-
-    #[test]
     fn test_issue_100() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(ws.check_code_for(
@@ -231,6 +210,27 @@ mod test {
 
             bar({})
             "#
+        ));
+    }
+
+    #[test]
+    fn test_issue_107() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+        ---@type {bar?: fun():string}
+        local props
+        if props.bar then
+            local foo = props.bar()
+        end
+
+        if type(props.bar) == 'function' then
+            local foo = props.bar()
+        end
+
+        local foo = props.bar and props.bar() or nil
+        "#
         ));
     }
 
@@ -4226,37 +4226,68 @@ _2 = a[1]
         assert_eq!(narrowed, LuaType::Any);
     }
 
-    #[gtest]
-    fn test_unknown_local_indexed_guard_is_not_promoted_to_any() {
+    #[test]
+    fn test_unknown_local_istable_guard_is_scoped() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+
         let file_id = ws.def_file(
             "test.lua",
             r#"
-            local my_local ---@type unknown
-            if my_local.Version then
-                local a = my_local
+            local x ---@type unknown
+            if istable(x) then
+                print(x) -- 1st from end
             end
-        "#,
+            print(x) -- 0th from end
+            "#,
         );
 
-        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "my_local", 0);
-        assert_eq!(narrowed, LuaType::Unknown);
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 1);
+        assert_eq!(ws.humanize_type(narrowed), "table");
+
+        let not_narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 0);
+        assert_eq!(ws.humanize_type(not_narrowed), "unknown");
     }
 
     #[gtest]
-    fn test_unknown_local_binary_guard_is_not_promoted_to_any() {
+    fn test_unknown_local_indexed_guard_promoted_to_any_within_scope() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
             r#"
-            local my_local ---@type unknown
-            if my_local.Version < 4.1 then
-                local a = my_local
+            local x ---@type unknown
+            if x.Version then
+                print(x) -- 1st from end
             end
+            print(x) -- 0th from end
         "#,
         );
 
-        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "my_local", 0);
-        assert_eq!(narrowed, LuaType::Unknown);
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 1);
+        assert_eq!(narrowed, LuaType::Any);
+
+        let not_narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 0);
+        assert_eq!(not_narrowed, LuaType::Unknown);
+    }
+
+    #[gtest]
+    fn test_unknown_local_binary_guard_promoted_to_any_within_scope() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local y ---@type unknown
+            if y.Version < 4.1 then
+                print(y) -- 1st from end
+            end
+            print(y) -- 0th from end
+        "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "y", 1);
+        assert_eq!(narrowed, LuaType::Any);
+
+        let not_narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "y", 0);
+        assert_eq!(not_narrowed, LuaType::Unknown);
     }
 }
