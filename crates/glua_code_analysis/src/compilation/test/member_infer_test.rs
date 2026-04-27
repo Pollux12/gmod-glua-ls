@@ -1060,4 +1060,74 @@ Glide.TestVar:TestMethod()
         let has_diag = file_has_diagnostic(&mut ws, file_id2, DiagnosticCode::UndefinedField);
         assert_that!(has_diag, eq(false));
     }
+
+    #[gtest]
+    fn test_guarded_global_field_table_persists_methods_across_files() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_a = ws.def_file(
+            "file_a.lua",
+            r#"
+Glide = Glide or {}
+---@class GlideEditor
+local Editor = Glide.VehicleLayoutEditor or {}
+function Editor:TestMethod() end
+Glide.VehicleLayoutEditor = Editor
+"#,
+        );
+        let file_b = ws.def_file(
+            "file_b.lua",
+            r#"
+local Editor = Glide.VehicleLayoutEditor
+Editor:TestMethod()
+"#,
+        );
+        let file_c = ws.def_file(
+            "file_c.lua",
+            r#"
+local Editor = Glide.VehicleLayoutEditor
+Editor:MissingMethod()
+"#,
+        );
+
+        let editor_type = local_name_type(&mut ws, file_b, "Editor");
+        assert_that!(
+            editor_type.is_unknown(),
+            eq(false),
+            "Editor should not be unknown. Actually: {:?}",
+            editor_type
+        );
+
+        let has_undef = file_has_diagnostic(&mut ws, file_b, DiagnosticCode::UndefinedField);
+        assert_that!(
+            has_undef,
+            eq(false),
+            "Method defined through guarded local alias should persist across files"
+        );
+
+        let has_need_check_nil = file_has_diagnostic(&mut ws, file_b, DiagnosticCode::NeedCheckNil);
+        assert_that!(
+            has_need_check_nil,
+            eq(false),
+            "Method call should not require a nil check if correctly inferred"
+        );
+
+        let has_undef_missing =
+            file_has_diagnostic(&mut ws, file_c, DiagnosticCode::UndefinedField);
+        assert_that!(
+            has_undef_missing,
+            eq(true),
+            "Method missing from Editor should trigger UndefinedField"
+        );
+
+        let editor_type_a = local_name_type(&mut ws, file_a, "Editor");
+        assert_that!(
+            &editor_type,
+            eq(&editor_type_a),
+            "Editor in file_b should have the same concrete type as Editor in file_a"
+        );
+    }
 }
