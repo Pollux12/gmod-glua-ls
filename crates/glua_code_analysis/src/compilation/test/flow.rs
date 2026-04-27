@@ -4136,10 +4136,10 @@ _2 = a[1]
     }
 
     #[gtest]
-    fn test_undefined_global_guard_after_index_truthy_does_not_promote_to_any() {
+    fn test_undefined_global_guard_after_index_truthy_promotes_to_any() {
         // Reading `tmysql.Version` in an `if` condition implies `tmysql` is
-        // non-nil/non-false in the truthy branch, but that does not mean the
-        // undefined-global base is safe to promote to `any`.
+        // non-nil/non-false in the truthy branch, so we promote the
+        // undefined-global base to `any` rather than keeping it nil/unknown.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4151,11 +4151,11 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_eq!(narrowed, LuaType::Nil);
+        assert_eq!(narrowed, LuaType::Any);
     }
 
     #[gtest]
-    fn test_undefined_global_guard_after_truthy_does_not_promote_to_any() {
+    fn test_undefined_global_guard_after_truthy_keeps_nil_without_index_evidence() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4171,7 +4171,7 @@ _2 = a[1]
     }
 
     #[gtest]
-    fn test_undefined_global_guard_after_deep_index_truthy_does_not_promote_to_any() {
+    fn test_undefined_global_guard_after_deep_index_truthy_promotes_to_any() {
         // Deep index chains: prefix is itself an IndexExpr.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
@@ -4184,13 +4184,13 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_eq!(narrowed, LuaType::Nil);
+        assert_eq!(narrowed, LuaType::Any);
     }
 
     #[gtest]
-    fn test_undefined_global_guard_after_index_comparison_does_not_promote_to_any() {
+    fn test_undefined_global_guard_after_index_comparison_promotes_to_any() {
         // Comparison on indexed read (e.g. `tmysql.Version < 4.1`) implies
-        // the indexed base is non-nil in the truthy branch.
+        // the indexed base is non-nil in the truthy branch, so it promotes to `Any`.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4202,14 +4202,14 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_eq!(narrowed, LuaType::Nil);
+        assert_eq!(narrowed, LuaType::Any);
     }
 
     #[gtest]
-    fn test_undefined_global_guard_in_else_after_index_does_not_promote_to_any() {
+    fn test_undefined_global_guard_in_else_after_index_promotes_to_any() {
         // The else-branch of `if tmysql.Version then ... else ... end` is only
         // reached if the index access succeeded (i.e. tmysql was non-nil),
-        // so tmysql should also narrow without becoming `any`.
+        // so tmysql should narrow and become `Any`.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4223,6 +4223,40 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_eq!(narrowed, LuaType::Nil);
+        assert_eq!(narrowed, LuaType::Any);
+    }
+
+    #[gtest]
+    fn test_unknown_local_indexed_guard_is_not_promoted_to_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local my_local ---@type unknown
+            if my_local.Version then
+                local a = my_local
+            end
+        "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "my_local", 0);
+        assert_eq!(narrowed, LuaType::Unknown);
+    }
+
+    #[gtest]
+    fn test_unknown_local_binary_guard_is_not_promoted_to_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local my_local ---@type unknown
+            if my_local.Version < 4.1 then
+                local a = my_local
+            end
+        "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "my_local", 0);
+        assert_eq!(narrowed, LuaType::Unknown);
     }
 }

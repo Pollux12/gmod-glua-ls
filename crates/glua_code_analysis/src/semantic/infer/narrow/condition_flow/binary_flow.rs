@@ -177,8 +177,8 @@ fn try_unknown_prefix_widen(
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
-    if matches!(left_type, LuaType::Unknown) {
-        Ok(Some(LuaType::Unknown))
+    if matches!(left_type, LuaType::Unknown) && matches!(var_ref_id, VarRefId::GlobalName(_, _)) {
+        Ok(Some(LuaType::Any))
     } else {
         Ok(None)
     }

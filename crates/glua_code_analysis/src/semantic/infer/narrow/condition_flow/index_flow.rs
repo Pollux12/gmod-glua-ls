@@ -120,8 +120,9 @@ fn maybe_field_exist_narrow(
         // implies the base is non-nil/non-false at this point — both branches of
         // an `if tmysql.X then ... else ... end` only execute if `tmysql.X` was
         // successfully evaluated, which requires `tmysql` to be non-nil.
-        if matches!(left_type, LuaType::Unknown) {
-            return Ok(ResultTypeOrContinue::Result(LuaType::Unknown));
+        if matches!(left_type, LuaType::Unknown) && matches!(var_ref_id, VarRefId::GlobalName(_, _))
+        {
+            return Ok(ResultTypeOrContinue::Result(LuaType::Any));
         }
         return Ok(ResultTypeOrContinue::Continue);
     };
@@ -388,8 +389,8 @@ fn maybe_transitive_unknown_prefix_narrow(
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
-    if matches!(left_type, LuaType::Unknown) {
-        return Ok(ResultTypeOrContinue::Result(LuaType::Unknown));
+    if matches!(left_type, LuaType::Unknown) && matches!(var_ref_id, VarRefId::GlobalName(_, _)) {
+        return Ok(ResultTypeOrContinue::Result(LuaType::Any));
     }
     Ok(ResultTypeOrContinue::Continue)
 }
