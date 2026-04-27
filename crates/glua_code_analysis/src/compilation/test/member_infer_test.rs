@@ -1022,4 +1022,42 @@ mod test {
             value_ty
         );
     }
+
+    #[gtest]
+    fn test_bootstrap_table_literal_preserves_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+local var = Glide.TestVar or {}
+function var:TestMethod() end
+Glide.TestVar = var
+
+var:TestMethod()
+Glide.TestVar:TestMethod()
+"#,
+        );
+
+        let has_diag = file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert_that!(has_diag, eq(false));
+    }
+
+    #[gtest]
+    fn test_bootstrap_table_cross_file() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+local var = Glide.TestVar or {}
+function var:TestMethod() end
+Glide.TestVar = var
+"#,
+        );
+        let file_id2 = ws.def(
+            r#"
+Glide.TestVar:TestMethod()
+"#,
+        );
+
+        let has_diag = file_has_diagnostic(&mut ws, file_id2, DiagnosticCode::UndefinedField);
+        assert_that!(has_diag, eq(false));
+    }
 }
