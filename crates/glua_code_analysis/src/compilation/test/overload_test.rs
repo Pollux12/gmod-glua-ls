@@ -347,7 +347,7 @@ mod test {
         );
 
         let ty = ws.expr_ty("A");
-        assert_eq!(ws.humanize_type(ty), "any");
+        assert_eq!(ws.humanize_type(ty), "unknown");
     }
 
     #[test]
@@ -423,7 +423,7 @@ mod test {
         );
 
         let ty = ws.expr_ty("A");
-        assert_eq!(ws.humanize_type(ty), "any");
+        assert_eq!(ws.humanize_type(ty), "unknown");
     }
 
     #[test]
@@ -496,7 +496,7 @@ mod test {
         );
 
         let ty = ws.expr_ty("A");
-        assert_eq!(ws.humanize_type(ty), "any");
+        assert_eq!(ws.humanize_type(ty), "unknown");
     }
 
     #[test]
