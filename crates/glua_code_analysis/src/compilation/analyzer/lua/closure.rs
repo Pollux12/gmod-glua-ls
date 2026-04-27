@@ -1,7 +1,8 @@
 use std::ops::Deref;
 
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaFuncStat, LuaVarExpr,
+    LuaAst, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaComment, LuaDocTagReturn,
+    LuaFuncStat, LuaStat, LuaSyntaxKind, LuaVarExpr,
 };
 
 use crate::{
@@ -116,7 +117,10 @@ fn analyze_return(
     closure: &LuaClosureExpr,
 ) -> Option<()> {
     let signature = analyzer.db.get_signature_index().get(signature_id)?;
-    if signature.resolve_return == SignatureReturnStatus::DocResolve {
+    if signature.resolve_return == SignatureReturnStatus::DocResolve
+        && (!signature_has_uninformative_return(signature)
+            || closure_has_direct_return_doc(closure))
+    {
         return None;
     }
 
@@ -179,6 +183,29 @@ fn analyze_return(
     Some(())
 }
 
+fn signature_has_uninformative_return(signature: &crate::LuaSignature) -> bool {
+    let return_type = signature.get_return_type();
+    return_type.is_any() || return_type.is_unknown()
+}
+
+fn closure_has_direct_return_doc(closure: &LuaClosureExpr) -> bool {
+    let Some(comment) = closure
+        .ancestors::<LuaStat>()
+        .next()
+        .and_then(|stat| stat.syntax().prev_sibling())
+    else {
+        return false;
+    };
+
+    let kind: LuaSyntaxKind = comment.kind().into();
+    if kind != LuaSyntaxKind::Comment {
+        return false;
+    }
+
+    LuaComment::cast(comment)
+        .is_some_and(|comment| comment.children::<LuaDocTagReturn>().next().is_some())
+}
+
 fn analyze_lambda_returns(
     analyzer: &mut LuaAnalyzer,
     signature_id: &LuaSignatureId,
@@ -212,12 +239,15 @@ pub fn analyze_return_point(
     cache: &mut LuaInferCache,
     return_points: &Vec<LuaReturnPoint>,
 ) -> Result<Vec<LuaDocReturnInfo>, InferFailReason> {
-    let mut return_type = LuaType::Unknown;
+    let mut return_type = None;
     for point in return_points {
         match point {
             LuaReturnPoint::Expr(expr) => {
                 let expr_type = infer_expr(db, cache, expr.clone())?;
-                return_type = union_return_expr(db, return_type, expr_type);
+                return_type = Some(match return_type {
+                    Some(current) => union_return_expr(db, current, expr_type),
+                    None => expr_type,
+                });
             }
             LuaReturnPoint::MuliExpr(exprs) => {
                 let mut multi_return = vec![];
@@ -226,17 +256,23 @@ pub fn analyze_return_point(
                     multi_return.push(expr_type);
                 }
                 let typ = LuaType::Variadic(VariadicType::Multi(multi_return).into());
-                return_type = union_return_expr(db, return_type, typ);
+                return_type = Some(match return_type {
+                    Some(current) => union_return_expr(db, current, typ),
+                    None => typ,
+                });
             }
             LuaReturnPoint::Nil => {
-                return_type = union_return_expr(db, return_type, LuaType::Nil);
+                return_type = Some(match return_type {
+                    Some(current) => union_return_expr(db, current, LuaType::Nil),
+                    None => LuaType::Nil,
+                });
             }
-            _ => {}
+            LuaReturnPoint::Error => {}
         }
     }
 
     Ok(vec![LuaDocReturnInfo {
-        type_ref: return_type,
+        type_ref: return_type.unwrap_or(LuaType::Unknown),
         description: None,
         name: None,
         attributes: None,
@@ -245,11 +281,15 @@ pub fn analyze_return_point(
 }
 
 fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
-    if left == LuaType::Unknown {
-        return right;
-    }
-
     match (&left, &right) {
+        (LuaType::Any, right) if should_union_any_as_unknown(right) => {
+            LuaType::from_vec(vec![LuaType::Unknown, right.clone()])
+        }
+        (left, LuaType::Any) if should_union_any_as_unknown(left) => {
+            LuaType::from_vec(vec![left.clone(), LuaType::Unknown])
+        }
+        (LuaType::Unknown, LuaType::Unknown) => LuaType::Unknown,
+        (LuaType::Unknown, _) | (_, LuaType::Unknown) => LuaType::from_vec(vec![left, right]),
         (LuaType::Variadic(left_variadic), LuaType::Variadic(right_variadic)) => {
             match (&left_variadic.deref(), &right_variadic.deref()) {
                 (VariadicType::Base(left_base), VariadicType::Base(right_base)) => {
@@ -331,4 +371,8 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
         }
         _ => TypeOps::Union.apply(db, &left, &right),
     }
+}
+
+fn should_union_any_as_unknown(typ: &LuaType) -> bool {
+    !matches!(typ, LuaType::Any | LuaType::Unknown | LuaType::Nil) && !typ.is_nullable()
 }

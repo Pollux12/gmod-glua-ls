@@ -1,10 +1,85 @@
 #[cfg(test)]
 mod test {
+    use glua_parser::{LuaAstNode, LuaFuncStat, LuaIndexKey, LuaNameExpr, LuaVarExpr};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, LuaType, LuaTypeDeclId, VirtualWorkspace};
+    use crate::{DiagnosticCode, LuaSignatureId, LuaType, LuaTypeDeclId, VirtualWorkspace};
+
+    fn assert_union_contains_unknown_and(typ: LuaType, expected: LuaType) {
+        let LuaType::Union(union) = typ else {
+            panic!("expected union return type");
+        };
+        let types = union.into_vec();
+        assert!(types.contains(&LuaType::Unknown), "{types:?}");
+        assert!(types.contains(&expected), "{types:?}");
+    }
+
+    fn nth_name_expr_type_from_end(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth_from_end: usize,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let name_exprs = root
+            .clone()
+            .descendants::<LuaNameExpr>()
+            .filter(|expr| expr.get_name_text().as_deref() == Some(name))
+            .collect::<Vec<_>>();
+        let name_expr = name_exprs
+            .into_iter()
+            .rev()
+            .nth(nth_from_end)
+            .expect("expected matching name expression");
+        semantic_model
+            .get_semantic_info(name_expr.syntax().clone().into())
+            .expect("expected semantic info for name expression")
+            .typ
+    }
+
+    fn signature_return_type_for_function(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let func_stat = root
+            .descendants::<LuaFuncStat>()
+            .find(|stat| function_stat_name_is(stat, name))
+            .expect("expected function declaration");
+        let closure = func_stat.get_closure().expect("expected function closure");
+        let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+        semantic_model
+            .get_db()
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature")
+            .get_return_type()
+    }
+
+    fn function_stat_name_is(stat: &LuaFuncStat, name: &str) -> bool {
+        match stat.get_func_name() {
+            Some(LuaVarExpr::IndexExpr(index_expr)) => {
+                matches!(index_expr.get_index_key(), Some(LuaIndexKey::Name(name_token)) if name_token.get_name_text() == name)
+            }
+            Some(LuaVarExpr::NameExpr(name_expr)) => {
+                name_expr.get_name_text().as_deref() == Some(name)
+            }
+            _ => false,
+        }
+    }
 
     #[test]
     fn test_str_tpl_type() {
@@ -55,6 +130,418 @@ mod test {
         let result_ty = ws.expr_ty("ents.Create('sent_npc')");
         let expected = ws.ty("sent_npc");
         assert_eq!(result_ty, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_function_body_return_preserves_declared_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+                ---@class glide_wheel: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                ENT = {}
+
+                function ENT:CreateWheel()
+                    local wheel = ents.Create("glide_wheel")
+                    return wheel
+                end
+            "#,
+        );
+
+        let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
+        let expected = ws.ty("glide_wheel");
+        assert_eq!(wheel_ty, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_function_body_return_is_not_erased_by_any_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+                ---@class glide_wheel: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                ---@return any
+                function getExistingWheel()
+                end
+
+                ENT = {}
+
+                function ENT:CreateWheel()
+                    local existingWheel = getExistingWheel()
+                    if IsValid(existingWheel) then
+                        return existingWheel
+                    end
+
+                    local wheel = ents.Create("glide_wheel")
+                    return wheel
+                end
+            "#,
+        );
+
+        let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
+        let expected = ws.ty("glide_wheel");
+        assert_union_contains_unknown_and(wheel_ty, expected);
+    }
+
+    #[gtest]
+    fn test_unresolved_return_fallback_uses_unknown_not_any() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                local existingWheel = otherWheel
+                local otherWheel = existingWheel
+
+                function CreateWheel()
+                    return existingWheel
+                end
+            "#,
+        );
+
+        let wheel_ty = ws.expr_ty("CreateWheel()");
+        assert_eq!(wheel_ty, LuaType::Unknown);
+    }
+
+    #[gtest]
+    fn test_unknown_return_branch_is_preserved_before_precise_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+                ---@class glide_wheel: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                ---@return unknown
+                function getExistingWheel()
+                end
+
+                ENT = {}
+
+                function ENT:CreateWheel()
+                    local existingWheel = getExistingWheel()
+                    if existingWheel then
+                        return existingWheel
+                    end
+
+                    local wheel = ents.Create("glide_wheel")
+                    return wheel
+                end
+            "#,
+        );
+
+        let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
+        let expected = ws.ty("glide_wheel");
+        assert_union_contains_unknown_and(wheel_ty, expected);
+    }
+
+    #[gtest]
+    fn test_unknown_return_branch_is_preserved_after_precise_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+                ---@class glide_wheel: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                ---@return unknown
+                function getFallbackWheel()
+                end
+
+                ENT = {}
+
+                function ENT:CreateWheel()
+                    if makeNewWheel then
+                        local wheel = ents.Create("glide_wheel")
+                        return wheel
+                    end
+
+                    return getFallbackWheel()
+                end
+            "#,
+        );
+
+        let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
+        let expected = ws.ty("glide_wheel");
+        assert_union_contains_unknown_and(wheel_ty, expected);
+    }
+
+    #[gtest]
+    fn test_shadowed_isvalid_does_not_narrow_function_body_return() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                local function IsValid(_)
+                    return true
+                end
+
+                ---@param value string?
+                function getValue(value)
+                    if IsValid(value) then
+                        return value
+                    end
+
+                    return "fallback"
+                end
+            "#,
+        );
+
+        let value_ty = ws.expr_ty("getValue(nil)");
+        assert!(value_ty.is_nullable(), "{value_ty:?}");
+    }
+
+    #[gtest]
+    fn test_table_field_existing_return_does_not_poison_precise_createwheel_return() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+                ---@class base_glide: Entity
+                ---@class glide_wheel: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                ENT = {}
+
+                function ENT:CreateWheel()
+                    local selfTbl = {}
+                    ---@type table<number, glide_wheel>
+                    selfTbl.wheels = {}
+                    local index = 1
+                    local existingWheel = selfTbl.wheels and selfTbl.wheels[index]
+
+                    if IsValid(existingWheel) then
+                        return existingWheel
+                    end
+
+                    local wheel = ents.Create("glide_wheel")
+                    return wheel
+                end
+            "#,
+        );
+
+        let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
+        let expected = ws.ty("glide_wheel");
+        assert_eq!(wheel_ty, expected);
+    }
+
+    #[gtest]
+    fn test_gettable_existing_wheel_return_does_not_poison_precise_createwheel_return() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def_file(
+            "lua/entities/base_glide/sv_wheels.lua",
+            r#"
+                ---@class Entity
+                ---@return tableof<self>
+                function Entity:GetTable()
+                end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName)
+                end
+
+                ---@class glide_wheel: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                local getTable = FindMetaTable("Entity").GetTable
+                ENT = {}
+
+                function ENT:Initialize()
+                    local selfTbl = getTable(self)
+                    --- @type table<number, glide_wheel>
+                    selfTbl.wheels = {}
+                    selfTbl.wheelCount = 0
+                end
+
+                function ENT:CreateWheel()
+                    local selfTbl = getTable(self)
+                    local index = selfTbl.wheelCount + 1
+                    local existingWheel = selfTbl.wheels and selfTbl.wheels[index]
+
+                    if IsValid(existingWheel) then
+                        return existingWheel
+                    end
+
+                    local wheel = ents.Create("glide_wheel")
+                    selfTbl.wheels[index] = wheel
+                    return wheel
+                end
+            "#,
+        );
+
+        let expected = ws.ty("glide_wheel");
+        let return_wheel_ty = nth_name_expr_type_from_end(&mut ws, file_id, "wheel", 0);
+        assert_eq!(return_wheel_ty, expected);
+
+        let signature_return = signature_return_type_for_function(&mut ws, file_id, "CreateWheel");
+        assert_eq!(signature_return, expected);
+    }
+
+    #[gtest]
+    fn test_unresolved_return_branch_is_not_dropped_for_precise_later_return() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def_file(
+            "lua/entities/base_glide/sv_wheels.lua",
+            r#"
+                ---@class Entity
+                ---@class glide_wheel: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                ENT = {}
+
+                function ENT:CreateWheel()
+                    if shouldReuseWheel then
+                        return unresolvedWheel
+                    end
+
+                    local wheel = ents.Create("glide_wheel")
+                    return wheel
+                end
+            "#,
+        );
+
+        let expected = LuaType::Ref(LuaTypeDeclId::global("glide_wheel"));
+        let signature_return = signature_return_type_for_function(&mut ws, file_id, "CreateWheel");
+        assert_union_contains_unknown_and(signature_return, expected);
+    }
+
+    #[gtest]
+    fn test_direct_any_return_doc_preserves_user_authored_any_over_body_inference() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+                ---@class glide_wheel: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                ---@return any
+                function CreateWheel()
+                    local wheel = ents.Create("glide_wheel")
+                    return wheel
+                end
+            "#,
+        );
+
+        let wheel_ty = ws.expr_ty("CreateWheel()");
+        assert_eq!(wheel_ty, LuaType::Any);
+    }
+
+    #[gtest]
+    fn test_direct_any_return_doc_preserves_user_authored_any_over_unresolved_body() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@return any
+                function getWheel()
+                    return unresolvedWheel
+                end
+            "#,
+        );
+
+        let wheel_ty = ws.expr_ty("getWheel()");
+        assert_eq!(wheel_ty, LuaType::Any);
+    }
+
+    #[gtest]
+    fn test_any_parent_function_doc_does_not_override_precise_body_return() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+                ---@class glide_wheel: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                ENT = {}
+
+                ---@type fun(self: table): any
+                ENT.CreateWheel = function(self)
+                    local wheel = ents.Create("glide_wheel")
+                    return wheel
+                end
+            "#,
+        );
+
+        let wheel_ty = ws.expr_ty("ENT.CreateWheel(ENT)");
+        let expected = ws.ty("glide_wheel");
+        assert_eq!(wheel_ty, expected);
     }
 
     #[gtest]

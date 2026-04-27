@@ -640,14 +640,21 @@ fn resolve_doc_function(
         );
     }
 
-    if signature.resolve_return == SignatureReturnStatus::UnResolve
-        || signature.resolve_return == SignatureReturnStatus::InferResolve
-    {
+    let doc_return = doc_func.get_ret();
+    let should_apply_return = match signature.resolve_return {
+        SignatureReturnStatus::UnResolve => true,
+        SignatureReturnStatus::InferResolve => {
+            should_doc_return_override_inferred(doc_return, &signature.get_return_type())
+        }
+        SignatureReturnStatus::DocResolve => false,
+    };
+
+    if should_apply_return {
         signature.resolve_return = SignatureReturnStatus::DocResolve;
         signature.return_docs.clear();
         signature.return_docs.push(LuaDocReturnInfo {
             name: None,
-            type_ref: doc_func.get_ret().clone(),
+            type_ref: doc_return.clone(),
             description: None,
             attributes: None,
             return_kind: ReturnTypeKind::default(),
@@ -655,6 +662,12 @@ fn resolve_doc_function(
     }
 
     Ok(())
+}
+
+fn should_doc_return_override_inferred(doc_return: &LuaType, inferred_return: &LuaType) -> bool {
+    !(doc_return.is_any() || doc_return.is_unknown())
+        || inferred_return.is_any()
+        || inferred_return.is_unknown()
 }
 
 fn filter_signature_type(

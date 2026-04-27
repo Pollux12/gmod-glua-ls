@@ -61,11 +61,15 @@ pub fn resolve_all_reason(
     loop_count: usize,
 ) {
     for (reason, _) in reason_unresolves.iter_mut() {
-        resolve_as_any(db, reason, loop_count);
+        resolve_as_unknown(db, reason, loop_count);
     }
 }
 
-pub fn resolve_as_any(db: &mut DbIndex, reason: &InferFailReason, loop_count: usize) -> Option<()> {
+pub fn resolve_as_unknown(
+    db: &mut DbIndex,
+    reason: &InferFailReason,
+    loop_count: usize,
+) -> Option<()> {
     match reason {
         InferFailReason::None
         | InferFailReason::FieldNotFound
@@ -76,7 +80,7 @@ pub fn resolve_as_any(db: &mut DbIndex, reason: &InferFailReason, loop_count: us
         }
         InferFailReason::UnResolveDeclType(decl_id) => {
             db.get_type_index_mut()
-                .bind_type((*decl_id).into(), LuaTypeCache::InferType(LuaType::Any));
+                .bind_type((*decl_id).into(), LuaTypeCache::InferType(LuaType::Unknown));
         }
         InferFailReason::UnResolveMemberType(member_id) => {
             // 第一次循环不处理, 或许需要判断`unresolves`是否全为取值再跳过?
@@ -92,21 +96,21 @@ pub fn resolve_as_any(db: &mut DbIndex, reason: &InferFailReason, loop_count: us
                 let semantic_member_id = member_item.resolve_semantic_decl(db)?;
                 if let LuaSemanticDeclId::Member(member_id) = semantic_member_id {
                     db.get_type_index_mut()
-                        .bind_type(member_id.into(), LuaTypeCache::InferType(LuaType::Any));
+                        .bind_type(member_id.into(), LuaTypeCache::InferType(LuaType::Unknown));
                 }
             }
         }
         InferFailReason::UnResolveExpr(expr) => {
             let key = InFiled::new(expr.file_id, expr.value.get_syntax_id());
             db.get_type_index_mut()
-                .bind_type(key.into(), LuaTypeCache::InferType(LuaType::Any));
+                .bind_type(key.into(), LuaTypeCache::InferType(LuaType::Unknown));
         }
         InferFailReason::UnResolveSignatureReturn(signature_id) => {
             let signature = db.get_signature_index_mut().get_mut(signature_id)?;
             if !signature.is_resolve_return() {
                 signature.return_docs = vec![LuaDocReturnInfo {
                     name: None,
-                    type_ref: LuaType::Any,
+                    type_ref: LuaType::Unknown,
                     description: None,
                     attributes: None,
                     return_kind: ReturnTypeKind::default(),
@@ -117,7 +121,7 @@ pub fn resolve_as_any(db: &mut DbIndex, reason: &InferFailReason, loop_count: us
         InferFailReason::UnResolveModuleExport(file_id) => {
             let module = db.get_module_index_mut().get_module_mut(*file_id)?;
             if module.export_type.is_none() {
-                module.export_type = Some(LuaType::Any);
+                module.export_type = Some(LuaType::Unknown);
             }
         }
     }

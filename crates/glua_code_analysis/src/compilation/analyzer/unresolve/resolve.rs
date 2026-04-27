@@ -10,10 +10,11 @@ use glua_parser::{
 };
 
 use crate::{
-    DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclTypeKind, LuaMember,
-    LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
-    OperatorFunction, SemanticDeclLevel, SignatureReturnStatus, TypeOps,
+    DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclTypeKind,
+    LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
+    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
+    LuaTypeDeclId, LuaTypeFlag, OperatorFunction, SemanticDeclLevel, SignatureReturnStatus,
+    TypeOps, VariadicType,
     compilation::analyzer::{
         common::{add_member, bind_type},
         lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
@@ -224,12 +225,47 @@ pub fn try_resolve_return_point(
         .get_mut(&return_.signature_id)
         .ok_or(InferFailReason::None)?;
 
-    if signature.resolve_return == SignatureReturnStatus::UnResolve {
+    if should_apply_resolved_return_docs(signature, &return_docs) {
         signature.resolve_return = SignatureReturnStatus::InferResolve;
         signature.return_docs = return_docs;
     }
 
     Ok(())
+}
+
+fn should_apply_resolved_return_docs(
+    signature: &LuaSignature,
+    return_docs: &[LuaDocReturnInfo],
+) -> bool {
+    if signature.resolve_return == SignatureReturnStatus::UnResolve {
+        return true;
+    }
+
+    if signature.resolve_return != SignatureReturnStatus::InferResolve {
+        return false;
+    }
+
+    let current_return = signature.get_return_type();
+    let new_return = return_docs_to_type(return_docs);
+
+    (current_return.is_unknown() || current_return.is_any())
+        && !(new_return.is_unknown() || new_return.is_any())
+}
+
+fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
+    match return_docs.len() {
+        0 => LuaType::Nil,
+        1 => return_docs[0].type_ref.clone(),
+        _ => LuaType::Variadic(
+            VariadicType::Multi(
+                return_docs
+                    .iter()
+                    .map(|info| info.type_ref.clone())
+                    .collect(),
+            )
+            .into(),
+        ),
+    }
 }
 
 pub fn try_resolve_iter_var(

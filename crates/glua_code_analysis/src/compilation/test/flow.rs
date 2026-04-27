@@ -2253,6 +2253,29 @@ _2 = a[1]
     }
 
     #[test]
+    fn test_local_cached_isvalid_keeps_unknown_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local IsValid = IsValid
+
+            ---@return unknown
+            function getMaybe()
+            end
+
+            local maybe = getMaybe()
+            if IsValid(maybe) then
+                a = maybe
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        assert_eq!(a, LuaType::Unknown);
+    }
+
+    #[test]
     fn test_local_cached_isfunction_narrows_nil() {
         let mut ws = VirtualWorkspace::new();
 
@@ -4113,11 +4136,10 @@ _2 = a[1]
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_after_index_truthy_guard() {
+    fn test_undefined_global_guard_after_index_truthy_does_not_promote_to_any() {
         // Reading `tmysql.Version` in an `if` condition implies `tmysql` is
-        // non-nil/non-false in the truthy branch. The base type is Unknown
-        // (undefined global), so we narrow it to `any` rather than leaving
-        // hover/inference reporting `unknown`.
+        // non-nil/non-false in the truthy branch, but that does not mean the
+        // undefined-global base is safe to promote to `any`.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4129,11 +4151,11 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Nil);
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_after_truthy_guard() {
+    fn test_undefined_global_guard_after_truthy_does_not_promote_to_any() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4145,11 +4167,11 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Nil);
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_after_deep_index_truthy_guard() {
+    fn test_undefined_global_guard_after_deep_index_truthy_does_not_promote_to_any() {
         // Deep index chains: prefix is itself an IndexExpr.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
@@ -4162,11 +4184,11 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Nil);
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_after_index_comparison_guard() {
+    fn test_undefined_global_guard_after_index_comparison_does_not_promote_to_any() {
         // Comparison on indexed read (e.g. `tmysql.Version < 4.1`) implies
         // the indexed base is non-nil in the truthy branch.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -4180,14 +4202,14 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Nil);
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_in_else_after_index_guard() {
+    fn test_undefined_global_guard_in_else_after_index_does_not_promote_to_any() {
         // The else-branch of `if tmysql.Version then ... else ... end` is only
         // reached if the index access succeeded (i.e. tmysql was non-nil),
-        // so tmysql should also narrow to Any in the false branch.
+        // so tmysql should also narrow without becoming `any`.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4201,6 +4223,6 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Nil);
     }
 }

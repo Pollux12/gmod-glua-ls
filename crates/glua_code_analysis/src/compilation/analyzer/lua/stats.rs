@@ -807,6 +807,7 @@ fn resolve_index_expr_member_owner(prefix_type: &LuaType) -> Option<(LuaMemberOw
         LuaType::Instance(instance) => {
             Some((LuaMemberOwner::Element(instance.get_range().clone()), false))
         }
+        LuaType::TableOf(inner) => resolve_index_expr_member_owner(inner),
         LuaType::TypeGuard(inner) => resolve_index_expr_member_owner(inner),
         LuaType::Union(union) => pick_preferred_index_expr_member_owner(union.into_vec().iter()),
         LuaType::Intersection(intersection) => {
