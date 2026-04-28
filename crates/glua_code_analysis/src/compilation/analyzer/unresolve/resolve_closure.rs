@@ -8,8 +8,8 @@ use glua_parser::{
 use crate::{
     DbIndex, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo, LuaDocReturnInfo,
     LuaFunctionType, LuaInferCache, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaSignature,
-    LuaSignatureId, LuaType, LuaTypeDeclId, ReturnTypeKind, SignatureReturnStatus, TypeOps,
-    get_real_type, infer_call_expr_func, infer_expr, infer_table_should_be,
+    LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel, ReturnTypeKind, SignatureReturnStatus,
+    TypeOps, get_real_type, humanize_type, infer_call_expr_func, infer_expr, infer_table_should_be,
 };
 
 use super::{
@@ -205,7 +205,8 @@ fn resolve_call_param_doc_function(
                 if let Some(LuaType::DocFunction(func)) = union_types
                     .into_vec()
                     .iter()
-                    .find(|typ| matches!(typ, LuaType::DocFunction(_)))
+                    .filter(|typ| matches!(typ, LuaType::DocFunction(_)))
+                    .min_by_key(|typ| stable_type_selection_key(db, typ))
                 {
                     return Some(func.clone());
                 }
@@ -221,6 +222,10 @@ fn resolve_call_param_doc_function(
         Some(origin_signature_id),
         call_file_id,
     )
+}
+
+fn stable_type_selection_key(db: &DbIndex, typ: &LuaType) -> String {
+    humanize_type(db, typ, RenderLevel::Detailed)
 }
 
 pub fn resolve_gmod_hook_add_callback_doc_function(
@@ -808,5 +813,103 @@ fn find_best_function_type(
                 .map(LuaType::DocFunction)
                 .collect(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use glua_parser::{LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaParser, ParserConfig};
+
+    use super::resolve_call_param_doc_function;
+    use crate::{
+        AsyncState, DbIndex, FileId, LuaFunctionType, LuaSignatureId, LuaType, LuaUnionType,
+    };
+
+    fn parse_call_and_closure(code: &str) -> (LuaCallExpr, LuaClosureExpr) {
+        let tree = LuaParser::parse(code, ParserConfig::default());
+        let root = tree.get_chunk_node();
+        let call_expr = root
+            .descendants::<LuaCallExpr>()
+            .next()
+            .expect("expected call expression");
+        let closure_expr = root
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure expression");
+        (call_expr, closure_expr)
+    }
+
+    fn make_doc_func(
+        param_name: &str,
+        param_type: LuaType,
+        return_type: LuaType,
+    ) -> Arc<LuaFunctionType> {
+        Arc::new(LuaFunctionType::new(
+            AsyncState::None,
+            false,
+            false,
+            vec![(param_name.to_string(), Some(param_type))],
+            return_type,
+        ))
+    }
+
+    fn make_call_sig_with_callback_union(union: LuaUnionType) -> LuaFunctionType {
+        LuaFunctionType::new(
+            AsyncState::None,
+            false,
+            false,
+            vec![(
+                "callback".to_string(),
+                Some(LuaType::Union(Arc::new(union))),
+            )],
+            LuaType::Nil,
+        )
+    }
+
+    #[test]
+    fn resolve_call_param_doc_function_union_doc_function_order_is_deterministic() {
+        let db = DbIndex::new();
+        let file_id = FileId::new(1);
+        let (call_expr, closure_expr) = parse_call_and_closure("register(function() end)");
+        let origin_signature_id = LuaSignatureId::from_closure(file_id, &closure_expr);
+
+        let alpha_doc_func = make_doc_func("alpha", LuaType::String, LuaType::Boolean);
+        let beta_doc_func = make_doc_func("beta", LuaType::Integer, LuaType::Number);
+
+        let alpha_first_sig = make_call_sig_with_callback_union(LuaUnionType::from_vec(vec![
+            LuaType::DocFunction(alpha_doc_func.clone()),
+            LuaType::DocFunction(beta_doc_func.clone()),
+        ]));
+        let beta_first_sig = make_call_sig_with_callback_union(LuaUnionType::from_vec(vec![
+            LuaType::DocFunction(beta_doc_func),
+            LuaType::DocFunction(alpha_doc_func),
+        ]));
+
+        let selected_alpha_first = resolve_call_param_doc_function(
+            &db,
+            &call_expr,
+            &alpha_first_sig,
+            0,
+            origin_signature_id,
+            file_id,
+        )
+        .expect("expected callback doc function to be selected from alpha-first union");
+        let selected_beta_first = resolve_call_param_doc_function(
+            &db,
+            &call_expr,
+            &beta_first_sig,
+            0,
+            origin_signature_id,
+            file_id,
+        )
+        .expect("expected callback doc function to be selected from beta-first union");
+
+        assert_eq!(
+            selected_alpha_first.as_ref(),
+            selected_beta_first.as_ref(),
+            "doc function selection should be independent of union member order"
+        );
     }
 }

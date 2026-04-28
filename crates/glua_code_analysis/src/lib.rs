@@ -392,6 +392,12 @@ impl EmmyLuaAnalysis {
     pub fn update_files_by_uri(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
         let mut removed_files = HashSet::new();
         let mut updated_files = HashSet::new();
+        let mut files = files;
+        files.sort_by_cached_key(|(uri, _)| {
+            uri_to_file_path(uri)
+                .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
+                .unwrap_or_else(|| uri.as_str().to_string())
+        });
 
         // Separate files into: unchanged (skip), to-remove, and to-parse
         let mut to_parse: Vec<(Uri, String)> = Vec::new();
@@ -525,6 +531,12 @@ impl EmmyLuaAnalysis {
         &mut self,
         files: Vec<(Uri, Option<String>)>,
     ) -> Vec<FileId> {
+        let mut files = files;
+        files.sort_by_cached_key(|(uri, _)| {
+            uri_to_file_path(uri)
+                .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
+                .unwrap_or_else(|| uri.as_str().to_string())
+        });
         let mut removed_files = HashSet::new();
         let mut updated_files = HashSet::new();
         {
@@ -835,6 +847,58 @@ mod tests {
                 .get_module_index()
                 .get_module(file_id)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn vfs_update_files_by_uri_assigns_stable_file_ids_for_new_files() {
+        let make_uri = |root: &PathBuf, name: &str| {
+            let file = root.join(name);
+            Uri::parse_from_file_path(&file).expect("uri should parse")
+        };
+
+        let workspace_a = std::env::temp_dir().join("gmod_glua_ls_stable_ids_a");
+        let workspace_b = std::env::temp_dir().join("gmod_glua_ls_stable_ids_b");
+
+        let mut analysis_a = EmmyLuaAnalysis::new();
+        analysis_a.add_main_workspace(workspace_a.clone());
+        let a1 = make_uri(&workspace_a, "a.lua");
+        let b1 = make_uri(&workspace_a, "b.lua");
+        let ids_a = analysis_a.update_files_by_uri(vec![
+            (b1.clone(), Some("return 'b'".to_string())),
+            (a1.clone(), Some("return 'a'".to_string())),
+        ]);
+        assert_eq!(ids_a.len(), 2);
+        let a1_id = analysis_a
+            .get_file_id(&a1)
+            .expect("a.lua should have stable file id");
+        let b1_id = analysis_a
+            .get_file_id(&b1)
+            .expect("b.lua should have stable file id");
+
+        let mut analysis_b = EmmyLuaAnalysis::new();
+        analysis_b.add_main_workspace(workspace_b.clone());
+        let a2 = make_uri(&workspace_b, "a.lua");
+        let b2 = make_uri(&workspace_b, "b.lua");
+        let ids_b = analysis_b.update_files_by_uri(vec![
+            (a2.clone(), Some("return 'a'".to_string())),
+            (b2.clone(), Some("return 'b'".to_string())),
+        ]);
+        assert_eq!(ids_b.len(), 2);
+        let a2_id = analysis_b
+            .get_file_id(&a2)
+            .expect("a.lua should have stable file id");
+        let b2_id = analysis_b
+            .get_file_id(&b2)
+            .expect("b.lua should have stable file id");
+
+        assert_eq!(
+            a1_id, a2_id,
+            "a.lua file id should be input-order independent"
+        );
+        assert_eq!(
+            b1_id, b2_id,
+            "b.lua file id should be input-order independent"
         );
     }
 }

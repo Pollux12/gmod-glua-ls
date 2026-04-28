@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::Arc;
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaCommentOwner, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
@@ -8,15 +8,16 @@ use glua_parser::{
 use rowan::{NodeOrToken, TextRange, TextSize};
 
 use crate::{
-    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaMemberKey, LuaMemberOwner,
-    LuaSemanticDeclId, LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
+    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaDiagnosticConfig, LuaInferCache,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, SemanticDeclLevel, SemanticModel,
+    WorkspaceId,
 };
 
 use super::{Checker, DiagnosticContext};
 use crate::compilation::analyzer::gmod::realm_from_doc_comment;
 
-/// Cross-file callee realm cache type (thread-safe).
-pub type SharedCalleeRealmCache = RwLock<HashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>>;
+/// Immutable, workspace-scoped callee realm map keyed by semantic declaration.
+pub type PrecomputedCalleeRealmMap = HashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
 
 pub struct GmodRealmMisuseChecker;
 
@@ -57,7 +58,10 @@ impl Checker for GmodRealmMisuseChecker {
 
         let mut decl_annotation_cache = HashMap::new();
         let mut callee_realm_cache: CalleeRealmCache = HashMap::new();
-        let shared_callee_cache = shared_data.as_ref().map(|s| &s.shared_callee_realm_cache);
+        let precomputed_callee_realms = shared_data
+            .as_ref()
+            .and_then(|s| s.callee_realms_by_workspace.get(&workspace_id))
+            .map(Arc::as_ref);
 
         for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
             if context.is_cancelled() {
@@ -77,7 +81,7 @@ impl Checker for GmodRealmMisuseChecker {
                 &gm_method_realms,
                 &mut decl_annotation_cache,
                 &mut callee_realm_cache,
-                shared_callee_cache,
+                precomputed_callee_realms,
             );
             if callee_realms.is_empty() {
                 continue;
@@ -195,7 +199,7 @@ fn resolve_callee_realms(
     gm_method_realms: &GmMethodRealmMap,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
     callee_realm_cache: &mut CalleeRealmCache,
-    shared_callee_cache: Option<&SharedCalleeRealmCache>,
+    precomputed_callee_realms: Option<&PrecomputedCalleeRealmMap>,
 ) -> Vec<ResolvedRealm> {
     // Fast path: GM method annotations (O(1) HashMap lookup, no inference needed)
     if let Some(prefix_expr) = call_expr.get_prefix_expr()
@@ -216,20 +220,17 @@ fn resolve_callee_realms(
         SemanticDeclLevel::default(),
     );
 
-    // Check caches — local first (no lock), then shared cross-file cache
+    // Check caches — local first, then immutable workspace precompute.
     if let Some(ref decl) = semantic_decl {
         if let Some(cached) = callee_realm_cache.get(decl) {
             return cached.clone();
         }
-        if let Some(shared) = shared_callee_cache {
-            if let Ok(guard) = shared.read() {
-                if let Some(cached) = guard.get(decl) {
-                    let result = cached.clone();
-                    // Promote to local cache to avoid future lock acquisitions
-                    callee_realm_cache.insert(decl.clone(), result.clone());
-                    return result;
-                }
-            }
+        if let Some(precomputed) = precomputed_callee_realms
+            && let Some(cached) = precomputed.get(decl)
+        {
+            let result = cached.clone();
+            callee_realm_cache.insert(decl.clone(), result.clone());
+            return result;
         }
     }
 
@@ -278,14 +279,9 @@ fn resolve_callee_realms(
         }
     }
 
-    // Cache result in both local and shared caches
+    // Cache result in file-local cache only.
     if let Some(decl) = semantic_decl {
-        callee_realm_cache.insert(decl.clone(), realms.clone());
-        if let Some(shared) = shared_callee_cache {
-            if let Ok(mut guard) = shared.write() {
-                guard.insert(decl, realms.clone());
-            }
-        }
+        callee_realm_cache.insert(decl, realms.clone());
     }
     realms
 }
@@ -435,6 +431,22 @@ fn resolve_decl_annotation_realm_at_offset(
         .map(|entry| entry.realm)
 }
 
+fn resolve_decl_annotation_realm_at_offset_from_db(
+    db: &crate::DbIndex,
+    file_id: &FileId,
+    offset: TextSize,
+    decl_annotation_cache: &mut DeclAnnotationRealmCache,
+) -> Option<GmodRealm> {
+    let file_entries = decl_annotation_cache
+        .entry(*file_id)
+        .or_insert_with(|| collect_decl_annotation_realms_for_file_from_db(db, file_id));
+
+    file_entries
+        .iter()
+        .find(|entry| entry.range.contains(offset))
+        .map(|entry| entry.realm)
+}
+
 fn collect_decl_annotation_realms_for_file(
     context: &DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -463,6 +475,40 @@ fn collect_decl_annotation_realms_for_file(
         if context.is_cancelled() {
             return realms;
         }
+        if let Some(comment) = local_func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            realms.push(AnnotatedRealmRange {
+                range: local_func_stat.get_range(),
+                realm,
+            });
+        }
+    }
+
+    realms
+}
+
+fn collect_decl_annotation_realms_for_file_from_db(
+    db: &crate::DbIndex,
+    file_id: &FileId,
+) -> Vec<AnnotatedRealmRange> {
+    let Some(tree) = db.get_vfs().get_syntax_tree(file_id) else {
+        return Vec::new();
+    };
+
+    let mut realms = Vec::new();
+    for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
+        if let Some(comment) = func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            realms.push(AnnotatedRealmRange {
+                range: func_stat.get_range(),
+                realm,
+            });
+        }
+    }
+
+    for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
         if let Some(comment) = local_func_stat.get_left_comment()
             && let Some(realm) = realm_from_doc_comment(&comment)
         {
@@ -651,7 +697,7 @@ fn push_unique_realm(realms: &mut Vec<ResolvedRealm>, realm: ResolvedRealm) {
 fn pick_best_mismatch_candidate(realms: &[ResolvedRealm]) -> ResolvedRealm {
     *realms
         .iter()
-        .max_by_key(|realm| evidence_priority(realm.evidence))
+        .max_by_key(|realm| mismatch_candidate_sort_key(realm))
         .unwrap_or(&ResolvedRealm {
             realm: GmodRealm::Unknown,
             evidence: RealmEvidence::Unknown,
@@ -659,6 +705,34 @@ fn pick_best_mismatch_candidate(realms: &[ResolvedRealm]) -> ResolvedRealm {
 }
 
 fn evidence_priority(evidence: RealmEvidence) -> u8 {
+    match evidence {
+        RealmEvidence::ExplicitBranch => 5,
+        RealmEvidence::ExplicitAnnotation => 4,
+        RealmEvidence::InferredFilename => 3,
+        RealmEvidence::InferredDependency => 2,
+        RealmEvidence::InferredDefault => 1,
+        RealmEvidence::Unknown => 0,
+    }
+}
+
+fn mismatch_candidate_sort_key(realm: &ResolvedRealm) -> (u8, u8, u8) {
+    (
+        evidence_priority(realm.evidence),
+        realm_ordinal(realm.realm),
+        evidence_ordinal(realm.evidence),
+    )
+}
+
+fn realm_ordinal(realm: GmodRealm) -> u8 {
+    match realm {
+        GmodRealm::Client => 0,
+        GmodRealm::Server => 1,
+        GmodRealm::Shared => 2,
+        GmodRealm::Unknown => 3,
+    }
+}
+
+fn evidence_ordinal(evidence: RealmEvidence) -> u8 {
     match evidence {
         RealmEvidence::ExplicitBranch => 5,
         RealmEvidence::ExplicitAnnotation => 4,
@@ -748,7 +822,7 @@ fn unknown_realm_candidate(
         .copied()
         .filter(|callee| matches!(callee.realm, GmodRealm::Client | GmodRealm::Server))
         .filter(|callee| supports_unknown_realm_diagnostic(callee.evidence))
-        .max_by_key(|realm| evidence_priority(realm.evidence))
+        .max_by_key(mismatch_candidate_sort_key)
 }
 
 fn supports_unknown_realm_diagnostic(evidence: RealmEvidence) -> bool {
@@ -821,6 +895,175 @@ fn realm_label(realm: GmodRealm) -> &'static str {
     }
 }
 
+fn resolve_precomputed_decl_realm(
+    db: &crate::DbIndex,
+    semantic_decl: &LuaSemanticDeclId,
+    decl_annotation_cache: &mut DeclAnnotationRealmCache,
+) -> Option<ResolvedRealm> {
+    let (decl_file_id, decl_offset) = semantic_decl_position(semantic_decl)?;
+    let infer_index = db.get_gmod_infer_index();
+    let metadata = infer_index.get_realm_file_metadata(&decl_file_id)?;
+    if let Some(annotation_realm) = resolve_decl_annotation_realm_at_offset_from_db(
+        db,
+        &decl_file_id,
+        decl_offset,
+        decl_annotation_cache,
+    ) {
+        return Some(ResolvedRealm {
+            realm: annotation_realm,
+            evidence: RealmEvidence::ExplicitAnnotation,
+        });
+    }
+
+    Some(resolve_realm_at_offset(
+        infer_index,
+        &decl_file_id,
+        metadata,
+        decl_offset,
+    ))
+}
+
+/// Precompute declaration/member/signature realm facts for workspace diagnostics.
+pub fn precompute_callee_realms_for_workspace(
+    db: &crate::DbIndex,
+    workspace_id: WorkspaceId,
+    workspace_file_ids: &[FileId],
+    gm_method_realms: &GmMethodRealmMap,
+) -> PrecomputedCalleeRealmMap {
+    let module_index = db.get_module_index();
+    let mut callee_realms = HashMap::new();
+    let mut decl_annotation_cache = HashMap::new();
+    let precompute_config = Arc::new(LuaDiagnosticConfig::default());
+    let mut workspace_callee_realm_cache: CalleeRealmCache = HashMap::new();
+
+    for &file_id in workspace_file_ids {
+        let candidate_workspace_id = module_index
+            .get_workspace_id(file_id)
+            .unwrap_or(WorkspaceId::MAIN);
+        if module_index
+            .workspace_resolution_priority(workspace_id, candidate_workspace_id)
+            .is_none()
+        {
+            continue;
+        }
+
+        if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
+            let mut decl_ids: Vec<_> = decl_tree.get_decls().keys().copied().collect();
+            decl_ids.sort_unstable_by_key(|decl_id| decl_id.position);
+            for decl_id in decl_ids {
+                let semantic_decl = LuaSemanticDeclId::LuaDecl(decl_id);
+                if let Some(resolved) =
+                    resolve_precomputed_decl_realm(db, &semantic_decl, &mut decl_annotation_cache)
+                {
+                    callee_realms.insert(semantic_decl, vec![resolved]);
+                }
+            }
+        }
+
+        let mut member_ids: Vec<_> = db
+            .get_member_index()
+            .get_file_members(file_id)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect();
+        member_ids.sort_unstable_by_key(|member_id| member_id.get_position());
+        for member_id in member_ids {
+            let semantic_decl = LuaSemanticDeclId::Member(member_id);
+            if let Some(resolved) =
+                resolve_precomputed_decl_realm(db, &semantic_decl, &mut decl_annotation_cache)
+            {
+                callee_realms.insert(semantic_decl, vec![resolved]);
+            }
+        }
+    }
+
+    let mut signature_ids: Vec<_> = db
+        .get_signature_index()
+        .iter()
+        .map(|(signature_id, _)| *signature_id)
+        .filter(|signature_id| {
+            let candidate_workspace_id = module_index
+                .get_workspace_id(signature_id.get_file_id())
+                .unwrap_or(WorkspaceId::MAIN);
+            module_index
+                .workspace_resolution_priority(workspace_id, candidate_workspace_id)
+                .is_some()
+        })
+        .collect();
+    signature_ids.sort_unstable_by_key(|signature_id| {
+        (signature_id.get_file_id(), signature_id.get_position())
+    });
+    for signature_id in signature_ids {
+        let semantic_decl = LuaSemanticDeclId::Signature(signature_id);
+        if let Some(resolved) =
+            resolve_precomputed_decl_realm(db, &semantic_decl, &mut decl_annotation_cache)
+        {
+            callee_realms.insert(semantic_decl, vec![resolved]);
+        }
+    }
+
+    // Enrich declaration realms with the same multi-source callee resolution used by
+    // diagnostic-time resolution (member candidates, global-name candidates, origin owners, etc).
+    // This keeps immutable precompute payloads aligned with the legacy per-file cache semantics.
+    for &file_id in workspace_file_ids {
+        let candidate_workspace_id = module_index
+            .get_workspace_id(file_id)
+            .unwrap_or(WorkspaceId::MAIN);
+        if module_index
+            .workspace_resolution_priority(workspace_id, candidate_workspace_id)
+            .is_none()
+        {
+            continue;
+        }
+        let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+            continue;
+        };
+        let semantic_model = SemanticModel::new(
+            file_id,
+            db,
+            LuaInferCache::new(file_id, Default::default()),
+            Arc::new(db.get_emmyrc().clone()),
+            tree.get_chunk_node(),
+        );
+        let context = DiagnosticContext::new(
+            file_id,
+            db,
+            precompute_config.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
+            let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+                continue;
+            };
+            let Some(semantic_decl) = semantic_model.find_decl(
+                NodeOrToken::Node(prefix_expr.syntax().clone()),
+                SemanticDeclLevel::default(),
+            ) else {
+                continue;
+            };
+
+            let resolved_realms = resolve_callee_realms(
+                &context,
+                &semantic_model,
+                &call_expr,
+                gm_method_realms,
+                &mut decl_annotation_cache,
+                &mut workspace_callee_realm_cache,
+                None,
+            );
+            if resolved_realms.is_empty() {
+                continue;
+            }
+            let entry = callee_realms.entry(semantic_decl).or_insert_with(Vec::new);
+            for resolved in resolved_realms {
+                push_unique_realm(entry, resolved);
+            }
+        }
+    }
+
+    callee_realms
+}
+
 /// Precompute GM method realm annotations for a specific workspace.
 /// This is the same data that `collect_annotated_gm_method_realms` computes per-file,
 /// but extracted to be called once per workspace during batch diagnostics.
@@ -858,4 +1101,84 @@ pub fn precompute_gm_method_realms(
     }
 
     gm_method_realms
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+
+    use super::{
+        RealmEvidence, ResolvedRealm, pick_best_mismatch_candidate, unknown_realm_candidate,
+    };
+    use crate::GmodRealm;
+
+    #[gtest]
+    fn pick_best_mismatch_candidate_uses_realm_tiebreaker_for_equal_evidence() {
+        let candidates = vec![
+            ResolvedRealm {
+                realm: GmodRealm::Client,
+                evidence: RealmEvidence::ExplicitAnnotation,
+            },
+            ResolvedRealm {
+                realm: GmodRealm::Server,
+                evidence: RealmEvidence::ExplicitAnnotation,
+            },
+        ];
+
+        assert_that!(
+            pick_best_mismatch_candidate(&candidates),
+            eq(ResolvedRealm {
+                realm: GmodRealm::Server,
+                evidence: RealmEvidence::ExplicitAnnotation,
+            })
+        );
+    }
+
+    #[gtest]
+    fn pick_best_mismatch_candidate_keeps_evidence_priority_dominant() {
+        let candidates = vec![
+            ResolvedRealm {
+                realm: GmodRealm::Client,
+                evidence: RealmEvidence::ExplicitBranch,
+            },
+            ResolvedRealm {
+                realm: GmodRealm::Server,
+                evidence: RealmEvidence::ExplicitAnnotation,
+            },
+        ];
+
+        assert_that!(
+            pick_best_mismatch_candidate(&candidates),
+            eq(ResolvedRealm {
+                realm: GmodRealm::Client,
+                evidence: RealmEvidence::ExplicitBranch,
+            })
+        );
+    }
+
+    #[gtest]
+    fn unknown_realm_candidate_uses_realm_tiebreaker_for_equal_evidence() {
+        let call_realm = ResolvedRealm {
+            realm: GmodRealm::Unknown,
+            evidence: RealmEvidence::Unknown,
+        };
+        let callee_realms = vec![
+            ResolvedRealm {
+                realm: GmodRealm::Client,
+                evidence: RealmEvidence::ExplicitAnnotation,
+            },
+            ResolvedRealm {
+                realm: GmodRealm::Server,
+                evidence: RealmEvidence::ExplicitAnnotation,
+            },
+        ];
+
+        assert_that!(
+            unknown_realm_candidate(call_realm, &callee_realms),
+            some(eq(ResolvedRealm {
+                realm: GmodRealm::Server,
+                evidence: RealmEvidence::ExplicitAnnotation,
+            }))
+        );
+    }
 }

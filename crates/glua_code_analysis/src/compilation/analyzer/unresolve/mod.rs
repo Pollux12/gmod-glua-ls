@@ -3,6 +3,7 @@ mod find_decl_function;
 mod resolve;
 mod resolve_closure;
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::{
@@ -270,12 +271,17 @@ fn try_resolve(
         let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
 
-        for (check_reason, unresolves) in reason_resolve.iter_mut() {
-            let reached = check_reach_reason(db, infer_manager, check_reason).unwrap_or(false);
+        for check_reason in sorted_reason_keys(reason_resolve) {
+            let Some(unresolves) = reason_resolve.get_mut(&check_reason) else {
+                continue;
+            };
+
+            let reached = check_reach_reason(db, infer_manager, &check_reason).unwrap_or(false);
             if !reached {
                 continue;
             }
 
+            unresolves.sort_unstable_by(unresolve_stable_cmp);
             for mut unresolve in unresolves.drain(..) {
                 let file_id = unresolve.get_file_id().unwrap_or(FileId { id: 0 });
                 let cache = infer_manager.get_infer_cache(file_id);
@@ -332,7 +338,7 @@ fn try_resolve(
                         }
                     }
                     Err(reason) => {
-                        if reason != *check_reason {
+                        if reason != check_reason {
                             changed = true;
                             retain_unresolve.push((unresolve, reason));
                         }
@@ -340,7 +346,7 @@ fn try_resolve(
                 }
             }
 
-            to_be_remove.push(check_reason.clone());
+            to_be_remove.push(check_reason);
         }
 
         for reason in to_be_remove {
@@ -355,6 +361,100 @@ fn try_resolve(
             break;
         }
     }
+}
+
+fn sorted_reason_keys(
+    reason_resolve: &HashMap<InferFailReason, Vec<UnResolve>>,
+) -> Vec<InferFailReason> {
+    let mut keys: Vec<InferFailReason> = reason_resolve.keys().cloned().collect();
+    keys.sort_unstable_by(infer_fail_reason_stable_cmp);
+    keys
+}
+
+fn infer_fail_reason_kind_rank(reason: &InferFailReason) -> u8 {
+    match reason {
+        InferFailReason::None => 0,
+        InferFailReason::RecursiveInfer => 1,
+        InferFailReason::FieldNotFound => 2,
+        InferFailReason::UnResolveOperatorCall => 3,
+        InferFailReason::UnResolveDeclType(_) => 4,
+        InferFailReason::UnResolveMemberType(_) => 5,
+        InferFailReason::UnResolveExpr(_) => 6,
+        InferFailReason::UnResolveSignatureReturn(_) => 7,
+        InferFailReason::UnResolveTypeDecl(_) => 8,
+        InferFailReason::UnResolveModuleExport(_) => 9,
+    }
+}
+
+fn infer_fail_reason_stable_cmp(a: &InferFailReason, b: &InferFailReason) -> Ordering {
+    let rank_cmp = infer_fail_reason_kind_rank(a).cmp(&infer_fail_reason_kind_rank(b));
+    if rank_cmp != Ordering::Equal {
+        return rank_cmp;
+    }
+
+    match (a, b) {
+        (
+            InferFailReason::UnResolveDeclType(a_decl),
+            InferFailReason::UnResolveDeclType(b_decl),
+        ) => a_decl
+            .file_id
+            .id
+            .cmp(&b_decl.file_id.id)
+            .then_with(|| u32::from(a_decl.position).cmp(&u32::from(b_decl.position))),
+        (
+            InferFailReason::UnResolveMemberType(a_member),
+            InferFailReason::UnResolveMemberType(b_member),
+        ) => a_member.file_id.id.cmp(&b_member.file_id.id).then_with(|| {
+            u32::from(a_member.get_position()).cmp(&u32::from(b_member.get_position()))
+        }),
+        (InferFailReason::UnResolveExpr(a_expr), InferFailReason::UnResolveExpr(b_expr)) => {
+            a_expr.file_id.id.cmp(&b_expr.file_id.id).then_with(|| {
+                u32::from(a_expr.value.syntax().text_range().start())
+                    .cmp(&u32::from(b_expr.value.syntax().text_range().start()))
+            })
+        }
+        (
+            InferFailReason::UnResolveSignatureReturn(a_signature),
+            InferFailReason::UnResolveSignatureReturn(b_signature),
+        ) => a_signature
+            .get_file_id()
+            .id
+            .cmp(&b_signature.get_file_id().id)
+            .then_with(|| {
+                u32::from(a_signature.get_position()).cmp(&u32::from(b_signature.get_position()))
+            }),
+        (
+            InferFailReason::UnResolveTypeDecl(a_type),
+            InferFailReason::UnResolveTypeDecl(b_type),
+        ) => a_type.get_name().cmp(b_type.get_name()),
+        (
+            InferFailReason::UnResolveModuleExport(a_file_id),
+            InferFailReason::UnResolveModuleExport(b_file_id),
+        ) => a_file_id.id.cmp(&b_file_id.id),
+        _ => Ordering::Equal,
+    }
+}
+
+fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
+    match unresolve {
+        UnResolve::Decl(_) => 0,
+        UnResolve::IterDecl(_) => 1,
+        UnResolve::Member(_) => 2,
+        UnResolve::Module(_) => 3,
+        UnResolve::Return(_) => 4,
+        UnResolve::ClosureParams(_) => 5,
+        UnResolve::ClosureReturn(_) => 6,
+        UnResolve::ClosureParentParams(_) => 7,
+        UnResolve::ModuleRef(_) => 8,
+        UnResolve::TableField(_) => 9,
+        UnResolve::SpecialCall(_) => 10,
+    }
+}
+
+fn unresolve_stable_cmp(a: &UnResolve, b: &UnResolve) -> Ordering {
+    unresolve_kind_rank(a)
+        .cmp(&unresolve_kind_rank(b))
+        .then_with(|| a.sort_key().cmp(&b.sort_key()))
 }
 
 #[derive(Debug)]
@@ -593,5 +693,40 @@ pub struct UnResolveSpecialCall {
 impl From<UnResolveSpecialCall> for UnResolve {
     fn from(un_resolve_special_call: UnResolveSpecialCall) -> Self {
         UnResolve::SpecialCall(Box::new(un_resolve_special_call))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use rowan::TextSize;
+
+    use crate::{FileId, InferFailReason, LuaDeclId, LuaTypeDeclId};
+
+    use super::sorted_reason_keys;
+
+    #[test]
+    fn reason_group_order_is_stable_across_hashmap_insertion_order() {
+        let reasons = [
+            InferFailReason::FieldNotFound,
+            InferFailReason::UnResolveDeclType(LuaDeclId::new(FileId::new(2), TextSize::new(20))),
+            InferFailReason::UnResolveDeclType(LuaDeclId::new(FileId::new(2), TextSize::new(8))),
+            InferFailReason::UnResolveTypeDecl(LuaTypeDeclId::local(FileId::new(3), "Local.Zed")),
+            InferFailReason::UnResolveTypeDecl(LuaTypeDeclId::global("Global.A")),
+            InferFailReason::UnResolveModuleExport(FileId::new(9)),
+        ];
+
+        let mut forward: HashMap<InferFailReason, Vec<super::UnResolve>> = HashMap::new();
+        for reason in reasons.iter().cloned() {
+            forward.insert(reason, Vec::new());
+        }
+
+        let mut reverse: HashMap<InferFailReason, Vec<super::UnResolve>> = HashMap::new();
+        for reason in reasons.iter().rev().cloned() {
+            reverse.insert(reason, Vec::new());
+        }
+
+        assert_eq!(sorted_reason_keys(&forward), sorted_reason_keys(&reverse));
     }
 }

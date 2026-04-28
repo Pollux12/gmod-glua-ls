@@ -620,7 +620,7 @@ end
         );
 
         let e_ty = ws.expr_ty("E");
-        assert_eq!(ws.humanize_type(e_ty), r#"(false|("b"))?"#);
+        assert_eq!(ws.humanize_type(e_ty), r#"(("b")|false)?"#);
     }
 
     #[test]
@@ -637,7 +637,7 @@ end
         );
 
         let e_ty = ws.expr_ty("E");
-        assert_eq!(ws.humanize_type(e_ty), r#"(false|"a")?"#);
+        assert_eq!(ws.humanize_type(e_ty), r#"("a"|false)?"#);
     }
 
     #[test]

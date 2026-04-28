@@ -60,7 +60,9 @@ pub fn resolve_all_reason(
     reason_unresolves: &mut HashMap<InferFailReason, Vec<UnResolve>>,
     loop_count: usize,
 ) {
-    for (reason, _) in reason_unresolves.iter_mut() {
+    let mut reasons: Vec<InferFailReason> = reason_unresolves.keys().cloned().collect();
+    reasons.sort_unstable_by(super::infer_fail_reason_stable_cmp);
+    for reason in &reasons {
         resolve_as_unknown(db, reason, loop_count);
     }
 }

@@ -327,7 +327,20 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
     let mut map: HashMap<String, (LuaChunk, LuaBlock)> = HashMap::new();
 
     let vfs = db.get_vfs();
-    for file_id in vfs.get_all_file_ids() {
+    let mut candidate_file_ids = vfs.get_all_file_ids();
+    candidate_file_ids.sort_by_cached_key(|file_id| {
+        let raw_path = vfs
+            .get_file_path(file_id)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default();
+        (
+            crate::vfs::normalize_path_for_ordering(&raw_path),
+            raw_path,
+            file_id.id,
+        )
+    });
+
+    for file_id in candidate_file_ids {
         // Skip files that obviously can't contain net helper bodies. Any
         // helper that wraps a net write/read must contain `net.` literally,
         // so this prunes the vast majority of files cheaply.
@@ -362,6 +375,8 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
                 };
 
                 if let Some(key) = key {
+                    // Deterministic duplicate winner rule:
+                    // the first helper discovered in sorted path order wins.
                     map.entry(key).or_insert_with(|| (chunk.clone(), block));
                 }
                 continue;
@@ -383,6 +398,8 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
                     };
 
                     if let Some(key) = key {
+                        // Deterministic duplicate winner rule:
+                        // the first helper discovered in sorted path order wins.
                         map.entry(key).or_insert_with(|| (chunk.clone(), block));
                     }
                 }

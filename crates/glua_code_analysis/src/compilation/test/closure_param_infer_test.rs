@@ -211,6 +211,39 @@ mod test {
     }
 
     #[test]
+    fn test_callback_union_order_selects_deterministic_doc_function_variant() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@alias CallbackString fun(arg: string)
+                ---@alias CallbackInteger fun(arg: integer)
+
+                ---@param cb CallbackString|CallbackInteger
+                function takes_union_first(cb) end
+
+                ---@param cb CallbackInteger|CallbackString
+                function takes_union_second(cb) end
+
+                takes_union_first(function(arg)
+                    callback_union_first = arg
+                end)
+
+                takes_union_second(function(arg)
+                    callback_union_second = arg
+                end)
+            "#,
+        );
+
+        let first_ty = ws.expr_ty("callback_union_first");
+        let second_ty = ws.expr_ty("callback_union_second");
+        assert_eq!(
+            ws.humanize_type(first_ty),
+            ws.humanize_type(second_ty),
+            "callback inference should be independent of union member order"
+        );
+    }
+
+    #[test]
     fn test_field_doc_function() {
         let mut ws = VirtualWorkspace::new();
 

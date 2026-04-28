@@ -896,7 +896,10 @@ mod tests {
     use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
     use rowan::{TextRange, TextSize};
 
-    use super::{find_members_in_workspace_for_file, find_members_with_key_in_workspace_for_file};
+    use super::{
+        find_members_in_workspace_for_file, find_members_with_key,
+        find_members_with_key_in_workspace_for_file,
+    };
     use crate::{
         DbIndex, FileId, GlobalId, GmodRealm, GmodRealmFileMetadata, LuaMemberKey, LuaType,
         LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, WorkspaceId,
@@ -1131,5 +1134,79 @@ mod tests {
         assert_eq!(members[0].key, key);
         assert_eq!(members[0].typ, LuaType::String);
         assert_eq!(members[0].property_owner_id, Some(shared_member.into()));
+    }
+
+    #[test]
+    fn find_members_with_key_is_stable_for_reversed_same_key_insertions() {
+        let mut db_forward = make_db();
+        let mut db_reversed = make_db();
+        let type_decl_id = LuaTypeDeclId::global("StableSelectionOwner");
+        let owner = LuaMemberOwner::Type(type_decl_id.clone());
+        let key = LuaMemberKey::Name("stableField".into());
+
+        let first_member = make_member_id(FileId::new(41), 1);
+        let second_member = make_member_id(FileId::new(42), 2);
+
+        add_type_decl(&mut db_forward, first_member.file_id, type_decl_id.clone());
+        add_type_decl(&mut db_reversed, first_member.file_id, type_decl_id.clone());
+        bind_member_type(&mut db_forward, first_member, LuaType::String);
+        bind_member_type(&mut db_forward, second_member, LuaType::Integer);
+        bind_member_type(&mut db_reversed, first_member, LuaType::String);
+        bind_member_type(&mut db_reversed, second_member, LuaType::Integer);
+
+        db_forward.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                first_member,
+                key.clone(),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+        db_forward.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                second_member,
+                key.clone(),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+
+        db_reversed.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                second_member,
+                key.clone(),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+        db_reversed.get_member_index_mut().add_member(
+            owner,
+            LuaMember::new(
+                first_member,
+                key.clone(),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+
+        let selected_forward = find_members_with_key(
+            &db_forward,
+            &LuaType::Ref(type_decl_id.clone()),
+            key.clone(),
+            false,
+        )
+        .expect("forward insertion should resolve");
+        let selected_reversed =
+            find_members_with_key(&db_reversed, &LuaType::Ref(type_decl_id), key, false)
+                .expect("reversed insertion should resolve");
+
+        assert_eq!(
+            selected_forward[0].property_owner_id,
+            selected_reversed[0].property_owner_id
+        );
+        assert_eq!(selected_forward[0].typ, selected_reversed[0].typ);
     }
 }

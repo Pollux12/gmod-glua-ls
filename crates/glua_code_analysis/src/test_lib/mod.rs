@@ -1,7 +1,11 @@
+#[cfg(test)]
+use std::{collections::BTreeSet, path::Path};
 use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{LuaAstNode, LuaAstToken, LuaLocalName};
 use lsp_types::NumberOrString;
+#[cfg(test)]
+use lsp_types::{Diagnostic, DiagnosticSeverity};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -16,6 +20,73 @@ pub struct VirtualWorkspace {
     pub virtual_url_generator: VirtualUrlGenerator,
     pub analysis: EmmyLuaAnalysis,
     id_counter: u32,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DiagnosticSnapshot {
+    pub file: String,
+    pub range_start_line: u32,
+    pub range_start_character: u32,
+    pub range_end_line: u32,
+    pub range_end_character: u32,
+    pub severity: Option<i32>,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+#[cfg(test)]
+pub fn diagnostics_to_snapshot_set(
+    file: impl Into<String>,
+    diagnostics: Vec<Diagnostic>,
+) -> BTreeSet<DiagnosticSnapshot> {
+    let file = file.into();
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| DiagnosticSnapshot {
+            file: file.clone(),
+            range_start_line: diagnostic.range.start.line,
+            range_start_character: diagnostic.range.start.character,
+            range_end_line: diagnostic.range.end.line,
+            range_end_character: diagnostic.range.end.character,
+            severity: diagnostic.severity.map(diagnostic_severity_to_i32),
+            code: diagnostic.code.map(number_or_string_to_string),
+            message: diagnostic.message,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn diagnostic_severity_to_i32(severity: DiagnosticSeverity) -> i32 {
+    match severity {
+        DiagnosticSeverity::ERROR => 1,
+        DiagnosticSeverity::WARNING => 2,
+        DiagnosticSeverity::INFORMATION => 3,
+        DiagnosticSeverity::HINT => 4,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+fn number_or_string_to_string(code: NumberOrString) -> String {
+    match code {
+        NumberOrString::Number(number) => number.to_string(),
+        NumberOrString::String(text) => text,
+    }
+}
+
+#[cfg(test)]
+fn normalize_snapshot_file(base: &Path, file_path: &Path) -> String {
+    let normalized = file_path
+        .strip_prefix(base)
+        .unwrap_or(file_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if normalized.is_empty() {
+        file_path.to_string_lossy().replace('\\', "/")
+    } else {
+        normalized
+    }
 }
 
 #[allow(unused, clippy::unwrap_used)]
@@ -235,6 +306,56 @@ impl VirtualWorkspace {
 
     pub fn get_db_mut(&mut self) -> &mut DbIndex {
         (self.analysis.compilation.get_db_mut()) as _
+    }
+
+    #[cfg(test)]
+    pub fn run_diagnostics_with_shared_snapshots(
+        &self,
+        file_ids: &[FileId],
+    ) -> BTreeSet<DiagnosticSnapshot> {
+        let shared_snapshot = self.analysis.precompute_diagnostic_shared_data();
+        let mut combined = BTreeSet::new();
+
+        for &file_id in file_ids {
+            let diagnostics = self
+                .analysis
+                .diagnose_file_with_shared(file_id, CancellationToken::new(), shared_snapshot.clone())
+                .unwrap_or_else(|| {
+                    let file = self
+                        .analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_path(&file_id)
+                        .map(|path| normalize_snapshot_file(&self.virtual_url_generator.base, path))
+                        .unwrap_or_else(|| format!("file-id:{}", file_id.id));
+                    panic!(
+                        "expected diagnostics vector for selected file while collecting shared snapshots: {}",
+                        file
+                    );
+                });
+            combined.extend(self.diagnostic_snapshots_for_file(file_id, diagnostics));
+        }
+
+        combined
+    }
+
+    #[cfg(test)]
+    pub fn diagnostic_snapshots_for_file(
+        &self,
+        file_id: FileId,
+        diagnostics: Vec<Diagnostic>,
+    ) -> BTreeSet<DiagnosticSnapshot> {
+        let normalized_file = self
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_path(&file_id)
+            .map(|path| normalize_snapshot_file(&self.virtual_url_generator.base, path))
+            .unwrap_or_else(|| format!("file-id:{}", file_id.id));
+
+        diagnostics_to_snapshot_set(normalized_file, diagnostics)
     }
 }
 

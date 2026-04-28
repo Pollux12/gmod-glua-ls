@@ -183,15 +183,9 @@ fn build_function_define_hover(
                     .get_realm_at_offset(&builder.semantic_model.get_file_id(), trigger_position)
             },
         );
-    // 去重, 这是必须的
-    function_infos.dedup_by(|current, previous| {
-        if current.primary != previous.primary {
-            return false;
-        }
-
-        merge_preferred_description(previous, current, caller_realm);
-        true
-    });
+    // 去重, 这是必须的.
+    // Keep the last occurrence for each signature so the active symbol remains the primary entry.
+    dedup_function_infos(&mut function_infos, caller_realm);
 
     // 需要显示重载的情况
     match function_infos.len() {
@@ -270,6 +264,25 @@ fn merge_preferred_description(
         }
         _ => {}
     }
+}
+
+fn dedup_function_infos(
+    function_infos: &mut Vec<HoverFunctionInfo>,
+    caller_realm: glua_code_analysis::GmodRealm,
+) {
+    let mut deduped_reversed: Vec<HoverFunctionInfo> = Vec::with_capacity(function_infos.len());
+    for function_info in function_infos.drain(..).rev() {
+        if let Some(existing) = deduped_reversed
+            .iter_mut()
+            .find(|existing| existing.primary == function_info.primary)
+        {
+            merge_preferred_description(existing, &function_info, caller_realm);
+            continue;
+        }
+        deduped_reversed.push(function_info);
+    }
+    deduped_reversed.reverse();
+    *function_infos = deduped_reversed;
 }
 
 fn merge_docless_realms(

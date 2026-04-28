@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use glua_parser::LuaSyntaxId;
+use rowan::TextSize;
 
 use super::LuaIndex;
 use crate::FileId;
@@ -106,7 +107,14 @@ impl GmodScriptedClassFileMetadata {
 #[derive(Debug, Default)]
 pub struct GmodClassMetadataIndex {
     file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
-    vgui_panels: HashMap<String, Option<String>>,
+    vgui_panels: HashMap<String, Vec<VguiPanelDefinition>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VguiPanelDefinition {
+    file_id: FileId,
+    range_start: TextSize,
+    base_name: Option<String>,
 }
 
 impl GmodClassMetadataIndex {
@@ -151,7 +159,8 @@ impl GmodClassMetadataIndex {
     }
 
     fn insert_vgui_panel_from_call(
-        vgui_panels: &mut HashMap<String, Option<String>>,
+        vgui_panels: &mut HashMap<String, Vec<VguiPanelDefinition>>,
+        file_id: FileId,
         kind: GmodScriptedClassCallKind,
         call_metadata: &GmodScriptedClassCallMetadata,
     ) {
@@ -160,24 +169,33 @@ impl GmodClassMetadataIndex {
             return;
         };
 
-        vgui_panels.insert(panel_name, base_name);
+        vgui_panels
+            .entry(panel_name)
+            .or_default()
+            .push(VguiPanelDefinition {
+                file_id,
+                range_start: call_metadata.syntax_id.get_range().start(),
+                base_name,
+            });
     }
 
     fn update_vgui_panels_from_call(
         &mut self,
+        file_id: FileId,
         kind: GmodScriptedClassCallKind,
         call_metadata: &GmodScriptedClassCallMetadata,
     ) {
-        Self::insert_vgui_panel_from_call(&mut self.vgui_panels, kind, call_metadata);
+        Self::insert_vgui_panel_from_call(&mut self.vgui_panels, file_id, kind, call_metadata);
     }
 
     fn recompute_vgui_panels(&mut self) {
         let mut vgui_panels = HashMap::new();
 
-        for file_metadata in self.file_metadata.values() {
+        for (file_id, file_metadata) in &self.file_metadata {
             for call in &file_metadata.vgui_register_calls {
                 Self::insert_vgui_panel_from_call(
                     &mut vgui_panels,
+                    *file_id,
                     GmodScriptedClassCallKind::VguiRegister,
                     call,
                 );
@@ -185,6 +203,7 @@ impl GmodClassMetadataIndex {
             for call in &file_metadata.derma_define_control_calls {
                 Self::insert_vgui_panel_from_call(
                     &mut vgui_panels,
+                    *file_id,
                     GmodScriptedClassCallKind::DermaDefineControl,
                     call,
                 );
@@ -200,7 +219,7 @@ impl GmodClassMetadataIndex {
         kind: GmodScriptedClassCallKind,
         call_metadata: GmodScriptedClassCallMetadata,
     ) {
-        self.update_vgui_panels_from_call(kind, &call_metadata);
+        self.update_vgui_panels_from_call(file_id, kind, &call_metadata);
 
         self.file_metadata
             .entry(file_id)
@@ -250,11 +269,17 @@ impl GmodClassMetadataIndex {
             }
         }
 
+        definitions.sort_by_key(|(file_id, call)| (file_id.id, call.syntax_id.get_range().start()));
         definitions
     }
 
     pub fn get_vgui_panel_base(&self, name: &str) -> Option<Option<String>> {
-        self.vgui_panels.get(name).cloned()
+        self.vgui_panels.get(name).map(|definitions| {
+            definitions
+                .iter()
+                .min_by_key(|definition| (definition.file_id.id, definition.range_start))
+                .and_then(|definition| definition.base_name.clone())
+        })
     }
 }
 
@@ -267,5 +292,73 @@ impl LuaIndex for GmodClassMetadataIndex {
     fn clear(&mut self) {
         self.file_metadata.clear();
         self.recompute_vgui_panels();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
+    use rowan::{TextRange, TextSize};
+
+    use super::{
+        GmodClassCallArg, GmodClassCallLiteral, GmodClassMetadataIndex, GmodScriptedClassCallKind,
+        GmodScriptedClassCallMetadata,
+    };
+    use crate::FileId;
+
+    fn range(start: u32) -> TextRange {
+        TextRange::new(TextSize::new(start), TextSize::new(start + 1))
+    }
+
+    fn arg(start: u32, value: Option<GmodClassCallLiteral>) -> GmodClassCallArg {
+        GmodClassCallArg {
+            syntax_id: LuaSyntaxId::new(LuaSyntaxKind::NameExpr.into(), range(start)),
+            value,
+        }
+    }
+
+    fn vgui_register_call(panel: &str, base: &str, start: u32) -> GmodScriptedClassCallMetadata {
+        GmodScriptedClassCallMetadata {
+            syntax_id: LuaSyntaxId::new(LuaSyntaxKind::CallExpr.into(), range(start)),
+            literal_args: vec![
+                Some(GmodClassCallLiteral::String(panel.to_string())),
+                None,
+                Some(GmodClassCallLiteral::String(base.to_string())),
+            ],
+            args: vec![
+                arg(
+                    start + 1,
+                    Some(GmodClassCallLiteral::String(panel.to_string())),
+                ),
+                arg(start + 2, None),
+                arg(
+                    start + 3,
+                    Some(GmodClassCallLiteral::String(base.to_string())),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn duplicate_vgui_panel_base_prefers_deterministic_file_order() {
+        let mut index = GmodClassMetadataIndex::new();
+        let canonical_file = FileId::new(1);
+        let shadow_file = FileId::new(2);
+
+        index.add_call(
+            canonical_file,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("DeterministicPanel", "DFrame", 10),
+        );
+        index.add_call(
+            shadow_file,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("DeterministicPanel", "EditablePanel", 20),
+        );
+
+        assert_eq!(
+            index.get_vgui_panel_base("DeterministicPanel"),
+            Some(Some("DFrame".to_string()))
+        );
     }
 }

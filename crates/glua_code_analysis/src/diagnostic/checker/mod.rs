@@ -64,7 +64,8 @@ use super::{
 };
 
 pub use gmod_realm_misuse::GmMethodRealmMap;
-pub use gmod_realm_misuse::SharedCalleeRealmCache;
+pub use gmod_realm_misuse::PrecomputedCalleeRealmMap;
+pub use gmod_realm_misuse::precompute_callee_realms_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 
 pub trait Checker {
@@ -216,14 +217,13 @@ pub fn check_file(
 /// Precomputed data shared across all diagnostic files in a batch run.
 /// Computing this once instead of per-file saves ~60s on large workspaces.
 pub struct SharedDiagnosticData {
+    /// Main-workspace file IDs sorted by stable FileId order.
+    pub workspace_file_ids: Arc<Vec<FileId>>,
     /// Maps workspace_id -> precomputed GM method realm annotations.
     /// GmodRealmMisuseChecker uses this to avoid re-scanning all annotations per file.
     pub gm_method_realms: HashMap<WorkspaceId, Arc<GmMethodRealmMap>>,
-    /// Cross-file callee realm cache. Since LuaSemanticDeclId is stable across files,
-    /// realm resolved for a declaration in one file can be reused by all other files.
-    /// This eliminates redundant infer_expr + member lookup for common functions
-    /// (e.g. Entity:GetPos) that appear across hundreds of files.
-    pub shared_callee_realm_cache: SharedCalleeRealmCache,
+    /// Maps workspace_id -> immutable, precomputed callee-declaration realm data.
+    pub callee_realms_by_workspace: HashMap<WorkspaceId, Arc<PrecomputedCalleeRealmMap>>,
 }
 
 pub struct DiagnosticContext<'a> {

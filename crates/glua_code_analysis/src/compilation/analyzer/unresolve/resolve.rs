@@ -13,15 +13,15 @@ use crate::{
     DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclTypeKind,
     LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
     LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, LuaTypeFlag, OperatorFunction, SemanticDeclLevel, SignatureReturnStatus,
-    TypeOps, VariadicType,
+    LuaTypeDeclId, LuaTypeFlag, OperatorFunction, RenderLevel, SemanticDeclLevel,
+    SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         common::{add_member, bind_type},
         lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
         unresolve::UnResolveSpecialCall,
     },
     db_index::{LuaFunctionType, LuaMemberOwner, LuaSignature, LuaSignatureId},
-    find_members_with_key,
+    find_members_with_key, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SemanticDeclGuard, infer_call_expr_func, infer_expr,
         infer_expr_semantic_decl,
@@ -947,7 +947,7 @@ fn materialize_str_tpl_class_from_call(
     is_colon_define: bool,
     is_colon_call: bool,
 ) -> ResolveResult {
-    let Some(str_tpl) = find_str_tpl_ref(param_type) else {
+    let Some(str_tpl) = find_str_tpl_ref(db, param_type) else {
         return Ok(());
     };
 
@@ -1191,7 +1191,7 @@ fn get_constructor_target_type(
     is_colon_define: bool,
     is_colon_call: bool,
 ) -> Option<LuaTypeDeclId> {
-    if let Some(str_tpl) = find_str_tpl_ref(param_type) {
+    if let Some(str_tpl) = find_str_tpl_ref(db, param_type) {
         let arg_expr = get_call_arg_expr(&call_expr, call_index, is_colon_define, is_colon_call)?;
         let name = infer_string_const_arg(db, cache, &arg_expr)?;
         let type_decl_id: LuaTypeDeclId = LuaTypeDeclId::global(
@@ -1206,20 +1206,41 @@ fn get_constructor_target_type(
     None
 }
 
-fn find_str_tpl_ref(typ: &LuaType) -> Option<Arc<crate::LuaStringTplType>> {
+fn find_str_tpl_ref(db: &DbIndex, typ: &LuaType) -> Option<Arc<crate::LuaStringTplType>> {
     match typ {
         LuaType::StrTplRef(str_tpl) => Some(str_tpl.clone()),
-        LuaType::TypeGuard(inner) => find_str_tpl_ref(inner),
-        LuaType::Union(union) => union.into_vec().iter().find_map(find_str_tpl_ref),
-        LuaType::Intersection(intersection) => {
-            intersection.get_types().iter().find_map(find_str_tpl_ref)
-        }
+        LuaType::TypeGuard(inner) => find_str_tpl_ref(db, inner),
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .filter_map(|union_type| find_str_tpl_ref(db, union_type))
+            .min_by_key(|str_tpl| str_tpl_selection_key(db, str_tpl)),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .filter_map(|intersection_type| find_str_tpl_ref(db, intersection_type))
+            .min_by_key(|str_tpl| str_tpl_selection_key(db, str_tpl)),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
-            .find_map(|(union_type, _)| find_str_tpl_ref(union_type)),
+            .filter_map(|(union_type, _)| find_str_tpl_ref(db, union_type))
+            .min_by_key(|str_tpl| str_tpl_selection_key(db, str_tpl)),
         _ => None,
     }
+}
+
+fn str_tpl_selection_key(db: &DbIndex, str_tpl: &crate::LuaStringTplType) -> String {
+    let constraint_key = str_tpl
+        .get_constraint()
+        .map(|constraint| humanize_type(db, constraint, RenderLevel::Detailed))
+        .unwrap_or_default();
+    format!(
+        "{}|{}|{}|{}",
+        str_tpl.get_prefix(),
+        str_tpl.get_name(),
+        str_tpl.get_suffix(),
+        constraint_key
+    )
 }
 
 fn get_call_arg_expr(
@@ -1249,15 +1270,21 @@ fn infer_string_const_arg(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, sync::Arc};
 
     use rowan::{TextRange, TextSize};
 
-    use super::{get_operator_id_priority_tiers, select_operator_ids_by_workspace_and_realm};
+    use super::{
+        find_str_tpl_ref, get_operator_id_priority_tiers,
+        select_operator_ids_by_workspace_and_realm,
+    };
     use crate::{
-        DbIndex, FileId, GmodRealm, GmodRealmFileMetadata, InFiled, LuaOperator,
+        DbIndex, FileId, GenericTplId, GmodRealm, GmodRealmFileMetadata, InFiled, LuaOperator,
         LuaOperatorMetaMethod, LuaOperatorOwner, LuaType, LuaTypeDeclId, WorkspaceId,
-        db_index::{AsyncState, LuaFunctionType, OperatorFunction, WorkspaceKind},
+        db_index::{
+            AsyncState, LuaFunctionType, LuaStringTplType, LuaUnionType, OperatorFunction,
+            WorkspaceKind,
+        },
     };
 
     fn make_db() -> DbIndex {
@@ -1431,5 +1458,42 @@ mod tests {
         );
 
         assert_eq!(selected, vec![best_tier_operator]);
+    }
+
+    #[test]
+    fn find_str_tpl_ref_union_order_is_deterministic() {
+        let alpha_tpl = LuaType::StrTplRef(Arc::new(LuaStringTplType::new(
+            "alpha.",
+            "T",
+            GenericTplId::Func(0),
+            "",
+            Some(LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+        )));
+        let beta_tpl = LuaType::StrTplRef(Arc::new(LuaStringTplType::new(
+            "beta.",
+            "T",
+            GenericTplId::Func(0),
+            "",
+            Some(LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+        )));
+
+        let alpha_first = LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
+            alpha_tpl.clone(),
+            beta_tpl.clone(),
+        ])));
+        let beta_first =
+            LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![beta_tpl, alpha_tpl])));
+
+        let db = make_db();
+        let alpha_first_selected = find_str_tpl_ref(&db, &alpha_first)
+            .expect("expected string template in alpha-first union");
+        let beta_first_selected = find_str_tpl_ref(&db, &beta_first)
+            .expect("expected string template in beta-first union");
+
+        assert_eq!(
+            alpha_first_selected.get_prefix(),
+            beta_first_selected.get_prefix(),
+            "string template selection should be independent of union member order"
+        );
     }
 }

@@ -361,7 +361,8 @@ impl GmodNetworkIndex {
     }
 
     pub fn get_send_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetSendFlow)> {
-        self.send_flows_by_message
+        let mut flows: Vec<_> = self
+            .send_flows_by_message
             .get(name)
             .into_iter()
             .flat_map(|indexed_flows| indexed_flows.iter())
@@ -369,13 +370,27 @@ impl GmodNetworkIndex {
                 self.file_data
                     .get(file_id)
                     .and_then(|file_data| file_data.send_flows.get(*flow_idx))
-                    .map(|flow| (*file_id, flow))
+                    .map(|flow| (*file_id, *flow_idx, flow))
             })
+            .collect();
+
+        flows.sort_by_key(|(file_id, flow_idx, flow)| {
+            (
+                file_id.id,
+                u32::from(flow.start_range.start()),
+                u32::from(flow.send_range.start()),
+                *flow_idx,
+            )
+        });
+        flows
+            .into_iter()
+            .map(|(file_id, _flow_idx, flow)| (file_id, flow))
             .collect()
     }
 
     pub fn get_receive_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetReceiveFlow)> {
-        self.receive_flows_by_message
+        let mut flows: Vec<_> = self
+            .receive_flows_by_message
             .get(name)
             .into_iter()
             .flat_map(|indexed_flows| indexed_flows.iter())
@@ -383,8 +398,16 @@ impl GmodNetworkIndex {
                 self.file_data
                     .get(file_id)
                     .and_then(|file_data| file_data.receive_flows.get(*flow_idx))
-                    .map(|flow| (*file_id, flow))
+                    .map(|flow| (*file_id, *flow_idx, flow))
             })
+            .collect();
+
+        flows.sort_by_key(|(file_id, flow_idx, flow)| {
+            (file_id.id, u32::from(flow.receive_range.start()), *flow_idx)
+        });
+        flows
+            .into_iter()
+            .map(|(file_id, _flow_idx, flow)| (file_id, flow))
             .collect()
     }
 

@@ -27,6 +27,7 @@ pub struct LuaModuleIndex {
     module_root_id: ModuleNodeId,
     module_nodes: HashMap<ModuleNodeId, ModuleNode>,
     file_module_map: HashMap<FileId, ModuleInfo>,
+    file_module_paths: HashMap<FileId, String>,
     module_name_to_file_ids: HashMap<String, Vec<FileId>>,
     legacy_module_envs: HashMap<FileId, Vec<LegacyModuleEnv>>,
     workspaces: Vec<Workspace>,
@@ -50,6 +51,7 @@ impl LuaModuleIndex {
             module_root_id: ModuleNodeId { id: 0 },
             module_nodes: HashMap::new(),
             file_module_map: HashMap::new(),
+            file_module_paths: HashMap::new(),
             module_name_to_file_ids: HashMap::new(),
             legacy_module_envs: HashMap::new(),
             workspaces: Vec::new(),
@@ -114,13 +116,15 @@ impl LuaModuleIndex {
             self.remove(file_id);
         }
 
-        let (module_path, workspace_id) = self.extract_module_path(path)?;
+        let normalized_path = path.replace('\\', "/");
+        let (module_path, workspace_id) = self.extract_module_path(&normalized_path)?;
         let mut module_path = module_path.replace(['\\', '/'], ".");
         if !self.module_replace_vec.is_empty() {
             module_path = self.replace_module_path(&module_path);
         }
 
         self.add_module_by_module_path(file_id, module_path, workspace_id);
+        self.file_module_paths.insert(file_id, normalized_path);
         Some(workspace_id)
     }
 
@@ -374,8 +378,7 @@ impl LuaModuleIndex {
         }
 
         let node = self.module_nodes.get(&parent_node_id)?;
-        let file_id = node.file_ids.first()?;
-        self.file_module_map.get(file_id)
+        self.select_module_globally(&node.file_ids)
     }
 
     fn exact_find_module_in_workspace(
@@ -401,36 +404,46 @@ impl LuaModuleIndex {
     ///
     /// Candidates must either exactly equal `module_path` or end with `.{module_path}`.
     /// Among matches, prefer the one with the fewest leading path segments before the suffix,
-    /// then use lexicographic `full_module_name` ordering as a stable tie-break.
+    /// then use lexicographic `full_module_name` ordering as a stable tie-break, and finally
+    /// fall back to the same deterministic ordering used by global module resolution.
     fn fuzzy_find_module(&self, module_path: &str, last_name: &str) -> Option<&ModuleInfo> {
         let file_ids = self.module_name_to_file_ids.get(last_name)?;
         let suffix_with_boundary = format!(".{}", module_path);
-        file_ids
-            .iter()
-            .filter_map(|file_id| {
-                let module_info = self.file_module_map.get(file_id)?;
-                let full_module_name = module_info.full_module_name.as_str();
-                let leading_segment_count = if full_module_name == module_path {
-                    Some(0)
-                } else {
-                    full_module_name
-                        .strip_suffix(&suffix_with_boundary)
-                        .map(|prefix| {
-                            prefix
-                                .split('.')
-                                .filter(|segment| !segment.is_empty())
-                                .count()
-                        })
-                }?;
+        let mut best: Option<(&ModuleInfo, usize)> = None;
+        for file_id in file_ids {
+            let Some(module_info) = self.file_module_map.get(file_id) else {
+                continue;
+            };
 
-                Some((leading_segment_count, module_info))
-            })
-            .min_by(|(left_count, left_info), (right_count, right_info)| {
-                left_count
-                    .cmp(right_count)
-                    .then_with(|| left_info.full_module_name.cmp(&right_info.full_module_name))
-            })
-            .map(|(_, module_info)| module_info)
+            let full_module_name = module_info.full_module_name.as_str();
+            let Some(leading_segment_count) = (if full_module_name == module_path {
+                Some(0)
+            } else {
+                full_module_name
+                    .strip_suffix(&suffix_with_boundary)
+                    .map(|prefix| {
+                        prefix
+                            .split('.')
+                            .filter(|segment| !segment.is_empty())
+                            .count()
+                    })
+            }) else {
+                continue;
+            };
+
+            match best {
+                Some((best_module, best_leading_count))
+                    if !self.is_candidate_better_for_fuzzy_global(
+                        module_info,
+                        leading_segment_count,
+                        best_module,
+                        best_leading_count,
+                    ) => {}
+                _ => best = Some((module_info, leading_segment_count)),
+            }
+        }
+
+        best.map(|(module_info, _)| module_info)
     }
 
     fn fuzzy_find_module_in_workspace(
@@ -455,14 +468,14 @@ impl LuaModuleIndex {
             };
 
             match best {
-                Some((_best_module, best_priority)) if priority > best_priority => {}
-                Some((best_module, best_priority)) if priority == best_priority => {
-                    let best_is_current_workspace = best_module.workspace_id == workspace_id;
-                    let candidate_is_current_workspace = module_info.workspace_id == workspace_id;
-                    if !best_is_current_workspace && candidate_is_current_workspace {
-                        best = Some((module_info, priority));
-                    }
-                }
+                Some((best_module, best_priority))
+                    if priority > best_priority
+                        || (priority == best_priority
+                            && !self.is_candidate_better_for_workspace(
+                                module_info,
+                                best_module,
+                                workspace_id,
+                            )) => {}
                 _ => best = Some((module_info, priority)),
             }
         }
@@ -477,7 +490,9 @@ impl LuaModuleIndex {
     ) -> Option<&ModuleInfo> {
         let mut best: Option<(&ModuleInfo, u8)> = None;
         for file_id in file_ids {
-            let module_info = self.file_module_map.get(file_id)?;
+            let Some(module_info) = self.file_module_map.get(file_id) else {
+                continue;
+            };
             let Some(priority) =
                 self.workspace_resolution_priority(workspace_id, module_info.workspace_id)
             else {
@@ -485,19 +500,123 @@ impl LuaModuleIndex {
             };
 
             match best {
-                Some((_best_module, best_priority)) if priority > best_priority => {}
-                Some((best_module, best_priority)) if priority == best_priority => {
-                    let best_is_current_workspace = best_module.workspace_id == workspace_id;
-                    let candidate_is_current_workspace = module_info.workspace_id == workspace_id;
-                    if !best_is_current_workspace && candidate_is_current_workspace {
-                        best = Some((module_info, priority));
-                    }
-                }
+                Some((best_module, best_priority))
+                    if priority > best_priority
+                        || (priority == best_priority
+                            && !self.is_candidate_better_for_workspace(
+                                module_info,
+                                best_module,
+                                workspace_id,
+                            )) => {}
                 _ => best = Some((module_info, priority)),
             }
         }
 
         best.map(|(module_info, _)| module_info)
+    }
+
+    fn select_module_globally(&self, file_ids: &[FileId]) -> Option<&ModuleInfo> {
+        let mut best: Option<&ModuleInfo> = None;
+        for file_id in file_ids {
+            let Some(module_info) = self.file_module_map.get(file_id) else {
+                continue;
+            };
+            match best {
+                Some(best_module) if !self.is_candidate_better_global(module_info, best_module) => {
+                }
+                _ => best = Some(module_info),
+            }
+        }
+
+        best
+    }
+
+    fn is_candidate_better_for_workspace(
+        &self,
+        candidate: &ModuleInfo,
+        current_best: &ModuleInfo,
+        current_workspace_id: WorkspaceId,
+    ) -> bool {
+        (
+            candidate.workspace_id != current_workspace_id,
+            self.workspace_order_priority(candidate.workspace_id),
+            self.module_path_key(candidate.file_id).is_none(),
+            self.module_path_key(candidate.file_id),
+            candidate.full_module_name.as_str(),
+            candidate.file_id,
+        ) < (
+            current_best.workspace_id != current_workspace_id,
+            self.workspace_order_priority(current_best.workspace_id),
+            self.module_path_key(current_best.file_id).is_none(),
+            self.module_path_key(current_best.file_id),
+            current_best.full_module_name.as_str(),
+            current_best.file_id,
+        )
+    }
+
+    fn is_candidate_better_global(
+        &self,
+        candidate: &ModuleInfo,
+        current_best: &ModuleInfo,
+    ) -> bool {
+        (
+            self.workspace_kind_priority(candidate.workspace_id),
+            self.workspace_order_priority(candidate.workspace_id),
+            self.module_path_key(candidate.file_id).is_none(),
+            self.module_path_key(candidate.file_id),
+            candidate.full_module_name.as_str(),
+            candidate.file_id,
+        ) < (
+            self.workspace_kind_priority(current_best.workspace_id),
+            self.workspace_order_priority(current_best.workspace_id),
+            self.module_path_key(current_best.file_id).is_none(),
+            self.module_path_key(current_best.file_id),
+            current_best.full_module_name.as_str(),
+            current_best.file_id,
+        )
+    }
+
+    fn is_candidate_better_for_fuzzy_global(
+        &self,
+        candidate: &ModuleInfo,
+        candidate_leading_segment_count: usize,
+        current_best: &ModuleInfo,
+        current_best_leading_segment_count: usize,
+    ) -> bool {
+        (
+            candidate_leading_segment_count,
+            candidate.full_module_name.as_str(),
+        ) < (
+            current_best_leading_segment_count,
+            current_best.full_module_name.as_str(),
+        ) || (candidate_leading_segment_count == current_best_leading_segment_count
+            && candidate.full_module_name == current_best.full_module_name
+            && self.is_candidate_better_global(candidate, current_best))
+    }
+
+    fn workspace_order_priority(&self, workspace_id: WorkspaceId) -> (usize, WorkspaceId) {
+        (
+            self.workspaces
+                .iter()
+                .position(|workspace| workspace.id == workspace_id)
+                .unwrap_or(usize::MAX),
+            workspace_id,
+        )
+    }
+
+    fn workspace_kind_priority(&self, workspace_id: WorkspaceId) -> u8 {
+        match self.get_workspace_kind(workspace_id) {
+            WorkspaceKind::Main => 0,
+            WorkspaceKind::Library => 1,
+            WorkspaceKind::Std => 2,
+            WorkspaceKind::Remote => 3,
+        }
+    }
+
+    fn module_path_key(&self, file_id: FileId) -> Option<&str> {
+        self.file_module_paths
+            .get(&file_id)
+            .map(|path| path.as_str())
     }
 
     /// Find a module node by module path.
@@ -823,6 +942,7 @@ impl LuaModuleIndex {
                 file_ids.push(module_info.file_id);
             }
         }
+        file_ids.sort_unstable();
 
         file_ids
     }
@@ -834,6 +954,7 @@ impl LuaModuleIndex {
                 file_ids.push(module_info.file_id);
             }
         }
+        file_ids.sort_unstable();
 
         file_ids
     }
@@ -896,6 +1017,7 @@ impl LuaIndex for LuaModuleIndex {
             };
 
         self.legacy_module_envs.remove(&file_id);
+        self.file_module_paths.remove(&file_id);
 
         if parent_id.is_none() || child_id.is_none() {
             return;
@@ -952,6 +1074,7 @@ impl LuaIndex for LuaModuleIndex {
     fn clear(&mut self) {
         self.module_nodes.clear();
         self.file_module_map.clear();
+        self.file_module_paths.clear();
         self.module_name_to_file_ids.clear();
         self.legacy_module_envs.clear();
 

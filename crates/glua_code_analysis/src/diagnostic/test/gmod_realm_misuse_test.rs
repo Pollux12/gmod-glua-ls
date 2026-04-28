@@ -836,6 +836,55 @@ mod tests {
     }
 
     #[gtest]
+    fn test_shared_snapshot_redefinition_uses_global_candidate_realms_not_decl_position_only() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatch);
+
+        ws.def_file(
+            "lua/autorun/sh_snapshot_redef_shared.lua",
+            r#"
+                function SnapshotRealmRedefinitionTarget()
+                    return true
+                end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/sh_snapshot_redef_client.lua",
+            r#"
+                ---@realm client
+                function SnapshotRealmRedefinitionTarget()
+                    return true
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/autorun/sh_snapshot_redef_call.lua",
+            r#"
+                if SERVER then
+                    SnapshotRealmRedefinitionTarget()
+                end
+            "#,
+        );
+
+        let snapshots = ws.run_diagnostics_with_shared_snapshots(&[file_id]);
+        let strict_code = Some(DiagnosticCode::GmodRealmMismatch.get_name().to_string());
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.code == strict_code),
+            "Expected strict realm mismatch in shared-snapshot diagnostics, got: {:?}",
+            snapshots
+        );
+    }
+
+    #[gtest]
     fn test_reports_risky_mismatch_for_client_calling_annotated_server_ent_method() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
