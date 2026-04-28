@@ -933,6 +933,88 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_gmod_member_prefers_real_definition_over_source_uri() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        ws.def_file(
+            "glua-api-snippets/output/hook.lua",
+            r#"
+                hook = {}
+                ---@source https://wiki.facepunch.com/gmod/hook.Run
+                ---@param eventName string
+                function hook.Run(eventName, ...)
+                end
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                hook.Ru<??>n("Think")
+            "#,
+            vec![Expected {
+                file: "hook.lua".to_string(),
+                line: 4,
+            }],
+        ));
+
+        check!(ws.check_definition(
+            r#"
+                local run = hook.Ru<??>n
+            "#,
+            vec![Expected {
+                file: "hook.lua".to_string(),
+                line: 4,
+            }],
+        ));
+
+        check!(ws.check_definition(
+            r#"
+                local run = hook.Run
+                ru<??>n("Think")
+            "#,
+            vec![
+                Expected {
+                    file: "".to_string(),
+                    line: 1,
+                },
+                Expected {
+                    file: "hook.lua".to_string(),
+                    line: 4,
+                },
+            ],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_source_file_uri_redirects_before_stub_definition() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        ws.def_file(
+            "annotations/generated.lua",
+            r#"
+                api = {}
+                ---@source file:///real/source.lua#7:3
+                function api.Stub()
+                end
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                api.St<??>ub()
+            "#,
+            vec![Expected {
+                file: "source.lua".to_string(),
+                line: 7,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_vgui_panel_definition_from_string() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
