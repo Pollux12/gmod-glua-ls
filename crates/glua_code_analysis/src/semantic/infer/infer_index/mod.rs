@@ -181,7 +181,7 @@ pub fn infer_member_by_member_key(
     infer_guard: &InferGuardRef,
 ) -> InferResult {
     match &prefix_type {
-        LuaType::Table => Ok(nullable_any_type()),
+        LuaType::Table => infer_plain_table_member(db, cache, index_expr),
         LuaType::Any => Ok(LuaType::Any),
         LuaType::Unknown => Err(InferFailReason::FieldNotFound),
         LuaType::Nil => Ok(LuaType::Never),
@@ -310,6 +310,31 @@ fn is_table_const_from_doc_tag(db: &DbIndex, inst: &InFiled<TextRange>) -> bool 
 
 fn nullable_any_type() -> LuaType {
     LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into())
+}
+
+fn infer_plain_table_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: LuaIndexMemberExpr,
+) -> InferResult {
+    let nullable_any = nullable_any_type();
+
+    let index_prefix_expr = match index_expr.clone() {
+        LuaIndexMemberExpr::TableField(_) => return Ok(nullable_any),
+        _ => index_expr.get_prefix_expr().ok_or(InferFailReason::None)?,
+    };
+
+    let Some(index_key) = index_expr.get_index_key() else {
+        return Ok(nullable_any);
+    };
+
+    if let LuaIndexKey::Expr(expr) = index_key
+        && check_iter_var_range(db, cache, &expr, index_prefix_expr).unwrap_or(false)
+    {
+        return Ok(LuaType::Any);
+    }
+
+    Ok(nullable_any)
 }
 
 fn infer_custom_type_member(

@@ -302,6 +302,50 @@ mod test {
     }
 
     #[gtest]
+    fn test_reverse_len_for_loop_index_on_plain_table_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@param myWeapons table
+            local function clear(myWeapons)
+                if not myWeapons then
+                    return
+                end
+
+                for i = #myWeapons, 1, -1 do
+                    myWeapons[i]:OnRemove()
+                    myWeapons[i] = nil
+                end
+            end
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_reverse_len_for_loop_index_with_zero_bound_still_reports_nil_access() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@param myWeapons table
+            local function clear(myWeapons)
+                for i = #myWeapons, 0, -1 do
+                    myWeapons[i]:OnRemove()
+                end
+            end
+        "#;
+
+        let has_need_check_nil = !ws.check_code_for(DiagnosticCode::NeedCheckNil, code);
+        let has_unchecked_nil_access = !ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code);
+        assert_that!(has_need_check_nil || has_unchecked_nil_access, eq(true));
+    }
+
+    #[gtest]
     fn test_isvalid_narrows_nil_from_nullable_type() {
         // Bug repro: IsValid(maybe) should narrow away nil in the true branch
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

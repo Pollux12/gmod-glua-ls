@@ -131,6 +131,9 @@ fn check_index_var_in_range(
     let iter_exprs = for_stat.get_iter_expr().collect::<Vec<_>>();
     let test_len_expr = match iter_exprs.len() {
         2 => {
+            if !is_one_based_index_bound(db, cache, iter_exprs[0].clone()).unwrap_or(false) {
+                return None;
+            }
             let LuaExpr::UnaryExpr(unary_expr) = iter_exprs[1].clone() else {
                 return None;
             };
@@ -142,11 +145,17 @@ fn check_index_var_in_range(
                 return None;
             };
             if step_value > 0 {
+                if !is_one_based_index_bound(db, cache, iter_exprs[0].clone()).unwrap_or(false) {
+                    return None;
+                }
                 let LuaExpr::UnaryExpr(unary_expr) = iter_exprs[1].clone() else {
                     return None;
                 };
                 unary_expr
             } else if step_value < 0 {
+                if !is_one_based_index_bound(db, cache, iter_exprs[1].clone()).unwrap_or(false) {
+                    return None;
+                }
                 let LuaExpr::UnaryExpr(unary_expr) = iter_exprs[0].clone() else {
                     return None;
                 };
@@ -186,4 +195,16 @@ fn check_is_len(
     let prefix_expr_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr)?;
 
     Some(len_expr_var_ref_id == prefix_expr_var_ref_id)
+}
+
+fn is_one_based_index_bound(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+) -> Option<bool> {
+    let bound_type = infer_expr(db, cache, expr).ok()?;
+    Some(matches!(
+        bound_type,
+        LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) if value >= 1
+    ))
 }
