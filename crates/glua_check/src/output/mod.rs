@@ -266,10 +266,7 @@ trait OutputWriter {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{
-        OutputDiagnostic, compare_output_diagnostics, normalize_path_for_sort, output_result,
-        severity_test_key,
-    };
+    use super::{OutputDiagnostic, compare_output_diagnostics, output_result, severity_test_key};
     use crate::cmd_args::{OutputDestination, OutputFormat};
     use glua_code_analysis::{DbIndex, FileId, file_path_to_uri};
     use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
@@ -444,7 +441,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn normalize_path_for_sort_removes_verbatim_prefix_and_normalizes_case() {
-        let normalized = normalize_path_for_sort(std::path::Path::new(r"\\?\C:\Project\File.lua"));
+        let normalized =
+            super::normalize_path_for_sort(std::path::Path::new(r"\\?\C:\Project\File.lua"));
         assert_eq!(normalized, "c:/project/file.lua");
     }
 
