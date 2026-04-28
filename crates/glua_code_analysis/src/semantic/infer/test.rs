@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, LuaType, LuaUnionType, VirtualWorkspace};
+    use crate::{DiagnosticCode, FileId, LuaType, LuaUnionType, VirtualWorkspace};
     use glua_parser::{LuaAstNode, LuaExpr, LuaNameExpr};
 
     fn infer_last_name_expr_type(
@@ -9,6 +9,14 @@ mod test {
         name: &str,
     ) -> crate::LuaType {
         let file_id = ws.def(code);
+        infer_last_name_expr_type_in_file(ws, file_id, name)
+    }
+
+    fn infer_last_name_expr_type_in_file(
+        ws: &VirtualWorkspace,
+        file_id: FileId,
+        name: &str,
+    ) -> crate::LuaType {
         let semantic_model = ws
             .analysis
             .compilation
@@ -325,6 +333,183 @@ mod test {
             ty,
             ws.ty("any"),
             "Type should be Any after truthy guard, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
+    fn test_guarded_unknown_index_expr_value_narrows_to_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            local function draw(rec)
+                if not rec or not rec.data then return end
+
+                local d = rec.data
+                print(d)
+            end
+        "#,
+            "d",
+        );
+
+        assert_eq!(
+            ty,
+            ws.ty("any"),
+            "Guarded unknown field value should narrow to Any, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
+    fn test_pairs_value_preserves_indexed_assignment_table_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            Glide = {}
+            Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+
+            local entId = 1
+            local rec = Glide.DebugSnapshots[entId]
+            if not rec then
+                rec = { data = {}, t = 0 }
+                Glide.DebugSnapshots[entId] = rec
+            end
+
+            local function draw()
+                local snaps = Glide.DebugSnapshots or {}
+                for entId, rec in pairs(snaps) do
+                    if not rec or not rec.data then return end
+
+                    local d = rec.data
+                    print(d)
+                end
+            end
+        "#,
+            "d",
+        );
+
+        assert!(
+            matches!(ty, LuaType::TableConst(_)),
+            "Guarded field from pairs value should preserve the assigned data table, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
+    fn test_pairs_value_preserves_cross_file_indexed_assignment_table_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/sh_glide.lua",
+            r#"
+            ---@class Glide
+            Glide = Glide or {}
+        "#,
+        );
+        let consumer_file = ws.def_file(
+            "lua/glide/client/debugging.lua",
+            r#"
+            local SNAP_TTL = 1
+            local function draw()
+                local now = 2
+                local snaps = Glide.DebugSnapshots or {}
+                for entId, rec in pairs(snaps) do
+                    if not rec or not rec.data then continue end
+                    if now - rec.t > SNAP_TTL then
+                        Glide.DebugSnapshots[entId] = nil
+                        continue
+                    end
+
+                    local d = rec.data
+                    print(d)
+                end
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            Glide.DebugNetwork = Glide.DebugNetwork or {}
+
+            do
+                local shared = Glide.DebugNetwork
+                if not shared.REMOVED then
+                    shared.REMOVED = {}
+                end
+            end
+
+            if CLIENT then
+                local DebugNet = Glide.DebugNetwork
+                local REMOVED = DebugNet.REMOVED
+
+                local function readValue()
+                    return 1
+                end
+
+                function DebugNet.ReadSnapshot()
+                    local entId = 1
+                    local vehicleId = nil
+                    local fields = {}
+                    local key = "radius"
+                    fields[key] = readValue()
+
+                    return entId, vehicleId, fields
+                end
+            end
+
+            Glide.CMD_DEBUG_SNAPSHOT = 14
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+            local DebugNet = Glide.DebugNetwork
+            local REMOVED = DebugNet.REMOVED
+
+            commands[Glide.CMD_DEBUG_SNAPSHOT] = function()
+                local entId, vehicleId, fields = DebugNet.ReadSnapshot()
+                if not entId then return end
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+
+                local rec = Glide.DebugSnapshots[entId]
+                if not rec then
+                    rec = { data = {}, t = 0 }
+                    Glide.DebugSnapshots[entId] = rec
+                end
+
+                local data = rec.data
+                if vehicleId ~= nil then
+                    data.vehicle = vehicleId
+                else
+                    data.vehicle = nil
+                end
+
+                for key, value in pairs(fields) do
+                    if key ~= "ent" then
+                        if value == REMOVED then
+                            data[key] = nil
+                        else
+                            data[key] = value
+                        end
+                    end
+                end
+                rec.t = 0
+            end
+        "#,
+        );
+
+        let ty = infer_last_name_expr_type_in_file(&ws, consumer_file, "d");
+        assert!(
+            matches!(ty, LuaType::TableConst(_)),
+            "Cross-file guarded field from pairs value should preserve the assigned data table, got: {:?}",
             ty
         );
     }

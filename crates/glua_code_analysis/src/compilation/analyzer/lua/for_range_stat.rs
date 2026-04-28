@@ -1,10 +1,10 @@
-use glua_parser::{LuaAstToken, LuaExpr, LuaForRangeStat};
+use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 
 use crate::{
-    DbIndex, InferFailReason, LuaDeclId, LuaInferCache, LuaOperatorMetaMethod, LuaType,
-    LuaTypeCache, TplContext, TypeOps, TypeSubstitutor, VariadicType,
-    compilation::analyzer::unresolve::UnResolveIterVar, infer_expr, instantiate_doc_function,
-    tpl_pattern_match_args,
+    DbIndex, InferFailReason, LuaDeclId, LuaInferCache, LuaMemberKey, LuaOperatorMetaMethod,
+    LuaType, LuaTypeCache, TplContext, TypeOps, TypeSubstitutor, VariadicType,
+    compilation::analyzer::unresolve::UnResolveIterVar, get_member_map, infer_expr,
+    instantiate_doc_function, tpl_pattern_match_args,
 };
 
 use super::LuaAnalyzer;
@@ -64,7 +64,7 @@ pub fn analyze_for_range_stat(
 }
 
 pub fn infer_for_range_iter_expr_func(
-    db: &mut DbIndex,
+    db: &DbIndex,
     cache: &mut LuaInferCache,
     iter_exprs: &[LuaExpr],
 ) -> Result<VariadicType, InferFailReason> {
@@ -80,6 +80,12 @@ pub fn infer_for_range_iter_expr_func(
 
     let iter_func_expr = iter_exprs[0].clone();
     let first_expr_type = infer_expr(db, cache, iter_func_expr)?;
+    if let Some(iter_types) =
+        try_infer_pairs_iter_types_from_table_members(db, cache, &iter_exprs[0], &first_expr_type)?
+    {
+        return Ok(iter_types);
+    }
+
     let doc_function = match first_expr_type {
         LuaType::DocFunction(func) => func,
         LuaType::Signature(sig_id) => {
@@ -168,4 +174,107 @@ pub fn infer_for_range_iter_expr_func(
     };
 
     Ok(instantiate_func.get_variadic_ret())
+}
+
+fn try_infer_pairs_iter_types_from_table_members(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    iter_expr: &LuaExpr,
+    first_expr_type: &LuaType,
+) -> Result<Option<VariadicType>, InferFailReason> {
+    if !matches!(first_expr_type, LuaType::Variadic(_)) {
+        return Ok(None);
+    }
+
+    let LuaExpr::CallExpr(call_expr) = iter_expr else {
+        return Ok(None);
+    };
+    if !is_global_pairs_call(db, cache, call_expr) {
+        return Ok(None);
+    }
+
+    let Some(args_list) = call_expr.get_args_list() else {
+        return Ok(None);
+    };
+    let mut args = args_list.get_args();
+    let Some(table_arg) = args.next() else {
+        return Ok(None);
+    };
+    if args.next().is_some() {
+        return Ok(None);
+    }
+
+    let table_type = infer_expr(db, cache, table_arg)?;
+    let Some(members) = get_member_map(db, &table_type) else {
+        return Ok(None);
+    };
+    if members.keys().any(is_pairs_metamethod_key) {
+        return Ok(None);
+    }
+
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    let mut member_entries = members.into_iter().collect::<Vec<_>>();
+    member_entries.sort_by_key(|(key, _)| member_key_stable_key(key));
+    for (key, member_infos) in member_entries {
+        let key_type = match key {
+            LuaMemberKey::Integer(i) => LuaType::IntegerConst(i),
+            LuaMemberKey::Name(name) => LuaType::StringConst(name.into()),
+            LuaMemberKey::ExprType(typ) => typ,
+            LuaMemberKey::None => continue,
+        };
+        keys.push(key_type);
+
+        let value_type = match member_infos.as_slice() {
+            [] => LuaType::Any,
+            [member] => member.typ.clone(),
+            _ => LuaType::from_vec(
+                member_infos
+                    .into_iter()
+                    .map(|member| member.typ)
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        values.push(value_type);
+    }
+
+    if keys.is_empty() || values.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(VariadicType::Multi(vec![
+        LuaType::from_vec(keys),
+        LuaType::from_vec(values),
+    ])))
+}
+
+fn is_pairs_metamethod_key(key: &LuaMemberKey) -> bool {
+    matches!(key, LuaMemberKey::Name(name) if name.as_str() == "__pairs")
+}
+
+fn member_key_stable_key(key: &LuaMemberKey) -> (u8, String) {
+    match key {
+        LuaMemberKey::None => (0, String::new()),
+        LuaMemberKey::Integer(i) => (1, i.to_string()),
+        LuaMemberKey::Name(name) => (2, name.to_string()),
+        LuaMemberKey::ExprType(typ) => (3, format!("{typ:?}")),
+    }
+}
+
+fn is_global_pairs_call(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    call_expr: &glua_parser::LuaCallExpr,
+) -> bool {
+    let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    if name_expr.get_name_text().as_deref() != Some("pairs") {
+        return false;
+    }
+
+    db.get_reference_index()
+        .get_local_reference(&cache.get_file_id())
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .is_none()
 }

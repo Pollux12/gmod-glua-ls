@@ -5,8 +5,8 @@ use std::{
 };
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
-    LuaLocalStat, LuaTableExpr, LuaTableField,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat,
+    LuaIndexExpr, LuaLocalStat, LuaTableExpr, LuaTableField,
 };
 
 use crate::{
@@ -39,6 +39,10 @@ pub fn try_resolve_decl(
     decl: &mut UnResolveDecl,
 ) -> ResolveResult {
     let expr = decl.expr.clone();
+    if should_defer_guarded_index_alias_resolution(db, cache, &expr) {
+        return Err(InferFailReason::FieldNotFound);
+    }
+
     let expr_type = infer_expr(db, cache, expr.clone())?;
     let decl_id = decl.decl_id;
     let expr_type = match &expr_type {
@@ -51,6 +55,39 @@ pub fn try_resolve_decl(
 
     bind_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
     Ok(())
+}
+
+fn should_defer_guarded_index_alias_resolution(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> bool {
+    let Some(left) = guarded_index_or_empty_table_left(expr) else {
+        return false;
+    };
+
+    match infer_expr(db, cache, left) {
+        Ok(ty) => ty.is_nil() || ty.is_unknown(),
+        Err(reason) => reason.is_need_resolve(),
+    }
+}
+
+fn guarded_index_or_empty_table_left(expr: &LuaExpr) -> Option<LuaExpr> {
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return None;
+    };
+    if binary_expr.get_op_token().map(|op| op.get_op()) != Some(BinaryOperator::OpOr) {
+        return None;
+    }
+    let (left, right) = binary_expr.get_exprs()?;
+    if !matches!(left, LuaExpr::IndexExpr(_)) {
+        return None;
+    }
+    if !matches!(right, LuaExpr::TableExpr(table_expr) if table_expr.is_empty()) {
+        return None;
+    }
+
+    Some(left)
 }
 
 pub fn try_resolve_member(

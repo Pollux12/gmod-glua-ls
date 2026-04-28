@@ -8,6 +8,8 @@ mod infer_cache_manager;
 mod lua;
 pub(crate) mod unresolve;
 
+pub(crate) use lua::infer_for_range_iter_expr_func;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,

@@ -96,22 +96,16 @@ pub fn try_bootstrap_or(
     right: &LuaExpr,
     err: &crate::semantic::InferFailReason,
 ) -> Option<LuaType> {
-    // Only for NeedResolve errors
     if !err.is_need_resolve() {
         return None;
     }
 
-    // Exact syntactic shape: RHS is an empty table literal {} and LHS is NameExpr or IndexExpr.
     if !matches!(left, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
         return None;
     }
 
-    if let LuaExpr::TableExpr(table_expr) = right {
-        if table_expr.is_empty() {
-            // Locally treat LHS as unknown only for bootstrap selection
-            // Return the RHS literal table type
-            return crate::semantic::infer_expr(db, cache, right.clone()).ok();
-        }
+    if matches!(right, LuaExpr::TableExpr(table_expr) if table_expr.is_empty()) {
+        return crate::semantic::infer_expr(db, cache, right.clone()).ok();
     }
 
     None

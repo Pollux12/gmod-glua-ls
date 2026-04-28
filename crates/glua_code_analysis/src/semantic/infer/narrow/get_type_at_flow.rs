@@ -207,6 +207,14 @@ fn get_type_at_flow_walk(
 
                     match get_decl_position_var_ref_type(db, cache, var_ref_id) {
                         Ok(var_type) => {
+                            if should_retry_decl_initializer_type(&var_type)
+                                && let Ok(Some(init_type)) =
+                                    try_infer_decl_initializer_type(db, cache, root, var_ref_id)
+                                && !should_retry_decl_initializer_type(&init_type)
+                            {
+                                return Ok(init_type);
+                            }
+
                             return Ok(var_type);
                         }
                         Err(err) => {
@@ -465,6 +473,10 @@ fn get_decl_position_var_ref_type(
     }
 
     get_var_ref_type(db, cache, var_ref_id)
+}
+
+fn should_retry_decl_initializer_type(typ: &LuaType) -> bool {
+    typ.is_unknown() || typ.contain_tpl()
 }
 
 fn with_flow_query_realm<T>(
