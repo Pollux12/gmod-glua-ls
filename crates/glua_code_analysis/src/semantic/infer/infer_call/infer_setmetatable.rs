@@ -2,6 +2,7 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey};
 
 use crate::{
     DbIndex, InFiled, InferFailReason, LuaInferCache, LuaInstanceType, LuaMemberKey, LuaType,
+    LuaUnionType,
     infer_expr,
     semantic::{infer::InferResult, member::find_members_with_key},
 };
@@ -115,10 +116,22 @@ fn infer_metatable_index_type(
     if let Some(meta_members) =
         find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), false)
         && let Some(meta_member) = meta_members.first()
-        && meta_member.typ.is_custom_type()
+        && is_supported_metatable_index_type(&meta_member.typ)
     {
         return Ok((meta_member.typ.clone(), true));
     }
 
     Ok((meta_type, false))
+}
+
+fn is_supported_metatable_index_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Union(union) => match union.as_ref() {
+            LuaUnionType::Nullable(inner) => is_supported_metatable_index_type(inner),
+            LuaUnionType::Multi(types) => types.iter().any(is_supported_metatable_index_type),
+        },
+        LuaType::TypeGuard(inner) => is_supported_metatable_index_type(inner),
+        LuaType::Instance(instance) => is_supported_metatable_index_type(instance.get_base()),
+        _ => typ.is_table() || typ.is_custom_type() || typ.is_object(),
+    }
 }

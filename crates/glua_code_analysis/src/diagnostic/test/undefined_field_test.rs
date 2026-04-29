@@ -72,6 +72,37 @@ mod test {
     }
 
     #[test]
+    fn test_setmetatable_named_metatable_does_not_report_undefined_field_for_methods() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                Glide = {}
+
+                local RangedFeature = {}
+                RangedFeature.__index = RangedFeature
+
+                function RangedFeature:Update() end
+                function RangedFeature:Think() end
+                function RangedFeature:Draw() end
+
+                function Glide.CreateRangedFeature(vehicle, maxDistance)
+                    return setmetatable({}, RangedFeature)
+                end
+
+                local ENT = {}
+
+                function ENT:Initialize()
+                    self.rfMisc = Glide.CreateRangedFeature(self, 1000)
+                    self.rfMisc:Update()
+                    self.rfMisc:Think()
+                    self.rfMisc:Draw()
+                end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_included_server_scripted_class_reverse_numeric_for_does_not_report_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
