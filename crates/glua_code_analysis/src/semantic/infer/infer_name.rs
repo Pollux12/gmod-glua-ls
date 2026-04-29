@@ -1,11 +1,8 @@
-use std::path::Path;
-
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaNameExpr,
     LuaVarExpr,
 };
 use rowan::TextSize;
-use wax::Pattern;
 
 use super::{InferFailReason, InferResult, infer_expr};
 use crate::{
@@ -202,98 +199,10 @@ fn detect_scoped_global_from_path(db: &DbIndex, file_id: FileId) -> Option<(Stri
 
 fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-    let include_patterns = scopes.include_patterns();
-    let exclude_patterns = scopes.exclude_patterns();
-    if include_patterns.is_empty() && exclude_patterns.is_empty() {
-        return true;
-    }
-
     let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
-        return include_patterns.is_empty();
+        return scopes.resolved_definitions().is_empty();
     };
-
-    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
-    let mut candidate_paths = Vec::new();
-    push_path_candidates(&mut candidate_paths, &normalized_path);
-    let normalized_lower = normalized_path.to_ascii_lowercase();
-    if let Some(lua_idx) = normalized_lower.find("/lua/") {
-        let lua_relative_path = normalized_path[lua_idx + 1..].to_string();
-        push_path_candidates(&mut candidate_paths, &lua_relative_path);
-        if let Some(stripped) = lua_relative_path.strip_prefix("lua/") {
-            push_path_candidates(&mut candidate_paths, stripped);
-        }
-    }
-    if let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) {
-        push_candidate_path(&mut candidate_paths, file_name);
-    }
-
-    if !include_patterns.is_empty() {
-        let include_set = match wax::any(
-            include_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(glob) => glob,
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
-                return true;
-            }
-        };
-        if !candidate_paths
-            .iter()
-            .any(|path| include_set.is_match(Path::new(path)))
-        {
-            return false;
-        }
-    }
-
-    if !exclude_patterns.is_empty() {
-        let exclude_set = match wax::any(
-            exclude_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(glob) => glob,
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");
-                return false;
-            }
-        };
-        if candidate_paths
-            .iter()
-            .any(|path| exclude_set.is_match(Path::new(path)))
-        {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn push_path_candidates(candidate_paths: &mut Vec<String>, path: &str) {
-    push_candidate_path(candidate_paths, path);
-
-    let segments = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    for idx in 0..segments.len() {
-        push_candidate_path(candidate_paths, &segments[idx..].join("/"));
-    }
-}
-
-fn push_candidate_path(candidate_paths: &mut Vec<String>, candidate: &str) {
-    if candidate.is_empty() {
-        return;
-    }
-
-    if candidate_paths.iter().any(|existing| existing == candidate) {
-        return;
-    }
-
-    candidate_paths.push(candidate.to_string());
+    scopes.is_file_in_scope(file_path)
 }
 
 fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -> InferResult {

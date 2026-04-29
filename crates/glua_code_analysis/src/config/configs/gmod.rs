@@ -979,18 +979,27 @@ impl EmmyrcGmodScriptedClassScopes {
             .collect()
     }
 
+    /// Returns true if the file matches at least one definition's include
+    /// patterns without being excluded by that *same* definition's exclude
+    /// patterns.  Unlike the old global exclude check, this prevents a
+    /// sibling definition's exclude (e.g. SWEP's `weapons/gmod_tool/**`)
+    /// from blocking a file that legitimately belongs to another definition
+    /// (e.g. STOOL's `weapons/gmod_tool/stools/**`).
+    pub fn is_file_in_scope(&self, file_path: &Path) -> bool {
+        let definitions = self.resolved_definitions();
+        if definitions.is_empty() {
+            return true;
+        }
+
+        definitions
+            .iter()
+            .any(|definition| matches_scope_patterns(file_path, &definition.include, &definition.exclude))
+    }
+
     pub fn detect_class_for_path(
         &self,
         file_path: &Path,
     ) -> Option<ResolvedGmodScriptedClassMatch> {
-        if !matches_scope_patterns(
-            file_path,
-            &self.include_patterns(),
-            &self.exclude_patterns(),
-        ) {
-            return None;
-        }
-
         let normalized_path = file_path.to_string_lossy().replace('\\', "/");
         let original_segments = normalized_path
             .split('/')
@@ -1010,6 +1019,18 @@ impl EmmyrcGmodScriptedClassScopes {
         let definitions = self.resolved_definitions();
         let mut best_match: Option<(ResolvedGmodScriptedClassDefinition, usize, usize)> = None;
         for definition in definitions {
+            // Check THIS definition's include/exclude patterns — do not merge
+            // excludes from other definitions, as they are definition-scoped.
+            // E.g. SWEP's "weapons/gmod_tool/**" exclude must not prevent
+            // STOOL files from matching the STOOL definition.
+            if !matches_scope_patterns(
+                file_path,
+                &definition.include,
+                &definition.exclude,
+            ) {
+                continue;
+            }
+
             let rule_len = definition.path.len();
             if rule_len == 0 || lower_segments.len() < rule_len {
                 continue;
@@ -1352,6 +1373,75 @@ mod tests {
         verify_that!(gmod.network.completion.mismatch_hints, eq(false))?;
         verify_that!(gmod.vgui.code_lens_enabled, eq(false))?;
         verify_that!(gmod.vgui.inlay_hint_enabled, eq(true))
+    }
+
+    #[gtest]
+    fn test_detect_class_for_path_stool_default_scopes() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+
+        // Standard lua-root path
+        let result = scopes.detect_class_for_path(Path::new(
+            "lua/weapons/gmod_tool/stools/hoverball.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
+        verify_that!(match_.class_name.as_str(), eq("hoverball"))?;
+
+        // Gamemode-nested path (e.g. gamemodes/sandbox/entities/weapons/...)
+        let result = scopes.detect_class_for_path(Path::new(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/stools/hoverball.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
+        verify_that!(match_.class_name.as_str(), eq("hoverball"))
+    }
+
+    #[gtest]
+    fn test_stool_not_matched_as_swep() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+
+        // STOOL files must be classified as TOOL, not SWEP
+        let result = scopes.detect_class_for_path(Path::new(
+            "lua/weapons/gmod_tool/stools/rope.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
+        verify_that!(match_.definition.id.as_str(), eq("stools"))?;
+
+        // Regular SWEP files must still be classified as SWEP
+        let result = scopes.detect_class_for_path(Path::new(
+            "lua/weapons/weapon_pistol/shared.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
+        verify_that!(match_.definition.id.as_str(), eq("weapons"))
+    }
+
+    #[gtest]
+    fn test_is_file_in_scope_stool() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+
+        // STOOL files should be considered in scope
+        verify_that!(
+            scopes.is_file_in_scope(Path::new("lua/weapons/gmod_tool/stools/hoverball.lua")),
+            eq(true)
+        )?;
+
+        // SWEP files should also be in scope
+        verify_that!(
+            scopes.is_file_in_scope(Path::new("lua/weapons/weapon_pistol/shared.lua")),
+            eq(true)
+        )?;
+
+        // Random files should not be in scope
+        verify_that!(
+            scopes.is_file_in_scope(Path::new("lua/random/file.lua")),
+            eq(false)
+        )
     }
 
     #[gtest]

@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
@@ -7,7 +6,6 @@ use glua_parser::{
     NumberResult, PathTrait,
 };
 use rowan::TextSize;
-use wax::Pattern;
 
 use crate::{
     AccessorFuncCallMetadata, DbIndex, FileId, GlobalId, GmodClassCallArg, GmodClassCallLiteral,
@@ -1397,121 +1395,20 @@ pub(in crate::compilation::analyzer) fn compute_scripted_class_files(
     file_ids: &[FileId],
 ) -> HashSet<FileId> {
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-    let include_patterns = scopes.include_patterns();
-    let exclude_patterns = scopes.exclude_patterns();
-    if include_patterns.is_empty() && exclude_patterns.is_empty() {
+    if scopes.resolved_definitions().is_empty() {
         return file_ids.iter().copied().collect();
     }
-
-    let include_glob = if !include_patterns.is_empty() {
-        match wax::any(
-            include_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(g) => Some(g),
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
-                return file_ids.iter().copied().collect();
-            }
-        }
-    } else {
-        None
-    };
-
-    let exclude_glob = if !exclude_patterns.is_empty() {
-        match wax::any(
-            exclude_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(g) => Some(g),
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");
-                return HashSet::new();
-            }
-        }
-    } else {
-        None
-    };
 
     file_ids
         .iter()
         .copied()
-        .filter(|file_id| check_file_in_scope(db, *file_id, &include_glob, &exclude_glob))
+        .filter(|file_id| {
+            let Some(file_path) = db.get_vfs().get_file_path(file_id) else {
+                return false;
+            };
+            scopes.is_file_in_scope(file_path)
+        })
         .collect()
-}
-
-fn check_file_in_scope(
-    db: &DbIndex,
-    file_id: FileId,
-    include_glob: &Option<wax::Any>,
-    exclude_glob: &Option<wax::Any>,
-) -> bool {
-    let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
-        return include_glob.is_none();
-    };
-
-    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
-    let mut candidate_paths = Vec::new();
-    push_path_candidates(&mut candidate_paths, &normalized_path);
-    let normalized_lower = normalized_path.to_ascii_lowercase();
-    if let Some(lua_idx) = normalized_lower.find("/lua/") {
-        let lua_relative_path = normalized_path[lua_idx + 1..].to_string();
-        push_path_candidates(&mut candidate_paths, &lua_relative_path);
-        if let Some(stripped) = lua_relative_path.strip_prefix("lua/") {
-            push_path_candidates(&mut candidate_paths, stripped);
-        }
-    }
-    if let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) {
-        push_candidate_path(&mut candidate_paths, file_name);
-    }
-
-    if let Some(include) = include_glob {
-        if !candidate_paths
-            .iter()
-            .any(|path| include.is_match(Path::new(path)))
-        {
-            return false;
-        }
-    }
-
-    if let Some(exclude) = exclude_glob {
-        if candidate_paths
-            .iter()
-            .any(|path| exclude.is_match(Path::new(path)))
-        {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn push_path_candidates(candidate_paths: &mut Vec<String>, path: &str) {
-    push_candidate_path(candidate_paths, path);
-
-    let segments = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    for idx in 0..segments.len() {
-        push_candidate_path(candidate_paths, &segments[idx..].join("/"));
-    }
-}
-
-fn push_candidate_path(candidate_paths: &mut Vec<String>, candidate: &str) {
-    if candidate.is_empty() {
-        return;
-    }
-
-    if candidate_paths.iter().any(|existing| existing == candidate) {
-        return;
-    }
-
-    candidate_paths.push(candidate.to_string());
 }
 
 fn extract_call_args(
