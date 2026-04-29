@@ -219,4 +219,16 @@ impl LuaTokenKind {
                 | LuaTokenKind::TkShiftRightAssign
         )
     }
+
+    pub fn is_trivia(self) -> bool {
+        matches!(
+            self,
+            LuaTokenKind::TkShortComment
+                | LuaTokenKind::TkLongComment
+                | LuaTokenKind::TkEndOfLine
+                | LuaTokenKind::TkWhitespace
+                | LuaTokenKind::TkShebang
+                | LuaTokenKind::TkDocContinue
+        )
+    }
 }

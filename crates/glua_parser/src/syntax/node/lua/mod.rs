@@ -298,7 +298,13 @@ impl LuaTableField {
 
                         return Some(LuaIndexKey::Expr(LuaExpr::cast(node).unwrap()));
                     }
-                    _ => return None,
+                    rowan::NodeOrToken::Token(token) => {
+                        let kind: LuaTokenKind = token.kind().into();
+                        if kind.is_trivia() {
+                            continue;
+                        }
+                        return None;
+                    }
                 }
             } else if let Some(token) = child.as_token() {
                 if token.kind() == LuaTokenKind::TkLeftBracket.into() {
