@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::{
     DiagnosticCode, GmodRealm, NetOpKind, NetReceiveFlow, NetSendFlow, SemanticModel,
     expected_receiver_realm, flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
@@ -73,6 +75,11 @@ fn check_read_write_mismatch(
     infer_index: &crate::GmodInferIndex,
     vfs: &crate::vfs::Vfs,
 ) {
+    let mut sorted_send_flow_cache: HashMap<
+        String,
+        Vec<(crate::FileId, &NetSendFlow, SenderSortKey)>,
+    > = HashMap::new();
+
     for receive_flow in receive_flows {
         if receive_flow.reads_opaque {
             // Callback body could not be inspected — counts/types unknown.
@@ -85,8 +92,11 @@ fn check_read_write_mismatch(
             continue;
         }
 
-        let matching_send_flows =
-            sorted_send_flows_for_message(network_index, vfs, &receive_flow.message_name);
+        let matching_send_flows = sorted_send_flow_cache
+            .entry(receive_flow.message_name.clone())
+            .or_insert_with(|| {
+                sorted_send_flows_for_message(network_index, vfs, &receive_flow.message_name)
+            });
         let mut has_matching_candidate = false;
         let mut best_mismatch: Option<CandidateMismatch> = None;
 
@@ -96,7 +106,7 @@ fn check_read_write_mismatch(
             }
 
             let sender_realm =
-                infer_index.get_realm_at_offset(&send_file_id, send_flow.start_range.start());
+                infer_index.get_realm_at_offset(send_file_id, send_flow.start_range.start());
             if !is_strict_realm(sender_realm) {
                 continue;
             }
@@ -139,7 +149,7 @@ fn check_read_write_mismatch(
                 message,
                 common_prefix_len: matching_prefix_len(send_flow, receive_flow),
                 write_count: send_flow.writes.len(),
-                sender_sort_key,
+                sender_sort_key: sender_sort_key.clone(),
             };
 
             let replace_best = match best_mismatch.as_ref() {
@@ -435,6 +445,11 @@ fn check_bits_mismatch(
 ) {
     use std::collections::HashSet;
 
+    let mut sorted_send_flow_cache: HashMap<
+        String,
+        Vec<(crate::FileId, &NetSendFlow, SenderSortKey)>,
+    > = HashMap::new();
+
     for receive_flow in receive_flows {
         if receive_flow.reads_opaque {
             continue;
@@ -446,8 +461,11 @@ fn check_bits_mismatch(
             continue;
         }
 
-        let matching_send_flows =
-            sorted_send_flows_for_message(network_index, vfs, &receive_flow.message_name);
+        let matching_send_flows = sorted_send_flow_cache
+            .entry(receive_flow.message_name.clone())
+            .or_insert_with(|| {
+                sorted_send_flows_for_message(network_index, vfs, &receive_flow.message_name)
+            });
 
         let mut reported: HashSet<(usize, u32, u32)> = HashSet::new();
 
@@ -457,7 +475,7 @@ fn check_bits_mismatch(
             }
 
             let sender_realm =
-                infer_index.get_realm_at_offset(&send_file_id, send_flow.start_range.start());
+                infer_index.get_realm_at_offset(send_file_id, send_flow.start_range.start());
             if !is_strict_realm(sender_realm) {
                 continue;
             }

@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc, vec};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    vec,
+};
 
 use glua_code_analysis::{
     AsyncState, DbIndex, InferGuard, LuaDocReturnInfo, LuaFunctionType, LuaMember, LuaMemberOwner,
@@ -271,14 +275,14 @@ fn dedup_function_infos(
     caller_realm: glua_code_analysis::GmodRealm,
 ) {
     let mut deduped_reversed: Vec<HoverFunctionInfo> = Vec::with_capacity(function_infos.len());
+    let mut index_by_primary: HashMap<String, usize> = HashMap::with_capacity(function_infos.len());
     for function_info in function_infos.drain(..).rev() {
-        if let Some(existing) = deduped_reversed
-            .iter_mut()
-            .find(|existing| existing.primary == function_info.primary)
-        {
+        if let Some(existing_index) = index_by_primary.get(&function_info.primary).copied() {
+            let existing = &mut deduped_reversed[existing_index];
             merge_preferred_description(existing, &function_info, caller_realm);
             continue;
         }
+        index_by_primary.insert(function_info.primary.clone(), deduped_reversed.len());
         deduped_reversed.push(function_info);
     }
     deduped_reversed.reverse();
