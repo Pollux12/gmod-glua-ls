@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, FileId, LuaType, LuaUnionType, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, FileId, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaType,
+        LuaUnionType, VirtualWorkspace, semantic::infer_owner_raw_member_type_with_realm,
+    };
     use glua_parser::{LuaAstNode, LuaExpr, LuaNameExpr};
 
     fn infer_last_name_expr_type(
@@ -726,6 +729,50 @@ mod test {
         let ty = ws.expr_ty("F");
 
         assert!(matches!(ty, LuaType::Signature(_)), "got: {ty:?}");
+    }
+
+    #[test]
+    fn test_table_const_exact_name_lookup_does_not_union_other_members() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local tbl = { pi = 3.1415 }
+            function tbl.max(a, b) return a > b and a or b end
+            local _ = tbl.Max
+            "#,
+        );
+
+        let tbl_type = infer_last_name_expr_type_in_file(&ws, file_id, "tbl");
+        let LuaType::TableConst(table_id) = tbl_type else {
+            panic!("expected table const, got: {tbl_type:?}");
+        };
+
+        let db = ws.analysis.compilation.get_db();
+        let missing_key = LuaMemberKey::Name("Max".into());
+        let missing_lookup = infer_owner_raw_member_type_with_realm(
+            db,
+            LuaMemberOwner::Element(table_id.clone()),
+            &missing_key,
+            file_id,
+            None,
+        );
+        assert!(
+            matches!(missing_lookup, Err(InferFailReason::FieldNotFound)),
+            "unexpected lookup result for missing exact key: {missing_lookup:?}"
+        );
+
+        let existing_key = LuaMemberKey::Name("max".into());
+        let existing_lookup = infer_owner_raw_member_type_with_realm(
+            db,
+            LuaMemberOwner::Element(table_id),
+            &existing_key,
+            file_id,
+            None,
+        );
+        assert!(
+            matches!(existing_lookup, Ok(LuaType::Signature(_))),
+            "expected function signature for existing key, got: {existing_lookup:?}"
+        );
     }
 
     #[test]

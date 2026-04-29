@@ -77,9 +77,33 @@ pub(crate) fn member_key_matches_type(
     let Some(member_key_type) = member_key_as_type(member_key) else {
         return false;
     };
+    if let Some(is_match) = exact_literal_member_key_match(access_key_type, &member_key_type) {
+        return is_match;
+    }
 
     check_type_compact(db, access_key_type, &member_key_type).is_ok()
         || check_type_compact(db, &member_key_type, access_key_type).is_ok()
+}
+
+fn exact_literal_member_key_match(
+    access_key_type: &LuaType,
+    member_key_type: &LuaType,
+) -> Option<bool> {
+    match (access_key_type, member_key_type) {
+        (LuaType::StringConst(left), LuaType::StringConst(right))
+        | (LuaType::StringConst(left), LuaType::DocStringConst(right))
+        | (LuaType::DocStringConst(left), LuaType::StringConst(right))
+        | (LuaType::DocStringConst(left), LuaType::DocStringConst(right)) => Some(left == right),
+        (LuaType::IntegerConst(left), LuaType::IntegerConst(right))
+        | (LuaType::IntegerConst(left), LuaType::DocIntegerConst(right))
+        | (LuaType::DocIntegerConst(left), LuaType::IntegerConst(right))
+        | (LuaType::DocIntegerConst(left), LuaType::DocIntegerConst(right)) => Some(left == right),
+        (LuaType::BooleanConst(left), LuaType::BooleanConst(right))
+        | (LuaType::BooleanConst(left), LuaType::DocBooleanConst(right))
+        | (LuaType::DocBooleanConst(left), LuaType::BooleanConst(right))
+        | (LuaType::DocBooleanConst(left), LuaType::DocBooleanConst(right)) => Some(left == right),
+        _ => None,
+    }
 }
 
 pub fn find_member_origin_owner(
