@@ -2,14 +2,17 @@ use glua_parser::{
     BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexExpr,
 };
 
-use crate::{DiagnosticCode, SemanticModel};
+use crate::{DiagnosticCode, LuaType, LuaUnionType, SemanticModel};
 
 use super::{Checker, DiagnosticContext};
 
 pub struct NeedCheckNilChecker;
 
 impl Checker for NeedCheckNilChecker {
-    const CODES: &[DiagnosticCode] = &[DiagnosticCode::NeedCheckNil];
+    const CODES: &[DiagnosticCode] = &[
+        DiagnosticCode::NeedCheckNil,
+        DiagnosticCode::UncheckedNilAccess,
+    ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
@@ -37,13 +40,22 @@ fn check_call_expr(
 ) -> Option<()> {
     let prefix = call_expr.get_prefix_expr()?;
     let func = semantic_model.infer_expr(prefix.clone()).ok()?;
-    if func.is_nullable() && !should_skip_deferred_nullable_function_call(&call_expr, &prefix) {
-        context.add_diagnostic(
-            DiagnosticCode::NeedCheckNil,
-            prefix.get_range(),
-            t!("function %{name} may be nil", name = prefix.syntax().text()).to_string(),
-            None,
-        );
+    if func.is_nullable() {
+        if should_report_unchecked_nil_access(&prefix, &func) {
+            context.add_diagnostic(
+                DiagnosticCode::UncheckedNilAccess,
+                prefix.get_range(),
+                t!("%{name} may be nil", name = prefix.syntax().text()).to_string(),
+                None,
+            );
+        } else if !should_skip_deferred_nullable_function_call(&call_expr, &prefix) {
+            context.add_diagnostic(
+                DiagnosticCode::NeedCheckNil,
+                prefix.get_range(),
+                t!("function %{name} may be nil", name = prefix.syntax().text()).to_string(),
+                None,
+            );
+        }
     }
 
     Some(())
@@ -70,8 +82,14 @@ fn check_index_expr(
     let prefix = index_expr.get_prefix_expr()?;
     let prefix_type = semantic_model.infer_expr(prefix.clone()).ok()?;
     if prefix_type.is_nullable() {
+        let diagnostic_code = if should_report_unchecked_nil_access(&prefix, &prefix_type) {
+            DiagnosticCode::UncheckedNilAccess
+        } else {
+            DiagnosticCode::NeedCheckNil
+        };
+
         context.add_diagnostic(
-            DiagnosticCode::NeedCheckNil,
+            diagnostic_code,
             prefix.get_range(),
             t!("%{name} may be nil", name = prefix.syntax().text()).to_string(),
             None,
@@ -79,6 +97,18 @@ fn check_index_expr(
     }
 
     Some(())
+}
+
+fn should_report_unchecked_nil_access(prefix_expr: &LuaExpr, prefix_type: &LuaType) -> bool {
+    matches!(prefix_expr, LuaExpr::IndexExpr(_)) && is_opaque_nullable_any(prefix_type)
+}
+
+fn is_opaque_nullable_any(ty: &LuaType) -> bool {
+    let LuaType::Union(union) = ty else {
+        return false;
+    };
+
+    matches!(union.as_ref(), LuaUnionType::Nullable(LuaType::Any))
 }
 
 fn check_binary_expr(

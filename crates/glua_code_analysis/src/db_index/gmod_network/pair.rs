@@ -1,8 +1,6 @@
 use crate::FileId;
 
-use super::{
-    GmodNetworkIndex, NetOpEntry, NetReceiveFlow, NetSendFlow, NetSendKind,
-};
+use super::{GmodNetworkIndex, NetOpEntry, NetReceiveFlow, NetSendFlow, NetSendKind};
 use crate::db_index::gmod_infer::{GmodInferIndex, GmodRealm};
 
 /// True when a sender flow's writes are structurally compatible with a
@@ -18,8 +16,7 @@ pub fn flows_can_match(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -
         return true;
     }
 
-    if !send_flow.writes.iter().any(|w| w.dynamic)
-        && !receive_flow.reads.iter().any(|r| r.dynamic)
+    if !send_flow.writes.iter().any(|w| w.dynamic) && !receive_flow.reads.iter().any(|r| r.dynamic)
     {
         return false;
     }

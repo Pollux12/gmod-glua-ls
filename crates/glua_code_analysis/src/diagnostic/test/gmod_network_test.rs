@@ -328,8 +328,7 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.diagnostics.disable =
-            vec![DiagnosticCode::GmodNetReadWriteTypeMismatch];
+        emmyrc.diagnostics.disable = vec![DiagnosticCode::GmodNetReadWriteTypeMismatch];
         ws.update_emmyrc(emmyrc);
 
         ws.def_file(
@@ -362,8 +361,7 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.diagnostics.disable =
-            vec![DiagnosticCode::GmodNetMissingNetworkCounterpart];
+        emmyrc.diagnostics.disable = vec![DiagnosticCode::GmodNetMissingNetworkCounterpart];
         ws.update_emmyrc(emmyrc);
 
         let server_file_id = ws.def_file(
@@ -1655,6 +1653,127 @@ mod tests {
             count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteTypeMismatch),
             eq(1usize)
         );
+    }
+
+    fn collect_helper_conflict_diagnostics(
+        helper_order: &[(&str, &str)],
+    ) -> Vec<lsp_types::Diagnostic> {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        for (file_path, source) in helper_order {
+            ws.def_file(file_path, source);
+        }
+
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("HelperConflict")
+            net.Start("HelperConflict")
+            DarkRP.writeDeterministic("payload")
+            net.Send(Entity(1))
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("HelperConflict", function()
+                local value = net.ReadString()
+            end)
+            "#,
+        );
+
+        file_diagnostics(&mut ws, client_file_id)
+    }
+
+    #[gtest]
+    fn test_duplicate_cross_file_helper_uses_deterministic_winner() {
+        let helper_a = (
+            "lua/autorun/shared/a_helpers.lua",
+            r#"
+            DarkRP = DarkRP or {}
+            function DarkRP.writeDeterministic(value)
+                net.WriteString(value)
+            end
+            "#,
+        );
+        let helper_z = (
+            "lua/autorun/shared/z_helpers.lua",
+            r#"
+            DarkRP = DarkRP or {}
+            function DarkRP.writeDeterministic(value)
+                net.WriteUInt(123, 8)
+            end
+            "#,
+        );
+
+        let forward = collect_helper_conflict_diagnostics(&[helper_a, helper_z]);
+        let reverse = collect_helper_conflict_diagnostics(&[helper_z, helper_a]);
+
+        assert_that!(
+            count_diagnostic(&forward, DiagnosticCode::GmodNetReadWriteTypeMismatch),
+            eq(0usize)
+        );
+        assert_eq!(reverse, forward);
+    }
+
+    fn collect_equal_score_tie_message(sender_order: &[(&str, &str)]) -> String {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        for (file_path, source) in sender_order {
+            ws.def_file(file_path, source);
+        }
+
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("TieBreakMessage", function()
+                local value = net.ReadString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == diagnostic_code(DiagnosticCode::GmodNetReadWriteTypeMismatch)
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .expect("expected type mismatch diagnostic")
+    }
+
+    #[gtest]
+    fn test_equal_score_network_mismatch_tie_is_deterministic() {
+        let sender_a = (
+            "lua/autorun/server/a_sender.lua",
+            r#"
+            util.AddNetworkString("TieBreakMessage")
+            net.Start("TieBreakMessage")
+            net.WriteInt(1, 8)
+            net.Broadcast()
+            "#,
+        );
+        let sender_z = (
+            "lua/autorun/server/z_sender.lua",
+            r#"
+            util.AddNetworkString("TieBreakMessage")
+            net.Start("TieBreakMessage")
+            net.WriteBool(true)
+            net.Broadcast()
+            "#,
+        );
+
+        let forward_message = collect_equal_score_tie_message(&[sender_a, sender_z]);
+        let reverse_message = collect_equal_score_tie_message(&[sender_z, sender_a]);
+
+        assert_eq!(reverse_message, forward_message);
+        expect_that!(forward_message.contains("expected `net.ReadInt`"), eq(true));
     }
 
     #[gtest]

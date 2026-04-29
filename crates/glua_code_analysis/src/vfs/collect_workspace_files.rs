@@ -1,22 +1,9 @@
 use std::{collections::HashSet, path::PathBuf};
 
-use crate::{EmmyLibraryItem, Emmyrc, LuaFileInfo, load_workspace_files};
-
-/// Normalize a path for deduplication without filesystem access.
-/// Uses case-insensitive comparison on Windows, forward slashes, and trailing slash removal.
-fn normalize_path_for_dedup(path: &str) -> String {
-    let mut normalized = path.replace('\\', "/");
-    // Remove trailing slash
-    while normalized.ends_with('/') {
-        normalized.pop();
-    }
-    // Case-insensitive on Windows (filesystem is case-insensitive)
-    #[cfg(target_os = "windows")]
-    {
-        normalized = normalized.to_lowercase();
-    }
-    normalized
-}
+use crate::{
+    EmmyLibraryItem, Emmyrc, LuaFileInfo, load_workspace_files,
+    vfs::loader::normalize_path_for_ordering,
+};
 
 #[derive(Clone, Debug)]
 pub enum WorkspaceImport {
@@ -49,14 +36,42 @@ impl WorkspaceFolder {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct WorkspaceFileCandidate {
+    pub workspace_priority: usize,
+    pub normalized_path: String,
+    pub file: LuaFileInfo,
+}
+
+pub(crate) fn dedupe_workspace_files_deterministic(
+    mut candidates: Vec<WorkspaceFileCandidate>,
+) -> Vec<LuaFileInfo> {
+    candidates.sort_by(|a, b| {
+        a.workspace_priority
+            .cmp(&b.workspace_priority)
+            .then_with(|| a.normalized_path.cmp(&b.normalized_path))
+            .then_with(|| a.file.path.cmp(&b.file.path))
+    });
+
+    let mut loaded_paths = HashSet::new();
+    let mut files = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if loaded_paths.insert(candidate.normalized_path) {
+            files.push(candidate.file);
+        } else {
+            log::debug!("Skipping duplicate file: {:?}", candidate.file.path);
+        }
+    }
+    files
+}
+
 pub fn collect_workspace_files(
     workspaces: &Vec<WorkspaceFolder>,
     emmyrc: &Emmyrc,
     extra_include: Option<Vec<String>>,
     extra_exclude: Option<Vec<String>>,
 ) -> Vec<LuaFileInfo> {
-    let mut files = Vec::new();
-    let mut loaded_paths = HashSet::new(); // Track loaded file paths (normalized strings) to avoid duplicates
+    let mut candidates = Vec::new();
     let (mut match_pattern, mut exclude, exclude_dir) = calculate_include_and_exclude(emmyrc);
     if let Some(extra_include) = extra_include {
         match_pattern.extend_from_slice(&extra_include);
@@ -134,13 +149,11 @@ pub fn collect_workspace_files(
                 };
                 if let Some(loaded) = loaded {
                     for file in loaded {
-                        let normalized_path = normalize_path_for_dedup(&file.path);
-
-                        if loaded_paths.insert(normalized_path) {
-                            files.push(file);
-                        } else {
-                            log::debug!("Skipping duplicate file: {:?}", file.path);
-                        }
+                        candidates.push(WorkspaceFileCandidate {
+                            workspace_priority: idx,
+                            normalized_path: normalize_path_for_ordering(&file.path),
+                            file,
+                        });
                     }
                 }
             }
@@ -179,19 +192,18 @@ pub fn collect_workspace_files(
                     };
                     if let Some(loaded) = loaded {
                         for file in loaded {
-                            let normalized_path = normalize_path_for_dedup(&file.path);
-
-                            if loaded_paths.insert(normalized_path) {
-                                files.push(file);
-                            } else {
-                                log::debug!("Skipping duplicate file: {:?}", file.path);
-                            }
+                            candidates.push(WorkspaceFileCandidate {
+                                workspace_priority: idx,
+                                normalized_path: normalize_path_for_ordering(&file.path),
+                                file,
+                            });
                         }
                     }
                 }
             }
         }
     }
+    let files = dedupe_workspace_files_deterministic(candidates);
 
     log::info!("load files from workspace count: {:?}", files.len());
 
@@ -259,4 +271,36 @@ fn find_library_exclude(library: &WorkspaceFolder, emmyrc: &Emmyrc) -> (Vec<Stri
     }
 
     (exclude, exclude_dirs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkspaceFileCandidate, dedupe_workspace_files_deterministic};
+    use crate::LuaFileInfo;
+
+    #[test]
+    fn vfs_collect_dedupe_is_deterministic_with_workspace_priority() {
+        let candidates = vec![
+            WorkspaceFileCandidate {
+                workspace_priority: 1,
+                normalized_path: "c:/addon/lua/autorun/shared/init.lua".to_string(),
+                file: LuaFileInfo {
+                    path: "C:/addon/lua/autorun/shared/init.lua".to_string(),
+                    content: "from workspace 1".to_string(),
+                },
+            },
+            WorkspaceFileCandidate {
+                workspace_priority: 0,
+                normalized_path: "c:/addon/lua/autorun/shared/init.lua".to_string(),
+                file: LuaFileInfo {
+                    path: "c:\\addon\\lua\\autorun\\shared\\init.lua".to_string(),
+                    content: "from workspace 0".to_string(),
+                },
+            },
+        ];
+
+        let deduped = dedupe_workspace_files_deterministic(candidates);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].content, "from workspace 0");
+    }
 }

@@ -1823,8 +1823,8 @@ mod tests {
         file_id: glua_code_analysis::FileId,
         position: lsp_types::Position,
     ) -> String {
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
-            .expect("expected hover");
+        let hover =
+            crate::handlers::hover::hover(&ws.analysis, file_id, position).expect("expected hover");
         let HoverContents::Markup(markup) = hover.contents else {
             panic!("expected HoverContents::Markup");
         };
@@ -2117,8 +2117,7 @@ mod tests {
             "expected typed header even with no usages, got: {value}"
         );
         assert!(
-            value.contains("no recorded usages")
-                || value.contains("No payload patterns indexed"),
+            value.contains("no recorded usages") || value.contains("No payload patterns indexed"),
             "expected an empty-state hint, got: {value}"
         );
         Ok(())

@@ -26,9 +26,11 @@ use crate::{
             infer_name::get_name_expr_var_ref_id,
             narrow::infer_expr_narrow_type,
         },
+        is_doc_tag_table_const,
         member::get_buildin_type_map_type_id,
-        member::member_key_matches_type,
+        member::infer_owner_raw_member_type_with_realm,
         member::intersect_member_types,
+        member::member_key_matches_type,
         type_check::{self, check_type_compact},
     },
 };
@@ -179,7 +181,7 @@ pub fn infer_member_by_member_key(
     infer_guard: &InferGuardRef,
 ) -> InferResult {
     match &prefix_type {
-        LuaType::Table => Ok(nullable_any_type()),
+        LuaType::Table => infer_plain_table_member(db, cache, index_expr),
         LuaType::Any => Ok(LuaType::Any),
         LuaType::Unknown => Err(InferFailReason::FieldNotFound),
         LuaType::Nil => Ok(LuaType::Never),
@@ -272,19 +274,67 @@ fn infer_table_member(
     inst: InFiled<TextRange>,
     index_expr: LuaIndexMemberExpr,
 ) -> InferResult {
-    let owner = LuaMemberOwner::Element(inst);
+    let owner = LuaMemberOwner::Element(inst.clone());
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
-    let member_item = match db.get_member_index().get_member_item(&owner, &key) {
-        Some(member_item) => member_item,
-        None => return Err(InferFailReason::FieldNotFound),
+    if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
+        return member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            index_expr.get_position(),
+        );
+    }
+
+    match infer_owner_raw_member_type_with_realm(
+        db,
+        owner,
+        &key,
+        cache.get_file_id(),
+        Some(index_expr.get_position()),
+    ) {
+        Ok(typ) => Ok(typ),
+        Err(InferFailReason::FieldNotFound) if is_table_const_from_doc_tag(db, &inst) => {
+            Ok(nullable_any_type())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn is_table_const_from_doc_tag(db: &DbIndex, inst: &InFiled<TextRange>) -> bool {
+    let Some(root) = db.get_vfs().get_syntax_tree(&inst.file_id) else {
+        return false;
     };
 
-    member_item.resolve_type_with_realm(db, &cache.get_file_id())
+    is_doc_tag_table_const(&root.get_red_root(), inst.value)
 }
 
 fn nullable_any_type() -> LuaType {
     LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into())
+}
+
+fn infer_plain_table_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: LuaIndexMemberExpr,
+) -> InferResult {
+    let nullable_any = nullable_any_type();
+
+    let index_prefix_expr = match index_expr.clone() {
+        LuaIndexMemberExpr::TableField(_) => return Ok(nullable_any),
+        _ => index_expr.get_prefix_expr().ok_or(InferFailReason::None)?,
+    };
+
+    let Some(index_key) = index_expr.get_index_key() else {
+        return Ok(nullable_any);
+    };
+
+    if let LuaIndexKey::Expr(expr) = index_key
+        && check_iter_var_range(db, cache, &expr, index_prefix_expr).unwrap_or(false)
+    {
+        return Ok(LuaType::Any);
+    }
+
+    Ok(nullable_any)
 }
 
 fn infer_custom_type_member(
@@ -837,6 +887,7 @@ pub fn infer_member_by_operator(
     infer_guard: &InferGuardRef,
 ) -> InferResult {
     match &prefix_type {
+        LuaType::Table => Ok(nullable_any_type()),
         LuaType::TableConst(in_filed) => {
             infer_member_by_index_table(db, cache, in_filed, index_expr)
         }

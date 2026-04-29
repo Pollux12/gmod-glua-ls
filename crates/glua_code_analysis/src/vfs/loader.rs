@@ -16,6 +16,22 @@ pub struct LuaFileInfo {
     pub content: String,
 }
 
+pub(crate) fn normalize_path_for_ordering(path: &str) -> String {
+    let mut normalized = path.replace('\\', "/");
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        normalized = normalized.to_lowercase();
+    }
+    normalized
+}
+
+pub(crate) fn sort_lua_files_by_normalized_path(files: &mut [LuaFileInfo]) {
+    files.sort_by_cached_key(|file| (normalize_path_for_ordering(&file.path), file.path.clone()));
+}
+
 impl LuaFileInfo {
     pub fn into_tuple(self) -> (PathBuf, Option<String>) {
         (PathBuf::from(self.path), Some(self.content))
@@ -109,7 +125,8 @@ pub fn load_workspace_files(
         });
     drop(tx);
 
-    let files: Vec<LuaFileInfo> = rx.into_iter().collect();
+    let mut files: Vec<LuaFileInfo> = rx.into_iter().collect();
+    sort_lua_files_by_normalized_path(&mut files);
     Ok(files)
 }
 
@@ -134,4 +151,35 @@ pub fn read_file_with_encoding(path: &Path, encoding: &str) -> Option<String> {
     }
 
     Some(content.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LuaFileInfo, normalize_path_for_ordering, sort_lua_files_by_normalized_path};
+
+    #[test]
+    fn vfs_loader_normalizes_slashes_and_trailing_separator() {
+        let normalized = normalize_path_for_ordering(r"C:\Workspace\Lua\test.lua\\");
+        assert!(!normalized.contains('\\'));
+        assert!(!normalized.ends_with('/'));
+    }
+
+    #[test]
+    fn vfs_loader_sorts_by_normalized_path() {
+        let mut files = vec![
+            LuaFileInfo {
+                path: r"C:\workspace\z.lua".to_string(),
+                content: String::new(),
+            },
+            LuaFileInfo {
+                path: r"C:/workspace/A.lua".to_string(),
+                content: String::new(),
+            },
+        ];
+
+        sort_lua_files_by_normalized_path(&mut files);
+
+        assert_eq!(files[0].path, r"C:/workspace/A.lua");
+        assert_eq!(files[1].path, r"C:\workspace\z.lua");
+    }
 }

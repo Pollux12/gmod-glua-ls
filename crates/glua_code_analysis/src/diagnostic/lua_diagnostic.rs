@@ -1,11 +1,12 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use log::info;
 
 pub use super::checker::DiagnosticContext;
 use super::checker::SharedDiagnosticData;
+use super::checker::precompute_callee_realms_for_workspace;
 use super::checker::precompute_gm_method_realms;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::semantic::LuaAnalysisPhase;
@@ -103,16 +104,27 @@ impl LuaDiagnostic {
     ) -> Arc<SharedDiagnosticData> {
         let db = compilation.get_db();
         let module_index = db.get_module_index();
+        let mut workspace_file_ids = module_index.get_main_workspace_file_ids();
+        workspace_file_ids.sort_unstable();
 
         let mut gm_method_realms = HashMap::new();
+        let mut callee_realms_by_workspace = HashMap::new();
         for workspace_id in module_index.get_main_workspace_ids() {
-            let realms = precompute_gm_method_realms(db, workspace_id);
-            gm_method_realms.insert(workspace_id, Arc::new(realms));
+            let realms = Arc::new(precompute_gm_method_realms(db, workspace_id));
+            let callee_realms = precompute_callee_realms_for_workspace(
+                db,
+                workspace_id,
+                &workspace_file_ids,
+                realms.as_ref(),
+            );
+            gm_method_realms.insert(workspace_id, realms);
+            callee_realms_by_workspace.insert(workspace_id, Arc::new(callee_realms));
         }
 
         Arc::new(SharedDiagnosticData {
+            workspace_file_ids: Arc::new(workspace_file_ids),
             gm_method_realms,
-            shared_callee_realm_cache: RwLock::new(HashMap::new()),
+            callee_realms_by_workspace,
         })
     }
 

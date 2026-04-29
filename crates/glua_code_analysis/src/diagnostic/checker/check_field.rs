@@ -5,11 +5,15 @@ use glua_parser::{
     LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaRepeatStat,
     LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat,
 };
+use smol_str::SmolStr;
 
 use crate::{
     DbIndex, DiagnosticCode, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaMemberKey,
-    LuaMemberOwner, LuaType, SemanticModel, enum_variable_is_param, get_keyof_members,
-    semantic::member_key_matches_type,
+    LuaMemberOwner, LuaType, LuaUnionType, SemanticModel, check_type_compact,
+    enum_variable_is_param, get_keyof_members,
+    semantic::{
+        infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
+    },
 };
 
 use super::{Checker, DiagnosticContext, humanize_lint_type};
@@ -200,6 +204,16 @@ fn is_invalid_prefix_type(typ: &LuaType, code: DiagnosticCode) -> bool {
             | LuaType::TplRef(_)
             | LuaType::StrTplRef(_) => return true,
             LuaType::TableConst(_) => return code == DiagnosticCode::InjectField,
+            LuaType::Union(union) => {
+                return match union.as_ref() {
+                    LuaUnionType::Nullable(typ) => {
+                        typ.is_nil() || is_invalid_prefix_type(typ, code)
+                    }
+                    LuaUnionType::Multi(types) => types
+                        .iter()
+                        .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ, code)),
+                };
+            }
             LuaType::Instance(instance_typ) => {
                 current_typ = instance_typ.get_base();
             }
@@ -277,6 +291,31 @@ pub(super) fn is_valid_member(
                     Err(_) => return Some(()),
                     _ => {}
                 }
+            }
+        }
+        LuaType::TableConst(id) => {
+            let key = LuaMemberKey::from_index_key(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                index_key,
+            )
+            .ok()?;
+            let owner = LuaMemberOwner::Element(id.clone());
+            match infer_owner_raw_member_type_with_realm(
+                semantic_model.get_db(),
+                owner,
+                &key,
+                semantic_model.get_file_id(),
+                Some(index_expr.get_position()),
+            ) {
+                Ok(_) => return Some(()),
+                Err(InferFailReason::FieldNotFound)
+                    if code == DiagnosticCode::UndefinedField
+                        && is_table_const_from_doc_tag(semantic_model, id) =>
+                {
+                    return Some(());
+                }
+                Err(_) => {}
             }
         }
         // In GMod mode, strings support numeric byte indexing (e.g. `str[2]`, `str[i]`).
@@ -388,7 +427,8 @@ pub(super) fn is_valid_member(
     // nil-safe context check (ancestor walk) — only needed when flow analysis
     // didn't already resolve the field above.
     if matches!(code, DiagnosticCode::UndefinedField) && is_nil_safe_expr_context(index_expr) {
-        if is_non_enum_custom_type(semantic_model, prefix_typ) {
+        if allows_nil_safe_expr_undefined_field_suppression(semantic_model, prefix_typ, &index_key)
+        {
             return Some(());
         }
 
@@ -490,6 +530,17 @@ pub(super) fn is_valid_member(
     }
 
     None
+}
+
+fn is_table_const_from_doc_tag(
+    semantic_model: &SemanticModel,
+    id: &crate::InFiled<rowan::TextRange>,
+) -> bool {
+    let Some(root) = semantic_model.get_root_by_file_id(id.file_id) else {
+        return false;
+    };
+
+    is_doc_tag_table_const(root.syntax(), id.value)
 }
 
 /// 检查枚举类型的自引用
@@ -785,16 +836,26 @@ fn is_expression_boundary(kind: LuaSyntaxKind) -> bool {
     )
 }
 
-fn is_non_enum_custom_type(semantic_model: &SemanticModel, typ: &LuaType) -> bool {
+fn allows_nil_safe_expr_undefined_field_suppression(
+    semantic_model: &SemanticModel,
+    typ: &LuaType,
+    index_key: &LuaIndexKey,
+) -> bool {
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => semantic_model
             .get_db()
             .get_type_index()
             .get_type_decl(id)
             .is_some_and(|decl| !decl.is_enum()),
-        LuaType::Instance(instance_type) => {
-            is_non_enum_custom_type(semantic_model, instance_type.get_base())
+        LuaType::TableConst(_) => true,
+        LuaType::TableGeneric(table_params) => {
+            table_generic_supports_index_key(semantic_model, table_params, index_key)
         }
+        LuaType::Instance(instance_type) => allows_nil_safe_expr_undefined_field_suppression(
+            semantic_model,
+            instance_type.get_base(),
+            index_key,
+        ),
         LuaType::Union(union_type) => {
             let members = union_type.into_vec();
             // Treat `T | nil` as equivalent to `T` for nil-safe context checks:
@@ -805,12 +866,37 @@ fn is_non_enum_custom_type(semantic_model: &SemanticModel, typ: &LuaType) -> boo
                 .filter(|t| !matches!(t, LuaType::Nil))
                 .collect();
             !non_nil.is_empty()
-                && non_nil
-                    .iter()
-                    .all(|t| is_non_enum_custom_type(semantic_model, t))
+                && non_nil.iter().all(|t| {
+                    allows_nil_safe_expr_undefined_field_suppression(semantic_model, t, index_key)
+                })
         }
         _ => false,
     }
+}
+
+fn table_generic_supports_index_key(
+    semantic_model: &SemanticModel,
+    table_params: &[LuaType],
+    index_key: &LuaIndexKey,
+) -> bool {
+    if table_params.len() != 2 {
+        return false;
+    }
+
+    let key_type = &table_params[0];
+    let access_key_type = match index_key {
+        LuaIndexKey::Name(name) => LuaType::StringConst(SmolStr::new(name.get_name_text()).into()),
+        LuaIndexKey::String(string) => {
+            LuaType::StringConst(SmolStr::new(string.get_value()).into())
+        }
+        LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_) => LuaType::Integer,
+        LuaIndexKey::Expr(expr) => match semantic_model.infer_expr(expr.clone()) {
+            Ok(typ) => typ,
+            Err(_) => return false,
+        },
+    };
+
+    check_type_compact(semantic_model.get_db(), key_type, &access_key_type).is_ok()
 }
 
 fn check_enum_is_param(

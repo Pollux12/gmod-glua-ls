@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use glua_parser::{LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr, LuaVarExpr};
+use glua_parser::{
+    LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaNameExpr,
+    LuaVarExpr,
+};
 use rowan::TextSize;
 use wax::Pattern;
 
@@ -8,6 +11,7 @@ use super::{InferFailReason, InferResult, infer_expr};
 use crate::{
     FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
     LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, TypeOps,
+    compilation::analyzer::infer_for_range_iter_expr_func,
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
     semantic::{
@@ -76,6 +80,14 @@ pub fn infer_name_expr(
         }
     };
 
+    if let Some(decl_id) = decl_id
+        && result.as_ref().is_ok_and(|typ| typ.contain_tpl())
+        && let Some(iter_type) =
+            try_infer_enclosing_for_range_iter_type(db, cache, &name_expr, decl_id)
+    {
+        return Ok(iter_type);
+    }
+
     // When the inferred type contains unresolved SelfInfer (e.g. from
     // `local selfTbl = GetTable(self)` where the call's SelfInfer wasn't
     // resolved during compilation), resolve it using the enclosing method's
@@ -89,6 +101,30 @@ pub fn infer_name_expr(
     }
 
     result
+}
+
+fn try_infer_enclosing_for_range_iter_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+    decl_id: LuaDeclId,
+) -> Option<LuaType> {
+    let for_range = name_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaForRangeStat::cast)?;
+    let var_idx = for_range
+        .get_var_name_list()
+        .enumerate()
+        .find_map(|(idx, var_name)| (var_name.get_position() == decl_id.position).then_some(idx))?;
+    let iter_exprs = for_range.get_expr_list().collect::<Vec<_>>();
+    let iter_var_types = infer_for_range_iter_expr_func(db, cache, &iter_exprs).ok()?;
+    let ret_type = iter_var_types
+        .get_type(var_idx)
+        .cloned()
+        .unwrap_or(LuaType::Unknown);
+
+    Some(TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil))
 }
 
 fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Option<LuaType> {

@@ -53,13 +53,24 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
         } else {
             break;
         };
+        let decl_id = LuaDeclId::new(analyzer.file_id, position);
+
+        if let Some(reason) = should_defer_guarded_index_alias(analyzer, &expr) {
+            let unresolve = UnResolveDecl {
+                file_id: analyzer.file_id,
+                decl_id,
+                expr: expr.clone(),
+                ret_idx: 0,
+            };
+            analyzer.context.add_unresolve(unresolve.into(), reason);
+            continue;
+        }
 
         match analyzer.infer_expr(&expr) {
             Ok(mut expr_type) => {
                 if let LuaType::Variadic(multi) = expr_type {
                     expr_type = multi.get_type(0)?.clone();
                 }
-                let decl_id = LuaDeclId::new(analyzer.file_id, position);
                 // 当`call`参数包含表时, 表可能未被分析, 需要延迟
                 if let LuaType::Instance(instance) = &expr_type
                     && instance.get_base().is_unknown()
@@ -88,14 +99,12 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 );
             }
             Err(InferFailReason::None) => {
-                let decl_id = LuaDeclId::new(analyzer.file_id, position);
                 analyzer
                     .db
                     .get_type_index_mut()
                     .bind_type(decl_id.into(), LuaTypeCache::InferType(LuaType::Nil));
             }
             Err(reason) => {
-                let decl_id = LuaDeclId::new(analyzer.file_id, position);
                 let unresolve = UnResolveDecl {
                     file_id: analyzer.file_id,
                     decl_id,
@@ -136,6 +145,20 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                             }
                         }
                         return Some(());
+                    } else {
+                        // Single-return or non-variadic evaluated to a single value,
+                        // so extra slots receive `any` (legacy convention) instead of unknown.
+                        for i in expr_count..name_count {
+                            let name = name_list.get(i)?;
+                            let position = name.get_position();
+                            let decl_id = LuaDeclId::new(analyzer.file_id, position);
+                            bind_type(
+                                analyzer.db,
+                                decl_id.into(),
+                                LuaTypeCache::InferType(LuaType::Any),
+                            );
+                        }
+                        return Some(());
                     }
                 }
                 Err(reason) => {
@@ -170,6 +193,36 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
     }
 
     Some(())
+}
+
+fn should_defer_guarded_index_alias(
+    analyzer: &mut LuaAnalyzer,
+    expr: &LuaExpr,
+) -> Option<InferFailReason> {
+    let left = guarded_index_or_empty_table_left(expr)?;
+    match analyzer.infer_expr(&left) {
+        Ok(ty) if ty.is_unknown() || ty.is_nil() => Some(InferFailReason::FieldNotFound),
+        Err(reason) if reason.is_need_resolve() => Some(reason),
+        _ => None,
+    }
+}
+
+fn guarded_index_or_empty_table_left(expr: &LuaExpr) -> Option<LuaExpr> {
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return None;
+    };
+    if binary_expr.get_op_token().map(|op| op.get_op()) != Some(BinaryOperator::OpOr) {
+        return None;
+    }
+    let (left, right) = binary_expr.get_exprs()?;
+    if !matches!(left, LuaExpr::IndexExpr(_)) {
+        return None;
+    }
+    if !matches!(right, LuaExpr::TableExpr(table_expr) if table_expr.is_empty()) {
+        return None;
+    }
+
+    Some(left)
 }
 
 fn call_expr_has_effect_table_arg(expr: &LuaExpr) -> Option<()> {
@@ -225,7 +278,12 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
             let index_key = index_expr.get_index_key()?;
             let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
             let (member_owner, set_owner_only) = resolve_index_expr_member_owner(&prefix_type)?;
-            if analyzer.db.get_member_index().get_member(&member_id).is_none() {
+            if analyzer
+                .db
+                .get_member_index()
+                .get_member(&member_id)
+                .is_none()
+            {
                 let cache = analyzer
                     .context
                     .infer_manager
@@ -244,7 +302,10 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
                     LuaMemberFeature::FileDefine
                 };
                 let member = LuaMember::new(member_id, member_key, decl_feature, None);
-                analyzer.db.get_member_index_mut().add_member(member_owner, member);
+                analyzer
+                    .db
+                    .get_member_index_mut()
+                    .add_member(member_owner, member);
                 return Some(());
             }
 
@@ -380,6 +441,18 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                             type_owner,
                             &last_expr_type,
                             i - expr_count + 1,
+                        );
+                    }
+                } else {
+                    for i in expr_count..var_count {
+                        let var = var_list.get(i)?;
+                        let type_owner = get_var_owner(analyzer, var.clone());
+                        set_index_expr_owner(analyzer, var.clone());
+                        assign_merge_type_owner_and_expr_type(
+                            analyzer,
+                            type_owner,
+                            &LuaType::Any,
+                            0, // Any doesn't need indexing
                         );
                     }
                 }
@@ -799,6 +872,7 @@ fn resolve_index_expr_member_owner(prefix_type: &LuaType) -> Option<(LuaMemberOw
         LuaType::Instance(instance) => {
             Some((LuaMemberOwner::Element(instance.get_range().clone()), false))
         }
+        LuaType::TableOf(inner) => resolve_index_expr_member_owner(inner),
         LuaType::TypeGuard(inner) => resolve_index_expr_member_owner(inner),
         LuaType::Union(union) => pick_preferred_index_expr_member_owner(union.into_vec().iter()),
         LuaType::Intersection(intersection) => {

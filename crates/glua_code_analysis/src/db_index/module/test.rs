@@ -357,4 +357,205 @@ mod tests {
             assert_eq!(module_info.full_module_name, "lua.treesitter-context");
         }
     }
+
+    #[test]
+    fn test_workspace_file_id_apis_are_sorted() {
+        let mut m = create_module();
+        m.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/Project").into(),
+            WorkspaceId::MAIN,
+            WorkspaceKind::Main,
+        );
+        m.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/Annotations").into(),
+            WorkspaceId { id: 3 },
+            WorkspaceKind::Library,
+        );
+
+        m.add_module_by_module_path(FileId { id: 30 }, "main_c".to_string(), WorkspaceId::MAIN);
+        m.add_module_by_module_path(FileId { id: 10 }, "main_a".to_string(), WorkspaceId::MAIN);
+        m.add_module_by_module_path(FileId { id: 20 }, "main_b".to_string(), WorkspaceId::MAIN);
+
+        m.add_module_by_module_path(
+            FileId { id: 50 },
+            "lib_b".to_string(),
+            WorkspaceId { id: 3 },
+        );
+        m.add_module_by_module_path(
+            FileId { id: 40 },
+            "lib_a".to_string(),
+            WorkspaceId { id: 3 },
+        );
+
+        assert_eq!(
+            m.get_main_workspace_file_ids(),
+            vec![FileId { id: 10 }, FileId { id: 20 }, FileId { id: 30 }]
+        );
+        assert_eq!(
+            m.get_lib_file_ids(),
+            vec![FileId { id: 40 }, FileId { id: 50 }]
+        );
+    }
+
+    #[test]
+    fn test_find_module_duplicate_prefers_main_workspace_independent_of_insert_order() {
+        for file_ids in [
+            [FileId { id: 1 }, FileId { id: 2 }],
+            [FileId { id: 2 }, FileId { id: 1 }],
+        ] {
+            let mut m = create_module();
+            m.add_workspace_root_with_kind(
+                Path::new("C:/Users/username/Project").into(),
+                WorkspaceId::MAIN,
+                WorkspaceKind::Main,
+            );
+            m.add_workspace_root_with_kind(
+                Path::new("C:/Users/username/Annotations").into(),
+                WorkspaceId { id: 3 },
+                WorkspaceKind::Library,
+            );
+
+            m.add_module_by_module_path(file_ids[0], "shared".to_string(), WorkspaceId { id: 3 });
+            m.add_module_by_module_path(file_ids[1], "shared".to_string(), WorkspaceId::MAIN);
+
+            let resolved = m.find_module("shared").unwrap();
+            assert_eq!(resolved.workspace_id, WorkspaceId::MAIN);
+        }
+    }
+
+    #[test]
+    fn test_find_module_in_workspace_duplicate_main_uses_workspace_order() {
+        for paths in [
+            [
+                (
+                    "C:/Users/username/ProjectB/shared.lua",
+                    WorkspaceId { id: 3 },
+                ),
+                ("C:/Users/username/ProjectA/shared.lua", WorkspaceId::MAIN),
+            ],
+            [
+                ("C:/Users/username/ProjectA/shared.lua", WorkspaceId::MAIN),
+                (
+                    "C:/Users/username/ProjectB/shared.lua",
+                    WorkspaceId { id: 3 },
+                ),
+            ],
+        ] {
+            let mut m = create_module();
+            m.add_workspace_root_with_kind(
+                Path::new("C:/Users/username/ProjectA").into(),
+                WorkspaceId::MAIN,
+                WorkspaceKind::Main,
+            );
+            m.add_workspace_root_with_kind(
+                Path::new("C:/Users/username/ProjectB").into(),
+                WorkspaceId { id: 3 },
+                WorkspaceKind::Main,
+            );
+            m.add_workspace_root_with_kind(
+                Path::new("C:/Users/username/ProjectC").into(),
+                WorkspaceId { id: 4 },
+                WorkspaceKind::Main,
+            );
+
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.workspace.enable_isolation = false;
+            m.update_config(Arc::new(emmyrc));
+
+            m.add_module_by_path(FileId { id: 1 }, paths[0].0);
+            m.add_module_by_path(FileId { id: 2 }, paths[1].0);
+
+            let resolved = m
+                .find_module_in_workspace("shared", WorkspaceId { id: 4 })
+                .unwrap();
+            assert_eq!(resolved.workspace_id, WorkspaceId::MAIN);
+        }
+    }
+
+    #[test]
+    fn test_find_module_duplicate_same_workspace_uses_lexical_path_priority() {
+        for insertion_order in [
+            [
+                (FileId { id: 20 }, "C:/Users/username/Project/a/shared.lua"),
+                (FileId { id: 10 }, "C:/Users/username/Project/b/shared.lua"),
+            ],
+            [
+                (FileId { id: 20 }, "C:/Users/username/Project/b/shared.lua"),
+                (FileId { id: 10 }, "C:/Users/username/Project/a/shared.lua"),
+            ],
+        ] {
+            let mut m = create_module();
+            m.add_workspace_root_with_kind(
+                Path::new("C:/Users/username/Project").into(),
+                WorkspaceId::MAIN,
+                WorkspaceKind::Main,
+            );
+            m.set_module_replace_patterns(
+                [("^([ab])\\.(.*)$".to_string(), "$2".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+
+            m.add_module_by_path(insertion_order[0].0, insertion_order[0].1);
+            m.add_module_by_path(insertion_order[1].0, insertion_order[1].1);
+
+            let expected_file_id = insertion_order
+                .iter()
+                .find(|(_, path)| path.contains("/a/"))
+                .map(|(file_id, _)| *file_id)
+                .unwrap();
+            let resolved = m.find_module("shared").unwrap();
+            assert_eq!(resolved.file_id, expected_file_id);
+        }
+    }
+
+    #[test]
+    fn test_fuzzy_find_module_duplicate_prefers_main_workspace_independent_of_insert_order() {
+        for insertion_order in [
+            [
+                (
+                    FileId { id: 1 },
+                    WorkspaceId { id: 3 },
+                    "C:/Users/username/Annotations/lua/shared.lua",
+                ),
+                (
+                    FileId { id: 2 },
+                    WorkspaceId::MAIN,
+                    "C:/Users/username/Project/lua/shared.lua",
+                ),
+            ],
+            [
+                (
+                    FileId { id: 2 },
+                    WorkspaceId::MAIN,
+                    "C:/Users/username/Project/lua/shared.lua",
+                ),
+                (
+                    FileId { id: 1 },
+                    WorkspaceId { id: 3 },
+                    "C:/Users/username/Annotations/lua/shared.lua",
+                ),
+            ],
+        ] {
+            let mut m = LuaModuleIndex::new();
+            m.update_config(Arc::new(Emmyrc::default()));
+            m.add_workspace_root_with_kind(
+                Path::new("C:/Users/username/Project").into(),
+                WorkspaceId::MAIN,
+                WorkspaceKind::Main,
+            );
+            m.add_workspace_root_with_kind(
+                Path::new("C:/Users/username/Annotations").into(),
+                WorkspaceId { id: 3 },
+                WorkspaceKind::Library,
+            );
+
+            m.add_module_by_path(insertion_order[0].0, insertion_order[0].2);
+            m.add_module_by_path(insertion_order[1].0, insertion_order[1].2);
+
+            let resolved = m.find_module("shared").unwrap();
+            assert_eq!(resolved.full_module_name, "lua.shared");
+            assert_eq!(resolved.workspace_id, WorkspaceId::MAIN);
+        }
+    }
 }

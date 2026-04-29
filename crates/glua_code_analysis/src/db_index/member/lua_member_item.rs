@@ -316,7 +316,11 @@ fn select_member_ids_by_workspace_and_realm(
     if !db.get_emmyrc().gmod.enabled {
         return priority_tiers
             .first()
-            .map(|(_, member_ids)| member_ids.clone())
+            .map(|(_, member_ids)| {
+                let mut member_ids = member_ids.clone();
+                sort_member_ids_for_caller(db, caller_realm, &mut member_ids);
+                member_ids
+            })
             .unwrap_or_default();
     }
 
@@ -358,7 +362,13 @@ fn sort_member_ids_for_caller(
     member_ids.sort_by_key(|member_id| {
         let member_realm =
             infer_index.get_realm_at_offset(&member_id.file_id, member_id.get_position());
-        realm_match_rank(caller_realm, member_realm)
+        (
+            realm_match_rank(caller_realm, member_realm),
+            member_id.file_id.id,
+            u32::from(member_id.get_position()),
+            u32::from(member_id.get_syntax_id().get_range().end()),
+            member_id.get_syntax_id().get_kind() as u16,
+        )
     });
 }
 
@@ -409,10 +419,20 @@ fn resolve_type_owner_member_id(
         LuaMemberIndexItem::Many(member_ids) => {
             let member_index = db.get_member_index();
             let mut resolve_state = MemberTypeResolveState::All;
-            let members = member_ids
+            let mut members = member_ids
                 .iter()
                 .map(|id| member_index.get_member(id))
                 .collect::<Option<Vec<_>>>()?;
+            members.sort_by_key(|member| {
+                let member_id = member.get_id();
+                let syntax_id = member_id.get_syntax_id();
+                (
+                    member_id.file_id.id,
+                    u32::from(member_id.get_position()),
+                    u32::from(syntax_id.get_range().end()),
+                    syntax_id.get_kind() as u16,
+                )
+            });
             for member in &members {
                 let feature = member.get_feature();
                 if feature.is_meta_decl() {
@@ -476,10 +496,20 @@ fn resolve_member_semantic_id(
         LuaMemberIndexItem::One(member_id) => Some(LuaSemanticDeclId::Member(*member_id)),
         LuaMemberIndexItem::Many(member_ids) => {
             let mut resolve_state = MemberSemanticDeclResolveState::MetaOrNone;
-            let members = member_ids
+            let mut members = member_ids
                 .iter()
                 .map(|id| db.get_member_index().get_member(id))
                 .collect::<Option<Vec<_>>>()?;
+            members.sort_by_key(|member| {
+                let member_id = member.get_id();
+                let syntax_id = member_id.get_syntax_id();
+                (
+                    member_id.file_id.id,
+                    u32::from(member_id.get_position()),
+                    u32::from(syntax_id.get_range().end()),
+                    syntax_id.get_kind() as u16,
+                )
+            });
             for member in &members {
                 let feature = member.get_feature();
                 if feature.is_file_define() {
@@ -580,11 +610,12 @@ mod tests {
     }
 
     fn make_member_id(file_id: FileId, start: u32) -> LuaMemberId {
+        make_member_id_with_kind(file_id, start, LuaSyntaxKind::NameExpr)
+    }
+
+    fn make_member_id_with_kind(file_id: FileId, start: u32, kind: LuaSyntaxKind) -> LuaMemberId {
         let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
-        LuaMemberId::new(
-            LuaSyntaxId::new(LuaSyntaxKind::NameExpr.into(), range),
-            file_id,
-        )
+        LuaMemberId::new(LuaSyntaxId::new(kind.into(), range), file_id)
     }
 
     fn set_file_realms(db: &mut DbIndex, file_realms: &[(FileId, GmodRealm)]) {
@@ -752,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn select_member_ids_by_workspace_and_realm_preserves_order_for_equivalent_matches() {
+    fn select_member_ids_by_workspace_and_realm_applies_stable_tiebreaker_for_equivalent_matches() {
         let mut db = make_db();
         let caller_file = FileId::new(30);
         let other_file = FileId::new(31);
@@ -774,7 +805,32 @@ mod tests {
             GmodRealm::Server,
         );
 
-        assert_eq!(selected, vec![other_file_member, same_file_member]);
+        assert_eq!(selected, vec![same_file_member, other_file_member]);
+    }
+
+    #[test]
+    fn select_member_ids_by_workspace_and_realm_is_stable_when_sort_fields_tie() {
+        let mut db = make_db();
+        let caller_file = FileId::new(32);
+        let first_member = make_member_id_with_kind(caller_file, 40, LuaSyntaxKind::NameExpr);
+        let second_member = make_member_id_with_kind(caller_file, 40, LuaSyntaxKind::IndexExpr);
+
+        set_file_realms(&mut db, &[(caller_file, GmodRealm::Server)]);
+
+        let selected_forward = select_member_ids_by_workspace_and_realm(
+            &db,
+            &caller_file,
+            vec![(0, vec![first_member, second_member])],
+            GmodRealm::Server,
+        );
+        let selected_reversed = select_member_ids_by_workspace_and_realm(
+            &db,
+            &caller_file,
+            vec![(0, vec![second_member, first_member])],
+            GmodRealm::Server,
+        );
+
+        assert_eq!(selected_forward, selected_reversed);
     }
 
     #[test]

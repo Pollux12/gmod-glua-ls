@@ -104,8 +104,7 @@ fn maybe_field_exist_narrow(
         {
             let member_index = db.get_member_index();
             let owner = LuaMemberOwner::Type(type_id.clone());
-            let global_owner =
-                LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
+            let global_owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
             if member_index.get_member_item(&owner, &member_key).is_some()
                 || member_index
                     .get_member_item(&global_owner, &member_key)
@@ -120,8 +119,7 @@ fn maybe_field_exist_narrow(
         // Indexing an Unknown base (e.g. an undefined global like `tmysql.Version`)
         // implies the base is non-nil/non-false at this point — both branches of
         // an `if tmysql.X then ... else ... end` only execute if `tmysql.X` was
-        // successfully evaluated, which requires `tmysql` to be non-nil. Narrow
-        // Unknown → Any so subsequent reads aren't reported as `unknown`.
+        // successfully evaluated, which requires `tmysql` to be non-nil.
         if matches!(left_type, LuaType::Unknown) {
             return Ok(ResultTypeOrContinue::Result(LuaType::Any));
         }
@@ -319,8 +317,7 @@ fn filter_candidates_by_caller_realm(
                 _ => return true,
             };
             let owner = LuaMemberOwner::Type(type_id.clone());
-            let global_owner =
-                LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
+            let global_owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
             let mut decls = member_index.get_members_for_owner_key(&owner, &key);
             decls.extend(member_index.get_members_for_owner_key(&global_owner, &key));
             if decls.is_empty() {

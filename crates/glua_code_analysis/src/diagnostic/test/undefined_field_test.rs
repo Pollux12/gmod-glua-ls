@@ -72,6 +72,37 @@ mod test {
     }
 
     #[test]
+    fn test_setmetatable_named_metatable_does_not_report_undefined_field_for_methods() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                Glide = {}
+
+                local RangedFeature = {}
+                RangedFeature.__index = RangedFeature
+
+                function RangedFeature:Update() end
+                function RangedFeature:Think() end
+                function RangedFeature:Draw() end
+
+                function Glide.CreateRangedFeature(vehicle, maxDistance)
+                    return setmetatable({}, RangedFeature)
+                end
+
+                local ENT = {}
+
+                function ENT:Initialize()
+                    self.rfMisc = Glide.CreateRangedFeature(self, 1000)
+                    self.rfMisc:Update()
+                    self.rfMisc:Think()
+                    self.rfMisc:Draw()
+                end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_included_server_scripted_class_reverse_numeric_for_does_not_report_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -1023,6 +1054,147 @@ mod test {
                 ---@type VehicleEqLike
                 local ent
                 local ok = ent.isGlideVehicle ~= nil
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_equality_context_for_custom_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class Params
+                Params = {}
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type Params
+                local params
+                local is_front = params.isFrontWheel == true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_equality_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_front = params.isFrontWheel == true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_inequality_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_not_front = params.isFrontWheel ~= true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_and_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_front = params.isFrontWheel and true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_or_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_front = params.isFrontWheel or false
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_not_context_for_inferred_table_const() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local params = {}
+                local is_not_front = not params.isFrontWheel
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_equality_context_for_string_keyed_generic_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type table<string, boolean>
+                local params = {}
+                local is_front = params.isFrontWheel == true
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_direct_dot_access_for_string_keyed_generic_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type table<string, boolean>
+                local params = {}
+                local is_front = params.isFrontWheel
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_direct_dot_access_for_integer_keyed_generic_table_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type table<integer, boolean>
+                local params = {}
+                local is_front = params.isFrontWheel
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_boolean_equality_context_for_integer_keyed_generic_table_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type table<integer, boolean>
+                local params = {}
+                local is_front = params.isFrontWheel == true
             "#
         ));
     }

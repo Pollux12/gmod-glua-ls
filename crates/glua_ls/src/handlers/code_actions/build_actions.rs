@@ -65,7 +65,9 @@ fn add_fix_code_action(
     data: &Option<serde_json::Value>,
 ) -> Option<()> {
     match diagnostic_code {
-        DiagnosticCode::NeedCheckNil => build_need_check_nil(semantic_model, actions, range, data),
+        DiagnosticCode::NeedCheckNil | DiagnosticCode::UncheckedNilAccess => {
+            build_need_check_nil(semantic_model, actions, range, data)
+        }
         DiagnosticCode::UnknownDocTag => build_add_doc_tag(semantic_model, actions, range, data),
         DiagnosticCode::PreferredLocalAlias => {
             build_preferred_local_alias_fix(semantic_model, actions, range, data)

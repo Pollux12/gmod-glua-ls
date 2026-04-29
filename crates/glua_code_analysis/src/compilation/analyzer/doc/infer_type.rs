@@ -208,10 +208,7 @@ fn infer_buildin_or_ref_type(
     }
 }
 
-fn infer_special_table_type(
-    analyzer: &mut DocAnalyzer,
-    table_type: &LuaDocType,
-) -> Option<LuaType> {
+fn infer_special_table_type(analyzer: &DocAnalyzer, table_type: &LuaDocType) -> Option<LuaType> {
     let parent = table_type.syntax().parent()?;
     if matches!(
         parent.kind().into(),

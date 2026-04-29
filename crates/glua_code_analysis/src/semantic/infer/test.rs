@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, FileId, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaType,
+        LuaUnionType, VirtualWorkspace, semantic::infer_owner_raw_member_type_with_realm,
+    };
     use glua_parser::{LuaAstNode, LuaExpr, LuaNameExpr};
 
     fn infer_last_name_expr_type(
@@ -9,6 +12,14 @@ mod test {
         name: &str,
     ) -> crate::LuaType {
         let file_id = ws.def(code);
+        infer_last_name_expr_type_in_file(ws, file_id, name)
+    }
+
+    fn infer_last_name_expr_type_in_file(
+        ws: &VirtualWorkspace,
+        file_id: FileId,
+        name: &str,
+    ) -> crate::LuaType {
         let semantic_model = ws
             .analysis
             .compilation
@@ -330,6 +341,183 @@ mod test {
     }
 
     #[test]
+    fn test_guarded_unknown_index_expr_value_narrows_to_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            local function draw(rec)
+                if not rec or not rec.data then return end
+
+                local d = rec.data
+                print(d)
+            end
+        "#,
+            "d",
+        );
+
+        assert_eq!(
+            ty,
+            ws.ty("any"),
+            "Guarded unknown field value should narrow to Any, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
+    fn test_pairs_value_preserves_indexed_assignment_table_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            Glide = {}
+            Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+
+            local entId = 1
+            local rec = Glide.DebugSnapshots[entId]
+            if not rec then
+                rec = { data = {}, t = 0 }
+                Glide.DebugSnapshots[entId] = rec
+            end
+
+            local function draw()
+                local snaps = Glide.DebugSnapshots or {}
+                for entId, rec in pairs(snaps) do
+                    if not rec or not rec.data then return end
+
+                    local d = rec.data
+                    print(d)
+                end
+            end
+        "#,
+            "d",
+        );
+
+        assert!(
+            matches!(ty, LuaType::TableConst(_)),
+            "Guarded field from pairs value should preserve the assigned data table, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
+    fn test_pairs_value_preserves_cross_file_indexed_assignment_table_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/sh_glide.lua",
+            r#"
+            ---@class Glide
+            Glide = Glide or {}
+        "#,
+        );
+        let consumer_file = ws.def_file(
+            "lua/glide/client/debugging.lua",
+            r#"
+            local SNAP_TTL = 1
+            local function draw()
+                local now = 2
+                local snaps = Glide.DebugSnapshots or {}
+                for entId, rec in pairs(snaps) do
+                    if not rec or not rec.data then continue end
+                    if now - rec.t > SNAP_TTL then
+                        Glide.DebugSnapshots[entId] = nil
+                        continue
+                    end
+
+                    local d = rec.data
+                    print(d)
+                end
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            Glide.DebugNetwork = Glide.DebugNetwork or {}
+
+            do
+                local shared = Glide.DebugNetwork
+                if not shared.REMOVED then
+                    shared.REMOVED = {}
+                end
+            end
+
+            if CLIENT then
+                local DebugNet = Glide.DebugNetwork
+                local REMOVED = DebugNet.REMOVED
+
+                local function readValue()
+                    return 1
+                end
+
+                function DebugNet.ReadSnapshot()
+                    local entId = 1
+                    local vehicleId = nil
+                    local fields = {}
+                    local key = "radius"
+                    fields[key] = readValue()
+
+                    return entId, vehicleId, fields
+                end
+            end
+
+            Glide.CMD_DEBUG_SNAPSHOT = 14
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+            local DebugNet = Glide.DebugNetwork
+            local REMOVED = DebugNet.REMOVED
+
+            commands[Glide.CMD_DEBUG_SNAPSHOT] = function()
+                local entId, vehicleId, fields = DebugNet.ReadSnapshot()
+                if not entId then return end
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+
+                local rec = Glide.DebugSnapshots[entId]
+                if not rec then
+                    rec = { data = {}, t = 0 }
+                    Glide.DebugSnapshots[entId] = rec
+                end
+
+                local data = rec.data
+                if vehicleId ~= nil then
+                    data.vehicle = vehicleId
+                else
+                    data.vehicle = nil
+                end
+
+                for key, value in pairs(fields) do
+                    if key ~= "ent" then
+                        if value == REMOVED then
+                            data[key] = nil
+                        else
+                            data[key] = value
+                        end
+                    end
+                end
+                rec.t = 0
+            end
+        "#,
+        );
+
+        let ty = infer_last_name_expr_type_in_file(&ws, consumer_file, "d");
+        assert!(
+            matches!(ty, LuaType::TableConst(_)),
+            "Cross-file guarded field from pairs value should preserve the assigned data table, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
     fn test_and_false_branch_does_not_over_narrow_left_operand() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let ty = infer_last_name_expr_type(
@@ -451,5 +639,160 @@ mod test {
         );
 
         assert_eq!(ws.expr_ty("multistatements"), ws.ty("nil"));
+    }
+
+    #[test]
+    fn test_inferred_collection_index_has_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            local keys = {}
+
+            for key in pairs({"a", "b", "c", "d"}) do
+                keys[#keys + 1] = key
+            end
+
+            print(keys[1])
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[test]
+    fn test_annotated_table_index_infers_nullable_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@type table
+            local keys
+            local var = keys[1]
+            print(var)
+        "#;
+
+        let ty = infer_last_name_expr_type(&mut ws, code, "var");
+        let expected =
+            LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into());
+
+        assert!(
+            ws.check_type(&ty, &expected),
+            "expected nullable any, got {}",
+            ws.humanize_type(ty.clone())
+        );
+        assert!(!ty.is_nil(), "got nil");
+        assert!(!ty.is_unknown(), "got unknown");
+    }
+
+    #[test]
+    fn test_annotated_table_index_has_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@type table
+            local keys
+            local var = keys[1]
+            print(var)
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[test]
+    fn test_annotated_table_nil_union_index_infers_nullable_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@type table|nil
+            local keys
+            local var = keys[1]
+            print(var)
+        "#;
+
+        let ty = infer_last_name_expr_type(&mut ws, code, "var");
+        let expected =
+            LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into());
+
+        assert!(
+            ws.check_type(&ty, &expected),
+            "expected nullable any, got {}",
+            ws.humanize_type(ty.clone())
+        );
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[test]
+    fn test_annotated_table_assigned_member_keeps_specific_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            GG = {} --- @type table
+            function GG.fun() end
+            F = GG.fun
+        "#,
+        );
+
+        let ty = ws.expr_ty("F");
+
+        assert!(matches!(ty, LuaType::Signature(_)), "got: {ty:?}");
+    }
+
+    #[test]
+    fn test_table_const_exact_name_lookup_does_not_union_other_members() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local tbl = { pi = 3.1415 }
+            function tbl.max(a, b) return a > b and a or b end
+            local _ = tbl.Max
+            "#,
+        );
+
+        let tbl_type = infer_last_name_expr_type_in_file(&ws, file_id, "tbl");
+        let LuaType::TableConst(table_id) = tbl_type else {
+            panic!("expected table const, got: {tbl_type:?}");
+        };
+
+        let db = ws.analysis.compilation.get_db();
+        let missing_key = LuaMemberKey::Name("Max".into());
+        let missing_lookup = infer_owner_raw_member_type_with_realm(
+            db,
+            LuaMemberOwner::Element(table_id.clone()),
+            &missing_key,
+            file_id,
+            None,
+        );
+        assert!(
+            matches!(missing_lookup, Err(InferFailReason::FieldNotFound)),
+            "unexpected lookup result for missing exact key: {missing_lookup:?}"
+        );
+
+        let existing_key = LuaMemberKey::Name("max".into());
+        let existing_lookup = infer_owner_raw_member_type_with_realm(
+            db,
+            LuaMemberOwner::Element(table_id),
+            &existing_key,
+            file_id,
+            None,
+        );
+        assert!(
+            matches!(existing_lookup, Ok(LuaType::Signature(_))),
+            "expected function signature for existing key, got: {existing_lookup:?}"
+        );
+    }
+
+    #[test]
+    fn test_inferred_collection_index_in_client_realm_has_no_undefined_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            local keys = {}
+
+            for key in pairs({"a", "b", "c", "d"}) do
+                keys[#keys + 1] = key
+            end
+
+            if CLIENT then
+                A = keys[1]
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let ty = infer_last_name_expr_type(&mut ws, code, "A");
+        assert!(!ty.is_unknown());
     }
 }

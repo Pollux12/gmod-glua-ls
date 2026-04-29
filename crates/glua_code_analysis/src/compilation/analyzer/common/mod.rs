@@ -36,11 +36,35 @@ pub fn bind_type(
             .bind_type(type_owner.clone(), type_cache);
         migrate_global_members_when_type_resolve(db, type_owner);
     } else {
-        let decl_type = decl_type_cache?.as_type();
-        merge_def_type(db, decl_type.clone(), type_cache.as_type().clone(), 0);
+        let decl_type_cache = decl_type_cache?;
+        let decl_type = decl_type_cache.as_type();
+        if should_inferred_signature_replace_uninformative_cache(decl_type_cache, &type_cache) {
+            db.get_type_index_mut()
+                .force_bind_type(type_owner.clone(), type_cache);
+            migrate_global_members_when_type_resolve(db, type_owner);
+        } else {
+            merge_def_type(db, decl_type.clone(), type_cache.as_type().clone(), 0);
+        }
     }
 
     Some(())
+}
+
+fn should_inferred_signature_replace_uninformative_cache(
+    current_cache: &LuaTypeCache,
+    new_cache: &LuaTypeCache,
+) -> bool {
+    let LuaTypeCache::InferType(LuaType::Signature(_)) = new_cache else {
+        return false;
+    };
+
+    match current_cache {
+        LuaTypeCache::DocType(LuaType::DocFunction(func)) => {
+            matches!(func.get_ret(), LuaType::Any | LuaType::Unknown)
+        }
+        LuaTypeCache::InferType(typ) => typ.is_any() || typ.is_unknown(),
+        _ => false,
+    }
 }
 
 fn merge_def_type(db: &mut DbIndex, decl_type: LuaType, expr_type: LuaType, merge_level: i32) {

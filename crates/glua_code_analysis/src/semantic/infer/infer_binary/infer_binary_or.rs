@@ -89,6 +89,28 @@ fn has_required_fields(db: &DbIndex, type_decl_id: &LuaTypeDeclId) -> bool {
     false // No required fields in this type
 }
 
+pub fn try_bootstrap_or(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    left: &LuaExpr,
+    right: &LuaExpr,
+    err: &crate::semantic::InferFailReason,
+) -> Option<LuaType> {
+    if !err.is_need_resolve() {
+        return None;
+    }
+
+    if !matches!(left, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
+        return None;
+    }
+
+    if matches!(right, LuaExpr::TableExpr(table_expr) if table_expr.is_empty()) {
+        return crate::semantic::infer_expr(db, cache, right.clone()).ok();
+    }
+
+    None
+}
+
 pub fn special_or_rule(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -100,7 +122,12 @@ pub fn special_or_rule(
     if let LuaExpr::CallExpr(call_expr) = &right_expr
         && call_expr.is_error()
     {
-        return Some(remove_false_or_nil(left_type.clone()));
+        let narrowed = remove_false_or_nil(left_type.clone());
+        return Some(if narrowed.is_unknown() {
+            LuaType::Any
+        } else {
+            narrowed
+        });
     }
 
     if is_unresolved_global_unknown_name_expr(db, cache, &left_expr, left_type) {
@@ -124,22 +151,29 @@ pub fn special_or_rule(
     match right_expr {
         LuaExpr::TableExpr(table_expr) => {
             if table_expr.is_empty() {
-                // When left is Unknown (an unresolved global), `x or {}` should
-                // produce `{} | nil` (i.e. `{}?`), not `Any`. Fall through to
-                // the general `infer_binary_expr_or` which handles this correctly.
-                if left_type.is_unknown() {
-                    return None;
+                // When left is an unresolved global or field, `x or {}` is a
+                // bootstrap pattern. Prefer the RHS table literal so member
+                // definitions attach to the concrete table owner.
+                if (left_type.is_unknown() || left_type.is_nil())
+                    && (matches!(left_expr, LuaExpr::IndexExpr(_))
+                        || is_unresolved_global_unknown_name_expr(db, cache, &left_expr, left_type))
+                {
+                    return Some(right_type.clone());
                 }
 
-                // Remove nil/false from left type and check if result is table-compatible
+                // A local explicitly typed as unknown is dynamic rather than an
+                // unresolved bootstrap target. Keep it broad after the truthy
+                // fallback instead of collapsing it to nil or a fresh literal.
                 let left_without_nil = remove_false_or_nil(left_type.clone());
-                if check_type_compact(db, &left_without_nil, &LuaType::Table).is_ok() {
-                    // Only narrow if empty table can actually satisfy the type
-                    // (i.e., the type has no required fields)
+                let left_eval = if left_without_nil.is_unknown() {
+                    LuaType::Any
+                } else {
+                    left_without_nil.clone()
+                };
+                if check_type_compact(db, &left_eval, &LuaType::Table).is_ok() {
                     if can_empty_table_satisfy_type(db, &left_without_nil) {
                         return Some(left_without_nil);
                     }
-                    // Otherwise, fall through to regular OR logic which will create a union
                 }
             }
         }
@@ -153,18 +187,21 @@ pub fn special_or_rule(
                 return None;
             }
 
-            // When left is Unknown (an unresolved global), fall through to
-            // general or logic which produces `nil | right_type` (nullable).
-            if left_type.is_unknown() {
-                return None;
-            }
-
             if check_type_compact(db, left_type, right_type).is_ok() {
-                return Some(remove_false_or_nil(left_type.clone()));
+                let narrowed = remove_false_or_nil(left_type.clone());
+                return Some(if narrowed.is_unknown() {
+                    LuaType::Any
+                } else {
+                    narrowed
+                });
             }
         }
 
         _ => {}
+    }
+
+    if left_type.is_unknown() {
+        return Some(TypeOps::Union.apply(db, &LuaType::Any, right_type));
     }
 
     None

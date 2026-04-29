@@ -1,7 +1,8 @@
+use std::collections::HashMap;
+
 use crate::{
-    DiagnosticCode, GmodRealm, NetOpKind, NetReceiveFlow, NetSendFlow,
-    SemanticModel, expected_receiver_realm, flows_can_match, is_opposite_strict_realm_pair,
-    is_strict_realm,
+    DiagnosticCode, GmodRealm, NetOpKind, NetReceiveFlow, NetSendFlow, SemanticModel,
+    expected_receiver_realm, flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -26,6 +27,7 @@ impl Checker for GmodNetworkChecker {
         let db = semantic_model.get_db();
         let network_index = db.get_gmod_network_index();
         let infer_index = db.get_gmod_infer_index();
+        let vfs = db.get_vfs();
         let Some(file_data) = network_index.get_file_data(file_id) else {
             return;
         };
@@ -36,6 +38,7 @@ impl Checker for GmodNetworkChecker {
             file_data.receive_flows.as_slice(),
             network_index,
             infer_index,
+            vfs,
         );
 
         check_missing_send_counterpart(
@@ -59,6 +62,7 @@ impl Checker for GmodNetworkChecker {
             file_data.receive_flows.as_slice(),
             network_index,
             infer_index,
+            vfs,
         );
     }
 }
@@ -69,7 +73,13 @@ fn check_read_write_mismatch(
     receive_flows: &[NetReceiveFlow],
     network_index: &crate::GmodNetworkIndex,
     infer_index: &crate::GmodInferIndex,
+    vfs: &crate::vfs::Vfs,
 ) {
+    let mut sorted_send_flow_cache: HashMap<
+        String,
+        Vec<(crate::FileId, &NetSendFlow, SenderSortKey)>,
+    > = HashMap::new();
+
     for receive_flow in receive_flows {
         if receive_flow.reads_opaque {
             // Callback body could not be inspected — counts/types unknown.
@@ -82,18 +92,21 @@ fn check_read_write_mismatch(
             continue;
         }
 
-        let matching_send_flows =
-            network_index.get_send_flows_for_message(&receive_flow.message_name);
+        let matching_send_flows = sorted_send_flow_cache
+            .entry(receive_flow.message_name.clone())
+            .or_insert_with(|| {
+                sorted_send_flows_for_message(network_index, vfs, &receive_flow.message_name)
+            });
         let mut has_matching_candidate = false;
         let mut best_mismatch: Option<CandidateMismatch> = None;
 
-        for (send_file_id, send_flow) in matching_send_flows {
+        for (send_file_id, send_flow, sender_sort_key) in matching_send_flows {
             if send_flow.is_wrapped {
                 continue;
             }
 
             let sender_realm =
-                infer_index.get_realm_at_offset(&send_file_id, send_flow.start_range.start());
+                infer_index.get_realm_at_offset(send_file_id, send_flow.start_range.start());
             if !is_strict_realm(sender_realm) {
                 continue;
             }
@@ -136,13 +149,16 @@ fn check_read_write_mismatch(
                 message,
                 common_prefix_len: matching_prefix_len(send_flow, receive_flow),
                 write_count: send_flow.writes.len(),
+                sender_sort_key: sender_sort_key.clone(),
             };
 
             let replace_best = match best_mismatch.as_ref() {
                 Some(current_best) => {
                     candidate.common_prefix_len > current_best.common_prefix_len
                         || (candidate.common_prefix_len == current_best.common_prefix_len
-                            && candidate.write_count > current_best.write_count)
+                            && (candidate.write_count > current_best.write_count
+                                || (candidate.write_count == current_best.write_count
+                                    && candidate.sender_sort_key < current_best.sender_sort_key)))
                 }
                 None => true,
             };
@@ -168,6 +184,49 @@ struct CandidateMismatch {
     message: String,
     common_prefix_len: usize,
     write_count: usize,
+    sender_sort_key: SenderSortKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SenderSortKey {
+    normalized_path: String,
+    raw_path: String,
+    file_id: u32,
+    start_offset: u32,
+    send_offset: u32,
+}
+
+fn sender_sort_key(
+    vfs: &crate::vfs::Vfs,
+    file_id: crate::FileId,
+    send_flow: &NetSendFlow,
+) -> SenderSortKey {
+    let raw_path = vfs
+        .get_file_path(&file_id)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    SenderSortKey {
+        normalized_path: crate::vfs::normalize_path_for_ordering(&raw_path),
+        raw_path,
+        file_id: file_id.id,
+        start_offset: u32::from(send_flow.start_range.start()),
+        send_offset: u32::from(send_flow.send_range.start()),
+    }
+}
+
+fn sorted_send_flows_for_message<'a>(
+    network_index: &'a crate::GmodNetworkIndex,
+    vfs: &crate::vfs::Vfs,
+    message_name: &str,
+) -> Vec<(crate::FileId, &'a NetSendFlow, SenderSortKey)> {
+    let mut candidates: Vec<_> = network_index
+        .get_send_flows_for_message(message_name)
+        .into_iter()
+        .map(|(file_id, send_flow)| (file_id, send_flow, sender_sort_key(vfs, file_id, send_flow)))
+        .collect();
+    candidates.sort_by(|left, right| left.2.cmp(&right.2));
+    candidates
 }
 
 fn matching_prefix_len(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -> usize {
@@ -271,17 +330,15 @@ fn first_mismatch_diagnostic(
     send_flow: &NetSendFlow,
     receive_flow: &NetReceiveFlow,
 ) -> Option<(DiagnosticCode, rowan::TextRange, String)> {
-    let has_dynamic = send_flow.writes.iter().any(|w| w.dynamic)
-        || receive_flow.reads.iter().any(|r| r.dynamic);
+    let has_dynamic =
+        send_flow.writes.iter().any(|w| w.dynamic) || receive_flow.reads.iter().any(|r| r.dynamic);
 
     // Count mismatch is meaningless when either side contains dynamic ops
     // (their effective count is variable). The DP-based matcher already
     // rejected this pair, so the failure is a real structural mismatch — but
     // emitting a precise position is unreliable, so we fall through to the
     // per-position type/order checks below and skip the raw count message.
-    if !has_dynamic
-        && send_flow.writes.len() != receive_flow.reads.len()
-    {
+    if !has_dynamic && send_flow.writes.len() != receive_flow.reads.len() {
         return Some((
             DiagnosticCode::GmodNetReadWriteOrderMismatch,
             receive_flow.receive_range,
@@ -384,8 +441,14 @@ fn check_bits_mismatch(
     receive_flows: &[NetReceiveFlow],
     network_index: &crate::GmodNetworkIndex,
     infer_index: &crate::GmodInferIndex,
+    vfs: &crate::vfs::Vfs,
 ) {
     use std::collections::HashSet;
+
+    let mut sorted_send_flow_cache: HashMap<
+        String,
+        Vec<(crate::FileId, &NetSendFlow, SenderSortKey)>,
+    > = HashMap::new();
 
     for receive_flow in receive_flows {
         if receive_flow.reads_opaque {
@@ -398,18 +461,21 @@ fn check_bits_mismatch(
             continue;
         }
 
-        let matching_send_flows =
-            network_index.get_send_flows_for_message(&receive_flow.message_name);
+        let matching_send_flows = sorted_send_flow_cache
+            .entry(receive_flow.message_name.clone())
+            .or_insert_with(|| {
+                sorted_send_flows_for_message(network_index, vfs, &receive_flow.message_name)
+            });
 
         let mut reported: HashSet<(usize, u32, u32)> = HashSet::new();
 
-        for (send_file_id, send_flow) in matching_send_flows {
+        for (send_file_id, send_flow, _) in matching_send_flows {
             if send_flow.is_wrapped {
                 continue;
             }
 
             let sender_realm =
-                infer_index.get_realm_at_offset(&send_file_id, send_flow.start_range.start());
+                infer_index.get_realm_at_offset(send_file_id, send_flow.start_range.start());
             if !is_strict_realm(sender_realm) {
                 continue;
             }

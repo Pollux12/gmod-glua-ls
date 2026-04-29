@@ -58,6 +58,8 @@ pub enum DiagnosticCode {
     CodeStyleCheck,
     /// Need check nil
     NeedCheckNil,
+    /// Unchecked nil access
+    UncheckedNilAccess,
     /// Await in sync
     AwaitInSync,
     /// Doc tag usage error
@@ -177,6 +179,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::PreferredLocalAlias => DiagnosticSeverity::HINT,
         DiagnosticCode::CallNonCallable => DiagnosticSeverity::WARNING,
         DiagnosticCode::NeedCheckNil => DiagnosticSeverity::HINT,
+        DiagnosticCode::UncheckedNilAccess => DiagnosticSeverity::WARNING,
         DiagnosticCode::GenericConstraintMismatch => DiagnosticSeverity::INFORMATION,
         DiagnosticCode::GmodInvalidHookName => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodRealmMismatch => DiagnosticSeverity::ERROR,
@@ -338,6 +341,23 @@ mod tests {
         assert_that!(
             is_code_default_enable(&DiagnosticCode::UndefinedGlobalAssignment, level),
             eq(true)
+        );
+    }
+
+    #[gtest]
+    fn unchecked_nil_access_default_severity_enable_and_name() {
+        let level = LuaLanguageLevel::Lua54;
+        assert_that!(
+            get_default_severity(DiagnosticCode::UncheckedNilAccess),
+            eq(DiagnosticSeverity::WARNING)
+        );
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::UncheckedNilAccess, level),
+            eq(true)
+        );
+        assert_that!(
+            DiagnosticCode::UncheckedNilAccess.get_name(),
+            eq("unchecked-nil-access")
         );
     }
 

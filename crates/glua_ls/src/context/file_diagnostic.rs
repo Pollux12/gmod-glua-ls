@@ -337,13 +337,16 @@ impl FileDiagnostic {
         drop(token);
 
         let mut result = Vec::new();
-        let analysis = self.analysis.read().await;
-        let main_workspace_file_ids = analysis
-            .compilation
-            .get_db()
-            .get_module_index()
-            .get_main_workspace_file_ids();
-        drop(analysis);
+        let (main_workspace_file_ids, shared_data) = {
+            let analysis = self.analysis.read().await;
+            let file_ids = analysis
+                .compilation
+                .get_db()
+                .get_module_index()
+                .get_main_workspace_file_ids();
+            let shared_data = analysis.precompute_diagnostic_shared_data();
+            (file_ids, shared_data)
+        };
         let profile_text = format!(
             "workspace diagnostic pull slow: {} files",
             main_workspace_file_ids.len()
@@ -363,9 +366,16 @@ impl FileDiagnostic {
             let token = cancel_token.clone();
             let tx = tx.clone();
             let semaphore = semaphore.clone();
+            let shared_data = shared_data.clone();
             tokio::spawn(async move {
-                let result =
-                    diagnose_workspace_file_off_thread(analysis, semaphore, file_id, token).await;
+                let result = diagnose_workspace_file_off_thread(
+                    analysis,
+                    semaphore,
+                    file_id,
+                    shared_data,
+                    token,
+                )
+                .await;
                 let _ = tx.send(result).await;
             });
         }
@@ -412,13 +422,16 @@ impl FileDiagnostic {
         drop(token);
 
         let mut result = Vec::new();
-        let analysis = self.analysis.read().await;
-        let main_workspace_file_ids = analysis
-            .compilation
-            .get_db()
-            .get_module_index()
-            .get_main_workspace_file_ids();
-        drop(analysis);
+        let (main_workspace_file_ids, shared_data) = {
+            let analysis = self.analysis.read().await;
+            let file_ids = analysis
+                .compilation
+                .get_db()
+                .get_module_index()
+                .get_main_workspace_file_ids();
+            let shared_data = analysis.precompute_diagnostic_shared_data();
+            (file_ids, shared_data)
+        };
 
         let status_bar = self.status_bar.clone();
         status_bar
@@ -441,9 +454,16 @@ impl FileDiagnostic {
             let token = cancel_token.clone();
             let tx = tx.clone();
             let semaphore = semaphore.clone();
+            let shared_data = shared_data.clone();
             tokio::spawn(async move {
-                let result =
-                    diagnose_workspace_file_off_thread(analysis, semaphore, file_id, token).await;
+                let result = diagnose_workspace_file_off_thread(
+                    analysis,
+                    semaphore,
+                    file_id,
+                    shared_data,
+                    token,
+                )
+                .await;
                 let _ = tx.send(result).await;
             });
         }
@@ -518,6 +538,7 @@ async fn diagnose_workspace_file_off_thread(
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     semaphore: Arc<Semaphore>,
     file_id: FileId,
+    shared_data: Arc<glua_code_analysis::SharedDiagnosticData>,
     cancel_token: CancellationToken,
 ) -> Option<(Vec<Diagnostic>, Uri)> {
     if cancel_token.is_cancelled() {
@@ -537,6 +558,7 @@ async fn diagnose_workspace_file_off_thread(
     };
 
     let blocking_analysis = analysis;
+    let blocking_shared_data = shared_data;
     let blocking_token = cancel_token.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -546,7 +568,11 @@ async fn diagnose_workspace_file_off_thread(
 
         // Diagnose under a blocking read lock to avoid starving Tokio worker threads.
         let guard = blocking_analysis.blocking_read();
-        let diagnostics = guard.diagnose_file(file_id, blocking_token.clone())?;
+        let diagnostics = guard.diagnose_file_with_shared(
+            file_id,
+            blocking_token.clone(),
+            blocking_shared_data,
+        )?;
         let uri = guard.get_uri(file_id)?;
         Some((diagnostics, uri))
     })
@@ -570,13 +596,16 @@ async fn push_workspace_diagnostic(
     silent: bool,
     cancel_token: CancellationToken,
 ) {
-    let read_analysis = analysis.read().await;
-    let main_workspace_file_ids = read_analysis
-        .compilation
-        .get_db()
-        .get_module_index()
-        .get_main_workspace_file_ids();
-    drop(read_analysis);
+    let (main_workspace_file_ids, shared_data) = {
+        let read_analysis = analysis.read().await;
+        let file_ids = read_analysis
+            .compilation
+            .get_db()
+            .get_module_index()
+            .get_main_workspace_file_ids();
+        let shared_data = read_analysis.precompute_diagnostic_shared_data();
+        (file_ids, shared_data)
+    };
     // diagnostic files
     let (tx, mut rx) = tokio::sync::mpsc::channel::<FileId>(100);
     let valid_file_count = main_workspace_file_ids.len();
@@ -602,9 +631,16 @@ async fn push_workspace_diagnostic(
         let client = client_proxy.clone();
         let semaphore = semaphore.clone();
         let tx = tx.clone();
+        let shared_data = shared_data.clone();
         tokio::spawn(async move {
-            let result =
-                diagnose_workspace_file_off_thread(analysis, semaphore, file_id, token).await;
+            let result = diagnose_workspace_file_off_thread(
+                analysis,
+                semaphore,
+                file_id,
+                shared_data,
+                token,
+            )
+            .await;
             if let Some((diagnostics, uri)) = result {
                 let diagnostic_param = lsp_types::PublishDiagnosticsParams {
                     uri,

@@ -87,13 +87,16 @@ pub async fn run_check(cmd_args: CmdArgs) -> Result<(), Box<dyn Error + Sync + S
 
     let (sender, receiver) = tokio::sync::mpsc::channel(100);
     let analysis = Arc::new(analysis);
+    let shared_data = analysis.precompute_diagnostic_shared_data();
     let db = analysis.compilation.get_db();
     for file_id in need_check_files.clone() {
         let sender = sender.clone();
         let analysis = analysis.clone();
+        let shared_data = shared_data.clone();
         tokio::spawn(async move {
             let cancel_token = CancellationToken::new();
-            let diagnostics = analysis.diagnose_file(file_id, cancel_token);
+            let diagnostics =
+                analysis.diagnose_file_with_shared(file_id, cancel_token, shared_data);
             sender.send((file_id, diagnostics)).await.unwrap();
         });
     }

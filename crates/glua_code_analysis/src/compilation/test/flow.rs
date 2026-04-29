@@ -135,27 +135,6 @@ mod test {
     }
 
     #[test]
-    fn test_issue_107() {
-        let mut ws = VirtualWorkspace::new();
-        assert!(ws.check_code_for(
-            DiagnosticCode::NeedCheckNil,
-            r#"
-        ---@type {bar?: fun():string}
-        local props
-        if props.bar then
-            local foo = props.bar()
-        end
-
-        if type(props.bar) == 'function' then
-            local foo = props.bar()
-        end
-
-        local foo = props.bar and props.bar() or nil
-        "#
-        ));
-    }
-
-    #[test]
     fn test_issue_100() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(ws.check_code_for(
@@ -231,6 +210,27 @@ mod test {
 
             bar({})
             "#
+        ));
+    }
+
+    #[test]
+    fn test_issue_107() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+        ---@type {bar?: fun():string}
+        local props
+        if props.bar then
+            local foo = props.bar()
+        end
+
+        if type(props.bar) == 'function' then
+            local foo = props.bar()
+        end
+
+        local foo = props.bar and props.bar() or nil
+        "#
         ));
     }
 
@@ -620,7 +620,7 @@ end
         );
 
         let e_ty = ws.expr_ty("E");
-        assert_eq!(ws.humanize_type(e_ty), r#"(false|("b"))?"#);
+        assert_eq!(ws.humanize_type(e_ty), r#"(("b")|false)?"#);
     }
 
     #[test]
@@ -637,7 +637,7 @@ end
         );
 
         let e_ty = ws.expr_ty("E");
-        assert_eq!(ws.humanize_type(e_ty), r#"(false|"a")?"#);
+        assert_eq!(ws.humanize_type(e_ty), r#"("a"|false)?"#);
     }
 
     #[test]
@@ -2250,6 +2250,29 @@ _2 = a[1]
         let a = ws.expr_ty("a");
         let expected = ws.ty("string");
         assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn test_local_cached_isvalid_keeps_unknown_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local IsValid = IsValid
+
+            ---@return unknown
+            function getMaybe()
+            end
+
+            local maybe = getMaybe()
+            if IsValid(maybe) then
+                a = maybe
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        assert_eq!(a, LuaType::Unknown);
     }
 
     #[test]
@@ -4113,11 +4136,10 @@ _2 = a[1]
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_after_index_truthy_guard() {
+    fn test_undefined_global_guard_after_index_truthy_promotes_to_any() {
         // Reading `tmysql.Version` in an `if` condition implies `tmysql` is
-        // non-nil/non-false in the truthy branch. The base type is Unknown
-        // (undefined global), so we narrow it to `any` rather than leaving
-        // hover/inference reporting `unknown`.
+        // non-nil/non-false in the truthy branch, so we promote the
+        // undefined-global base to `any` rather than keeping it nil/unknown.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4129,11 +4151,11 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Any);
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_after_truthy_guard() {
+    fn test_undefined_global_guard_after_truthy_keeps_nil_without_index_evidence() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4145,11 +4167,11 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Nil);
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_after_deep_index_truthy_guard() {
+    fn test_undefined_global_guard_after_deep_index_truthy_promotes_to_any() {
         // Deep index chains: prefix is itself an IndexExpr.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
@@ -4162,13 +4184,13 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Any);
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_after_index_comparison_guard() {
+    fn test_undefined_global_guard_after_index_comparison_promotes_to_any() {
         // Comparison on indexed read (e.g. `tmysql.Version < 4.1`) implies
-        // the indexed base is non-nil in the truthy branch.
+        // the indexed base is non-nil in the truthy branch, so it promotes to `Any`.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4180,14 +4202,14 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Any);
     }
 
     #[gtest]
-    fn test_undefined_global_narrowed_to_any_in_else_after_index_guard() {
+    fn test_undefined_global_guard_in_else_after_index_promotes_to_any() {
         // The else-branch of `if tmysql.Version then ... else ... end` is only
         // reached if the index access succeeded (i.e. tmysql was non-nil),
-        // so tmysql should also narrow to Any in the false branch.
+        // so tmysql should narrow and become `Any`.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4201,6 +4223,71 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_that!(ws.humanize_type(narrowed), eq("any"));
+        assert_eq!(narrowed, LuaType::Any);
+    }
+
+    #[test]
+    fn test_unknown_local_istable_guard_is_scoped() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local x ---@type unknown
+            if istable(x) then
+                print(x) -- 1st from end
+            end
+            print(x) -- 0th from end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 1);
+        assert_eq!(ws.humanize_type(narrowed), "table");
+
+        let not_narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 0);
+        assert_eq!(ws.humanize_type(not_narrowed), "unknown");
+    }
+
+    #[gtest]
+    fn test_unknown_local_indexed_guard_promoted_to_any_within_scope() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local x ---@type unknown
+            if x.Version then
+                print(x) -- 1st from end
+            end
+            print(x) -- 0th from end
+        "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 1);
+        assert_eq!(narrowed, LuaType::Any);
+
+        let not_narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 0);
+        assert_eq!(not_narrowed, LuaType::Unknown);
+    }
+
+    #[gtest]
+    fn test_unknown_local_binary_guard_promoted_to_any_within_scope() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local y ---@type unknown
+            if y.Version < 4.1 then
+                print(y) -- 1st from end
+            end
+            print(y) -- 0th from end
+        "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "y", 1);
+        assert_eq!(narrowed, LuaType::Any);
+
+        let not_narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "y", 0);
+        assert_eq!(not_narrowed, LuaType::Unknown);
     }
 }

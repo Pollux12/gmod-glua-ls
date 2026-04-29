@@ -5,22 +5,23 @@ use std::{
 };
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
-    LuaLocalStat, LuaTableExpr, LuaTableField,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat,
+    LuaIndexExpr, LuaLocalStat, LuaTableExpr, LuaTableField,
 };
 
 use crate::{
-    DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclTypeKind, LuaMember,
-    LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
-    OperatorFunction, SemanticDeclLevel, SignatureReturnStatus, TypeOps,
+    DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclTypeKind,
+    LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
+    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
+    LuaTypeDeclId, LuaTypeFlag, OperatorFunction, RenderLevel, SemanticDeclLevel,
+    SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         common::{add_member, bind_type},
         lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
         unresolve::UnResolveSpecialCall,
     },
     db_index::{LuaFunctionType, LuaMemberOwner, LuaSignature, LuaSignatureId},
-    find_members_with_key,
+    find_members_with_key, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SemanticDeclGuard, infer_call_expr_func, infer_expr,
         infer_expr_semantic_decl,
@@ -38,6 +39,10 @@ pub fn try_resolve_decl(
     decl: &mut UnResolveDecl,
 ) -> ResolveResult {
     let expr = decl.expr.clone();
+    if should_defer_guarded_index_alias_resolution(db, cache, &expr) {
+        return Err(InferFailReason::FieldNotFound);
+    }
+
     let expr_type = infer_expr(db, cache, expr.clone())?;
     let decl_id = decl.decl_id;
     let expr_type = match &expr_type {
@@ -50,6 +55,39 @@ pub fn try_resolve_decl(
 
     bind_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
     Ok(())
+}
+
+fn should_defer_guarded_index_alias_resolution(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> bool {
+    let Some(left) = guarded_index_or_empty_table_left(expr) else {
+        return false;
+    };
+
+    match infer_expr(db, cache, left) {
+        Ok(ty) => ty.is_nil() || ty.is_unknown(),
+        Err(reason) => reason.is_need_resolve(),
+    }
+}
+
+fn guarded_index_or_empty_table_left(expr: &LuaExpr) -> Option<LuaExpr> {
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return None;
+    };
+    if binary_expr.get_op_token().map(|op| op.get_op()) != Some(BinaryOperator::OpOr) {
+        return None;
+    }
+    let (left, right) = binary_expr.get_exprs()?;
+    if !matches!(left, LuaExpr::IndexExpr(_)) {
+        return None;
+    }
+    if !matches!(right, LuaExpr::TableExpr(table_expr) if table_expr.is_empty()) {
+        return None;
+    }
+
+    Some(left)
 }
 
 pub fn try_resolve_member(
@@ -224,12 +262,51 @@ pub fn try_resolve_return_point(
         .get_mut(&return_.signature_id)
         .ok_or(InferFailReason::None)?;
 
-    if signature.resolve_return == SignatureReturnStatus::UnResolve {
+    if should_apply_resolved_return_docs(signature, &return_docs) {
         signature.resolve_return = SignatureReturnStatus::InferResolve;
         signature.return_docs = return_docs;
     }
 
     Ok(())
+}
+
+fn should_apply_resolved_return_docs(
+    signature: &LuaSignature,
+    return_docs: &[LuaDocReturnInfo],
+) -> bool {
+    let current_return = signature.get_return_type();
+    let new_return = return_docs_to_type(return_docs);
+
+    if signature.resolve_return == SignatureReturnStatus::UnResolve {
+        return true;
+    }
+
+    if signature.resolve_return != SignatureReturnStatus::InferResolve {
+        return false;
+    }
+
+    if current_return.is_unknown() && new_return.is_any() {
+        return true; // Allow upgrading Unknown to Any
+    }
+
+    (current_return.is_unknown() || current_return.is_any())
+        && !(new_return.is_unknown() || new_return.is_any())
+}
+
+fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
+    match return_docs.len() {
+        0 => LuaType::Nil,
+        1 => return_docs[0].type_ref.clone(),
+        _ => LuaType::Variadic(
+            VariadicType::Multi(
+                return_docs
+                    .iter()
+                    .map(|info| info.type_ref.clone())
+                    .collect(),
+            )
+            .into(),
+        ),
+    }
 }
 
 pub fn try_resolve_iter_var(
@@ -907,7 +984,7 @@ fn materialize_str_tpl_class_from_call(
     is_colon_define: bool,
     is_colon_call: bool,
 ) -> ResolveResult {
-    let Some(str_tpl) = find_str_tpl_ref(param_type) else {
+    let Some(str_tpl) = find_str_tpl_ref(db, param_type) else {
         return Ok(());
     };
 
@@ -1151,7 +1228,7 @@ fn get_constructor_target_type(
     is_colon_define: bool,
     is_colon_call: bool,
 ) -> Option<LuaTypeDeclId> {
-    if let Some(str_tpl) = find_str_tpl_ref(param_type) {
+    if let Some(str_tpl) = find_str_tpl_ref(db, param_type) {
         let arg_expr = get_call_arg_expr(&call_expr, call_index, is_colon_define, is_colon_call)?;
         let name = infer_string_const_arg(db, cache, &arg_expr)?;
         let type_decl_id: LuaTypeDeclId = LuaTypeDeclId::global(
@@ -1166,20 +1243,41 @@ fn get_constructor_target_type(
     None
 }
 
-fn find_str_tpl_ref(typ: &LuaType) -> Option<Arc<crate::LuaStringTplType>> {
+fn find_str_tpl_ref(db: &DbIndex, typ: &LuaType) -> Option<Arc<crate::LuaStringTplType>> {
     match typ {
         LuaType::StrTplRef(str_tpl) => Some(str_tpl.clone()),
-        LuaType::TypeGuard(inner) => find_str_tpl_ref(inner),
-        LuaType::Union(union) => union.into_vec().iter().find_map(find_str_tpl_ref),
-        LuaType::Intersection(intersection) => {
-            intersection.get_types().iter().find_map(find_str_tpl_ref)
-        }
+        LuaType::TypeGuard(inner) => find_str_tpl_ref(db, inner),
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .filter_map(|union_type| find_str_tpl_ref(db, union_type))
+            .min_by_key(|str_tpl| str_tpl_selection_key(db, str_tpl)),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .filter_map(|intersection_type| find_str_tpl_ref(db, intersection_type))
+            .min_by_key(|str_tpl| str_tpl_selection_key(db, str_tpl)),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
-            .find_map(|(union_type, _)| find_str_tpl_ref(union_type)),
+            .filter_map(|(union_type, _)| find_str_tpl_ref(db, union_type))
+            .min_by_key(|str_tpl| str_tpl_selection_key(db, str_tpl)),
         _ => None,
     }
+}
+
+fn str_tpl_selection_key(db: &DbIndex, str_tpl: &crate::LuaStringTplType) -> String {
+    let constraint_key = str_tpl
+        .get_constraint()
+        .map(|constraint| humanize_type(db, constraint, RenderLevel::Detailed))
+        .unwrap_or_default();
+    format!(
+        "{}|{}|{}|{}",
+        str_tpl.get_prefix(),
+        str_tpl.get_name(),
+        str_tpl.get_suffix(),
+        constraint_key
+    )
 }
 
 fn get_call_arg_expr(
@@ -1209,15 +1307,21 @@ fn infer_string_const_arg(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, sync::Arc};
 
     use rowan::{TextRange, TextSize};
 
-    use super::{get_operator_id_priority_tiers, select_operator_ids_by_workspace_and_realm};
+    use super::{
+        find_str_tpl_ref, get_operator_id_priority_tiers,
+        select_operator_ids_by_workspace_and_realm,
+    };
     use crate::{
-        DbIndex, FileId, GmodRealm, GmodRealmFileMetadata, InFiled, LuaOperator,
+        DbIndex, FileId, GenericTplId, GmodRealm, GmodRealmFileMetadata, InFiled, LuaOperator,
         LuaOperatorMetaMethod, LuaOperatorOwner, LuaType, LuaTypeDeclId, WorkspaceId,
-        db_index::{AsyncState, LuaFunctionType, OperatorFunction, WorkspaceKind},
+        db_index::{
+            AsyncState, LuaFunctionType, LuaStringTplType, LuaUnionType, OperatorFunction,
+            WorkspaceKind,
+        },
     };
 
     fn make_db() -> DbIndex {
@@ -1391,5 +1495,42 @@ mod tests {
         );
 
         assert_eq!(selected, vec![best_tier_operator]);
+    }
+
+    #[test]
+    fn find_str_tpl_ref_union_order_is_deterministic() {
+        let alpha_tpl = LuaType::StrTplRef(Arc::new(LuaStringTplType::new(
+            "alpha.",
+            "T",
+            GenericTplId::Func(0),
+            "",
+            Some(LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+        )));
+        let beta_tpl = LuaType::StrTplRef(Arc::new(LuaStringTplType::new(
+            "beta.",
+            "T",
+            GenericTplId::Func(0),
+            "",
+            Some(LuaType::Ref(LuaTypeDeclId::global("Entity"))),
+        )));
+
+        let alpha_first = LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
+            alpha_tpl.clone(),
+            beta_tpl.clone(),
+        ])));
+        let beta_first =
+            LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![beta_tpl, alpha_tpl])));
+
+        let db = make_db();
+        let alpha_first_selected = find_str_tpl_ref(&db, &alpha_first)
+            .expect("expected string template in alpha-first union");
+        let beta_first_selected = find_str_tpl_ref(&db, &beta_first)
+            .expect("expected string template in beta-first union");
+
+        assert_eq!(
+            alpha_first_selected.get_prefix(),
+            beta_first_selected.get_prefix(),
+            "string template selection should be independent of union member order"
+        );
     }
 }

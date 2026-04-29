@@ -450,8 +450,12 @@ fn resolve_receive_kind_label(semantic_model: &SemanticModel, call_expr: &LuaCal
         return fallback;
     };
 
-    let paired =
-        glua_code_analysis::pair_senders_for_receive(network_index, infer_index, file_id, receive_flow);
+    let paired = glua_code_analysis::pair_senders_for_receive(
+        network_index,
+        infer_index,
+        file_id,
+        receive_flow,
+    );
 
     let mut kinds: Vec<&'static str> = Vec::new();
     for (_, flow) in &paired {

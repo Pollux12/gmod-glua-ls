@@ -1,15 +1,17 @@
 ---
 title: "@source"
-description: Redirect Go to Definition to a source URI.
+description: Link generated annotations to source files or external documentation.
 ---
 
 ## Overview
 
-`@source` tells GLuaLS to open a different location when you use **Go to Definition**.
+`@source` links generated annotations back to their original source.
+
+For local source URIs such as `file:///...`, GLuaLS uses this as a **Go to Definition** redirect. For web URLs such as `https://...`, GLuaLS treats the URL as external documentation only, so hover can show it as a clickable **Source** link without replacing the real code definition target.
 
 When a symbol with `@source` is shown in hover, GLuaLS also renders the source URI as a clickable Markdown link.
 
-This is mainly useful in generated annotation files that point back to a real source file or external URI.
+This is mainly useful in generated annotation files that point back to a real source file or to an external reference page.
 
 ---
 
@@ -22,9 +24,9 @@ This is mainly useful in generated annotation files that point back to a real so
 
 `@source` accepts either a bare URI or a URI followed by `#line:column`.
 
-- `file:///...` for local files
-- `https://...` for web links
-- A bare URI opens the target at `0:0`
+- `file:///...` for local files used by **Go to Definition**
+- `https://...` for web links shown from hover, not used as definition locations
+- A bare local URI opens the target at `0:0`
 - `line` and `column` use zero-based positions when present
 - `#l41:0` is also accepted for the line part
 
@@ -53,4 +55,4 @@ For generated wiki annotations, you can also point directly at a page:
 function Entity:SetPos(pos) end
 ```
 
-Hover shows that URI as a clickable **Source** link, and **Go to Definition** opens the page URI directly.
+Hover shows that URI as a clickable **Source** link. **Go to Definition** still resolves to the annotation/code definition instead of opening the web page.

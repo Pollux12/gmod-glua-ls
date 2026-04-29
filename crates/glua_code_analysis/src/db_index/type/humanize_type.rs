@@ -275,7 +275,7 @@ where
         RenderLevel::Brief => 2,
         RenderLevel::Minimal => 2,
     };
-    // 需要确保顺序
+    // Sort before truncation so rendered subsets stay canonical across runs.
     let mut seen = HashSet::new();
     let mut type_strings = Vec::new();
     let mut has_nil = false;
@@ -292,6 +292,7 @@ where
             type_strings.push(type_str);
         }
     }
+    type_strings.sort_unstable();
     let dots = if type_strings.len() > num { "..." } else { "" };
     let display_types: Vec<_> = type_strings.into_iter().take(num).collect();
     let type_str = display_types.join("|");
@@ -312,7 +313,13 @@ fn humanize_multi_line_union_type(
     multi_union: &LuaMultiLineUnion,
     level: RenderLevel,
 ) -> String {
-    let members = multi_union.get_unions();
+    let mut members = multi_union.get_unions().to_vec();
+    members.sort_by_cached_key(|(typ, description)| {
+        let type_key = humanize_type(db, typ, level.next_level());
+        let description_key = description.as_deref().unwrap_or_default().to_string();
+        (type_key, description_key)
+    });
+
     let num = match level {
         RenderLevel::Documentation => 500,
         RenderLevel::CustomDetailed(n) => n as usize,
@@ -337,7 +344,7 @@ fn humanize_multi_line_union_type(
     }
 
     text.push('\n');
-    for (typ, description) in members {
+    for (typ, description) in &members {
         let type_humanize_text = humanize_type(db, typ, RenderLevel::Minimal);
         if let Some(description) = description {
             text.push_str(&format!(
@@ -828,5 +835,59 @@ fn build_table_member_string(
         LuaMemberKey::Integer(i) => format!("[{i}]{separator}{member_value}"),
         LuaMemberKey::None => member_value,
         LuaMemberKey::ExprType(_) => member_value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::{LuaType, LuaUnionType};
+
+    use super::{RenderLevel, format_union_type};
+
+    fn simple_type_label(ty: &LuaType) -> String {
+        match ty {
+            LuaType::String => "string".to_string(),
+            LuaType::Number => "number".to_string(),
+            LuaType::Boolean => "boolean".to_string(),
+            LuaType::Function => "function".to_string(),
+            LuaType::Nil => "nil".to_string(),
+            _ => "other".to_string(),
+        }
+    }
+
+    #[test]
+    fn format_union_type_sorts_members_consistently() {
+        let left = LuaUnionType::from_vec(vec![LuaType::String, LuaType::Number, LuaType::Boolean]);
+        let right =
+            LuaUnionType::from_vec(vec![LuaType::Boolean, LuaType::String, LuaType::Number]);
+
+        let left_render =
+            format_union_type(&left, RenderLevel::Detailed, |ty, _| simple_type_label(ty));
+        let right_render =
+            format_union_type(&right, RenderLevel::Detailed, |ty, _| simple_type_label(ty));
+
+        assert_eq!(left_render, right_render);
+        assert_eq!(left_render, "(boolean|number|string)");
+    }
+
+    #[test]
+    fn format_union_type_keeps_nullable_suffix_with_canonical_order() {
+        let union = LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
+            LuaType::String,
+            LuaType::Number,
+            LuaType::Nil,
+        ])));
+
+        let rendered = if let LuaType::Union(inner) = union {
+            format_union_type(inner.as_ref(), RenderLevel::Detailed, |ty, _| {
+                simple_type_label(ty)
+            })
+        } else {
+            unreachable!("expected union type")
+        };
+
+        assert_eq!(rendered, "(number|string)?");
     }
 }

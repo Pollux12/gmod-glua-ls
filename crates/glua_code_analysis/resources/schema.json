@@ -124,6 +124,11 @@
           "type": "string"
         },
         {
+          "const": "unchecked-nil-access",
+          "description": "Unchecked nil access",
+          "type": "string"
+        },
+        {
           "const": "await-in-sync",
           "description": "Await in sync",
           "type": "string"

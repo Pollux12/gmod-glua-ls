@@ -27,7 +27,6 @@ pub fn goto_def_definition(
     semantic_id: LuaSemanticDeclId,
     trigger_token: &LuaSyntaxToken,
 ) -> Option<GotoDefinitionResponse> {
-    // 首先检查属性源位置
     if let Some(property) = semantic_model
         .get_db()
         .get_property_index()
@@ -38,20 +37,19 @@ pub fn goto_def_definition(
         return Some(GotoDefinitionResponse::Scalar(location));
     }
 
-    // 根据不同的语义声明类型处理
-    match semantic_id {
+    match &semantic_id {
         LuaSemanticDeclId::LuaDecl(decl_id) => handle_decl_definition(
             semantic_model,
             compilation,
             trigger_token,
             &semantic_id,
-            &decl_id,
+            decl_id,
         ),
         LuaSemanticDeclId::Member(member_id) => {
-            handle_member_definition(semantic_model, compilation, trigger_token, &member_id)
+            handle_member_definition(semantic_model, compilation, trigger_token, member_id)
         }
         LuaSemanticDeclId::TypeDecl(type_decl_id) => {
-            handle_type_decl_definition(semantic_model, &type_decl_id)
+            handle_type_decl_definition(semantic_model, type_decl_id)
         }
         _ => None,
     }
@@ -253,6 +251,11 @@ fn add_instance_table_member_locations(
 }
 
 fn goto_source_location(source: &str) -> Option<Location> {
+    let source = source.trim();
+    if is_web_source_uri(source) {
+        return None;
+    }
+
     if let Some((uri, range_text)) = source.rsplit_once('#')
         && let Some(range) = parse_source_range(range_text)
     {
@@ -269,6 +272,14 @@ fn goto_source_location(source: &str) -> Option<Location> {
             end: Position::new(0, 0),
         },
     })
+}
+
+fn is_web_source_uri(source: &str) -> bool {
+    let Some((scheme, _)) = source.split_once(':') else {
+        return false;
+    };
+
+    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
 }
 
 fn parse_source_range(range_text: &str) -> Option<Range> {
@@ -640,18 +651,23 @@ mod tests {
     use googletest::prelude::*;
 
     #[gtest]
-    fn test_goto_source_location_supports_plain_uri() -> Result<()> {
-        let location = goto_source_location("https://wiki.facepunch.com/gmod/Entity:SetPos")
+    fn test_goto_source_location_supports_plain_file_uri() -> Result<()> {
+        let location = goto_source_location("file:///tmp/test.lua")
             .ok_or("missing source location")
             .or_fail()?;
 
-        verify_eq!(
-            location.uri.as_str(),
-            "https://wiki.facepunch.com/gmod/Entity:SetPos"
-        )?;
+        verify_eq!(location.uri.as_str(), "file:///tmp/test.lua")?;
         verify_eq!(location.range.start.line, 0)?;
         verify_eq!(location.range.start.character, 0)?;
         Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_source_location_ignores_http_url() -> Result<()> {
+        verify_that!(
+            goto_source_location("https://wiki.facepunch.com/gmod/Entity:SetPos"),
+            none()
+        )
     }
 
     #[gtest]

@@ -93,11 +93,20 @@ pub fn get_type_at_flow(
             // Don't cache — this is a transient cycle-detection signal.
         }
         Err(reason) => {
-            let entry = CacheEntry::Error(reason.clone());
-            for &fid in &visited_flow_ids {
-                cache
-                    .flow_node_cache
-                    .insert((var_ref_id.clone(), fid, query_realm), entry.clone());
+            let should_cache = match reason {
+                InferFailReason::UnResolveDeclType(_) => {
+                    cache.get_config().analysis_phase.is_diagnostics()
+                }
+                _ => true,
+            };
+
+            if should_cache {
+                let entry = CacheEntry::Error(reason.clone());
+                for &fid in &visited_flow_ids {
+                    cache
+                        .flow_node_cache
+                        .insert((var_ref_id.clone(), fid, query_realm), entry.clone());
+                }
             }
         }
     }
@@ -198,6 +207,14 @@ fn get_type_at_flow_walk(
 
                     match get_decl_position_var_ref_type(db, cache, var_ref_id) {
                         Ok(var_type) => {
+                            if should_retry_decl_initializer_type(&var_type)
+                                && let Ok(Some(init_type)) =
+                                    try_infer_decl_initializer_type(db, cache, root, var_ref_id)
+                                && !should_retry_decl_initializer_type(&init_type)
+                            {
+                                return Ok(init_type);
+                            }
+
                             return Ok(var_type);
                         }
                         Err(err) => {
@@ -456,6 +473,10 @@ fn get_decl_position_var_ref_type(
     }
 
     get_var_ref_type(db, cache, var_ref_id)
+}
+
+fn should_retry_decl_initializer_type(typ: &LuaType) -> bool {
+    typ.is_unknown() || typ.contain_tpl()
 }
 
 fn with_flow_query_realm<T>(
@@ -1012,7 +1033,10 @@ fn try_infer_decl_initializer_type(
         return Ok(None);
     };
 
-    let Some(node) = initializer.get_expr_syntax_id().to_node_from_root(root.syntax()) else {
+    let Some(node) = initializer
+        .get_expr_syntax_id()
+        .to_node_from_root(root.syntax())
+    else {
         return Ok(None);
     };
 

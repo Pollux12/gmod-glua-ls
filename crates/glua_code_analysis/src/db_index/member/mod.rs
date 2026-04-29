@@ -295,6 +295,7 @@ impl LuaMemberIndex {
             }
         }
 
+        members.sort_by_key(|member| stable_member_sort_key(member));
         Some(members)
     }
 
@@ -311,9 +312,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_sorted_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
-        let mut members = self.get_members(owner)?;
-        members.sort_by_key(|member| member.get_sort_key());
-        Some(members)
+        self.get_members(owner)
     }
 
     pub fn get_member_item(
@@ -394,6 +393,17 @@ impl LuaMemberIndex {
         member_ids.retain(|id| *id == member_id);
         Some(())
     }
+}
+
+fn stable_member_sort_key(member: &LuaMember) -> (u32, u32, u32, u16) {
+    let member_id = member.get_id();
+    let syntax_id = member_id.get_syntax_id();
+    (
+        member_id.file_id.id,
+        u32::from(member_id.get_position()),
+        u32::from(syntax_id.get_range().end()),
+        syntax_id.get_kind() as u16,
+    )
 }
 
 impl LuaIndex for LuaMemberIndex {
