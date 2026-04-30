@@ -4559,4 +4559,288 @@ mod test {
         };
         assert_eq!(count, 1);
     }
+
+    // --- scripted_ents.GetMember delegation tests ---
+
+    #[gtest]
+    fn test_getmember_delegation_copies_network_vars_to_delegating_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Simulate the real edit_sky / env_skypaint pattern
+        ws.def_files(vec![
+            (
+                "lua/entities/env_skypaint/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "TopColorR")
+                    self:NetworkVar("Float", 0, "TopColorG")
+                    self:NetworkVar("Float", 0, "TopColorB")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/edit_sky/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    local SetupDataTables = scripted_ents.GetMember("env_skypaint", "SetupDataTables")
+                    SetupDataTables(self)
+                end
+            "#,
+            ),
+        ]);
+
+        // Verify the delegating entity has the NetworkVar members from the target
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("edit_sky");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on edit_sky class");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetTopColorR".to_string()),
+            "missing GetTopColorR in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetTopColorR".to_string()),
+            "missing SetTopColorR in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetTopColorG".to_string()),
+            "missing GetTopColorG in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetTopColorG".to_string()),
+            "missing SetTopColorG in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetTopColorB".to_string()),
+            "missing GetTopColorB in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetTopColorB".to_string()),
+            "missing SetTopColorB in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_no_undefined_field_diagnostics() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/env_skypaint/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Int", 0, "SkyTopColor")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/edit_sky/shared.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    local SetupDataTables = scripted_ents.GetMember("env_skypaint", "SetupDataTables")
+                    SetupDataTables(self)
+                end
+            "#,
+            ),
+            (
+                "lua/entities/edit_sky/cl_init.lua",
+                r#"
+                function ENT:Think()
+                    local color = self:GetSkyTopColor()
+                    self:SetSkyTopColor(color + 1)
+                end
+            "#,
+            ),
+        ]);
+
+        let target_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/entities/edit_sky/cl_init.lua");
+        let target_file_id = ws
+            .analysis
+            .get_file_id(&target_uri)
+            .expect("expected file id");
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(target_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_with_direct_call_pattern() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Test direct call: scripted_ents.GetMember("class", "method")(self)
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("String", "Label")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    scripted_ents.GetMember("target_ent", "SetupDataTables")(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("delegating_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetLabel".to_string()),
+            "missing GetLabel in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetLabel".to_string()),
+            "missing SetLabel in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_preserves_target_entity_network_vars() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Verify the target entity still has its own NetworkVar members
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "Speed")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    local f = scripted_ents.GetMember("target_ent", "SetupDataTables")
+                    f(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+
+        // Target should still have its members
+        let target_class_id = LuaTypeDeclId::global("target_ent");
+        let target_owner = LuaMemberOwner::Type(target_class_id);
+        let target_members = db
+            .get_member_index()
+            .get_members(&target_owner)
+            .expect("expected members on target_ent");
+        let target_names: Vec<_> = target_members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+        assert!(
+            target_names.contains(&"GetSpeed".to_string()),
+            "target_ent missing GetSpeed in {target_names:?}"
+        );
+
+        // Delegating entity should also have the members
+        let deleg_class_id = LuaTypeDeclId::global("delegating_ent");
+        let deleg_owner = LuaMemberOwner::Type(deleg_class_id);
+        let deleg_members = db
+            .get_member_index()
+            .get_members(&deleg_owner)
+            .expect("expected members on delegating_ent");
+        let deleg_names: Vec<_> = deleg_members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+        assert!(
+            deleg_names.contains(&"GetSpeed".to_string()),
+            "delegating_ent missing GetSpeed in {deleg_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_target_not_found_does_not_crash() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Delegation to a nonexistent class should not crash
+        ws.def_file(
+            "lua/entities/edit_sky/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                local f = scripted_ents.GetMember("nonexistent_class", "SetupDataTables")
+                f(self)
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("edit_sky");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members");
+        // Should not have get/set members from the nonexistent class
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+        assert!(
+            !member_names.contains(&"GetSpeed".to_string()),
+            "unexpected GetSpeed from nonexistent target in {member_names:?}"
+        );
+    }
 }

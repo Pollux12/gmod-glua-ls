@@ -4,12 +4,12 @@ use std::{
 };
 
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk,
-    LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr,
+    LuaChunk, LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
-    LuaLocalFuncStat, LuaLocalStat, LuaRepeatStat, LuaStat, LuaSyntaxNode, LuaVarExpr,
-    LuaWhileStat, NumberResult, PathTrait,
+    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaRepeatStat, LuaStat,
+    LuaSyntaxNode, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
 };
 
 use crate::{
@@ -288,6 +288,15 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         let do_profile = context.tree_list.len() > 100;
 
         let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
+
+        // Resolve scripted_ents.GetMember delegations BEFORE synthesizing
+        // members so that NetworkVar calls copied from target entities are
+        // picked up by synthesize_scripted_class_members.
+        let t_deleg = std::time::Instant::now();
+        resolve_getmember_network_var_delegations(db, &scripted_scope_files, context);
+        if do_profile {
+            log::info!("gmod post: getmember_delegations cost {:?}", t_deleg.elapsed());
+        }
 
         let t0 = std::time::Instant::now();
         synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
@@ -1606,6 +1615,322 @@ pub(crate) fn ensure_scoped_class_type_decl_for_file(
         &global_name,
         range,
     ))
+}
+
+/// Resolve scripted_ents.GetMember("class", "method") delegation patterns.
+///
+/// Detects patterns like:
+/// ```lua
+/// function ENT:SetupDataTables()
+///     local f = scripted_ents.GetMember("target_class", "SetupDataTables")
+///     f(self)
+/// end
+/// ```
+///
+/// When such a delegation is found, NetworkVar calls from the target entity's
+/// metadata are copied into the current entity's metadata so that
+/// `synthesize_scripted_class_members` will produce Get/Set members for them.
+fn resolve_getmember_network_var_delegations(
+    db: &mut DbIndex,
+    scripted_scope_files: &HashSet<FileId>,
+    context: &AnalyzeContext,
+) {
+    // Build class_name -> file_id reverse mapping from scoped class info
+    let class_file_map = build_class_file_map(db);
+
+    // Collect files to process: only scripted scope files whose source
+    // contains "scripted_ents.GetMember".  Collect into owned structures
+    // so we can drop the immutable VFS borrow before mutable db access.
+    let candidate_files: Vec<(FileId, LuaChunk, LuaTypeDeclId)> = {
+        let vfs = db.get_vfs();
+        context
+            .tree_list
+            .iter()
+            .filter(|t| scripted_scope_files.contains(&t.file_id))
+            .filter(|t| {
+                vfs.get_file_content(&t.file_id)
+                    .is_some_and(|c| c.contains("scripted_ents.GetMember"))
+            })
+            .filter_map(|t| {
+                let scope_match = db
+                    .get_gmod_infer_index()
+                    .get_scoped_class_info(&t.file_id)
+                    .cloned()?;
+                let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+                Some((t.file_id, t.value.clone(), class_decl_id))
+            })
+            .collect()
+    };
+
+    for (file_id, chunk, class_decl_id) in &candidate_files {
+        find_and_resolve_getmember_delegations(
+            db,
+            *file_id,
+            class_decl_id,
+            chunk,
+            &class_file_map,
+        );
+    }
+}
+
+/// Build a mapping from class_name to (file_id, class_decl_id) for all known
+/// scripted entity classes.
+fn build_class_file_map(db: &DbIndex) -> HashMap<String, (FileId, LuaTypeDeclId)> {
+    let mut map = HashMap::new();
+    let gmod_infer = db.get_gmod_infer_index();
+    let vfs = db.get_vfs();
+    let all_file_ids = vfs.get_all_file_ids();
+
+    for file_id in all_file_ids {
+        if let Some(info) = gmod_infer.get_scoped_class_info(&file_id) {
+            let class_decl_id = LuaTypeDeclId::global(&info.class_name);
+            // Prefer init.lua files (canonical class file) over secondary files
+            let is_init = vfs
+                .get_file_path(&file_id)
+                .map(|p| p.to_string_lossy().ends_with("init.lua"))
+                .unwrap_or(false);
+            if is_init {
+                map.insert(info.class_name.clone(), (file_id, class_decl_id));
+            } else {
+                // Only insert if no init.lua entry exists for this class yet
+                map.entry(info.class_name.clone())
+                    .or_insert((file_id, class_decl_id));
+            }
+        }
+    }
+
+    map
+}
+
+/// Walk a scripted class file's AST looking for `scripted_ents.GetMember` delegation
+/// patterns. When found, copy NetworkVar calls from the target class into this file's
+/// metadata.
+fn find_and_resolve_getmember_delegations(
+    db: &mut DbIndex,
+    current_file_id: FileId,
+    current_class_decl_id: &LuaTypeDeclId,
+    chunk: &LuaChunk,
+    class_file_map: &HashMap<String, (FileId, LuaTypeDeclId)>,
+) {
+    // Collect local variable names assigned from scripted_ents.GetMember calls.
+    // Map: local_name -> (target_class_name, target_method_name)
+    let mut getmember_locals: HashMap<String, (String, String)> = HashMap::new();
+
+    for node in chunk.syntax().descendants() {
+        // Match: local Name = scripted_ents.GetMember("class", "method")
+        if let Some(local_stat) = LuaLocalStat::cast(node.clone()) {
+            let local_names: Vec<LuaLocalName> = local_stat.get_local_name_list().collect();
+            let value_exprs: Vec<LuaExpr> = local_stat.get_value_exprs().collect();
+            for (i, local_name) in local_names.iter().enumerate() {
+                let Some(local_name_text) = local_name
+                    .get_name_token()
+                    .map(|t| t.get_name_text().to_string())
+                else {
+                    continue;
+                };
+
+                let Some(value_expr) = value_exprs.get(i) else {
+                    continue;
+                };
+
+                let LuaExpr::CallExpr(call_expr) = value_expr else {
+                    continue;
+                };
+
+                if let Some((target_class, target_method)) =
+                    extract_getmember_call(&call_expr, false)
+                {
+                    getmember_locals
+                        .insert(local_name_text, (target_class, target_method));
+                }
+            }
+        }
+
+        // Match: f(self) or f(self, ...) where f is a tracked local
+        if let Some(call_expr) = LuaCallExpr::cast(node) {
+            let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr() else {
+                continue;
+            };
+            let Some(caller_name) = name_expr.get_name_text() else {
+                continue;
+            };
+
+            let Some((target_class, _target_method)) = getmember_locals.get(&caller_name) else {
+                continue;
+            };
+
+            // Verify the first argument is "self"
+            let Some(args_list) = call_expr.get_args_list() else {
+                continue;
+            };
+            let first_arg = args_list.get_args().next();
+            if !matches!(
+                first_arg.as_ref().map(|a| a.syntax().text()),
+                Some(t) if t == "self"
+            ) {
+                continue;
+            };
+
+            // Also check as a statement: f(self) as a statement
+            // Actually the descendant walk will hit both LuaCallExpr and
+            // LuaCallExprStat, and the LuaCallExpr inside a LuaCallExprStat
+            // will match either way.
+
+            // Look up the target class
+            if let Some(&(target_file_id, ref _target_class_decl_id)) =
+                class_file_map.get(target_class)
+            {
+                copy_network_var_calls_from(
+                    db,
+                    current_file_id,
+                    current_class_decl_id,
+                    target_file_id,
+                );
+            }
+        }
+    }
+
+    // Also check direct calls: scripted_ents.GetMember("class", "method")(self)
+    for node in chunk.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        let Some(LuaExpr::CallExpr(inner_call)) = node.get_prefix_expr() else {
+            continue;
+        };
+        if let Some((target_class, _target_method)) =
+            extract_getmember_call(&inner_call, true)
+        {
+            let Some(args_list) = node.get_args_list() else {
+                continue;
+            };
+            let first_arg = args_list.get_args().next();
+            if !matches!(
+                first_arg.as_ref().map(|a| a.syntax().text()),
+                Some(t) if t == "self"
+            ) {
+                continue;
+            };
+
+            if let Some(&(target_file_id, _)) = class_file_map.get(&target_class) {
+                copy_network_var_calls_from(
+                    db,
+                    current_file_id,
+                    current_class_decl_id,
+                    target_file_id,
+                );
+            }
+        }
+    }
+}
+
+/// Extract (class_name, method_name) from a `scripted_ents.GetMember` call expression.
+/// `require_parenthesized` controls whether we also check for parenthesized calls.
+fn extract_getmember_call(
+    call_expr: &LuaCallExpr,
+    require_parenthesized: bool,
+) -> Option<(String, String)> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+
+    // Check for parenthesized: (scripted_ents.GetMember)(...)
+    if let LuaExpr::ParenExpr(paren_expr) = &prefix_expr {
+        let inner = paren_expr.get_expr()?;
+        if !matches!(inner, LuaExpr::IndexExpr(_)) {
+            return None;
+        }
+        if require_parenthesized {
+            return None;
+        }
+    }
+
+    let index_expr = match &prefix_expr {
+        LuaExpr::IndexExpr(idx) => idx.clone(),
+        LuaExpr::ParenExpr(paren) => {
+            let inner = paren.get_expr()?;
+            if let LuaExpr::IndexExpr(idx) = inner {
+                idx.clone()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // Check the index key is "GetMember"
+    let key_match = match index_expr.get_index_key() {
+        Some(LuaIndexKey::Name(name_token)) => name_token.get_name_text() == "GetMember",
+        Some(LuaIndexKey::String(string_token)) => string_token.get_value() == "GetMember",
+        _ => false,
+    };
+    if !key_match {
+        return None;
+    }
+
+    // Check the prefix is "scripted_ents"
+    let prefix_match = match index_expr.get_prefix_expr() {
+        Some(LuaExpr::NameExpr(name_expr)) => {
+            name_expr.get_name_text().as_deref() == Some("scripted_ents")
+        }
+        _ => false,
+    };
+    if !prefix_match {
+        return None;
+    }
+
+    // Extract string literal arguments
+    let args_list = call_expr.get_args_list()?;
+    let args: Vec<LuaExpr> = args_list.get_args().collect();
+    let class_name = extract_string_literal(args.first()?)?;
+    let method_name = extract_string_literal(args.get(1)?)?;
+
+    Some((class_name, method_name))
+}
+
+/// Extract a string literal value from an expression, supporting parenthesized literals.
+fn extract_string_literal(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(literal) => match literal.get_literal() {
+            Some(LuaLiteralToken::String(s)) => Some(s.get_value().to_string()),
+            _ => None,
+        },
+        LuaExpr::ParenExpr(paren) => {
+            let inner = paren.get_expr()?;
+            extract_string_literal(&inner)
+        }
+        _ => None,
+    }
+}
+
+/// Copy NetworkVar and NetworkVarElement calls from the target entity's metadata
+/// into the current entity's metadata so they get synthesized as Get/Set members.
+fn copy_network_var_calls_from(
+    db: &mut DbIndex,
+    current_file_id: FileId,
+    _current_class_decl_id: &LuaTypeDeclId,
+    target_file_id: FileId,
+) {
+    let target_metadata = match db
+        .get_gmod_class_metadata_index()
+        .get_file_metadata(&target_file_id)
+    {
+        Some(m) => m.clone(),
+        None => return,
+    };
+
+    let metadata_index = db.get_gmod_class_metadata_index_mut();
+
+    for nv_call in &target_metadata.network_var_calls {
+        metadata_index.add_call(
+            current_file_id,
+            GmodScriptedClassCallKind::NetworkVar,
+            nv_call.clone(),
+        );
+    }
+
+    for nve_call in &target_metadata.network_var_element_calls {
+        metadata_index.add_call(
+            current_file_id,
+            GmodScriptedClassCallKind::NetworkVarElement,
+            nve_call.clone(),
+        );
+    }
 }
 
 /// Synthesize typed members from AccessorFunc, NetworkVar, and DEFINE_BASECLASS
