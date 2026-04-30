@@ -321,7 +321,7 @@ fn scripted_scope_include_default() -> Vec<EmmyrcGmodScriptedClassScopeEntry> {
             "SWEPs",
             &["weapons"],
             &["weapons/**"],
-            &["weapons/gmod_tool/**"],
+            &["weapons/gmod_tool/stools/**"],
             "SWEP",
             None,
             Some("folder-library"),
@@ -982,7 +982,7 @@ impl EmmyrcGmodScriptedClassScopes {
     /// Returns true if the file matches at least one definition's include
     /// patterns without being excluded by that *same* definition's exclude
     /// patterns.  Unlike the old global exclude check, this prevents a
-    /// sibling definition's exclude (e.g. SWEP's `weapons/gmod_tool/**`)
+    /// sibling definition's exclude (e.g. SWEP's `weapons/gmod_tool/stools/**`)
     /// from blocking a file that legitimately belongs to another definition
     /// (e.g. STOOL's `weapons/gmod_tool/stools/**`).
     pub fn is_file_in_scope(&self, file_path: &Path) -> bool {
@@ -1021,7 +1021,7 @@ impl EmmyrcGmodScriptedClassScopes {
         for definition in definitions {
             // Check THIS definition's include/exclude patterns — do not merge
             // excludes from other definitions, as they are definition-scoped.
-            // E.g. SWEP's "weapons/gmod_tool/**" exclude must not prevent
+            // E.g. SWEP's "weapons/gmod_tool/stools/**" exclude must not prevent
             // STOOL files from matching the STOOL definition.
             if !matches_scope_patterns(
                 file_path,
@@ -1210,7 +1210,7 @@ mod tests {
         verify_that!(definitions[0].class_global.as_str(), eq("ENT"))?;
         verify_that!(
             definitions[1].exclude.as_slice(),
-            eq(&["weapons/gmod_tool/**".to_string()])
+            eq(&["weapons/gmod_tool/stools/**".to_string()])
         )?;
         verify_that!(definitions[3].parent_id.as_deref(), eq(Some("weapons")))?;
         verify_that!(definitions[4].scaffold.is_none(), eq(true))?;
@@ -1437,11 +1437,58 @@ mod tests {
             eq(true)
         )?;
 
+        // gmod_tool weapon itself should be in scope as SWEP
+        verify_that!(
+            scopes.is_file_in_scope(Path::new("lua/weapons/gmod_tool/init.lua")),
+            eq(true)
+        )?;
+
         // Random files should not be in scope
         verify_that!(
             scopes.is_file_in_scope(Path::new("lua/random/file.lua")),
             eq(false)
         )
+    }
+
+    #[gtest]
+    fn test_gmod_tool_weapon_detected_as_swep() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+
+        // lua/weapons/gmod_tool/init.lua — the Sword Tool Gun weapon itself
+        let result = scopes.detect_class_for_path(Path::new(
+            "lua/weapons/gmod_tool/init.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
+        verify_that!(match_.class_name.as_str(), eq("gmod_tool"))?;
+
+        // lua/weapons/gmod_tool/shared.lua — shared SWEP file
+        let result = scopes.detect_class_for_path(Path::new(
+            "lua/weapons/gmod_tool/shared.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
+        verify_that!(match_.class_name.as_str(), eq("gmod_tool"))?;
+
+        // gamemodes/sandbox/entities/weapons/gmod_tool/init.lua — gamemode-nested SWEP
+        let result = scopes.detect_class_for_path(Path::new(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/init.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
+        verify_that!(match_.class_name.as_str(), eq("gmod_tool"))?;
+
+        // STOOL files must still be classified as TOOL
+        let result = scopes.detect_class_for_path(Path::new(
+            "lua/weapons/gmod_tool/stools/hoverball.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
+        verify_that!(match_.class_name.as_str(), eq("hoverball"))
     }
 
     #[gtest]
