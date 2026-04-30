@@ -661,14 +661,6 @@ pub(crate) fn unwrapp_return_type(
     call_expr: LuaCallExpr,
 ) -> InferResult {
     match &return_type {
-        LuaType::Table => {
-            let id = InFiled {
-                file_id: cache.get_file_id(),
-                value: call_expr.get_range(),
-            };
-
-            return Ok(LuaType::TableConst(id));
-        }
         LuaType::TableConst(inst) => {
             if is_need_wrap_instance(cache, &call_expr, inst) {
                 let id = InFiled {

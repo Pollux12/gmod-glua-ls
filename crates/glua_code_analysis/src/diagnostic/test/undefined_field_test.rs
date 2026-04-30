@@ -2305,4 +2305,40 @@ mod test {
         });
         assert!(!has_undefined, "Expected no undefined-field, but got one");
     }
+
+    #[test]
+    fn test_return_table_numeric_index_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        // Numeric indexing on a value from ---@return table should not trigger
+        // undefined-field (the table is generic/open, not a tracked literal).
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@param s string
+            ---@return table
+            local function string_Split(s) end
+
+            local VecComp = string_Split("1 2 3", " ")
+            local ang = VecComp[1]
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_return_table_string_index_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        // String-key indexing (dot and bracket) on a value from ---@return table
+        // should not trigger undefined-field.
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@return table
+            local function getConfig() end
+
+            local cfg = getConfig()
+            local a = cfg.foo
+            local b = cfg["bar"]
+            "#
+        ));
+    }
 }

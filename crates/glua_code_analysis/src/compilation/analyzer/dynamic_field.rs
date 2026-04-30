@@ -132,6 +132,7 @@ fn get_field_name(index_expr: &glua_parser::LuaIndexExpr) -> Option<SmolStr> {
 /// - `TableConst` (inferred from `return {}` or similar)
 fn is_unresolved_table_type(typ: &LuaType) -> bool {
     match typ {
+        LuaType::Table => true,
         LuaType::Ref(id) | LuaType::Def(id) => id.get_name() == "table",
         LuaType::TableConst(_) => true,
         LuaType::Union(union_type) => {
