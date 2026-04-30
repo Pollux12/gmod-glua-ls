@@ -14,11 +14,29 @@ GLuaLS ships without bundled GMod API definitions — instead, the VSCode extens
 
 On first launch and periodically thereafter, the extension:
 
-1. Checks the remote metadata for the [gluals-annotations](https://github.com/Pollux12/gmod-luals-addon/tree/gluals-annotations) branch
+1. Checks the remote metadata for the [gluals-annotations](https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations) branch
 2. If the annotations are outdated or missing, downloads and extracts the latest ZIP
 3. Points the language server at the annotations path automatically
 
 Annotations are stored in VS Code's global extension storage (separate from your project), so they are shared across all workspaces.
+
+---
+
+## Annotation source
+
+By default, the extension downloads annotations from `Pollux12/annotations-gmod-glua-ls` on the `gluals-annotations` branch. You can point automatic downloads at another compatible GitHub repository or branch from VS Code settings:
+
+| VSCode Setting | Default | Description |
+|---|---|---|
+| `gluals.gmod.annotationsRepository` | `Pollux12/annotations-gmod-glua-ls` | GitHub repository in `owner/repository` format, or a GitHub repository URL |
+| `gluals.gmod.annotationsBranch` | `gluals-annotations` | Branch containing generated annotations and `__metadata.json`; plugin artifact branches are not supported |
+
+```json VS Code settings
+{
+  "gluals.gmod.annotationsRepository": "Pollux12/annotations-gmod-glua-ls",
+  "gluals.gmod.annotationsBranch": "gluals-annotations"
+}
+```
 
 ---
 
