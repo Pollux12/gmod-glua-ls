@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualHoverResult, check};
+    use glua_code_analysis::Emmyrc;
     use googletest::prelude::*;
     use lsp_types::HoverContents;
 
@@ -713,6 +714,87 @@ mod tests {
                     .to_string(),
             },
         ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_ents_create_override_hover_keeps_annotated_docs_and_signatures() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "ents_meta.lua",
+            r#"
+                ---@class Entity
+
+                ---Create entity from classname.
+                ---@param class string Entity class name.
+                ---@return Entity ent Created entity instance.
+                function ents.Create(class) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ents = ents or {}
+                local originalCreate = ents.Create
+
+                function ents.Create(name, safety)
+                    if originalCreate then
+                        return originalCreate(name)
+                    end
+                    return nil
+                end
+
+                local alias = ents.Cr<??>eate
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        let docs_pos = markup.value.find("Create entity from classname.");
+        assert!(
+            docs_pos.is_some(),
+            "expected annotated description in hover, got: {}",
+            markup.value
+        );
+        let docs_pos = docs_pos.expect("docs position should exist");
+        let top_section = &markup.value[..docs_pos];
+
+        assert!(
+            top_section.matches("```lua").count() >= 2,
+            "expected both override and annotated signatures at top, got: {}",
+            markup.value
+        );
+        assert!(
+            top_section.contains("function Create(name, safety)"),
+            "expected override signature in top section, got: {}",
+            markup.value
+        );
+        assert!(
+            top_section.contains("safety"),
+            "expected extra override parameter in top section, got: {}",
+            markup.value
+        );
+        assert!(
+            top_section.contains("function Create(class: string)"),
+            "expected annotated signature in top section, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Entity class name."),
+            "expected annotated param docs in hover, got: {}",
+            markup.value
+        );
+
         Ok(())
     }
 

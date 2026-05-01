@@ -2,8 +2,7 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey};
 
 use crate::{
     DbIndex, InFiled, InferFailReason, LuaInferCache, LuaInstanceType, LuaMemberKey, LuaType,
-    LuaUnionType,
-    infer_expr,
+    LuaUnionType, infer_expr,
     semantic::{infer::InferResult, member::find_members_with_key},
 };
 

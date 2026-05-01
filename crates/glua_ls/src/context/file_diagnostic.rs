@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -24,6 +27,7 @@ pub struct FileDiagnostic {
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     client: Arc<ClientProxy>,
     status_bar: Arc<StatusBar>,
+    startup_complete_notified: Arc<AtomicBool>,
     diagnostic_tokens: Arc<Mutex<HashMap<FileId, CancellationToken>>>,
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
     cached_file_diagnostics: Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>,
@@ -39,6 +43,7 @@ impl FileDiagnostic {
         Self {
             analysis,
             client,
+            startup_complete_notified: Arc::new(AtomicBool::new(false)),
             diagnostic_tokens: Arc::new(Mutex::new(HashMap::new())),
             workspace_diagnostic_token: Arc::new(Mutex::new(None)),
             cached_file_diagnostics: Arc::new(Mutex::new(HashMap::new())),
@@ -74,6 +79,22 @@ impl FileDiagnostic {
 
     pub async fn clear_recent_edit(&self, uri: &Uri) {
         self.recently_edited_lines.lock().await.remove(uri);
+    }
+
+    fn notify_startup_complete(&self) {
+        if self
+            .startup_complete_notified
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        self.client.send_notification(
+            "gluals/serverStatus",
+            serde_json::json!({
+                "state": "startupComplete",
+            }),
+        );
     }
 
     pub async fn cache_fresh_file_diagnostics(&self, uri: &Uri, diagnostics: &[Diagnostic]) {
@@ -251,10 +272,18 @@ impl FileDiagnostic {
         let analysis = self.analysis.clone();
         let client_proxy = self.client.clone();
         let status_bar = self.status_bar.clone();
+        let file_diagnostic = self.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {
-                    push_workspace_diagnostic(analysis, client_proxy, status_bar, silent, cancel_token).await
+                    push_workspace_diagnostic(
+                        file_diagnostic,
+                        analysis,
+                        client_proxy,
+                        status_bar,
+                        silent,
+                        cancel_token,
+                    ).await
                 }
                 _ = cancel_token.cancelled() => {
                     log::info!("cancel workspace diagnostic");
@@ -515,6 +544,7 @@ impl FileDiagnostic {
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnosis complete".to_string()),
         );
+        self.notify_startup_complete();
 
         result
     }
@@ -590,6 +620,7 @@ async fn diagnose_workspace_file_off_thread(
 }
 
 async fn push_workspace_diagnostic(
+    file_diagnostic: FileDiagnostic,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     client_proxy: Arc<ClientProxy>,
     status_bar: Arc<StatusBar>,
@@ -695,6 +726,7 @@ async fn push_workspace_diagnostic(
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnosis complete".to_string()),
         );
+        file_diagnostic.notify_startup_complete();
     }
 }
 

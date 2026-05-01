@@ -1925,6 +1925,359 @@ return t
                 .all(|diagnostic| diagnostic.code != code_string)
         );
     }
+
+    /// When an unannotated main-workspace override shadows an annotated library
+    /// function, the annotated return type should still take priority and the
+    /// override's parameter overloads should be respected.
+    #[test]
+    fn test_annotated_library_override_suppresses_assign_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        // Main workspace: unannotated override + test call
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, ...)
+                -- unannotated override, analyzer infers nil return
+                return nil
+            end
+
+            ---@type Entity
+            local ent = ents.Create("letter")
+            -- ent should resolve to Entity (from annotation), not nil
+            "#
+        ));
+    }
+
+    /// The main-workspace override of an annotated library function should not
+    /// trigger "expected N parameters but found M" when the override accepts
+    /// more parameters.
+    #[test]
+    fn test_annotated_library_override_suppresses_redundant_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library2");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        // Main workspace: override with extra parameters + test call
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, ...)
+                return nil
+            end
+
+            local x = ents.Create("foo", "extra_arg")
+            -- Should NOT produce "expected 1 parameters but found 2"
+            "#
+        ));
+    }
+
+    /// Repro for non-variadic declaration-style override: extra parameters
+    /// accepted by the override must suppress redundant-parameter diagnostics.
+    #[test]
+    fn test_annotated_library_non_variadic_override_suppresses_redundant_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_non_variadic");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        // Main workspace: declaration-style non-variadic override with extra parameter.
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, safety)
+                return nil
+            end
+
+            local x = ents.Create("foo", "extra_arg")
+            -- Should NOT produce "expected 1 parameters but found 2"
+            "#
+        ));
+    }
+
+    /// Assignment-style override should still inherit annotated return type when
+    /// called with extra parameters accepted by the override.
+    #[test]
+    fn test_annotated_library_file_define_override_return_type_with_extra_params() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_file_define_ret");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+            local originalCreate = ents.Create
+
+            ents.Create = function(name, safety)
+                if originalCreate then
+                    return originalCreate(name)
+                end
+                return nil
+            end
+
+            ---@type Entity
+            local ent = ents.Create("foo", "extra")
+            -- Should use annotated return type (Entity), not override's nil inference
+            "#
+        ));
+    }
+
+    /// Isolates call-site checking by assigning a predeclared function into the
+    /// override slot (instead of inline closure assignment typing).
+    #[test]
+    fn test_annotated_library_file_define_named_override_suppresses_redundant_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_file_define_named");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+            local originalCreate = ents.Create
+
+            local function create_override(name, safety)
+                if originalCreate then
+                    return originalCreate(name)
+                end
+                return nil
+            end
+
+            ents.Create = create_override
+            local x = ents.Create("foo", "extra_arg")
+            "#
+        ));
+    }
+
+    /// The annotated return type should take priority even when the override's
+    /// extra parameters are used (2-param call still returns Entity, not nil).
+    #[test]
+    fn test_annotated_library_override_return_type_with_extra_params() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library3");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        // Main workspace: 2-param call with typed local should NOT produce
+        // assign-type-mismatch because the meta return type (Entity) wins.
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, ...)
+                return nil
+            end
+
+            ---@type Entity
+            local ent = ents.Create("foo", "extra")
+            -- Should NOT be nil — meta return type (Entity) takes priority
+            "#
+        ));
+    }
+
+    /// Guard against hiding the annotated return entirely (e.g. degrading to
+    /// unknown): with library annotation present, assigning override call result
+    /// to an incompatible concrete target type should still report mismatch.
+    #[test]
+    fn test_annotated_library_override_extra_params_mismatch_incompatible_target() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_incompatible_target");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, safety)
+                return nil
+            end
+
+            ---@type string
+            local ent = ents.Create("foo", "extra")
+            "#
+        ));
+    }
+
+    /// Without the library annotation, the override's nil return SHOULD trigger
+    /// assign-type-mismatch. This proves the library annotation is the fix.
+    #[test]
+    fn test_unannotated_override_alone_does_produce_assign_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // No library workspace — only the unannotated override exists.
+        // The override returns number, so assigning to a string-typed local
+        // SHOULD produce assign-type-mismatch.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, ...)
+                return 123
+            end
+
+            ---@type string
+            local ent = ents.Create("foo")
+            "#
+        ));
+    }
 }
 
 #[test]

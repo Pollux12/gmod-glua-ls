@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    DbIndex, FileId, InferFailReason, LuaSemanticDeclId, LuaType, TypeOps,
+    DbIndex, FileId, InferFailReason, LuaFunctionType, LuaSemanticDeclId, LuaType, TypeOps,
     db_index::gmod_infer::GmodRealm,
 };
 use rowan::TextSize;
@@ -196,6 +196,30 @@ fn resolve_member_type(
                             );
                         }
                     }
+
+                    // If file-decl members (unannotated overrides) also exist,
+                    // merge them as additional overloads, but with their
+                    // return types replaced by the meta return type so the
+                    // annotated return type takes priority. This allows the
+                    // override's parameter list (e.g. extra params) to be
+                    // accepted without triggering param-count diagnostics.
+                    let meta_ret = extract_callable_return_union(db, &typ);
+                    if let Some(ref meta_ret) = meta_ret {
+                        for member in &members {
+                            let feature = member.get_feature();
+                            if feature.is_file_decl() || feature.is_file_define() {
+                                let member_type = db
+                                    .get_type_index()
+                                    .get_type_cache(&member.get_id().into())
+                                    .ok_or(InferFailReason::UnResolveMemberType(member.get_id()))?
+                                    .as_type();
+                                let adjusted_type =
+                                    replace_function_return(db, member_type, meta_ret);
+                                typ = TypeOps::Union.apply(db, &typ, &adjusted_type);
+                            }
+                        }
+                    }
+
                     Ok(typ)
                 }
                 MemberTypeResolveState::FileDecl => {
@@ -217,6 +241,75 @@ fn resolve_member_type(
                 }
             }
         }
+    }
+}
+
+/// Extracts a union of return types from all callable entries
+/// (DocFunction/Signature) found anywhere in the given type.
+fn extract_callable_return_union(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
+    fn collect_callable_returns(db: &DbIndex, typ: &LuaType, out: &mut Vec<LuaType>) {
+        match typ {
+            LuaType::DocFunction(func) => out.push(func.get_ret().clone()),
+            LuaType::Signature(signature_id) => {
+                if let Some(signature) = db.get_signature_index().get(signature_id) {
+                    out.push(signature.get_return_type());
+                }
+            }
+            LuaType::Union(union) => {
+                for t in union.into_vec() {
+                    collect_callable_returns(db, &t, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut returns = Vec::new();
+    collect_callable_returns(db, typ, &mut returns);
+    if returns.is_empty() {
+        None
+    } else {
+        Some(LuaType::from_vec(returns))
+    }
+}
+
+/// Creates a copy of `typ` with any DocFunction return types replaced by
+/// `new_ret`. Non-function types pass through unchanged.
+fn replace_function_return(db: &DbIndex, typ: &LuaType, new_ret: &LuaType) -> LuaType {
+    match typ {
+        LuaType::DocFunction(func) => {
+            let merged = LuaFunctionType::new(
+                func.get_async_state(),
+                func.is_colon_define(),
+                func.is_variadic(),
+                func.get_params().to_vec(),
+                new_ret.clone(),
+            );
+            LuaType::DocFunction(Arc::new(merged))
+        }
+        LuaType::Signature(signature_id) => {
+            if let Some(signature) = db.get_signature_index().get(signature_id) {
+                let merged = LuaFunctionType::new(
+                    signature.async_state,
+                    signature.is_colon_define,
+                    signature.is_vararg,
+                    signature.get_type_params(),
+                    new_ret.clone(),
+                );
+                LuaType::DocFunction(Arc::new(merged))
+            } else {
+                LuaType::Signature(*signature_id)
+            }
+        }
+        LuaType::Union(union) => {
+            let new_types: Vec<_> = union
+                .into_vec()
+                .iter()
+                .map(|t| replace_function_return(db, t, new_ret))
+                .collect();
+            LuaType::from_vec(new_types)
+        }
+        other => other.clone(),
     }
 }
 
@@ -333,7 +426,13 @@ fn select_member_ids_by_workspace_and_realm(
         })
         .unwrap_or_default();
 
+    let member_index = db.get_member_index();
     let infer_index = db.get_gmod_infer_index();
+
+    let mut result = Vec::new();
+    let mut found_first_compatible = false;
+    let mut all_seen_are_non_meta = true;
+
     for (_, tier_member_ids) in priority_tiers {
         let compatible_member_ids = tier_member_ids
             .into_iter()
@@ -343,14 +442,46 @@ fn select_member_ids_by_workspace_and_realm(
                 is_realm_compatible(caller_realm, member_realm)
             })
             .collect::<Vec<_>>();
-        if !compatible_member_ids.is_empty() {
-            let mut compatible_member_ids = compatible_member_ids;
-            sort_member_ids_for_caller(db, caller_realm, &mut compatible_member_ids);
-            return compatible_member_ids;
+
+        if compatible_member_ids.is_empty() {
+            continue;
+        }
+
+        if !found_first_compatible {
+            // First compatible tier: include all its realm-compatible members.
+            let has_meta = compatible_member_ids.iter().any(|mid| {
+                member_index
+                    .get_member(mid)
+                    .is_some_and(|m| m.get_feature().is_meta_decl())
+            });
+            result.extend(compatible_member_ids);
+            found_first_compatible = true;
+            all_seen_are_non_meta = !has_meta;
+        } else if all_seen_are_non_meta {
+            // We have only non-meta members so far. Supplement with any
+            // meta (annotated) members from this lower-priority tier so that
+            // resolve_member_type can prefer them via meta_override_file_define.
+            let meta_members: Vec<_> = compatible_member_ids
+                .into_iter()
+                .filter(|mid| {
+                    member_index
+                        .get_member(mid)
+                        .is_some_and(|m| m.get_feature().is_meta_decl())
+                })
+                .collect();
+            if !meta_members.is_empty() {
+                result.extend(meta_members);
+                all_seen_are_non_meta = false;
+            }
         }
     }
 
-    fallback_member_ids
+    if result.is_empty() {
+        return fallback_member_ids;
+    }
+
+    sort_member_ids_for_caller(db, caller_realm, &mut result);
+    result
 }
 
 fn sort_member_ids_for_caller(
@@ -989,5 +1120,105 @@ mod tests {
 
         assert_eq!(client_decl, Some(LuaSemanticDeclId::Member(client_member)));
         assert_eq!(server_decl, Some(LuaSemanticDeclId::Member(server_member)));
+    }
+
+    #[test]
+    fn select_member_ids_includes_annotated_from_lower_tier_when_highest_is_non_meta() {
+        let mut db = make_db();
+        let module_index = db.get_module_index_mut();
+
+        let workspace_a = WorkspaceId::MAIN;
+        let library_workspace = WorkspaceId { id: 4 };
+
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectA").into(),
+            workspace_a,
+            WorkspaceKind::Main,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectA/lua/lib").into(),
+            library_workspace,
+            WorkspaceKind::Library,
+        );
+
+        let caller_file = FileId::new(1);
+        module_index.add_module_by_path(
+            caller_file,
+            "C:/Users/username/ProjectA/entities/letter/init.lua",
+        );
+
+        // Library file with annotated MetaMethodDecl (same as glua-api-snippets ents.lua)
+        let library_file = FileId::new(2);
+        module_index
+            .add_module_by_path(library_file, "C:/Users/username/ProjectA/lua/lib/ents.lua");
+
+        // Main workspace file with unannotated override (simulating DarkRP sh_workarounds.lua)
+        let override_file = FileId::new(3);
+        module_index.add_module_by_path(
+            override_file,
+            "C:/Users/username/ProjectA/gamemode/modules/workarounds/sh_workarounds.lua",
+        );
+
+        let library_member = make_member_id(library_file, 1);
+        let override_member = make_member_id(override_file, 2);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ents"));
+
+        // Annotated MetaMethodDecl in library
+        db.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                library_member,
+                LuaMemberKey::Name("Create".into()),
+                LuaMemberFeature::MetaMethodDecl,
+                None,
+            ),
+        );
+        // Unannotated FileMethodDecl in main (DarkRP override)
+        db.get_member_index_mut().add_member(
+            owner,
+            LuaMember::new(
+                override_member,
+                LuaMemberKey::Name("Create".into()),
+                LuaMemberFeature::FileMethodDecl,
+                None,
+            ),
+        );
+
+        // Caller file is shared realm (entities/letter/ pattern)
+        // Library file is shared realm (top-level ents.lua)
+        // Override file is server realm (inside `if SERVER then`)
+        set_file_realms(
+            &mut db,
+            &[
+                (caller_file, GmodRealm::Shared),
+                (library_file, GmodRealm::Shared),
+                (override_file, GmodRealm::Server),
+            ],
+        );
+
+        // GMod must be enabled for realm filtering to work
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        db.get_module_index_mut().update_config(Arc::new(emmyrc));
+
+        let selected = select_member_ids_by_workspace_and_realm(
+            &db,
+            &caller_file,
+            vec![(0, vec![override_member]), (1, vec![library_member])],
+            GmodRealm::Shared,
+        );
+
+        // Verify BOTH members are returned — the annotated library member
+        // must be included even though it's in a lower-priority tier, because
+        // the higher-priority tier has only unannotated members.
+        assert!(
+            selected.contains(&library_member),
+            "annotated MetaMethodDecl from library workspace should be included \
+             even when an unannotated FileMethodDecl exists in the main workspace"
+        );
+        assert!(
+            selected.contains(&override_member),
+            "main-workspace FileMethodDecl override should still be included"
+        );
     }
 }

@@ -4,12 +4,12 @@ use std::{
 };
 
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr,
-    LuaChunk, LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk,
+    LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
-    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaRepeatStat, LuaStat,
-    LuaSyntaxNode, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
+    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaRepeatStat, LuaStat, LuaSyntaxNode,
+    LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
 };
 
 use crate::{
@@ -295,7 +295,10 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         let t_deleg = std::time::Instant::now();
         resolve_getmember_network_var_delegations(db, &scripted_scope_files, context);
         if do_profile {
-            log::info!("gmod post: getmember_delegations cost {:?}", t_deleg.elapsed());
+            log::info!(
+                "gmod post: getmember_delegations cost {:?}",
+                t_deleg.elapsed()
+            );
         }
 
         let t0 = std::time::Instant::now();
@@ -1663,13 +1666,7 @@ fn resolve_getmember_network_var_delegations(
     };
 
     for (file_id, chunk, class_decl_id) in &candidate_files {
-        find_and_resolve_getmember_delegations(
-            db,
-            *file_id,
-            class_decl_id,
-            chunk,
-            &class_file_map,
-        );
+        find_and_resolve_getmember_delegations(db, *file_id, class_decl_id, chunk, &class_file_map);
     }
 }
 
@@ -1740,8 +1737,7 @@ fn find_and_resolve_getmember_delegations(
                 if let Some((target_class, target_method)) =
                     extract_getmember_call(&call_expr, false)
                 {
-                    getmember_locals
-                        .insert(local_name_text, (target_class, target_method));
+                    getmember_locals.insert(local_name_text, (target_class, target_method));
                 }
             }
         }
@@ -1795,9 +1791,7 @@ fn find_and_resolve_getmember_delegations(
         let Some(LuaExpr::CallExpr(inner_call)) = node.get_prefix_expr() else {
             continue;
         };
-        if let Some((target_class, _target_method)) =
-            extract_getmember_call(&inner_call, true)
-        {
+        if let Some((target_class, _target_method)) = extract_getmember_call(&inner_call, true) {
             let Some(args_list) = node.get_args_list() else {
                 continue;
             };
