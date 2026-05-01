@@ -544,7 +544,9 @@ impl FileDiagnostic {
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnosis complete".to_string()),
         );
-        self.notify_startup_complete();
+        if count == valid_file_count && !cancel_token.is_cancelled() {
+            self.notify_startup_complete();
+        }
 
         result
     }
@@ -726,7 +728,9 @@ async fn push_workspace_diagnostic(
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnosis complete".to_string()),
         );
-        file_diagnostic.notify_startup_complete();
+        if count == valid_file_count && !cancel_token.is_cancelled() {
+            file_diagnostic.notify_startup_complete();
+        }
     }
 }
 
