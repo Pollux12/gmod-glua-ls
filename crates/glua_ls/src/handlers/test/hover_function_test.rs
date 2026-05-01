@@ -1175,4 +1175,59 @@ mod tests {
 
         Ok(())
     }
+
+    #[gtest]
+    fn test_hover_duplicate_library_annotated_global_preserves_type_and_docs() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+
+        ws.def_files(vec![
+            (
+                "library/output/_globals.lua",
+                r#"
+                    ---@meta
+                    ---@type string
+                    ---Contains the version number of GMod.
+                    VERSION = nil
+                "#,
+            ),
+            (
+                "library/custom/_globals.lua",
+                r#"
+                    ---@meta
+                    ---@type string
+                    ---Contains the version number of GMod.
+                    VERSION = nil
+                "#,
+            ),
+        ]);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                print(VER<??>SION)
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("(global) VERSION: string"),
+            "expected annotated global type in hover, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Contains the version number of GMod."),
+            "expected annotated global docs in hover, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
 }

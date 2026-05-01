@@ -59,21 +59,16 @@ pub fn infer_name_expr(
         }
 
         match get_name_expr_var_ref_id(db, cache, &name_expr) {
-            Some(VarRefId::GlobalName(_, _)) => infer_expr_narrow_type(
+            Some(var_ref_id) => infer_expr_narrow_type(
                 db,
                 cache,
                 LuaExpr::NameExpr(name_expr.clone()),
-                VarRefId::GlobalName(
-                    internment::ArcIntern::new(smol_str::SmolStr::new(name)),
-                    name_expr.get_position(),
-                ),
+                var_ref_id,
             )
             .or_else(|_| {
                 infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
             }),
-            Some(_) | None => {
-                infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-            }
+            None => infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name),
         }
     };
 

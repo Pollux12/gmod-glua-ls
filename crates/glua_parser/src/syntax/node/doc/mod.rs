@@ -51,7 +51,9 @@ impl LuaAstNode for LuaComment {
 fn is_additive_doc_tag(kind: LuaSyntaxKind) -> bool {
     matches!(
         kind,
-        LuaSyntaxKind::DocTagVisibility
+        LuaSyntaxKind::DocTagMeta
+            | LuaSyntaxKind::DocTagType
+            | LuaSyntaxKind::DocTagVisibility
             | LuaSyntaxKind::DocTagExport
             | LuaSyntaxKind::DocTagVersion
             | LuaSyntaxKind::DocTagNodiscard
