@@ -1914,6 +1914,25 @@ _2 = a[1]
     }
 
     #[test]
+    fn test_gmod_func_param_name_hint_infers_function_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            local function run(func)
+                A = func
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedGlobal, code));
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "function");
+    }
+
+    #[test]
     fn test_explicit_param_annotation_overrides_gmod_name_fallback() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

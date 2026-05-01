@@ -32,6 +32,7 @@ const FILE_PARAM_DEFAULTS: &[(&str, &str)] = &[
     ("inflictor", "Entity"),
     ("victim", "Entity"),
     ("cmd", "CUserCmd"),
+    ("func", "function"),
     ("mat", "IMaterial"),
 ];
 
@@ -991,9 +992,9 @@ impl EmmyrcGmodScriptedClassScopes {
             return true;
         }
 
-        definitions
-            .iter()
-            .any(|definition| matches_scope_patterns(file_path, &definition.include, &definition.exclude))
+        definitions.iter().any(|definition| {
+            matches_scope_patterns(file_path, &definition.include, &definition.exclude)
+        })
     }
 
     pub fn detect_class_for_path(
@@ -1023,11 +1024,7 @@ impl EmmyrcGmodScriptedClassScopes {
             // excludes from other definitions, as they are definition-scoped.
             // E.g. SWEP's "weapons/gmod_tool/stools/**" exclude must not prevent
             // STOOL files from matching the STOOL definition.
-            if !matches_scope_patterns(
-                file_path,
-                &definition.include,
-                &definition.exclude,
-            ) {
+            if !matches_scope_patterns(file_path, &definition.include, &definition.exclude) {
                 continue;
             }
 
@@ -1380,9 +1377,8 @@ mod tests {
         let scopes = EmmyrcGmodScriptedClassScopes::default();
 
         // Standard lua-root path
-        let result = scopes.detect_class_for_path(Path::new(
-            "lua/weapons/gmod_tool/stools/hoverball.lua",
-        ));
+        let result =
+            scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/stools/hoverball.lua"));
         verify_that!(result.is_some(), eq(true))?;
         let match_ = result.unwrap();
         verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
@@ -1403,18 +1399,16 @@ mod tests {
         let scopes = EmmyrcGmodScriptedClassScopes::default();
 
         // STOOL files must be classified as TOOL, not SWEP
-        let result = scopes.detect_class_for_path(Path::new(
-            "lua/weapons/gmod_tool/stools/rope.lua",
-        ));
+        let result =
+            scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/stools/rope.lua"));
         verify_that!(result.is_some(), eq(true))?;
         let match_ = result.unwrap();
         verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
         verify_that!(match_.definition.id.as_str(), eq("stools"))?;
 
         // Regular SWEP files must still be classified as SWEP
-        let result = scopes.detect_class_for_path(Path::new(
-            "lua/weapons/weapon_pistol/shared.lua",
-        ));
+        let result =
+            scopes.detect_class_for_path(Path::new("lua/weapons/weapon_pistol/shared.lua"));
         verify_that!(result.is_some(), eq(true))?;
         let match_ = result.unwrap();
         verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
@@ -1455,18 +1449,14 @@ mod tests {
         let scopes = EmmyrcGmodScriptedClassScopes::default();
 
         // lua/weapons/gmod_tool/init.lua — the Sword Tool Gun weapon itself
-        let result = scopes.detect_class_for_path(Path::new(
-            "lua/weapons/gmod_tool/init.lua",
-        ));
+        let result = scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/init.lua"));
         verify_that!(result.is_some(), eq(true))?;
         let match_ = result.unwrap();
         verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
         verify_that!(match_.class_name.as_str(), eq("gmod_tool"))?;
 
         // lua/weapons/gmod_tool/shared.lua — shared SWEP file
-        let result = scopes.detect_class_for_path(Path::new(
-            "lua/weapons/gmod_tool/shared.lua",
-        ));
+        let result = scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/shared.lua"));
         verify_that!(result.is_some(), eq(true))?;
         let match_ = result.unwrap();
         verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
@@ -1482,9 +1472,8 @@ mod tests {
         verify_that!(match_.class_name.as_str(), eq("gmod_tool"))?;
 
         // STOOL files must still be classified as TOOL
-        let result = scopes.detect_class_for_path(Path::new(
-            "lua/weapons/gmod_tool/stools/hoverball.lua",
-        ));
+        let result =
+            scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/stools/hoverball.lua"));
         verify_that!(result.is_some(), eq(true))?;
         let match_ = result.unwrap();
         verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
@@ -1511,6 +1500,10 @@ mod tests {
         verify_that!(
             gmod.file_param_defaults.get("ent"),
             eq(Some(&"Entity".to_string()))
+        )?;
+        verify_that!(
+            gmod.file_param_defaults.get("func"),
+            eq(Some(&"function".to_string()))
         )
     }
 }
