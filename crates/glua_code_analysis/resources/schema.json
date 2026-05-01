@@ -1594,7 +1594,7 @@
               {
                 "classGlobal": "SWEP",
                 "exclude": [
-                  "weapons/gmod_tool/**"
+                  "weapons/gmod_tool/stools/**"
                 ],
                 "icon": "folder-library",
                 "id": "weapons",
@@ -1969,7 +1969,7 @@
             {
               "classGlobal": "SWEP",
               "exclude": [
-                "weapons/gmod_tool/**"
+                "weapons/gmod_tool/stools/**"
               ],
               "icon": "folder-library",
               "id": "weapons",
@@ -2781,7 +2781,7 @@
             {
               "classGlobal": "SWEP",
               "exclude": [
-                "weapons/gmod_tool/**"
+                "weapons/gmod_tool/stools/**"
               ],
               "icon": "folder-library",
               "id": "weapons",
