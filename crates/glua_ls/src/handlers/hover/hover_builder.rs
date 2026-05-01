@@ -31,6 +31,7 @@ pub struct HoverBuilder<'a> {
     /// For `@see` and unknown tags tags
     tag_content: Option<Vec<(String, String)>>,
     realm: Option<GmodRealm>,
+    realm_is_explicit: bool,
 
     trigger_token: Option<LuaSyntaxToken>,
     pub semantic_model: &'a SemanticModel<'a>,
@@ -75,6 +76,7 @@ impl<'a> HoverBuilder<'a> {
             type_expansion: None,
             tag_content: None,
             realm: None,
+            realm_is_explicit: false,
             detail_render_level,
             substitutor,
         }
@@ -149,7 +151,14 @@ impl<'a> HoverBuilder<'a> {
     }
 
     pub fn add_annotation_description(&mut self, annotation_description: String) {
-        if annotation_description.trim().is_empty() {
+        let annotation_description = annotation_description.trim().to_string();
+        if annotation_description.is_empty() {
+            return;
+        }
+
+        if self.annotation_description.iter().any(|existing| {
+            matches!(existing, MarkedString::String(existing_markdown) if existing_markdown.trim() == annotation_description)
+        }) {
             return;
         }
 
@@ -183,14 +192,23 @@ impl<'a> HoverBuilder<'a> {
                 source,
                 tag_content,
                 realm,
-                explicit_realm: _,
+                explicit_realm,
             } = desc_info;
 
             if let Some(realm) = realm
                 && include_realm
-                && self.realm.is_none()
             {
-                self.realm = Some(realm);
+                match self.realm {
+                    None => {
+                        self.realm = Some(realm);
+                        self.realm_is_explicit = explicit_realm;
+                    }
+                    Some(_) if explicit_realm && !self.realm_is_explicit => {
+                        self.realm = Some(realm);
+                        self.realm_is_explicit = true;
+                    }
+                    _ => {}
+                }
             }
 
             if let Some(description) = description {

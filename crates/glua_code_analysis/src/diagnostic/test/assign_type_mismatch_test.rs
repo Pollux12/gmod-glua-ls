@@ -2278,6 +2278,75 @@ return t
             "#
         ));
     }
+
+    #[test]
+    fn test_server_only_override_does_not_suppress_client_redundant_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_realm_split");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@realm shared
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        ws.def_file(
+            "gamemode/modules/workarounds/sv_workarounds.lua",
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, safety)
+                return nil
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+            if SERVER then
+                local ok = ents.Create("foo", "extra")
+            end
+            "#
+        ));
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+            if CLIENT then
+                local ok = ents.Create("foo")
+            end
+            "#
+        ));
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+            if CLIENT then
+                local should_error = ents.Create("foo", "extra")
+            end
+            "#
+        ));
+    }
 }
 
 #[test]

@@ -162,7 +162,7 @@ fn resolve_member_type(
             match resolve_state {
                 MemberTypeResolveState::All => {
                     let mut typ = LuaType::Unknown;
-                    for member in members {
+                    for member in &members {
                         let member_type_cache = db
                             .get_type_index()
                             .get_type_cache(&member.get_id().into())
@@ -178,6 +178,12 @@ fn resolve_member_type(
                             member_type.clone()
                         };
                         typ = TypeOps::Union.apply(db, &typ, &member_type);
+                    }
+                    if let Some(adapters) =
+                        build_generic_arity_adapters_for_overrides(db, &typ, &members)
+                    {
+                        let base_typ = prune_non_generic_callables_for_adapter_merge(db, &typ);
+                        typ = TypeOps::Union.apply(db, &base_typ, &adapters);
                     }
                     Ok(typ)
                 }
@@ -196,28 +202,11 @@ fn resolve_member_type(
                             );
                         }
                     }
-
-                    // If file-decl members (unannotated overrides) also exist,
-                    // merge them as additional overloads, but with their
-                    // return types replaced by the meta return type so the
-                    // annotated return type takes priority. This allows the
-                    // override's parameter list (e.g. extra params) to be
-                    // accepted without triggering param-count diagnostics.
-                    let meta_ret = extract_callable_return_union(db, &typ);
-                    if let Some(ref meta_ret) = meta_ret {
-                        for member in &members {
-                            let feature = member.get_feature();
-                            if feature.is_file_decl() || feature.is_file_define() {
-                                let member_type = db
-                                    .get_type_index()
-                                    .get_type_cache(&member.get_id().into())
-                                    .ok_or(InferFailReason::UnResolveMemberType(member.get_id()))?
-                                    .as_type();
-                                let adjusted_type =
-                                    replace_function_return(db, member_type, meta_ret);
-                                typ = TypeOps::Union.apply(db, &typ, &adjusted_type);
-                            }
-                        }
+                    if let Some(adapters) =
+                        build_generic_arity_adapters_for_overrides(db, &typ, &members)
+                    {
+                        let base_typ = prune_non_generic_callables_for_adapter_merge(db, &typ);
+                        typ = TypeOps::Union.apply(db, &base_typ, &adapters);
                     }
 
                     Ok(typ)
@@ -237,6 +226,12 @@ fn resolve_member_type(
                             );
                         }
                     }
+                    if let Some(adapters) =
+                        build_generic_arity_adapters_for_overrides(db, &typ, &members)
+                    {
+                        let base_typ = prune_non_generic_callables_for_adapter_merge(db, &typ);
+                        typ = TypeOps::Union.apply(db, &base_typ, &adapters);
+                    }
                     Ok(typ)
                 }
             }
@@ -244,72 +239,225 @@ fn resolve_member_type(
     }
 }
 
-/// Extracts a union of return types from all callable entries
-/// (DocFunction/Signature) found anywhere in the given type.
-fn extract_callable_return_union(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
-    fn collect_callable_returns(db: &DbIndex, typ: &LuaType, out: &mut Vec<LuaType>) {
+#[derive(Debug, Clone, Copy, Default)]
+struct OverrideCallableShape {
+    max_required_params: usize,
+    has_variadic: bool,
+    callable_member_count: usize,
+    has_non_generic_callable: bool,
+}
+
+fn build_generic_arity_adapters_for_overrides(
+    db: &DbIndex,
+    typ: &LuaType,
+    members: &[&crate::LuaMember],
+) -> Option<LuaType> {
+    let override_shape = collect_override_callable_shape(db, members);
+    if override_shape.callable_member_count < 2 || !override_shape.has_non_generic_callable {
+        return None;
+    }
+    if override_shape.max_required_params == 0 && !override_shape.has_variadic {
+        return None;
+    }
+
+    let generic_callables = extract_generic_callables(db, typ);
+    if generic_callables.is_empty() {
+        return None;
+    }
+
+    let adapters = generic_callables
+        .into_iter()
+        .filter_map(|generic_callable| {
+            if !override_shape.has_variadic
+                && override_shape.max_required_params <= generic_callable.get_params().len()
+            {
+                return None;
+            }
+
+            let mut params = generic_callable.get_params().to_vec();
+            while params.len() < override_shape.max_required_params {
+                params.push(("__override_extra".to_string(), Some(LuaType::Any)));
+            }
+
+            Some(LuaType::DocFunction(Arc::new(LuaFunctionType::new(
+                generic_callable.get_async_state(),
+                generic_callable.is_colon_define(),
+                generic_callable.is_variadic() || override_shape.has_variadic,
+                params,
+                generic_callable.get_ret().clone(),
+            ))))
+        })
+        .collect::<Vec<_>>();
+
+    if adapters.is_empty() {
+        None
+    } else {
+        Some(LuaType::from_vec(adapters))
+    }
+}
+
+fn collect_override_callable_shape(
+    db: &DbIndex,
+    members: &[&crate::LuaMember],
+) -> OverrideCallableShape {
+    fn type_has_callable(typ: &LuaType) -> bool {
         match typ {
-            LuaType::DocFunction(func) => out.push(func.get_ret().clone()),
-            LuaType::Signature(signature_id) => {
-                if let Some(signature) = db.get_signature_index().get(signature_id) {
-                    out.push(signature.get_return_type());
+            LuaType::DocFunction(_) | LuaType::Signature(_) => true,
+            LuaType::Union(union_type) => union_type.into_vec().iter().any(type_has_callable),
+            _ => false,
+        }
+    }
+
+    fn type_has_non_generic_callable(db: &DbIndex, typ: &LuaType) -> bool {
+        match typ {
+            LuaType::DocFunction(function_type) => !function_type.contain_tpl(),
+            LuaType::Signature(signature_id) => db
+                .get_signature_index()
+                .get(signature_id)
+                .is_some_and(|signature| {
+                    !signature.is_generic()
+                        && !signature.has_special_call_params()
+                        && !signature.to_doc_func_type().contain_tpl()
+                }),
+            LuaType::Union(union_type) => union_type
+                .into_vec()
+                .iter()
+                .any(|union_member| type_has_non_generic_callable(db, union_member)),
+            _ => false,
+        }
+    }
+
+    fn collect_from_type(db: &DbIndex, typ: &LuaType, shape: &mut OverrideCallableShape) {
+        match typ {
+            LuaType::DocFunction(function_type) => {
+                if function_type.is_variadic() {
+                    shape.has_variadic = true;
+                } else {
+                    shape.max_required_params = shape
+                        .max_required_params
+                        .max(function_type.get_params().len());
                 }
             }
-            LuaType::Union(union) => {
-                for t in union.into_vec() {
-                    collect_callable_returns(db, &t, out);
+            LuaType::Signature(signature_id) => {
+                if let Some(signature) = db.get_signature_index().get(signature_id) {
+                    if signature.is_vararg {
+                        shape.has_variadic = true;
+                    } else {
+                        shape.max_required_params = shape
+                            .max_required_params
+                            .max(signature.get_type_params().len());
+                    }
+                }
+            }
+            LuaType::Union(union_type) => {
+                for union_member in union_type.into_vec() {
+                    collect_from_type(db, &union_member, shape);
                 }
             }
             _ => {}
         }
     }
 
-    let mut returns = Vec::new();
-    collect_callable_returns(db, typ, &mut returns);
-    if returns.is_empty() {
-        None
-    } else {
-        Some(LuaType::from_vec(returns))
+    let mut shape = OverrideCallableShape::default();
+    for member in members {
+        let feature = member.get_feature();
+        if !feature.is_file_decl() && !feature.is_file_define() {
+            continue;
+        }
+        let Some(cache) = db.get_type_index().get_type_cache(&member.get_id().into()) else {
+            continue;
+        };
+        let member_type = cache.as_type();
+        if type_has_callable(member_type) {
+            shape.callable_member_count += 1;
+        }
+        if type_has_non_generic_callable(db, member_type) {
+            shape.has_non_generic_callable = true;
+        }
+        collect_from_type(db, member_type, &mut shape);
     }
+    shape
 }
 
-/// Creates a copy of `typ` with any DocFunction return types replaced by
-/// `new_ret`. Non-function types pass through unchanged.
-fn replace_function_return(db: &DbIndex, typ: &LuaType, new_ret: &LuaType) -> LuaType {
-    match typ {
-        LuaType::DocFunction(func) => {
-            let merged = LuaFunctionType::new(
-                func.get_async_state(),
-                func.is_colon_define(),
-                func.is_variadic(),
-                func.get_params().to_vec(),
-                new_ret.clone(),
-            );
-            LuaType::DocFunction(Arc::new(merged))
-        }
-        LuaType::Signature(signature_id) => {
-            if let Some(signature) = db.get_signature_index().get(signature_id) {
-                let merged = LuaFunctionType::new(
-                    signature.async_state,
-                    signature.is_colon_define,
-                    signature.is_vararg,
-                    signature.get_type_params(),
-                    new_ret.clone(),
-                );
-                LuaType::DocFunction(Arc::new(merged))
-            } else {
-                LuaType::Signature(*signature_id)
+fn extract_generic_callables(db: &DbIndex, typ: &LuaType) -> Vec<Arc<LuaFunctionType>> {
+    fn collect(db: &DbIndex, typ: &LuaType, out: &mut Vec<Arc<LuaFunctionType>>) {
+        match typ {
+            LuaType::DocFunction(function_type) => {
+                if function_type.contain_tpl() {
+                    out.push(function_type.clone());
+                }
             }
+            LuaType::Signature(signature_id) => {
+                if let Some(signature) = db.get_signature_index().get(signature_id) {
+                    let function_type = Arc::new(LuaFunctionType::new(
+                        signature.async_state,
+                        signature.is_colon_define,
+                        signature.is_vararg,
+                        signature.get_type_params(),
+                        signature.get_return_type(),
+                    ));
+                    if signature.is_generic()
+                        || signature.has_special_call_params()
+                        || function_type.contain_tpl()
+                    {
+                        out.push(function_type);
+                    }
+                }
+            }
+            LuaType::Union(union_type) => {
+                for union_member in union_type.into_vec() {
+                    collect(db, &union_member, out);
+                }
+            }
+            _ => {}
         }
-        LuaType::Union(union) => {
-            let new_types: Vec<_> = union
+    }
+
+    let mut callables = Vec::new();
+    collect(db, typ, &mut callables);
+    callables
+}
+
+fn prune_non_generic_callables_for_adapter_merge(db: &DbIndex, typ: &LuaType) -> LuaType {
+    fn is_generic_callable(db: &DbIndex, typ: &LuaType) -> bool {
+        match typ {
+            LuaType::DocFunction(function_type) => function_type.contain_tpl(),
+            LuaType::Signature(signature_id) => db
+                .get_signature_index()
+                .get(signature_id)
+                .is_some_and(|signature| {
+                    signature.is_generic()
+                        || signature.has_special_call_params()
+                        || signature.to_doc_func_type().contain_tpl()
+                }),
+            _ => false,
+        }
+    }
+
+    match typ {
+        LuaType::Union(union_type) => {
+            let pruned_members = union_type
                 .into_vec()
                 .iter()
-                .map(|t| replace_function_return(db, t, new_ret))
-                .collect();
-            LuaType::from_vec(new_types)
+                .filter(|union_member| {
+                    if matches!(
+                        union_member,
+                        LuaType::DocFunction(_) | LuaType::Signature(_)
+                    ) {
+                        is_generic_callable(db, union_member)
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if pruned_members.is_empty() {
+                typ.clone()
+            } else {
+                LuaType::from_vec(pruned_members)
+            }
         }
-        other => other.clone(),
+        _ => typ.clone(),
     }
 }
 

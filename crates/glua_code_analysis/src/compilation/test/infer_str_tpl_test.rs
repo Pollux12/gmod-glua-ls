@@ -164,6 +164,38 @@ mod test {
     }
 
     #[gtest]
+    fn test_str_tpl_generic_override_with_extra_param_preserves_instantiated_return() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+                ---@class letter: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                local originalCreate = ents.Create
+                function ents.Create(name, safety)
+                    if originalCreate then
+                        return originalCreate(name)
+                    end
+                    return nil
+                end
+            "#,
+        );
+
+        let spawned_ty = ws.expr_ty("ents.Create(\"letter\", \"meow\")");
+        let expected = ws.ty("letter");
+        assert_eq!(spawned_ty, expected);
+    }
+
+    #[gtest]
     fn test_str_tpl_generic_function_body_return_is_not_erased_by_any_branch() {
         let mut ws = VirtualWorkspace::new();
 

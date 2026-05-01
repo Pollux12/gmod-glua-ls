@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::{HashMap, HashSet},
     sync::Arc,
     vec,
@@ -6,8 +7,8 @@ use std::{
 
 use glua_code_analysis::{
     AsyncState, DbIndex, InferGuard, LuaDocReturnInfo, LuaFunctionType, LuaMember, LuaMemberOwner,
-    LuaSemanticDeclId, LuaType, RenderLevel, ReturnTypeKind, TypeSubstitutor, VariadicType,
-    humanize_type, infer_call_expr_func, instantiate_doc_function,
+    LuaSemanticDeclId, LuaType, RenderLevel, ReturnTypeKind, SemanticDeclLevel, TypeSubstitutor,
+    VariadicType, humanize_type, infer_call_expr_func, instantiate_doc_function,
     try_extract_signature_id_from_field,
 };
 
@@ -118,6 +119,7 @@ struct HoverFunctionInfo {
     primary: String,
     overloads: Option<Vec<String>>,
     description: Option<DescriptionInfo>,
+    is_trigger_owner: bool,
 }
 
 #[allow(unused)]
@@ -129,6 +131,11 @@ fn build_function_define_hover(
     is_local: bool,
 ) -> Option<()> {
     let is_field = function_member_is_field(db, semantic_decls);
+    let trigger_decl = builder.get_trigger_token().and_then(|token| {
+        builder
+            .semantic_model
+            .find_decl(token.into(), SemanticDeclLevel::default())
+    });
     let mut function_infos = Vec::new();
     for (semantic_decl_id, typ) in semantic_decls {
         let mut typ = typ.clone();
@@ -169,6 +176,7 @@ fn build_function_define_hover(
                 None
             },
             description,
+            is_trigger_owner: trigger_decl.as_ref() == Some(semantic_decl_id),
         });
     }
 
@@ -190,7 +198,6 @@ fn build_function_define_hover(
     // 去重, 这是必须的.
     // Keep the last occurrence for each signature so the active symbol remains the primary entry.
     dedup_function_infos(&mut function_infos, caller_realm);
-
     // 需要显示重载的情况
     match function_infos.len() {
         0 => {
@@ -202,17 +209,43 @@ fn build_function_define_hover(
                 .add_description_from_info_with_realm(function_infos[0].description.clone(), true);
         }
         _ => {
-            let main_type = function_infos.pop()?;
+            let main_type = if let Some(trigger_idx) =
+                function_infos.iter().position(|info| info.is_trigger_owner)
+            {
+                function_infos.remove(trigger_idx)
+            } else {
+                function_infos.pop()?
+            };
             builder.set_type_description(main_type.primary.clone());
             builder.add_description_from_info_with_realm(main_type.description.clone(), true);
 
-            for type_desc in function_infos {
-                builder.add_signature_overload(type_desc.primary.clone());
-                if let Some(overloads) = &type_desc.overloads {
-                    for overload in overloads {
+            let mut seen_signatures = HashSet::new();
+            seen_signatures.insert(main_type.primary.clone());
+            if let Some(overloads) = &main_type.overloads {
+                for overload in overloads {
+                    if seen_signatures.insert(overload.clone()) {
                         builder.add_signature_overload(overload.clone());
                     }
                 }
+            }
+
+            function_infos.sort_by_key(|info| {
+                Reverse(info.overloads.as_ref().is_some_and(|v| !v.is_empty()))
+            });
+            for type_desc in &function_infos {
+                if seen_signatures.insert(type_desc.primary.clone()) {
+                    builder.add_signature_overload(type_desc.primary.clone());
+                }
+                if let Some(overloads) = &type_desc.overloads {
+                    for overload in overloads {
+                        if seen_signatures.insert(overload.clone()) {
+                            builder.add_signature_overload(overload.clone());
+                        }
+                    }
+                }
+            }
+
+            for type_desc in function_infos {
                 builder.add_description_from_info_with_realm(type_desc.description.clone(), true);
             }
         }
@@ -225,6 +258,7 @@ fn merge_preferred_description(
     incoming: &HoverFunctionInfo,
     caller_realm: glua_code_analysis::GmodRealm,
 ) {
+    existing.is_trigger_owner |= incoming.is_trigger_owner;
     match (&mut existing.description, &incoming.description) {
         (None, Some(incoming_description)) => {
             existing.description = Some(incoming_description.clone());
@@ -232,6 +266,14 @@ fn merge_preferred_description(
         (Some(existing_description), Some(incoming_description)) => {
             if existing_description.realm.is_none() && incoming_description.realm.is_some() {
                 existing_description.realm = incoming_description.realm;
+                existing_description.explicit_realm = incoming_description.explicit_realm;
+            } else if existing_description.realm.is_some()
+                && incoming_description.realm.is_some()
+                && incoming_description.explicit_realm
+                && !existing_description.explicit_realm
+            {
+                existing_description.realm = incoming_description.realm;
+                existing_description.explicit_realm = true;
             }
 
             if existing_description.description.is_none()
@@ -256,6 +298,8 @@ fn merge_preferred_description(
                 && incoming_description.source.is_none()
                 && existing_description.tag_content.is_none()
                 && incoming_description.tag_content.is_none()
+                && !existing_description.explicit_realm
+                && !incoming_description.explicit_realm
             {
                 existing_description.realm = merge_docless_realms(
                     caller_realm,
@@ -717,4 +761,85 @@ pub fn is_function(typ: &LuaType) -> bool {
                 .all(|t| matches!(t, LuaType::DocFunction(_) | LuaType::Signature(_))),
             _ => false,
         }
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_code_analysis::GmodRealm;
+
+    use crate::handlers::hover::humanize_types::DescriptionInfo;
+
+    use super::{HoverFunctionInfo, merge_preferred_description};
+
+    #[test]
+    fn merge_preferred_description_explicit_realm_overrides_implicit_realm() {
+        let mut existing = HoverFunctionInfo {
+            primary: "(function) ents.Create(class: string)".to_string(),
+            overloads: None,
+            description: Some(DescriptionInfo {
+                description: Some("override docs".to_string()),
+                source: None,
+                tag_content: None,
+                realm: Some(GmodRealm::Shared),
+                explicit_realm: false,
+            }),
+            is_trigger_owner: true,
+        };
+        let incoming = HoverFunctionInfo {
+            primary: "(function) ents.Create(class: string)".to_string(),
+            overloads: None,
+            description: Some(DescriptionInfo {
+                description: Some("annotated docs".to_string()),
+                source: None,
+                tag_content: None,
+                realm: Some(GmodRealm::Server),
+                explicit_realm: true,
+            }),
+            is_trigger_owner: false,
+        };
+
+        merge_preferred_description(&mut existing, &incoming, GmodRealm::Shared);
+
+        let merged = existing
+            .description
+            .expect("description should remain present");
+        assert_eq!(merged.realm, Some(GmodRealm::Server));
+        assert!(merged.explicit_realm);
+    }
+
+    #[test]
+    fn merge_preferred_description_preserves_existing_explicit_docless_realm() {
+        let mut existing = HoverFunctionInfo {
+            primary: "(method) GM:Spawn()".to_string(),
+            overloads: None,
+            description: Some(DescriptionInfo {
+                description: None,
+                source: None,
+                tag_content: None,
+                realm: Some(GmodRealm::Server),
+                explicit_realm: true,
+            }),
+            is_trigger_owner: true,
+        };
+        let incoming = HoverFunctionInfo {
+            primary: "(method) GM:Spawn()".to_string(),
+            overloads: None,
+            description: Some(DescriptionInfo {
+                description: None,
+                source: None,
+                tag_content: None,
+                realm: Some(GmodRealm::Shared),
+                explicit_realm: false,
+            }),
+            is_trigger_owner: false,
+        };
+
+        merge_preferred_description(&mut existing, &incoming, GmodRealm::Shared);
+
+        let merged = existing
+            .description
+            .expect("description should remain present");
+        assert_eq!(merged.realm, Some(GmodRealm::Server));
+        assert!(merged.explicit_realm);
+    }
 }

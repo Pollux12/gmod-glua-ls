@@ -5,7 +5,10 @@ use glua_parser::{
     LuaLiteralToken,
 };
 
-use crate::{DbIndex, DiagnosticCode, LuaSignatureId, LuaType, SemanticModel};
+use crate::{
+    DbIndex, DiagnosticCode, LuaSemanticDeclId, LuaSignatureId, LuaType, SemanticDeclLevel,
+    SemanticModel,
+};
 
 use super::{Checker, DiagnosticContext};
 
@@ -195,6 +198,16 @@ fn check_call_expr(
             return Some(());
         }
 
+        if has_override_callable_accepting_call(
+            context,
+            semantic_model,
+            &call_expr,
+            min_call_args_count,
+            colon_call,
+        ) {
+            return Some(());
+        }
+
         // 参数定义中最后一个参数是 `...`
         if fake_params.last().is_some_and(|(name, typ)| {
             name == "..." || typ.as_ref().is_some_and(|typ| typ.is_variadic())
@@ -287,4 +300,123 @@ fn is_nullable(db: &DbIndex, typ: &LuaType) -> bool {
         }
     }
     false
+}
+
+fn has_override_callable_accepting_call(
+    context: &DiagnosticContext,
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    min_call_args_count: usize,
+    colon_call: bool,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(LuaSemanticDeclId::Member(member_id)) = semantic_model.find_decl(
+        prefix_expr.syntax().clone().into(),
+        SemanticDeclLevel::default(),
+    ) else {
+        return false;
+    };
+
+    let Some(member) = context.db.get_member_index().get_member(&member_id) else {
+        return false;
+    };
+    let Some(owner) = context.db.get_member_index().get_current_owner(&member_id) else {
+        return false;
+    };
+    let Some(member_item) = context
+        .db
+        .get_member_index()
+        .get_member_item(owner, member.get_key())
+    else {
+        return false;
+    };
+
+    let visible_member_ids = member_item.visible_member_ids_with_realm_at_offset(
+        context.db,
+        &semantic_model.get_file_id(),
+        call_expr.get_position(),
+    );
+    if visible_member_ids.is_empty() {
+        return false;
+    }
+
+    let has_meta_decl = visible_member_ids.iter().any(|visible_member_id| {
+        context
+            .db
+            .get_member_index()
+            .get_member(visible_member_id)
+            .is_some_and(|visible_member| visible_member.get_feature().is_meta_decl())
+    });
+    if !has_meta_decl {
+        return false;
+    }
+
+    visible_member_ids.iter().any(|visible_member_id| {
+        let Some(visible_member) = context.db.get_member_index().get_member(visible_member_id)
+        else {
+            return false;
+        };
+        let feature = visible_member.get_feature();
+        if !feature.is_file_decl() && !feature.is_file_define() {
+            return false;
+        }
+
+        context
+            .db
+            .get_type_index()
+            .get_type_cache(&visible_member.get_id().into())
+            .is_some_and(|cache| {
+                callable_accepts_call_args(
+                    context.db,
+                    cache.as_type(),
+                    min_call_args_count,
+                    colon_call,
+                )
+            })
+    })
+}
+
+fn callable_accepts_call_args(
+    db: &DbIndex,
+    typ: &LuaType,
+    min_call_args_count: usize,
+    colon_call: bool,
+) -> bool {
+    match typ {
+        LuaType::DocFunction(function_type) => {
+            let Some(mut expected_params_len) = get_params_len(function_type.get_params()) else {
+                return true;
+            };
+            if function_type.is_colon_define() && !colon_call {
+                expected_params_len += 1;
+            }
+            let mut effective_min_call_args_count = min_call_args_count;
+            if colon_call && !function_type.is_colon_define() {
+                effective_min_call_args_count += 1;
+            }
+            effective_min_call_args_count <= expected_params_len
+        }
+        LuaType::Signature(signature_id) => {
+            let Some(signature) = db.get_signature_index().get(signature_id) else {
+                return false;
+            };
+            let Some(mut expected_params_len) = get_params_len(&signature.get_type_params()) else {
+                return true;
+            };
+            if signature.is_colon_define && !colon_call {
+                expected_params_len += 1;
+            }
+            let mut effective_min_call_args_count = min_call_args_count;
+            if colon_call && !signature.is_colon_define {
+                effective_min_call_args_count += 1;
+            }
+            effective_min_call_args_count <= expected_params_len
+        }
+        LuaType::Union(union_type) => union_type.into_vec().iter().any(|union_member| {
+            callable_accepts_call_args(db, union_member, min_call_args_count, colon_call)
+        }),
+        _ => false,
+    }
 }
