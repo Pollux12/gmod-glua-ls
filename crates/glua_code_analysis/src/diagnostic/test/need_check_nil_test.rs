@@ -2,6 +2,26 @@
 mod test {
     use crate::{DiagnosticCode, VirtualWorkspace};
     use googletest::prelude::*;
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    fn diagnostics_for_code(
+        ws: &mut VirtualWorkspace,
+        diagnostic_code: DiagnosticCode,
+        code: &str,
+    ) -> Vec<lsp_types::Diagnostic> {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let file_id = ws.def(code);
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(diagnostic_code.get_name().to_string()))
+            })
+            .collect()
+    }
 
     #[test]
     fn test_issue_245() {
@@ -753,5 +773,123 @@ mod test {
             end
             "#,
         ));
+    }
+
+    #[gtest]
+    fn test_no_duplicate_nil_check_for_call_on_uninit_local() {
+        // Regression: `local test; test.meow()` should not produce two need-check-nil
+        // diagnostics. The call-site check (check_call_expr) covers it, and the
+        // index-expr check (check_index_expr) is suppressed when the IndexExpr is
+        // a call prefix and itself nullable.
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            local test
+            test.meow()
+        "#;
+
+        let need_check_nil_diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            code,
+        );
+
+        assert_that!(
+            need_check_nil_diagnostics.len(),
+            eq(0_usize),
+            "definite-nil receiver call should be unchecked-nil-access, not need-check-nil"
+        );
+    }
+
+    #[gtest]
+    fn test_single_unchecked_nil_access_for_call_on_uninit_local() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            local test
+            test.meow()
+        "#;
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            code,
+        );
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+
+        let diagnostic = &diagnostics[0];
+        assert_that!(diagnostic.message.as_str(), contains_substring("may be nil"));
+        assert_that!(
+            diagnostic.range.end.character - diagnostic.range.start.character,
+            eq(4_u32),
+            "unchecked nil receiver diagnostic should target `test`"
+        );
+    }
+
+    #[gtest]
+    fn test_nil_check_for_field_access_on_uninit_local_still_emits() {
+        // `local test; local x = test.meow` — no call, so check_call_expr does
+        // NOT fire. check_index_expr must still emit because `test` is nil.
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            local test
+            local x = test.meow
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_and_method_call_on_indexed_receiver_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Seat
+            ---@field GetDriver fun(self: Seat): Entity?
+            "#,
+        );
+
+        let code = r#"
+            ---@param seats Seat[]
+            ---@param count integer
+            local function test(seats, count)
+                for i = count, 1, -1 do
+                    local driver = IsValid(seats[i]) and seats[i]:GetDriver()
+                end
+            end
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        assert_that!(ws.check_code_for(DiagnosticCode::NeedCheckNil, code), eq(true));
+    }
+
+    #[gtest]
+    fn test_bracket_index_need_check_nil_range_covers_full_prefix_name() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            local lastNick
+            local nick = "x"
+            local i = 1
+            local _ = lastNick[i] ~= nick
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+        assert_that!(diagnostics.len(), eq(1_usize));
+
+        let diagnostic = &diagnostics[0];
+        assert_that!(
+            diagnostic.message.as_str(),
+            contains_substring("lastNick may be nil")
+        );
+        assert_that!(
+            diagnostic.range.end.character - diagnostic.range.start.character,
+            eq(8_u32),
+            "need-check-nil on `lastNick[i]` should span full `lastNick`"
+        );
     }
 }
