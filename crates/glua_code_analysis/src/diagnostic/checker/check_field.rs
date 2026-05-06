@@ -154,7 +154,7 @@ fn check_index_expr(
         .infer_expr(index_expr.get_prefix_expr()?)
         .unwrap_or(LuaType::Unknown);
 
-    if is_invalid_prefix_type(&prefix_typ, code) {
+    if is_invalid_prefix_type(&prefix_typ) {
         return Some(());
     }
 
@@ -260,7 +260,7 @@ fn check_index_expr(
     Some(())
 }
 
-fn is_invalid_prefix_type(typ: &LuaType, code: DiagnosticCode) -> bool {
+fn is_invalid_prefix_type(typ: &LuaType) -> bool {
     let mut current_typ = typ;
     loop {
         match current_typ {
@@ -276,12 +276,10 @@ fn is_invalid_prefix_type(typ: &LuaType, code: DiagnosticCode) -> bool {
             LuaType::TableConst(_) => return false,
             LuaType::Union(union) => {
                 return match union.as_ref() {
-                    LuaUnionType::Nullable(typ) => {
-                        typ.is_nil() || is_invalid_prefix_type(typ, code)
-                    }
+                    LuaUnionType::Nullable(typ) => typ.is_nil() || is_invalid_prefix_type(typ),
                     LuaUnionType::Multi(types) => types
                         .iter()
-                        .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ, code)),
+                        .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ)),
                 };
             }
             LuaType::Instance(instance_typ) => {

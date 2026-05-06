@@ -136,7 +136,10 @@ fn check_table_expr(
         LuaType::Object(_) => type_cache
             .entry(table_type.clone())
             .or_insert_with(|| {
-                Arc::new(get_required_fields(context, std::slice::from_ref(&table_type)).unwrap_or_default())
+                Arc::new(
+                    get_required_fields(context, std::slice::from_ref(&table_type))
+                        .unwrap_or_default(),
+                )
             })
             .clone(),
         LuaType::Intersection(intersections) => type_cache
