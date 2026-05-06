@@ -66,7 +66,6 @@ fn check_call_expr(
         check_param(
             context,
             semantic_model,
-            &call_expr,
             i,
             param_type,
             &arg_infos,
@@ -144,7 +143,6 @@ fn check_doc_tag_type(
 fn check_param(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
-    call_expr: &LuaCallExpr,
     param_index: usize,
     param_type: &LuaType,
     arg_infos: &[LuaType],
@@ -161,8 +159,8 @@ fn check_param(
                     instantiate_type_generic(semantic_model.get_db(), &ty, substitutor),
                 )
             });
-            let arg_expr = call_expr.get_args_list()?.get_args().nth(param_index)?;
-            let arg_type = semantic_model.infer_expr(arg_expr.clone()).ok()?;
+            let arg_type = arg_infos.get(param_index)?;
+            let arg_range = arg_ranges.get(param_index).copied()?;
 
             if from_union && !arg_type.is_string() {
                 return None;
@@ -172,16 +170,13 @@ fn check_param(
                 context,
                 semantic_model,
                 str_tpl_ref,
-                &arg_type,
-                arg_expr.get_range(),
+                arg_type,
+                arg_range,
                 extend_type,
             );
         }
         LuaType::TplRef(tpl_ref) | LuaType::ConstTplRef(tpl_ref) => {
-            if from_union
-                && let Some(arg_expr) = call_expr.get_args_list()?.get_args().nth(param_index)
-            {
-                let arg_type = semantic_model.infer_expr(arg_expr).ok()?;
+            if from_union && let Some(arg_type) = arg_infos.get(param_index) {
                 if let LuaType::StringConst(type_name) | LuaType::DocStringConst(type_name) =
                     arg_type
                     && semantic_model
@@ -210,7 +205,6 @@ fn check_param(
                     check_param(
                         context,
                         semantic_model,
-                        call_expr,
                         param_index,
                         union_member_type,
                         arg_infos,

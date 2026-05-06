@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use glua_parser::{LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaVarExpr};
+use glua_parser::{
+    LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaSyntaxKind, LuaVarExpr,
+};
 
 use crate::{
-    DiagnosticCode, FileId, LuaMemberId, LuaMemberOwner, LuaSemanticDeclId, LuaType, ModuleInfo,
-    SemanticDeclLevel, SemanticModel, parse_require_module_info,
+    DiagnosticCode, FileId, LuaMemberId, LuaMemberOwner, LuaType, ModuleInfo, SemanticModel,
+    parse_require_module_info,
 };
 
 use super::{Checker, DiagnosticContext, check_field, humanize_lint_type};
@@ -67,24 +69,19 @@ fn check_export_index_expr(
 ) -> Option<()> {
     let db = context.db;
     let prefix_expr = index_expr.get_prefix_expr()?;
-    let prefix_info = semantic_model.get_semantic_info(prefix_expr.syntax().clone().into())?;
-    let prefix_typ = prefix_info.typ.clone();
+    if !matches!(prefix_expr, LuaExpr::NameExpr(_) | LuaExpr::CallExpr(_)) {
+        return Some(());
+    }
     let index_key = index_expr.get_index_key()?;
 
-    // Fast-path skip for non-table-like prefixes before expensive require/export resolution.
-    match &prefix_typ {
-        LuaType::TableConst(_)
-        | LuaType::Ref(_)
-        | LuaType::Def(_)
-        | LuaType::Instance(_)
-        | LuaType::ModuleRef(_) => {}
-        _ => return Some(()),
-    }
-
-    // Imported exported modules can appear as ModuleRef/Ref wrappers before resolving down to
-    // the underlying exported table, so handle that path before the plain TableConst guard.
-    if let Some(module_info) = check_require_table_const_with_export(semantic_model, index_expr) {
-        let export_typ = module_info.export_type.as_ref().unwrap_or(&prefix_typ);
+    if let Some(module_info) = check_require_table_const_with_export(semantic_model, &prefix_expr) {
+        let fallback_export_typ;
+        let export_typ = if let Some(export_typ) = module_info.export_type.as_ref() {
+            export_typ
+        } else {
+            fallback_export_typ = LuaType::ModuleRef(module_info.file_id);
+            &fallback_export_typ
+        };
 
         let has_member = has_export_member(
             semantic_model,
@@ -126,21 +123,16 @@ fn check_export_index_expr(
         return Some(());
     }
 
-    // `check_export` 仅需要处理 `TableConst, 其它类型由 `check_field` 负责.
-    let LuaType::TableConst(table_const) = &prefix_typ else {
+    let LuaExpr::NameExpr(name_expr) = &prefix_expr else {
         return Some(());
     };
 
-    // 不是导入表, 且定义位于当前文件中, 则尝试检查本地表.
-    if code != DiagnosticCode::UndefinedField && table_const.file_id != semantic_model.get_file_id()
-    {
-        return Some(());
-    }
+    let decl_id = semantic_model
+        .get_db()
+        .get_reference_index()
+        .get_local_reference(&semantic_model.get_file_id())
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))?;
 
-    let Some(LuaSemanticDeclId::LuaDecl(decl_id)) = prefix_info.semantic_decl else {
-        return Some(());
-    };
-    // 必须为 local 声明
     let decl = semantic_model
         .get_db()
         .get_decl_index()
@@ -154,6 +146,17 @@ fn check_export_index_expr(
         .get_property_index()
         .get_property(&decl_id.into())?;
     if property.export().is_none() {
+        return Some(());
+    }
+
+    let prefix_typ = semantic_model.infer_expr(prefix_expr.clone()).ok()?;
+    let LuaType::TableConst(table_const) = &prefix_typ else {
+        return Some(());
+    };
+
+    // 不是导入表, 且定义位于当前文件中, 则尝试检查本地表.
+    if code != DiagnosticCode::UndefinedField && table_const.file_id != semantic_model.get_file_id()
+    {
         return Some(());
     }
 
@@ -397,32 +400,37 @@ fn module_source_declares_exported_key(
 
 fn check_require_table_const_with_export<'a>(
     semantic_model: &'a SemanticModel,
-    index_expr: &LuaIndexExpr,
+    prefix_expr: &LuaExpr,
 ) -> Option<&'a ModuleInfo> {
-    // 获取前缀表达式的语义信息
-    let prefix_expr = index_expr.get_prefix_expr()?;
-    if let Some(call_expr) = LuaCallExpr::cast(prefix_expr.syntax().clone()) {
-        let module_info = parse_require_expr_module_info(semantic_model, &call_expr)?;
+    if let LuaExpr::CallExpr(call_expr) = prefix_expr {
+        let module_info = parse_require_expr_module_info(semantic_model, call_expr)?;
         if module_info.is_export(semantic_model.get_db()) {
             return Some(module_info);
         }
+        return None;
     }
 
-    let semantic_decl_id = semantic_model.find_decl(
-        prefix_expr.syntax().clone().into(),
-        SemanticDeclLevel::NoTrace,
-    )?;
-    // 检查是否是声明引用
-    let decl_id = match semantic_decl_id {
-        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id,
-        _ => return None,
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return None;
     };
+
+    let decl_id = semantic_model
+        .get_db()
+        .get_reference_index()
+        .get_local_reference(&semantic_model.get_file_id())
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))?;
 
     // 获取声明
     let decl = semantic_model
         .get_db()
         .get_decl_index()
         .get_decl(&decl_id)?;
+    if decl
+        .get_value_syntax_id()
+        .is_none_or(|syntax_id| syntax_id.get_kind() != LuaSyntaxKind::RequireCallExpr)
+    {
+        return None;
+    }
 
     let module_info = parse_require_module_info(semantic_model, &decl)?;
     if module_info.is_export(semantic_model.get_db()) {
