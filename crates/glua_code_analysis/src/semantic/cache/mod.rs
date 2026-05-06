@@ -2,13 +2,14 @@ mod cache_options;
 
 pub use cache_options::{CacheOptions, LuaAnalysisPhase};
 use glua_parser::LuaSyntaxId;
+use rowan::TextRange;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use crate::{
-    FileId, FlowId, GmodRealm, LuaFunctionType, LuaSemanticDeclId,
+    FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaSemanticDeclId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::infer::{InferFailReason, VarRefId},
 };
@@ -36,8 +37,10 @@ pub struct LuaInferCache {
     pub expr_cache: HashMap<LuaSyntaxId, CacheEntry<LuaType>>,
     pub call_cache:
         HashMap<(LuaSyntaxId, Option<usize>, LuaType), CacheEntry<Arc<LuaFunctionType>>>,
-    pub flow_node_cache: HashMap<(VarRefId, FlowId, GmodRealm), CacheEntry<LuaType>>,
+    pub call_arg_types_cache: HashMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
+    pub flow_node_cache: HashMap<VarRefId, HashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>>,
     pub flow_query_realm: Option<GmodRealm>,
+    pub flow_node_realm_cache: HashMap<FlowId, GmodRealm>,
     pub index_ref_origin_type_cache: HashMap<VarRefId, CacheEntry<LuaType>>,
     pub expr_var_ref_id_cache: HashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
@@ -50,14 +53,12 @@ pub struct LuaInferCache {
     /// Cache for `find_decl` results so that multiple diagnostic checkers
     /// processing the same file don't redo the full member-resolution chain.
     pub decl_cache: HashMap<LuaSyntaxId, Option<LuaSemanticDeclId>>,
-    /// Tracks total flow nodes visited during flow analysis. When this exceeds
-    /// `flow_node_budget`, subsequent flow walks return the base type without
-    /// narrowing. This prevents pathologically large files from dominating
-    /// diagnostic time.
+    /// Cache for resolved generic-for variable types. For `pairs` loops over
+    /// templated tables, each use of the loop value can otherwise re-run the
+    /// full iterator inference from the enclosing `for` statement.
+    pub for_range_iter_var_type_cache: HashMap<LuaDeclId, CacheEntry<LuaType>>,
+    /// Tracks total flow nodes visited during flow analysis for profiling.
     pub flow_nodes_visited: u32,
-    /// Maximum number of flow nodes to visit before skipping narrowing.
-    /// 0 means unlimited.
-    pub flow_node_budget: u32,
     // Diagnostic profiling counters (zero-cost when not read)
     pub prof_infer_expr_calls: u32,
     pub prof_infer_expr_hits: u32,
@@ -81,8 +82,10 @@ impl LuaInferCache {
             config,
             expr_cache: HashMap::new(),
             call_cache: HashMap::new(),
+            call_arg_types_cache: HashMap::new(),
             flow_node_cache: HashMap::new(),
             flow_query_realm: None,
+            flow_node_realm_cache: HashMap::new(),
             index_ref_origin_type_cache: HashMap::new(),
             expr_var_ref_id_cache: HashMap::new(),
             narrow_by_literal_stop_position_cache: HashSet::new(),
@@ -90,8 +93,8 @@ impl LuaInferCache {
             pending_str_tpl_type_decls: Vec::new(),
             self_type_cache: HashMap::new(),
             decl_cache: HashMap::new(),
+            for_range_iter_var_type_cache: HashMap::new(),
             flow_nodes_visited: 0,
-            flow_node_budget: 0,
             prof_infer_expr_calls: 0,
             prof_infer_expr_hits: 0,
             prof_flow_calls: 0,
@@ -150,14 +153,17 @@ impl LuaInferCache {
     pub fn clear(&mut self) {
         self.expr_cache.clear();
         self.call_cache.clear();
+        self.call_arg_types_cache.clear();
         self.flow_node_cache.clear();
         self.flow_query_realm = None;
+        self.flow_node_realm_cache.clear();
         self.index_ref_origin_type_cache.clear();
         self.expr_var_ref_id_cache.clear();
         self.scoped_scripted_global_cache = None;
         self.pending_str_tpl_type_decls.clear();
         self.self_type_cache.clear();
         self.decl_cache.clear();
+        self.for_range_iter_var_type_cache.clear();
         self.flow_nodes_visited = 0;
     }
 
@@ -166,8 +172,34 @@ impl LuaInferCache {
         self.clear();
     }
 
-    /// Returns true if the flow analysis budget has been exhausted.
-    pub fn flow_budget_exhausted(&self) -> bool {
-        self.flow_node_budget > 0 && self.flow_nodes_visited >= self.flow_node_budget
+    pub fn get_flow_cache(
+        &self,
+        var_ref_id: &VarRefId,
+        flow_id: FlowId,
+        query_realm: GmodRealm,
+    ) -> Option<&CacheEntry<LuaType>> {
+        self.flow_node_cache
+            .get(var_ref_id)
+            .and_then(|by_flow| by_flow.get(&(flow_id, query_realm)))
+    }
+
+    pub fn set_flow_cache(
+        &mut self,
+        var_ref_id: &VarRefId,
+        flow_id: FlowId,
+        query_realm: GmodRealm,
+        entry: CacheEntry<LuaType>,
+    ) {
+        self.flow_node_cache
+            .entry(var_ref_id.clone())
+            .or_default()
+            .insert((flow_id, query_realm), entry);
+    }
+
+    pub fn flow_cache_entry_count(&self) -> usize {
+        self.flow_node_cache
+            .values()
+            .map(|entries| entries.len())
+            .sum()
     }
 }
