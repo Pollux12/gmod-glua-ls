@@ -292,6 +292,49 @@ mod test {
     }
 
     #[test]
+    fn test_dynamic_index_on_empty_table_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local tbl = {}
+                local id = 1
+                local _ = tbl[id]
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_gamemode_pairs_copy_fields_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class GM
+                ---@type GM
+                GAMEMODE = {}
+
+                local source = {
+                    soundA = "ambient/water/drip1.wav",
+                    soundB = "ambient/water/drip2.wav",
+                }
+
+                for key, val in pairs(source) do
+                    GAMEMODE[key] = val
+                end
+
+                local _a = GAMEMODE.soundA
+                local _b = GAMEMODE.soundB
+            "#
+        ));
+    }
+
+    #[test]
     fn test_lua_string_indexing_still_reports() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
@@ -1944,6 +1987,136 @@ mod test {
                 local obj = {}
                 if obj.unknownField then
                     print("exists")
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_constructor_field_visible_to_sibling_method_with_index() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestLocationInfo
+                ---@field Name string
+
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                ---@param loc_id integer
+                ---@param loc_info TestLocationInfo
+                function LOCATION:Init(loc_id, loc_info)
+                    local instance = loc_info
+                    setmetatable(instance, self)
+                    instance._OriginalName = loc_info.Name
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._OriginalName
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_constructor_field_without_index_still_undefined() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestLocationInfoNoIndex
+                ---@field Name string
+
+                local LOCATION = {}
+
+                ---@param loc_id integer
+                ---@param loc_info TestLocationInfoNoIndex
+                function LOCATION:Init(loc_id, loc_info)
+                    local instance = loc_info
+                    setmetatable(instance, self)
+                    instance._OriginalName = loc_info.Name
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._OriginalName
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_constructor_field_shadowed_instance_stays_undefined() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                function LOCATION:Init()
+                    local instance = {}
+                    do
+                        local instance = {}
+                        setmetatable(instance, self)
+                    end
+
+                    instance._OriginalName = true
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._OriginalName
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_constructor_field_nested_closure_stays_undefined() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                function LOCATION:Init()
+                    local instance = {}
+
+                    local function attach()
+                        setmetatable(instance, self)
+                    end
+
+                    attach()
+                    instance._OriginalName = true
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._OriginalName
                 end
             "#
         ));

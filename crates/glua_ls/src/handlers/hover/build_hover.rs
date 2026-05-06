@@ -11,7 +11,7 @@ use glua_parser::{
     LuaSyntaxToken, LuaTableExpr, LuaTableField, PathTrait,
 };
 use lsp_types::{Hover, HoverContents, MarkedString, MarkupContent};
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 use crate::handlers::hover::function::{build_function_hover, is_function};
 use crate::handlers::hover::humanize_type_decl::build_type_decl_hover;
@@ -110,14 +110,26 @@ fn build_dynamic_field_hover_without_property(
     let prefix_type = semantic_model
         .infer_expr(index_expr.get_prefix_expr()?)
         .ok()?;
-    if !is_dynamic_field_for_type(db, &prefix_type, &field_name) {
+    if !is_dynamic_field_for_type(
+        db,
+        semantic_model,
+        &prefix_type,
+        &field_name,
+        index_expr.get_position(),
+    ) {
         return None;
     }
 
-    let type_humanize_text = if typ.is_const() {
-        hover_const_type(db, typ)
+    let hover_type = if matches!(typ, LuaType::Nil | LuaType::Unknown) {
+        LuaType::Any
     } else {
-        humanize_type(db, typ, RenderLevel::Simple)
+        typ.clone()
+    };
+
+    let type_humanize_text = if hover_type.is_const() {
+        hover_const_type(db, &hover_type)
+    } else {
+        humanize_type(db, &hover_type, RenderLevel::Simple)
     };
 
     Some(format!(
@@ -126,32 +138,26 @@ fn build_dynamic_field_hover_without_property(
     ))
 }
 
-fn is_dynamic_field_for_type(db: &DbIndex, typ: &LuaType, field_name: &str) -> bool {
+fn is_dynamic_field_for_type(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    typ: &LuaType,
+    field_name: &str,
+    position_offset: TextSize,
+) -> bool {
     let emmyrc = db.get_emmyrc();
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
     }
 
-    let index = db.get_dynamic_field_index();
-    has_dynamic_field_for_type(index, typ, field_name)
-}
-
-fn has_dynamic_field_for_type(
-    index: &glua_code_analysis::DynamicFieldIndex,
-    typ: &LuaType,
-    field_name: &str,
-) -> bool {
-    match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => index.has_field(id, field_name),
-        LuaType::Instance(instance) => {
-            has_dynamic_field_for_type(index, instance.get_base(), field_name)
-        }
-        LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
-            .any(|member_type| has_dynamic_field_for_type(index, member_type, field_name)),
-        _ => false,
-    }
+    let key = LuaMemberKey::Name(field_name.into());
+    semantic_model
+        .get_member_info_with_key_at_offset(typ, key, true, position_offset)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| member.property_owner_id.is_none())
+        })
 }
 
 pub fn build_hover_content_for_completion<'a>(
@@ -791,12 +797,43 @@ fn adjust_semantic_decls(
 ) -> Option<()> {
     if let Some(pos) = semantic_decls
         .iter()
-        .position(|(_, typ)| current_type == typ)
+        .position(|(decl, typ)| decl == current_semantic_decl_id && current_type == typ)
     {
         let item = semantic_decls.remove(pos);
         semantic_decls.push(item);
         return Some(());
     }
+
+    if let Some(pos) = semantic_decls
+        .iter()
+        .position(|(_, typ)| current_type == typ)
+    {
+        let should_preserve_current_member = matches!(
+            current_semantic_decl_id,
+            LuaSemanticDeclId::Member(member_id)
+                if builder
+                    .semantic_model
+                    .get_db()
+                    .get_member_index()
+                    .get_member(member_id)
+                    .is_some_and(|member| {
+                        member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
+                    })
+        ) && semantic_decls
+            .get(pos)
+            .is_some_and(|(decl, _)| decl != current_semantic_decl_id);
+
+        if should_preserve_current_member
+            && has_add_to_semantic_decls(builder, current_semantic_decl_id).unwrap_or(true)
+        {
+            semantic_decls.push((current_semantic_decl_id.clone(), current_type.clone()));
+        } else {
+            let item = semantic_decls.remove(pos);
+            semantic_decls.push(item);
+        }
+        return Some(());
+    }
+
     // semantic_decls 是追溯最初定义的结果, 不包含当前内容
     let current_len = semantic_decls.len();
     if current_len == 0 {

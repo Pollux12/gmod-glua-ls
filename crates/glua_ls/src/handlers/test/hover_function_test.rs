@@ -1177,6 +1177,61 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_member_alias_preserves_alias_identity() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---Returns the entity class name.
+                ---@return string class
+                function Entity:GetClass()
+                end
+
+                ---@generic T: table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName)
+                end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local ENTITY = FindMetaTable("Entity")
+                ENTITY.Te<??>st1Alias = ENTITY.GetClass
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("Test1Alias"),
+            "expected hover to keep alias member identity, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("GetClass"),
+            "expected hover to retain aliased method context, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Returns the entity class name."),
+            "expected hover to preserve aliased docs, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_duplicate_library_annotated_global_preserves_type_and_docs() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
         let library_root = ws.virtual_url_generator.base.join("library");
@@ -1223,7 +1278,9 @@ mod tests {
             markup.value
         );
         assert!(
-            markup.value.contains("Contains the version number of GMod."),
+            markup
+                .value
+                .contains("Contains the version number of GMod."),
             "expected annotated global docs in hover, got: {}",
             markup.value
         );

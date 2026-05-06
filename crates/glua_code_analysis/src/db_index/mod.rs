@@ -27,7 +27,7 @@ pub use accessor_func::*;
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
-pub use dynamic_field::DynamicFieldIndex;
+pub use dynamic_field::{DynamicFieldIndex, DynamicFieldOwner};
 pub use flow::*;
 pub use global::{GlobalId, LuaGlobalIndex};
 pub use gmod_class::*;

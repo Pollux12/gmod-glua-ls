@@ -44,6 +44,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_initialized_assignment_chain_does_not_report_assign_type_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                WepHolster = {}
+                WepHolster.defData = {}
+                WepHolster.defData["weapon_pistol"] = {}
+                WepHolster.defData["weapon_pistol"].Model = "models/weapons/w_pistol.mdl"
+                WepHolster.defData["weapon_pistol"].BoneOffset = {
+                    Vector(1, 2, 3),
+                    Angle(4, 5, 6),
+                }
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_inferred_table_literal_fields_can_widen_after_later_assignments() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@class Vector
+
+                ---@return Vector
+                local function Vector()
+                end
+
+                local cfg = {
+                    color = "white",
+                    enabled = false,
+                }
+
+                cfg.color = Vector()
+                cfg.enabled = { reason = "starting up" }
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_default_initialized_assignment_chain_skips_inferred_member_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local t = {}
+                t.x = {}
+                t.x.y = 1
+                t.x.y = "x"
+            "#
+        ));
+    }
+
     // #[test]
     // fn test_3() {
     //     let mut ws = VirtualWorkspace::new();
@@ -1413,6 +1469,35 @@ return t
                 selfTbl.spin = 0
                 selfTbl.tilt = 0
             end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_find_meta_table_member_alias_does_not_report_assign_type_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@return string
+            function Entity:GetClass()
+            end
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return T
+            function FindMetaTable(metaName)
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local ENTITY = FindMetaTable("Entity")
+            ENTITY.Test1Alias = ENTITY.GetClass
             "#
         ));
     }

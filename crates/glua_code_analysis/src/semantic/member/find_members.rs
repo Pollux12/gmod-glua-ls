@@ -230,7 +230,10 @@ fn find_members_guard(
     match &prefix_type {
         LuaType::TableConst(id) => {
             let member_owner = LuaMemberOwner::Element(id.clone());
-            find_owner_members(db, ctx, &member_owner, filter)
+            let mut members =
+                find_owner_members(db, ctx, &member_owner, filter).unwrap_or_default();
+            append_dynamic_fields_for_table(db, ctx, id, &mut members, filter);
+            Some(members)
         }
         LuaType::TableGeneric(table_type) => {
             find_table_generic_members(db, ctx, table_type, filter)
@@ -844,18 +847,81 @@ fn append_dynamic_fields_for_type(
     let index = db.get_dynamic_field_index();
     let mut field_names = if emmyrc.gmod.dynamic_fields_global {
         index
-            .get_fields(type_decl_id)
+            .get_fields(&crate::DynamicFieldOwner::Type(type_decl_id.clone()))
             .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default()
     } else if let Some(file_id) = ctx.file_id() {
         index
-            .get_fields_in_file(type_decl_id, file_id)
+            .get_fields_in_file(
+                &crate::DynamicFieldOwner::Type(type_decl_id.clone()),
+                file_id,
+            )
             .into_iter()
             .cloned()
             .collect::<Vec<_>>()
     } else {
         index
-            .get_fields(type_decl_id)
+            .get_fields(&crate::DynamicFieldOwner::Type(type_decl_id.clone()))
+            .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+
+    field_names.sort_unstable();
+
+    for field_name in field_names {
+        let member_key = LuaMemberKey::Name(field_name);
+        if !should_include_member(&member_key, filter) {
+            continue;
+        }
+
+        if members.iter().any(|member| member.key == member_key) {
+            continue;
+        }
+
+        members.push(LuaMemberInfo {
+            property_owner_id: None,
+            key: member_key,
+            typ: LuaType::Any,
+            feature: None,
+            overload_index: None,
+        });
+
+        if should_stop_collecting(members.len(), filter) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn append_dynamic_fields_for_table(
+    db: &DbIndex,
+    ctx: &FindMembersContext,
+    table_range: &crate::InFiled<rowan::TextRange>,
+    members: &mut Vec<LuaMemberInfo>,
+    filter: &FindMemberFilter,
+) -> bool {
+    let emmyrc = db.get_emmyrc();
+    if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
+        return false;
+    }
+
+    let index = db.get_dynamic_field_index();
+    let owner = crate::DynamicFieldOwner::Table(table_range.clone());
+    let mut field_names = if emmyrc.gmod.dynamic_fields_global {
+        index
+            .get_fields(&owner)
+            .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    } else if let Some(file_id) = ctx.file_id() {
+        index
+            .get_fields_in_file(&owner, file_id)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        index
+            .get_fields(&owner)
             .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default()
     };

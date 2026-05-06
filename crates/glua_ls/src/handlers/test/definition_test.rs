@@ -705,6 +705,97 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_inferred_dynamic_field_definition_for_metatable_instance() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_definition(
+            r#"
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                function LOCATION:Init()
+                    local instance = {}
+                    setmetatable(instance, self)
+                    instance._OriginalName = true
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._Origi<??>nalName
+                end
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 7,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_inferred_dynamic_field_definition_respects_file_scope() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = false;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "assign.lua",
+            "---@class DynGotoScoped.Entity\n---@type DynGotoScoped.Entity\nlocal ent\nent.testVar = true\n",
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@type DynGotoScoped.Entity
+                local ent2
+                ent2.te<??>stVar
+            "#,
+        )?;
+        let file_id = ws.def_file("use.lua", &content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position);
+        verify_that!(result, none())?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_inferred_dynamic_field_definition_for_tableof() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_definition(
+            r#"
+                ---@class TblDef.Entity
+                local TblDef = {}
+
+                ---@return tableof<self>
+                function TblDef:GetTable() end
+
+                function TblDef:Init()
+                    local tbl = self:GetTable()
+                    tbl.customData = true
+                    return tbl.cus<??>tomData
+                end
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 9,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_prefers_same_file_scripted_class_field_definition() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

@@ -3542,6 +3542,56 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_dynamic_field_completion_for_metatable_instance() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                function LOCATION:Init()
+                    local instance = {}
+                    setmetatable(instance, self)
+                    instance._OriginalName = true
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self.<??>
+                end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let completion_result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+
+        let completion_items = match completion_result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let completion_labels = completion_items
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+
+        verify_that!(&completion_labels, contains(eq("_OriginalName")))?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_plugin_function_decl_completion_uses_gm_fallback_with_param_detail() -> Result<()>
     {
         let mut ws = ProviderVirtualWorkspace::new();

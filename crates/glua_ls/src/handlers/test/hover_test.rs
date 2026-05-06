@@ -1447,6 +1447,118 @@ mod tests {
         Ok(())
     }
 
+    #[gtest]
+    fn test_hover_dynamic_field_for_metatable_instance() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        check!(ws.check_hover(
+            r#"
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                function LOCATION:Init()
+                    local instance = {}
+                    setmetatable(instance, self)
+                    instance._OriginalName = true
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._Origi<??>nalName
+                end
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(infer) _OriginalName: any\n```".to_string(),
+            },
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_field_respects_file_scope() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = false;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "assign.lua",
+            "---@class HoverDynScoped.Entity\n---@type HoverDynScoped.Entity\nlocal ent\nent.testVar = true\n",
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@type HoverDynScoped.Entity
+                local ent2
+                local x = ent2.te<??>stVar
+            "#,
+        )?;
+        let file_id = ws.def_file("use.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+        assert!(
+            !markup.value.contains("(infer) testVar"),
+            "dynamic field hover should not leak across files when dynamic_fields_global=false, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_field_for_tableof() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class HoverTbl.Entity
+                local HoverTbl = {}
+
+                ---@return tableof<self>
+                function HoverTbl:GetTable() end
+
+                function HoverTbl:Init()
+                    local tbl = self:GetTable()
+                    tbl.customData = true
+                    return tbl.cus<??>tomData
+                end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+        assert!(
+            markup.value.contains("customData"),
+            "expected tableof dynamic field hover to resolve field name, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("HoverTbl.Entity"),
+            "expected tableof dynamic field hover to stay on class context, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
     /// Hovering the `function` keyword in a hook.Add callback should show the anonymous callback
     /// signature (e.g. `function(ply: Player, seat: Vehicle) -> boolean`) and NOT the generic
     /// "The function keyword is used to define a function..." keyword docs.

@@ -1651,6 +1651,67 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_panel_baseclass_calls_no_false_positive_diagnostics() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+        ws.enable_check(DiagnosticCode::MissingParameter);
+
+        ws.def(
+            r#"
+            ---@class DProgress
+            local DProgress = {}
+
+            function DProgress:Init()
+            end
+
+            ---@param width number
+            ---@param height number
+            function DProgress:PerformLayout(width, height)
+            end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/baseclass_panel.lua",
+            r#"
+            local PROGRESS = {}
+
+            function PROGRESS:Init()
+                self.BaseClass.Init(self)
+            end
+
+            function PROGRESS:PerformLayout(width, height)
+                self.BaseClass.PerformLayout(self, width, height)
+            end
+
+            vgui.Register("BaseClassProgress", PROGRESS, "DProgress")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let false_positive_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::NeedCheckNil,
+            DiagnosticCode::MissingParameter,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| !false_positive_codes.contains(&diag.code)),
+            "unexpected BaseClass diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vgui_register_not_captured_when_gmod_disabled() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

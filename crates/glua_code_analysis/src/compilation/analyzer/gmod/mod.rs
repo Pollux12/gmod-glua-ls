@@ -3219,6 +3219,7 @@ fn synthesize_panel_class(
             db.get_type_index_mut()
                 .add_super_type(class_decl_id.clone(), file_id, super_type);
         }
+        synthesize_panel_baseclass_member(db, file_id, &class_decl_id, base_name, call);
     }
 
     // Bind the table variable to the panel class
@@ -3290,6 +3291,37 @@ fn synthesize_panel_class(
             }
         }
     }
+}
+
+fn synthesize_panel_baseclass_member(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    base_name: &str,
+    call: &GmodScriptedClassCallMetadata,
+) {
+    let owner = LuaMemberOwner::Type(class_decl_id.clone());
+    let member_key = LuaMemberKey::Name("BaseClass".into());
+    if db
+        .get_member_index()
+        .get_member_item(&owner, &member_key)
+        .is_some()
+    {
+        return;
+    }
+
+    let syntax_id = call
+        .args
+        .get(2)
+        .map(|arg| arg.syntax_id)
+        .unwrap_or(call.syntax_id);
+    let member_id = LuaMemberId::new(syntax_id, file_id);
+    let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
+    db.get_member_index_mut().add_member(owner, member);
+    db.get_type_index_mut().bind_type(
+        member_id.into(),
+        LuaTypeCache::DocType(LuaType::Ref(LuaTypeDeclId::global(base_name))),
+    );
 }
 
 /// Resolve AccessorFunc force type argument to a LuaType.
