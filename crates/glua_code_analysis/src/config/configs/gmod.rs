@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::Path;
 
 use schemars::JsonSchema;
@@ -1090,6 +1091,212 @@ impl EmmyrcGmodScriptedClassScopes {
             class_name,
         })
     }
+
+    pub(crate) fn scan_scripted_class_scope_files<'a, T>(
+        &self,
+        files: impl IntoIterator<Item = (T, &'a Path)>,
+    ) -> (HashSet<T>, HashMap<T, ResolvedGmodScriptedClassMatch>)
+    where
+        T: Copy + Eq + Hash,
+    {
+        let definitions = self.resolved_definitions();
+        if definitions.is_empty() {
+            return (HashSet::new(), HashMap::new());
+        }
+
+        let compiled_definitions = compile_scope_definitions(&definitions);
+        let mut scope_files = HashSet::new();
+        let mut matches = HashMap::new();
+        for (file_id, file_path) in files {
+            let candidate_paths = build_scope_candidate_paths(file_path);
+            if !compiled_definitions.iter().any(|definition| {
+                matches_compiled_scope_patterns(
+                    &candidate_paths,
+                    &definition.include,
+                    &definition.exclude,
+                )
+            }) {
+                continue;
+            }
+
+            scope_files.insert(file_id);
+            if let Some(scope_match) = detect_class_for_path_with_compiled_definitions(
+                file_path,
+                &candidate_paths,
+                &compiled_definitions,
+            ) {
+                matches.insert(file_id, scope_match);
+            }
+        }
+
+        (scope_files, matches)
+    }
+}
+
+struct CompiledScopeDefinition<'a> {
+    definition: &'a ResolvedGmodScriptedClassDefinition,
+    include: ScopePatternSet<'a>,
+    exclude: ScopePatternSet<'a>,
+}
+
+enum ScopePatternSet<'a> {
+    Empty,
+    Valid(wax::Any<'a>),
+    Invalid,
+}
+
+fn compile_scope_definitions(
+    definitions: &[ResolvedGmodScriptedClassDefinition],
+) -> Vec<CompiledScopeDefinition<'_>> {
+    definitions
+        .iter()
+        .map(|definition| CompiledScopeDefinition {
+            definition,
+            include: compile_scope_patterns(&definition.include, "include"),
+            exclude: compile_scope_patterns(&definition.exclude, "exclude"),
+        })
+        .collect()
+}
+
+fn compile_scope_patterns<'a>(patterns: &'a [String], kind: &str) -> ScopePatternSet<'a> {
+    if patterns.is_empty() {
+        return ScopePatternSet::Empty;
+    }
+
+    match wax::any(patterns.iter().map(String::as_str)) {
+        Ok(glob) => ScopePatternSet::Valid(glob),
+        Err(err) => {
+            log::warn!("Invalid gmod.scriptedClassScopes.{kind} pattern: {err}");
+            ScopePatternSet::Invalid
+        }
+    }
+}
+
+fn detect_class_for_path_with_compiled_definitions(
+    file_path: &Path,
+    candidate_paths: &[String],
+    definitions: &[CompiledScopeDefinition],
+) -> Option<ResolvedGmodScriptedClassMatch> {
+    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
+    let original_segments = normalized_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let lower_segments = normalized_path
+        .to_ascii_lowercase()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lower_segments.is_empty() {
+        return None;
+    }
+
+    let mut best_match: Option<(&ResolvedGmodScriptedClassDefinition, usize, usize)> = None;
+    for definition in definitions {
+        if !matches_compiled_scope_patterns(
+            candidate_paths,
+            &definition.include,
+            &definition.exclude,
+        ) {
+            continue;
+        }
+
+        let rule_len = definition.definition.path.len();
+        if rule_len == 0 || lower_segments.len() < rule_len {
+            continue;
+        }
+
+        for start_idx in (0..=lower_segments.len() - rule_len).rev() {
+            let mut matched = true;
+            for (offset, rule_segment) in definition.definition.path.iter().enumerate() {
+                if lower_segments[start_idx + offset] != rule_segment.to_ascii_lowercase() {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if !matched {
+                continue;
+            }
+
+            let end_idx = start_idx + rule_len - 1;
+            let replace_best = match best_match {
+                None => true,
+                Some((_, best_end_idx, best_rule_len)) => {
+                    end_idx > best_end_idx || (end_idx == best_end_idx && rule_len > best_rule_len)
+                }
+            };
+            if replace_best {
+                best_match = Some((definition.definition, end_idx, rule_len));
+            }
+
+            break;
+        }
+    }
+
+    let (definition, best_end_idx, _) = best_match?;
+    let class_idx = best_end_idx + 1;
+    if class_idx >= lower_segments.len() {
+        return None;
+    }
+
+    let class_name = if class_idx == original_segments.len() - 1 {
+        original_segments[class_idx]
+            .strip_suffix(".lua")
+            .unwrap_or(original_segments[class_idx].as_str())
+            .to_string()
+    } else {
+        original_segments[class_idx].clone()
+    };
+    if class_name.is_empty() {
+        return None;
+    }
+
+    let class_name = match definition.class_name_prefix.as_deref() {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}{class_name}"),
+        _ => class_name,
+    };
+
+    Some(ResolvedGmodScriptedClassMatch {
+        definition: definition.clone(),
+        class_name,
+    })
+}
+
+fn matches_compiled_scope_patterns(
+    candidate_paths: &[String],
+    include_patterns: &ScopePatternSet<'_>,
+    exclude_patterns: &ScopePatternSet<'_>,
+) -> bool {
+    match include_patterns {
+        ScopePatternSet::Empty => {}
+        ScopePatternSet::Valid(include_set) => {
+            if !candidate_paths
+                .iter()
+                .any(|path| include_set.is_match(Path::new(path)))
+            {
+                return false;
+            }
+        }
+        ScopePatternSet::Invalid => return true,
+    }
+
+    match exclude_patterns {
+        ScopePatternSet::Empty => {}
+        ScopePatternSet::Valid(exclude_set) => {
+            if candidate_paths
+                .iter()
+                .any(|path| exclude_set.is_match(Path::new(path)))
+            {
+                return false;
+            }
+        }
+        ScopePatternSet::Invalid => return false,
+    }
+
+    true
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]

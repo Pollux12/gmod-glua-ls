@@ -16,8 +16,8 @@ use std::{
 };
 
 use crate::{
-    AsyncState, Emmyrc, FileId, InFiled, InferFailReason, LuaFunctionType, LuaMember,
-    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, WorkspaceId,
+    AsyncState, Emmyrc, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaFunctionType,
+    LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, WorkspaceId,
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
 };
@@ -229,7 +229,8 @@ pub struct AnalyzeContext {
     #[allow(unused)]
     config: Arc<Emmyrc>,
     metas: HashSet<FileId>,
-    scripted_scope_files: Option<HashSet<FileId>>,
+    scripted_scope_files: Option<Arc<HashSet<FileId>>>,
+    scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
     infer_manager: InferCacheManager,
     pub workspace_id: Option<WorkspaceId>,
@@ -242,6 +243,7 @@ impl AnalyzeContext {
             config: emmyrc,
             metas: HashSet::new(),
             scripted_scope_files: None,
+            scripted_scope_infos: None,
             unresolves: Vec::new(),
             infer_manager: InferCacheManager::new(),
             workspace_id: None,
@@ -260,17 +262,70 @@ impl AnalyzeContext {
         self.unresolves.push((un_resolve, reason));
     }
 
-    pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> &HashSet<FileId> {
-        if self.scripted_scope_files.is_none() {
+    pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> Arc<HashSet<FileId>> {
+        self.ensure_scripted_scope_cache(db);
+
+        self.scripted_scope_files
+            .as_ref()
+            .expect("set above")
+            .clone()
+    }
+
+    pub fn get_or_compute_scripted_scope_infos(
+        &mut self,
+        db: &DbIndex,
+    ) -> Arc<HashMap<FileId, GmodScopedClassInfo>> {
+        self.ensure_scripted_scope_cache(db);
+
+        self.scripted_scope_infos
+            .as_ref()
+            .expect("set above")
+            .clone()
+    }
+
+    fn ensure_scripted_scope_cache(&mut self, db: &DbIndex) {
+        if self.scripted_scope_files.is_some() && self.scripted_scope_infos.is_some() {
+            return;
+        }
+
+        let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+        if scopes.resolved_definitions().is_empty() {
             let file_ids = self
                 .tree_list
                 .iter()
                 .map(|in_filed_tree| in_filed_tree.file_id)
-                .collect::<Vec<_>>();
-            self.scripted_scope_files =
-                Some(lua::call::compute_scripted_class_files(db, &file_ids));
+                .collect::<HashSet<_>>();
+            self.scripted_scope_files = Some(Arc::new(file_ids));
+            self.scripted_scope_infos = Some(Arc::new(HashMap::new()));
+            return;
         }
 
-        self.scripted_scope_files.as_ref().expect("set above")
+        let file_paths = self
+            .tree_list
+            .iter()
+            .filter_map(|in_filed_tree| {
+                db.get_vfs()
+                    .get_file_path(&in_filed_tree.file_id)
+                    .map(|path| (in_filed_tree.file_id, path.as_path()))
+            })
+            .collect::<Vec<_>>();
+        let (scripted_scope_files, scoped_matches) =
+            scopes.scan_scripted_class_scope_files(file_paths);
+        let scripted_scope_infos = scoped_matches
+            .into_iter()
+            .map(|(file_id, scope_match)| {
+                (
+                    file_id,
+                    GmodScopedClassInfo {
+                        class_name: scope_match.class_name,
+                        global_name: scope_match.definition.class_global,
+                        class_name_prefix: scope_match.definition.class_name_prefix,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        self.scripted_scope_files = Some(Arc::new(scripted_scope_files));
+        self.scripted_scope_infos = Some(Arc::new(scripted_scope_infos));
     }
 }
