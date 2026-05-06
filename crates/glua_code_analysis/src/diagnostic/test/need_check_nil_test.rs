@@ -18,7 +18,9 @@ mod test {
             .into_iter()
             .filter(|diagnostic| {
                 diagnostic.code
-                    == Some(NumberOrString::String(diagnostic_code.get_name().to_string()))
+                    == Some(NumberOrString::String(
+                        diagnostic_code.get_name().to_string(),
+                    ))
             })
             .collect()
     }
@@ -363,6 +365,40 @@ mod test {
         let has_need_check_nil = !ws.check_code_for(DiagnosticCode::NeedCheckNil, code);
         let has_unchecked_nil_access = !ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code);
         assert_that!(has_need_check_nil || has_unchecked_nil_access, eq(true));
+    }
+
+    #[gtest]
+    fn test_assignment_chain_initialized_tables_do_not_require_nil_check() {
+        let mut ws = VirtualWorkspace::new();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                WepHolster = {}
+                WepHolster.defData = {}
+                WepHolster.defData["weapon_pistol"] = {}
+                WepHolster.defData["weapon_pistol"].Model = "models/weapons/W_pistol.mdl"
+                WepHolster.defData["weapon_pistol"].BoneOffset = { Vector(0, 0, 0), Angle(0, 0, 0) }
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_nullable_assignment_lhs_still_requires_nil_check() {
+        let mut ws = VirtualWorkspace::new();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@type table?
+                local maybe
+                maybe.foo = 1
+                "#,
+            ),
+            eq(false)
+        );
     }
 
     #[gtest]
@@ -787,11 +823,8 @@ mod test {
             test.meow()
         "#;
 
-        let need_check_nil_diagnostics = diagnostics_for_code(
-            &mut ws,
-            DiagnosticCode::NeedCheckNil,
-            code,
-        );
+        let need_check_nil_diagnostics =
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
 
         assert_that!(
             need_check_nil_diagnostics.len(),
@@ -808,16 +841,15 @@ mod test {
             test.meow()
         "#;
 
-        let diagnostics = diagnostics_for_code(
-            &mut ws,
-            DiagnosticCode::UncheckedNilAccess,
-            code,
-        );
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
 
         assert_that!(diagnostics.len(), eq(1_usize));
 
         let diagnostic = &diagnostics[0];
-        assert_that!(diagnostic.message.as_str(), contains_substring("may be nil"));
+        assert_that!(
+            diagnostic.message.as_str(),
+            contains_substring("may be nil")
+        );
         assert_that!(
             diagnostic.range.end.character - diagnostic.range.start.character,
             eq(4_u32),
@@ -865,7 +897,10 @@ mod test {
             ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
             eq(true)
         );
-        assert_that!(ws.check_code_for(DiagnosticCode::NeedCheckNil, code), eq(true));
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
     }
 
     #[gtest]

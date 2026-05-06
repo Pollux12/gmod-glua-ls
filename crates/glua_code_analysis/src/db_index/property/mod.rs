@@ -258,6 +258,18 @@ impl LuaPropertyIndex {
             .get(owner_id)
             .and_then(|id| self.properties.get(id))
     }
+
+    pub fn iter_owner_properties(
+        &self,
+    ) -> impl Iterator<Item = (&LuaSemanticDeclId, &LuaCommonProperty)> {
+        self.property_owners_map
+            .iter()
+            .filter_map(|(owner_id, property_id)| {
+                self.properties
+                    .get(property_id)
+                    .map(|property| (owner_id, property))
+            })
+    }
 }
 
 impl LuaIndex for LuaPropertyIndex {

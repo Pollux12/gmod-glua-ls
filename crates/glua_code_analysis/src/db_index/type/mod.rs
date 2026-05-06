@@ -364,6 +364,10 @@ impl LuaTypeIndex {
     pub fn get_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
         self.types.get(owner)
     }
+
+    pub fn iter_type_caches(&self) -> impl Iterator<Item = (&LuaTypeOwner, &LuaTypeCache)> {
+        self.types.iter()
+    }
 }
 
 impl LuaIndex for LuaTypeIndex {

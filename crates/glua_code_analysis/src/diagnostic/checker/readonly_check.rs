@@ -1,9 +1,13 @@
-use glua_parser::{LuaAssignStat, LuaAst, LuaAstNode, LuaExpr, LuaSyntaxId, LuaSyntaxKind};
+use std::collections::HashSet;
+
+use glua_parser::{
+    LuaAssignStat, LuaAst, LuaAstNode, LuaExpr, LuaIndexKey, LuaSyntaxId, LuaSyntaxKind,
+};
 use rowan::{NodeOrToken, TextRange};
 
 use crate::{
-    DiagnosticCode, LuaDeclId, LuaMemberId, LuaSemanticDeclId, PropertyDeclFeature,
-    SemanticDeclLevel, SemanticModel,
+    DiagnosticCode, LuaCommonProperty, LuaDeclId, LuaMemberId, LuaSemanticDeclId,
+    PropertyDeclFeature, SemanticDeclLevel, SemanticModel,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -15,10 +19,15 @@ impl Checker for ReadOnlyChecker {
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
+        let candidates = ReadOnlyCandidates::new(context);
+        if candidates.is_empty() {
+            return;
+        }
+
         for ast_node in root.descendants::<LuaAst>() {
             match ast_node {
                 LuaAst::LuaAssignStat(assign_stat) => {
-                    check_assign_stat(context, semantic_model, &assign_stat);
+                    check_assign_stat(context, semantic_model, &assign_stat, &candidates);
                 }
                 // need check?
                 LuaAst::LuaFuncStat(_) => {}
@@ -28,6 +37,93 @@ impl Checker for ReadOnlyChecker {
             }
         }
     }
+}
+
+struct ReadOnlyCandidates {
+    names: HashSet<String>,
+}
+
+impl ReadOnlyCandidates {
+    fn new(context: &DiagnosticContext) -> Self {
+        let db = context.db;
+        let mut names = HashSet::new();
+        for (owner_id, property) in db.get_property_index().iter_owner_properties() {
+            if !property_can_report_readonly(property) {
+                continue;
+            }
+
+            match owner_id {
+                LuaSemanticDeclId::LuaDecl(decl_id) => {
+                    if let Some(decl) = db.get_decl_index().get_decl(decl_id) {
+                        names.insert(decl.get_name().to_string());
+                    }
+                }
+                LuaSemanticDeclId::Member(member_id) => {
+                    if let Some(member) = db.get_member_index().get_member(member_id)
+                        && let Some(name) = member.get_key().get_name()
+                    {
+                        names.insert(name.to_string());
+                    }
+                }
+                LuaSemanticDeclId::TypeDecl(type_decl_id) => {
+                    names.insert(type_decl_id.get_name().to_string());
+                    names.insert(type_decl_id.get_simple_name().to_string());
+                }
+                LuaSemanticDeclId::Signature(_) => {}
+            }
+        }
+
+        Self { names }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn should_check_expr(&self, expr: &LuaExpr) -> bool {
+        let mut current = expr.clone();
+        loop {
+            match current {
+                LuaExpr::NameExpr(name_expr) => {
+                    return name_expr
+                        .get_name_text()
+                        .is_some_and(|name| self.names.contains(name.as_ref() as &str));
+                }
+                LuaExpr::IndexExpr(index_expr) => {
+                    if let Some(index_key) = index_expr.get_index_key()
+                        && self.should_check_index_key(&index_key)
+                    {
+                        return true;
+                    }
+                    let Some(prefix) = index_expr.get_prefix_expr() else {
+                        return false;
+                    };
+                    current = prefix;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn should_check_index_key(&self, index_key: &LuaIndexKey) -> bool {
+        match index_key {
+            LuaIndexKey::Name(name) => {
+                let name = name.get_name_text();
+                self.names.contains(name)
+            }
+            LuaIndexKey::String(string) => {
+                let value = string.get_value();
+                self.names.contains(value.as_str())
+            }
+            LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_) | LuaIndexKey::Expr(_) => false,
+        }
+    }
+}
+
+fn property_can_report_readonly(property: &LuaCommonProperty) -> bool {
+    property
+        .decl_features
+        .has_feature(PropertyDeclFeature::ReadOnly)
 }
 
 fn check_and_report_semantic_id(
@@ -75,10 +171,15 @@ fn check_assign_stat(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     assign_stat: &LuaAssignStat,
+    candidates: &ReadOnlyCandidates,
 ) -> Option<()> {
     let (vars, _) = assign_stat.get_var_and_expr_list();
     for var in vars {
         let mut var = LuaExpr::cast(var.syntax().clone())?;
+        if !candidates.should_check_expr(&var) {
+            continue;
+        }
+
         loop {
             let node_or_token = NodeOrToken::Node(var.syntax().clone());
             let semantic_decl_id =

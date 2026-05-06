@@ -1,8 +1,10 @@
+use std::collections::HashSet;
+
 use glua_parser::{LuaAst, LuaAstNode, LuaIndexExpr, LuaNameExpr};
 
 use crate::{
-    DiagnosticCode, LuaDeclId, LuaDeprecated, LuaMemberId, LuaSemanticDeclId, LuaType,
-    SemanticDeclLevel, SemanticModel,
+    DiagnosticCode, LuaCommonProperty, LuaDeclId, LuaDeprecated, LuaMemberId, LuaSemanticDeclId,
+    LuaType, SemanticDeclLevel, SemanticModel,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -14,13 +16,18 @@ impl Checker for DeprecatedChecker {
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
+        let candidates = DeprecatedCandidates::new(context);
+        if candidates.is_empty() {
+            return;
+        }
+
         for node in root.descendants::<LuaAst>() {
             match node {
                 LuaAst::LuaNameExpr(name_expr) => {
-                    check_name_expr(context, semantic_model, name_expr);
+                    check_name_expr(context, semantic_model, name_expr, &candidates);
                 }
                 LuaAst::LuaIndexExpr(index_expr) => {
-                    check_index_expr(context, semantic_model, index_expr);
+                    check_index_expr(context, semantic_model, index_expr, &candidates);
                 }
                 _ => {}
             }
@@ -28,11 +35,72 @@ impl Checker for DeprecatedChecker {
     }
 }
 
+struct DeprecatedCandidates {
+    names: HashSet<String>,
+}
+
+impl DeprecatedCandidates {
+    fn new(context: &DiagnosticContext) -> Self {
+        let db = context.db;
+        let mut names = HashSet::new();
+        for (owner_id, property) in db.get_property_index().iter_owner_properties() {
+            if !property_can_report_deprecated(property) {
+                continue;
+            }
+
+            match owner_id {
+                LuaSemanticDeclId::LuaDecl(decl_id) => {
+                    if let Some(decl) = db.get_decl_index().get_decl(decl_id) {
+                        names.insert(decl.get_name().to_string());
+                    }
+                }
+                LuaSemanticDeclId::Member(member_id) => {
+                    if let Some(member) = db.get_member_index().get_member(member_id)
+                        && let Some(name) = member.get_key().get_name()
+                    {
+                        names.insert(name.to_string());
+                    }
+                }
+                LuaSemanticDeclId::TypeDecl(type_decl_id) => {
+                    names.insert(type_decl_id.get_name().to_string());
+                    names.insert(type_decl_id.get_simple_name().to_string());
+                }
+                LuaSemanticDeclId::Signature(_) => {}
+            }
+        }
+
+        Self { names }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn should_check(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+}
+
+fn property_can_report_deprecated(property: &LuaCommonProperty) -> bool {
+    property.deprecated().is_some()
+        || property.attribute_uses().is_some_and(|attribute_uses| {
+            attribute_uses
+                .iter()
+                .any(|attribute_use| attribute_use.id.get_name() == "deprecated")
+        })
+}
+
 fn check_name_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     name_expr: LuaNameExpr,
+    candidates: &DeprecatedCandidates,
 ) -> Option<()> {
+    let name_token = name_expr.get_name_token()?;
+    if !candidates.should_check(&name_token.get_name_text()) {
+        return Some(());
+    }
+
     let semantic_decl = semantic_model.find_decl(
         rowan::NodeOrToken::Node(name_expr.syntax().clone()),
         SemanticDeclLevel::default(),
@@ -58,7 +126,13 @@ fn check_index_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     index_expr: LuaIndexExpr,
+    candidates: &DeprecatedCandidates,
 ) -> Option<()> {
+    let index_name_token = index_expr.get_index_name_token()?;
+    if !candidates.should_check(index_name_token.text()) {
+        return Some(());
+    }
+
     let semantic_decl = semantic_model.find_decl(
         rowan::NodeOrToken::Node(index_expr.syntax().clone()),
         SemanticDeclLevel::default(),
@@ -69,7 +143,7 @@ fn check_index_expr(
     {
         return Some(());
     }
-    let index_name_range = index_expr.get_index_name_token()?.text_range();
+    let index_name_range = index_name_token.text_range();
     check_deprecated(context, semantic_model, &semantic_decl, index_name_range);
     Some(())
 }

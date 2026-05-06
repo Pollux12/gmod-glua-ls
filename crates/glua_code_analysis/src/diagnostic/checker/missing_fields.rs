@@ -1,13 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use glua_parser::{LuaAstNode, LuaIndexKey, LuaTableExpr, LuaTableField};
 
 use crate::{
-    DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaType, LuaTypeCache, LuaTypeDeclId,
-    SemanticModel,
+    DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaType, LuaTypeCache,
+    LuaTypeDeclId, SemanticModel,
 };
 
-use super::{Checker, DiagnosticContext, humanize_lint_type};
+use super::{Checker, DiagnosticContext, PrecomputedMissingRequiredFields, humanize_lint_type};
 use itertools::Itertools;
 
 pub struct MissingFieldsChecker;
@@ -18,7 +21,7 @@ impl Checker for MissingFieldsChecker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
 
-        let mut type_cache = HashMap::new();
+        let mut type_cache: HashMap<LuaType, Arc<HashSet<String>>> = HashMap::new();
         for expr in root.descendants::<LuaTableExpr>() {
             if context.is_cancelled() {
                 return;
@@ -32,7 +35,7 @@ fn check_table_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     expr: &LuaTableExpr,
-    type_cache: &mut HashMap<LuaType, HashSet<String>>,
+    type_cache: &mut HashMap<LuaType, Arc<HashSet<String>>>,
 ) -> Option<()> {
     if context.is_cancelled() {
         return Some(());
@@ -106,36 +109,52 @@ fn check_table_expr(
         .collect();
 
     let required_fields = match &table_type {
-        LuaType::Ref(type_decl_id) => type_cache.entry(table_type.clone()).or_insert_with(|| {
-            let types = type_decl_id.collect_super_types_with_self(context.db, table_type.clone());
-            get_required_fields(context, &types).unwrap_or_default()
-        }),
+        LuaType::Ref(type_decl_id) => get_precomputed_required_fields(context, type_decl_id)
+            .unwrap_or_else(|| {
+                type_cache
+                    .entry(table_type.clone())
+                    .or_insert_with(|| {
+                        let types = type_decl_id
+                            .collect_super_types_with_self(context.db, table_type.clone());
+                        Arc::new(get_required_fields(context, &types).unwrap_or_default())
+                    })
+                    .clone()
+            }),
         LuaType::Generic(generic_type) => {
             let type_decl_id = generic_type.get_base_type_id();
-            type_cache.entry(table_type.clone()).or_insert_with(|| {
-                let types =
-                    type_decl_id.collect_super_types_with_self(context.db, table_type.clone());
-                get_required_fields(context, &types).unwrap_or_default()
+            get_precomputed_required_fields(context, &type_decl_id).unwrap_or_else(|| {
+                type_cache
+                    .entry(table_type.clone())
+                    .or_insert_with(|| {
+                        let types = type_decl_id
+                            .collect_super_types_with_self(context.db, table_type.clone());
+                        Arc::new(get_required_fields(context, &types).unwrap_or_default())
+                    })
+                    .clone()
             })
         }
-        LuaType::Object(_) => type_cache.entry(table_type.clone()).or_insert_with(|| {
-            get_required_fields(context, &vec![table_type.clone()]).unwrap_or_default()
-        }),
-        LuaType::Intersection(intersections) => {
-            type_cache.entry(table_type.clone()).or_insert_with(|| {
+        LuaType::Object(_) => type_cache
+            .entry(table_type.clone())
+            .or_insert_with(|| {
+                Arc::new(get_required_fields(context, std::slice::from_ref(&table_type)).unwrap_or_default())
+            })
+            .clone(),
+        LuaType::Intersection(intersections) => type_cache
+            .entry(table_type.clone())
+            .or_insert_with(|| {
                 let mut computed_fields = HashSet::new();
                 for intersection_component in intersections.get_types() {
                     if context.is_cancelled() {
-                        return computed_fields;
+                        return Arc::new(computed_fields);
                     }
                     computed_fields.extend(
-                        get_required_fields(context, &vec![intersection_component.clone()])
+                        get_required_fields(context, std::slice::from_ref(&intersection_component))
                             .unwrap_or_default(),
                     );
                 }
-                computed_fields
+                Arc::new(computed_fields)
             })
-        }
+            .clone(),
         _ => return Some(()),
     };
 
@@ -162,6 +181,29 @@ fn check_table_expr(
     Some(())
 }
 
+pub fn precompute_missing_required_fields(db: &DbIndex) -> PrecomputedMissingRequiredFields {
+    db.get_type_index()
+        .get_all_types()
+        .into_iter()
+        .filter_map(|type_decl| {
+            let type_decl_id = type_decl.get_id();
+            let typ = LuaType::Ref(type_decl_id.clone());
+            let types = type_decl_id.collect_super_types_with_self(db, typ);
+            let required_fields = get_required_fields_for_types(db, &types, || false)?;
+            Some((type_decl_id, Arc::new(required_fields)))
+        })
+        .collect()
+}
+
+fn get_precomputed_required_fields(
+    context: &DiagnosticContext,
+    type_decl_id: &LuaTypeDeclId,
+) -> Option<Arc<HashSet<String>>> {
+    context
+        .get_shared_data_arc()
+        .and_then(|shared| shared.missing_required_fields.get(type_decl_id).cloned())
+}
+
 fn table_literal_looks_array_like(fields: &[LuaTableField]) -> bool {
     if fields.is_empty() {
         return false;
@@ -182,36 +224,48 @@ fn table_literal_looks_array_like(fields: &[LuaTableField]) -> bool {
 fn get_required_fields(
     context: &mut DiagnosticContext,
     // types 应为广度优先, 子类型会先于父类型被遍历, 而子类型的优先级高于父类型
-    types: &Vec<LuaType>,
+    types: &[LuaType],
 ) -> Option<HashSet<String>> {
-    let member_index = context.db.get_member_index();
+    let db = context.db;
+    get_required_fields_for_types(db, types, || context.is_cancelled())
+}
+
+fn get_required_fields_for_types(
+    db: &DbIndex,
+    // types 应为广度优先, 子类型会先于父类型被遍历, 而子类型的优先级高于父类型
+    types: &[LuaType],
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Option<HashSet<String>> {
+    let member_index = db.get_member_index();
     let mut required_fields: HashSet<String> = HashSet::new();
 
     let mut optional_type = HashSet::new();
     for super_type in types {
-        if context.is_cancelled() {
+        if is_cancelled() {
             return Some(required_fields);
         }
         match super_type {
             LuaType::Ref(type_decl_id) => process_type_decl_id(
-                context,
+                db,
                 member_index,
                 &mut required_fields,
                 &mut optional_type,
                 type_decl_id.clone(),
+                &mut is_cancelled,
             ),
             LuaType::Generic(generic_type) => process_type_decl_id(
-                context,
+                db,
                 member_index,
                 &mut required_fields,
                 &mut optional_type,
                 generic_type.get_base_type_id().clone(),
+                &mut is_cancelled,
             ),
             // 处理 ---@class test: { a: number }
             LuaType::Object(object_type) => {
                 let fields = object_type.get_fields();
                 for (key, decl_type) in fields {
-                    if context.is_cancelled() {
+                    if is_cancelled() {
                         return Some(required_fields);
                     }
                     let name = key.to_path();
@@ -229,15 +283,16 @@ fn get_required_fields(
     }
 
     fn process_type_decl_id(
-        context: &DiagnosticContext,
+        db: &DbIndex,
         member_index: &crate::LuaMemberIndex,
         required_fields: &mut HashSet<String>,
         optional_type: &mut HashSet<String>,
         type_decl_id: LuaTypeDeclId,
+        is_cancelled: &mut impl FnMut() -> bool,
     ) -> Option<()> {
         let members = member_index.get_members(&LuaMemberOwner::Type(type_decl_id))?;
         for member in members {
-            if context.is_cancelled() {
+            if is_cancelled() {
                 return Some(());
             }
             if matches!(
@@ -247,8 +302,7 @@ fn get_required_fields(
                 continue;
             }
             let name = member.get_key().to_path();
-            let decl_type = context
-                .db
+            let decl_type = db
                 .get_type_index()
                 .get_type_cache(&member.get_id().into())
                 .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))

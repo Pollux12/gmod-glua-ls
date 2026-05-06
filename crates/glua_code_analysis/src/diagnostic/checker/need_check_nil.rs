@@ -1,11 +1,15 @@
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexExpr,
-    LuaIndexKey,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr, LuaExpr,
+    LuaIndexExpr, LuaIndexKey,
 };
+use rowan::TextRange;
 
 use crate::{DiagnosticCode, LuaType, LuaUnionType, SemanticModel};
 
-use super::{Checker, DiagnosticContext};
+use super::{
+    AssignmentPrefixEvents, Checker, DiagnosticContext,
+    is_initialized_assignment_prefix as shared_is_initialized_assignment_prefix,
+};
 
 pub struct NeedCheckNilChecker;
 
@@ -17,6 +21,7 @@ impl Checker for NeedCheckNilChecker {
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
+        let assignment_prefixes = context.get_assignment_prefix_events(&root);
         for expr in root.descendants::<LuaExpr>() {
             match expr {
                 LuaExpr::CallExpr(call_expr) => {
@@ -26,7 +31,7 @@ impl Checker for NeedCheckNilChecker {
                     check_binary_expr(context, semantic_model, binary_expr);
                 }
                 LuaExpr::IndexExpr(index_expr) => {
-                    check_index_expr(context, semantic_model, index_expr);
+                    check_index_expr(context, semantic_model, index_expr, &assignment_prefixes);
                 }
                 _ => {}
             }
@@ -46,6 +51,13 @@ fn check_call_expr(
         && is_short_circuit_isvalid_guard_for_receiver(&call_expr, &receiver)
     {
         return Some(());
+    }
+
+    if let LuaExpr::IndexExpr(index_expr) = &prefix {
+        let receiver = index_expr.get_prefix_expr()?;
+        if report_nullable_receiver(context, semantic_model, &receiver) {
+            return Some(());
+        }
     }
 
     let func = semantic_model.infer_expr(prefix.clone()).ok()?;
@@ -69,34 +81,37 @@ fn check_call_expr(
         return Some(());
     }
 
-    // For member/method calls where the resolved callable is non-nullable but the
-    // receiver may be nil (e.g. `ent:GetPos()` with `ent: Entity?`), still report
-    // nil access at the call prefix. `check_index_expr` skips call prefixes to
-    // avoid duplicate diagnostics, so call_expr owns this case.
-    if let LuaExpr::IndexExpr(index_expr) = &prefix {
-        let receiver = index_expr.get_prefix_expr()?;
-        let receiver_type = semantic_model.infer_expr(receiver.clone()).ok()?;
-        if receiver_type.is_nullable() {
-            // Definite nil receivers should be warning-level unchecked access.
-            // Nullable-but-not-definite receivers remain NeedCheckNil.
-            let diagnostic_code = if receiver_type.is_nil()
-                || should_report_unchecked_nil_access(&receiver, &receiver_type)
-            {
-                DiagnosticCode::UncheckedNilAccess
-            } else {
-                DiagnosticCode::NeedCheckNil
-            };
+    Some(())
+}
 
-            context.add_diagnostic(
-                diagnostic_code,
-                receiver.get_range(),
-                t!("%{name} may be nil", name = receiver.syntax().text()).to_string(),
-                None,
-            );
-        }
+fn report_nullable_receiver(
+    context: &mut DiagnosticContext,
+    semantic_model: &SemanticModel,
+    receiver: &LuaExpr,
+) -> bool {
+    let Ok(receiver_type) = semantic_model.infer_expr(receiver.clone()) else {
+        return false;
+    };
+    if !receiver_type.is_nullable() {
+        return false;
     }
 
-    Some(())
+    // Definite nil receivers should be warning-level unchecked access.
+    // Nullable-but-not-definite receivers remain NeedCheckNil.
+    let diagnostic_code =
+        if receiver_type.is_nil() || should_report_unchecked_nil_access(receiver, &receiver_type) {
+            DiagnosticCode::UncheckedNilAccess
+        } else {
+            DiagnosticCode::NeedCheckNil
+        };
+
+    context.add_diagnostic(
+        diagnostic_code,
+        receiver.get_range(),
+        t!("%{name} may be nil", name = receiver.syntax().text()).to_string(),
+        None,
+    );
+    true
 }
 
 fn should_skip_deferred_nullable_function_call(call_expr: &LuaCallExpr, prefix: &LuaExpr) -> bool {
@@ -116,6 +131,7 @@ fn check_index_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     index_expr: LuaIndexExpr,
+    assignment_prefixes: &AssignmentPrefixEvents,
 ) -> Option<()> {
     // Call prefixes are handled in check_call_expr. Skipping here prevents
     // duplicate diagnostics for call expressions like `test.meow()`.
@@ -124,6 +140,10 @@ fn check_index_expr(
     }
 
     let prefix = index_expr.get_prefix_expr()?;
+    if is_initialized_assignment_lhs_prefix(&index_expr, &prefix, assignment_prefixes) {
+        return Some(());
+    }
+
     let prefix_type = semantic_model.infer_expr(prefix.clone()).ok()?;
     if prefix_type.is_nullable() {
         let diagnostic_code = if should_report_unchecked_nil_access(&prefix, &prefix_type) {
@@ -143,6 +163,37 @@ fn check_index_expr(
     Some(())
 }
 
+fn is_initialized_assignment_lhs_prefix(
+    index_expr: &LuaIndexExpr,
+    _prefix: &LuaExpr,
+    assignment_prefixes: &AssignmentPrefixEvents,
+) -> bool {
+    let Some(assign_stat) = index_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaAssignStat::cast)
+    else {
+        return false;
+    };
+
+    if !is_index_expr_in_assign_lhs(index_expr, &assign_stat) {
+        return false;
+    }
+
+    shared_is_initialized_assignment_prefix(index_expr, &assign_stat, assignment_prefixes)
+}
+
+fn is_index_expr_in_assign_lhs(index_expr: &LuaIndexExpr, assign_stat: &LuaAssignStat) -> bool {
+    let index_range = index_expr.syntax().text_range();
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    vars.into_iter()
+        .any(|var| range_contains(var.syntax().text_range(), index_range))
+}
+
+fn range_contains(outer: TextRange, inner: TextRange) -> bool {
+    outer.start() <= inner.start() && outer.end() >= inner.end()
+}
+
 /// Returns `true` when `index_expr` is the direct prefix of a `CallExpr`.
 /// In that case, nil diagnostics for the call are owned by `check_call_expr`.
 fn is_call_prefix(index_expr: &LuaIndexExpr) -> bool {
@@ -156,7 +207,10 @@ fn is_call_prefix(index_expr: &LuaIndexExpr) -> bool {
     call_prefix.syntax() == index_expr.syntax()
 }
 
-fn is_short_circuit_isvalid_guard_for_receiver(call_expr: &LuaCallExpr, receiver: &LuaExpr) -> bool {
+fn is_short_circuit_isvalid_guard_for_receiver(
+    call_expr: &LuaCallExpr,
+    receiver: &LuaExpr,
+) -> bool {
     let Some(binary_expr) = call_expr.get_parent::<LuaBinaryExpr>() else {
         return false;
     };
