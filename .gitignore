@@ -12,4 +12,5 @@ dhat-heap.json
 .context-engine/
 
 benchmark_*.log
+.bench-*.log
 100

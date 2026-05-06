@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use glua_code_analysis::{EmmyLuaAnalysis, FileId, Profile};
+use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use log::{debug, info, warn};
 use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -82,10 +82,7 @@ impl FileDiagnostic {
     }
 
     fn notify_startup_complete(&self) {
-        if self
-            .startup_complete_notified
-            .swap(true, Ordering::AcqRel)
-        {
+        if self.startup_complete_notified.swap(true, Ordering::AcqRel) {
             return;
         }
 
@@ -376,16 +373,6 @@ impl FileDiagnostic {
             let shared_data = analysis.precompute_diagnostic_shared_data();
             (file_ids, shared_data)
         };
-        let profile_text = format!(
-            "workspace diagnostic pull slow: {} files",
-            main_workspace_file_ids.len()
-        );
-        let _p = Profile::new(profile_text.as_str());
-        info!(
-            "workspace diagnostic pull slow started: files={}",
-            main_workspace_file_ids.len()
-        );
-
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
         let valid_file_count = main_workspace_file_ids.len();
         let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
@@ -469,12 +456,6 @@ impl FileDiagnostic {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
         let valid_file_count = main_workspace_file_ids.len();
-        let profile_text = format!("workspace diagnostic pull fast: {} files", valid_file_count);
-        let _p = Profile::new(profile_text.as_str());
-        info!(
-            "workspace diagnostic pull fast started: files={}",
-            valid_file_count
-        );
 
         let analysis = self.analysis.clone();
         let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
@@ -500,8 +481,6 @@ impl FileDiagnostic {
 
         let mut count = 0;
         if valid_file_count != 0 {
-            let text = format!("diagnose {} files", valid_file_count);
-            let _p = Profile::new(text.as_str());
             let mut last_percentage = 0;
 
             while count < valid_file_count {
@@ -642,15 +621,6 @@ async fn push_workspace_diagnostic(
     // diagnostic files
     let (tx, mut rx) = tokio::sync::mpsc::channel::<FileId>(100);
     let valid_file_count = main_workspace_file_ids.len();
-    let profile_text = format!(
-        "workspace diagnostic push (silent={}): {} files",
-        silent, valid_file_count
-    );
-    let _p = Profile::new(profile_text.as_str());
-    info!(
-        "workspace diagnostic push started: files={}, silent={}",
-        valid_file_count, silent
-    );
     if !silent {
         status_bar
             .create_progress_task(ProgressTask::DiagnoseWorkspace)

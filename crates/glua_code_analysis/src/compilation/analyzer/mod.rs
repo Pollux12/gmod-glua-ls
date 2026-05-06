@@ -172,7 +172,6 @@ fn module_analyze(
         return vec![];
     }
 
-    let _p = Profile::new("module analyze");
     let mut file_tree_map: HashMap<WorkspaceId, Vec<InFiled<LuaChunk>>> = HashMap::new();
     for in_filed_tree in need_analyzed_files {
         let file_id = in_filed_tree.file_id;

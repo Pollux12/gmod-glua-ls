@@ -40,14 +40,17 @@ pub struct UnResolveAnalysisPipeline;
 impl AnalysisPipeline for UnResolveAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         let _p = Profile::cond_new("resolve analyze", context.tree_list.len() > 1);
+        let log_enabled = log::log_enabled!(log::Level::Info);
         let mut infer_manager = std::mem::take(&mut context.infer_manager);
 
-        let mat_start = std::time::Instant::now();
+        let mat_start = log_enabled.then(std::time::Instant::now);
         materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
-        log::info!(
-            "unresolve: initial materialize_pending cost {:?}",
-            mat_start.elapsed()
-        );
+        if let Some(mat_start) = mat_start {
+            log::info!(
+                "unresolve: initial materialize_pending cost {:?}",
+                mat_start.elapsed()
+            );
+        }
 
         infer_manager.clear();
 
@@ -57,66 +60,80 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             reason_resolve.entry(reason).or_default().push(unresolve);
         }
 
-        let total_unresolves: usize = reason_resolve.values().map(|v| v.len()).sum();
-        log::info!(
-            "unresolve: starting with {} unresolves in {} reason groups",
-            total_unresolves,
-            reason_resolve.len()
-        );
+        if log_enabled {
+            let total_unresolves: usize = reason_resolve.values().map(|v| v.len()).sum();
+            log::info!(
+                "unresolve: starting with {} unresolves in {} reason groups",
+                total_unresolves,
+                reason_resolve.len()
+            );
+        }
 
         let mut loop_count = 0;
         while !reason_resolve.is_empty() {
-            let iter_start = std::time::Instant::now();
+            let iter_start = log_enabled.then(std::time::Instant::now);
 
-            let resolve_start = std::time::Instant::now();
+            let resolve_start = log_enabled.then(std::time::Instant::now);
             try_resolve(db, &mut infer_manager, &mut reason_resolve);
-            log::info!(
-                "unresolve: loop {} try_resolve cost {:?}",
-                loop_count,
-                resolve_start.elapsed()
-            );
+            if let Some(resolve_start) = resolve_start {
+                log::info!(
+                    "unresolve: loop {} try_resolve cost {:?}",
+                    loop_count,
+                    resolve_start.elapsed()
+                );
+            }
 
-            let mat_start = std::time::Instant::now();
+            let mat_start = log_enabled.then(std::time::Instant::now);
             materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
-            log::info!(
-                "unresolve: loop {} materialize_pending cost {:?}",
-                loop_count,
-                mat_start.elapsed()
-            );
+            if let Some(mat_start) = mat_start {
+                log::info!(
+                    "unresolve: loop {} materialize_pending cost {:?}",
+                    loop_count,
+                    mat_start.elapsed()
+                );
+            }
 
             if reason_resolve.is_empty() {
-                log::info!(
-                    "unresolve: loop {} total cost {:?} (resolved all)",
-                    loop_count,
-                    iter_start.elapsed()
-                );
+                if let Some(iter_start) = iter_start {
+                    log::info!(
+                        "unresolve: loop {} total cost {:?} (resolved all)",
+                        loop_count,
+                        iter_start.elapsed()
+                    );
+                }
                 break;
             }
 
-            let remaining: usize = reason_resolve.values().map(|v| v.len()).sum();
-            log::info!(
-                "unresolve: loop {} remaining {} unresolves",
-                loop_count,
-                remaining
-            );
+            if log_enabled {
+                let remaining: usize = reason_resolve.values().map(|v| v.len()).sum();
+                log::info!(
+                    "unresolve: loop {} remaining {} unresolves",
+                    loop_count,
+                    remaining
+                );
+            }
 
             if loop_count == 0 {
                 infer_manager.set_force();
             }
 
-            let reason_start = std::time::Instant::now();
+            let reason_start = log_enabled.then(std::time::Instant::now);
             resolve_all_reason(db, &mut reason_resolve, loop_count);
-            log::info!(
-                "unresolve: loop {} resolve_all_reason cost {:?}",
-                loop_count,
-                reason_start.elapsed()
-            );
+            if let Some(reason_start) = reason_start {
+                log::info!(
+                    "unresolve: loop {} resolve_all_reason cost {:?}",
+                    loop_count,
+                    reason_start.elapsed()
+                );
+            }
 
-            log::info!(
-                "unresolve: loop {} total cost {:?}",
-                loop_count,
-                iter_start.elapsed()
-            );
+            if let Some(iter_start) = iter_start {
+                log::info!(
+                    "unresolve: loop {} total cost {:?}",
+                    loop_count,
+                    iter_start.elapsed()
+                );
+            }
 
             if loop_count >= 5 {
                 break;
@@ -165,100 +182,6 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
             );
         }
     }
-}
-
-#[allow(unused)]
-fn record_unresolve_info(
-    time_hash_map: HashMap<usize, (u128, usize)>,
-    reason_unresolves: &HashMap<InferFailReason, Vec<UnResolve>>,
-) {
-    let mut unresolve_info: HashMap<String, usize> = HashMap::new();
-    for (check_reason, unresolves) in reason_unresolves.iter() {
-        for unresolve in unresolves {
-            match unresolve {
-                UnResolve::Return(_) => {
-                    unresolve_info
-                        .entry("UnResolveReturn".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::Decl(_) => {
-                    unresolve_info
-                        .entry("UnResolveDecl".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::Member(_) => {
-                    unresolve_info
-                        .entry("UnResolveMember".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::Module(_) => {
-                    unresolve_info
-                        .entry("UnResolveModule".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::ClosureParams(_) => {
-                    unresolve_info
-                        .entry("UnResolveClosureParams".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::ClosureReturn(_) => {
-                    unresolve_info
-                        .entry("UnResolveClosureReturn".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::ClosureParentParams(_) => {
-                    unresolve_info
-                        .entry("UnResolveClosureParentParams".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::IterDecl(_) => {
-                    unresolve_info
-                        .entry("UnResolveIterDecl".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::ModuleRef(_) => {
-                    unresolve_info
-                        .entry("UnResolveModuleRef".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::TableField(_) => {
-                    unresolve_info
-                        .entry("UnResolveTableField".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-                UnResolve::SpecialCall(_) => {
-                    unresolve_info
-                        .entry("UnResolveSpecialCall".to_string())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-            }
-        }
-    }
-
-    log::info!("unresolve reason count {}", reason_unresolves.len());
-    let mut s = String::new();
-    let mut unresolve_info_vec = unresolve_info
-        .iter()
-        .map(|(k, v)| (k.clone(), *v))
-        .collect::<Vec<_>>();
-    unresolve_info_vec.sort_by(|a, b| a.1.cmp(&b.1).reverse());
-    s.clear();
-    s.push_str("unresolve info:\n");
-    for (name, count) in unresolve_info_vec {
-        s.push_str(&format!("{}: {}\n", name, count));
-    }
-    log::info!("{}", s);
 }
 
 fn try_resolve(

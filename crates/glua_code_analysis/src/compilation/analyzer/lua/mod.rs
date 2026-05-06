@@ -8,6 +8,7 @@ mod stats;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use closure::analyze_closure;
 pub use closure::analyze_return_point;
@@ -45,28 +46,32 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         let _p = Profile::cond_new("lua analyze", context.tree_list.len() > 1);
         let tree_list = context.tree_list.clone();
+
         let file_ids = tree_list.iter().map(|x| x.file_id).collect::<Vec<_>>();
+
         let tree_map = tree_list
             .iter()
             .map(|x| (x.file_id, x.value.clone()))
             .collect::<HashMap<_, _>>();
+
         let special_call_direct_matcher = build_special_call_direct_matcher(db, &tree_map);
 
         // Pre-compute scripted class scope for all files (compile glob patterns once)
         let gmod_enabled = db.get_emmyrc().gmod.enabled;
         let scripted_scope_files = if gmod_enabled {
-            context.get_or_compute_scripted_scope_files(db).clone()
+            context.get_or_compute_scripted_scope_files(db)
         } else {
-            HashSet::new()
+            Arc::new(HashSet::new())
         };
 
         let file_dependency = db.get_file_dependencies_index().get_file_dependencies();
         let order = file_dependency.get_best_analysis_order(&file_ids, &context.metas);
-        let total_start = Instant::now();
+        let slow_log_enabled = log::log_enabled!(log::Level::Info);
+        let total_start = slow_log_enabled.then(Instant::now);
         let mut file_count: usize = 0;
         for file_id in order {
             if let Some(root) = tree_map.get(&file_id) {
-                let file_start = Instant::now();
+                let file_start = slow_log_enabled.then(Instant::now);
                 let is_scripted = scripted_scope_files.contains(&file_id);
                 let mut analyzer = LuaAnalyzer::new(
                     db,
@@ -81,22 +86,26 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 }
                 analyze_chunk_return(&mut analyzer, root.clone());
                 file_count += 1;
-                let file_elapsed = file_start.elapsed();
-                if file_elapsed.as_millis() > 10 {
-                    let path = db
-                        .get_vfs()
-                        .get_uri(&file_id)
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|| format!("{:?}", file_id));
-                    info!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
+                if let Some(file_start) = file_start {
+                    let file_elapsed = file_start.elapsed();
+                    if file_elapsed.as_millis() > 10 {
+                        let path = db
+                            .get_vfs()
+                            .get_uri(&file_id)
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|| format!("{:?}", file_id));
+                        info!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
+                    }
                 }
             }
         }
-        info!(
-            "lua analyze total: {} files in {:?}",
-            file_count,
-            total_start.elapsed()
-        );
+        if let Some(total_start) = total_start {
+            info!(
+                "lua analyze total: {} files in {:?}",
+                file_count,
+                total_start.elapsed()
+            );
+        }
     }
 }
 

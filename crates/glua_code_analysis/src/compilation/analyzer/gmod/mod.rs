@@ -101,12 +101,12 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let _p = Profile::cond_new("gmod pre-analyze", context.tree_list.len() > 1);
         let tree_list = context.tree_list.clone();
         let file_ids: Vec<FileId> = tree_list.iter().map(|x| x.file_id).collect();
-        let do_profile = tree_list.len() > 100;
+        let do_profile = tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
 
         // Pre-compute scripted class scope for all files (compile globs once)
         let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
 
-        let t0 = std::time::Instant::now();
+        let t0 = do_profile.then(std::time::Instant::now);
         let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::new();
         let mut annotation_realms: HashMap<FileId, GmodRealm> = HashMap::new();
         let mut t_hook = std::time::Duration::ZERO;
@@ -136,7 +136,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 .map(|c| scan_gmod_keywords(c, method_prefixes))
                 .unwrap_or_default();
 
-            let s = std::time::Instant::now();
+            let s = do_profile.then(std::time::Instant::now);
             let (gm_method_realms, receive_flows) = if keywords.needs_hook_metadata() {
                 collect_hook_metadata(
                     db,
@@ -147,9 +147,11 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             } else {
                 (Vec::new(), Vec::new())
             };
-            t_hook += s.elapsed();
+            if let Some(s) = s {
+                t_hook += s.elapsed();
+            }
 
-            let s = std::time::Instant::now();
+            let s = do_profile.then(std::time::Instant::now);
             if keywords.has_net || !receive_flows.is_empty() {
                 collect_network_flow_metadata(
                     db,
@@ -159,14 +161,16 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     &helper_registry,
                 );
             }
-            t_netflow += s.elapsed();
+            if let Some(s) = s {
+                t_netflow += s.elapsed();
+            }
 
             if !gm_method_realms.is_empty() {
                 db.get_gmod_infer_index_mut()
                     .set_gm_method_realm_annotations(in_filed_tree.file_id, gm_method_realms);
             }
             if is_in_scope {
-                let s = std::time::Instant::now();
+                let s = do_profile.then(std::time::Instant::now);
                 // Use cached scoped class info from decl phase, or detect if not cached
                 let scope_match = db
                     .get_gmod_infer_index()
@@ -209,9 +213,11 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                         &scope_match,
                     );
                 }
-                t_scoped += s.elapsed();
+                if let Some(s) = s {
+                    t_scoped += s.elapsed();
+                }
             }
-            let s = std::time::Instant::now();
+            let s = do_profile.then(std::time::Instant::now);
             if keywords.has_realm_branch {
                 let ranges = collect_branch_realm_ranges(&in_filed_tree.value);
                 if !ranges.is_empty() {
@@ -226,7 +232,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 db.get_gmod_infer_index_mut()
                     .set_member_realm_ranges(in_filed_tree.file_id, member_ranges);
             }
-            t_realm += s.elapsed();
+            if let Some(s) = s {
+                t_realm += s.elapsed();
+            }
 
             // Pre-index @fileparam annotations (O(1) lookup during resolve vs O(file_size) AST walk)
             // @fileparam is extremely rare; only scan if file content contains it
@@ -245,7 +253,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         if do_profile {
             log::info!(
                 "gmod pre: per-file metadata cost {:?} (hook={:?}, netflow={:?}, scoped={:?}, realm={:?})",
-                t0.elapsed(),
+                t0.map(|t0| t0.elapsed()).unwrap_or_default(),
                 t_hook,
                 t_netflow,
                 t_scoped,
@@ -254,19 +262,19 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         }
 
         // Network var wrappers are purely syntactic (AST pattern matching)
-        let t1 = std::time::Instant::now();
+        let t1 = do_profile.then(std::time::Instant::now);
         let tree_map: HashMap<FileId, LuaChunk> = tree_list
             .iter()
             .map(|x| (x.file_id, x.value.clone()))
             .collect();
         synthesize_network_var_wrappers(db, &scripted_scope_files, &tree_map);
-        if do_profile {
+        if let Some(t1) = t1 {
             log::info!("gmod pre: network_var_wrappers cost {:?}", t1.elapsed());
         }
 
-        let t2 = std::time::Instant::now();
+        let t2 = do_profile.then(std::time::Instant::now);
         rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms, &file_ids);
-        if do_profile {
+        if let Some(t2) = t2 {
             log::info!("gmod pre: rebuild_realm_metadata cost {:?}", t2.elapsed());
         }
     }
@@ -285,31 +293,31 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
 
         let _p = Profile::cond_new("gmod post-analyze", context.tree_list.len() > 1);
         let file_ids: Vec<FileId> = context.tree_list.iter().map(|x| x.file_id).collect();
-        let do_profile = context.tree_list.len() > 100;
+        let do_profile = context.tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
 
         let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
 
         // Resolve scripted_ents.GetMember delegations BEFORE synthesizing
         // members so that NetworkVar calls copied from target entities are
         // picked up by synthesize_scripted_class_members.
-        let t_deleg = std::time::Instant::now();
+        let t_deleg = do_profile.then(std::time::Instant::now);
         resolve_getmember_network_var_delegations(db, &scripted_scope_files, context);
-        if do_profile {
+        if let Some(t_deleg) = t_deleg {
             log::info!(
                 "gmod post: getmember_delegations cost {:?}",
                 t_deleg.elapsed()
             );
         }
 
-        let t0 = std::time::Instant::now();
+        let t0 = do_profile.then(std::time::Instant::now);
         synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
-        if do_profile {
+        if let Some(t0) = t0 {
             log::info!("gmod post: scripted_class_members cost {:?}", t0.elapsed());
         }
 
-        let t1 = std::time::Instant::now();
+        let t1 = do_profile.then(std::time::Instant::now);
         synthesize_vgui_registrations(db, &file_ids);
-        if do_profile {
+        if let Some(t1) = t1 {
             log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed());
         }
     }
@@ -420,14 +428,6 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
     }
 
     HelperRegistry { map }
-}
-
-#[allow(dead_code)]
-fn _debug_helper_registry(reg: &HelperRegistry) {
-    eprintln!("HelperRegistry has {} entries:", reg.map.len());
-    for k in reg.map.keys() {
-        eprintln!("  - {k}");
-    }
 }
 
 /// Per-file function definition lookup. Built once and reused for all

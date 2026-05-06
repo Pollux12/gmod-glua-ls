@@ -1,9 +1,3 @@
-use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
-    LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaTableExpr, LuaTableField,
-    LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
-};
-
 use crate::{
     InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
     LuaTypeCache, LuaTypeOwner, TypeOps,
@@ -13,6 +7,11 @@ use crate::{
     },
     db_index::{LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType},
     semantic::member_key_matches_type,
+};
+use glua_parser::{
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
+    LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaTableExpr, LuaTableField,
+    LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
 
 use super::LuaAnalyzer;
@@ -272,7 +271,6 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
     let file_id = analyzer.file_id;
     let index_expr = LuaIndexExpr::cast(var_expr.syntax().clone())?;
     let prefix_expr = index_expr.get_prefix_expr()?;
-
     match analyzer.infer_expr(&prefix_expr.clone()) {
         Ok(prefix_type) => {
             let index_key = index_expr.get_index_key()?;
@@ -472,8 +470,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             }
         }
     }
-
-    // Expressions like a, b are not valid
 
     Some(())
 }
