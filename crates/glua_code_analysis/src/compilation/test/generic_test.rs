@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
 
     #[test]
     fn test_issue_586() {
@@ -170,9 +170,36 @@ mod test {
             "#,
         );
         assert!(ws.check_code_for(DiagnosticCode::ParamTypeMismatch, r#"pred('hello', 1, {})"#));
+
+        // With strict mode (strict_type_coercion = true), "1" passed to integer is an error.
+        let mut strict_emmyrc = Emmyrc::default();
+        strict_emmyrc.strict.strict_type_coercion = true;
+        ws.update_emmyrc(strict_emmyrc);
         assert!(!ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"pred('hello',"1", {})"#
+        ));
+    }
+
+    #[test]
+    fn test_issue_738_lenient_coercion() {
+        // With strict_type_coercion disabled (default), numeric string literals are accepted for integer.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@alias Predicate<A> fun(...: A...): boolean
+            ---@type Predicate<[string, integer, table]>
+            pred = function() end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"pred('hello',"1", {})"#
+        ));
+        // Non-numeric strings still produce a diagnostic.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"pred('hello',"hello", {})"#
         ));
     }
 
@@ -340,7 +367,8 @@ mod test {
             end
             "#,
         );
-        assert!(!ws.check_code_for(
+        // `number` is tostring-coercible, so passing it to `string` param is no longer flagged.
+        assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
             ---@type fun(): number
@@ -463,10 +491,51 @@ mod test {
 
             "#,
         ));
+
+        // With strict mode, passing "1" where number is expected is an error.
+        let mut strict_emmyrc = Emmyrc::default();
+        strict_emmyrc.strict.strict_type_coercion = true;
+        ws.update_emmyrc(strict_emmyrc);
         assert!(!ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
             f("A", "b", "1")
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_infer_new_constructor_lenient_coercion() {
+        // With strict_type_coercion disabled (default), a numeric string literal is accepted for number.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@alias ConstructorParameters<T> T extends new (fun(...: infer P): any) and P or never
+
+            ---@generic T
+            ---@param name `T`|T
+            ---@param ... ConstructorParameters<T>...
+            function f(name, ...)
+            end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class A
+            ---@overload fun(name: string, age: number)
+            local A = {}
+            f("A", "b", "1")
+            "#,
+        ));
+        // Non-numeric strings still produce a diagnostic.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class A
+            ---@overload fun(name: string, age: number)
+            local A = {}
+            f("A", "b", "hello")
             "#,
         ));
     }
@@ -522,6 +591,12 @@ mod test {
             function f3(...) end
             "#,
             );
+            // Use strict mode: in lenient mode "2" would be accepted for integer.
+            {
+                let mut strict_emmyrc = Emmyrc::default();
+                strict_emmyrc.strict.strict_type_coercion = true;
+                ws.update_emmyrc(strict_emmyrc);
+            }
             assert!(!ws.check_code_for(
                 DiagnosticCode::ParamTypeMismatch,
                 r#"

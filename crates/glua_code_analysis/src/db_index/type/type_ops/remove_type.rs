@@ -3,6 +3,7 @@ use crate::{DbIndex, LuaType, get_real_type};
 pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Option<LuaType> {
     if source == removed_type {
         match source {
+            LuaType::DocIntegerConst(_) => return Some(LuaType::Integer),
             LuaType::IntegerConst(_) => return Some(LuaType::Integer),
             LuaType::FloatConst(_) => return Some(LuaType::Number),
             _ => return None,
@@ -107,12 +108,12 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
         LuaType::DocIntegerConst(i) | LuaType::IntegerConst(i) => match &real_type {
             LuaType::DocIntegerConst(i2) => {
                 if i == i2 {
-                    return None;
+                    return Some(LuaType::Integer);
                 }
             }
             LuaType::IntegerConst(i2) => {
                 if i == i2 {
-                    return None;
+                    return Some(LuaType::Integer);
                 }
             }
             _ => {}

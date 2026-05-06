@@ -165,6 +165,7 @@ These settings can also be configured via VS Code's settings (`gluals.*` prefix)
 |---|---|---|---|---|
 | `gluals.diagnostics.diagnosticInterval` | `diagnostics.diagnosticInterval` | `integer` | `500` | Scan delay in milliseconds |
 | `gluals.strict.inferredTypeMismatch` | `strict.inferredTypeMismatch` | `boolean` | `false` | Stricter type checking for inferred values |
+| `gluals.strict.strictTypeCoercion` | `strict.strictTypeCoercion` | `boolean` | `false` | When enabled, requires exact types in param-type-mismatch — disables GLua-aware coercions (e.g. number/boolean → string, numeric string literal → number/integer) |
 | `gluals.codeAction.insertSpace` | `codeAction.insertSpace` | `boolean` | `false` | Space after --- in diagnostic comments |
 
 ---
