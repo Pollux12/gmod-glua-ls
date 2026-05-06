@@ -1,4 +1,5 @@
 mod infer_array;
+pub(crate) use infer_array::check_iter_var_range;
 
 use std::collections::HashSet;
 
@@ -21,10 +22,8 @@ use crate::{
         InferGuard,
         generic::{TypeSubstitutor, instantiate_type_generic},
         infer::{
-            VarRefId,
-            infer_index::infer_array::{check_iter_var_range, infer_array_member},
-            infer_name::get_name_expr_var_ref_id,
-            narrow::infer_expr_narrow_type,
+            VarRefId, infer_index::infer_array::infer_array_member,
+            infer_name::get_name_expr_var_ref_id, narrow::infer_expr_narrow_type,
         },
         is_doc_tag_table_const,
         member::get_buildin_type_map_type_id,
@@ -149,6 +148,11 @@ pub fn get_index_expr_var_ref_id(
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
 ) -> Option<VarRefId> {
+    let syntax_id = index_expr.get_syntax_id();
+    if let Some(var_ref_id) = cache.expr_var_ref_id_cache.get(&syntax_id) {
+        return Some(var_ref_id.clone());
+    }
+
     let access_path = match index_expr.get_access_path() {
         Some(path) => ArcIntern::new(SmolStr::new(&path)),
         None => return None,
@@ -167,6 +171,9 @@ pub fn get_index_expr_var_ref_id(
         };
 
         let var_ref_id = VarRefId::IndexRef(decl_or_member_id, access_path);
+        cache
+            .expr_var_ref_id_cache
+            .insert(syntax_id, var_ref_id.clone());
         return Some(var_ref_id);
     }
 

@@ -35,9 +35,13 @@ pub fn infer_expr_semantic_decl(
         LuaExpr::NameExpr(name_expr) => {
             infer_name_expr_semantic_decl(db, cache, name_expr, semantic_guard.next_level()?, level)
         }
-        LuaExpr::IndexExpr(index_expr) => {
-            infer_index_expr_semantic_decl(db, cache, index_expr, semantic_guard.next_level()?)
-        }
+        LuaExpr::IndexExpr(index_expr) => infer_index_expr_semantic_decl(
+            db,
+            cache,
+            index_expr.clone(),
+            semantic_guard.next_level()?,
+        )
+        .or_else(|| fallback_index_expr_member_decl(db, file_id, &index_expr)),
         LuaExpr::ClosureExpr(closure_expr) => infer_closure_expr_semantic_decl(
             db,
             cache,
@@ -54,6 +58,17 @@ pub fn infer_expr_semantic_decl(
             None
         }
     }
+}
+
+fn fallback_index_expr_member_decl(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    index_expr: &LuaIndexExpr,
+) -> Option<LuaSemanticDeclId> {
+    let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+    db.get_member_index()
+        .get_member(&member_id)
+        .map(|_| LuaSemanticDeclId::Member(member_id))
 }
 
 fn infer_name_expr_semantic_decl(
@@ -90,13 +105,21 @@ fn infer_name_expr_semantic_decl(
                 let tree = db.get_vfs().get_syntax_tree(&file_id)?;
                 // second infer
                 let value_expr = LuaExpr::cast(value_expr_id.to_node(tree)?)?;
-                if let Some(semantic_id) = infer_expr_semantic_decl(
-                    db,
-                    cache,
-                    value_expr,
-                    semantic_guard.next_level()?,
-                    level.next_level()?,
-                ) {
+                let next_guard = semantic_guard.next_level()?;
+                let next_level = level.next_level()?;
+                let semantic_id = if file_id == cache.get_file_id() {
+                    infer_expr_semantic_decl(db, cache, value_expr, next_guard, next_level)
+                } else {
+                    let mut value_cache = LuaInferCache::new(file_id, cache.get_config().clone());
+                    infer_expr_semantic_decl(
+                        db,
+                        &mut value_cache,
+                        value_expr,
+                        next_guard,
+                        next_level,
+                    )
+                };
+                if let Some(semantic_id) = semantic_id {
                     return Some(semantic_id);
                 }
             }

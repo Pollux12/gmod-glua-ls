@@ -9,7 +9,7 @@ mod infer_unary;
 mod narrow;
 mod test;
 
-use std::ops::Deref;
+use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
     LuaAst, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaLiteralExpr, LuaLiteralToken,
@@ -20,7 +20,9 @@ use infer_call::infer_call_expr;
 pub use infer_call::infer_call_expr_func;
 pub use infer_doc_type::{DocTypeInferContext, infer_doc_type};
 pub use infer_fail_reason::InferFailReason;
+pub(crate) use infer_index::check_iter_var_range;
 pub use infer_index::infer_index_expr;
+pub(crate) use infer_index::infer_member_by_member_key;
 use infer_name::infer_name_expr;
 pub(crate) use infer_name::resolve_scoped_scripted_global_type_decl_id;
 pub use infer_name::{find_self_decl_or_member_id, infer_param};
@@ -28,6 +30,7 @@ use infer_table::infer_table_expr;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};
 use infer_unary::infer_unary_expr;
 pub use narrow::VarRefId;
+pub(crate) use narrow::get_var_expr_var_ref_id;
 
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -219,6 +222,41 @@ pub fn infer_expr_list_value_type_at(
                 .map(|(ty, _)| ty.clone()),
         )
     }
+}
+
+pub fn infer_call_arg_expr_list_types(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: LuaCallExpr,
+    var_count: Option<usize>,
+) -> Vec<(LuaType, TextRange)> {
+    let key = (call_expr.get_syntax_id(), var_count);
+    if let Some(types) = cache.call_arg_types_cache.get(&key) {
+        return types.as_ref().clone();
+    }
+    if let Some(var_count) = var_count {
+        let full_key = (call_expr.get_syntax_id(), None);
+        if let Some(types) = cache.call_arg_types_cache.get(&full_key)
+            && types.len() >= var_count
+        {
+            return types[..var_count].to_vec();
+        }
+    }
+
+    let types = call_expr
+        .get_args_list()
+        .and_then(|args| {
+            let exprs = args.get_args().collect::<Vec<_>>();
+            infer_expr_list_types(db, cache, &exprs, var_count, |db, cache, expr| {
+                Ok(infer_expr(db, cache, expr).unwrap_or(LuaType::Unknown))
+            })
+            .ok()
+        })
+        .unwrap_or_default();
+    cache
+        .call_arg_types_cache
+        .insert(key, Arc::new(types.clone()));
+    types
 }
 
 pub fn infer_expr_list_types<F>(

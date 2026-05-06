@@ -6,8 +6,9 @@ use rowan::TextSize;
 
 use super::{InferFailReason, InferResult, infer_expr};
 use crate::{
-    FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, TypeOps,
+    CacheEntry, FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel,
+    TypeOps,
     compilation::analyzer::infer_for_range_iter_expr_func,
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
@@ -37,12 +38,7 @@ pub fn infer_name_expr(
         .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&range));
     let result = if let Some(decl_id) = decl_id {
-        infer_expr_narrow_type(
-            db,
-            cache,
-            LuaExpr::NameExpr(name_expr.clone()),
-            VarRefId::VarRef(decl_id),
-        )
+        infer_local_decl_name_type(db, cache, &name_expr, decl_id)
     } else {
         if let Some(implicit_module_type) =
             infer_legacy_module_implicit_type(db, file_id, name_expr.get_position(), name)
@@ -59,15 +55,12 @@ pub fn infer_name_expr(
         }
 
         match get_name_expr_var_ref_id(db, cache, &name_expr) {
-            Some(var_ref_id) => infer_expr_narrow_type(
-                db,
-                cache,
-                LuaExpr::NameExpr(name_expr.clone()),
-                var_ref_id,
-            )
-            .or_else(|_| {
-                infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-            }),
+            Some(var_ref_id) => {
+                infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id)
+                    .or_else(|_| {
+                        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+                    })
+            }
             None => infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name),
         }
     };
@@ -95,12 +88,29 @@ pub fn infer_name_expr(
     result
 }
 
+fn infer_local_decl_name_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+    decl_id: LuaDeclId,
+) -> InferResult {
+    let var_ref_id = VarRefId::VarRef(decl_id);
+    infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id)
+}
+
 fn try_infer_enclosing_for_range_iter_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
     decl_id: LuaDeclId,
 ) -> Option<LuaType> {
+    if let Some(cached) = cache.for_range_iter_var_type_cache.get(&decl_id).cloned() {
+        return match cached {
+            CacheEntry::Cache(typ) => Some(typ),
+            CacheEntry::Ready | CacheEntry::Error(_) => None,
+        };
+    }
+
     let for_range = name_expr
         .syntax()
         .ancestors()
@@ -110,13 +120,28 @@ fn try_infer_enclosing_for_range_iter_type(
         .enumerate()
         .find_map(|(idx, var_name)| (var_name.get_position() == decl_id.position).then_some(idx))?;
     let iter_exprs = for_range.get_expr_list().collect::<Vec<_>>();
-    let iter_var_types = infer_for_range_iter_expr_func(db, cache, &iter_exprs).ok()?;
+    cache
+        .for_range_iter_var_type_cache
+        .insert(decl_id, CacheEntry::Ready);
+    let iter_var_types = match infer_for_range_iter_expr_func(db, cache, &iter_exprs) {
+        Ok(iter_var_types) => iter_var_types,
+        Err(reason) => {
+            cache
+                .for_range_iter_var_type_cache
+                .insert(decl_id, CacheEntry::Error(reason));
+            return None;
+        }
+    };
     let ret_type = iter_var_types
         .get_type(var_idx)
         .cloned()
         .unwrap_or(LuaType::Unknown);
+    let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
+    cache
+        .for_range_iter_var_type_cache
+        .insert(decl_id, CacheEntry::Cache(ret_type.clone()));
 
-    Some(TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil))
+    Some(ret_type)
 }
 
 fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Option<LuaType> {

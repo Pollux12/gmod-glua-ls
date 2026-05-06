@@ -286,10 +286,22 @@ fn name_expr_has_local_binding(
     cache: &mut LuaInferCache,
     name_expr: &glua_parser::LuaNameExpr,
 ) -> bool {
-    db.get_reference_index()
-        .get_local_reference(&cache.get_file_id())
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+
+    let file_id = cache.get_file_id();
+    let by_reference = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-        .is_some()
+        .is_some();
+    let by_scope = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)
+        .and_then(|decl_tree| decl_tree.find_local_decl(&name, name_expr.get_position()))
+        .is_some();
+    by_reference || by_scope
 }
 
 fn is_builtin_or_unresolved_global_name(
