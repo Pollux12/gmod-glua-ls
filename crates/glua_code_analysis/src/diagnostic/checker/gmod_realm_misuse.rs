@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use glua_parser::{
@@ -8,9 +8,8 @@ use glua_parser::{
 use rowan::{NodeOrToken, TextRange, TextSize};
 
 use crate::{
-    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaDiagnosticConfig, LuaInferCache,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, SemanticDeclLevel, SemanticModel,
-    WorkspaceId,
+    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -58,6 +57,7 @@ impl Checker for GmodRealmMisuseChecker {
 
         let mut decl_annotation_cache = HashMap::new();
         let mut callee_realm_cache: CalleeRealmCache = HashMap::new();
+        let mut member_candidate_cache: MemberCandidateCache = HashMap::new();
         let precomputed_callee_realms = shared_data
             .as_ref()
             .and_then(|s| s.callee_realms_by_workspace.get(&workspace_id))
@@ -81,6 +81,7 @@ impl Checker for GmodRealmMisuseChecker {
                 &gm_method_realms,
                 &mut decl_annotation_cache,
                 &mut callee_realm_cache,
+                &mut member_candidate_cache,
                 precomputed_callee_realms,
             );
             if callee_realms.is_empty() {
@@ -191,6 +192,7 @@ struct AnnotatedRealmRange {
 pub type GmMethodRealmMap = HashMap<String, Vec<ResolvedRealm>>;
 type DeclAnnotationRealmCache = HashMap<FileId, Vec<AnnotatedRealmRange>>;
 type CalleeRealmCache = HashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
+type MemberCandidateCache = HashMap<(LuaType, LuaMemberKey), Vec<LuaMemberId>>;
 
 fn resolve_callee_realms(
     context: &DiagnosticContext,
@@ -199,6 +201,7 @@ fn resolve_callee_realms(
     gm_method_realms: &GmMethodRealmMap,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
     callee_realm_cache: &mut CalleeRealmCache,
+    member_candidate_cache: &mut MemberCandidateCache,
     precomputed_callee_realms: Option<&PrecomputedCalleeRealmMap>,
 ) -> Vec<ResolvedRealm> {
     // Fast path: GM method annotations (O(1) HashMap lookup, no inference needed)
@@ -220,17 +223,11 @@ fn resolve_callee_realms(
         SemanticDeclLevel::default(),
     );
 
-    // Check caches — local first, then immutable workspace precompute.
+    // Check file-local cache first. Immutable precomputed decl realms are used
+    // below as a fallback after richer call-site candidates have been considered.
     if let Some(ref decl) = semantic_decl {
         if let Some(cached) = callee_realm_cache.get(decl) {
             return cached.clone();
-        }
-        if let Some(precomputed) = precomputed_callee_realms
-            && let Some(cached) = precomputed.get(decl)
-        {
-            let result = cached.clone();
-            callee_realm_cache.insert(decl.clone(), result.clone());
-            return result;
         }
     }
 
@@ -243,6 +240,7 @@ fn resolve_callee_realms(
         call_expr,
         gm_method_realms,
         decl_annotation_cache,
+        member_candidate_cache,
     ) && !member_realms.is_empty()
     {
         realms = member_realms;
@@ -260,7 +258,11 @@ fn resolve_callee_realms(
             push_unique_realm(&mut realms, realm);
         }
 
-        if let Some(realm) =
+        if let Some(precomputed) = precomputed_callee_realms.and_then(|map| map.get(decl)) {
+            for realm in precomputed {
+                push_unique_realm(&mut realms, *realm);
+            }
+        } else if let Some(realm) =
             resolve_decl_realm(context, semantic_model, decl, decl_annotation_cache)
         {
             push_unique_realm(&mut realms, realm);
@@ -268,14 +270,21 @@ fn resolve_callee_realms(
 
         if let LuaSemanticDeclId::Member(member_id) = decl.clone()
             && let Some(origin_owner) = semantic_model.get_member_origin_owner(member_id)
-            && let Some(realm) = resolve_decl_realm(
+        {
+            if let Some(precomputed) =
+                precomputed_callee_realms.and_then(|map| map.get(&origin_owner))
+            {
+                for realm in precomputed {
+                    push_unique_realm(&mut realms, *realm);
+                }
+            } else if let Some(realm) = resolve_decl_realm(
                 context,
                 semantic_model,
                 &origin_owner,
                 decl_annotation_cache,
-            )
-        {
-            push_unique_realm(&mut realms, realm);
+            ) {
+                push_unique_realm(&mut realms, realm);
+            }
         }
     }
 
@@ -342,6 +351,7 @@ fn resolve_member_candidate_realms(
     call_expr: &LuaCallExpr,
     gm_method_realms: &GmMethodRealmMap,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
+    member_candidate_cache: &mut MemberCandidateCache,
 ) -> Option<Vec<ResolvedRealm>> {
     let prefix_expr = call_expr.get_prefix_expr()?;
     let index_expr = LuaIndexExpr::cast(prefix_expr.syntax().clone())?;
@@ -361,8 +371,12 @@ fn resolve_member_candidate_realms(
         // For realm diagnostics we need ALL candidate declarations across
         // every workspace priority tier. The normal member-resolution path
         // `get_member_info_with_key` returns only realm-compatible members.
-        let all_member_ids =
-            collect_all_member_ids_for_type_key(semantic_model, &owner_type, &member_key);
+        let all_member_ids = collect_all_member_ids_for_type_key(
+            semantic_model,
+            &owner_type,
+            &member_key,
+            member_candidate_cache,
+        );
         for member_id in all_member_ids {
             if context.is_cancelled() {
                 return Some(realms);
@@ -553,7 +567,13 @@ fn collect_all_member_ids_for_type_key(
     semantic_model: &SemanticModel,
     owner_type: &LuaType,
     member_key: &LuaMemberKey,
-) -> Vec<crate::LuaMemberId> {
+    member_candidate_cache: &mut MemberCandidateCache,
+) -> Vec<LuaMemberId> {
+    let cache_key = (owner_type.clone(), member_key.clone());
+    if let Some(cached) = member_candidate_cache.get(&cache_key) {
+        return cached.clone();
+    }
+
     let db = semantic_model.get_db();
     let member_index = db.get_member_index();
 
@@ -572,6 +592,7 @@ fn collect_all_member_ids_for_type_key(
         }
     }
 
+    member_candidate_cache.insert(cache_key, result.clone());
     result
 }
 
@@ -582,18 +603,18 @@ fn collect_all_member_ids_for_type_key(
 /// no member-info construction). Recursion is bounded by `depth` to guard
 /// against pathological self-referential type graphs.
 fn owner_type_to_member_owners(typ: &LuaType, db: &crate::DbIndex) -> Vec<LuaMemberOwner> {
-    owner_type_to_member_owners_inner(typ, db, 0)
+    let mut visited = HashSet::new();
+    owner_type_to_member_owners_inner(typ, db, &mut visited)
 }
 
 fn owner_type_to_member_owners_inner(
     typ: &LuaType,
     db: &crate::DbIndex,
-    depth: u8,
+    visited: &mut HashSet<LuaType>,
 ) -> Vec<LuaMemberOwner> {
-    if depth > 8 {
+    if !visited.insert(typ.clone()) {
         return Vec::new();
     }
-    let next_depth = depth + 1;
     match typ {
         LuaType::TableConst(id) => vec![LuaMemberOwner::Element(id.clone())],
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
@@ -608,25 +629,25 @@ fn owner_type_to_member_owners_inner(
             owners.extend(owner_type_to_member_owners_inner(
                 inst.get_base(),
                 db,
-                next_depth,
+                visited,
             ));
             owners
         }
-        LuaType::TableOf(inner) => owner_type_to_member_owners_inner(inner, db, next_depth),
+        LuaType::TableOf(inner) => owner_type_to_member_owners_inner(inner, db, visited),
         LuaType::Union(union_type) => {
             let mut owners = Vec::new();
             for sub in union_type.into_vec() {
-                owners.extend(owner_type_to_member_owners_inner(&sub, db, next_depth));
+                owners.extend(owner_type_to_member_owners_inner(&sub, db, visited));
             }
             owners
         }
         LuaType::MultiLineUnion(multi_union) => {
-            owner_type_to_member_owners_inner(&multi_union.to_union(), db, next_depth)
+            owner_type_to_member_owners_inner(&multi_union.to_union(), db, visited)
         }
         LuaType::Intersection(intersection_type) => {
             let mut owners = Vec::new();
             for sub in intersection_type.get_types().iter() {
-                owners.extend(owner_type_to_member_owners_inner(sub, db, next_depth));
+                owners.extend(owner_type_to_member_owners_inner(sub, db, visited));
             }
             owners
         }
@@ -634,7 +655,7 @@ fn owner_type_to_member_owners_inner(
             if let Some(module_info) = db.get_module_index().get_module(*file_id)
                 && let Some(export_type) = &module_info.export_type
             {
-                owner_type_to_member_owners_inner(export_type, db, next_depth)
+                owner_type_to_member_owners_inner(export_type, db, visited)
             } else {
                 Vec::new()
             }
@@ -928,14 +949,10 @@ pub fn precompute_callee_realms_for_workspace(
     db: &crate::DbIndex,
     workspace_id: WorkspaceId,
     workspace_file_ids: &[FileId],
-    gm_method_realms: &GmMethodRealmMap,
 ) -> PrecomputedCalleeRealmMap {
     let module_index = db.get_module_index();
     let mut callee_realms = HashMap::new();
     let mut decl_annotation_cache = HashMap::new();
-    let precompute_config = Arc::new(LuaDiagnosticConfig::default());
-    let mut workspace_callee_realm_cache: CalleeRealmCache = HashMap::new();
-
     for &file_id in workspace_file_ids {
         let candidate_workspace_id = module_index
             .get_workspace_id(file_id)
@@ -999,65 +1016,6 @@ pub fn precompute_callee_realms_for_workspace(
             resolve_precomputed_decl_realm(db, &semantic_decl, &mut decl_annotation_cache)
         {
             callee_realms.insert(semantic_decl, vec![resolved]);
-        }
-    }
-
-    // Enrich declaration realms with the same multi-source callee resolution used by
-    // diagnostic-time resolution (member candidates, global-name candidates, origin owners, etc).
-    // This keeps immutable precompute payloads aligned with the legacy per-file cache semantics.
-    for &file_id in workspace_file_ids {
-        let candidate_workspace_id = module_index
-            .get_workspace_id(file_id)
-            .unwrap_or(WorkspaceId::MAIN);
-        if module_index
-            .workspace_resolution_priority(workspace_id, candidate_workspace_id)
-            .is_none()
-        {
-            continue;
-        }
-        let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
-            continue;
-        };
-        let semantic_model = SemanticModel::new(
-            file_id,
-            db,
-            LuaInferCache::new(file_id, Default::default()),
-            Arc::new(db.get_emmyrc().clone()),
-            tree.get_chunk_node(),
-        );
-        let context = DiagnosticContext::new(
-            file_id,
-            db,
-            precompute_config.clone(),
-            tokio_util::sync::CancellationToken::new(),
-        );
-        for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
-            let Some(prefix_expr) = call_expr.get_prefix_expr() else {
-                continue;
-            };
-            let Some(semantic_decl) = semantic_model.find_decl(
-                NodeOrToken::Node(prefix_expr.syntax().clone()),
-                SemanticDeclLevel::default(),
-            ) else {
-                continue;
-            };
-
-            let resolved_realms = resolve_callee_realms(
-                &context,
-                &semantic_model,
-                &call_expr,
-                gm_method_realms,
-                &mut decl_annotation_cache,
-                &mut workspace_callee_realm_cache,
-                None,
-            );
-            if resolved_realms.is_empty() {
-                continue;
-            }
-            let entry = callee_realms.entry(semantic_decl).or_insert_with(Vec::new);
-            for resolved in resolved_realms {
-                push_unique_realm(entry, resolved);
-            }
         }
     }
 
