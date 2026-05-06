@@ -1080,6 +1080,7 @@ pub enum LuaAliasCallKind {
     Unpack,
     RawGet,
     Merge,
+    Split,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]

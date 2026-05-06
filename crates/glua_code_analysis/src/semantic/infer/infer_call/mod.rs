@@ -43,8 +43,8 @@ pub fn infer_call_expr_func(
 ) -> InferCallFuncResult {
     let syntax_id = call_expr.get_syntax_id();
     let key = (syntax_id, args_count, call_expr_type.clone());
-    if let Some(cache) = cache.call_cache.get(&key) {
-        match cache {
+    if let Some(cache_entry) = cache.call_cache.get(&key) {
+        match cache_entry {
             CacheEntry::Cache(ty) => return Ok(ty.clone()),
             _ => return Err(InferFailReason::RecursiveInfer),
         }
@@ -189,7 +189,7 @@ fn infer_wrapped_setmetatable_call(
     args_count: Option<usize>,
 ) -> Option<InferCallFuncResult> {
     match call_expr_type {
-        LuaType::TableConst(_) | LuaType::Instance(_) => {}
+        LuaType::Table | LuaType::TableConst(_) | LuaType::Instance(_) => {}
         _ => return None,
     }
 
@@ -551,7 +551,7 @@ fn infer_table_type_doc_function(db: &DbIndex, table: InFiled<TextRange>) -> Inf
         let func = operator.get_operator_func(db);
         match func {
             LuaType::DocFunction(func) => {
-                return Ok(func);
+                return Ok(normalize_call_operator_doc_function(func.as_ref()));
             }
             LuaType::Signature(signature_id) => {
                 let signature = db
@@ -572,6 +572,21 @@ fn infer_table_type_doc_function(db: &DbIndex, table: InFiled<TextRange>) -> Inf
     }
 
     Err(InferFailReason::None)
+}
+
+fn normalize_call_operator_doc_function(func: &LuaFunctionType) -> Arc<LuaFunctionType> {
+    let mut params = func.get_params().to_vec();
+    if !params.is_empty() && !func.is_colon_define() {
+        params.remove(0);
+    }
+
+    Arc::new(LuaFunctionType::new(
+        func.get_async_state(),
+        false,
+        func.is_variadic(),
+        params,
+        func.get_ret().clone(),
+    ))
 }
 
 fn infer_union(

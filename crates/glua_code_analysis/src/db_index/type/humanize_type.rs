@@ -400,6 +400,7 @@ fn humanize_call_type(db: &DbIndex, inner: &LuaAliasCallType, level: RenderLevel
         LuaAliasCallKind::Index => "index",
         LuaAliasCallKind::RawGet => "rawget",
         LuaAliasCallKind::Merge => "Merge",
+        LuaAliasCallKind::Split => "split",
     };
     let operands = inner
         .get_operands()

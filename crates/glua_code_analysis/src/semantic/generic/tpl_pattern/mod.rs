@@ -285,8 +285,8 @@ fn object_tpl_pattern_match_member_owner_match(
     };
 
     let members = get_member_map(context.db, &owner_type).ok_or(InferFailReason::None)?;
-    for (k, v) in members {
-        let resolve_key = match &k {
+    for (k, v) in members.iter() {
+        let resolve_key = match k {
             LuaMemberKey::Integer(i) => Some(LuaType::IntegerConst(*i)),
             LuaMemberKey::Name(s) => Some(LuaType::StringConst(s.clone().into())),
             _ => None,
@@ -296,7 +296,7 @@ fn object_tpl_pattern_match_member_owner_match(
             1 => v[0].typ.clone(),
             _ => {
                 let mut types = Vec::new();
-                for m in &v {
+                for m in v {
                     types.push(m.typ.clone());
                 }
                 LuaType::from_vec(types)
@@ -498,11 +498,11 @@ fn table_generic_tpl_pattern_member_owner_match(
     let target_key_type = table_generic_params[0].clone();
     let mut keys = Vec::new();
     let mut values = Vec::new();
-    for (k, v) in members {
+    for (k, v) in members.iter() {
         let key_type = match k {
-            LuaMemberKey::Integer(i) => LuaType::IntegerConst(i),
+            LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
             LuaMemberKey::Name(s) => LuaType::StringConst(s.clone().into()),
-            LuaMemberKey::ExprType(typ) => typ,
+            LuaMemberKey::ExprType(typ) => typ.clone(),
             _ => continue,
         };
 
