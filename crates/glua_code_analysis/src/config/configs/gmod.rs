@@ -112,7 +112,7 @@ pub enum EmmyrcGmodScriptedClassScopeEntry {
     Definition(Box<EmmyrcGmodScriptedClassDefinition>),
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[derive(Serialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedClassDefinition {
     pub id: String,
@@ -150,14 +150,14 @@ pub struct EmmyrcGmodScriptedClassScaffold {
     pub files: Vec<EmmyrcGmodScriptedClassScaffoldFile>,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedClassScaffoldFile {
     pub path: String,
     pub template: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedGmodScriptedClassDefinition {
     pub id: String,
@@ -181,6 +181,273 @@ pub struct ResolvedGmodScriptedClassDefinition {
 pub struct ResolvedGmodScriptedClassMatch {
     pub definition: ResolvedGmodScriptedClassDefinition,
     pub class_name: String,
+}
+
+impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "id",
+            "label",
+            "path",
+            "include",
+            "exclude",
+            "classGlobal",
+            "parentId",
+            "icon",
+            "rootDir",
+            "scaffold",
+            "classNamePrefix",
+            "disabled",
+        ];
+
+        struct DefinitionVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DefinitionVisitor {
+            type Value = EmmyrcGmodScriptedClassDefinition;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct EmmyrcGmodScriptedClassDefinition")
+            }
+
+            fn visit_map<MapType>(self, mut map: MapType) -> Result<Self::Value, MapType::Error>
+            where
+                MapType: serde::de::MapAccess<'de>,
+            {
+                let mut id = None;
+                let mut label = None;
+                let mut path = None;
+                let mut include = None;
+                let mut exclude = None;
+                let mut class_global = None;
+                let mut parent_id = None;
+                let mut icon = None;
+                let mut root_dir = None;
+                let mut scaffold = None;
+                let mut class_name_prefix = None;
+                let mut disabled = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => read_unique_field(&mut id, &mut map, "id")?,
+                        "label" => read_unique_field(&mut label, &mut map, "label")?,
+                        "path" => read_unique_field(&mut path, &mut map, "path")?,
+                        "include" => read_unique_field(&mut include, &mut map, "include")?,
+                        "exclude" => read_unique_field(&mut exclude, &mut map, "exclude")?,
+                        "classGlobal" => {
+                            read_unique_field(&mut class_global, &mut map, "classGlobal")?
+                        }
+                        "parentId" => read_unique_field(&mut parent_id, &mut map, "parentId")?,
+                        "icon" => read_unique_field(&mut icon, &mut map, "icon")?,
+                        "rootDir" => read_unique_field(&mut root_dir, &mut map, "rootDir")?,
+                        "scaffold" => read_unique_field(&mut scaffold, &mut map, "scaffold")?,
+                        "classNamePrefix" => {
+                            read_unique_field(&mut class_name_prefix, &mut map, "classNamePrefix")?
+                        }
+                        "disabled" => read_unique_field(&mut disabled, &mut map, "disabled")?,
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(EmmyrcGmodScriptedClassDefinition {
+                    id: required_field::<_, MapType::Error>(id, "id")?,
+                    label: label.unwrap_or_default(),
+                    path: path.unwrap_or_default(),
+                    include: include.unwrap_or_default(),
+                    exclude: exclude.unwrap_or_default(),
+                    class_global: class_global.unwrap_or_default(),
+                    parent_id: parent_id.unwrap_or_default(),
+                    icon: icon.unwrap_or_default(),
+                    root_dir: root_dir.unwrap_or_default(),
+                    scaffold: scaffold.unwrap_or_default(),
+                    class_name_prefix: class_name_prefix.unwrap_or_default(),
+                    disabled: disabled.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "EmmyrcGmodScriptedClassDefinition",
+            FIELDS,
+            DefinitionVisitor,
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassScaffoldFile {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &["path", "template"];
+
+        struct ScaffoldFileVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ScaffoldFileVisitor {
+            type Value = EmmyrcGmodScriptedClassScaffoldFile;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct EmmyrcGmodScriptedClassScaffoldFile")
+            }
+
+            fn visit_map<MapType>(self, mut map: MapType) -> Result<Self::Value, MapType::Error>
+            where
+                MapType: serde::de::MapAccess<'de>,
+            {
+                let mut path = None;
+                let mut template = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "path" => read_unique_field(&mut path, &mut map, "path")?,
+                        "template" => read_unique_field(&mut template, &mut map, "template")?,
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(EmmyrcGmodScriptedClassScaffoldFile {
+                    path: required_field::<_, MapType::Error>(path, "path")?,
+                    template: required_field::<_, MapType::Error>(template, "template")?,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "EmmyrcGmodScriptedClassScaffoldFile",
+            FIELDS,
+            ScaffoldFileVisitor,
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "id",
+            "label",
+            "path",
+            "include",
+            "exclude",
+            "classGlobal",
+            "parentId",
+            "icon",
+            "rootDir",
+            "scaffold",
+            "classNamePrefix",
+        ];
+
+        struct ResolvedDefinitionVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ResolvedDefinitionVisitor {
+            type Value = ResolvedGmodScriptedClassDefinition;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct ResolvedGmodScriptedClassDefinition")
+            }
+
+            fn visit_map<MapType>(self, mut map: MapType) -> Result<Self::Value, MapType::Error>
+            where
+                MapType: serde::de::MapAccess<'de>,
+            {
+                let mut id = None;
+                let mut label = None;
+                let mut path = None;
+                let mut include = None;
+                let mut exclude = None;
+                let mut class_global = None;
+                let mut parent_id = None;
+                let mut icon = None;
+                let mut root_dir = None;
+                let mut scaffold = None;
+                let mut class_name_prefix = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => read_unique_field(&mut id, &mut map, "id")?,
+                        "label" => read_unique_field(&mut label, &mut map, "label")?,
+                        "path" => read_unique_field(&mut path, &mut map, "path")?,
+                        "include" => read_unique_field(&mut include, &mut map, "include")?,
+                        "exclude" => read_unique_field(&mut exclude, &mut map, "exclude")?,
+                        "classGlobal" => {
+                            read_unique_field(&mut class_global, &mut map, "classGlobal")?
+                        }
+                        "parentId" => read_unique_field(&mut parent_id, &mut map, "parentId")?,
+                        "icon" => read_unique_field(&mut icon, &mut map, "icon")?,
+                        "rootDir" => read_unique_field(&mut root_dir, &mut map, "rootDir")?,
+                        "scaffold" => read_unique_field(&mut scaffold, &mut map, "scaffold")?,
+                        "classNamePrefix" => {
+                            read_unique_field(&mut class_name_prefix, &mut map, "classNamePrefix")?
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(ResolvedGmodScriptedClassDefinition {
+                    id: required_field::<_, MapType::Error>(id, "id")?,
+                    label: required_field::<_, MapType::Error>(label, "label")?,
+                    path: required_field::<_, MapType::Error>(path, "path")?,
+                    include: required_field::<_, MapType::Error>(include, "include")?,
+                    exclude: required_field::<_, MapType::Error>(exclude, "exclude")?,
+                    class_global: required_field::<_, MapType::Error>(class_global, "classGlobal")?,
+                    parent_id: parent_id.unwrap_or_default(),
+                    icon: icon.unwrap_or_default(),
+                    root_dir: required_field::<_, MapType::Error>(root_dir, "rootDir")?,
+                    scaffold: scaffold.unwrap_or_default(),
+                    class_name_prefix: class_name_prefix.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "ResolvedGmodScriptedClassDefinition",
+            FIELDS,
+            ResolvedDefinitionVisitor,
+        )
+    }
+}
+
+fn read_unique_field<'de, MapType, FieldType>(
+    field: &mut Option<FieldType>,
+    map: &mut MapType,
+    name: &'static str,
+) -> Result<(), MapType::Error>
+where
+    MapType: serde::de::MapAccess<'de>,
+    FieldType: Deserialize<'de>,
+{
+    if field.is_some() {
+        return Err(<MapType::Error as serde::de::Error>::duplicate_field(name));
+    }
+
+    *field = Some(map.next_value()?);
+    Ok(())
+}
+
+fn required_field<FieldType, ErrorType>(
+    field: Option<FieldType>,
+    name: &'static str,
+) -> Result<FieldType, ErrorType>
+where
+    ErrorType: serde::de::Error,
+{
+    field.ok_or_else(|| ErrorType::missing_field(name))
 }
 
 fn enabled_default() -> bool {
@@ -1092,7 +1359,7 @@ impl EmmyrcGmodScriptedClassScopes {
         })
     }
 
-    pub(crate) fn scan_scripted_class_scope_files<'a, T>(
+    pub fn scan_scripted_class_scope_files<'a, T>(
         &self,
         files: impl IntoIterator<Item = (T, &'a Path)>,
     ) -> (HashSet<T>, HashMap<T, ResolvedGmodScriptedClassMatch>)
@@ -1449,6 +1716,135 @@ mod tests {
         verify_that!(gmod.detect_realm_from_calls, eq(None))?;
         verify_that!(gmod.infer_dynamic_fields, eq(true))?;
         verify_that!(gmod.dynamic_fields_global, eq(true))
+    }
+
+    #[gtest]
+    fn test_scripted_class_definition_deserialize_required_field_edges() -> Result<()> {
+        let definition: EmmyrcGmodScriptedClassDefinition = serde_json::from_str(
+            r#"{
+                "id": "custom",
+                "label": null,
+                "path": null,
+                "classNamePrefix": null,
+                "unknown": true
+            }"#,
+        )
+        .or_fail()?;
+
+        verify_that!(definition.id.as_str(), eq("custom"))?;
+        verify_that!(definition.label.is_none(), eq(true))?;
+        verify_that!(definition.path.is_none(), eq(true))?;
+        verify_that!(definition.class_name_prefix.is_none(), eq(true))?;
+
+        let missing_id =
+            serde_json::from_str::<EmmyrcGmodScriptedClassDefinition>(r#"{ "label": "Custom" }"#)
+                .unwrap_err();
+        verify_that!(
+            missing_id.to_string(),
+            contains_substring("missing field `id`")
+        )?;
+
+        let duplicate_id = serde_json::from_str::<EmmyrcGmodScriptedClassDefinition>(
+            r#"{ "id": "first", "id": "second" }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            duplicate_id.to_string(),
+            contains_substring("duplicate field `id`")
+        )
+    }
+
+    #[gtest]
+    fn test_scripted_class_scaffold_file_deserialize_required_field_edges() -> Result<()> {
+        let file: EmmyrcGmodScriptedClassScaffoldFile = serde_json::from_str(
+            r#"{
+                "path": "{{name}}/shared.lua",
+                "template": "ent_shared.lua",
+                "unknown": true
+            }"#,
+        )
+        .or_fail()?;
+
+        verify_that!(file.path.as_str(), eq("{{name}}/shared.lua"))?;
+        verify_that!(file.template.as_str(), eq("ent_shared.lua"))?;
+
+        let missing_template = serde_json::from_str::<EmmyrcGmodScriptedClassScaffoldFile>(
+            r#"{ "path": "{{name}}/shared.lua" }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            missing_template.to_string(),
+            contains_substring("missing field `template`")
+        )?;
+
+        let duplicate_path = serde_json::from_str::<EmmyrcGmodScriptedClassScaffoldFile>(
+            r#"{ "path": "one.lua", "path": "two.lua", "template": "base.lua" }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            duplicate_path.to_string(),
+            contains_substring("duplicate field `path`")
+        )
+    }
+
+    #[gtest]
+    fn test_resolved_scripted_class_definition_deserialize_required_field_edges() -> Result<()> {
+        let definition: ResolvedGmodScriptedClassDefinition = serde_json::from_str(
+            r#"{
+                "id": "custom",
+                "label": "Custom",
+                "path": ["custom"],
+                "include": ["custom/**"],
+                "exclude": [],
+                "classGlobal": "CUSTOM",
+                "parentId": null,
+                "icon": null,
+                "rootDir": "lua/custom",
+                "scaffold": null,
+                "classNamePrefix": null,
+                "unknown": true
+            }"#,
+        )
+        .or_fail()?;
+
+        verify_that!(definition.id.as_str(), eq("custom"))?;
+        verify_that!(definition.path.as_slice(), eq(&["custom".to_string()]))?;
+        verify_that!(definition.parent_id.is_none(), eq(true))?;
+        verify_that!(definition.scaffold.is_none(), eq(true))?;
+
+        let missing_root_dir = serde_json::from_str::<ResolvedGmodScriptedClassDefinition>(
+            r#"{
+                "id": "custom",
+                "label": "Custom",
+                "path": ["custom"],
+                "include": [],
+                "exclude": [],
+                "classGlobal": "CUSTOM"
+            }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            missing_root_dir.to_string(),
+            contains_substring("missing field `rootDir`")
+        )?;
+
+        let duplicate_class_global = serde_json::from_str::<ResolvedGmodScriptedClassDefinition>(
+            r#"{
+                "id": "custom",
+                "label": "Custom",
+                "path": ["custom"],
+                "include": [],
+                "exclude": [],
+                "classGlobal": "CUSTOM",
+                "classGlobal": "OTHER",
+                "rootDir": "lua/custom"
+            }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            duplicate_class_global.to_string(),
+            contains_substring("duplicate field `classGlobal`")
+        )
     }
 
     #[gtest]

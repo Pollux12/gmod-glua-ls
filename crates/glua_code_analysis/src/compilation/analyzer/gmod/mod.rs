@@ -1638,9 +1638,6 @@ fn resolve_getmember_network_var_delegations(
     scripted_scope_files: &HashSet<FileId>,
     context: &AnalyzeContext,
 ) {
-    // Build class_name -> file_id reverse mapping from scoped class info
-    let class_file_map = build_class_file_map(db);
-
     // Collect files to process: only scripted scope files whose source
     // contains "scripted_ents.GetMember".  Collect into owned structures
     // so we can drop the immutable VFS borrow before mutable db access.
@@ -1665,6 +1662,14 @@ fn resolve_getmember_network_var_delegations(
             .collect()
     };
 
+    if candidate_files.is_empty() {
+        return;
+    }
+
+    // Build class_name -> file_id reverse mapping only when there are
+    // delegating files to resolve; this avoids a full VFS scan on ordinary edits.
+    let class_file_map = build_class_file_map(db);
+
     for (file_id, chunk, class_decl_id) in &candidate_files {
         find_and_resolve_getmember_delegations(db, *file_id, class_decl_id, chunk, &class_file_map);
     }
@@ -1684,8 +1689,8 @@ fn build_class_file_map(db: &DbIndex) -> HashMap<String, (FileId, LuaTypeDeclId)
             // Prefer init.lua files (canonical class file) over secondary files
             let is_init = vfs
                 .get_file_path(&file_id)
-                .map(|p| p.to_string_lossy().ends_with("init.lua"))
-                .unwrap_or(false);
+                .and_then(|p| p.file_name().and_then(|name| name.to_str()))
+                .is_some_and(|name| name == "init.lua");
             if is_init {
                 map.insert(info.class_name.clone(), (file_id, class_decl_id));
             } else {
@@ -1751,9 +1756,12 @@ fn find_and_resolve_getmember_delegations(
                 continue;
             };
 
-            let Some((target_class, _target_method)) = getmember_locals.get(&caller_name) else {
+            let Some((target_class, target_method)) = getmember_locals.get(&caller_name) else {
                 continue;
             };
+            if target_method != "SetupDataTables" {
+                continue;
+            }
 
             // Verify the first argument is "self"
             let Some(args_list) = call_expr.get_args_list() else {
@@ -1791,7 +1799,11 @@ fn find_and_resolve_getmember_delegations(
         let Some(LuaExpr::CallExpr(inner_call)) = node.get_prefix_expr() else {
             continue;
         };
-        if let Some((target_class, _target_method)) = extract_getmember_call(&inner_call, true) {
+        if let Some((target_class, target_method)) = extract_getmember_call(&inner_call, true) {
+            if target_method != "SetupDataTables" {
+                continue;
+            }
+
             let Some(args_list) = node.get_args_list() else {
                 continue;
             };

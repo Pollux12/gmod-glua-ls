@@ -4869,6 +4869,113 @@ mod test {
     }
 
     #[gtest]
+    fn test_getmember_delegation_ignores_non_setupdatatables_method() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "Speed")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:Think()
+                    local Think = scripted_ents.GetMember("target_ent", "Think")
+                    Think(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("delegating_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on delegating_ent");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            !member_names.contains(&"GetSpeed".to_string()),
+            "unexpected copied GetSpeed from non-SetupDataTables delegation in {member_names:?}"
+        );
+        assert!(
+            !member_names.contains(&"SetSpeed".to_string()),
+            "unexpected copied SetSpeed from non-SetupDataTables delegation in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_prefers_exact_init_over_cl_init() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "ServerSpeed")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/target_ent/cl_init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "ClientOnlySpeed")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    scripted_ents.GetMember("target_ent", "SetupDataTables")(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("delegating_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on delegating_ent");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetServerSpeed".to_string()),
+            "missing GetServerSpeed from exact init.lua in {member_names:?}"
+        );
+        assert!(
+            !member_names.contains(&"GetClientOnlySpeed".to_string()),
+            "unexpected GetClientOnlySpeed copied from cl_init.lua in {member_names:?}"
+        );
+    }
+
+    #[gtest]
     fn test_getmember_delegation_target_not_found_does_not_crash() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
