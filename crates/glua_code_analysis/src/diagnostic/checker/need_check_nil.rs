@@ -4,7 +4,10 @@ use glua_parser::{
 };
 use rowan::TextRange;
 
-use crate::{DiagnosticCode, LuaType, LuaUnionType, SemanticModel};
+use crate::{
+    DiagnosticCode, LuaType, LuaUnionType, SemanticModel,
+    semantic::contains_gmod_invalid_entity_type,
+};
 
 use super::{
     AssignmentPrefixEvents, Checker, DiagnosticContext,
@@ -55,7 +58,7 @@ fn check_call_expr(
 
     if let LuaExpr::IndexExpr(index_expr) = &prefix {
         let receiver = index_expr.get_prefix_expr()?;
-        if report_nullable_receiver(context, semantic_model, &receiver) {
+        if report_unsafe_receiver(context, semantic_model, &receiver) {
             return Some(());
         }
     }
@@ -84,7 +87,7 @@ fn check_call_expr(
     Some(())
 }
 
-fn report_nullable_receiver(
+fn report_unsafe_receiver(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     receiver: &LuaExpr,
@@ -92,23 +95,38 @@ fn report_nullable_receiver(
     let Ok(receiver_type) = semantic_model.infer_expr(receiver.clone()) else {
         return false;
     };
-    if !receiver_type.is_nullable() {
-        return false;
-    }
-
-    // Definite nil receivers should be warning-level unchecked access.
-    // Nullable-but-not-definite receivers remain NeedCheckNil.
-    let diagnostic_code =
-        if receiver_type.is_nil() || should_report_unchecked_nil_access(receiver, &receiver_type) {
+    if receiver_type.is_nullable() {
+        // Definite nil receivers should be warning-level unchecked access.
+        // Nullable-but-not-definite receivers remain NeedCheckNil.
+        let diagnostic_code = if receiver_type.is_nil()
+            || should_report_unchecked_nil_access(receiver, &receiver_type)
+        {
             DiagnosticCode::UncheckedNilAccess
         } else {
             DiagnosticCode::NeedCheckNil
         };
 
+        context.add_diagnostic(
+            diagnostic_code,
+            receiver.get_range(),
+            t!("%{name} may be nil", name = receiver.syntax().text()).to_string(),
+            None,
+        );
+        return true;
+    }
+
+    if !contains_gmod_invalid_entity_type(semantic_model.get_db(), &receiver_type) {
+        return false;
+    }
+
     context.add_diagnostic(
-        diagnostic_code,
+        DiagnosticCode::NeedCheckNil,
         receiver.get_range(),
-        t!("%{name} may be nil", name = receiver.syntax().text()).to_string(),
+        t!(
+            "%{name} may be an invalid entity; check IsValid before calling Entity methods",
+            name = receiver.syntax().text()
+        )
+        .to_string(),
         None,
     );
     true

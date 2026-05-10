@@ -30,7 +30,7 @@ use infer_table::infer_table_expr;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};
 use infer_unary::infer_unary_expr;
 pub use narrow::VarRefId;
-pub(crate) use narrow::get_var_expr_var_ref_id;
+pub(crate) use narrow::{contains_gmod_invalid_entity_type, get_var_expr_var_ref_id};
 
 use rowan::TextRange;
 use smol_str::SmolStr;

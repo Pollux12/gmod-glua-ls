@@ -6,7 +6,9 @@ mod var_ref_id;
 
 use crate::{
     CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason,
-    LuaInferCache, LuaType, infer_param,
+    LuaInferCache, LuaType, TypeOps,
+    db_index::LuaTypeDeclId,
+    get_real_type, infer_param,
     semantic::infer::{
         InferResult,
         infer_name::{find_decl_member_type, infer_global_type},
@@ -16,6 +18,60 @@ pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
 pub use narrow_type::{narrow_down_type, narrow_false_or_nil, remove_false_or_nil};
 pub use var_ref_id::{VarRefId, get_var_expr_var_ref_id};
+
+const GMOD_INVALID_ENTITY_TYPE_NAME: &str = "InvalidEntity";
+
+pub(crate) fn gmod_invalid_entity_type() -> LuaType {
+    LuaType::Ref(LuaTypeDeclId::global(GMOD_INVALID_ENTITY_TYPE_NAME))
+}
+
+pub(crate) fn gmod_invalid_entity_type_is_defined(db: &DbIndex) -> bool {
+    db.get_type_index()
+        .get_type_decl(&LuaTypeDeclId::global(GMOD_INVALID_ENTITY_TYPE_NAME))
+        .is_some()
+}
+
+pub(crate) fn contains_gmod_invalid_entity_type(db: &DbIndex, typ: &LuaType) -> bool {
+    let real_type = get_real_type(db, typ).unwrap_or(typ);
+    match real_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            type_id.get_name() == GMOD_INVALID_ENTITY_TYPE_NAME
+        }
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(|member| contains_gmod_invalid_entity_type(db, member)),
+        LuaType::MultiLineUnion(multi_union) => multi_union
+            .get_unions()
+            .iter()
+            .any(|(member, _)| contains_gmod_invalid_entity_type(db, member)),
+        LuaType::Instance(instance_type) => {
+            contains_gmod_invalid_entity_type(db, instance_type.get_base())
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn remove_gmod_invalid_entity_type(db: &DbIndex, typ: LuaType) -> LuaType {
+    if is_gmod_invalid_entity_type(db, &typ) {
+        return LuaType::Never;
+    }
+
+    TypeOps::Remove.apply(db, &typ, &gmod_invalid_entity_type())
+}
+
+fn is_gmod_invalid_entity_type(db: &DbIndex, typ: &LuaType) -> bool {
+    let real_type = get_real_type(db, typ).unwrap_or(typ);
+    match real_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            type_id.get_name() == GMOD_INVALID_ENTITY_TYPE_NAME
+        }
+        LuaType::Instance(instance_type) => {
+            is_gmod_invalid_entity_type(db, instance_type.get_base())
+        }
+        _ => false,
+    }
+}
 
 pub fn infer_expr_narrow_type(
     db: &DbIndex,

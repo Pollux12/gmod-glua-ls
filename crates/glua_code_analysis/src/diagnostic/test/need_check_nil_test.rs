@@ -306,6 +306,154 @@ mod test {
     }
 
     #[gtest]
+    fn test_invalid_entity_method_requires_isvalid() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class InvalidEntity
+            ---@alias EntityOrNULL Entity|InvalidEntity
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+        let code = r#"
+            local ent = GetEntityOrNULL()
+            ent:GetPos()
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(false)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_truthy_check_does_not_narrow_invalid_entity() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class InvalidEntity
+            ---@alias EntityOrNULL Entity|InvalidEntity
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = GetEntityOrNULL()
+                if ent then
+                    ent:GetPos()
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_narrows_invalid_entity() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class InvalidEntity
+            ---@alias EntityOrNULL Entity|InvalidEntity
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = GetEntityOrNULL()
+                if IsValid(ent) then
+                    ent:GetPos()
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_isentity_does_not_narrow_invalid_entity_to_valid_entity() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class InvalidEntity
+            ---@alias EntityOrNULL Entity|InvalidEntity
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = GetEntityOrNULL()
+                if isentity(ent) then
+                    ent:GetPos()
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_invalid_entity_member_access_without_call_does_not_require_isvalid() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class InvalidEntity
+            ---@alias EntityOrNULL Entity|InvalidEntity
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = GetEntityOrNULL()
+                local get_pos = ent.GetPos
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_truthy_opaque_table_member_narrows_unchecked_nil_access() {
         let mut ws = VirtualWorkspace::new();
         assert_that!(
