@@ -213,4 +213,110 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[gtest]
+    fn test_member_variable_implementation_with_ref_prefix() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_implementation(
+            r#"
+                ---@class MyClass
+                ---@field myField number
+
+                ---@type MyClass
+                local MyClass = {}
+                MyClass.myField = 1
+
+                ---@type MyClass
+                local obj
+                obj.my<??>Field = 2
+            "#,
+            vec![
+                VirtualLocation {
+                    file: "".to_string(),
+                    line: 2,
+                },
+                VirtualLocation {
+                    file: "".to_string(),
+                    line: 6,
+                },
+                VirtualLocation {
+                    file: "".to_string(),
+                    line: 10,
+                },
+            ],
+        ));
+        Ok(())
+    }
+
+    /// Test C: the prefix-name fallback must resolve the prefix semantically,
+    /// not just by name text. An unrelated local named the same as the class
+    /// but typed as a different class must NOT match via the prefix fallback.
+    #[gtest]
+    fn test_implementation_prefix_fallback_requires_semantic_resolution() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        // `MyClass` is a class with field `myField`. A separate file has a
+        // local also named `MyClass` but annotated as `@type OtherClass`.
+        // The prefix fallback should NOT match because the local's type
+        // doesn't correspond to MyClass.
+        ws.def_file(
+            "other.lua",
+            r#"
+                ---@class OtherClass
+                ---@field myField string
+
+                ---@type OtherClass
+                local MyClass = {}
+
+                MyClass.myField = "hello"
+            "#,
+        );
+        check!(ws.check_implementation(
+            r#"
+                ---@class MyClass
+                ---@field my<??>Field number
+            "#,
+            vec![
+                // Only the @field declaration. Neither the untyped local
+                // in the main file nor the OtherClass-typed local in
+                // other.lua should appear.
+                VirtualLocation {
+                    file: "".to_string(),
+                    line: 2,
+                },
+            ],
+        ));
+        Ok(())
+    }
+
+    /// Regression: an untyped `local MyClass = {}; MyClass.myField = 999`
+    /// must NOT be included in implementations for a @class field of the
+    /// same name, because the table has no semantic tie to the class
+    /// (no @type annotation). The TableConst name-text fallback is removed.
+    #[gtest]
+    fn test_implementation_unrelated_untyped_table_const_excluded() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        // Separate file with an untyped local that shares the class name.
+        ws.def_file(
+            "unrelated.lua",
+            r#"
+                local MyClass = {}
+                MyClass.myField = 999
+            "#,
+        );
+        check!(ws.check_implementation(
+            r#"
+                ---@class MyClass
+                ---@field my<??>Field number
+            "#,
+            vec![
+                // Only the @field declaration. The untyped table in
+                // unrelated.lua must NOT appear.
+                VirtualLocation {
+                    file: "".to_string(),
+                    line: 2,
+                },
+            ],
+        ));
+        Ok(())
+    }
 }

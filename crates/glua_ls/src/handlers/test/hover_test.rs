@@ -145,6 +145,37 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_outparam_updates_trace_output_field() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class TraceResult
+                ---@field Hit boolean
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceLine(traceConfig) end
+
+                local ray = {}
+                local traceData = {
+                    output = ray,
+                }
+
+                util.TraceLine(traceData)
+
+                local hit = traceData.<??>output.Hit
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) output: TraceResult\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_decl_shows_inheritance_chain() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(
@@ -1440,7 +1471,8 @@ mod tests {
                 local x = ent.te<??>stVar
             "#,
             VirtualHoverResult {
-                value: "```lua\n(infer) testVar: true\n```".to_string(),
+                value: "```lua\n(field) testVar: true\n```\n\n&nbsp;&nbsp;in class `HoverDyn.Entity`"
+                    .to_string(),
             },
         ));
 
@@ -1472,7 +1504,7 @@ mod tests {
                 end
             "#,
             VirtualHoverResult {
-                value: "```lua\n(infer) _OriginalName: any\n```".to_string(),
+                value: "```lua\n(infer) _OriginalName: true\n```".to_string(),
             },
         ));
 
@@ -1553,6 +1585,201 @@ mod tests {
         assert!(
             markup.value.contains("HoverTbl.Entity"),
             "expected tableof dynamic field hover to stay on class context, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_local_gettable_call_uses_scoped_receiver_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(&dedent(
+            r#"
+                    ---@class Entity
+                    local Entity = {}
+
+                    ---@return tableof<self>
+                    function Entity:GetTable() end
+
+                    ---@generic T : table
+                    ---@param metaName `T`
+                    ---@return T
+                    function FindMetaTable(metaName) end
+
+                    local getTable = FindMetaTable("Entity").GetTable
+
+                    function ENT:Think(selfTbl)
+                        selfTbl = selfTbl or getTa<??>ble(self)
+                    end
+                "#,
+        ))?;
+        let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("glide_wheel:GetTable"),
+            "expected aliased GetTable hover to use scripted class receiver, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("tableof<glide_wheel>"),
+            "expected aliased GetTable hover to specialize return type, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("tableof<Entity>"),
+            "expected aliased GetTable hover to avoid base Entity return type, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_local_gettable_nested_state_field_keeps_declared_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(&dedent(
+            r#"
+                    ---@class Entity
+                    local Entity = {}
+
+                    ---@return tableof<self>
+                    function Entity:GetTable() end
+
+                    ---@generic T : table
+                    ---@param metaName `T`
+                    ---@return T
+                    function FindMetaTable(metaName) end
+
+                    ---@class GlideTraceData
+                    ---@field start number
+
+                    ---@class GlideWheelState
+                    ---@field traceData GlideTraceData
+
+                    local getTable = FindMetaTable("Entity").GetTable
+
+                    function ENT:Initialize()
+                        ---@type GlideWheelState
+                        self.state = {
+                            traceData = {
+                                start = 1,
+                            },
+                        }
+                    end
+
+                    function ENT:Think(selfTbl)
+                        selfTbl = selfTbl or getTable(self)
+                        local traceData = selfTbl.state.traceData
+                        return tra<??>ceData
+                    end
+                "#,
+        ))?;
+        let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("GlideTraceData"),
+            "expected nested traceData hover to keep declared type, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("never"),
+            "expected nested traceData hover to avoid never, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains(": nil"),
+            "expected nested traceData hover to avoid nil, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_local_gettable_state_field_keeps_typed_state() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(&dedent(
+            r#"
+                    ---@class Entity
+                    local Entity = {}
+
+                    ---@return tableof<self>
+                    function Entity:GetTable() end
+
+                    ---@generic T : table
+                    ---@param metaName `T`
+                    ---@return T
+                    function FindMetaTable(metaName) end
+
+                    ---@class GlideTraceData
+                    ---@field start number
+
+                    ---@class GlideWheelState
+                    ---@field traceData GlideTraceData
+
+                    local getTable = FindMetaTable("Entity").GetTable
+
+                    function ENT:Initialize()
+                        ---@type GlideWheelState
+                        self.state = {
+                            traceData = {
+                                start = 1,
+                            },
+                        }
+                    end
+
+                    function ENT:Think(selfTbl)
+                        selfTbl = selfTbl or getTable(self)
+                        return selfTbl.sta<??>te
+                    end
+                "#,
+        ))?;
+        let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("GlideWheelState"),
+            "expected state hover to keep GlideWheelState, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains(": any"),
+            "expected state hover to avoid any, got: {}",
             markup.value
         );
 

@@ -28,8 +28,15 @@ pub async fn on_references_handler(
     }
     let file_id = analysis.get_file_id(&uri)?;
     let position = params.text_document_position.position;
+    let include_declaration = params.context.include_declaration;
 
-    references(&analysis, file_id, position, &cancel_token)
+    references(
+        &analysis,
+        file_id,
+        position,
+        &cancel_token,
+        include_declaration,
+    )
 }
 
 pub fn references(
@@ -37,6 +44,7 @@ pub fn references(
     file_id: FileId,
     position: Position,
     cancel_token: &CancellationToken,
+    include_declaration: bool,
 ) -> Option<Vec<Location>> {
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     if !semantic_model.get_emmyrc().references.enable {
@@ -67,7 +75,13 @@ pub fn references(
         }
     };
 
-    search_references(&semantic_model, &analysis.compilation, token, cancel_token)
+    search_references(
+        &semantic_model,
+        &analysis.compilation,
+        token,
+        cancel_token,
+        include_declaration,
+    )
 }
 
 pub struct ReferencesCapabilities;

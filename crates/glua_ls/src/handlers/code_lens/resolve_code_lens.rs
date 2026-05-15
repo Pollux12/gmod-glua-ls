@@ -33,6 +33,7 @@ pub fn resolve_code_lens(
                 member_id,
                 &mut results,
                 cancel_token,
+                true,
             );
             let mut ref_count = results.len();
             ref_count = ref_count.saturating_sub(1);
@@ -55,6 +56,7 @@ pub fn resolve_code_lens(
                 decl_id,
                 &mut results,
                 cancel_token,
+                true,
             );
             let ref_count = results.len();
             let uri = semantic_model.get_document().get_uri();

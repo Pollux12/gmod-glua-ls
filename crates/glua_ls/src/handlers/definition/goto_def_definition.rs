@@ -6,7 +6,7 @@ use glua_code_analysis::{
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaReturnStat, LuaStringToken,
-    LuaSyntaxToken, LuaTableExpr, LuaTableField,
+    LuaSyntaxKind, LuaSyntaxToken, LuaTableExpr, LuaTableField,
 };
 use itertools::Itertools;
 use lsp_types::{GotoDefinitionResponse, Location, Position, Range, Uri};
@@ -16,7 +16,7 @@ use crate::{
         definition::goto_function::{
             find_function_call_origin, find_matching_function_definitions,
         },
-        hover::{find_all_same_named_members, find_member_origin_owners},
+        hover::{DeclOriginResult, find_all_same_named_members, find_member_origin_owners},
     },
     util::{to_camel_case, to_pascal_case, to_snake_case},
 };
@@ -117,11 +117,21 @@ fn handle_member_definition(
         }
     }
 
+    let instance_table_locations =
+        collect_instance_table_member_locations(semantic_model, trigger_token, member_id);
+    let should_skip_current_index_member = !instance_table_locations.is_empty()
+        && trigger_token
+            .parent()
+            .is_some_and(|node| LuaIndexExpr::can_cast(node.kind().into()));
     // 添加原始成员的位置
     for member in same_named_members {
-        if let LuaSemanticDeclId::Member(member_id) = member
-            && let Some(location) = get_member_location(semantic_model, &member_id)
+        if let LuaSemanticDeclId::Member(candidate_member_id) = member
+            && let Some(location) = get_member_location(semantic_model, &candidate_member_id)
         {
+            if should_skip_current_index_member && candidate_member_id == *member_id {
+                continue;
+            }
+
             // 尝试添加访问器的位置
             try_set_accessor_locations(
                 semantic_model,
@@ -134,7 +144,13 @@ fn handle_member_definition(
     }
 
     // 处理实例表成员
-    add_instance_table_member_locations(semantic_model, trigger_token, member_id, &mut locations);
+    locations.extend(instance_table_locations);
+
+    // Add origin owner locations so that usage-site members on typed/ref
+    // instances can still navigate to the defining @field or class-level
+    // assignment, even when the usage-site member's owner differs from the
+    // origin type.
+    add_member_origin_locations(semantic_model, compilation, member_id, &mut locations);
 
     if !locations.is_empty() {
         Some(GotoDefinitionResponse::Array(
@@ -217,12 +233,11 @@ fn process_matched_members(
     }
 }
 
-fn add_instance_table_member_locations(
+fn collect_instance_table_member_locations(
     semantic_model: &SemanticModel,
     trigger_token: &LuaSyntaxToken,
     member_id: &LuaMemberId,
-    locations: &mut Vec<Location>,
-) {
+) -> Vec<Location> {
     /* 对于实例的处理, 对于实例 obj
     ```lua
         ---@class T
@@ -236,6 +251,7 @@ fn add_instance_table_member_locations(
         obj:func(1) -- 点击`func`时, 不止需要寻找`T`的定义也需要寻找`obj`实例化时赋值的`func`
     ```
      */
+    let mut locations = Vec::new();
     if let Some(table_field_infos) =
         find_instance_table_member(semantic_model, trigger_token, member_id)
     {
@@ -247,6 +263,44 @@ fn add_instance_table_member_locations(
                 locations.push(location);
             }
         }
+    }
+
+    locations
+}
+
+/// Add origin owner locations for member variables so that usage-site members
+/// on typed/ref instances can navigate to the defining @field or class-level
+/// assignment, even when the usage-site member's owner differs from the
+/// origin type.
+fn add_member_origin_locations(
+    semantic_model: &SemanticModel,
+    compilation: &LuaCompilation,
+    member_id: &LuaMemberId,
+    locations: &mut Vec<Location>,
+) {
+    let origin_result =
+        find_member_origin_owners(compilation, semantic_model, *member_id, true, None);
+
+    match origin_result {
+        DeclOriginResult::Single(LuaSemanticDeclId::Member(origin_id)) => {
+            if origin_id != *member_id {
+                if let Some(location) = get_member_location(semantic_model, &origin_id) {
+                    locations.push(location);
+                }
+            }
+        }
+        DeclOriginResult::Multiple(members) => {
+            for member in members {
+                if let LuaSemanticDeclId::Member(origin_id) = member {
+                    if origin_id != *member_id {
+                        if let Some(location) = get_member_location(semantic_model, &origin_id) {
+                            locations.push(location);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -456,7 +510,32 @@ fn get_member_location(
     member_id: &LuaMemberId,
 ) -> Option<Location> {
     let document = semantic_model.get_document_by_file_id(member_id.file_id)?;
-    document.to_lsp_location(member_id.get_syntax_id().get_range())
+    let range = member_id.get_syntax_id().get_range();
+
+    // For IndexExpr members (dynamic fields), target the index key range
+    // (e.g. just "forwardSpeed") rather than the full expression range
+    // (e.g. "selfTbl.forwardSpeed") for precise go-to-definition.
+    if member_id.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr {
+        if let Some(key_range) = resolve_index_expr_key_range(semantic_model, member_id) {
+            return document.to_lsp_location(key_range);
+        }
+    }
+
+    document.to_lsp_location(range)
+}
+
+fn resolve_index_expr_key_range(
+    semantic_model: &SemanticModel,
+    member_id: &LuaMemberId,
+) -> Option<rowan::TextRange> {
+    let root = semantic_model
+        .get_db()
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+    let index_expr = LuaIndexExpr::cast(node)?;
+    index_expr.get_index_key()?.get_range()
 }
 
 fn get_decl_location(semantic_model: &SemanticModel, decl_id: &LuaDeclId) -> Option<Location> {

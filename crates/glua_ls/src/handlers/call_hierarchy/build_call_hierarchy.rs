@@ -108,6 +108,7 @@ pub fn build_incoming_hierarchy(
                 decl_id,
                 &mut locations,
                 cancel_token,
+                true,
             );
         }
         LuaSemanticDeclId::Member(member_id) => {
@@ -117,6 +118,7 @@ pub fn build_incoming_hierarchy(
                 member_id,
                 &mut locations,
                 cancel_token,
+                true,
             );
         }
         _ => return None,

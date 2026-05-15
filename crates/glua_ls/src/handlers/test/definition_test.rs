@@ -843,6 +843,7 @@ mod tests {
             .first()
             .ok_or("missing definition result")
             .or_fail()?;
+
         let file_name = first
             .uri
             .get_file_path()
@@ -1185,6 +1186,286 @@ mod tests {
             }],
         ));
 
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_dynamic_field_definition_targets_key_range() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "assign.lua",
+            r#"
+                ---@class DynKeyRange.Entity
+                ---@type DynKeyRange.Entity
+                local selfTbl
+                selfTbl.forwardSpeed = 100
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@type DynKeyRange.Entity
+                local ent
+                ent.forw<??>ardSpeed
+            "#,
+        )?;
+        let caller_file_id = ws.def_file("use.lua", &content);
+        let result =
+            crate::handlers::definition::definition(&ws.analysis, caller_file_id, position)
+                .ok_or("failed to get go to definition response")
+                .or_fail()?;
+
+        let locations = match result {
+            GotoDefinitionResponse::Scalar(location) => vec![location],
+            GotoDefinitionResponse::Array(locations) => locations,
+            GotoDefinitionResponse::Link(_) => {
+                return fail!("unexpected go to definition response");
+            }
+        };
+
+        let first = locations
+            .first()
+            .ok_or("missing definition result")
+            .or_fail()?;
+
+        let file_name = first
+            .uri
+            .get_file_path()
+            .or_fail()?
+            .file_name()
+            .or_fail()?
+            .to_string_lossy()
+            .to_string();
+        verify_eq!(file_name, "assign.lua".to_string())?;
+        verify_eq!(first.range.start.line, 4)?;
+
+        // The definition range should cover only the field key "forwardSpeed",
+        // not the full prefix expression "selfTbl.forwardSpeed".
+        // Line 4: "                selfTbl.forwardSpeed = 100"
+        //          0123456789012345678901234567890123456
+        // The dot-key token "forwardSpeed" starts at char 24, ends at char 36.
+        verify_eq!(first.range.start.character, 24u32)?;
+        verify_eq!(first.range.end.character, 36u32)?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_inferred_dynamic_field_bracket_key() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_file(
+            "bracket_assign.lua",
+            r#"
+                ---@class DynBracket.Entity
+                ---@type DynBracket.Entity
+                local tbl
+                tbl["forwardSpeed"] = 500
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@type DynBracket.Entity
+                local ent
+                ent.forw<??>ardSpeed
+            "#,
+        )?;
+        let caller_file_id = ws.def_file("bracket_use.lua", &content);
+        let result =
+            crate::handlers::definition::definition(&ws.analysis, caller_file_id, position)
+                .ok_or("failed to get go to definition response")
+                .or_fail()?;
+
+        let locations = match result {
+            GotoDefinitionResponse::Scalar(location) => vec![location],
+            GotoDefinitionResponse::Array(locations) => locations,
+            GotoDefinitionResponse::Link(_) => {
+                return fail!("unexpected go to definition response");
+            }
+        };
+
+        let first = locations
+            .first()
+            .ok_or("missing definition result")
+            .or_fail()?;
+
+        let file_name = first
+            .uri
+            .get_file_path()
+            .or_fail()?
+            .file_name()
+            .or_fail()?
+            .to_string_lossy()
+            .to_string();
+        verify_eq!(file_name, "bracket_assign.lua".to_string())?;
+        verify_eq!(first.range.start.line, 4)?;
+
+        // The definition range should cover only the string key token
+        // "forwardSpeed" (including quotes), not the full bracket expression.
+        // Line 4: "                tbl[\"forwardSpeed\"] = 500"
+        //          0123456789012345678901234567890123456789
+        // The string token "forwardSpeed" starts at char 20, ends at char 34.
+        verify_eq!(first.range.start.character, 20u32)?;
+        verify_eq!(first.range.end.character, 34u32)?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_member_variable_definition_navigates_to_origin() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_definition(
+            r#"
+                ---@class MyClass
+                ---@field myField number
+
+                ---@type MyClass
+                local obj
+
+                obj.my<??>Field = 42
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 2,
+            }]
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_member_variable_definition_via_typed_instance() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def_file(
+            "inner.lua",
+            r#"
+                ---@class Inner
+                ---@field isRedlining boolean
+            "#,
+        );
+        check!(ws.check_definition(
+            r#"
+                local Inner = require("inner")
+
+                ---@type Inner
+                local stream
+
+                stream.isRed<??>lining = true
+            "#,
+            vec![Expected {
+                file: "inner.lua".to_string(),
+                line: 2,
+            }]
+        ));
+        Ok(())
+    }
+
+    // Goto-definition for `self.stream.isRedlining` in a consumer method
+    // where `self.stream` was assigned from a factory function that creates
+    // a local `stream` table and returns `setmetatable(stream, EngineStream)`.
+    // The cursor on `isRedlining` in the consumer assignment should resolve
+    // to the `isRedlining = false` field in the factory's table literal.
+    #[gtest]
+    fn test_goto_metatable_factory_stream_field_definition_from_consumer_assignment() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        ws.def_file(
+            "glide_engine.lua",
+            r#"
+                local Glide = {}
+
+                local EngineStream = {}
+                EngineStream.__index = EngineStream
+
+                function Glide.CreateEngineStream(ply, active)
+                    local stream = {
+                        isRedlining = false,
+                        inputs = {
+                            redline = 0,
+                        },
+                    }
+                    return setmetatable(stream, EngineStream)
+                end
+
+                return Glide
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                local Glide = require("glide_engine")
+
+                local MyComponent = {}
+                MyComponent.__index = MyComponent
+
+                function MyComponent:Init()
+                    self.stream = Glide.CreateEngineStream(LocalPlayer(), true)
+                end
+
+                function MyComponent:Update(isRedlining)
+                    self.stream.isRed<??>lining = isRedlining
+                end
+            "#,
+            vec![Expected {
+                file: "glide_engine.lua".to_string(),
+                line: 8,
+            }]
+        ));
+
+        Ok(())
+    }
+
+    // Regression: goto-definition for `self.stream.isRedlining` in a
+    // metatable-created object should navigate to the `isRedlining` field
+    // in the `stream` sub-table, NOT to the `redline` field in `inputs`.
+    // The analyzer must correctly resolve the nested field path through
+    // `self.stream` rather than confusing `isRedlining` (boolean) with
+    // `redline` (number) in a sibling sub-table.
+    #[gtest]
+    fn test_metatable_stream_is_redlining_goto_resolves_stream_field() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_definition(
+            r#"
+                ---@class StreamSystem
+                local StreamSystem = {}
+                StreamSystem.__index = StreamSystem
+
+                function StreamSystem:new()
+                    local obj = setmetatable({
+                        stream = {
+                            isRedlining = false,
+                        },
+                        inputs = {
+                            redline = 0,
+                        },
+                    }, self)
+                    return obj
+                end
+
+                function StreamSystem:update(isRedlining)
+                    self.stream.isRed<??>lining = isRedlining
+                end
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 8,
+            }]
+        ));
         Ok(())
     }
 }

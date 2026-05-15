@@ -14,7 +14,8 @@ use crate::util::{find_ref_at, resolve_ref_single};
 pub use build_hover::build_hover_content_for_completion;
 use build_hover::build_semantic_info_hover;
 pub use find_origin::{
-    find_all_same_named_members, find_member_origin_owner, find_member_origin_owners,
+    DeclOriginResult, find_all_same_named_members, find_member_origin_owner,
+    find_member_origin_owners,
 };
 use glua_code_analysis::{
     EmmyLuaAnalysis, FileId, GmodRealm, LuaMemberKey, LuaSemanticDeclId, LuaType, LuaTypeDeclId,

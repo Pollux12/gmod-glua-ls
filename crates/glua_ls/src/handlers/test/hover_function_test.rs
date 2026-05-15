@@ -431,6 +431,58 @@ mod tests {
     }
 
     #[gtest]
+    fn test_defaulted_param_and_return_hover() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(
+            ws.check_hover(
+                r#"
+                ---@param retries number=3
+                ---@return boolean=false
+                local function run(retries)
+                    return true
+                end
+
+                local <??>alias = run
+            "#,
+                VirtualHoverResult {
+                    value: "```lua\nlocal function run(retries: number=3) -> boolean=false\n```"
+                        .to_string(),
+                },
+            )
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_member_function_defaulted_param_and_return_hover() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(
+            ws.check_hover(
+                r#"
+                ---@class Runner
+                local Runner = {}
+
+                ---@param retries number=3
+                ---@return boolean=false
+                function Runner:run(retries)
+                    return true
+                end
+
+                ---@type Runner
+                local runner
+
+                runner:ru<??>n()
+            "#,
+                VirtualHoverResult {
+                    value: "```lua\n(method) Runner:run(retries: number=3) -> boolean=false\n```"
+                        .to_string(),
+                },
+            )
+        );
+        Ok(())
+    }
+
+    #[gtest]
     fn test_other_file_function() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         ws.def_file(
@@ -476,7 +528,7 @@ mod tests {
                 RingBuffer:<??>get(1)
             "#,
             VirtualHoverResult {
-                value: "```lua\n(method) RingBuffer:get(index: integer) -> string?\n```\n\n---\n\n@*param* `index` — 索引".to_string(),
+                value: "```lua\n(method) RingBuffer:get(index: integer)\n  -> item: string?\n\n```\n\n---\n\n@*param* `index` — 索引".to_string(),
             },
         ));
         Ok(())

@@ -5,13 +5,6 @@ use std::{
     vec,
 };
 
-use glua_code_analysis::{
-    AsyncState, DbIndex, InferGuard, LuaDocReturnInfo, LuaFunctionType, LuaMember, LuaMemberOwner,
-    LuaSemanticDeclId, LuaType, RenderLevel, ReturnTypeKind, SemanticDeclLevel, TypeSubstitutor,
-    VariadicType, humanize_type, infer_call_expr_func, instantiate_doc_function,
-    try_extract_signature_id_from_field,
-};
-
 use crate::handlers::hover::{
     HoverBuilder,
     humanize_types::{
@@ -19,6 +12,13 @@ use crate::handlers::hover::{
         extract_parent_type_from_element, hover_humanize_type,
     },
     infer_prefix_global_name,
+};
+use glua_code_analysis::{
+    AsyncState, DbIndex, InferGuard, LuaDocDefaultValue, LuaDocParamInfo, LuaDocReturnInfo,
+    LuaFunctionType, LuaMember, LuaMemberOwner, LuaSemanticDeclId, LuaType, RenderLevel,
+    ReturnTypeKind, SemanticDeclLevel, TypeSubstitutor, VariadicType, humanize_type,
+    infer_call_expr_func, infer_self_type, instantiate_doc_function,
+    try_extract_signature_id_from_field,
 };
 
 pub fn build_function_hover(
@@ -98,15 +98,34 @@ fn build_function_call_hover(
     };
 
     let is_field = function_member_is_field(db, semantic_decls);
-    let contents = process_function_type(
-        builder,
-        db,
-        &LuaType::DocFunction(final_type),
-        function_member,
-        function_name,
-        is_local,
-        is_field,
-    )?;
+    let concrete_owner_type = infer_call_owner_type(builder, db, call_expr);
+    let contents = if let Some((param_docs, return_docs)) =
+        get_signature_hover_docs(db, match_semantic_decl, function_member)
+    {
+        vec![hover_doc_function_type(
+            builder,
+            db,
+            &final_type,
+            function_member,
+            function_name,
+            is_local,
+            is_field,
+            concrete_owner_type.as_ref(),
+            Some(param_docs),
+            merge_function_return_defaults(&final_type, return_docs),
+        )]
+    } else {
+        process_function_type(
+            builder,
+            db,
+            &LuaType::DocFunction(final_type),
+            function_member,
+            function_name,
+            is_local,
+            is_field,
+            concrete_owner_type.as_ref(),
+        )?
+    };
     let description = get_function_description(builder, db, &match_semantic_decl);
     builder.set_type_description(contents.first()?.clone());
     builder.add_description_from_info_with_realm(description, true);
@@ -161,6 +180,7 @@ fn build_function_define_hover(
             function_name,
             is_local,
             is_field,
+            None,
         ) else {
             continue;
         };
@@ -402,6 +422,7 @@ fn process_function_type(
     function_name: &str,
     is_local: bool,
     is_field: bool,
+    concrete_owner_type: Option<&LuaType>,
 ) -> Option<Vec<String>> {
     match typ {
         LuaType::DocFunction(lua_func) => {
@@ -413,6 +434,8 @@ fn process_function_type(
                 &function_name,
                 is_local,
                 is_field,
+                concrete_owner_type,
+                None,
                 convert_function_return_to_docs(lua_func),
             );
             Some(vec![content])
@@ -420,13 +443,16 @@ fn process_function_type(
         LuaType::Signature(signature_id) => {
             let signature = db.get_signature_index().get(&signature_id)?;
             let mut new_overloads = signature.overloads.clone();
-            let fake_doc_function = Arc::new(LuaFunctionType::new(
-                signature.async_state,
-                signature.is_colon_define,
-                signature.is_vararg,
-                signature.get_type_params(),
-                signature.get_return_type(),
-            ));
+            let fake_doc_function = Arc::new(
+                LuaFunctionType::new(
+                    signature.async_state,
+                    signature.is_colon_define,
+                    signature.is_vararg,
+                    signature.get_type_params(),
+                    signature.get_return_type(),
+                )
+                .with_optional_params(signature.get_param_optional_flags()),
+            );
             new_overloads.insert(0, fake_doc_function);
             let mut contents = Vec::with_capacity(new_overloads.len());
             for (i, overload) in new_overloads.iter().enumerate() {
@@ -438,8 +464,14 @@ fn process_function_type(
                     function_name,
                     is_local,
                     is_field,
+                    concrete_owner_type,
                     if i == 0 {
-                        signature.return_docs.clone()
+                        Some(&signature.param_docs)
+                    } else {
+                        None
+                    },
+                    if i == 0 {
+                        merge_function_return_docs(overload, &signature.return_docs)
                     } else {
                         convert_function_return_to_docs(overload)
                     },
@@ -458,6 +490,7 @@ fn process_function_type(
                     function_name,
                     is_local,
                     is_field,
+                    concrete_owner_type,
                 ) {
                     contents.extend(content);
                 }
@@ -475,7 +508,9 @@ fn hover_doc_function_type(
     owner_member: Option<&LuaMember>,
     func_name: &str,
     is_local: bool,
-    is_field: bool,                     /* 是否为类字段 */
+    is_field: bool, /* 是否为类字段 */
+    concrete_owner_type: Option<&LuaType>,
+    param_docs: Option<&HashMap<usize, LuaDocParamInfo>>,
     return_docs: Vec<LuaDocReturnInfo>, /* 返回值以此为准 */
 ) -> String {
     let async_label = match func.get_async_state() {
@@ -499,9 +534,8 @@ fn hover_doc_function_type(
         let member_key = owner_member.get_key().to_path();
         let mut name = String::with_capacity(member_key.len() + 16);
 
-        let mut push_typed_owner_prefix = |prefix: &str, type_decl_id| {
+        let mut push_typed_owner_prefix = |prefix: &str, owner_ty: LuaType| {
             name.push_str(prefix);
-            let owner_ty = LuaType::Ref(type_decl_id);
             is_method = func.is_method(builder.semantic_model, Some(&owner_ty));
             if is_method {
                 type_label = "(method) ";
@@ -515,9 +549,20 @@ fn hover_doc_function_type(
         if let Some(parent_owner) = parent_owner {
             match parent_owner {
                 LuaMemberOwner::Type(type_decl_id) => {
-                    let prefix = infer_prefix_global_name(builder.semantic_model, owner_member)
-                        .unwrap_or_else(|| type_decl_id.get_simple_name());
-                    push_typed_owner_prefix(prefix, type_decl_id.clone());
+                    if let Some(owner_ty) = concrete_owner_type.cloned() {
+                        if let Some(prefix) = owner_type_display_name(&owner_ty) {
+                            push_typed_owner_prefix(&prefix, owner_ty);
+                        } else {
+                            let prefix =
+                                infer_prefix_global_name(builder.semantic_model, owner_member)
+                                    .unwrap_or_else(|| type_decl_id.get_simple_name());
+                            push_typed_owner_prefix(&prefix, LuaType::Ref(type_decl_id.clone()));
+                        }
+                    } else {
+                        let prefix = infer_prefix_global_name(builder.semantic_model, owner_member)
+                            .unwrap_or_else(|| type_decl_id.get_simple_name());
+                        push_typed_owner_prefix(&prefix, LuaType::Ref(type_decl_id.clone()));
+                    }
                 }
                 LuaMemberOwner::Element(element_id) => {
                     if let Some(LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id)) =
@@ -525,7 +570,7 @@ fn hover_doc_function_type(
                     {
                         push_typed_owner_prefix(
                             type_decl_id.get_simple_name(),
-                            type_decl_id.clone(),
+                            LuaType::Ref(type_decl_id.clone()),
                         );
                     } else if let Some(owner_name) =
                         extract_owner_name_from_element(builder.semantic_model, element_id)
@@ -551,22 +596,39 @@ fn hover_doc_function_type(
         .get_params()
         .iter()
         .enumerate()
-        .map(|(index, param)| {
-            let name = param.0.clone();
-            if index == 0 && is_method && !func.is_colon_define() {
-                "".to_string()
-            } else if let Some(ty) = &param.1 {
-                format!("{}: {}", name, humanize_type(db, ty, RenderLevel::Simple))
-            } else {
-                name.to_string()
-            }
-        })
+        .map(|(index, param)| build_function_param(db, func, param_docs, index, param, is_method))
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(", ");
 
     let ret_detail = build_function_returns(builder, return_docs);
     format_function_type(type_label, async_label, full_name, params, ret_detail)
+}
+
+fn infer_call_owner_type(
+    builder: &mut HoverBuilder,
+    db: &DbIndex,
+    call_expr: &glua_parser::LuaCallExpr,
+) -> Option<LuaType> {
+    if !matches!(
+        call_expr.get_prefix_expr()?,
+        glua_parser::LuaExpr::NameExpr(_)
+    ) {
+        return None;
+    }
+
+    let mut cache = builder.semantic_model.get_cache().borrow_mut();
+    infer_self_type(db, &mut cache, call_expr)
+}
+
+fn owner_type_display_name(owner_type: &LuaType) -> Option<String> {
+    match owner_type {
+        LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
+            Some(type_decl_id.get_simple_name().to_string())
+        }
+        LuaType::Generic(generic) => Some(generic.get_base_type_id().get_simple_name().to_string()),
+        _ => None,
+    }
 }
 
 fn convert_function_return_to_docs(func: &LuaFunctionType) -> Vec<LuaDocReturnInfo> {
@@ -576,6 +638,7 @@ fn convert_function_return_to_docs(func: &LuaFunctionType) -> Vec<LuaDocReturnIn
                 name: None,
                 type_ref: base.clone(),
                 description: None,
+                default_value: None,
                 attributes: None,
                 return_kind: ReturnTypeKind::default(),
             }],
@@ -585,6 +648,7 @@ fn convert_function_return_to_docs(func: &LuaFunctionType) -> Vec<LuaDocReturnIn
                     name: None,
                     type_ref: ty.clone(),
                     description: None,
+                    default_value: None,
                     attributes: None,
                     return_kind: ReturnTypeKind::default(),
                 })
@@ -594,9 +658,118 @@ fn convert_function_return_to_docs(func: &LuaFunctionType) -> Vec<LuaDocReturnIn
             name: None,
             type_ref: func.get_ret().clone(),
             description: None,
+            default_value: None,
             attributes: None,
             return_kind: ReturnTypeKind::default(),
         }],
+    }
+}
+
+fn merge_function_return_docs(
+    func: &LuaFunctionType,
+    return_docs: &[LuaDocReturnInfo],
+) -> Vec<LuaDocReturnInfo> {
+    if return_docs.is_empty() {
+        return convert_function_return_to_docs(func);
+    }
+
+    let mut merged = convert_function_return_to_docs(func);
+    if merged.is_empty() {
+        return return_docs.to_vec();
+    }
+
+    for (idx, return_doc) in return_docs.iter().enumerate() {
+        if let Some(merged_return) = merged.get_mut(idx) {
+            merged_return.name = return_doc.name.clone();
+            merged_return.default_value = return_doc.default_value.clone();
+            merged_return.description = return_doc.description.clone();
+            merged_return.attributes = return_doc.attributes.clone();
+            merged_return.return_kind = return_doc.return_kind;
+        } else {
+            merged.push(return_doc.clone());
+        }
+    }
+
+    merged
+}
+
+fn merge_function_return_defaults(
+    func: &LuaFunctionType,
+    return_docs: &[LuaDocReturnInfo],
+) -> Vec<LuaDocReturnInfo> {
+    let mut merged = convert_function_return_to_docs(func);
+    for (idx, return_doc) in return_docs.iter().enumerate() {
+        if let Some(merged_return) = merged.get_mut(idx) {
+            merged_return.name = return_doc.name.clone();
+            merged_return.default_value = return_doc.default_value.clone();
+            merged_return.return_kind = return_doc.return_kind;
+        }
+    }
+
+    merged
+}
+
+fn get_signature_hover_docs<'a>(
+    db: &'a DbIndex,
+    semantic_decl: &LuaSemanticDeclId,
+    function_member: Option<&LuaMember>,
+) -> Option<(&'a HashMap<usize, LuaDocParamInfo>, &'a [LuaDocReturnInfo])> {
+    let signature_id = match semantic_decl {
+        LuaSemanticDeclId::Signature(signature_id) => Some(*signature_id),
+        LuaSemanticDeclId::Member(_) => db
+            .get_property_index()
+            .get_signature_owner(semantic_decl)
+            .or_else(|| {
+                function_member.and_then(|member| try_extract_signature_id_from_field(db, member))
+            }),
+        _ => db.get_property_index().get_signature_owner(semantic_decl),
+    }?;
+    let signature = db.get_signature_index().get(&signature_id)?;
+    Some((&signature.param_docs, signature.return_docs.as_slice()))
+}
+
+fn build_function_param(
+    db: &DbIndex,
+    func: &LuaFunctionType,
+    param_docs: Option<&HashMap<usize, LuaDocParamInfo>>,
+    index: usize,
+    param: &(String, Option<LuaType>),
+    is_method: bool,
+) -> String {
+    if index == 0 && is_method && !func.is_colon_define() {
+        return "".to_string();
+    }
+
+    let param_doc = param_docs.and_then(|docs| docs.get(&index));
+    let name = param_doc
+        .map(|doc| doc.name.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&param.0);
+    let type_ref = param
+        .1
+        .as_ref()
+        .or_else(|| param_doc.map(|doc| &doc.type_ref));
+
+    let mut rendered = if let Some(ty) = type_ref {
+        format!("{}: {}", name, humanize_type(db, ty, RenderLevel::Simple))
+    } else {
+        name.to_string()
+    };
+
+    if let Some(default_value) = param_doc.and_then(|doc| doc.default_value.as_ref()) {
+        rendered.push('=');
+        rendered.push_str(&format_doc_default_value(default_value));
+    }
+
+    rendered
+}
+
+fn format_doc_default_value(default_value: &LuaDocDefaultValue) -> String {
+    match default_value {
+        LuaDocDefaultValue::Nil => "nil".to_string(),
+        LuaDocDefaultValue::Boolean(value) => value.to_string(),
+        LuaDocDefaultValue::Number(value) => value.clone(),
+        LuaDocDefaultValue::String(value) => format!("{value:?}"),
     }
 }
 
@@ -717,7 +890,11 @@ fn build_function_return_type(
             builder.add_type_expansion(new_type_expansion);
         }
     };
-    type_text
+    if let Some(default_value) = &ret_info.default_value {
+        format!("{}={}", type_text, format_doc_default_value(default_value))
+    } else {
+        type_text
+    }
 }
 
 // 函数是否为类字段, 任意一个为类字段我们都认为全部为类字段

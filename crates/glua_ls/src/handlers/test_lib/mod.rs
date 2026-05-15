@@ -657,9 +657,54 @@ impl ProviderVirtualWorkspace {
                 .map(|(file_name, content)| (file_name.as_str(), content.as_str()))
                 .collect(),
         );
-        let result = references(&self.analysis, file_id, position, &CancellationToken::new())
-            .ok_or("failed to get references")
-            .or_fail()?;
+        let result = references(
+            &self.analysis,
+            file_id,
+            position,
+            &CancellationToken::new(),
+            true,
+        )
+        .ok_or("failed to get references")
+        .or_fail()?;
+        Self::assert_locations(result, expected)
+    }
+
+    pub fn check_references_with_include_declaration(
+        &mut self,
+        main_block_str: &str,
+        other_files: Vec<(&str, &str)>,
+        expected: Vec<VirtualLocation>,
+        include_declaration: bool,
+    ) -> Result<()> {
+        let (main_content, position) = Self::handle_file_content(main_block_str)?;
+        let file_id = self.def(&main_content);
+
+        let processed_other_files = other_files
+            .into_iter()
+            .map(|(file_name, content)| {
+                let (content, position) = Self::handle_file_content_option(content)?;
+                if position.is_some() {
+                    return Err("found multiple <??>").or_fail();
+                }
+                Ok((file_name.to_string(), content))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.def_files(
+            processed_other_files
+                .iter()
+                .map(|(file_name, content)| (file_name.as_str(), content.as_str()))
+                .collect(),
+        );
+        let result = references(
+            &self.analysis,
+            file_id,
+            position,
+            &CancellationToken::new(),
+            include_declaration,
+        )
+        .ok_or("failed to get references")
+        .or_fail()?;
         Self::assert_locations(result, expected)
     }
 }
