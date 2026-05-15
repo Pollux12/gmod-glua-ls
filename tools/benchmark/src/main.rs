@@ -291,12 +291,14 @@ async fn main() {
     eprintln!("{:<45} {:>12}", "Phase", "Duration");
     eprintln!("{}", "-".repeat(60));
 
+    let warning_threshold = std::time::Duration::from_secs(2);
+    let error_threshold = std::time::Duration::from_secs(10);
     let mut total = std::time::Duration::ZERO;
     for result in &results {
         total += result.duration;
-        let status = if result.duration.as_secs() >= 10 {
+        let status = if result.duration >= error_threshold {
             "❌"
-        } else if result.duration.as_secs() >= 2 {
+        } else if result.duration >= warning_threshold {
             "⚠️"
         } else {
             "✅"
@@ -311,7 +313,7 @@ async fn main() {
     eprintln!("{}", "-".repeat(60));
 
     let index_diag_total = indexing_duration + diagnostics_duration;
-    let target_status = if index_diag_total.as_secs() <= 10 {
+    let target_status = if index_diag_total <= error_threshold {
         "✅ TARGET MET"
     } else {
         "❌ TARGET NOT MET"
