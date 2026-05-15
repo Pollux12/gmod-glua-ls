@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaGeneralToken,
-    LuaLiteralToken,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr,
+    LuaFuncStat, LuaGeneralToken, LuaIndexExpr, LuaLiteralToken, LuaNameExpr, LuaTableField,
 };
 
 use crate::{
@@ -110,6 +110,21 @@ fn check_call_expr(
 ) -> Option<()> {
     let func = semantic_model.infer_call_expr_func(call_expr.clone(), None)?;
     let mut fake_params = func.get_params().to_vec();
+    let mut fake_param_optional = func.get_optional_params().to_vec();
+    if let Some(signature_id) = get_prefix_expr_signature_id(context.db, semantic_model, &call_expr)
+        && let Some(signature) = context.db.get_signature_index().get(&signature_id)
+        && !signature.param_docs.is_empty()
+    {
+        let signature_optional = signature.get_param_optional_flags();
+        if fake_param_optional.len() < signature_optional.len() {
+            fake_param_optional.resize(signature_optional.len(), false);
+        }
+        for (idx, is_optional) in signature_optional.into_iter().enumerate() {
+            if is_optional {
+                fake_param_optional[idx] = true;
+            }
+        }
+    }
     let call_args = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
     let mut call_args_count = call_args.len();
     let last_arg_is_dots = call_args.last().is_some_and(is_dots_expr);
@@ -120,6 +135,7 @@ fn check_call_expr(
         (true, true) | (false, false) => {}
         (false, true) => {
             fake_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
+            fake_param_optional.insert(0, false);
         }
         (true, false) => {
             call_args_count += 1;
@@ -163,6 +179,7 @@ fn check_call_expr(
             let typ = param_info.1.clone();
             if let Some(typ) = typ
                 && !is_nullable(context.db, &typ)
+                && !fake_param_optional.get(i).copied().unwrap_or(false)
             {
                 miss_parameter_info.push(t!("missing parameter: %{name}", name = param_info.0,));
             }
@@ -255,6 +272,106 @@ fn is_dots_expr(expr: &LuaExpr) -> bool {
         return true;
     }
     false
+}
+
+fn get_prefix_expr_signature_id(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+) -> Option<crate::LuaSignatureId> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    if let LuaExpr::NameExpr(name_expr) = &prefix_expr
+        && let Some(signature_id) = get_local_name_signature_id(db, semantic_model, name_expr)
+    {
+        return Some(signature_id);
+    }
+
+    let semantic_decl = semantic_model.find_decl(
+        prefix_expr.syntax().clone().into(),
+        SemanticDeclLevel::default(),
+    )?;
+    get_signature_id_from_semantic_decl_value_expr(db, semantic_decl)
+}
+
+fn get_local_name_signature_id(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    name_expr: &LuaNameExpr,
+) -> Option<crate::LuaSignatureId> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&semantic_model.get_file_id(), name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+    let closure = LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)?;
+    let LuaExpr::ClosureExpr(closure) = closure else {
+        return None;
+    };
+    Some(crate::LuaSignatureId::from_closure(
+        decl.get_file_id(),
+        &closure,
+    ))
+}
+
+fn get_signature_id_from_semantic_decl_value_expr(
+    db: &DbIndex,
+    semantic_decl: LuaSemanticDeclId,
+) -> Option<crate::LuaSignatureId> {
+    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
+        return Some(signature_id);
+    }
+    let file_id = match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
+        LuaSemanticDeclId::Member(member_id) => member_id.file_id,
+        LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
+        LuaSemanticDeclId::TypeDecl(_) => return None,
+    };
+    let LuaExpr::ClosureExpr(closure) = get_semantic_decl_value_expr(db, semantic_decl)? else {
+        return None;
+    };
+    Some(crate::LuaSignatureId::from_closure(file_id, &closure))
+}
+
+fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -> Option<LuaExpr> {
+    match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(&decl_id)?;
+            let value_syntax_id = decl.get_value_syntax_id()?;
+            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
+        }
+        LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
+        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
+    }
+}
+
+fn get_member_value_expr(db: &DbIndex, member_id: crate::LuaMemberId) -> Option<LuaExpr> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+
+    if let Some(field) = LuaTableField::cast(node.clone()) {
+        return field.get_value_expr();
+    }
+
+    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
+            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+            let value_idx = vars
+                .iter()
+                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
+            return value_exprs.get(value_idx).cloned();
+        }
+
+        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
+            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
+        }
+    }
+
+    None
 }
 
 fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {

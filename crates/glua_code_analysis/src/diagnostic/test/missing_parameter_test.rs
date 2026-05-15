@@ -238,4 +238,38 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn test_defaulted_param_is_omittable_for_missing_parameter_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param retries number=3
+            local function run(retries)
+            end
+
+            run()
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_defaulted_param_is_omittable_for_missing_parameter_with_overload_resolution() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param retries number=3
+            ---@return boolean
+            ---@overload fun(name: string): string
+            local function pick(retries)
+            end
+
+            pick()
+        "#
+        ));
+    }
 }
