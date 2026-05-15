@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
@@ -306,15 +306,18 @@ mod test {
     }
 
     #[gtest]
-    fn test_invalid_entity_method_requires_isvalid() {
+    fn test_null_method_requires_isvalid() {
         let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
         ws.def(
             r#"
             ---@class Entity
             ---@field GetPos fun(self: Entity): any
 
-            ---@class InvalidEntity
-            ---@alias EntityOrNULL Entity|InvalidEntity
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
 
             ---@return EntityOrNULL
             function GetEntityOrNULL() end
@@ -336,15 +339,18 @@ mod test {
     }
 
     #[gtest]
-    fn test_truthy_check_does_not_narrow_invalid_entity() {
+    fn test_truthy_check_does_not_narrow_null() {
         let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
         ws.def(
             r#"
             ---@class Entity
             ---@field GetPos fun(self: Entity): any
 
-            ---@class InvalidEntity
-            ---@alias EntityOrNULL Entity|InvalidEntity
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
 
             ---@return EntityOrNULL
             function GetEntityOrNULL() end
@@ -366,15 +372,18 @@ mod test {
     }
 
     #[gtest]
-    fn test_isvalid_narrows_invalid_entity() {
+    fn test_isvalid_narrows_null() {
         let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
         ws.def(
             r#"
             ---@class Entity
             ---@field GetPos fun(self: Entity): any
 
-            ---@class InvalidEntity
-            ---@alias EntityOrNULL Entity|InvalidEntity
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
 
             ---@return EntityOrNULL
             function GetEntityOrNULL() end
@@ -396,15 +405,49 @@ mod test {
     }
 
     #[gtest]
-    fn test_isentity_does_not_narrow_invalid_entity_to_valid_entity() {
+    fn test_isvalid_narrows_explicit_null_param() {
         let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
         ws.def(
             r#"
             ---@class Entity
             ---@field GetPos fun(self: Entity): any
 
-            ---@class InvalidEntity
-            ---@alias EntityOrNULL Entity|InvalidEntity
+            ---@class NULL : Entity
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@param ent NULL
+                local function takes_null(ent)
+                    if IsValid(ent) then
+                        ent:GetPos()
+                    end
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_isentity_does_not_narrow_null_to_valid_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
 
             ---@return EntityOrNULL
             function GetEntityOrNULL() end
@@ -426,15 +469,148 @@ mod test {
     }
 
     #[gtest]
-    fn test_invalid_entity_member_access_without_call_does_not_require_isvalid() {
+    fn test_explicit_entity_null_union_method_requires_isvalid() {
         let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
         ws.def(
             r#"
             ---@class Entity
             ---@field GetPos fun(self: Entity): any
 
-            ---@class InvalidEntity
-            ---@alias EntityOrNULL Entity|InvalidEntity
+            ---@class NULL : Entity
+
+            ---@return Entity|NULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+        let code = r#"
+            local ent = GetEntityOrNULL()
+            ent:GetPos()
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(false)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_truthy_check_does_not_narrow_explicit_entity_null_union() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+
+            ---@return Entity|NULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = GetEntityOrNULL()
+                if ent then
+                    ent:GetPos()
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_narrows_player_or_null_to_player() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@field Nick fun(self: Player): string
+
+            ---@class NULL : Entity
+
+            ---@return Player|NULL
+            function GetPlayerOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ply = GetPlayerOrNULL()
+                if IsValid(ply) then
+                    ply:Nick()
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_isentity_does_not_narrow_player_or_null_to_player() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@field Nick fun(self: Player): string
+
+            ---@class NULL : Entity
+
+            ---@return Player|NULL
+            function GetPlayerOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ply = GetPlayerOrNULL()
+                if isentity(ply) then
+                    ply:Nick()
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_null_member_access_without_call_does_not_require_isvalid() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
 
             ---@return EntityOrNULL
             function GetEntityOrNULL() end
@@ -450,6 +626,286 @@ mod test {
                 "#,
             ),
             eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_direct_null_truthy_check_still_requires_isvalid() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+
+            ---@type NULL
+            NULL = nil
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                if NULL then
+                    NULL:GetPos()
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_direct_null_truthy_check_reports_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+
+            ---@type NULL
+            NULL = nil
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                if NULL then
+                    NULL:GetPos()
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_nil_comparison_does_not_promote_entity_or_null() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        let code = r#"
+            local ent = GetEntityOrNULL()
+            if ent ~= nil then
+                ent:GetPos()
+            end
+            "#;
+
+        assert_that!(ws.check_code_for(DiagnosticCode::GmodNullCheck, code), eq(false));
+        assert_that!(ws.check_code_for(DiagnosticCode::NeedCheckNil, code), eq(false));
+    }
+
+    #[gtest]
+    fn test_isvalid_check_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local ent = GetEntityOrNULL()
+                if IsValid(ent) then
+                    ent:GetPos()
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_truthy_and_isvalid_guard_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        let code = r#"
+            local ent = GetEntityOrNULL()
+            if ent and IsValid(ent) then
+                ent:GetPos()
+            end
+            "#;
+
+        assert_that!(ws.check_code_for(DiagnosticCode::GmodNullCheck, code), eq(true));
+        assert_that!(ws.check_code_for(DiagnosticCode::NeedCheckNil, code), eq(true));
+    }
+
+    #[gtest]
+    fn test_not_truthy_or_not_isvalid_guard_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local ent = GetEntityOrNULL()
+                if not ent or not IsValid(ent) then
+                    return
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_nil_comparison_and_isvalid_guard_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        let code = r#"
+            local ent = GetEntityOrNULL()
+            if ent ~= nil and IsValid(ent) then
+                ent:GetPos()
+            end
+            "#;
+
+        assert_that!(ws.check_code_for(DiagnosticCode::GmodNullCheck, code), eq(true));
+        assert_that!(ws.check_code_for(DiagnosticCode::NeedCheckNil, code), eq(true));
+    }
+
+    #[gtest]
+    fn test_nil_comparison_or_not_isvalid_guard_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local ent = GetEntityOrNULL()
+                if ent == nil or not IsValid(ent) then
+                    return
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_entity_or_null_param_requires_isvalid_inside_function() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@param ent Entity|NULL
+                local function use_entity(ent)
+                    ent:GetPos()
+                end
+                "#,
+            ),
+            eq(false)
         );
     }
 

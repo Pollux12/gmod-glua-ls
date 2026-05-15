@@ -17,6 +17,12 @@ use super::{
     type_check_guard::TypeCheckGuard,
 };
 
+const GMOD_NULL_TYPE_NAME: &str = "NULL";
+
+fn is_exact_gmod_null_decl_id(context: &TypeCheckContext, type_id: &LuaTypeDeclId) -> bool {
+    context.db.get_emmyrc().gmod.enabled && type_id == &LuaTypeDeclId::global(GMOD_NULL_TYPE_NAME)
+}
+
 pub fn check_ref_type_compact(
     context: &mut TypeCheckContext,
     source_id: &LuaTypeDeclId,
@@ -151,12 +157,18 @@ fn check_ref_class(
                 return Ok(());
             }
 
+            if is_exact_gmod_null_decl_id(context, source_id)
+                && !is_exact_gmod_null_decl_id(context, id)
+            {
+                return Err(TypeCheckFailReason::TypeNotMatch);
+            }
+
+            if is_exact_gmod_null_decl_id(context, id) {
+                return Err(TypeCheckFailReason::TypeNotMatch);
+            }
+
             // 检查子类型关系
             if is_sub_type_of(context.db, id, source_id) {
-                return Ok(());
-            }
-            // 这不是正确的逻辑. 但不假设超类会自动转换为子类, 则会过于严格
-            if is_sub_type_of(context.db, source_id, id) {
                 return Ok(());
             }
 

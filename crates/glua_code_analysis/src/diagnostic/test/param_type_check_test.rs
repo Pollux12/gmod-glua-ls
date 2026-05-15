@@ -2695,4 +2695,178 @@ mod test {
         "#
         ));
     }
+
+    // --- GMod NULL compatibility tests ---
+
+    #[test]
+    fn test_core_null_type_is_not_assignable_to_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            "#,
+        );
+
+        let null_ty = ws.ty("NULL");
+        let entity_ty = ws.ty("Entity");
+        assert!(!ws.check_type(&null_ty, &entity_ty));
+    }
+
+    #[test]
+    fn test_null_expr_type_is_not_assignable_to_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            ---@type NULL
+            NULL = nil
+            "#,
+        );
+
+        let null_expr_ty = ws.expr_ty("NULL");
+        let entity_ty = ws.ty("Entity");
+        assert!(!ws.check_type(&null_expr_ty, &entity_ty));
+    }
+
+    #[test]
+    fn test_null_param_rejects_entity_gmod() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            ---@type NULL
+            NULL = nil
+            "#,
+        );
+
+        let null_ty = ws.ty("NULL");
+        let entity_ty = ws.ty("Entity");
+        assert!(!ws.check_type(&entity_ty, &null_ty));
+    }
+
+    /// NULL should NOT be compatible with unrelated subclasses like Player.
+    #[test]
+    fn test_null_not_compatible_with_player() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class NULL : Entity
+            "#,
+        );
+
+        let null_ty = ws.ty("NULL");
+        let player_ty = ws.ty("Player");
+        assert!(!ws.check_type(&null_ty, &player_ty));
+    }
+
+    // --- Union coercion suppression tests ---
+
+    /// `(any|string)` passed to `string` param should not produce a mismatch.
+    /// Both union arms are accepted by GLua string coercion checking.
+    #[test]
+    fn test_any_string_union_to_string_param() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param s string
+            local function f(s) end
+
+            ---@type any|string
+            local val
+            f(val)
+        "#
+        ));
+    }
+
+    /// `(0|any|number)` passed to `number` param should not produce a mismatch.
+    /// Each union arm is accepted by number checking.
+    #[test]
+    fn test_any_number_union_to_number_param() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function f(n) end
+
+            ---@type 0|any|number
+            local val
+            f(val)
+        "#
+        ));
+    }
+
+    /// `(any|string)` passed to `number` param SHOULD still mismatch.
+    /// The `string` arm remains incompatible with `number`.
+    #[test]
+    fn test_any_string_union_to_number_param_still_mismatches() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function f(n) end
+
+            ---@type any|string
+            local val
+            f(val)
+        "#
+        ));
+    }
+
+    /// `any|string|nil` should satisfy `string?` through nullable string coercion.
+    #[test]
+    fn test_any_string_nil_to_string_nullable_passes() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param s string?
+            local function f(s) end
+
+            ---@type any|string|nil
+            local val
+            f(val)
+        "#
+        ));
+    }
+
+    /// `any|string|nil` should still mismatch `number?` because `string` is incompatible.
+    #[test]
+    fn test_any_string_nil_to_number_nullable_mismatches() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number?
+            local function f(n) end
+
+            ---@type any|string|nil
+            local val
+            f(val)
+        "#
+        ));
+    }
 }

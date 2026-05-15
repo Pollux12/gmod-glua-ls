@@ -924,14 +924,30 @@ fn strip_nullable_param(ty: &LuaType) -> &LuaType {
 /// under GLua's implicit coercion rules.
 fn is_primitive_coercible_to(param_type: &LuaType, expr_type: &LuaType) -> bool {
     match param_type {
-        // `string` params accept any primitive that `tostring()` handles cleanly.
-        LuaType::String => is_tostring_coercible(expr_type),
+        // `string` params accept any primitive that `tostring()` handles cleanly,
+        // plus `any`/`unknown` which are too unspecific to warrant a diagnostic.
+        LuaType::String => {
+            is_tostring_coercible(expr_type) || matches!(expr_type, LuaType::Any | LuaType::Unknown)
+        }
         // `number`/`integer` params accept string literals that are valid numbers,
         // e.g. the elements of `string.Explode(" ", "10 20 30")`.
-        // GLua/LuaJIT does not distinguish between integer and float at runtime.
-        LuaType::Number | LuaType::Integer => is_numeric_string_literal(expr_type),
+        // `any`/`unknown` are too unspecific to warrant a diagnostic.
+        LuaType::Number | LuaType::Integer => {
+            is_number_coercible(expr_type) || matches!(expr_type, LuaType::Any | LuaType::Unknown)
+        }
         _ => false,
     }
+}
+
+fn is_number_coercible(ty: &LuaType) -> bool {
+    matches!(
+        ty,
+        LuaType::Number
+            | LuaType::Integer
+            | LuaType::FloatConst(_)
+            | LuaType::IntegerConst(_)
+            | LuaType::DocIntegerConst(_)
+    ) || is_numeric_string_literal(ty)
 }
 
 /// Returns `true` if `ty` is a string constant that is a valid number (integer or float).

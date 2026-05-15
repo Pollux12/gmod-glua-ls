@@ -669,6 +669,13 @@ pub fn infer_global_type(
     call_offset: Option<TextSize>,
     name: &str,
 ) -> InferResult {
+    if db.get_emmyrc().gmod.enabled && name == "NULL" {
+        let null_decl_id = LuaTypeDeclId::global("NULL");
+        if db.get_type_index().get_type_decl(&null_decl_id).is_some() {
+            return Ok(LuaType::Ref(null_decl_id));
+        }
+    }
+
     if let Some(module_decl_type) =
         infer_legacy_module_local_type(db, current_file_id, call_offset, name)
     {

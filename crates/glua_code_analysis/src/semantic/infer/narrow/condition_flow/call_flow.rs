@@ -11,10 +11,9 @@ use crate::{
         infer_index::infer_member_by_member_key,
         narrow::{
             ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
-            get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow,
-            gmod_invalid_entity_type, gmod_invalid_entity_type_is_defined, narrow_down_type,
-            narrow_false_or_nil, remove_false_or_nil, remove_gmod_invalid_entity_type,
-            var_ref_id::get_var_expr_var_ref_id,
+            get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow, gmod_null_type,
+            gmod_null_type_is_defined, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
+            remove_gmod_null_type, var_ref_id::get_var_expr_var_ref_id,
         },
     },
 };
@@ -827,7 +826,7 @@ fn try_narrow_isvalid(
 
     let result_type = match condition_flow {
         InferConditionFlow::TrueCondition => {
-            remove_gmod_invalid_entity_type(db, remove_false_or_nil(antecedent_type))
+            remove_gmod_null_type(db, remove_false_or_nil(antecedent_type))
         }
         InferConditionFlow::FalseCondition => antecedent_type,
     };
@@ -890,8 +889,8 @@ fn resolve_entity_guard_target_type(db: &DbIndex, cache: &LuaInferCache) -> Opti
         .find_type_decl(cache.get_file_id(), "Entity")
         .map(|decl| LuaType::Ref(decl.get_id()))?;
 
-    if gmod_invalid_entity_type_is_defined(db) {
-        return Some(TypeOps::Union.apply(db, &entity_type, &gmod_invalid_entity_type()));
+    if gmod_null_type_is_defined(db) {
+        return Some(TypeOps::Union.apply(db, &entity_type, &gmod_null_type()));
     }
 
     Some(entity_type)
