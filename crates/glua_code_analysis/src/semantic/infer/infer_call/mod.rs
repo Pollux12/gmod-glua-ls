@@ -419,13 +419,7 @@ fn infer_doc_function(
     // Handle self-type substitution for functions with SelfInfer in return type
     // (e.g., tableof<self>). This covers cases like `local getTable = Entity.GetTable; getTable(self)`
     if func.contain_self() {
-        let self_type = infer_self_type(db, cache, &call_expr).or_else(|| {
-            // For regular function calls (not method calls), infer self type from first arg
-            let args_list = call_expr.get_args_list()?;
-            let first_arg = args_list.get_args().next()?;
-            let arg_type = infer_expr(db, cache, first_arg).ok()?;
-            Some(build_self_type(db, &arg_type))
-        });
+        let self_type = infer_self_type(db, cache, &call_expr);
         if let Some(self_type) = self_type {
             let mut substitutor = crate::semantic::generic::TypeSubstitutor::new();
             substitutor.add_self_type(self_type);

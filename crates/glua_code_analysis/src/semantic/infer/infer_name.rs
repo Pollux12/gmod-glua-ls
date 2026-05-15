@@ -95,7 +95,15 @@ fn infer_local_decl_name_type(
     decl_id: LuaDeclId,
 ) -> InferResult {
     let var_ref_id = VarRefId::VarRef(decl_id);
-    infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id)
+    let result =
+        infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id);
+    if result.as_ref().is_ok_and(|typ| typ.is_never())
+        && let Some(initializer_type) = try_infer_local_initializer_type(db, cache, decl_id)
+    {
+        return Ok(initializer_type);
+    }
+
+    result
 }
 
 fn try_infer_enclosing_for_range_iter_type(
@@ -142,6 +150,31 @@ fn try_infer_enclosing_for_range_iter_type(
         .insert(decl_id, CacheEntry::Cache(ret_type.clone()));
 
     Some(ret_type)
+}
+
+fn try_infer_local_initializer_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+) -> Option<LuaType> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)?
+        .get_red_root();
+    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    let expr = LuaExpr::cast(node)?;
+    let init_type = match infer_expr(db, cache, expr).ok()? {
+        LuaType::Variadic(variadic) => variadic
+            .get_type(initializer.get_ret_idx())
+            .cloned()
+            .unwrap_or(LuaType::Nil),
+        ty if initializer.get_ret_idx() == 0 => ty,
+        _ => LuaType::Nil,
+    };
+
+    (!init_type.is_never() && !init_type.is_nil()).then_some(init_type)
 }
 
 fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Option<LuaType> {

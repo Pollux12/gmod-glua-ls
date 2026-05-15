@@ -2,8 +2,11 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey};
 
 use crate::{
     DbIndex, InFiled, InferFailReason, LuaInferCache, LuaInstanceType, LuaMemberKey, LuaType,
-    LuaUnionType, infer_expr,
-    semantic::{infer::InferResult, member::find_members_with_key},
+    LuaUnionType, SemanticDeclLevel, infer_expr,
+    semantic::{
+        SemanticDeclGuard, infer::InferResult, infer_expr_semantic_decl,
+        member::find_members_with_key,
+    },
 };
 
 pub fn infer_setmetatable_call(
@@ -48,7 +51,55 @@ pub fn infer_setmetatable_call(
                 return infer_expr(db, cache, basic_table);
             }
 
+            if is_index && let Some(range) = resolve_table_backing_range(db, cache, &basic_table) {
+                return Ok(LuaType::Instance(
+                    LuaInstanceType::new(meta_type, range).into(),
+                ));
+            }
+
             Ok(meta_type)
+        }
+    }
+}
+
+fn resolve_table_backing_range(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    match expr {
+        LuaExpr::TableExpr(table_expr) => {
+            Some(InFiled::new(cache.get_file_id(), table_expr.get_range()))
+        }
+        _ => {
+            let semantic_decl = infer_expr_semantic_decl(
+                db,
+                cache,
+                expr.clone(),
+                SemanticDeclGuard::default(),
+                SemanticDeclLevel::default(),
+            )?;
+            let decl_id = match semantic_decl {
+                crate::LuaSemanticDeclId::LuaDecl(decl_id) => decl_id,
+                _ => return None,
+            };
+            let root = db
+                .get_vfs()
+                .get_syntax_tree(&decl_id.file_id)?
+                .get_red_root();
+            let value_expr = db
+                .get_decl_index()
+                .get_decl(&decl_id)?
+                .get_value_syntax_id()?
+                .to_node_from_root(&root)
+                .and_then(LuaExpr::cast)?;
+
+            match value_expr {
+                LuaExpr::TableExpr(table_expr) => {
+                    Some(InFiled::new(decl_id.file_id, table_expr.get_range()))
+                }
+                _ => None,
+            }
         }
     }
 }
