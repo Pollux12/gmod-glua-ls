@@ -25,7 +25,7 @@ use stats::{
 };
 
 use log::info;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     Emmyrc, FileId, InferFailReason,
@@ -81,8 +81,16 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                     is_scripted,
                     &special_call_direct_matcher,
                 );
+                let mut profile = slow_log_enabled.then(LuaAnalyzeProfile::default);
                 for node in root.descendants::<LuaAst>() {
-                    analyze_node(&mut analyzer, node);
+                    if let Some(profile) = profile.as_mut() {
+                        let kind = lua_ast_profile_kind(&node);
+                        let node_start = Instant::now();
+                        analyze_node(&mut analyzer, node);
+                        profile.record(kind, node_start.elapsed());
+                    } else {
+                        analyze_node(&mut analyzer, node);
+                    }
                 }
                 analyze_chunk_return(&mut analyzer, root.clone());
                 file_count += 1;
@@ -95,6 +103,9 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                             .map(|u| u.to_string())
                             .unwrap_or_else(|| format!("{:?}", file_id));
                         info!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
+                        if let Some(profile) = profile.as_ref() {
+                            profile.log_slow_file(&path);
+                        }
                     }
                 }
             }
@@ -106,6 +117,50 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 total_start.elapsed()
             );
         }
+    }
+}
+
+#[derive(Default)]
+struct LuaAnalyzeProfile {
+    node_stats: HashMap<&'static str, (usize, Duration)>,
+}
+
+impl LuaAnalyzeProfile {
+    fn record(&mut self, kind: &'static str, elapsed: Duration) {
+        let (count, total) = self.node_stats.entry(kind).or_default();
+        *count += 1;
+        *total += elapsed;
+    }
+
+    fn log_slow_file(&self, path: &str) {
+        let mut stats = self
+            .node_stats
+            .iter()
+            .map(|(kind, (count, total))| (*kind, *count, *total))
+            .collect::<Vec<_>>();
+        stats.sort_by_key(|(_, _, total)| std::cmp::Reverse(*total));
+        let summary = stats
+            .into_iter()
+            .take(8)
+            .map(|(kind, count, total)| format!("{kind}: {count} in {total:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        info!("lua analyze slow file node profile: {} [{}]", path, summary);
+    }
+}
+
+fn lua_ast_profile_kind(node: &LuaAst) -> &'static str {
+    match node {
+        LuaAst::LuaLocalStat(_) => "local_stat",
+        LuaAst::LuaAssignStat(_) => "assign_stat",
+        LuaAst::LuaForRangeStat(_) => "for_range_stat",
+        LuaAst::LuaFuncStat(_) => "func_stat",
+        LuaAst::LuaLocalFuncStat(_) => "local_func_stat",
+        LuaAst::LuaTableField(_) => "table_field",
+        LuaAst::LuaClosureExpr(_) => "closure_expr",
+        LuaAst::LuaCallExpr(call_expr) if call_expr.is_setmetatable() => "setmetatable_call",
+        LuaAst::LuaCallExpr(_) => "call_expr",
+        _ => "other",
     }
 }
 

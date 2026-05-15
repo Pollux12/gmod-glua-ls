@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaIndexKey,
@@ -31,13 +31,65 @@ impl Checker for ParamTypeCheckChecker {
             .get_shared_data_arc()
             .map(|shared_data| shared_data.param_type_candidates.clone())
             .unwrap_or_else(|| Arc::new(precompute_param_type_candidates(semantic_model.get_db())));
+        let profile_enabled = log::log_enabled!(log::Level::Info);
+        let mut profile = profile_enabled.then(ParamTypeCheckProfile::default);
 
         for call_expr in root.descendants::<LuaCallExpr>() {
             if context.is_cancelled() {
                 return;
             }
-            check_call_expr(context, semantic_model, call_expr, &candidates);
+            if let Some(profile) = profile.as_mut() {
+                profile.calls_scanned += 1;
+            }
+            let call_start = profile_enabled.then(std::time::Instant::now);
+            check_call_expr(
+                context,
+                semantic_model,
+                call_expr,
+                &candidates,
+                profile.as_mut(),
+            );
+            if let (Some(profile), Some(call_start)) = (profile.as_mut(), call_start) {
+                profile.total_call_time += call_start.elapsed();
+            }
         }
+
+        if let Some(profile) = profile {
+            profile.log(semantic_model.get_file_id());
+        }
+    }
+}
+
+#[derive(Default)]
+struct ParamTypeCheckProfile {
+    calls_scanned: usize,
+    calls_without_actionable_args: usize,
+    static_candidate_hits: usize,
+    static_candidate_misses: usize,
+    unknown_static_names: usize,
+    calls_checked: usize,
+    calls_without_signature: usize,
+    infer_func_time: Duration,
+    infer_arg_time: Duration,
+    total_call_time: Duration,
+}
+
+impl ParamTypeCheckProfile {
+    fn log(&self, file_id: crate::FileId) {
+        log::info!(
+            "param type profile: file={:?} calls_scanned={} no_args={} static_hits={} static_misses={} unknown_names={} calls_checked={} no_signature={} infer_func_time={:?} infer_arg_time={:?} total_call_time={:?}",
+            file_id,
+            self.calls_scanned,
+            self.calls_without_actionable_args,
+            self.static_candidate_hits,
+            self.static_candidate_misses,
+            self.unknown_static_names,
+            self.calls_checked,
+            self.calls_without_signature,
+            self.infer_func_time,
+            self.infer_arg_time,
+            self.total_call_time,
+        );
     }
 }
 
@@ -47,14 +99,33 @@ pub struct PrecomputedParamTypeCandidates {
 }
 
 impl PrecomputedParamTypeCandidates {
-    fn should_check_call(&self, call_expr: &LuaCallExpr) -> bool {
+    fn should_check_call_with_profile(
+        &self,
+        call_expr: &LuaCallExpr,
+        mut profile: Option<&mut ParamTypeCheckProfile>,
+    ) -> bool {
         if self.typed_callee_names.is_empty() {
             return true;
         }
         match static_call_name(call_expr) {
-            StaticCallName::Static(name) if self.typed_callee_names.contains(name.as_str()) => true,
-            StaticCallName::Static(_) => false,
-            StaticCallName::Unknown => true,
+            StaticCallName::Static(name) if self.typed_callee_names.contains(name.as_str()) => {
+                if let Some(profile) = profile.as_mut() {
+                    profile.static_candidate_hits += 1;
+                }
+                true
+            }
+            StaticCallName::Static(_) => {
+                if let Some(profile) = profile.as_mut() {
+                    profile.static_candidate_misses += 1;
+                }
+                false
+            }
+            StaticCallName::Unknown => {
+                if let Some(profile) = profile.as_mut() {
+                    profile.unknown_static_names += 1;
+                }
+                true
+            }
         }
     }
 
@@ -311,6 +382,7 @@ fn check_call_expr(
     semantic_model: &SemanticModel,
     call_expr: LuaCallExpr,
     candidates: &PrecomputedParamTypeCandidates,
+    mut profile: Option<&mut ParamTypeCheckProfile>,
 ) -> Option<()> {
     if context.is_cancelled() {
         return Some(());
@@ -321,14 +393,32 @@ fn check_call_expr(
             .get_args_list()
             .is_none_or(|args| args.get_args().next().is_none())
     {
+        if let Some(profile) = profile.as_mut() {
+            profile.calls_without_actionable_args += 1;
+        }
         return Some(());
     }
 
-    if !candidates.should_check_call(&call_expr) {
+    if !candidates.should_check_call_with_profile(&call_expr, profile.as_deref_mut()) {
         return Some(());
     }
 
-    let func = semantic_model.infer_call_expr_func(call_expr.clone(), None)?;
+    if let Some(profile) = profile.as_mut() {
+        profile.calls_checked += 1;
+    }
+    let infer_func_start = profile.is_some().then(std::time::Instant::now);
+    let Some(func) = semantic_model.infer_call_expr_func(call_expr.clone(), None) else {
+        if let Some(profile) = profile.as_mut() {
+            profile.calls_without_signature += 1;
+            if let Some(infer_func_start) = infer_func_start {
+                profile.infer_func_time += infer_func_start.elapsed();
+            }
+        }
+        return None;
+    };
+    if let (Some(profile), Some(infer_func_start)) = (profile.as_mut(), infer_func_start) {
+        profile.infer_func_time += infer_func_start.elapsed();
+    }
     let mut params = func.get_params().to_vec();
     let colon_call = call_expr.is_colon_call();
     let colon_define = func.is_colon_define();
@@ -342,8 +432,12 @@ fn check_call_expr(
     };
 
     let arg_exprs = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
+    let infer_arg_start = profile.is_some().then(std::time::Instant::now);
     let arg_infos =
         semantic_model.infer_call_arg_expr_list_types(call_expr.clone(), arg_type_count);
+    if let (Some(profile), Some(infer_arg_start)) = (profile.as_mut(), infer_arg_start) {
+        profile.infer_arg_time += infer_arg_start.elapsed();
+    }
     let (mut arg_types, mut arg_ranges): (Vec<LuaType>, Vec<TextRange>) =
         arg_infos.into_iter().unzip();
 

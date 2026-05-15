@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use glua_parser::{
@@ -76,12 +77,20 @@ impl Checker for CheckFieldChecker {
         let mut checked_index_expr = HashSet::new();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
         let mut state = CheckFieldState::default();
+        let profile_enabled = log::log_enabled!(log::Level::Info);
+        let mut profile = profile_enabled.then(CheckFieldProfile::default);
         for node in root.descendants::<LuaAst>() {
             if context.is_cancelled() {
                 return;
             }
+            if let Some(profile) = profile.as_mut() {
+                profile.nodes_scanned += 1;
+            }
             match node {
                 LuaAst::LuaAssignStat(assign) => {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.assignment_nodes += 1;
+                    }
                     let (vars, _) = assign.get_var_and_expr_list();
                     for var in vars.iter() {
                         if let LuaVarExpr::IndexExpr(index_expr) = var {
@@ -99,11 +108,15 @@ impl Checker for CheckFieldChecker {
                                 index_expr,
                                 DiagnosticCode::InjectField,
                                 &mut state,
+                                profile.as_mut(),
                             );
                         }
                     }
                 }
                 LuaAst::LuaFuncStat(func_stat) => {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.func_name_nodes += 1;
+                    }
                     if let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() {
                         checked_index_expr.insert(index_expr.syntax().clone());
                         check_index_expr(
@@ -112,11 +125,18 @@ impl Checker for CheckFieldChecker {
                             &index_expr,
                             DiagnosticCode::InjectField,
                             &mut state,
+                            profile.as_mut(),
                         );
                     }
                 }
                 LuaAst::LuaIndexExpr(index_expr) => {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.index_expr_nodes += 1;
+                    }
                     if checked_index_expr.contains(index_expr.syntax()) {
+                        if let Some(profile) = profile.as_mut() {
+                            profile.prechecked_index_skips += 1;
+                        }
                         continue;
                     }
                     check_index_expr(
@@ -125,10 +145,14 @@ impl Checker for CheckFieldChecker {
                         &index_expr,
                         DiagnosticCode::UndefinedField,
                         &mut state,
+                        profile.as_mut(),
                     );
                 }
                 _ => {}
             }
+        }
+        if let Some(profile) = profile {
+            profile.log(semantic_model.get_file_id(), state.member_infer_cache.len());
         }
     }
 }
@@ -138,28 +162,80 @@ struct CheckFieldState {
     member_infer_cache: HashMap<(LuaType, LuaMemberKey, bool), bool>,
 }
 
+#[derive(Default)]
+struct CheckFieldProfile {
+    nodes_scanned: usize,
+    assignment_nodes: usize,
+    func_name_nodes: usize,
+    index_expr_nodes: usize,
+    prechecked_index_skips: usize,
+    index_expr_checked: usize,
+    invalid_prefix_skips: usize,
+    valid_member_hits: usize,
+    dynamic_field_skips: usize,
+    subclass_field_skips: usize,
+    diagnostics_emitted: usize,
+    prefix_infer_time: Duration,
+    valid_member_time: Duration,
+}
+
+impl CheckFieldProfile {
+    fn log(&self, file_id: crate::FileId, member_cache_entries: usize) {
+        log::info!(
+            "check field profile: file={:?} nodes={} assignments={} func_names={} index_nodes={} prechecked_skips={} checked={} invalid_prefix_skips={} valid_member_hits={} dynamic_skips={} subclass_skips={} diagnostics={} prefix_infer_time={:?} valid_member_time={:?} member_cache_entries={}",
+            file_id,
+            self.nodes_scanned,
+            self.assignment_nodes,
+            self.func_name_nodes,
+            self.index_expr_nodes,
+            self.prechecked_index_skips,
+            self.index_expr_checked,
+            self.invalid_prefix_skips,
+            self.valid_member_hits,
+            self.dynamic_field_skips,
+            self.subclass_field_skips,
+            self.diagnostics_emitted,
+            self.prefix_infer_time,
+            self.valid_member_time,
+            member_cache_entries,
+        );
+    }
+}
+
 fn check_index_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
     code: DiagnosticCode,
     state: &mut CheckFieldState,
+    mut profile: Option<&mut CheckFieldProfile>,
 ) -> Option<()> {
     if context.is_cancelled() {
         return Some(());
     }
 
     let db = context.db;
+    if let Some(profile) = profile.as_mut() {
+        profile.index_expr_checked += 1;
+    }
+    let prefix_infer_start = profile.is_some().then(std::time::Instant::now);
     let prefix_typ = semantic_model
         .infer_expr(index_expr.get_prefix_expr()?)
         .unwrap_or(LuaType::Unknown);
+    if let (Some(profile), Some(prefix_infer_start)) = (profile.as_mut(), prefix_infer_start) {
+        profile.prefix_infer_time += prefix_infer_start.elapsed();
+    }
 
     if is_invalid_prefix_type(&prefix_typ) {
+        if let Some(profile) = profile.as_mut() {
+            profile.invalid_prefix_skips += 1;
+        }
         return Some(());
     }
 
     let index_key = index_expr.get_index_key()?;
 
+    let valid_member_start = profile.is_some().then(std::time::Instant::now);
     let valid_member = is_valid_member_with_state(
         context,
         semantic_model,
@@ -170,7 +246,13 @@ fn check_index_expr(
         state,
     )
     .is_some();
+    if let (Some(profile), Some(valid_member_start)) = (profile.as_mut(), valid_member_start) {
+        profile.valid_member_time += valid_member_start.elapsed();
+    }
     if valid_member {
+        if let Some(profile) = profile.as_mut() {
+            profile.valid_member_hits += 1;
+        }
         // TableOf types allow dot-access to all members but flag colon method calls.
         // GetTable() returns a plain table with fields; colon calls pass the wrong self.
         if is_tableof_colon_access(&prefix_typ, index_expr) {
@@ -191,6 +273,9 @@ fn check_index_expr(
     let field_name = SmolStr::new(index_key.get_path_part());
 
     if is_dynamic_field(db, &prefix_typ, &field_name) {
+        if let Some(profile) = profile.as_mut() {
+            profile.dynamic_field_skips += 1;
+        }
         return Some(());
     }
 
@@ -204,6 +289,9 @@ fn check_index_expr(
     if matches!(code, DiagnosticCode::UndefinedField)
         && field_exists_on_subclass(context, db, &prefix_typ, &field_name)
     {
+        if let Some(profile) = profile.as_mut() {
+            profile.subclass_field_skips += 1;
+        }
         return Some(());
     }
 
@@ -234,6 +322,9 @@ fn check_index_expr(
 
     match code {
         DiagnosticCode::InjectField => {
+            if let Some(profile) = profile.as_mut() {
+                profile.diagnostics_emitted += 1;
+            }
             context.add_diagnostic(
                 DiagnosticCode::InjectField,
                 index_key.get_range()?,
@@ -247,6 +338,9 @@ fn check_index_expr(
             );
         }
         DiagnosticCode::UndefinedField => {
+            if let Some(profile) = profile.as_mut() {
+                profile.diagnostics_emitted += 1;
+            }
             context.add_diagnostic(
                 DiagnosticCode::UndefinedField,
                 index_key.get_range()?,

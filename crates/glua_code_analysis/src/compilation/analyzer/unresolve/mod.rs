@@ -4,7 +4,7 @@ mod resolve;
 mod resolve_closure;
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use crate::{
     FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaSemanticDeclId, LuaTypeDecl,
@@ -74,13 +74,16 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             let iter_start = log_enabled.then(std::time::Instant::now);
 
             let resolve_start = log_enabled.then(std::time::Instant::now);
-            try_resolve(db, &mut infer_manager, &mut reason_resolve);
+            let profile = try_resolve(db, &mut infer_manager, &mut reason_resolve, log_enabled);
             if let Some(resolve_start) = resolve_start {
                 log::info!(
                     "unresolve: loop {} try_resolve cost {:?}",
                     loop_count,
                     resolve_start.elapsed()
                 );
+            }
+            if let Some(profile) = profile {
+                profile.log(loop_count);
             }
 
             let mat_start = log_enabled.then(std::time::Instant::now);
@@ -188,18 +191,30 @@ fn try_resolve(
     db: &mut DbIndex,
     infer_manager: &mut InferCacheManager,
     reason_resolve: &mut HashMap<InferFailReason, Vec<UnResolve>>,
-) {
+    profile_enabled: bool,
+) -> Option<TryResolveProfile> {
+    let mut profile = profile_enabled.then(TryResolveProfile::default);
     loop {
         let mut changed = false;
         let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
 
         for check_reason in sorted_reason_keys(reason_resolve) {
+            if let Some(profile) = profile.as_mut() {
+                profile.record_group_seen(
+                    &check_reason,
+                    reason_resolve.get(&check_reason).map_or(0, Vec::len),
+                );
+            }
             let Some(unresolves) = reason_resolve.get_mut(&check_reason) else {
                 continue;
             };
 
+            let reach_start = profile_enabled.then(std::time::Instant::now);
             let reached = check_reach_reason(db, infer_manager, &check_reason).unwrap_or(false);
+            if let (Some(profile), Some(reach_start)) = (profile.as_mut(), reach_start) {
+                profile.record_reach_check(&check_reason, reached, reach_start.elapsed());
+            }
             if !reached {
                 continue;
             }
@@ -208,6 +223,7 @@ fn try_resolve(
             for mut unresolve in unresolves.drain(..) {
                 let file_id = unresolve.get_file_id().unwrap_or(FileId { id: 0 });
                 let cache = infer_manager.get_infer_cache(file_id);
+                let attempt_start = profile_enabled.then(std::time::Instant::now);
                 let resolve_result = match &mut unresolve {
                     UnResolve::Decl(un_resolve_decl) => {
                         try_resolve_decl(db, cache, un_resolve_decl)
@@ -243,6 +259,13 @@ fn try_resolve(
                         try_resolve_special_call(db, cache, un_resolve_special_call)
                     }
                 };
+                if let (Some(profile), Some(attempt_start)) = (profile.as_mut(), attempt_start) {
+                    profile.record_attempt(
+                        &check_reason,
+                        resolve_result.as_ref().err(),
+                        attempt_start.elapsed(),
+                    );
+                }
 
                 match resolve_result {
                     Ok(_) => {
@@ -283,6 +306,118 @@ fn try_resolve(
         if !changed || reason_resolve.is_empty() {
             break;
         }
+    }
+    profile
+}
+
+#[derive(Default)]
+struct TryResolveProfile {
+    reason_stats: HashMap<&'static str, TryResolveReasonStats>,
+}
+
+#[derive(Default)]
+struct TryResolveReasonStats {
+    groups_seen: usize,
+    unresolves_seen: usize,
+    reach_checks: usize,
+    reach_hits: usize,
+    reach_time: Duration,
+    attempts: usize,
+    ok: usize,
+    err_none: usize,
+    err_recursive: usize,
+    err_field_not_found: usize,
+    err_operator_call: usize,
+    err_same_reason: usize,
+    err_other_reason: usize,
+    attempt_time: Duration,
+}
+
+impl TryResolveProfile {
+    fn stats_mut(&mut self, reason: &InferFailReason) -> &mut TryResolveReasonStats {
+        self.reason_stats
+            .entry(infer_fail_reason_label(reason))
+            .or_default()
+    }
+
+    fn record_group_seen(&mut self, reason: &InferFailReason, len: usize) {
+        let stats = self.stats_mut(reason);
+        stats.groups_seen += 1;
+        stats.unresolves_seen += len;
+    }
+
+    fn record_reach_check(&mut self, reason: &InferFailReason, reached: bool, elapsed: Duration) {
+        let stats = self.stats_mut(reason);
+        stats.reach_checks += 1;
+        if reached {
+            stats.reach_hits += 1;
+        }
+        stats.reach_time += elapsed;
+    }
+
+    fn record_attempt(
+        &mut self,
+        check_reason: &InferFailReason,
+        err_reason: Option<&InferFailReason>,
+        elapsed: Duration,
+    ) {
+        let stats = self.stats_mut(check_reason);
+        stats.attempts += 1;
+        stats.attempt_time += elapsed;
+        match err_reason {
+            None => stats.ok += 1,
+            Some(InferFailReason::None) => stats.err_none += 1,
+            Some(InferFailReason::RecursiveInfer) => stats.err_recursive += 1,
+            Some(InferFailReason::FieldNotFound) => stats.err_field_not_found += 1,
+            Some(InferFailReason::UnResolveOperatorCall) => stats.err_operator_call += 1,
+            Some(reason) if reason == check_reason => stats.err_same_reason += 1,
+            Some(_) => stats.err_other_reason += 1,
+        }
+    }
+
+    fn log(&self, loop_count: usize) {
+        let mut stats = self
+            .reason_stats
+            .iter()
+            .map(|(reason, stats)| (*reason, stats))
+            .collect::<Vec<_>>();
+        stats.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.attempt_time + stats.reach_time));
+        for (reason, stats) in stats.into_iter().take(12) {
+            log::info!(
+                "unresolve: loop {} reason {} groups={} unresolves={} reach={}/{} reach_time={:?} attempts={} ok={} same_err={} other_err={} field_err={} op_err={} none_err={} recursive_err={} attempt_time={:?}",
+                loop_count,
+                reason,
+                stats.groups_seen,
+                stats.unresolves_seen,
+                stats.reach_hits,
+                stats.reach_checks,
+                stats.reach_time,
+                stats.attempts,
+                stats.ok,
+                stats.err_same_reason,
+                stats.err_other_reason,
+                stats.err_field_not_found,
+                stats.err_operator_call,
+                stats.err_none,
+                stats.err_recursive,
+                stats.attempt_time,
+            );
+        }
+    }
+}
+
+fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str {
+    match reason {
+        InferFailReason::None => "none",
+        InferFailReason::RecursiveInfer => "recursive_infer",
+        InferFailReason::FieldNotFound => "field_not_found",
+        InferFailReason::UnResolveOperatorCall => "operator_call",
+        InferFailReason::UnResolveDeclType(_) => "decl_type",
+        InferFailReason::UnResolveMemberType(_) => "member_type",
+        InferFailReason::UnResolveExpr(_) => "expr",
+        InferFailReason::UnResolveSignatureReturn(_) => "signature_return",
+        InferFailReason::UnResolveTypeDecl(_) => "type_decl",
+        InferFailReason::UnResolveModuleExport(_) => "module_export",
     }
 }
 

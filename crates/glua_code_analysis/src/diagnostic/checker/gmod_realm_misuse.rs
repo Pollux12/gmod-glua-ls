@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaCommentOwner, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
@@ -62,10 +63,15 @@ impl Checker for GmodRealmMisuseChecker {
             .as_ref()
             .and_then(|s| s.callee_realms_by_workspace.get(&workspace_id))
             .map(Arc::as_ref);
+        let profile_enabled = log::log_enabled!(log::Level::Info);
+        let mut profile = profile_enabled.then(GmodRealmMisuseProfile::default);
 
         for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
             if context.is_cancelled() {
                 return;
+            }
+            if let Some(profile) = profile.as_mut() {
+                profile.calls_scanned += 1;
             }
             let call_realm = resolve_realm_at_offset(
                 infer_index,
@@ -73,7 +79,17 @@ impl Checker for GmodRealmMisuseChecker {
                 file_realm_metadata,
                 call_expr.get_range().start(),
             );
+            if call_realm.realm == GmodRealm::Shared {
+                if let Some(profile) = profile.as_mut() {
+                    profile.shared_call_skips += 1;
+                }
+                continue;
+            }
 
+            if let Some(profile) = profile.as_mut() {
+                profile.calls_checked += 1;
+            }
+            let resolve_start = profile_enabled.then(Instant::now);
             let mut callee_realms = resolve_callee_realms(
                 context,
                 semantic_model,
@@ -83,8 +99,15 @@ impl Checker for GmodRealmMisuseChecker {
                 &mut callee_realm_cache,
                 &mut member_candidate_cache,
                 precomputed_callee_realms,
+                profile.as_mut(),
             );
+            if let (Some(profile), Some(resolve_start)) = (profile.as_mut(), resolve_start) {
+                profile.callee_resolution_time += resolve_start.elapsed();
+            }
             if callee_realms.is_empty() {
+                if let Some(profile) = profile.as_mut() {
+                    profile.empty_callee_realms += 1;
+                }
                 continue;
             }
 
@@ -101,10 +124,10 @@ impl Checker for GmodRealmMisuseChecker {
                 );
             }
 
-            let call_name = call_expr
-                .get_access_path()
-                .unwrap_or_else(|| "function".to_string());
             if let Some(callee_realm) = unknown_realm_candidate(call_realm, &callee_realms) {
+                let call_name = call_expr
+                    .get_access_path()
+                    .unwrap_or_else(|| "function".to_string());
                 context.add_diagnostic(
                     DiagnosticCode::GmodUnknownRealm,
                     call_expr.get_range(),
@@ -116,24 +139,23 @@ impl Checker for GmodRealmMisuseChecker {
                     ),
                     None,
                 );
+                if let Some(profile) = profile.as_mut() {
+                    profile.diagnostics_emitted += 1;
+                }
                 continue;
             }
 
-            let mismatch_candidates: Vec<ResolvedRealm> = callee_realms
-                .iter()
-                .copied()
-                .filter(|callee| is_cross_realm_misuse(call_realm.realm, callee.realm))
-                .collect();
-            if mismatch_candidates.is_empty() {
+            let Some(callee_realm) =
+                pick_best_mismatch_candidate_for_call(call_realm.realm, &callee_realms)
+            else {
                 continue;
-            }
+            };
             let compatible_candidate = callee_realms
                 .iter()
                 .copied()
                 .filter(|callee| !is_cross_realm_misuse(call_realm.realm, callee.realm))
                 .max_by_key(|realm| evidence_priority(realm.evidence));
 
-            let callee_realm = pick_best_mismatch_candidate(&mismatch_candidates);
             if compatible_candidate.is_some_and(|candidate| {
                 // When the mismatch comes from an explicit `---@realm` annotation the
                 // developer deliberately restricted the function.  Only suppress if the
@@ -157,13 +179,65 @@ impl Checker for GmodRealmMisuseChecker {
                 continue;
             };
 
+            let call_name = call_expr
+                .get_access_path()
+                .unwrap_or_else(|| "function".to_string());
             context.add_diagnostic(
                 code,
                 call_expr.get_range(),
                 mismatch_message(code, &call_name, call_realm.realm, callee_realm.realm),
                 None,
             );
+            if let Some(profile) = profile.as_mut() {
+                profile.diagnostics_emitted += 1;
+            }
         }
+
+        if let Some(mut profile) = profile {
+            profile.annotation_cache_files_loaded = decl_annotation_cache.len();
+            profile.log(file_id);
+        }
+    }
+}
+
+#[derive(Default)]
+struct GmodRealmMisuseProfile {
+    calls_scanned: usize,
+    calls_checked: usize,
+    shared_call_skips: usize,
+    empty_callee_realms: usize,
+    diagnostics_emitted: usize,
+    gm_method_fast_hits: usize,
+    decl_cache_hits: usize,
+    decl_cache_misses: usize,
+    precomputed_callee_hits: usize,
+    member_candidate_cache_hits: usize,
+    member_candidate_cache_misses: usize,
+    member_candidate_time: Duration,
+    annotation_cache_files_loaded: usize,
+    callee_resolution_time: Duration,
+}
+
+impl GmodRealmMisuseProfile {
+    fn log(&self, file_id: FileId) {
+        log::info!(
+            "gmod realm misuse profile: file={:?} calls_scanned={} calls_checked={} shared_skips={} empty_callee={} diagnostics={} gm_fast_hits={} decl_cache_hits={} decl_cache_misses={} precomputed_hits={} member_cache_hits={} member_cache_misses={} member_time={:?} annotation_files_loaded={} callee_time={:?}",
+            file_id,
+            self.calls_scanned,
+            self.calls_checked,
+            self.shared_call_skips,
+            self.empty_callee_realms,
+            self.diagnostics_emitted,
+            self.gm_method_fast_hits,
+            self.decl_cache_hits,
+            self.decl_cache_misses,
+            self.precomputed_callee_hits,
+            self.member_candidate_cache_hits,
+            self.member_candidate_cache_misses,
+            self.member_candidate_time,
+            self.annotation_cache_files_loaded,
+            self.callee_resolution_time,
+        );
     }
 }
 
@@ -203,6 +277,7 @@ fn resolve_callee_realms(
     callee_realm_cache: &mut CalleeRealmCache,
     member_candidate_cache: &mut MemberCandidateCache,
     precomputed_callee_realms: Option<&PrecomputedCalleeRealmMap>,
+    mut profile: Option<&mut GmodRealmMisuseProfile>,
 ) -> Vec<ResolvedRealm> {
     // Fast path: GM method annotations (O(1) HashMap lookup, no inference needed)
     if let Some(prefix_expr) = call_expr.get_prefix_expr()
@@ -210,6 +285,9 @@ fn resolve_callee_realms(
     {
         let gm_realms = resolve_annotated_gm_method_realms(&index_expr, gm_method_realms);
         if !gm_realms.is_empty() {
+            if let Some(profile) = profile.as_mut() {
+                profile.gm_method_fast_hits += 1;
+            }
             return gm_realms;
         }
     }
@@ -227,7 +305,13 @@ fn resolve_callee_realms(
     // below as a fallback after richer call-site candidates have been considered.
     if let Some(ref decl) = semantic_decl {
         if let Some(cached) = callee_realm_cache.get(decl) {
+            if let Some(profile) = profile.as_mut() {
+                profile.decl_cache_hits += 1;
+            }
             return cached.clone();
+        }
+        if let Some(profile) = profile.as_mut() {
+            profile.decl_cache_misses += 1;
         }
     }
 
@@ -241,6 +325,7 @@ fn resolve_callee_realms(
         gm_method_realms,
         decl_annotation_cache,
         member_candidate_cache,
+        profile.as_deref_mut(),
     ) && !member_realms.is_empty()
     {
         realms = member_realms;
@@ -259,6 +344,9 @@ fn resolve_callee_realms(
         }
 
         if let Some(precomputed) = precomputed_callee_realms.and_then(|map| map.get(decl)) {
+            if let Some(profile) = profile.as_mut() {
+                profile.precomputed_callee_hits += 1;
+            }
             for realm in precomputed {
                 push_unique_realm(&mut realms, *realm);
             }
@@ -274,6 +362,9 @@ fn resolve_callee_realms(
             if let Some(precomputed) =
                 precomputed_callee_realms.and_then(|map| map.get(&origin_owner))
             {
+                if let Some(profile) = profile.as_mut() {
+                    profile.precomputed_callee_hits += 1;
+                }
                 for realm in precomputed {
                     push_unique_realm(&mut realms, *realm);
                 }
@@ -352,6 +443,7 @@ fn resolve_member_candidate_realms(
     gm_method_realms: &GmMethodRealmMap,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
     member_candidate_cache: &mut MemberCandidateCache,
+    mut profile: Option<&mut GmodRealmMisuseProfile>,
 ) -> Option<Vec<ResolvedRealm>> {
     let prefix_expr = call_expr.get_prefix_expr()?;
     let index_expr = LuaIndexExpr::cast(prefix_expr.syntax().clone())?;
@@ -360,6 +452,9 @@ fn resolve_member_candidate_realms(
     // If we already have explicit GM method realm annotations, skip expensive inference.
     // The precomputed annotations are authoritative for GM.*/GAMEMODE.* calls.
     if !realms.is_empty() {
+        if let Some(profile) = profile.as_mut() {
+            profile.gm_method_fast_hits += 1;
+        }
         return Some(realms);
     }
 
@@ -371,12 +466,17 @@ fn resolve_member_candidate_realms(
         // For realm diagnostics we need ALL candidate declarations across
         // every workspace priority tier. The normal member-resolution path
         // `get_member_info_with_key` returns only realm-compatible members.
+        let member_start = profile.is_some().then(Instant::now);
         let all_member_ids = collect_all_member_ids_for_type_key(
             semantic_model,
             &owner_type,
             &member_key,
             member_candidate_cache,
+            profile.as_deref_mut(),
         );
+        if let (Some(profile), Some(member_start)) = (profile.as_mut(), member_start) {
+            profile.member_candidate_time += member_start.elapsed();
+        }
         for member_id in all_member_ids {
             if context.is_cancelled() {
                 return Some(realms);
@@ -568,10 +668,17 @@ fn collect_all_member_ids_for_type_key(
     owner_type: &LuaType,
     member_key: &LuaMemberKey,
     member_candidate_cache: &mut MemberCandidateCache,
+    mut profile: Option<&mut GmodRealmMisuseProfile>,
 ) -> Vec<LuaMemberId> {
     let cache_key = (owner_type.clone(), member_key.clone());
     if let Some(cached) = member_candidate_cache.get(&cache_key) {
+        if let Some(profile) = profile.as_mut() {
+            profile.member_candidate_cache_hits += 1;
+        }
         return cached.clone();
+    }
+    if let Some(profile) = profile.as_mut() {
+        profile.member_candidate_cache_misses += 1;
     }
 
     let db = semantic_model.get_db();
@@ -715,6 +822,7 @@ fn push_unique_realm(realms: &mut Vec<ResolvedRealm>, realm: ResolvedRealm) {
     realms.push(realm);
 }
 
+#[cfg(test)]
 fn pick_best_mismatch_candidate(realms: &[ResolvedRealm]) -> ResolvedRealm {
     *realms
         .iter()
@@ -723,6 +831,17 @@ fn pick_best_mismatch_candidate(realms: &[ResolvedRealm]) -> ResolvedRealm {
             realm: GmodRealm::Unknown,
             evidence: RealmEvidence::Unknown,
         })
+}
+
+fn pick_best_mismatch_candidate_for_call(
+    call_realm: GmodRealm,
+    realms: &[ResolvedRealm],
+) -> Option<ResolvedRealm> {
+    realms
+        .iter()
+        .copied()
+        .filter(|callee| is_cross_realm_misuse(call_realm, callee.realm))
+        .max_by_key(mismatch_candidate_sort_key)
 }
 
 fn evidence_priority(evidence: RealmEvidence) -> u8 {

@@ -113,6 +113,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let mut t_netflow = std::time::Duration::ZERO;
         let mut t_scoped = std::time::Duration::ZERO;
         let mut t_realm = std::time::Duration::ZERO;
+        let mut profile = do_profile.then(GmodPreProfile::default);
 
         // Build a workspace-global registry of helper functions so that
         // net.Read/Write expansion can follow helpers defined in *other* files
@@ -135,6 +136,10 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 .get_file_content(&in_filed_tree.file_id)
                 .map(|c| scan_gmod_keywords(c, method_prefixes))
                 .unwrap_or_default();
+            if let Some(profile) = profile.as_mut() {
+                profile.files_scanned += 1;
+                profile.record_keywords(&keywords, is_in_scope);
+            }
 
             let s = do_profile.then(std::time::Instant::now);
             let (gm_method_realms, receive_flows) = if keywords.needs_hook_metadata() {
@@ -145,8 +150,15 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     &helper_registry,
                 )
             } else {
+                if let Some(profile) = profile.as_mut() {
+                    profile.hook_metadata_skips += 1;
+                }
                 (Vec::new(), Vec::new())
             };
+            if let Some(profile) = profile.as_mut() {
+                profile.gm_method_realms += gm_method_realms.len();
+                profile.receive_flows += receive_flows.len();
+            }
             if let Some(s) = s {
                 t_hook += s.elapsed();
             }
@@ -160,6 +172,8 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     receive_flows,
                     &helper_registry,
                 );
+            } else if let Some(profile) = profile.as_mut() {
+                profile.netflow_skips += 1;
             }
             if let Some(s) = s {
                 t_netflow += s.elapsed();
@@ -193,6 +207,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                         Some(m)
                     });
                 if let Some(scope_match) = scope_match {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.scoped_class_matches += 1;
+                    }
                     ensure_scoped_class_type_decl(
                         db,
                         in_filed_tree.file_id,
@@ -220,6 +237,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             let s = do_profile.then(std::time::Instant::now);
             if keywords.has_realm_branch {
                 let ranges = collect_branch_realm_ranges(&in_filed_tree.value);
+                if let Some(profile) = profile.as_mut() {
+                    profile.branch_realm_ranges += ranges.len();
+                }
                 if !ranges.is_empty() {
                     branch_realm_ranges.insert(in_filed_tree.file_id, ranges);
                 }
@@ -227,8 +247,14 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             if keywords.has_realm_anno {
                 if let Some(realm) = collect_realm_annotation(&in_filed_tree.value) {
                     annotation_realms.insert(in_filed_tree.file_id, realm);
+                    if let Some(profile) = profile.as_mut() {
+                        profile.annotation_realms += 1;
+                    }
                 }
                 let member_ranges = collect_member_realm_ranges(&in_filed_tree.value);
+                if let Some(profile) = profile.as_mut() {
+                    profile.member_realm_ranges += member_ranges.len();
+                }
                 db.get_gmod_infer_index_mut()
                     .set_member_realm_ranges(in_filed_tree.file_id, member_ranges);
             }
@@ -251,6 +277,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             }
         }
         if do_profile {
+            if let Some(profile) = profile.as_ref() {
+                profile.log();
+            }
             log::info!(
                 "gmod pre: per-file metadata cost {:?} (hook={:?}, netflow={:?}, scoped={:?}, realm={:?})",
                 t0.map(|t0| t0.elapsed()).unwrap_or_default(),
@@ -277,6 +306,60 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         if let Some(t2) = t2 {
             log::info!("gmod pre: rebuild_realm_metadata cost {:?}", t2.elapsed());
         }
+    }
+}
+
+#[derive(Default)]
+struct GmodPreProfile {
+    files_scanned: usize,
+    hook_keyword_files: usize,
+    net_keyword_files: usize,
+    system_call_keyword_files: usize,
+    gm_func_keyword_files: usize,
+    realm_branch_keyword_files: usize,
+    realm_annotation_keyword_files: usize,
+    scoped_files: usize,
+    hook_metadata_skips: usize,
+    netflow_skips: usize,
+    gm_method_realms: usize,
+    receive_flows: usize,
+    scoped_class_matches: usize,
+    branch_realm_ranges: usize,
+    annotation_realms: usize,
+    member_realm_ranges: usize,
+}
+
+impl GmodPreProfile {
+    fn record_keywords(&mut self, keywords: &GmodKeywords, is_scoped: bool) {
+        self.hook_keyword_files += usize::from(keywords.has_hook);
+        self.net_keyword_files += usize::from(keywords.has_net);
+        self.system_call_keyword_files += usize::from(keywords.has_system_call);
+        self.gm_func_keyword_files += usize::from(keywords.has_gm_func);
+        self.realm_branch_keyword_files += usize::from(keywords.has_realm_branch);
+        self.realm_annotation_keyword_files += usize::from(keywords.has_realm_anno);
+        self.scoped_files += usize::from(is_scoped);
+    }
+
+    fn log(&self) {
+        log::info!(
+            "gmod pre profile: files={} keyword_files hook={} net={} system={} gm_func={} realm_branch={} realm_anno={} scoped={} hook_skips={} netflow_skips={} gm_method_realms={} receive_flows={} scoped_matches={} branch_ranges={} annotation_realms={} member_ranges={}",
+            self.files_scanned,
+            self.hook_keyword_files,
+            self.net_keyword_files,
+            self.system_call_keyword_files,
+            self.gm_func_keyword_files,
+            self.realm_branch_keyword_files,
+            self.realm_annotation_keyword_files,
+            self.scoped_files,
+            self.hook_metadata_skips,
+            self.netflow_skips,
+            self.gm_method_realms,
+            self.receive_flows,
+            self.scoped_class_matches,
+            self.branch_realm_ranges,
+            self.annotation_realms,
+            self.member_realm_ranges,
+        );
     }
 }
 
