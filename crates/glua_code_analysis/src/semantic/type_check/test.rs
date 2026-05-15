@@ -208,4 +208,38 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn test_defaulted_class_field_is_not_required_for_table_compatibility() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class TraceLike
+            ---@field Hit boolean=false
+            ---@field HitPos number
+            "#,
+        );
+
+        let target_ty = ws.ty("TraceLike");
+        let table_ty = ws.expr_ty("{ HitPos = 1 }");
+
+        assert!(ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn test_defaulted_generic_field_is_not_required_for_table_compatibility() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class TraceBox<T>
+            ---@field Value T
+            ---@field Hit boolean=false
+            "#,
+        );
+
+        let target_ty = ws.ty("TraceBox<number>");
+        let table_ty = ws.expr_ty("{ Value = 1 }");
+
+        assert!(ws.check_type(&target_ty, &table_ty));
+    }
 }

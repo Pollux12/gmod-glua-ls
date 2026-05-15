@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::{
-    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, RenderLevel, humanize_type,
+    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
+    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, RenderLevel, humanize_type,
     semantic::{
         member::find_members,
         type_check::{
@@ -289,15 +289,21 @@ fn check_ref_type_compact_table(
     };
 
     for source_member in source_type_members {
-        if !is_required_structural_member(Some(source_member.get_feature())) {
-            continue;
-        }
         let source_member_type = context
             .db
             .get_type_index()
             .get_type_cache(&source_member.get_id().into())
             .unwrap_or(&LuaTypeCache::InferType(LuaType::Any))
             .as_type();
+        let property_owner_id = LuaSemanticDeclId::Member(source_member.get_id());
+        if !is_required_structural_member(
+            context.db,
+            Some(source_member.get_feature()),
+            Some(&property_owner_id),
+            Some(source_member_type),
+        ) {
+            continue;
+        }
         let key = source_member.get_key();
 
         if context.is_key_checked(key) {
@@ -388,7 +394,12 @@ fn check_ref_type_compact_object(
     };
 
     for source_member in source_type_members {
-        if !is_required_structural_member(source_member.feature) {
+        if !is_required_structural_member(
+            context.db,
+            source_member.feature,
+            source_member.property_owner_id.as_ref(),
+            Some(&source_member.typ),
+        ) {
             continue;
         }
         let source_member_type = source_member.typ;

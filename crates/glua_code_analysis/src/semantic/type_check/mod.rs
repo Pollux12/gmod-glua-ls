@@ -21,7 +21,7 @@ pub use type_check_fail_reason::TypeCheckFailReason;
 use type_check_guard::TypeCheckGuard;
 
 use crate::{
-    LuaMemberFeature, LuaUnionType,
+    LuaMemberFeature, LuaSemanticDeclId, LuaUnionType,
     db_index::{DbIndex, LuaType},
     semantic::type_check::type_check_context::TypeCheckContext,
 };
@@ -29,11 +29,42 @@ pub use sub_type::is_sub_type_of;
 pub type TypeCheckResult = Result<(), TypeCheckFailReason>;
 pub use type_check_context::TypeCheckCheckLevel;
 
-fn is_required_structural_member(feature: Option<LuaMemberFeature>) -> bool {
-    !matches!(
+fn is_required_structural_member(
+    db: &DbIndex,
+    feature: Option<LuaMemberFeature>,
+    property_owner_id: Option<&LuaSemanticDeclId>,
+    member_type: Option<&LuaType>,
+) -> bool {
+    if matches!(
         feature,
         Some(LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl)
-    )
+    ) {
+        return false;
+    }
+
+    !member_has_documented_default(db, property_owner_id, member_type)
+}
+
+fn member_has_documented_default(
+    db: &DbIndex,
+    property_owner_id: Option<&LuaSemanticDeclId>,
+    member_type: Option<&LuaType>,
+) -> bool {
+    if property_owner_id.is_some_and(|owner_id| {
+        db.get_property_index()
+            .get_property(owner_id)
+            .is_some_and(|property| property.default_value().is_some())
+    }) {
+        return true;
+    }
+
+    match member_type {
+        Some(LuaType::Signature(signature_id)) => db
+            .get_property_index()
+            .get_property(&LuaSemanticDeclId::Signature(signature_id.clone()))
+            .is_some_and(|property| property.default_value().is_some()),
+        _ => false,
+    }
 }
 
 pub fn check_type_compact(

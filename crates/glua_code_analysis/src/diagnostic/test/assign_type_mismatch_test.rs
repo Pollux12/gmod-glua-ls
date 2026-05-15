@@ -662,7 +662,7 @@ local b = a
             "#
         ));
 
-        assert!(ws.check_code_for_namespace(
+        assert!(!ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
 ---@class A
@@ -788,7 +788,7 @@ return t
         config.strict.array_index = true;
         ws.analysis.update_config(config.into());
 
-        assert!(ws.check_code_for_namespace(
+        assert!(!ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
             ---@class A
@@ -799,8 +799,6 @@ return t
                 "#
         ));
 
-        // 允许接受父类.
-        // TODO: 接受父类时应该检查是否具有子类的所有非可空成员.
         assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
