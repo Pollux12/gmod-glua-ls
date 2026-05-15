@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 
 pub use async_state::AsyncState;
 pub use signature::{
-    LuaDocParamInfo, LuaDocReturnInfo, LuaGenericParamInfo, LuaNoDiscard, LuaSignature,
-    LuaSignatureId, ReturnTypeKind, SignatureReturnStatus,
+    LuaDocDefaultValue, LuaDocParamInfo, LuaDocReturnInfo, LuaGenericParamInfo, LuaNoDiscard,
+    LuaOutParamInfo, LuaSignature, LuaSignatureId, ReturnTypeKind, SignatureReturnStatus,
 };
 
 use crate::FileId;

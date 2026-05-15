@@ -182,7 +182,7 @@ pub fn resolve_signature_by_args(
 
             let match_result = if param_type.is_any() {
                 ParamMatchResult::Any
-            } else if param_type.is_nullable() {
+            } else if param_type.is_nullable() || func.is_param_optional(param_index) {
                 ParamMatchResult::Type
             } else {
                 ParamMatchResult::Not

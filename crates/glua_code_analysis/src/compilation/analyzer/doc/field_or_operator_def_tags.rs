@@ -7,7 +7,7 @@ use glua_parser::{
 
 use crate::{
     AnalyzeError, AsyncState, DiagnosticCode, LuaFunctionType, LuaMemberFeature, LuaMemberId,
-    LuaSignatureId, LuaTypeCache, OperatorFunction, TypeOps,
+    LuaSignatureId, LuaTypeCache, OperatorFunction,
     compilation::analyzer::doc::preprocess_description,
     db_index::{
         LuaMember, LuaMemberKey, LuaMemberOwner, LuaOperator, LuaOperatorMetaMethod,
@@ -15,7 +15,9 @@ use crate::{
     },
 };
 
-use super::{DocAnalyzer, infer_type::infer_type};
+use super::{
+    DocAnalyzer, apply_nullable_doc_default, convert_doc_default_value, infer_type::infer_type,
+};
 
 pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<()> {
     let current_type_id = match &analyzer.current_type_id {
@@ -44,20 +46,15 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
 
     let nullable = tag.is_nullable();
     let type_node = tag.get_type()?;
-    let (mut field_type, property_owner) = match &type_node {
+    let mut field_type = infer_type(analyzer, type_node.clone());
+    let property_owner = match &type_node {
         LuaDocType::Func(doc_func) => {
-            let typ = infer_type(analyzer, type_node.clone());
-            let signature_id = LuaSignatureId::from_doc_func(analyzer.file_id, doc_func);
-            (typ, LuaSemanticDeclId::Signature(signature_id))
+            LuaSemanticDeclId::Signature(LuaSignatureId::from_doc_func(analyzer.file_id, doc_func))
         }
-        _ => (
-            infer_type(analyzer, type_node),
-            LuaSemanticDeclId::Member(member_id),
-        ),
+        _ => LuaSemanticDeclId::Member(member_id),
     };
-    if nullable && !field_type.is_nullable() {
-        field_type = TypeOps::Union.apply(analyzer.db, &field_type, &LuaType::Nil);
-    }
+    let default_value = tag.get_default_value().map(convert_doc_default_value);
+    field_type = apply_nullable_doc_default(analyzer, field_type, nullable, default_value.as_ref());
 
     let mut description = String::new();
 
@@ -156,6 +153,14 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
             analyzer.file_id,
             property_owner.clone(),
             description,
+        );
+    }
+
+    if let Some(default_value) = default_value {
+        analyzer.db.get_property_index_mut().add_default_value(
+            analyzer.file_id,
+            property_owner,
+            default_value,
         );
     }
 

@@ -4,13 +4,17 @@ use glua_parser::{LuaVersionCondition, VisibilityKind};
 
 use crate::{
     LuaType, LuaTypeDeclId,
-    db_index::property::decl_feature::{DeclFeatureFlag, PropertyDeclFeature},
+    db_index::{
+        property::decl_feature::{DeclFeatureFlag, PropertyDeclFeature},
+        signature::LuaDocDefaultValue,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaCommonProperty {
     pub visibility: VisibilityKind,
     pub description: Option<Box<String>>,
+    pub default_value: Option<LuaDocDefaultValue>,
     pub source: Option<Box<String>>,
     pub deprecated: Option<Box<LuaDeprecated>>,
     pub version_conds: Option<Box<Vec<LuaVersionCondition>>>,
@@ -31,6 +35,7 @@ impl LuaCommonProperty {
         Self {
             visibility: VisibilityKind::Public,
             description: None,
+            default_value: None,
             source: None,
             deprecated: None,
             version_conds: None,
@@ -65,12 +70,20 @@ impl LuaCommonProperty {
         self.source.as_deref()
     }
 
+    pub fn default_value(&self) -> Option<&LuaDocDefaultValue> {
+        self.default_value.as_ref()
+    }
+
     pub fn add_extra_description(&mut self, description: String) {
         self.description = Some(Box::new(description));
     }
 
     pub fn add_extra_source(&mut self, source: String) {
         self.source = Some(Box::new(source));
+    }
+
+    pub fn add_extra_default_value(&mut self, default_value: LuaDocDefaultValue) {
+        self.default_value = Some(default_value);
     }
 
     pub fn add_extra_deprecated(&mut self, message: Option<String>) {

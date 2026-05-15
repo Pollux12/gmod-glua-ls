@@ -389,13 +389,16 @@ fn extract_generic_callables(db: &DbIndex, typ: &LuaType) -> Vec<Arc<LuaFunction
             }
             LuaType::Signature(signature_id) => {
                 if let Some(signature) = db.get_signature_index().get(signature_id) {
-                    let function_type = Arc::new(LuaFunctionType::new(
-                        signature.async_state,
-                        signature.is_colon_define,
-                        signature.is_vararg,
-                        signature.get_type_params(),
-                        signature.get_return_type(),
-                    ));
+                    let function_type = Arc::new(
+                        LuaFunctionType::new(
+                            signature.async_state,
+                            signature.is_colon_define,
+                            signature.is_vararg,
+                            signature.get_type_params(),
+                            signature.get_return_type(),
+                        )
+                        .with_optional_params(signature.get_param_optional_flags()),
+                    );
                     if signature.is_generic()
                         || signature.has_special_call_params()
                         || function_type.contain_tpl()

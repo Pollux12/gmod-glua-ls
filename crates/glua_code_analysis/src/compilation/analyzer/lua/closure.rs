@@ -154,6 +154,7 @@ fn analyze_return(
         Err(InferFailReason::None) => {
             vec![LuaDocReturnInfo {
                 type_ref: LuaType::Unknown,
+                default_value: None,
                 description: None,
                 name: None,
                 attributes: None,
@@ -273,6 +274,7 @@ pub fn analyze_return_point(
 
     Ok(vec![LuaDocReturnInfo {
         type_ref: return_type.unwrap_or(LuaType::Unknown),
+        default_value: None,
         description: None,
         name: None,
         attributes: None,

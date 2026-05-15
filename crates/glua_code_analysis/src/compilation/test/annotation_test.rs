@@ -1,6 +1,252 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaIndexExpr};
+
+    use crate::{
+        DiagnosticCode, FileId, LuaDocDefaultValue, LuaMemberOwner, LuaSemanticDeclId, LuaType,
+        LuaTypeDeclId, VirtualWorkspace,
+    };
+
+    fn index_expr_ty(ws: &VirtualWorkspace, file_id: FileId, expr_text: &str) -> LuaType {
+        index_expr_ty_at_occurrence(ws, file_id, expr_text, 0)
+    }
+
+    fn index_expr_ty_at_occurrence(
+        ws: &VirtualWorkspace,
+        file_id: FileId,
+        expr_text: &str,
+        occurrence: usize,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let mut seen = Vec::new();
+        let mut seen_occurrence = 0usize;
+        for index_expr in semantic_model.get_root().descendants::<LuaIndexExpr>() {
+            let text = index_expr.syntax().text().to_string();
+            seen.push(text.clone());
+            if text == expr_text
+                && seen_occurrence == occurrence
+                && let Some(info) =
+                    semantic_model.get_semantic_info(index_expr.syntax().clone().into())
+            {
+                return info.typ;
+            } else if text == expr_text {
+                seen_occurrence += 1;
+            }
+        }
+
+        panic!("expected semantic info for `{expr_text}` at occurrence {occurrence}, saw {seen:?}");
+    }
+
+    fn type_decl_id_from_type(typ: &LuaType) -> Option<LuaTypeDeclId> {
+        match typ {
+            LuaType::Def(type_decl_id) | LuaType::Ref(type_decl_id) => Some(type_decl_id.clone()),
+            LuaType::Instance(instance) => type_decl_id_from_type(instance.get_base()),
+            LuaType::TypeGuard(inner) => type_decl_id_from_type(inner),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_inline_default_metadata_storage() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@class Example
+        ---@field ContentsLeft=0 CONTENTS
+        ---@field ContentsRight CONTENTS=0
+        ---@field EntityDefault Entity="NULL"
+        local Example = {}
+
+        ---@param retries_left=3 number
+        ---@param retries_right number=3
+        ---@return boolean=false
+        function Example:Run(retries_left, retries_right)
+        end
+        "#,
+        );
+
+        let class_type = ws.ty("Example");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let db = semantic_model.get_db();
+
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure");
+        let signature_id = crate::LuaSignatureId::from_closure(file_id, &closure);
+        let signature = db
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature");
+
+        let left_idx = signature
+            .find_param_idx("retries_left")
+            .expect("missing retries_left param");
+        let right_idx = signature
+            .find_param_idx("retries_right")
+            .expect("missing retries_right param");
+        let left_default = signature
+            .param_docs
+            .get(&left_idx)
+            .and_then(|doc| doc.default_value.clone());
+        let right_default = signature
+            .param_docs
+            .get(&right_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            left_default,
+            Some(LuaDocDefaultValue::Number("3".to_string()))
+        );
+        assert_eq!(
+            right_default,
+            Some(LuaDocDefaultValue::Number("3".to_string()))
+        );
+
+        let return_default = signature
+            .return_docs
+            .first()
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(return_default, Some(LuaDocDefaultValue::Boolean(false)));
+
+        let class_decl_id =
+            type_decl_id_from_type(&class_type).expect("expected class type declaration id");
+        let members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(class_decl_id))
+            .expect("expected class members");
+
+        for key_name in ["ContentsLeft", "ContentsRight"] {
+            let member = members
+                .iter()
+                .filter_map(|item| db.get_member_index().get_member(&item.get_id()))
+                .find(|member| member.get_key().get_name() == Some(key_name))
+                .expect("expected field member");
+            let property = db
+                .get_property_index()
+                .get_property(&LuaSemanticDeclId::Member(member.get_id()))
+                .expect("expected field property");
+            assert_eq!(
+                property.default_value(),
+                Some(&LuaDocDefaultValue::Number("0".to_string()))
+            );
+        }
+
+        let entity_member = members
+            .iter()
+            .filter_map(|item| db.get_member_index().get_member(&item.get_id()))
+            .find(|member| member.get_key().get_name() == Some("EntityDefault"))
+            .expect("expected EntityDefault member");
+        let entity_property = db
+            .get_property_index()
+            .get_property(&LuaSemanticDeclId::Member(entity_member.get_id()))
+            .expect("expected EntityDefault property");
+        assert_eq!(
+            entity_property.default_value(),
+            Some(&LuaDocDefaultValue::String("NULL".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_inline_default_metadata_storage_for_local_function() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@param retries number=3
+        ---@return boolean
+        local function run(retries)
+        end
+        "#,
+        );
+        let expected_number = ws.ty("number");
+        let expected_boolean = ws.ty("boolean");
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let db = semantic_model.get_db();
+
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure");
+        let signature_id = crate::LuaSignatureId::from_closure(file_id, &closure);
+        let signature = db
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature");
+
+        let retries_idx = signature
+            .find_param_idx("retries")
+            .expect("missing retries param");
+        let retries_default = signature
+            .param_docs
+            .get(&retries_idx)
+            .and_then(|doc| doc.default_value.clone());
+        let retries_type = signature
+            .param_docs
+            .get(&retries_idx)
+            .map(|doc| doc.type_ref.clone());
+        assert_eq!(
+            retries_default,
+            Some(LuaDocDefaultValue::Number("3".to_string()))
+        );
+        assert_eq!(retries_type, Some(expected_number));
+        assert_eq!(
+            signature
+                .return_docs
+                .first()
+                .map(|doc| doc.type_ref.clone()),
+            Some(expected_boolean)
+        );
+    }
+
+    #[test]
+    fn test_local_function_call_infers_defaulted_param_and_return_metadata() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@param retries number=3
+        ---@return boolean
+        local function run(retries)
+        end
+
+        local result = run()
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let call_expr = semantic_model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .next()
+            .expect("expected call");
+        let func = semantic_model
+            .infer_call_expr_func(call_expr, None)
+            .expect("expected callable");
+
+        assert!(func.is_param_optional(0));
+        assert_eq!(func.get_ret(), &ws.ty("boolean"));
+    }
 
     #[test]
     fn test_issue_223() {

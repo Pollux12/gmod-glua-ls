@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod test {
+    use glua_parser::{LuaAstNode, LuaCallExpr};
 
     use crate::{DiagnosticCode, VirtualWorkspace};
 
@@ -624,5 +625,38 @@ mod test {
         end
         "#
         ));
+    }
+
+    #[test]
+    fn test_defaulted_param_is_omittable_during_overload_resolution() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param retries number=3
+            ---@return boolean
+            ---@overload fun(name: string): string
+            local function pick(retries)
+            end
+
+            pick()
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let call_expr = semantic_model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .next()
+            .expect("expected call");
+        let func = semantic_model
+            .infer_call_expr_func(call_expr, None)
+            .expect("expected callable");
+
+        assert_eq!(func.get_ret(), &ws.ty("boolean"));
     }
 }

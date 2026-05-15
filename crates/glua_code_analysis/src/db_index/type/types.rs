@@ -645,6 +645,7 @@ pub struct LuaFunctionType {
     is_colon_define: bool,
     is_variadic: bool,
     params: Vec<(String, Option<LuaType>)>,
+    optional_params: Vec<bool>,
     ret: LuaType,
 }
 
@@ -670,13 +671,21 @@ impl LuaFunctionType {
         params: Vec<(String, Option<LuaType>)>,
         ret: LuaType,
     ) -> Self {
+        let optional_params = vec![false; params.len()];
         Self {
             async_state,
             is_colon_define,
             is_variadic,
             params,
+            optional_params,
             ret,
         }
+    }
+
+    pub fn with_optional_params(mut self, optional_params: Vec<bool>) -> Self {
+        self.optional_params = optional_params;
+        self.optional_params.resize(self.params.len(), false);
+        self
     }
 
     pub fn get_async_state(&self) -> AsyncState {
@@ -689,6 +698,14 @@ impl LuaFunctionType {
 
     pub fn get_params(&self) -> &[(String, Option<LuaType>)] {
         &self.params
+    }
+
+    pub fn get_optional_params(&self) -> &[bool] {
+        &self.optional_params
+    }
+
+    pub fn is_param_optional(&self, idx: usize) -> bool {
+        self.optional_params.get(idx).copied().unwrap_or(false)
     }
 
     pub fn get_ret(&self) -> &LuaType {

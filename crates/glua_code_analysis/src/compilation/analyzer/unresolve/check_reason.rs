@@ -113,6 +113,7 @@ pub fn resolve_as_unknown(
                 signature.return_docs = vec![LuaDocReturnInfo {
                     name: None,
                     type_ref: LuaType::Unknown,
+                    default_value: None,
                     description: None,
                     attributes: None,
                     return_kind: ReturnTypeKind::default(),
