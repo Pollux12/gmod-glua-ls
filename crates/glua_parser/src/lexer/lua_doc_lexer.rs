@@ -258,6 +258,10 @@ impl LuaDocLexer<'_> {
                 reader.bump();
                 LuaTokenKind::TkDocQuestion
             }
+            '=' => {
+                reader.bump();
+                LuaTokenKind::TkDocMatch
+            }
             '+' => {
                 reader.bump();
                 LuaTokenKind::TkPlus
@@ -738,6 +742,7 @@ fn to_tag(text: &str) -> LuaTokenKind {
         "schema" => LuaTokenKind::TKTagSchema,
         "realm" => LuaTokenKind::TkTagRealm,
         "fileparam" => LuaTokenKind::TkTagFileparam,
+        "outparam" => LuaTokenKind::TkTagOutparam,
         _ => LuaTokenKind::TkTagOther,
     }
 }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey,
     LuaLiteralToken, LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
@@ -155,7 +157,18 @@ fn get_type_at_flow_walk(
                         }
                     };
 
-                    if can_skip && all_branch_antecedents_alive(tree, flow_node) {
+                    if can_skip
+                        && all_branch_antecedents_alive(tree, flow_node)
+                        && !branch_has_relevant_special_call_effects(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            flow_node,
+                            info.common_predecessor,
+                            var_ref_id,
+                        )
+                    {
                         antecedent_flow_id = info.common_predecessor;
                         continue;
                     }
@@ -243,6 +256,35 @@ fn get_type_at_flow_walk(
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
+            }
+            FlowNodeKind::Call(call_ptr) => {
+                let call_expr_stat = call_ptr.to_node(root).ok_or(InferFailReason::None)?;
+                if let Some(effects) = db
+                    .get_flow_index()
+                    .get_special_call_effects(&cache.get_file_id(), call_expr_stat.get_position())
+                {
+                    let mut effect_type = None;
+                    for effect in effects {
+                        if special_call_effect_matches_var_ref(&effect.target, var_ref_id) {
+                            effect_type = Some(match effect_type {
+                                Some(current_type) => {
+                                    TypeOps::Union.apply(db, &current_type, &effect.type_ref)
+                                }
+                                None => effect.type_ref.clone(),
+                            });
+                        }
+                    }
+                    if let Some(effect_type) = effect_type {
+                        return Ok(effect_type);
+                    }
+                }
+
+                if let Some(merged_type) =
+                    try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
+                {
+                    return Ok(merged_type);
+                }
+                antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
             }
             FlowNodeKind::ImplFunc(func_ptr) => {
                 let func_stat = func_ptr.to_node(root).ok_or(InferFailReason::None)?;
@@ -644,6 +686,7 @@ fn get_flow_node_realm(
         FlowNodeKind::Assignment(assign_ptr, _) => {
             assign_ptr.to_node(root).map(|node| node.get_position())
         }
+        FlowNodeKind::Call(call_ptr) => call_ptr.to_node(root).map(|node| node.get_position()),
         FlowNodeKind::TrueCondition(condition_ptr)
         | FlowNodeKind::FalseCondition(condition_ptr) => {
             condition_ptr.to_node(root).map(|node| node.get_position())
@@ -715,6 +758,93 @@ fn all_branch_antecedents_alive(tree: &FlowTree, flow_node: &FlowNode) -> bool {
         }
         _ => false,
     }
+}
+
+fn branch_has_relevant_special_call_effects(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &LuaInferCache,
+    root: &LuaChunk,
+    flow_node: &FlowNode,
+    stop_at: FlowId,
+    var_ref_id: &VarRefId,
+) -> bool {
+    let Some(FlowAntecedent::Multiple(idx)) = &flow_node.antecedent else {
+        return false;
+    };
+    let Some(antecedents) = tree.get_multi_antecedents(*idx) else {
+        return false;
+    };
+
+    let mut visited = HashSet::new();
+    antecedents.iter().copied().any(|flow_id| {
+        antecedent_has_relevant_special_call_effect(
+            db,
+            tree,
+            cache,
+            root,
+            flow_id,
+            stop_at,
+            var_ref_id,
+            &mut visited,
+        )
+    })
+}
+
+fn antecedent_has_relevant_special_call_effect(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &LuaInferCache,
+    root: &LuaChunk,
+    flow_id: FlowId,
+    stop_at: FlowId,
+    var_ref_id: &VarRefId,
+    visited: &mut HashSet<FlowId>,
+) -> bool {
+    if flow_id == stop_at || !visited.insert(flow_id) {
+        return false;
+    }
+
+    let Some(flow_node) = tree.get_flow_node(flow_id) else {
+        return false;
+    };
+
+    if let FlowNodeKind::Call(call_ptr) = &flow_node.kind
+        && let Some(call_expr_stat) = call_ptr.to_node(root)
+        && let Some(effects) = db
+            .get_flow_index()
+            .get_special_call_effects(&cache.get_file_id(), call_expr_stat.get_position())
+        && effects
+            .iter()
+            .any(|effect| special_call_effect_matches_var_ref(&effect.target, var_ref_id))
+    {
+        return true;
+    }
+
+    match &flow_node.antecedent {
+        Some(FlowAntecedent::Single(prev)) => antecedent_has_relevant_special_call_effect(
+            db, tree, cache, root, *prev, stop_at, var_ref_id, visited,
+        ),
+        Some(FlowAntecedent::Multiple(idx)) => {
+            tree.get_multi_antecedents(*idx).is_some_and(|prevs| {
+                prevs.iter().copied().any(|prev| {
+                    antecedent_has_relevant_special_call_effect(
+                        db, tree, cache, root, prev, stop_at, var_ref_id, visited,
+                    )
+                })
+            })
+        }
+        None => false,
+    }
+}
+
+fn special_call_effect_matches_var_ref(effect_target: &VarRefId, var_ref_id: &VarRefId) -> bool {
+    effect_target == var_ref_id
+        || matches!(
+            (effect_target, var_ref_id),
+            (VarRefId::SelfRef(effect_base), VarRefId::IndexRef(current_base, _))
+                if effect_base == current_base
+        )
 }
 
 fn get_type_at_assign_stat(

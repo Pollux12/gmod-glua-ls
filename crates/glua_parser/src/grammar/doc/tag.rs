@@ -78,6 +78,7 @@ fn parse_tag_detail(p: &mut LuaDocParser) -> DocParseResult {
         LuaTokenKind::TkTagMeta => parse_tag_meta(p),
         LuaTokenKind::TkTagRealm => parse_tag_realm(p),
         LuaTokenKind::TkTagFileparam => parse_tag_fileparam(p),
+        LuaTokenKind::TkTagOutparam => parse_tag_outparam(p),
         LuaTokenKind::TkTagExport => parse_tag_export(p),
         LuaTokenKind::TkLanguage => parse_tag_language(p),
         LuaTokenKind::TkTagAttribute => parse_tag_attribute(p),
@@ -338,7 +339,13 @@ fn parse_tag_field(p: &mut LuaDocParser) -> DocParseResult {
         }
     }
     if_token_bump(p, LuaTokenKind::TkDocQuestion);
+    if p.current_token() == LuaTokenKind::TkDocMatch {
+        parse_doc_default_value(p)?;
+    }
     parse_type(p)?;
+    if p.current_token() == LuaTokenKind::TkDocMatch {
+        parse_doc_default_value(p)?;
+    }
 
     p.set_lexer_state(LuaDocLexerState::Description);
     parse_description(p);
@@ -388,8 +395,14 @@ fn parse_tag_param(p: &mut LuaDocParser) -> DocParseResult {
     }
 
     if_token_bump(p, LuaTokenKind::TkDocQuestion);
+    if p.current_token() == LuaTokenKind::TkDocMatch {
+        parse_doc_default_value(p)?;
+    }
 
     parse_type(p)?;
+    if p.current_token() == LuaTokenKind::TkDocMatch {
+        parse_doc_default_value(p)?;
+    }
 
     p.set_lexer_state(LuaDocLexerState::Description);
     parse_description(p);
@@ -411,17 +424,58 @@ fn parse_tag_return(p: &mut LuaDocParser) -> DocParseResult {
     }
 
     parse_type(p)?;
+    if p.current_token() == LuaTokenKind::TkDocMatch {
+        parse_doc_default_value(p)?;
+    }
 
     if_token_bump(p, LuaTokenKind::TkName);
 
     while p.current_token() == LuaTokenKind::TkComma {
         p.bump();
         parse_type(p)?;
+        if p.current_token() == LuaTokenKind::TkDocMatch {
+            parse_doc_default_value(p)?;
+        }
         if_token_bump(p, LuaTokenKind::TkName);
     }
 
     p.set_lexer_state(LuaDocLexerState::Description);
     parse_description(p);
+    Ok(m.complete(p))
+}
+
+fn parse_doc_default_value(p: &mut LuaDocParser) -> DocParseResult {
+    let m = p.mark(LuaSyntaxKind::DocDefaultValue);
+    expect_token(p, LuaTokenKind::TkDocMatch)?;
+    match p.current_token() {
+        LuaTokenKind::TkNil
+        | LuaTokenKind::TkTrue
+        | LuaTokenKind::TkFalse
+        | LuaTokenKind::TkInt
+        | LuaTokenKind::TkFloat
+        | LuaTokenKind::TkString => {
+            p.bump();
+        }
+        LuaTokenKind::TkPlus | LuaTokenKind::TkMinus => {
+            p.bump();
+            match p.current_token() {
+                LuaTokenKind::TkInt | LuaTokenKind::TkFloat => p.bump(),
+                _ => {
+                    return Err(LuaParseError::doc_error_from(
+                        &t!("expect numeric default literal value"),
+                        p.current_token_range(),
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(LuaParseError::doc_error_from(
+                &t!("expect default literal value"),
+                p.current_token_range(),
+            ));
+        }
+    }
+
     Ok(m.complete(p))
 }
 
@@ -719,6 +773,22 @@ fn parse_tag_fileparam(p: &mut LuaDocParser) -> DocParseResult {
     p.bump();
     expect_token(p, LuaTokenKind::TkName)?; // param name
     parse_type(p)?; // type
+    p.set_lexer_state(LuaDocLexerState::Description);
+    parse_description(p);
+    Ok(m.complete(p))
+}
+
+// ---@outparam <param.field> <type>
+fn parse_tag_outparam(p: &mut LuaDocParser) -> DocParseResult {
+    p.set_lexer_state(LuaDocLexerState::Normal);
+    let m = p.mark(LuaSyntaxKind::DocTagOutparam);
+    p.bump();
+    expect_token(p, LuaTokenKind::TkName)?;
+    while p.current_token() == LuaTokenKind::TkDot {
+        p.bump();
+        expect_token(p, LuaTokenKind::TkName)?;
+    }
+    parse_type(p)?;
     p.set_lexer_state(LuaDocLexerState::Description);
     parse_description(p);
     Ok(m.complete(p))

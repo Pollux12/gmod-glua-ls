@@ -20,7 +20,7 @@ use crate::{
 pub fn bind_local_stat(
     binder: &mut FlowBinder,
     local_stat: LuaLocalStat,
-    current: FlowId,
+    mut current: FlowId,
 ) -> FlowId {
     let local_names = local_stat.get_local_name_list().collect::<Vec<_>>();
     let values = local_stat.get_value_exprs().collect::<Vec<_>>();
@@ -36,7 +36,7 @@ pub fn bind_local_stat(
 
     for value in values {
         // If there are more values than names, we still need to bind the values
-        bind_expr(binder, value.clone(), current);
+        current = bind_top_level_expr(binder, value.clone(), current);
     }
 
     let local_flow_id = binder.create_decl(local_stat.get_position());
@@ -73,14 +73,12 @@ fn check_value_expr_is_check_expr(value_expr: LuaExpr) -> bool {
 pub fn bind_assign_stat(
     binder: &mut FlowBinder,
     assign_stat: LuaAssignStat,
-    current: FlowId,
+    mut current: FlowId,
 ) -> FlowId {
     let (vars, values) = assign_stat.get_var_and_expr_list();
     // First bind the right-hand side expressions
     for expr in &values {
-        if let Some(ast) = LuaAst::cast(expr.syntax().clone()) {
-            bind_node(binder, ast, current);
-        }
+        current = bind_top_level_expr(binder, expr.clone(), current);
     }
 
     let mut has_name = false;
@@ -134,7 +132,9 @@ pub fn bind_call_expr_stat(
         if let Some(ast) = LuaAst::cast(call_expr.syntax().clone()) {
             bind_each_child(binder, ast, current);
         }
-        current
+        let flow_id = binder.create_node(FlowNodeKind::Call(call_expr.to_ptr()));
+        binder.add_antecedent(flow_id, current);
+        flow_id
     }
 }
 
@@ -209,11 +209,11 @@ pub fn bind_goto_stat(binder: &mut FlowBinder, goto_stat: LuaGotoStat, current: 
 pub fn bind_return_stat(
     binder: &mut FlowBinder,
     return_stat: LuaReturnStat,
-    current: FlowId,
+    mut current: FlowId,
 ) -> FlowId {
     // If there are expressions in the return statement, bind them
     for expr in return_stat.get_expr_list() {
-        bind_expr(binder, expr.clone(), current);
+        current = bind_top_level_expr(binder, expr.clone(), current);
     }
 
     // Return statements are typically used to exit a function
@@ -222,6 +222,26 @@ pub fn bind_return_stat(
     binder.add_antecedent(return_flow_id, current);
 
     return_flow_id
+}
+
+fn bind_top_level_expr(binder: &mut FlowBinder, expr: LuaExpr, current: FlowId) -> FlowId {
+    bind_expr(binder, expr.clone(), current);
+
+    let Some(call_expr) = unwrap_top_level_call_expr(&expr) else {
+        return current;
+    };
+
+    let flow_id = binder.create_node(FlowNodeKind::Call(call_expr.to_ptr()));
+    binder.add_antecedent(flow_id, current);
+    flow_id
+}
+
+fn unwrap_top_level_call_expr(expr: &LuaExpr) -> Option<glua_parser::LuaCallExpr> {
+    match expr {
+        LuaExpr::CallExpr(call_expr) => Some(call_expr.clone()),
+        LuaExpr::ParenExpr(paren_expr) => unwrap_top_level_call_expr(&paren_expr.get_expr()?),
+        _ => None,
+    }
 }
 
 pub fn bind_do_stat(binder: &mut FlowBinder, do_stat: LuaDoStat, mut current: FlowId) -> FlowId {

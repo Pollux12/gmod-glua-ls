@@ -96,6 +96,7 @@ fn parse_description(p: &mut LuaDocParser) {
     | LuaTokenKind::TkEndOfLine
     | LuaTokenKind::TkWhitespace
     | LuaTokenKind::TkDocContinue
+    | LuaTokenKind::TkDocMatch
     | LuaTokenKind::TkNormalStart = p.current_token()
     {
         p.bump();

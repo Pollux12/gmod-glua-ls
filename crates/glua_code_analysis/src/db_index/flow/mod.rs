@@ -4,7 +4,9 @@ mod signature_cast;
 
 use std::collections::HashMap;
 
-use crate::{FileId, LuaSignatureId};
+use rowan::TextSize;
+
+use crate::{FileId, LuaSignatureId, LuaType, VarRefId};
 pub use flow_node::*;
 pub use flow_tree::{BranchLabelInfo, FlowTree};
 use glua_parser::{LuaAstPtr, LuaDocOpType};
@@ -16,6 +18,7 @@ use super::traits::LuaIndex;
 pub struct LuaFlowIndex {
     file_flow_tree: HashMap<FileId, FlowTree>,
     signature_cast_cache: HashMap<FileId, HashMap<LuaSignatureId, LuaSignatureCast>>,
+    special_call_effects: HashMap<FileId, HashMap<TextSize, Vec<LuaSpecialCallEffect>>>,
 }
 
 impl Default for LuaFlowIndex {
@@ -29,6 +32,7 @@ impl LuaFlowIndex {
         Self {
             file_flow_tree: HashMap::new(),
             signature_cast_cache: HashMap::new(),
+            special_call_effects: HashMap::new(),
         }
     }
 
@@ -66,16 +70,50 @@ impl LuaFlowIndex {
                 },
             );
     }
+
+    pub fn add_special_call_effect(
+        &mut self,
+        file_id: FileId,
+        position: TextSize,
+        target: VarRefId,
+        type_ref: LuaType,
+    ) {
+        self.special_call_effects
+            .entry(file_id)
+            .or_default()
+            .entry(position)
+            .or_default()
+            .push(LuaSpecialCallEffect { target, type_ref });
+    }
+
+    pub fn get_special_call_effects(
+        &self,
+        file_id: &FileId,
+        position: TextSize,
+    ) -> Option<&[LuaSpecialCallEffect]> {
+        self.special_call_effects
+            .get(file_id)?
+            .get(&position)
+            .map(|effects| effects.as_slice())
+    }
 }
 
 impl LuaIndex for LuaFlowIndex {
     fn remove(&mut self, file_id: FileId) {
         self.file_flow_tree.remove(&file_id);
         self.signature_cast_cache.remove(&file_id);
+        self.special_call_effects.remove(&file_id);
     }
 
     fn clear(&mut self) {
         self.file_flow_tree.clear();
         self.signature_cast_cache.clear();
+        self.special_call_effects.clear();
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct LuaSpecialCallEffect {
+    pub target: VarRefId,
+    pub type_ref: LuaType,
 }

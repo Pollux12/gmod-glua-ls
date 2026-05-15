@@ -6,15 +6,17 @@ use std::{
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat,
-    LuaIndexExpr, LuaLocalStat, LuaTableExpr, LuaTableField,
+    LuaIndexExpr, LuaLocalStat, LuaTableExpr, LuaTableField, PathTrait,
 };
+use internment::ArcIntern;
+use rowan::TextSize;
 
 use crate::{
-    DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclTypeKind,
-    LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
-    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, LuaTypeFlag, OperatorFunction, RenderLevel, SemanticDeclLevel,
-    SignatureReturnStatus, TypeOps, VariadicType,
+    DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId,
+    LuaDeclTypeKind, LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey,
+    LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache,
+    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel,
+    SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         common::{add_member, bind_type},
         lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
@@ -23,10 +25,11 @@ use crate::{
     db_index::{LuaFunctionType, LuaMemberOwner, LuaSignature, LuaSignatureId},
     find_members_with_key, humanize_type,
     semantic::{
-        InferGuard, LuaInferCache, SemanticDeclGuard, infer_call_expr_func, infer_expr,
-        infer_expr_semantic_decl,
+        InferGuard, LuaInferCache, SemanticDeclGuard, VarRefId, get_var_expr_var_ref_id,
+        infer_call_expr_func, infer_expr, infer_expr_semantic_decl,
     },
 };
+use smol_str::SmolStr;
 
 use super::{
     ResolveResult, UnResolveDecl, UnResolveIterVar, UnResolveMember, UnResolveModule,
@@ -370,7 +373,15 @@ pub fn try_resolve_special_call(
         &call_expr,
         &prefix_expr,
     )?;
-    if callable_param_infos.is_empty() {
+    let callable_out_param_infos = collect_special_call_out_param_infos_for_prefix(
+        db,
+        cache,
+        unresolve_special_call.file_id,
+        call_expr.get_position(),
+        &call_expr,
+        &prefix_expr,
+    )?;
+    if callable_param_infos.is_empty() && callable_out_param_infos.is_empty() {
         return Ok(());
     }
 
@@ -398,6 +409,17 @@ pub fn try_resolve_special_call(
         }
     }
 
+    for out_param_info in callable_out_param_infos {
+        apply_out_param_from_call(
+            db,
+            cache,
+            unresolve_special_call.file_id,
+            &unresolve_special_call.call_expr,
+            &out_param_info,
+            is_colon_call,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -408,6 +430,20 @@ struct SpecialCallParamInfo {
     is_constructor: bool,
     is_colon_define: bool,
     signature_id: Option<LuaSignatureId>,
+}
+
+#[derive(Debug, Clone)]
+struct SpecialCallOutParamInfo {
+    param_idx: usize,
+    field_path: Vec<String>,
+    type_ref: LuaType,
+    is_colon_define: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedOutParamTarget {
+    owner: Option<LuaTypeOwner>,
+    value_expr: Option<LuaExpr>,
 }
 
 fn collect_special_call_param_infos_for_prefix(
@@ -497,6 +533,87 @@ fn collect_special_call_param_infos_for_prefix_inner(
         None,
     )?;
     Ok(collect_doc_function_special_call_params(call_func.as_ref()))
+}
+
+fn collect_special_call_out_param_infos_for_prefix(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    caller_file_id: FileId,
+    caller_position: rowan::TextSize,
+    call_expr: &LuaCallExpr,
+    prefix_expr: &LuaExpr,
+) -> Result<Vec<SpecialCallOutParamInfo>, InferFailReason> {
+    let mut visited_wrapped_decls = HashSet::new();
+    collect_special_call_out_param_infos_for_prefix_inner(
+        db,
+        cache,
+        caller_file_id,
+        caller_position,
+        call_expr,
+        prefix_expr,
+        &mut visited_wrapped_decls,
+    )
+}
+
+fn collect_special_call_out_param_infos_for_prefix_inner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    caller_file_id: FileId,
+    caller_position: rowan::TextSize,
+    _call_expr: &LuaCallExpr,
+    prefix_expr: &LuaExpr,
+    visited_wrapped_decls: &mut HashSet<LuaSemanticDeclId>,
+) -> Result<Vec<SpecialCallOutParamInfo>, InferFailReason> {
+    let semantic_decl = infer_expr_semantic_decl(
+        db,
+        cache,
+        prefix_expr.clone(),
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    );
+
+    if let Some(semantic_decl) = semantic_decl {
+        let out_params =
+            collect_special_call_out_param_infos_from_semantic_decl(db, semantic_decl.clone())?;
+        if !out_params.is_empty() {
+            return Ok(out_params);
+        }
+
+        if visited_wrapped_decls.insert(semantic_decl.clone()) {
+            if let Some(target_expr) = get_wrapped_callable_target_expr(db, semantic_decl) {
+                let out_params = collect_special_call_out_param_infos_for_prefix_inner(
+                    db,
+                    cache,
+                    caller_file_id,
+                    caller_position,
+                    _call_expr,
+                    &target_expr,
+                    visited_wrapped_decls,
+                )?;
+                if !out_params.is_empty() {
+                    return Ok(out_params);
+                }
+            }
+        }
+    }
+
+    let callable_type = infer_expr(db, cache, prefix_expr.clone())?;
+    let out_params = collect_special_call_out_param_infos(db, &callable_type);
+    if !out_params.is_empty() {
+        return Ok(out_params);
+    }
+
+    let operator_collection = collect_special_call_out_param_infos_from_callable_operators(
+        db,
+        caller_file_id,
+        caller_position,
+        &callable_type,
+    );
+    if operator_collection.had_operators {
+        return Ok(operator_collection.out_param_infos);
+    }
+
+    Ok(Vec::new())
 }
 
 pub(crate) fn get_wrapped_callable_target_expr(
@@ -757,6 +874,156 @@ impl SpecialCallOperatorCollection {
     }
 }
 
+fn collect_special_call_out_param_infos_from_callable_operators(
+    db: &DbIndex,
+    caller_file_id: FileId,
+    caller_position: rowan::TextSize,
+    callable_type: &LuaType,
+) -> SpecialCallOutParamOperatorCollection {
+    match callable_type {
+        LuaType::TableConst(in_file_range) => db
+            .get_metatable_index()
+            .get(in_file_range)
+            .map(|meta_table| {
+                collect_special_call_out_param_infos_from_operator_owner(
+                    db,
+                    caller_file_id,
+                    caller_position,
+                    &LuaOperatorOwner::Table(meta_table.clone()),
+                )
+            })
+            .unwrap_or_default(),
+        LuaType::Def(type_decl_id) | LuaType::Ref(type_decl_id) => {
+            collect_special_call_out_param_infos_from_operator_owner(
+                db,
+                caller_file_id,
+                caller_position,
+                &LuaOperatorOwner::Type(type_decl_id.clone()),
+            )
+        }
+        LuaType::Instance(instance) => {
+            collect_special_call_out_param_infos_from_callable_operators(
+                db,
+                caller_file_id,
+                caller_position,
+                instance.get_base(),
+            )
+        }
+        LuaType::TypeGuard(inner) => collect_special_call_out_param_infos_from_callable_operators(
+            db,
+            caller_file_id,
+            caller_position,
+            inner,
+        ),
+        LuaType::Union(union) => union.into_vec().iter().fold(
+            SpecialCallOutParamOperatorCollection::default(),
+            |mut collection, union_type| {
+                collection.extend(
+                    collect_special_call_out_param_infos_from_callable_operators(
+                        db,
+                        caller_file_id,
+                        caller_position,
+                        union_type,
+                    ),
+                );
+                collection
+            },
+        ),
+        LuaType::Intersection(intersection) => intersection.get_types().iter().fold(
+            SpecialCallOutParamOperatorCollection::default(),
+            |mut collection, intersection_type| {
+                collection.extend(
+                    collect_special_call_out_param_infos_from_callable_operators(
+                        db,
+                        caller_file_id,
+                        caller_position,
+                        intersection_type,
+                    ),
+                );
+                collection
+            },
+        ),
+        LuaType::MultiLineUnion(union) => union.get_unions().iter().fold(
+            SpecialCallOutParamOperatorCollection::default(),
+            |mut collection, (union_type, _)| {
+                collection.extend(
+                    collect_special_call_out_param_infos_from_callable_operators(
+                        db,
+                        caller_file_id,
+                        caller_position,
+                        union_type,
+                    ),
+                );
+                collection
+            },
+        ),
+        _ => SpecialCallOutParamOperatorCollection::default(),
+    }
+}
+
+fn collect_special_call_out_param_infos_from_operator_owner(
+    db: &DbIndex,
+    caller_file_id: FileId,
+    caller_position: rowan::TextSize,
+    owner: &LuaOperatorOwner,
+) -> SpecialCallOutParamOperatorCollection {
+    let Some(operator_ids) = db
+        .get_operator_index()
+        .get_operators(owner, LuaOperatorMetaMethod::Call)
+    else {
+        return SpecialCallOutParamOperatorCollection::default();
+    };
+
+    let priority_tiers = get_operator_id_priority_tiers(db, caller_file_id, operator_ids);
+    let visible_operator_ids = select_operator_ids_by_workspace_and_realm(
+        db,
+        caller_file_id,
+        caller_position,
+        priority_tiers,
+    );
+
+    let out_param_infos = visible_operator_ids
+        .iter()
+        .flat_map(|operator_id| {
+            let Some(operator) = db.get_operator_index().get_operator(operator_id) else {
+                return Vec::new();
+            };
+
+            match operator.get_operator_func(db) {
+                LuaType::Signature(signature_id) => db
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .map(|signature| {
+                        adjust_operator_special_call_out_param_infos(
+                            collect_signature_special_call_out_params(signature),
+                            should_strip_first_operator_param(signature.is_colon_define, owner),
+                        )
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        })
+        .collect();
+
+    SpecialCallOutParamOperatorCollection {
+        out_param_infos,
+        had_operators: true,
+    }
+}
+
+#[derive(Debug, Default)]
+struct SpecialCallOutParamOperatorCollection {
+    out_param_infos: Vec<SpecialCallOutParamInfo>,
+    had_operators: bool,
+}
+
+impl SpecialCallOutParamOperatorCollection {
+    fn extend(&mut self, other: SpecialCallOutParamOperatorCollection) {
+        self.had_operators |= other.had_operators;
+        self.out_param_infos.extend(other.out_param_infos);
+    }
+}
+
 fn get_operator_id_priority_tiers(
     db: &DbIndex,
     caller_file_id: FileId,
@@ -850,6 +1117,24 @@ fn adjust_operator_special_call_param_infos(
         .collect()
 }
 
+fn adjust_operator_special_call_out_param_infos(
+    out_param_infos: Vec<SpecialCallOutParamInfo>,
+    strip_first_param: bool,
+) -> Vec<SpecialCallOutParamInfo> {
+    if !strip_first_param {
+        return out_param_infos;
+    }
+
+    out_param_infos
+        .into_iter()
+        .filter_map(|mut out_param_info| {
+            out_param_info.param_idx = out_param_info.param_idx.checked_sub(1)?;
+            out_param_info.is_colon_define = false;
+            Some(out_param_info)
+        })
+        .collect()
+}
+
 fn collect_special_call_param_infos_from_semantic_decl(
     db: &DbIndex,
     semantic_decl: LuaSemanticDeclId,
@@ -877,6 +1162,109 @@ fn collect_special_call_param_infos_from_semantic_decl(
             .unwrap_or_default()),
         LuaSemanticDeclId::TypeDecl(_) => Ok(Vec::new()),
     }
+}
+
+fn collect_special_call_out_param_infos_from_semantic_decl(
+    db: &DbIndex,
+    semantic_decl: LuaSemanticDeclId,
+) -> Result<Vec<SpecialCallOutParamInfo>, InferFailReason> {
+    match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            if let Some(signature_id) = db
+                .get_property_index()
+                .get_signature_owner(&LuaSemanticDeclId::LuaDecl(decl_id))
+            {
+                let out_params = db
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .map(collect_signature_special_call_out_params)
+                    .unwrap_or_default();
+                if !out_params.is_empty() {
+                    return Ok(out_params);
+                }
+            }
+            if let Some(signature_id) = get_signature_id_from_semantic_decl_value_expr(
+                db,
+                LuaSemanticDeclId::LuaDecl(decl_id),
+            ) {
+                let out_params = db
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .map(collect_signature_special_call_out_params)
+                    .unwrap_or_default();
+                if !out_params.is_empty() {
+                    return Ok(out_params);
+                }
+            }
+            let type_cache = db
+                .get_type_index()
+                .get_type_cache(&decl_id.into())
+                .ok_or(InferFailReason::UnResolveDeclType(decl_id))?;
+            Ok(collect_special_call_out_param_infos(
+                db,
+                type_cache.as_type(),
+            ))
+        }
+        LuaSemanticDeclId::Member(member_id) => {
+            if let Some(signature_id) = db
+                .get_property_index()
+                .get_signature_owner(&LuaSemanticDeclId::Member(member_id))
+            {
+                let out_params = db
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .map(collect_signature_special_call_out_params)
+                    .unwrap_or_default();
+                if !out_params.is_empty() {
+                    return Ok(out_params);
+                }
+            }
+            if let Some(signature_id) = get_signature_id_from_semantic_decl_value_expr(
+                db,
+                LuaSemanticDeclId::Member(member_id),
+            ) {
+                let out_params = db
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .map(collect_signature_special_call_out_params)
+                    .unwrap_or_default();
+                if !out_params.is_empty() {
+                    return Ok(out_params);
+                }
+            }
+            let type_cache = db
+                .get_type_index()
+                .get_type_cache(&member_id.into())
+                .ok_or(InferFailReason::UnResolveMemberType(member_id))?;
+            Ok(collect_special_call_out_param_infos(
+                db,
+                type_cache.as_type(),
+            ))
+        }
+        LuaSemanticDeclId::Signature(signature_id) => Ok(db
+            .get_signature_index()
+            .get(&signature_id)
+            .filter(|signature| signature_has_any_special_call_params(signature))
+            .map(collect_signature_special_call_out_params)
+            .unwrap_or_default()),
+        LuaSemanticDeclId::TypeDecl(_) => Ok(Vec::new()),
+    }
+}
+
+fn get_signature_id_from_semantic_decl_value_expr(
+    db: &DbIndex,
+    semantic_decl: LuaSemanticDeclId,
+) -> Option<LuaSignatureId> {
+    let file_id = match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
+        LuaSemanticDeclId::Member(member_id) => member_id.file_id,
+        LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
+        LuaSemanticDeclId::TypeDecl(_) => return None,
+    };
+    let LuaExpr::ClosureExpr(closure) = get_semantic_decl_value_expr(db, semantic_decl)? else {
+        return None;
+    };
+    Some(LuaSignatureId::from_closure(file_id, &closure))
 }
 
 fn collect_special_call_param_infos(
@@ -911,6 +1299,39 @@ fn collect_special_call_param_infos(
     }
 }
 
+fn collect_special_call_out_param_infos(
+    db: &DbIndex,
+    callable_type: &LuaType,
+) -> Vec<SpecialCallOutParamInfo> {
+    match callable_type {
+        LuaType::Signature(signature_id) => db
+            .get_signature_index()
+            .get(signature_id)
+            .filter(|signature| signature_has_any_special_call_params(signature))
+            .map(collect_signature_special_call_out_params)
+            .unwrap_or_default(),
+        LuaType::TypeGuard(inner) => collect_special_call_out_param_infos(db, inner),
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .flat_map(|union_type| collect_special_call_out_param_infos(db, union_type))
+            .collect(),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .flat_map(|intersection_type| {
+                collect_special_call_out_param_infos(db, intersection_type)
+            })
+            .collect(),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .flat_map(|(union_type, _)| collect_special_call_out_param_infos(db, union_type))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn collect_signature_special_call_params(
     signature: &LuaSignature,
     signature_id: LuaSignatureId,
@@ -934,6 +1355,23 @@ fn collect_signature_special_call_params(
 
     param_infos.sort_by_key(|param_info| param_info.param_idx);
     param_infos
+}
+
+fn collect_signature_special_call_out_params(
+    signature: &LuaSignature,
+) -> Vec<SpecialCallOutParamInfo> {
+    let mut out_params = signature
+        .out_params
+        .iter()
+        .map(|out_param| SpecialCallOutParamInfo {
+            param_idx: out_param.param_idx,
+            field_path: out_param.field_path.clone(),
+            type_ref: out_param.type_ref.clone(),
+            is_colon_define: signature.is_colon_define,
+        })
+        .collect::<Vec<_>>();
+    out_params.sort_by_key(|out_param| out_param.param_idx);
+    out_params
 }
 
 fn collect_doc_function_special_call_params(func: &LuaFunctionType) -> Vec<SpecialCallParamInfo> {
@@ -971,6 +1409,347 @@ fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {
             .iter()
             .any(|(union_type, _)| type_contains_str_tpl_ref(union_type)),
         _ => false,
+    }
+}
+
+fn apply_out_param_from_call(
+    db: &mut DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    out_param_info: &SpecialCallOutParamInfo,
+    is_colon_call: bool,
+) -> ResolveResult {
+    let Some(arg_expr) = get_call_arg_expr(
+        call_expr,
+        out_param_info.param_idx,
+        out_param_info.is_colon_define,
+        is_colon_call,
+    ) else {
+        return Ok(());
+    };
+
+    let arg_expr_for_effects = arg_expr.clone();
+    let mut visited = HashSet::new();
+    let Some(target) = resolve_out_param_target(
+        db,
+        cache,
+        file_id,
+        arg_expr,
+        &out_param_info.field_path,
+        &mut visited,
+    ) else {
+        return Ok(());
+    };
+
+    let effect_targets = collect_out_param_effect_targets(
+        db,
+        cache,
+        arg_expr_for_effects,
+        &out_param_info.field_path,
+        &target,
+    );
+    for effect_target in effect_targets {
+        db.get_flow_index_mut().add_special_call_effect(
+            file_id,
+            call_expr.get_position(),
+            effect_target,
+            out_param_info.type_ref.clone(),
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_out_param_target(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    expr: LuaExpr,
+    field_path: &[String],
+    visited: &mut HashSet<LuaSemanticDeclId>,
+) -> Option<ResolvedOutParamTarget> {
+    if field_path.is_empty() {
+        return Some(ResolvedOutParamTarget {
+            owner: expr_type_owner(db, cache, expr.clone()),
+            value_expr: Some(expr),
+        });
+    }
+
+    if let LuaExpr::TableExpr(table_expr) = expr.clone()
+        && let Some(field) = find_table_field_by_name(&table_expr, &field_path[0])
+    {
+        let owner = Some(LuaMemberId::new(field.get_syntax_id(), file_id).into());
+        let value_expr = field.get_value_expr();
+        if field_path.len() == 1 {
+            return Some(ResolvedOutParamTarget { owner, value_expr });
+        }
+
+        if let Some(value_expr) = value_expr {
+            return resolve_out_param_target(
+                db,
+                cache,
+                file_id,
+                value_expr,
+                &field_path[1..],
+                visited,
+            );
+        }
+    }
+
+    if let Some(semantic_decl) = infer_expr_semantic_decl(
+        db,
+        cache,
+        expr.clone(),
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    ) && visited.insert(semantic_decl.clone())
+        && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
+        && let Some(target) =
+            resolve_out_param_target(db, cache, file_id, value_expr, field_path, visited)
+    {
+        return Some(target);
+    }
+
+    let target = resolve_out_param_target_from_member_lookup(db, cache, expr, &field_path[0])?;
+    if field_path.len() == 1 {
+        return Some(target);
+    }
+
+    let value_expr = target.value_expr.clone()?;
+    resolve_out_param_target(db, cache, file_id, value_expr, &field_path[1..], visited)
+}
+
+fn resolve_out_param_target_from_member_lookup(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    field_name: &str,
+) -> Option<ResolvedOutParamTarget> {
+    let expr_type = infer_expr(db, cache, expr).ok()?;
+    let member_infos =
+        find_members_with_key(db, &expr_type, LuaMemberKey::Name(field_name.into()), true)?;
+
+    member_infos.into_iter().find_map(|member_info| {
+        let semantic_decl = member_info.property_owner_id?;
+        Some(ResolvedOutParamTarget {
+            owner: semantic_decl_to_type_owner(semantic_decl.clone()),
+            value_expr: get_semantic_decl_value_expr(db, semantic_decl),
+        })
+    })
+}
+
+fn find_table_field_by_name(table_expr: &LuaTableExpr, field_name: &str) -> Option<LuaTableField> {
+    table_expr
+        .get_fields()
+        .find(|field| match field.get_field_key() {
+            Some(glua_parser::LuaIndexKey::Name(name)) => name.get_name_text() == field_name,
+            Some(glua_parser::LuaIndexKey::String(string)) => string.get_value() == field_name,
+            _ => false,
+        })
+}
+
+fn expr_type_owner(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Option<LuaTypeOwner> {
+    infer_expr_semantic_decl(
+        db,
+        cache,
+        expr,
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    )
+    .and_then(semantic_decl_to_type_owner)
+}
+
+fn semantic_decl_to_type_owner(semantic_decl: LuaSemanticDeclId) -> Option<LuaTypeOwner> {
+    match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => Some(decl_id.into()),
+        LuaSemanticDeclId::Member(member_id) => Some(member_id.into()),
+        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
+    }
+}
+
+fn collect_out_param_effect_targets(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg_expr: LuaExpr,
+    field_path: &[String],
+    target: &ResolvedOutParamTarget,
+) -> Vec<VarRefId> {
+    let mut targets = Vec::new();
+    let mut visited_aliases = HashSet::new();
+    let call_position = arg_expr.get_range().start();
+
+    collect_out_param_effect_path_targets(
+        db,
+        cache,
+        arg_expr,
+        call_position,
+        field_path,
+        &mut targets,
+        &mut visited_aliases,
+    );
+
+    if let Some(owner) = target.owner.clone()
+        && let Some(owner_target) = type_owner_to_var_ref_id(owner)
+        && !targets.iter().any(|existing| existing == &owner_target)
+    {
+        targets.push(owner_target);
+    }
+
+    if let Some(value_expr) = target.value_expr.clone()
+        && let Some(value_target) = get_var_expr_var_ref_id(db, cache, value_expr)
+        && !targets.iter().any(|existing| existing == &value_target)
+    {
+        targets.push(value_target);
+    }
+
+    targets
+}
+
+fn collect_out_param_effect_path_targets(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg_expr: LuaExpr,
+    call_position: TextSize,
+    field_path: &[String],
+    targets: &mut Vec<VarRefId>,
+    visited_aliases: &mut HashSet<LuaSemanticDeclId>,
+) {
+    let arg_access_path = get_expr_access_path(&arg_expr);
+    if let Some(base_var_ref_id) = get_var_expr_var_ref_id(db, cache, arg_expr.clone()) {
+        if let Some(path_target) = extend_var_ref_id_with_path(
+            base_var_ref_id.clone(),
+            arg_access_path.as_deref(),
+            field_path,
+        ) && !targets.iter().any(|existing| existing == &path_target)
+        {
+            targets.push(path_target);
+        }
+
+        if let Some(semantic_decl) = semantic_decl_from_var_ref_id(&base_var_ref_id)
+            && visited_aliases.insert(semantic_decl.clone())
+            && !semantic_decl_has_write_before_position(db, &semantic_decl, call_position)
+            && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
+        {
+            collect_out_param_effect_path_targets(
+                db,
+                cache,
+                value_expr,
+                call_position,
+                field_path,
+                targets,
+                visited_aliases,
+            );
+        }
+        return;
+    }
+
+    if let Some(semantic_decl) = infer_expr_semantic_decl(
+        db,
+        cache,
+        arg_expr,
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    ) && visited_aliases.insert(semantic_decl.clone())
+        && !semantic_decl_has_write_before_position(db, &semantic_decl, call_position)
+        && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
+    {
+        collect_out_param_effect_path_targets(
+            db,
+            cache,
+            value_expr,
+            call_position,
+            field_path,
+            targets,
+            visited_aliases,
+        );
+    }
+}
+
+fn semantic_decl_has_write_before_position(
+    db: &DbIndex,
+    semantic_decl: &LuaSemanticDeclId,
+    position: TextSize,
+) -> bool {
+    let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_decl else {
+        return false;
+    };
+
+    let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
+        return false;
+    };
+    if !decl.is_local() {
+        return false;
+    }
+
+    db.get_reference_index()
+        .get_decl_references(&decl.get_file_id(), decl_id)
+        .is_some_and(|decl_refs| {
+            let decl_position = decl.get_position();
+            decl_refs.cells.iter().any(|decl_ref| {
+                decl_ref.is_write
+                    && decl_ref.range.start() > decl_position
+                    && decl_ref.range.start() < position
+            })
+        })
+}
+
+fn semantic_decl_from_var_ref_id(var_ref_id: &VarRefId) -> Option<LuaSemanticDeclId> {
+    match var_ref_id {
+        VarRefId::VarRef(decl_id) => Some(LuaSemanticDeclId::LuaDecl(*decl_id)),
+        VarRefId::SelfRef(decl_or_member_id) => match decl_or_member_id {
+            LuaDeclOrMemberId::Decl(decl_id) => Some(LuaSemanticDeclId::LuaDecl(*decl_id)),
+            LuaDeclOrMemberId::Member(member_id) => Some(LuaSemanticDeclId::Member(*member_id)),
+        },
+        VarRefId::IndexRef(_, _) | VarRefId::GlobalName(_, _) => None,
+    }
+}
+
+fn get_expr_access_path(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => Some(name_expr.get_name_text()?.to_string()),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn type_owner_to_var_ref_id(type_owner: LuaTypeOwner) -> Option<VarRefId> {
+    match type_owner {
+        LuaTypeOwner::Decl(decl_id) => Some(VarRefId::VarRef(decl_id)),
+        LuaTypeOwner::Member(member_id) => {
+            Some(VarRefId::SelfRef(LuaDeclOrMemberId::Member(member_id)))
+        }
+        LuaTypeOwner::SyntaxId(_) => None,
+    }
+}
+
+fn extend_var_ref_id_with_path(
+    var_ref_id: VarRefId,
+    access_path: Option<&str>,
+    field_path: &[String],
+) -> Option<VarRefId> {
+    if field_path.is_empty() {
+        return Some(var_ref_id);
+    }
+
+    let full_path = match access_path {
+        Some(access_path) => format!("{}.{}", access_path, field_path.join(".")),
+        None => field_path.join("."),
+    };
+    match var_ref_id {
+        VarRefId::VarRef(decl_id) => Some(VarRefId::IndexRef(
+            LuaDeclOrMemberId::Decl(decl_id),
+            ArcIntern::from(SmolStr::new(&full_path)),
+        )),
+        VarRefId::SelfRef(decl_or_member_id) => Some(VarRefId::IndexRef(
+            decl_or_member_id,
+            ArcIntern::from(SmolStr::new(&full_path)),
+        )),
+        VarRefId::IndexRef(decl_or_member_id, _) => Some(VarRefId::IndexRef(
+            decl_or_member_id,
+            ArcIntern::from(SmolStr::new(&full_path)),
+        )),
+        VarRefId::GlobalName(_, _) => None,
     }
 }
 
