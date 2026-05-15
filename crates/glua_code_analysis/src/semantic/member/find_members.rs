@@ -15,6 +15,7 @@ use crate::{
 
 use super::{
     FindMembersResult, LuaMemberInfo, get_buildin_type_map_type_id, intersect_member_types,
+    resolve_dynamic_field_member_for_file,
 };
 
 #[derive(Debug, Clone)]
@@ -878,10 +879,21 @@ fn append_dynamic_fields_for_type(
             continue;
         }
 
+        let resolved = ctx.file_id().and_then(|file_id| {
+            resolve_dynamic_field_member_for_file(
+                db,
+                file_id,
+                &LuaType::Ref(type_decl_id.clone()),
+                &member_key,
+            )
+        });
+
         members.push(LuaMemberInfo {
             property_owner_id: None,
             key: member_key,
-            typ: LuaType::Any,
+            typ: resolved
+                .map(|resolution| resolution.typ)
+                .unwrap_or(LuaType::Any),
             feature: None,
             overload_index: None,
         });
@@ -938,10 +950,21 @@ fn append_dynamic_fields_for_table(
             continue;
         }
 
+        let resolved = ctx.file_id().and_then(|file_id| {
+            resolve_dynamic_field_member_for_file(
+                db,
+                file_id,
+                &LuaType::TableConst(table_range.clone()),
+                &member_key,
+            )
+        });
+
         members.push(LuaMemberInfo {
             property_owner_id: None,
             key: member_key,
-            typ: LuaType::Any,
+            typ: resolved
+                .map(|resolution| resolution.typ)
+                .unwrap_or(LuaType::Any),
             feature: None,
             overload_index: None,
         });

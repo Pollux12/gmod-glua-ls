@@ -3406,18 +3406,6 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
         })
 }
 
-/// Returns the gmod scripted-class name that the given file belongs to, if any.
-/// For example, a file at `lua/entities/base_glide_car/sv_braking.lua` returns
-/// `Some("base_glide_car")`.
-/// Uses cached scoped class info when available (populated during gmod_pre phase),
-/// falling back to path detection.
-pub fn get_gmod_class_name_for_file(db: &DbIndex, file_id: FileId) -> Option<String> {
-    if let Some(info) = db.get_gmod_infer_index().get_scoped_class_info(&file_id) {
-        return Some(info.class_name.clone());
-    }
-    detect_scoped_class_from_path(db, file_id).map(|m| m.class_name)
-}
-
 /// Returns the scripted class info `(class_name, global_name)` for a file, if it belongs to a
 /// GMod scripted class scope.  `global_name` is the well-known table name used in the file
 /// (e.g. `"ENT"`, `"SWEP"`, `"TOOL"`, `"EFFECT"`, `"PLUGIN"`).

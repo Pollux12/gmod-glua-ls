@@ -1,6 +1,6 @@
 use crate::{
-    InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
-    LuaTypeCache, LuaTypeOwner, TypeOps,
+    CacheEntry, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId,
+    LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
     compilation::analyzer::{
         common::{add_member, bind_type},
         unresolve::{UnResolveDecl, UnResolveMember},
@@ -70,6 +70,20 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 if let LuaType::Variadic(multi) = expr_type {
                     expr_type = multi.get_type(0)?.clone();
                 }
+                if should_defer_nil_gmod_self_index(analyzer, &expr, &expr_type) {
+                    clear_index_expr_type_cache(analyzer, &expr);
+                    let unresolve = UnResolveDecl {
+                        file_id: analyzer.file_id,
+                        decl_id,
+                        expr: expr.clone(),
+                        ret_idx: 0,
+                    };
+                    analyzer
+                        .context
+                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    continue;
+                }
+
                 // 当`call`参数包含表时, 表可能未被分析, 需要延迟
                 if let LuaType::Instance(instance) = &expr_type
                     && instance.get_base().is_unknown()
@@ -236,6 +250,65 @@ fn call_expr_has_effect_table_arg(expr: &LuaExpr) -> Option<()> {
         }
     }
     None
+}
+
+fn should_defer_nil_gmod_self_index(
+    analyzer: &LuaAnalyzer,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    if !analyzer.gmod_enabled
+        || !analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        || !expr_type.is_nil()
+        || !analyzer.is_scripted_class_scope
+    {
+        return false;
+    }
+
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return false;
+    };
+    nested_index_root_is_self(index_expr)
+}
+
+fn nested_index_root_is_self(index_expr: &LuaIndexExpr) -> bool {
+    let Some(mut prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let mut saw_nested_index = false;
+    while let LuaExpr::IndexExpr(prefix_index) = prefix_expr {
+        saw_nested_index = true;
+        let Some(next_prefix) = prefix_index.get_prefix_expr() else {
+            return false;
+        };
+        prefix_expr = next_prefix;
+    }
+
+    saw_nested_index
+        && matches!(
+            prefix_expr,
+            LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self")
+        )
+}
+
+fn clear_index_expr_type_cache(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) {
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let mut current_expr = expr.clone();
+    while let LuaExpr::IndexExpr(index_expr) = current_expr {
+        let syntax_id = index_expr.get_syntax_id();
+        if matches!(cache.expr_cache.get(&syntax_id), Some(CacheEntry::Cache(typ)) if typ.is_nil())
+        {
+            cache.expr_cache.remove(&syntax_id);
+            cache.expr_var_ref_id_cache.remove(&syntax_id);
+        }
+        let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+            break;
+        };
+        current_expr = prefix_expr;
+    }
 }
 
 fn get_var_owner(analyzer: &mut LuaAnalyzer, var: LuaVarExpr) -> LuaTypeOwner {
@@ -536,6 +609,9 @@ fn get_widened_member_assignment_collection_type(
         if related_member_id == *member_id {
             continue;
         }
+        if !is_member_realm_compatible(analyzer, *member_id, related_member_id) {
+            continue;
+        }
 
         let Some(existing_cache) = analyzer
             .db
@@ -596,6 +672,9 @@ fn get_widened_member_assignment_type(
             if related_member_id == *member_id {
                 continue;
             }
+            if !is_member_realm_compatible(analyzer, *member_id, related_member_id) {
+                continue;
+            }
             saw_previous_assignment = true;
 
             if !is_assignment_file_define_member(analyzer.db, related_member_id) {
@@ -649,6 +728,9 @@ fn get_widened_member_assignment_type(
     for related_member in related_members {
         let related_member_id = related_member.get_id();
         if related_member_id == *member_id {
+            continue;
+        }
+        if !is_member_realm_compatible(analyzer, *member_id, related_member_id) {
             continue;
         }
         saw_previous_assignment = true;
@@ -775,6 +857,27 @@ fn class_decl_id_from_type(typ: &LuaType) -> Option<crate::LuaTypeDeclId> {
 
 fn is_table_bootstrap_type(typ: &LuaType) -> bool {
     typ.is_table() || matches!(typ, LuaType::Unknown | LuaType::Nil | LuaType::Never)
+}
+
+fn is_member_realm_compatible(
+    analyzer: &LuaAnalyzer,
+    current_member_id: LuaMemberId,
+    related_member_id: LuaMemberId,
+) -> bool {
+    if !analyzer.db.get_emmyrc().gmod.enabled {
+        return true;
+    }
+
+    let infer_index = analyzer.db.get_gmod_infer_index();
+    let current_realm = infer_index
+        .get_realm_at_offset(&current_member_id.file_id, current_member_id.get_position());
+    let related_realm = infer_index
+        .get_realm_at_offset(&related_member_id.file_id, related_member_id.get_position());
+
+    !matches!(
+        (current_realm, related_realm),
+        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
+    )
 }
 
 fn widen_existing_member_collection_type(

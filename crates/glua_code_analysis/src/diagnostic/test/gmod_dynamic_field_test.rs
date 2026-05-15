@@ -203,4 +203,47 @@ mod test {
             "#
         ));
     }
+
+    #[gtest]
+    fn test_param_check_handles_recursive_dynamic_field_value() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            ---@field SetNWEntity fun(self: Entity, key: string, value: Entity)
+
+            ---@class DynTest8.Chip: Entity
+
+            ---@type DynTest8.Chip
+            local self
+
+            self:SetNWEntity("owner", self._Owner)
+            "#
+        ));
+    }
+
+    #[gtest]
+    fn test_dynamic_field_value_type_stays_precise_for_param_check() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class DynTest9.Entity
+            ---@class DynTest9.Other
+
+            ---@type DynTest9.Entity
+            local ent
+            ent.preciseCount = 1
+
+            ---@type DynTest9.Entity
+            local ent2
+
+            ---@param value DynTest9.Other
+            local function takes_other(value) end
+
+            takes_other(ent2.preciseCount)
+            "#
+        ));
+    }
 }

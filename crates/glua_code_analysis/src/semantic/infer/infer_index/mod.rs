@@ -4,15 +4,17 @@ pub(crate) use infer_array::check_iter_var_range;
 use std::collections::HashSet;
 
 use glua_parser::{
-    LuaAstNode, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, NumberResult, PathTrait,
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaLocalStat,
+    LuaNameExpr, NumberResult, PathTrait,
 };
 use internment::ArcIntern;
 use rowan::TextRange;
 use smol_str::SmolStr;
 
 use crate::{
-    CacheEntry, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclOrMemberId,
-    LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
+    CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
+    LuaDeclOrMemberId, LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
+    compilation::get_scripted_class_info_for_file,
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaObjectType,
         LuaOperatorMetaMethod, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType,
@@ -30,6 +32,7 @@ use crate::{
         member::infer_owner_raw_member_type_with_realm,
         member::intersect_member_types,
         member::member_key_matches_type,
+        member::resolve_dynamic_field_member,
         type_check::{self, check_type_compact},
     },
 };
@@ -300,8 +303,17 @@ fn infer_table_member(
         Some(index_expr.get_position()),
     ) {
         Ok(typ) => Ok(typ),
-        Err(InferFailReason::FieldNotFound) if is_table_const_from_doc_tag(db, &inst) => {
-            Ok(nullable_any_type())
+        Err(InferFailReason::FieldNotFound) => {
+            if let Some(dynamic_field) =
+                resolve_dynamic_field_member(db, cache, &LuaType::TableConst(inst.clone()), &key)
+            {
+                return Ok(dynamic_field.typ);
+            }
+            if is_table_const_from_doc_tag(db, &inst) {
+                Ok(nullable_any_type())
+            } else {
+                Err(InferFailReason::FieldNotFound)
+            }
         }
         Err(err) => Err(err),
     }
@@ -324,6 +336,10 @@ fn infer_plain_table_member(
     cache: &mut LuaInferCache,
     index_expr: LuaIndexMemberExpr,
 ) -> InferResult {
+    if let Some(member_type) = infer_gmod_plain_table_dynamic_field(db, cache, &index_expr) {
+        return Ok(member_type);
+    }
+
     let nullable_any = nullable_any_type();
 
     let index_prefix_expr = match index_expr.clone() {
@@ -342,6 +358,202 @@ fn infer_plain_table_member(
     }
 
     Ok(nullable_any)
+}
+
+fn infer_gmod_plain_table_dynamic_field(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexMemberExpr,
+) -> Option<LuaType> {
+    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+        return None;
+    }
+
+    if !is_gmod_gettable_alias_member_access(db, cache, index_expr) {
+        return None;
+    }
+
+    let (class_name, _) = get_scripted_class_info_for_file(db, cache.get_file_id())?;
+
+    let index_key = index_expr.get_index_key()?;
+    let member_key = LuaMemberKey::from_index_key(db, cache, &index_key).ok()?;
+    let class_type = LuaType::Ref(LuaTypeDeclId::global(&class_name));
+    if let Ok(member_type) = infer_member_by_member_key(
+        db,
+        cache,
+        &class_type,
+        index_expr.clone(),
+        &InferGuard::new(),
+    ) {
+        return Some(member_type);
+    }
+
+    resolve_dynamic_field_member(db, cache, &class_type, &member_key)
+        .map(|resolution| resolution.typ)
+}
+
+fn is_gmod_gettable_alias_member_access(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexMemberExpr,
+) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    match prefix_expr {
+        LuaExpr::NameExpr(name_expr) => local_name_initializer_expr(db, cache, &name_expr)
+            .is_some_and(|initializer| is_self_gettable_call(db, cache, &initializer)),
+        LuaExpr::CallExpr(call_expr) => is_self_gettable_call_expr(db, cache, &call_expr),
+        _ => false,
+    }
+}
+
+fn local_name_initializer_expr(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaExpr> {
+    let Some(VarRefId::VarRef(decl_id)) = get_name_expr_var_ref_id(db, cache, name_expr) else {
+        return None;
+    };
+    if decl_id.file_id != cache.get_file_id()
+        || has_local_write_before_use(db, &cache.get_file_id(), &decl_id, name_expr.get_position())
+    {
+        return None;
+    }
+    db.get_decl_index().get_decl(&decl_id)?;
+    let token = match name_expr.get_root().token_at_offset(decl_id.position) {
+        rowan::TokenAtOffset::Single(token) => token,
+        rowan::TokenAtOffset::Between(_, right) => right,
+        rowan::TokenAtOffset::None => return None,
+    };
+
+    for ancestor in token.parent_ancestors() {
+        let Some(local_stat) = LuaLocalStat::cast(ancestor) else {
+            continue;
+        };
+
+        let name_index = local_stat
+            .get_local_name_list()
+            .position(|local_name| local_name.get_position() == decl_id.position)?;
+        return local_stat.get_value_exprs().nth(name_index);
+    }
+
+    None
+}
+
+fn has_local_write_before_use(
+    db: &DbIndex,
+    file_id: &FileId,
+    decl_id: &LuaDeclId,
+    use_position: rowan::TextSize,
+) -> bool {
+    db.get_reference_index()
+        .get_decl_references(file_id, decl_id)
+        .is_some_and(|decl_ref| {
+            decl_ref.cells.iter().any(|cell| {
+                cell.is_write
+                    && cell.range.start() > decl_id.position
+                    && cell.range.start() < use_position
+            })
+        })
+}
+
+fn is_self_gettable_call(db: &DbIndex, cache: &mut LuaInferCache, expr: &LuaExpr) -> bool {
+    let LuaExpr::CallExpr(call_expr) = expr else {
+        return false;
+    };
+
+    is_self_gettable_call_expr(db, cache, call_expr)
+}
+
+fn is_self_gettable_call_expr(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    if call_expr.is_colon_call() {
+        let LuaExpr::IndexExpr(index_expr) = &prefix_expr else {
+            return false;
+        };
+        return is_entity_gettable_index_expr(db, cache, &prefix_expr)
+            && index_expr
+                .get_prefix_expr()
+                .is_some_and(|self_expr| is_self_expr(&self_expr));
+    }
+
+    if !call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().next())
+        .is_some_and(|arg| is_self_expr(&arg))
+    {
+        return false;
+    }
+
+    match prefix_expr {
+        LuaExpr::IndexExpr(_) => is_entity_gettable_index_expr(db, cache, &prefix_expr),
+        LuaExpr::NameExpr(name_expr) => local_name_initializer_expr(db, cache, &name_expr)
+            .is_some_and(|initializer| is_entity_gettable_index_expr(db, cache, &initializer)),
+        _ => false,
+    }
+}
+
+fn is_entity_gettable_index_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: &LuaExpr) -> bool {
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return false;
+    };
+
+    if !matches!(
+        index_expr.get_index_key(),
+        Some(LuaIndexKey::Name(name)) if name.get_name_text() == "GetTable"
+    ) {
+        return false;
+    }
+
+    let Some(receiver_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Ok(receiver_type) = infer_expr(db, cache, receiver_expr) else {
+        return false;
+    };
+
+    is_entity_or_derived_type(db, &receiver_type)
+}
+
+fn is_entity_or_derived_type(db: &DbIndex, typ: &LuaType) -> bool {
+    let entity_id = LuaTypeDeclId::global("Entity");
+    match typ {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            type_id == &entity_id || type_check::is_sub_type_of(db, type_id, &entity_id)
+        }
+        LuaType::Generic(generic) => {
+            let type_id = generic.get_base_type_id_ref();
+            type_id == &entity_id || type_check::is_sub_type_of(db, type_id, &entity_id)
+        }
+        LuaType::Instance(instance) => is_entity_or_derived_type(db, instance.get_base()),
+        LuaType::TableOf(base) => is_entity_or_derived_type(db, base),
+        LuaType::Union(union) => {
+            let types = union.into_vec();
+            let mut saw_non_nil = false;
+            for typ in types.iter().filter(|typ| !matches!(typ, LuaType::Nil)) {
+                saw_non_nil = true;
+                if !is_entity_or_derived_type(db, typ) {
+                    return false;
+                }
+            }
+            saw_non_nil
+        }
+        _ => false,
+    }
+}
+
+fn is_self_expr(expr: &LuaExpr) -> bool {
+    matches!(expr, LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self"))
 }
 
 fn infer_custom_type_member(
@@ -408,6 +620,12 @@ fn infer_custom_type_member(
         }
 
         return resolved;
+    }
+
+    if let Some(dynamic_field) =
+        resolve_dynamic_field_member(db, cache, &LuaType::Ref(prefix_type_id.clone()), &key)
+    {
+        return Ok(dynamic_field.typ);
     }
 
     // 解决`key`为表达式的情况
@@ -689,25 +907,35 @@ fn infer_index_metamethod(
     key_type: &LuaType,
     value_type: &LuaType,
 ) -> InferResult {
-    let access_key_type = match &index_key {
-        LuaIndexKey::Name(name) => LuaType::StringConst(SmolStr::new(name.get_name_text()).into()),
-        LuaIndexKey::String(s) => LuaType::StringConst(SmolStr::new(s.get_value()).into()),
-        LuaIndexKey::Integer(i) => {
-            if let NumberResult::Int(index_value) = i.get_number_value() {
-                LuaType::IntegerConst(index_value)
-            } else {
-                return Err(InferFailReason::FieldNotFound);
-            }
-        }
-        LuaIndexKey::Idx(i) => LuaType::IntegerConst(*i as i64),
-        LuaIndexKey::Expr(expr) => infer_expr(db, cache, expr.clone())?,
-    };
+    let access_key_type = index_key_access_type(db, cache, index_key)?;
 
     if check_type_compact(db, key_type, &access_key_type).is_ok() {
         return Ok(value_type.clone());
     }
 
     Err(InferFailReason::FieldNotFound)
+}
+
+fn index_key_access_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_key: &LuaIndexKey,
+) -> InferResult {
+    match index_key {
+        LuaIndexKey::Name(name) => Ok(LuaType::StringConst(
+            SmolStr::new(name.get_name_text()).into(),
+        )),
+        LuaIndexKey::String(s) => Ok(LuaType::StringConst(SmolStr::new(s.get_value()).into())),
+        LuaIndexKey::Integer(i) => {
+            if let NumberResult::Int(index_value) = i.get_number_value() {
+                Ok(LuaType::IntegerConst(index_value))
+            } else {
+                Err(InferFailReason::FieldNotFound)
+            }
+        }
+        LuaIndexKey::Idx(i) => Ok(LuaType::IntegerConst(*i as i64)),
+        LuaIndexKey::Expr(expr) => infer_expr(db, cache, expr.clone()),
+    }
 }
 
 fn infer_union_member(
@@ -980,42 +1208,64 @@ fn infer_member_by_index_table(
         }
         None => {
             let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
-            if let LuaIndexKey::Expr(expr) = index_key {
-                let key_type = infer_expr(db, cache, expr.clone())?;
-                let members = db
-                    .get_member_index()
-                    .get_members(&LuaMemberOwner::Element(table_range.clone()));
-                if let Some(mut members) = members {
-                    members.sort_by(|a, b| a.get_key().cmp(b.get_key()));
-                    let mut result_type = LuaType::Unknown;
-                    for member in members {
-                        if member_key_matches_type(db, &key_type, member.get_key()) {
-                            let member_type = db
-                                .get_type_index()
-                                .get_type_cache(&member.get_id().into())
-                                .map(|it| it.as_type())
-                                .unwrap_or(&LuaType::Unknown);
+            let key_type = index_key_access_type(db, cache, &index_key)?;
+            let members = db
+                .get_member_index()
+                .get_members(&LuaMemberOwner::Element(table_range.clone()));
+            if let Some(mut members) = members {
+                members.sort_by(|a, b| a.get_key().cmp(b.get_key()));
+                let mut result_type = LuaType::Unknown;
+                let mut matched_inferred_index_key = false;
+                for member in members {
+                    if member_key_matches_type(db, &key_type, member.get_key()) {
+                        matched_inferred_index_key |=
+                            is_inferred_index_member_key(member.get_key());
+                        let member_type = db
+                            .get_type_index()
+                            .get_type_cache(&member.get_id().into())
+                            .map(|it| it.as_type())
+                            .unwrap_or(&LuaType::Unknown);
 
-                            result_type = TypeOps::Union.apply(db, &result_type, member_type);
-                        }
+                        result_type = TypeOps::Union.apply(db, &result_type, member_type);
+                    }
+                }
+
+                if !result_type.is_unknown() {
+                    if table_index_result_may_be_nil(db, &key_type, matched_inferred_index_key) {
+                        result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
                     }
 
-                    if !result_type.is_unknown() {
-                        if matches!(
-                            key_type,
-                            LuaType::String | LuaType::Number | LuaType::Integer
-                        ) {
-                            result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
-                        }
-
-                        return Ok(result_type);
-                    }
+                    return Ok(result_type);
                 }
             }
         }
     }
 
     Err(InferFailReason::FieldNotFound)
+}
+
+fn table_index_result_may_be_nil(
+    db: &DbIndex,
+    key_type: &LuaType,
+    matched_inferred_index_key: bool,
+) -> bool {
+    matches!(
+        key_type,
+        LuaType::String | LuaType::Number | LuaType::Integer
+    ) || (db.get_emmyrc().strict.array_index
+        && matched_inferred_index_key
+        && is_numeric_access_key_type(key_type))
+}
+
+fn is_numeric_access_key_type(key_type: &LuaType) -> bool {
+    matches!(
+        key_type,
+        LuaType::Integer | LuaType::Number | LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
+    )
+}
+
+fn is_inferred_index_member_key(key: &LuaMemberKey) -> bool {
+    matches!(key, LuaMemberKey::ExprType(_))
 }
 
 fn infer_member_by_index_custom_type(

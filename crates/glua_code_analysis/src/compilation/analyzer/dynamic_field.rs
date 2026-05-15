@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexKey, LuaSyntaxKind,
-    LuaVarExpr,
+    LuaTableField, LuaVarExpr,
 };
 use smol_str::SmolStr;
 
 use crate::{
-    LuaMemberKey, LuaType, LuaTypeDeclId,
+    InFiled, LuaMemberKey, LuaType, VarRefId,
     db_index::{DbIndex, DynamicFieldOwner},
     profile::Profile,
     semantic::{
@@ -15,7 +15,7 @@ use crate::{
     },
 };
 
-use super::{AnalysisPipeline, AnalyzeContext, gmod::get_gmod_class_name_for_file};
+use super::{AnalysisPipeline, AnalyzeContext};
 
 pub struct DynamicFieldAnalysisPipeline;
 
@@ -25,55 +25,68 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
         let tree_list = context.tree_list.clone();
         let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
             Vec::new();
+        let profile_enabled = log::log_enabled!(log::Level::Info);
+        let mut profile = profile_enabled.then(DynamicFieldProfile::default);
 
         for in_filed_tree in &tree_list {
             let root = in_filed_tree.value.clone();
             let file_id = in_filed_tree.file_id;
             let cache = context.infer_manager.get_infer_cache(file_id);
             let mut prefix_type_cache: HashMap<rowan::TextRange, Option<LuaType>> = HashMap::new();
-            // Pre-compute the gmod class for this file (if any) to avoid
-            // repeated path lookups inside the inner loop.
-            let file_class_type = get_gmod_class_name_for_file(&*db, file_id)
-                .map(|name| LuaType::Ref(LuaTypeDeclId::global(&name)));
-
             for assign in root.descendants::<LuaAssignStat>() {
+                if let Some(profile) = profile.as_mut() {
+                    profile.assignments_scanned += 1;
+                }
                 let (vars, _) = assign.get_var_and_expr_list();
                 for var in vars.iter() {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.vars_scanned += 1;
+                    }
                     let LuaVarExpr::IndexExpr(index_expr) = var else {
                         continue;
                     };
+                    if let Some(profile) = profile.as_mut() {
+                        profile.index_candidates += 1;
+                    }
                     let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+                        continue;
+                    };
+                    let field_names = get_field_names(db, cache, &index_expr);
+                    if field_names.is_empty() {
+                        if let Some(profile) = profile.as_mut() {
+                            profile.no_field_name_skips += 1;
+                        }
                         continue;
                     };
 
                     let prefix_range = prefix_expr.syntax().text_range();
-                    let prefix_type =
-                        if let Some(cached_type) = prefix_type_cache.get(&prefix_range) {
-                            match cached_type {
-                                Some(prefix_type) => prefix_type.clone(),
-                                None => continue,
-                            }
-                        } else {
-                            let inferred = infer_expr(&*db, cache, prefix_expr.clone()).ok();
-                            prefix_type_cache.insert(prefix_range, inferred.clone());
-                            let Some(prefix_type) = inferred else {
-                                continue;
-                            };
-                            prefix_type
+                    let prefix_type = if let Some(cached_type) =
+                        prefix_type_cache.get(&prefix_range)
+                    {
+                        if let Some(profile) = profile.as_mut() {
+                            profile.owner_cache_hits += 1;
+                        }
+                        match cached_type {
+                            Some(prefix_type) => prefix_type.clone(),
+                            None => continue,
+                        }
+                    } else {
+                        if let Some(profile) = profile.as_mut() {
+                            profile.owner_cache_misses += 1;
+                        }
+                        let infer_start = profile_enabled.then(std::time::Instant::now);
+                        let inferred = infer_expr(&*db, cache, prefix_expr.clone()).ok();
+                        if let (Some(profile), Some(infer_start)) = (profile.as_mut(), infer_start)
+                        {
+                            profile.owner_infer_time += infer_start.elapsed();
+                        }
+                        prefix_type_cache.insert(prefix_range, inferred.clone());
+                        let Some(prefix_type) = inferred else {
+                            continue;
                         };
-                    let field_names = get_field_names(db, cache, &index_expr);
-                    if field_names.is_empty() {
-                        continue;
+                        prefix_type
                     };
 
-                    // When the prefix resolves to a generic table type (e.g.
-                    // from Entity:GetTable()) and the file belongs to a gmod
-                    // scripted class, index under the class type so that
-                    // `self.field` accesses find these dynamic fields.
-                    //
-                    // Also handles TableOf(SelfInfer) — when SelfInfer couldn't
-                    // be resolved during compilation (e.g. localized GetTable),
-                    // we fall back to the file's class type.
                     let effective_type = if let Some(metatable_type) =
                         infer_setmetatable_target_type(
                             &*db,
@@ -82,35 +95,43 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                             index_expr.get_range(),
                         ) {
                         metatable_type
-                    } else if is_unresolved_table_type(&prefix_type) {
-                        if let Some(class_type) = &file_class_type {
-                            class_type.clone()
-                        } else {
-                            prefix_type
-                        }
-                    } else if has_unresolved_self_infer(&prefix_type) {
-                        if let Some(class_type) = &file_class_type {
-                            replace_self_infer(&prefix_type, class_type)
-                        } else {
-                            prefix_type
-                        }
                     } else {
                         prefix_type
                     };
 
+                    // Store the index key range (e.g. just "forwardSpeed") rather
+                    // than the full index expression range (e.g. "selfTbl.forwardSpeed")
+                    // so that go-to-definition targets the field key precisely.
+                    let Some(definition_range) =
+                        index_expr.get_index_key().and_then(|k| k.get_range())
+                    else {
+                        continue;
+                    };
+
                     for field_name in field_names {
+                        if let Some(profile) = profile.as_mut() {
+                            profile.fields_collected += 1;
+                        }
                         collect_for_type(
                             &effective_type,
                             &field_name,
                             file_id,
-                            index_expr.get_range(),
+                            definition_range,
                             &mut collected,
                         );
                     }
                 }
             }
+
+            for call_expr in root.descendants::<LuaCallExpr>() {
+                if let Some(profile) = profile.as_mut() {
+                    profile.calls_scanned += 1;
+                }
+                collect_setmetatable_table_fields(&*db, cache, &call_expr, file_id, &mut collected);
+            }
         }
 
+        let propagate_start = profile_enabled.then(std::time::Instant::now);
         // Propagate dynamic fields to parent types so that e.g. a field assigned
         // on `base_glide` (which extends `Entity`) is also visible when the variable
         // is typed as `Entity`.  This avoids false-positive `undefined-field` when
@@ -131,16 +152,144 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                         *file_id,
                         *range,
                     ));
+                    if let Some(profile) = profile.as_mut() {
+                        profile.fields_propagated += 1;
+                    }
                 }
             }
         }
+        if let (Some(profile), Some(propagate_start)) = (profile.as_mut(), propagate_start) {
+            profile.propagation_time += propagate_start.elapsed();
+        }
 
+        let insert_start = profile_enabled.then(std::time::Instant::now);
         let index = db.get_dynamic_field_index_mut();
         for (owner, field_name, file_id, range) in &collected {
             index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
         }
         for (owner, field_name, file_id, range) in &propagated {
             index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
+        }
+        if let (Some(profile), Some(insert_start)) = (profile.as_mut(), insert_start) {
+            profile.insertion_time += insert_start.elapsed();
+        }
+        if let Some(profile) = profile {
+            profile.log(tree_list.len(), collected.len(), propagated.len());
+        }
+    }
+}
+
+#[derive(Default)]
+struct DynamicFieldProfile {
+    assignments_scanned: usize,
+    vars_scanned: usize,
+    index_candidates: usize,
+    no_field_name_skips: usize,
+    calls_scanned: usize,
+    fields_collected: usize,
+    fields_propagated: usize,
+    owner_cache_hits: usize,
+    owner_cache_misses: usize,
+    owner_infer_time: Duration,
+    propagation_time: Duration,
+    insertion_time: Duration,
+}
+
+impl DynamicFieldProfile {
+    fn log(&self, file_count: usize, collected: usize, propagated: usize) {
+        log::info!(
+            "dynamic field profile: files={} assignments={} vars={} index_candidates={} no_field_name_skips={} calls={} fields_collected={} collected_entries={} propagated={} owner_cache_hits={} owner_cache_misses={} owner_infer_time={:?} propagation_time={:?} insertion_time={:?}",
+            file_count,
+            self.assignments_scanned,
+            self.vars_scanned,
+            self.index_candidates,
+            self.no_field_name_skips,
+            self.calls_scanned,
+            self.fields_collected,
+            collected,
+            propagated,
+            self.owner_cache_hits,
+            self.owner_cache_misses,
+            self.owner_infer_time,
+            self.propagation_time,
+            self.insertion_time,
+        );
+    }
+}
+
+fn collect_setmetatable_table_fields(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+    file_id: crate::FileId,
+    collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+) {
+    if !call_expr.is_setmetatable() {
+        return;
+    }
+
+    let Some(arg_list) = call_expr.get_args_list() else {
+        return;
+    };
+    let args = arg_list.get_args().collect::<Vec<_>>();
+    if args.len() != 2 {
+        return;
+    }
+
+    let LuaExpr::TableExpr(table_expr) = &args[0] else {
+        return;
+    };
+    let Some(target_type) = infer_metatable_index_type_for_dynamic_field(db, cache, &args[1])
+    else {
+        return;
+    };
+
+    for field in table_expr.get_fields() {
+        collect_nested_table_field(db, cache, &field, &target_type, file_id, collected);
+    }
+}
+
+fn collect_nested_table_field(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    field: &LuaTableField,
+    owner_type: &LuaType,
+    file_id: crate::FileId,
+    collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+) {
+    let Some(field_key) = field.get_field_key() else {
+        return;
+    };
+    let field_names = match field_key {
+        LuaIndexKey::Name(ref name) => vec![name.get_name_text().into()],
+        LuaIndexKey::String(ref string) => vec![string.get_value().into()],
+        LuaIndexKey::Expr(ref expr) => {
+            string_const_names(&infer_expr(db, cache, expr.clone()).ok())
+        }
+        _ => Vec::new(),
+    };
+    if field_names.is_empty() {
+        return;
+    }
+
+    let Some(definition_range) = field_key.get_range() else {
+        return;
+    };
+
+    for field_name in field_names {
+        collect_for_type(
+            owner_type,
+            &field_name,
+            file_id,
+            definition_range,
+            collected,
+        );
+    }
+
+    if let Some(LuaExpr::TableExpr(table_expr)) = field.get_value_expr() {
+        let nested_owner = LuaType::TableConst(InFiled::new(file_id, table_expr.get_range()));
+        for nested_field in table_expr.get_fields() {
+            collect_nested_table_field(db, cache, &nested_field, &nested_owner, file_id, collected);
         }
     }
 }
@@ -152,14 +301,50 @@ fn infer_setmetatable_target_type(
     assignment_range: rowan::TextRange,
 ) -> Option<LuaType> {
     let prefix_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr.clone())?;
-    let scope = prefix_expr.syntax().ancestors().find(|node| {
+    if matches!(prefix_var_ref_id, VarRefId::GlobalName(_, _)) {
+        return collect_setmetatable_bindings(db, cache, prefix_expr, prefix_var_ref_id)
+            .into_iter()
+            .take_while(|(range, _)| range.end() <= assignment_range.start())
+            .last()
+            .map(|(_, target_type)| target_type);
+    }
+
+    if !cache
+        .dynamic_field_metatable_cache
+        .contains_key(&prefix_var_ref_id)
+    {
+        let bindings =
+            collect_setmetatable_bindings(db, cache, prefix_expr, prefix_var_ref_id.clone());
+        cache
+            .dynamic_field_metatable_cache
+            .insert(prefix_var_ref_id.clone(), bindings);
+    }
+
+    cache
+        .dynamic_field_metatable_cache
+        .get(&prefix_var_ref_id)?
+        .iter()
+        .take_while(|(range, _)| range.end() <= assignment_range.start())
+        .last()
+        .map(|(_, target_type)| target_type.clone())
+}
+
+fn collect_setmetatable_bindings(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    prefix_expr: &LuaExpr,
+    prefix_var_ref_id: VarRefId,
+) -> Vec<(rowan::TextRange, LuaType)> {
+    let Some(scope) = prefix_expr.syntax().ancestors().find(|node| {
         matches!(
             node.kind().into(),
             LuaSyntaxKind::ClosureExpr | LuaSyntaxKind::FuncStat | LuaSyntaxKind::LocalFuncStat
         )
-    })?;
+    }) else {
+        return Vec::new();
+    };
 
-    let mut matched_type = None;
+    let mut bindings = Vec::new();
     for node in scope.descendants() {
         let Some(call_expr) = LuaCallExpr::cast(node) else {
             continue;
@@ -176,7 +361,7 @@ fn infer_setmetatable_target_type(
             continue;
         }
 
-        if !call_expr.is_setmetatable() || call_expr.get_range().end() > assignment_range.start() {
+        if !call_expr.is_setmetatable() {
             continue;
         }
 
@@ -197,11 +382,12 @@ fn infer_setmetatable_target_type(
 
         if let Some(target_type) = infer_metatable_index_type_for_dynamic_field(db, cache, &args[1])
         {
-            matched_type = Some(target_type);
+            bindings.push((call_expr.get_range(), target_type));
         }
     }
 
-    matched_type
+    bindings.sort_by_key(|(range, _)| range.start());
+    bindings
 }
 
 fn infer_metatable_index_type_for_dynamic_field(
@@ -211,10 +397,16 @@ fn infer_metatable_index_type_for_dynamic_field(
 ) -> Option<LuaType> {
     if let Some(name_expr) = unwrap_paren_to_name_expr(metatable_expr)
         && name_expr.get_name_text().as_deref() == Some("self")
-        && let Some(self_type) = infer_enclosing_method_self_type(db, cache, metatable_expr)
-        && let Some(index_type) = infer_index_type_from_metatable_type(db, &self_type)
     {
-        return Some(index_type);
+        if let Some(self_type) = infer_enclosing_method_self_type(db, cache, metatable_expr) {
+            if self_type.is_custom_type() {
+                return Some(self_type);
+            }
+
+            if let Some(index_type) = infer_index_type_from_metatable_type(db, &self_type) {
+                return Some(index_type);
+            }
+        }
     }
 
     if let LuaExpr::TableExpr(table) = metatable_expr {
@@ -318,57 +510,6 @@ fn string_const_names(typ: &Option<LuaType>) -> Vec<SmolStr> {
             .flat_map(|typ| string_const_names(&Some(typ.clone())))
             .collect(),
         _ => Vec::new(),
-    }
-}
-
-/// Returns true when the type is a generic/unresolved table type that
-/// does not carry useful class information.  Matches:
-/// - `table` (the bare Ref/Def type)
-/// - `table|nil`
-/// - `TableConst` (inferred from `return {}` or similar)
-fn is_unresolved_table_type(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Table => true,
-        LuaType::Ref(id) | LuaType::Def(id) => id.get_name() == "table",
-        LuaType::TableConst(_) => true,
-        LuaType::Union(union_type) => {
-            let types = union_type.into_vec();
-            types.iter().any(is_unresolved_table_type)
-                && types
-                    .iter()
-                    .all(|t| is_unresolved_table_type(t) || matches!(t, LuaType::Nil))
-        }
-        _ => false,
-    }
-}
-
-/// Returns true when the type contains an unresolved SelfInfer,
-/// e.g. `TableOf(SelfInfer)` from an unresolved localized GetTable call.
-fn has_unresolved_self_infer(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::SelfInfer => true,
-        LuaType::TableOf(inner) => has_unresolved_self_infer(inner),
-        LuaType::Union(union_type) => union_type.into_vec().iter().any(has_unresolved_self_infer),
-        _ => false,
-    }
-}
-
-/// Replaces SelfInfer in a type with the given class type.
-fn replace_self_infer(typ: &LuaType, class_type: &LuaType) -> LuaType {
-    match typ {
-        LuaType::SelfInfer => class_type.clone(),
-        LuaType::TableOf(inner) => {
-            LuaType::TableOf(Box::new(replace_self_infer(inner, class_type)))
-        }
-        LuaType::Union(union_type) => {
-            let new_types: Vec<LuaType> = union_type
-                .into_vec()
-                .iter()
-                .map(|t| replace_self_infer(t, class_type))
-                .collect();
-            LuaType::from_vec(new_types)
-        }
-        _ => typ.clone(),
     }
 }
 

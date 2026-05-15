@@ -9,9 +9,10 @@ use std::{
 };
 
 use crate::{
-    FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaSemanticDeclId,
+    FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey,
+    LuaSemanticDeclId, VarRefId,
     db_index::{LuaType, LuaTypeDeclId},
-    semantic::infer::{InferFailReason, VarRefId},
+    semantic::infer::InferFailReason,
 };
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,11 @@ pub struct LuaInferCache {
     /// templated tables, each use of the loop value can otherwise re-run the
     /// full iterator inference from the enclosing `for` statement.
     pub for_range_iter_var_type_cache: HashMap<LuaDeclId, CacheEntry<LuaType>>,
+    pub dynamic_field_metatable_cache: HashMap<VarRefId, Vec<(TextRange, LuaType)>>,
+    pub dynamic_field_resolution_cache:
+        HashMap<(LuaType, LuaMemberKey), Option<(LuaType, Option<LuaSemanticDeclId>)>>,
+    pub dynamic_field_type_cache: HashMap<LuaMemberId, Option<LuaType>>,
+    pub dynamic_field_resolving: HashSet<LuaMemberId>,
     /// Tracks total flow nodes visited during flow analysis for profiling.
     pub flow_nodes_visited: u32,
     // Diagnostic profiling counters (zero-cost when not read)
@@ -94,6 +100,10 @@ impl LuaInferCache {
             self_type_cache: HashMap::new(),
             decl_cache: HashMap::new(),
             for_range_iter_var_type_cache: HashMap::new(),
+            dynamic_field_metatable_cache: HashMap::new(),
+            dynamic_field_resolution_cache: HashMap::new(),
+            dynamic_field_type_cache: HashMap::new(),
+            dynamic_field_resolving: HashSet::new(),
             flow_nodes_visited: 0,
             prof_infer_expr_calls: 0,
             prof_infer_expr_hits: 0,
@@ -164,6 +174,10 @@ impl LuaInferCache {
         self.self_type_cache.clear();
         self.decl_cache.clear();
         self.for_range_iter_var_type_cache.clear();
+        self.dynamic_field_metatable_cache.clear();
+        self.dynamic_field_resolution_cache.clear();
+        self.dynamic_field_type_cache.clear();
+        self.dynamic_field_resolving.clear();
         self.flow_nodes_visited = 0;
     }
 

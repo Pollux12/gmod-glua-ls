@@ -9,7 +9,7 @@ use crate::{
     LuaTypeDeclId, LuaUnionType,
     semantic::{
         infer::{find_self_decl_or_member_id, resolve_scoped_scripted_global_type_decl_id},
-        member::get_buildin_type_map_type_id,
+        member::{get_buildin_type_map_type_id, resolve_dynamic_field_member},
         semantic_info::resolve_global_decl_id,
     },
 };
@@ -427,6 +427,12 @@ fn infer_custom_type_member_semantic_decl(
             ),
             None => member_item.resolve_semantic_decl_with_realm(db, &cache.get_file_id()),
         };
+    }
+
+    if let Some(dynamic_field) =
+        resolve_dynamic_field_member(db, cache, &LuaType::Ref(prefix_type_id.clone()), member_key)
+    {
+        return dynamic_field.semantic_decl;
     }
 
     if type_decl.is_class() {

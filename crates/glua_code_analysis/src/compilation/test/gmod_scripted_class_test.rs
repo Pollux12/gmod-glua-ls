@@ -46,6 +46,72 @@ mod test {
             .expect("expected semantic info for index expr")
     }
 
+    fn local_name_type(ws: &mut VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("expected local name");
+        let token = local_name
+            .get_name_token()
+            .expect("expected local name token");
+
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .map(|info| info.typ)
+            .expect("expected semantic info for local name")
+    }
+
+    fn local_assignment_value_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let local_stat = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaLocalStat>()
+            .find(|local_stat| {
+                local_stat.get_local_name_list().any(|local_name| {
+                    local_name
+                        .get_name_token()
+                        .is_some_and(|token| token.get_name_text() == name)
+                })
+            })
+            .expect("expected local assignment");
+        let name_index = local_stat
+            .get_local_name_list()
+            .position(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("expected local name in assignment");
+        let expr = local_stat
+            .get_value_exprs()
+            .nth(name_index)
+            .expect("expected local assignment value");
+
+        semantic_model
+            .infer_expr(expr)
+            .expect("expected inferred local assignment value type")
+    }
+
     fn super_types_of(ws: &mut VirtualWorkspace, class_name: &str) -> Vec<LuaType> {
         let db = ws.get_db_mut();
         db.get_type_index()
@@ -3615,6 +3681,150 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_gettable_alias_preserves_typed_nested_state_fields_in_scripted_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "cityrp/entities/entities/glide_wheel/init.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class GlideTraceData
+                ---@field start number
+
+                ---@class GlideWheelState
+                ---@field traceData GlideTraceData
+
+                local getTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    ---@type GlideWheelState
+                    self.state = {
+                        traceData = {
+                            start = 1,
+                        },
+                    }
+                end
+
+                function ENT:Think(selfTbl)
+                    selfTbl = selfTbl or getTable(self)
+                    local traceData = selfTbl.state.traceData
+                    return traceData.start
+                end
+            "#,
+        );
+
+        let expected_state = ws.ty("GlideWheelState");
+        let expected_trace = ws.ty("GlideTraceData");
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "selfTbl.state"),
+            expected_state
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "selfTbl.state.traceData"),
+            expected_trace
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == undefined_field)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect();
+
+        assert!(
+            !messages.iter().any(|message| {
+                message.contains("state")
+                    || message.contains("traceData")
+                    || message.contains("start")
+            }),
+            "unexpected UndefinedField diagnostics for nested typed state access: {messages:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_gettable_alias_uses_shadowed_self_argument_type_instead_of_receiver() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "cityrp/entities/entities/glide_wheel/init.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class GlideWheelState
+                ---@field traceData table
+
+                ---@class ShadowedSelfTable
+                ---@field other number
+
+                local getTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    ---@type GlideWheelState
+                    self.state = {
+                        traceData = {},
+                    }
+                end
+
+                function ENT:Think()
+                    ---@type ShadowedSelfTable
+                    local self = {
+                        other = 1,
+                    }
+
+                    local shadowTbl = getTable(self)
+                    local keep = shadowTbl.other
+                    local notReceiverState = shadowTbl.state
+                end
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "shadowTbl.other"),
+            ws.ty("number")
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "shadowTbl.state"),
+            LuaType::Nil
+        );
+    }
+
     #[test]
     fn test_dynamic_field_table_typed_in_class_file() {
         // When selfTbl is typed as `table` (e.g. from Entity:GetTable()),
@@ -3642,7 +3852,7 @@ mod test {
                 ---@class base_glide_car
                 local ENT = {}
 
-                ---@return table
+                ---@return tableof<self>
                 local function getTable(e) return {} end
 
                 function ENT:BrakeInit()
@@ -3748,6 +3958,398 @@ mod test {
         assert!(
             !field_names.iter().any(|m| m.contains("`[i]`")),
             "numeric for index into inferred ENT weapons table should not trigger undefined-field: {field_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_seat_table_index_is_deterministic_for_self_and_gettable_alias() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.strict.array_index = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "annotations/vehicle.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@class Vehicle : Entity
+                local Vehicle = {}
+
+                ---@return Entity
+                function Vehicle:GetDriver() end
+
+                ---@class prop_vehicle_prisoner_pod : Vehicle
+
+                ---@class NotEntity
+                local NotEntity = {}
+
+                ---@return table
+                function NotEntity:GetTable() end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/entities/base_glide/shared.lua",
+            r#"
+                ---@class base_glide : Entity
+                local ENT = {}
+            "#,
+        );
+
+        let init_code = r#"
+            ---@class base_glide
+            local ENT = {}
+
+            ---@type Entity
+            local EntityMeta = {}
+            local getTable = EntityMeta.GetTable
+            ---@type NotEntity
+            local NotEntityMeta = {}
+            local nonEntityGetTable = NotEntityMeta.GetTable
+            ---@return table
+            local function makePlainTable() end
+
+            function ENT:Initialize()
+                self.seats = {}
+            end
+
+            function ENT:Use()
+                local earlyDriverSeatSelf = self.seats[1]
+            end
+
+            ---@param index integer
+            function ENT:CreateSeat(index)
+                ---@type prop_vehicle_prisoner_pod
+                local seat
+                self.seats[index] = seat
+            end
+
+            function ENT:Think()
+                local selfTbl = getTable(self)
+                ---@type table
+                local unrelated = {}
+                local unrelatedSeats = unrelated.seats
+                if #selfTbl.seats > 0 then
+                    local driverSeatAlias = selfTbl.seats[1]
+                    local driverSeatSelf = self.seats[1]
+                    local driver = IsValid(driverSeatAlias) and driverSeatAlias:GetDriver() or NULL
+                end
+                if #selfTbl.seats > 0 then
+                    local driverSeatSelfOnly = self.seats[1]
+                    local driver = IsValid(driverSeatSelfOnly) and driverSeatSelfOnly:GetDriver() or NULL
+                end
+                local nonEntityTbl = nonEntityGetTable(self)
+                local nonEntitySeats = nonEntityTbl.seats
+                local reassignedTbl = getTable(self)
+                reassignedTbl = makePlainTable()
+                local reassignedSeats = reassignedTbl.seats
+                do
+                    ---@type table
+                    local selfTbl = {}
+                    local namedSelfTblSeats = selfTbl.seats
+                end
+            end
+        "#;
+
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", init_code);
+        let expected = ws.ty("prop_vehicle_prisoner_pod");
+        let expected_seats = ws.ty("prop_vehicle_prisoner_pod[]");
+
+        let alias_seats_type = index_expr_type(&mut ws, file_id, "selfTbl.seats");
+        let self_seats_type = index_expr_type(&mut ws, file_id, "self.seats");
+        let expected_seats_display = "{\n    prop_vehicle_prisoner_pod,\n}";
+
+        assert_that!(
+            ws.check_type(&alias_seats_type, &expected_seats),
+            eq(true),
+            "selfTbl.seats should be a prop_vehicle_prisoner_pod array, got {}",
+            ws.humanize_type_detailed(alias_seats_type.clone())
+        );
+        let alias_seats_display = ws.humanize_type_detailed(alias_seats_type.clone());
+        assert_that!(alias_seats_display.as_str(), eq(expected_seats_display));
+        assert_that!(
+            ws.check_type(&self_seats_type, &expected_seats),
+            eq(true),
+            "self.seats should be a prop_vehicle_prisoner_pod array, got {}",
+            ws.humanize_type_detailed(self_seats_type.clone())
+        );
+        let self_seats_display = ws.humanize_type_detailed(self_seats_type.clone());
+        assert_that!(self_seats_display.as_str(), eq(expected_seats_display));
+
+        let alias_type = local_name_type(&mut ws, file_id, "driverSeatAlias");
+        let self_type = local_name_type(&mut ws, file_id, "driverSeatSelf");
+        let alias_expr_type = local_assignment_value_type(&mut ws, file_id, "driverSeatAlias");
+        let self_expr_type = local_assignment_value_type(&mut ws, file_id, "driverSeatSelf");
+        let self_only_type = local_name_type(&mut ws, file_id, "driverSeatSelfOnly");
+        let self_only_expr_type =
+            local_assignment_value_type(&mut ws, file_id, "driverSeatSelfOnly");
+        let early_self_type = local_name_type(&mut ws, file_id, "earlyDriverSeatSelf");
+        let unrelated_type = local_name_type(&mut ws, file_id, "unrelatedSeats");
+        let named_self_tbl_type = local_name_type(&mut ws, file_id, "namedSelfTblSeats");
+        let non_entity_get_table_type = local_name_type(&mut ws, file_id, "nonEntitySeats");
+        let reassigned_get_table_type = local_name_type(&mut ws, file_id, "reassignedSeats");
+        let expected_driver_seat_display = "prop_vehicle_prisoner_pod";
+
+        assert_that!(
+            ws.check_type(&alias_type, &expected),
+            eq(true),
+            "selfTbl.seats[1] should be prop_vehicle_prisoner_pod after the length guard, got {}",
+            ws.humanize_type_detailed(alias_type.clone())
+        );
+        let alias_display = ws.humanize_type(alias_type.clone());
+        assert_that!(alias_display.as_str(), eq(expected_driver_seat_display));
+        assert_that!(
+            ws.humanize_type(alias_expr_type).as_str(),
+            eq(expected_driver_seat_display),
+            "selfTbl.seats[1] expression should match hover RHS inference"
+        );
+        assert_that!(
+            ws.check_type(&expected, &alias_type),
+            eq(true),
+            "selfTbl.seats[1] should not include stale any/table members, got {}",
+            ws.humanize_type_detailed(alias_type)
+        );
+        assert_that!(
+            ws.check_type(&self_type, &expected),
+            eq(true),
+            "self.seats[1] should be prop_vehicle_prisoner_pod after the length guard, got {}",
+            ws.humanize_type_detailed(self_type.clone())
+        );
+        let self_display = ws.humanize_type(self_type.clone());
+        assert_that!(self_display.as_str(), eq(expected_driver_seat_display));
+        assert_that!(
+            ws.humanize_type(self_expr_type).as_str(),
+            eq(expected_driver_seat_display),
+            "self.seats[1] expression should match hover RHS inference"
+        );
+        assert_that!(
+            ws.check_type(&expected, &self_type),
+            eq(true),
+            "self.seats[1] should not collapse to nil, got {}",
+            ws.humanize_type_detailed(self_type)
+        );
+        assert_that!(
+            ws.humanize_type(self_only_type).as_str(),
+            eq(expected_driver_seat_display),
+            "self.seats[1] should work when it is the only driverSeat assignment"
+        );
+        assert_that!(
+            ws.humanize_type(self_only_expr_type).as_str(),
+            eq(expected_driver_seat_display),
+            "self.seats[1] RHS hover type should work without a sibling selfTbl.seats[1] expression"
+        );
+        assert_that!(
+            ws.humanize_type(early_self_type).as_str(),
+            eq(expected_driver_seat_display),
+            "an early self.seats[1] read must not remain cached as nil before later seat writes are analyzed"
+        );
+        let unrelated_display = ws.humanize_type(unrelated_type);
+        assert_that!(
+            unrelated_display.as_str(),
+            eq("any?"),
+            "plain tables unrelated to Entity:GetTable(self) must not inherit scripted-class fields"
+        );
+        let named_self_tbl_display = ws.humanize_type(named_self_tbl_type);
+        assert_that!(
+            named_self_tbl_display.as_str(),
+            eq("any?"),
+            "a table named selfTbl must not inherit scripted-class fields unless it comes from Entity:GetTable(self)"
+        );
+        let non_entity_get_table_display = ws.humanize_type(non_entity_get_table_type);
+        assert_that!(
+            non_entity_get_table_display.as_str(),
+            eq("any?"),
+            "a non-Entity GetTable(self) alias must not inherit scripted-class fields"
+        );
+        let reassigned_get_table_display = ws.humanize_type_detailed(reassigned_get_table_type);
+        assert_that!(
+            reassigned_get_table_display.as_str(),
+            eq("any?"),
+            "a reassigned GetTable(self) alias must not keep scripted-class field provenance"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("unchecked-nil-access".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_access,
+            is_empty(),
+            "IsValid(driverSeatAlias) should narrow the indexed seat receiver"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_seat_table_index_is_same_after_batch_load_and_touch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.strict.array_index = true;
+        ws.update_emmyrc(emmyrc);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@return tableof<self>
+            function Entity:GetTable() end
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+
+            ---@class Vehicle : Entity
+            local Vehicle = {}
+
+            ---@return Entity
+            function Vehicle:GetDriver() end
+
+            ---@class prop_vehicle_prisoner_pod : Vehicle
+
+            ---@return table
+            function Entity:GetTable() end
+        "#;
+
+        let shared_code = r#"
+            ---@class base_glide : Entity
+            local ENT = {}
+        "#;
+
+        let cl_init_code = r#"
+            function ENT:RefreshSeats()
+                local seats = {}
+                self.seats = table.Reverse(seats)
+            end
+
+            function ENT:OnRemove()
+                self.seats = nil
+            end
+        "#;
+
+        let init_path = "lua/entities/base_glide/init.lua";
+        let init_code = r#"
+            ---@class base_glide
+            local ENT = {}
+
+            local EntityMeta = FindMetaTable("Entity")
+            local getTable = EntityMeta.GetTable
+
+            function ENT:Initialize()
+                self.seats = self.seats or {}
+            end
+
+            function ENT:Use()
+                local earlyDriverSeatSelf = self.seats[1]
+            end
+
+            ---@param index integer
+            function ENT:CreateSeat(index)
+                ---@type prop_vehicle_prisoner_pod
+                local seat
+                self.seats[index] = seat
+            end
+
+            function ENT:Think()
+                local selfTbl = getTable(self)
+                if #selfTbl.seats > 0 then
+                    local driverSeatAlias = selfTbl.seats[1]
+                    local driverSeatSelf = self.seats[1]
+                    local driver = IsValid(driverSeatAlias) and driverSeatAlias:GetDriver() or NULL
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/vehicle.lua", annotations_code),
+            ("lua/entities/base_glide/cl_init.lua", cl_init_code),
+            ("lua/entities/base_glide/shared.lua", shared_code),
+            (init_path, init_code),
+        ]);
+        let init_uri = ws.virtual_url_generator.new_uri(init_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&init_uri)
+            .expect("expected init file id");
+
+        let expected = ws.ty("prop_vehicle_prisoner_pod");
+        let expected_seats_display = "{\n    prop_vehicle_prisoner_pod,\n}";
+
+        let alias_seats_initial = index_expr_type(&mut ws, file_id, "selfTbl.seats");
+        let alias_initial = local_name_type(&mut ws, file_id, "driverSeatAlias");
+        let self_initial = local_name_type(&mut ws, file_id, "driverSeatSelf");
+        let self_expr_initial = local_assignment_value_type(&mut ws, file_id, "driverSeatSelf");
+        let early_self_initial = local_name_type(&mut ws, file_id, "earlyDriverSeatSelf");
+
+        assert_that!(
+            ws.humanize_type_detailed(alias_seats_initial).as_str(),
+            eq(expected_seats_display),
+            "cold batch load should not produce stale table unions for selfTbl.seats"
+        );
+        assert_that!(
+            ws.check_type(&alias_initial, &expected),
+            eq(true),
+            "cold batch load should type selfTbl.seats[1] as the vehicle seat"
+        );
+        assert_that!(
+            ws.check_type(&self_initial, &expected),
+            eq(true),
+            "cold batch load should type self.seats[1] as the vehicle seat"
+        );
+        assert_that!(
+            ws.humanize_type(self_expr_initial).as_str(),
+            eq("prop_vehicle_prisoner_pod"),
+            "cold batch load should type self.seats[1] RHS for hover"
+        );
+        assert_that!(
+            ws.humanize_type(early_self_initial).as_str(),
+            eq("prop_vehicle_prisoner_pod"),
+            "an early self.seats[1] read must be revisited after later seat writes are analyzed"
+        );
+
+        ws.analysis
+            .update_file_by_uri(&init_uri, Some(format!("{init_code}\n")))
+            .expect("expected touched init file id");
+
+        let alias_seats_after_touch = index_expr_type(&mut ws, file_id, "selfTbl.seats");
+        let alias_after_touch = local_name_type(&mut ws, file_id, "driverSeatAlias");
+        let self_after_touch = local_name_type(&mut ws, file_id, "driverSeatSelf");
+        let self_expr_after_touch = local_assignment_value_type(&mut ws, file_id, "driverSeatSelf");
+        let early_self_after_touch = local_name_type(&mut ws, file_id, "earlyDriverSeatSelf");
+
+        assert_that!(
+            ws.humanize_type_detailed(alias_seats_after_touch).as_str(),
+            eq(expected_seats_display),
+            "touching the file should not change selfTbl.seats type"
+        );
+        assert_that!(ws.check_type(&alias_after_touch, &expected), eq(true));
+        assert_that!(ws.check_type(&self_after_touch, &expected), eq(true));
+        assert_that!(
+            ws.humanize_type(self_expr_after_touch).as_str(),
+            eq("prop_vehicle_prisoner_pod"),
+            "touching the file should not change self.seats[1] RHS hover type"
+        );
+        assert_that!(
+            ws.humanize_type(early_self_after_touch).as_str(),
+            eq("prop_vehicle_prisoner_pod")
         );
     }
 
