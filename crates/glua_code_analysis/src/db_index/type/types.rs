@@ -1718,8 +1718,8 @@ fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
     // for determinism (pointer addresses vary across runs/edits).
     let detail: u64 = match ty {
         LuaType::BooleanConst(b) => *b as u64,
-        LuaType::IntegerConst(n) => (*n & 0xFFFF) as u64,
-        LuaType::DocIntegerConst(n) => (*n & 0xFFFF) as u64,
+        LuaType::IntegerConst(n) => *n as u64,
+        LuaType::DocIntegerConst(n) => *n as u64,
         LuaType::FloatConst(f) => f.to_bits(),
         LuaType::DocBooleanConst(b) => *b as u64,
         // String-like: hash the content for determinism
@@ -1730,7 +1730,26 @@ fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
         LuaType::Namespace(s) | LuaType::Language(s) | LuaType::ConditionalInfer(s) => {
             hash_str_content(s.as_str())
         }
-        LuaType::TableConst(filed) => u32::from(filed.value.start()) as u64,
+        LuaType::TableConst(filed) => {
+            ((filed.file_id.id as u64) << 32) | (u32::from(filed.value.start()) as u64)
+        }
+        // Singleton variants: can never appear twice in a HashSet-derived union
+        // (LuaType derives Eq+Hash), so tiebreaking detail is unnecessary.
+        LuaType::Nil
+        | LuaType::Boolean
+        | LuaType::Integer
+        | LuaType::Number
+        | LuaType::String
+        | LuaType::Table
+        | LuaType::Userdata
+        | LuaType::Function
+        | LuaType::Thread
+        | LuaType::SelfInfer
+        | LuaType::Global
+        | LuaType::Never
+        | LuaType::Unknown
+        | LuaType::Any
+        | LuaType::Io => 0,
         // Arc-wrapped complex types: hash Debug representation for determinism.
         // Pointer addresses are non-deterministic across runs/edits.
         _ => hash_str_content(&format!("{ty:?}")),
