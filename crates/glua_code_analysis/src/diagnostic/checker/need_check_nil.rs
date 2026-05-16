@@ -342,12 +342,8 @@ fn check_binary_expr(
 
     if matches!(op, BinaryOperator::OpEq | BinaryOperator::OpNe) {
         if let Some(non_nil_side) = get_null_nil_comparison_operand(semantic_model, &left, &right) {
-            if is_nil_comparison_guarded_by_isvalid(
-                semantic_model,
-                &binary_expr,
-                non_nil_side,
-                op,
-            ) {
+            if is_nil_comparison_guarded_by_isvalid(semantic_model, &binary_expr, non_nil_side, op)
+            {
                 return Some(());
             }
 
@@ -514,7 +510,10 @@ fn is_nil_comparison_guarded_by_isvalid(
     let Some(parent_binary_expr) = comparison_expr.get_parent::<LuaBinaryExpr>() else {
         return false;
     };
-    let Some(parent_op) = parent_binary_expr.get_op_token().map(|token| token.get_op()) else {
+    let Some(parent_op) = parent_binary_expr
+        .get_op_token()
+        .map(|token| token.get_op())
+    else {
         return false;
     };
     let Some((left, right)) = parent_binary_expr.get_exprs() else {
@@ -524,14 +523,12 @@ fn is_nil_comparison_guarded_by_isvalid(
     let (guard_expr, negated_guard) = if left.syntax() == comparison_expr.syntax() {
         (
             right,
-            matches!(comparison_op, BinaryOperator::OpEq)
-                && parent_op == BinaryOperator::OpOr,
+            matches!(comparison_op, BinaryOperator::OpEq) && parent_op == BinaryOperator::OpOr,
         )
     } else if right.syntax() == comparison_expr.syntax() {
         (
             left,
-            matches!(comparison_op, BinaryOperator::OpEq)
-                && parent_op == BinaryOperator::OpOr,
+            matches!(comparison_op, BinaryOperator::OpEq) && parent_op == BinaryOperator::OpOr,
         )
     } else {
         return false;
@@ -604,7 +601,8 @@ fn exprs_reference_same_var(
     right: &LuaExpr,
 ) -> bool {
     let mut cache = semantic_model.get_cache().borrow_mut();
-    let Some(left_ref_id) = get_var_expr_var_ref_id(semantic_model.get_db(), &mut cache, left.clone())
+    let Some(left_ref_id) =
+        get_var_expr_var_ref_id(semantic_model.get_db(), &mut cache, left.clone())
     else {
         return false;
     };

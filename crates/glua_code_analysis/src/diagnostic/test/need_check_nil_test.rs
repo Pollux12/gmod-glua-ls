@@ -717,8 +717,14 @@ mod test {
             end
             "#;
 
-        assert_that!(ws.check_code_for(DiagnosticCode::GmodNullCheck, code), eq(false));
-        assert_that!(ws.check_code_for(DiagnosticCode::NeedCheckNil, code), eq(false));
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+            eq(false)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(false)
+        );
     }
 
     #[gtest]
@@ -780,8 +786,14 @@ mod test {
             end
             "#;
 
-        assert_that!(ws.check_code_for(DiagnosticCode::GmodNullCheck, code), eq(true));
-        assert_that!(ws.check_code_for(DiagnosticCode::NeedCheckNil, code), eq(true));
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
     }
 
     #[gtest]
@@ -843,8 +855,14 @@ mod test {
             end
             "#;
 
-        assert_that!(ws.check_code_for(DiagnosticCode::GmodNullCheck, code), eq(true));
-        assert_that!(ws.check_code_for(DiagnosticCode::NeedCheckNil, code), eq(true));
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
     }
 
     #[gtest]
