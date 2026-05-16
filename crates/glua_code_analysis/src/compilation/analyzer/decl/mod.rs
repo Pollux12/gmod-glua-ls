@@ -344,10 +344,18 @@ impl<'a> DeclAnalyzer<'a> {
     }
 
     pub fn get_legacy_module_env_at(&self, position: TextSize) -> Option<&LegacyModuleEnv> {
-        self.legacy_module_envs
-            .iter()
-            .rev()
-            .find(|env| position > env.activation_position)
+        // Binary search: find the rightmost env where activation_position < position.
+        // The vector is sorted by activation_position ascending.
+        let envs = &self.legacy_module_envs;
+        if envs.is_empty() {
+            return None;
+        }
+        let pos_u32 = u32::from(position);
+        let idx = envs.partition_point(|env| u32::from(env.activation_position) < pos_u32);
+        if idx == 0 {
+            return None;
+        }
+        Some(&envs[idx - 1])
     }
 
     fn maybe_seed_scoped_class_local_decl(&mut self, chunk_range: TextRange) {
