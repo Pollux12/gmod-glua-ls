@@ -299,11 +299,17 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
         return None;
     };
 
-    signature.out_params.push(LuaOutParamInfo {
-        param_idx,
-        field_path,
-        type_ref,
-    });
+    if let Some(existing) = signature.out_params.iter_mut().find(|p| {
+        p.param_idx == param_idx && p.field_path == field_path
+    }) {
+        existing.type_ref = type_ref;
+    } else {
+        signature.out_params.push(LuaOutParamInfo {
+            param_idx,
+            field_path,
+            type_ref,
+        });
+    }
     Some(())
 }
 

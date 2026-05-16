@@ -1021,4 +1021,43 @@ mod test {
             ws.ty("boolean|string")
         );
     }
+
+    #[test]
+    fn test_outparam_duplicate_replaces() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lib.lua",
+            r#"
+                ---@class ResultInt
+                ---@field Value integer
+
+                ---@class ResultStr
+                ---@field Value string
+
+                util = {}
+
+                ---@outparam data.output ResultInt
+                ---@outparam data.output ResultStr
+                ---@param data table
+                function util.Process(data) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                local ray = {}
+                local data = {
+                    output = ray,
+                }
+
+                util.Process(data)
+                local val = data.output.Value
+            "#,
+        );
+        // Second @outparam should win (last-writer-wins), so Value is string not integer
+        assert_eq!(
+            index_expr_ty(&ws, file_id, "data.output.Value"),
+            ws.ty("string")
+        );
+    }
 }
