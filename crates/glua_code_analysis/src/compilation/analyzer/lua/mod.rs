@@ -6,8 +6,7 @@ mod metatable;
 mod module;
 mod stats;
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use closure::analyze_closure;
@@ -52,7 +51,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         let tree_map = tree_list
             .iter()
             .map(|x| (x.file_id, x.value.clone()))
-            .collect::<HashMap<_, _>>();
+            .collect::<FxHashMap<_, _>>();
 
         let special_call_direct_matcher = build_special_call_direct_matcher(db, &tree_map);
 
@@ -61,7 +60,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         let scripted_scope_files = if gmod_enabled {
             context.get_or_compute_scripted_scope_files(db)
         } else {
-            Arc::new(HashSet::new())
+            Arc::new(std::collections::HashSet::new())
         };
 
         let file_dependency = db.get_file_dependencies_index().get_file_dependencies();
@@ -96,7 +95,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 file_count += 1;
                 if let Some(file_start) = file_start {
                     let file_elapsed = file_start.elapsed();
-                    if file_elapsed.as_millis() > 10 {
+                    if file_elapsed.as_millis() > 1 {
                         let path = db
                             .get_vfs()
                             .get_uri(&file_id)
@@ -106,9 +105,153 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                         if let Some(profile) = profile.as_ref() {
                             profile.log_slow_file(&path);
                         }
+                        // Log infer_expr sub-type timing for this file
+                        let cache = context.infer_manager.get_infer_cache(file_id);
+                        let idx_ns = cache.prof_infer_index_time_ns;
+                        let call_ns = cache.prof_infer_call_time_ns;
+                        let name_ns = cache.prof_infer_name_time_ns;
+                        let tbl_ns = cache.prof_infer_table_time_ns;
+                        let other_ns = cache.prof_infer_other_time_ns;
+                        let idx_calls = cache.prof_infer_index_calls;
+                        let call_calls = cache.prof_infer_call_calls;
+                        let name_calls = cache.prof_infer_name_calls;
+                        let tbl_calls = cache.prof_infer_table_calls;
+                        let total_miss = cache.prof_infer_expr_calls - cache.prof_infer_expr_hits;
+                        let flow_calls = cache.prof_flow_calls;
+                        let flow_hits = cache.prof_flow_hits;
+                        let flow_hit_pct = flow_hits
+                            .checked_mul(100)
+                            .and_then(|h| h.checked_div(flow_calls))
+                            .unwrap_or(0);
+                        let flow_nodes_walked = cache.prof_flow_nodes_walked;
+                        let flow_cache_entries = cache.flow_cache_entry_count();
+                        let expr_cache_entries = cache.expr_cache.len();
+                        let cache_removals = cache.prof_expr_cache_removals;
+                        let unique_inferred = cache.prof_unique_inferred;
+                        let recursive_calls = cache.prof_infer_expr_recursive_calls;
+                        let max_depth = cache.prof_infer_expr_max_depth;
+                        let flow_walk_avg = if cache.prof_flow_calls > 0 {
+                            cache.prof_flow_walk_depth_sum / cache.prof_flow_calls as u64
+                        } else {
+                            0
+                        };
+                        let flow_walk_max = cache.prof_flow_walk_max_depth;
+                        let err_fnf = cache.prof_err_field_not_found;
+
+                        let err_ue = cache.prof_err_unresolve_expr;
+                        let err_udt = cache.prof_err_unresolve_decl_type;
+                        let err_umt = cache.prof_err_unresolve_member_type;
+                        let err_utd = cache.prof_err_unresolve_type_decl;
+                        let err_uo = cache.prof_err_unresolve_operator;
+                        let err_um = cache.prof_err_unresolve_module;
+                        let err_usr = cache.prof_err_unresolve_sig_return;
+                        // Log top UnResolveDeclType decl_ids
+                        let mut decl_ids: Vec<_> = cache.prof_unresolve_decl_ids.iter().collect();
+                        decl_ids.sort_by(|a, b| b.1.cmp(a.1));
+                        let top_ids: Vec<String> = decl_ids
+                            .iter()
+                            .take(10)
+                            .map(|(pos, count)| format!("{}:{}", pos, count))
+                            .collect();
+                        let unique_decls = decl_ids.len();
+                        info!(
+                            "lua infer profile: {} [misses={}/{} unique={} removals={} recursive={} max_depth={} err: fnf={} ue={} udt={} umt={} utd={} uo={} um={} usr={} index={} in {}ms call={} in {}ms name={} in {}ms table={} in {}ms other={}ms flow: calls={} hits={} ({}%) nodes_walked={} walk_avg={} walk_max={} flow_cache={} expr_cache={} udt_unique={} udt_decls={} udt_top={}]",
+                            path,
+                            total_miss,
+                            cache.prof_infer_expr_calls,
+                            unique_inferred,
+                            cache_removals,
+                            recursive_calls,
+                            max_depth,
+                            err_fnf,
+                            err_ue,
+                            err_udt,
+                            err_umt,
+                            err_utd,
+                            err_uo,
+                            err_um,
+                            err_usr,
+                            idx_calls,
+                            idx_ns / 1_000_000,
+                            call_calls,
+                            call_ns / 1_000_000,
+                            name_calls,
+                            name_ns / 1_000_000,
+                            tbl_calls,
+                            tbl_ns / 1_000_000,
+                            other_ns / 1_000_000,
+                            flow_calls,
+                            flow_hits,
+                            flow_hit_pct,
+                            flow_nodes_walked,
+                            flow_walk_avg,
+                            flow_walk_max,
+                            flow_cache_entries,
+                            expr_cache_entries,
+                            unique_decls,
+                            cache.prof_unresolve_decl_names.join(","),
+                            top_ids.join(","),
+                        );
                     }
                 }
             }
+        }
+        // Workspace-level infer_expr sub-type timing aggregation
+        if slow_log_enabled {
+            let mut total_idx_ns: u64 = 0;
+            let mut total_call_ns: u64 = 0;
+            let mut total_name_ns: u64 = 0;
+            let mut total_tbl_ns: u64 = 0;
+            let mut total_other_ns: u64 = 0;
+            let mut total_idx_calls: u32 = 0;
+            let mut total_call_calls: u32 = 0;
+            let mut total_name_calls: u32 = 0;
+            let mut total_tbl_calls: u32 = 0;
+            let mut total_misses: u32 = 0;
+            let mut total_calls: u32 = 0;
+            let mut total_name_local: u32 = 0;
+            let mut total_name_narrow: u32 = 0;
+            let mut total_name_global: u32 = 0;
+            let mut total_name_self: u32 = 0;
+            let mut total_name_narrow_ns: u64 = 0;
+            for fid in &file_ids {
+                let cache = context.infer_manager.get_infer_cache(*fid);
+                total_idx_ns += cache.prof_infer_index_time_ns;
+                total_call_ns += cache.prof_infer_call_time_ns;
+                total_name_ns += cache.prof_infer_name_time_ns;
+                total_tbl_ns += cache.prof_infer_table_time_ns;
+                total_other_ns += cache.prof_infer_other_time_ns;
+                total_idx_calls += cache.prof_infer_index_calls;
+                total_call_calls += cache.prof_infer_call_calls;
+                total_name_calls += cache.prof_infer_name_calls;
+                total_tbl_calls += cache.prof_infer_table_calls;
+                total_misses += cache.prof_infer_expr_calls - cache.prof_infer_expr_hits;
+                total_calls += cache.prof_infer_expr_calls;
+                total_name_local += cache.prof_name_local_calls;
+                total_name_narrow += cache.prof_name_narrow_calls;
+                total_name_global += cache.prof_name_global_calls;
+                total_name_self += cache.prof_name_self_calls;
+                total_name_narrow_ns += cache.prof_name_narrow_time_ns;
+            }
+            info!(
+                "lua infer workspace total: [misses={}/{} index={} in {}ms call={} in {}ms name={} in {}ms (local={} narrow={} in {}ms global={} self={}) table={} in {}ms other={}ms]",
+                total_misses,
+                total_calls,
+                total_idx_calls,
+                total_idx_ns / 1_000_000,
+                total_call_calls,
+                total_call_ns / 1_000_000,
+                total_name_calls,
+                total_name_ns / 1_000_000,
+                total_name_local,
+                total_name_narrow,
+                total_name_narrow_ns / 1_000_000,
+                total_name_global,
+                total_name_self,
+                total_tbl_calls,
+                total_tbl_ns / 1_000_000,
+                total_other_ns / 1_000_000,
+            );
         }
         if let Some(total_start) = total_start {
             info!(
@@ -122,7 +265,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
 
 #[derive(Default)]
 struct LuaAnalyzeProfile {
-    node_stats: HashMap<&'static str, (usize, Duration)>,
+    node_stats: FxHashMap<&'static str, (usize, Duration)>,
 }
 
 impl LuaAnalyzeProfile {

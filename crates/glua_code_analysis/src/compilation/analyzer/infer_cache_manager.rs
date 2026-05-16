@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::{
     FileId, LuaAnalysisPhase,
@@ -7,14 +7,14 @@ use crate::{
 
 #[derive(Debug, Default)]
 pub struct InferCacheManager {
-    infer_map: HashMap<FileId, LuaInferCache>,
+    infer_map: FxHashMap<FileId, LuaInferCache>,
     current_phase: LuaAnalysisPhase,
 }
 
 impl InferCacheManager {
     pub fn new() -> Self {
         InferCacheManager {
-            infer_map: HashMap::new(),
+            infer_map: FxHashMap::default(),
             current_phase: LuaAnalysisPhase::Ordered,
         }
     }

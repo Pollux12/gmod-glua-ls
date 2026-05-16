@@ -3,8 +3,9 @@ mod find_decl_function;
 mod resolve;
 mod resolve_closure;
 
+use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use crate::{
     FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaSemanticDeclId, LuaTypeDecl,
@@ -54,8 +55,8 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 
         infer_manager.clear();
 
-        // Use HashMap for O(1) reason grouping (matching upstream)
-        let mut reason_resolve: HashMap<InferFailReason, Vec<UnResolve>> = HashMap::new();
+        // Use FxHashMap for O(1) reason grouping (matching upstream)
+        let mut reason_resolve: FxHashMap<InferFailReason, Vec<UnResolve>> = FxHashMap::default();
         for (unresolve, reason) in context.unresolves.drain(..) {
             reason_resolve.entry(reason).or_default().push(unresolve);
         }
@@ -190,16 +191,23 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
 fn try_resolve(
     db: &mut DbIndex,
     infer_manager: &mut InferCacheManager,
-    reason_resolve: &mut HashMap<InferFailReason, Vec<UnResolve>>,
+    reason_resolve: &mut FxHashMap<InferFailReason, Vec<UnResolve>>,
     profile_enabled: bool,
 ) -> Option<TryResolveProfile> {
     let mut profile = profile_enabled.then(TryResolveProfile::default);
+    let mut cached_sorted_keys: Option<Vec<InferFailReason>> = None;
     loop {
         let mut changed = false;
         let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
 
-        for check_reason in sorted_reason_keys(reason_resolve) {
+        // Only re-sort keys when the set of reason groups has changed.
+        // This avoids cloning and sorting on every inner loop iteration.
+        let sorted_keys = cached_sorted_keys
+            .take()
+            .unwrap_or_else(|| sorted_reason_keys(reason_resolve));
+
+        for check_reason in &sorted_keys {
             if let Some(profile) = profile.as_mut() {
                 profile.record_group_seen(
                     &check_reason,
@@ -284,7 +292,7 @@ fn try_resolve(
                         }
                     }
                     Err(reason) => {
-                        if reason != check_reason {
+                        if reason != *check_reason {
                             changed = true;
                             retain_unresolve.push((unresolve, reason));
                         }
@@ -292,13 +300,14 @@ fn try_resolve(
                 }
             }
 
-            to_be_remove.push(check_reason);
+            to_be_remove.push(check_reason.clone());
         }
 
         for reason in to_be_remove {
             reason_resolve.remove(&reason);
         }
 
+        let keys_changed = !retain_unresolve.is_empty();
         for (unresolve, reason) in retain_unresolve {
             reason_resolve.entry(reason).or_default().push(unresolve);
         }
@@ -306,13 +315,20 @@ fn try_resolve(
         if !changed || reason_resolve.is_empty() {
             break;
         }
+
+        // Re-use cached sorted keys if no new reason groups were added.
+        // When retain_unresolve adds items to new/existing groups, the key
+        // set may have changed, so we need to re-sort.
+        if !keys_changed {
+            cached_sorted_keys = Some(sorted_keys);
+        }
     }
     profile
 }
 
 #[derive(Default)]
 struct TryResolveProfile {
-    reason_stats: HashMap<&'static str, TryResolveReasonStats>,
+    reason_stats: FxHashMap<&'static str, TryResolveReasonStats>,
 }
 
 #[derive(Default)]
@@ -422,7 +438,7 @@ fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str {
 }
 
 fn sorted_reason_keys(
-    reason_resolve: &HashMap<InferFailReason, Vec<UnResolve>>,
+    reason_resolve: &FxHashMap<InferFailReason, Vec<UnResolve>>,
 ) -> Vec<InferFailReason> {
     let mut keys: Vec<InferFailReason> = reason_resolve.keys().cloned().collect();
     keys.sort_unstable_by(infer_fail_reason_stable_cmp);
@@ -756,7 +772,7 @@ impl From<UnResolveSpecialCall> for UnResolve {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     use rowan::TextSize;
 
@@ -775,12 +791,12 @@ mod tests {
             InferFailReason::UnResolveModuleExport(FileId::new(9)),
         ];
 
-        let mut forward: HashMap<InferFailReason, Vec<super::UnResolve>> = HashMap::new();
+        let mut forward: FxHashMap<InferFailReason, Vec<super::UnResolve>> = FxHashMap::default();
         for reason in reasons.iter().cloned() {
             forward.insert(reason, Vec::new());
         }
 
-        let mut reverse: HashMap<InferFailReason, Vec<super::UnResolve>> = HashMap::new();
+        let mut reverse: FxHashMap<InferFailReason, Vec<super::UnResolve>> = FxHashMap::default();
         for reason in reasons.iter().rev().cloned() {
             reverse.insert(reason, Vec::new());
         }

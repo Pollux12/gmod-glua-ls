@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use crate::{
-    DiagnosticCode, GmodRealm, NetOpKind, NetReceiveFlow, NetSendFlow, SemanticModel,
+    DiagnosticCode, FileId, GmodRealm, NetOpKind, NetReceiveFlow, NetSendFlow, SemanticModel,
     expected_receiver_realm, flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
 };
 
@@ -27,18 +29,23 @@ impl Checker for GmodNetworkChecker {
         let db = semantic_model.get_db();
         let network_index = db.get_gmod_network_index();
         let infer_index = db.get_gmod_infer_index();
-        let vfs = db.get_vfs();
         let Some(file_data) = network_index.get_file_data(file_id) else {
             return;
         };
+
+        // Use precomputed sorted send flows from shared diagnostic data.
+        // Built once per batch run instead of per-file for each message name.
+        let sorted_send_flows: Arc<SortedSendFlowCache> = context
+            .get_shared_data_arc()
+            .map(|shared| shared.sorted_send_flows.clone())
+            .unwrap_or_else(|| Arc::new(precompute_sorted_send_flows(network_index, db.get_vfs())));
 
         check_read_write_mismatch(
             context,
             file_id,
             file_data.receive_flows.as_slice(),
-            network_index,
+            &sorted_send_flows,
             infer_index,
-            vfs,
         );
 
         check_missing_send_counterpart(
@@ -60,9 +67,8 @@ impl Checker for GmodNetworkChecker {
             context,
             file_id,
             file_data.receive_flows.as_slice(),
-            network_index,
+            &sorted_send_flows,
             infer_index,
-            vfs,
         );
     }
 }
@@ -71,15 +77,9 @@ fn check_read_write_mismatch(
     context: &mut DiagnosticContext,
     file_id: crate::FileId,
     receive_flows: &[NetReceiveFlow],
-    network_index: &crate::GmodNetworkIndex,
+    sorted_send_flows: &SortedSendFlowCache,
     infer_index: &crate::GmodInferIndex,
-    vfs: &crate::vfs::Vfs,
 ) {
-    let mut sorted_send_flow_cache: HashMap<
-        String,
-        Vec<(crate::FileId, &NetSendFlow, SenderSortKey)>,
-    > = HashMap::new();
-
     for receive_flow in receive_flows {
         if receive_flow.reads_opaque {
             // Callback body could not be inspected — counts/types unknown.
@@ -92,11 +92,9 @@ fn check_read_write_mismatch(
             continue;
         }
 
-        let matching_send_flows = sorted_send_flow_cache
-            .entry(receive_flow.message_name.clone())
-            .or_insert_with(|| {
-                sorted_send_flows_for_message(network_index, vfs, &receive_flow.message_name)
-            });
+        let Some(matching_send_flows) = sorted_send_flows.get(&receive_flow.message_name) else {
+            continue;
+        };
         let mut has_matching_candidate = false;
         let mut best_mismatch: Option<CandidateMismatch> = None;
 
@@ -188,12 +186,37 @@ struct CandidateMismatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct SenderSortKey {
+pub struct SenderSortKey {
     normalized_path: String,
     raw_path: String,
     file_id: u32,
     start_offset: u32,
     send_offset: u32,
+}
+
+/// Precomputed send flows sorted by SenderSortKey for each message name.
+/// Built once per diagnostic batch run instead of per file.
+pub type SortedSendFlowCache = FxHashMap<String, Vec<(FileId, NetSendFlow, SenderSortKey)>>;
+
+/// Precompute and sort all send flows by message name, using VFS path
+/// ordering so that all files in a workspace sort consistently. Called
+/// once from `precompute_shared_data()` and reused across all files.
+pub fn precompute_sorted_send_flows(
+    network_index: &crate::GmodNetworkIndex,
+    vfs: &crate::vfs::Vfs,
+) -> SortedSendFlowCache {
+    let mut cache: SortedSendFlowCache = FxHashMap::default();
+    for (file_id, send_flow) in network_index.iter_send_flows() {
+        let sort_key = sender_sort_key(vfs, file_id, send_flow);
+        cache
+            .entry(send_flow.message_name.clone())
+            .or_default()
+            .push((file_id, send_flow.clone(), sort_key));
+    }
+    for flows in cache.values_mut() {
+        flows.sort_by(|a, b| a.2.cmp(&b.2));
+    }
+    cache
 }
 
 fn sender_sort_key(
@@ -213,20 +236,6 @@ fn sender_sort_key(
         start_offset: u32::from(send_flow.start_range.start()),
         send_offset: u32::from(send_flow.send_range.start()),
     }
-}
-
-fn sorted_send_flows_for_message<'a>(
-    network_index: &'a crate::GmodNetworkIndex,
-    vfs: &crate::vfs::Vfs,
-    message_name: &str,
-) -> Vec<(crate::FileId, &'a NetSendFlow, SenderSortKey)> {
-    let mut candidates: Vec<_> = network_index
-        .get_send_flows_for_message(message_name)
-        .into_iter()
-        .map(|(file_id, send_flow)| (file_id, send_flow, sender_sort_key(vfs, file_id, send_flow)))
-        .collect();
-    candidates.sort_by(|left, right| left.2.cmp(&right.2));
-    candidates
 }
 
 fn matching_prefix_len(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -> usize {
@@ -439,16 +448,10 @@ fn check_bits_mismatch(
     context: &mut DiagnosticContext,
     file_id: crate::FileId,
     receive_flows: &[NetReceiveFlow],
-    network_index: &crate::GmodNetworkIndex,
+    sorted_send_flows: &SortedSendFlowCache,
     infer_index: &crate::GmodInferIndex,
-    vfs: &crate::vfs::Vfs,
 ) {
     use std::collections::HashSet;
-
-    let mut sorted_send_flow_cache: HashMap<
-        String,
-        Vec<(crate::FileId, &NetSendFlow, SenderSortKey)>,
-    > = HashMap::new();
 
     for receive_flow in receive_flows {
         if receive_flow.reads_opaque {
@@ -461,11 +464,9 @@ fn check_bits_mismatch(
             continue;
         }
 
-        let matching_send_flows = sorted_send_flow_cache
-            .entry(receive_flow.message_name.clone())
-            .or_insert_with(|| {
-                sorted_send_flows_for_message(network_index, vfs, &receive_flow.message_name)
-            });
+        let Some(matching_send_flows) = sorted_send_flows.get(&receive_flow.message_name) else {
+            continue;
+        };
 
         let mut reported: HashSet<(usize, u32, u32)> = HashSet::new();
 

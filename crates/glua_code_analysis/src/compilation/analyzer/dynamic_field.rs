@@ -1,4 +1,5 @@
-use std::{collections::HashMap, time::Duration};
+use rustc_hash::FxHashMap;
+use std::time::Duration;
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexKey, LuaSyntaxKind,
@@ -17,6 +18,24 @@ use crate::{
 
 use super::{AnalysisPipeline, AnalyzeContext};
 
+/// Cache key for prefix type inference in dynamic field analysis.
+/// Uses VarRefId when available (same variable at different positions hits cache),
+/// falls back to TextRange for unnamable expressions (table constructors, etc.).
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum PrefixCacheKey {
+    Var(VarRefId),
+    Range(rowan::TextRange),
+}
+
+impl PrefixCacheKey {
+    fn from_expr(db: &DbIndex, cache: &mut crate::LuaInferCache, expr: &LuaExpr) -> Self {
+        match get_var_expr_var_ref_id(db, cache, expr.clone()) {
+            Some(var_ref_id) => PrefixCacheKey::Var(var_ref_id),
+            None => PrefixCacheKey::Range(expr.syntax().text_range()),
+        }
+    }
+}
+
 pub struct DynamicFieldAnalysisPipeline;
 
 impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
@@ -32,7 +51,8 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
             let root = in_filed_tree.value.clone();
             let file_id = in_filed_tree.file_id;
             let cache = context.infer_manager.get_infer_cache(file_id);
-            let mut prefix_type_cache: HashMap<rowan::TextRange, Option<LuaType>> = HashMap::new();
+            let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> =
+                FxHashMap::default();
             for assign in root.descendants::<LuaAssignStat>() {
                 if let Some(profile) = profile.as_mut() {
                     profile.assignments_scanned += 1;
@@ -59,10 +79,8 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                         continue;
                     };
 
-                    let prefix_range = prefix_expr.syntax().text_range();
-                    let prefix_type = if let Some(cached_type) =
-                        prefix_type_cache.get(&prefix_range)
-                    {
+                    let cache_key = PrefixCacheKey::from_expr(&*db, cache, &prefix_expr);
+                    let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
                         if let Some(profile) = profile.as_mut() {
                             profile.owner_cache_hits += 1;
                         }
@@ -80,7 +98,7 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                         {
                             profile.owner_infer_time += infer_start.elapsed();
                         }
-                        prefix_type_cache.insert(prefix_range, inferred.clone());
+                        prefix_type_cache.insert(cache_key, inferred.clone());
                         let Some(prefix_type) = inferred else {
                             continue;
                         };

@@ -3,10 +3,8 @@ mod cache_options;
 pub use cache_options::{CacheOptions, LuaAnalysisPhase};
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use rustc_hash::FxHashMap;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey,
@@ -35,33 +33,34 @@ pub struct PendingStrTplTypeDecl {
 pub struct LuaInferCache {
     file_id: FileId,
     config: CacheOptions,
-    pub expr_cache: HashMap<LuaSyntaxId, CacheEntry<LuaType>>,
+    pub expr_cache: FxHashMap<LuaSyntaxId, CacheEntry<LuaType>>,
     pub call_cache:
-        HashMap<(LuaSyntaxId, Option<usize>, LuaType), CacheEntry<Arc<LuaFunctionType>>>,
-    pub call_arg_types_cache: HashMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
-    pub flow_node_cache: HashMap<VarRefId, HashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>>,
+        FxHashMap<(LuaSyntaxId, Option<usize>, LuaType), CacheEntry<Arc<LuaFunctionType>>>,
+    pub call_arg_types_cache:
+        FxHashMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
+    pub flow_node_cache: FxHashMap<VarRefId, FxHashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>>,
     pub flow_query_realm: Option<GmodRealm>,
-    pub flow_node_realm_cache: HashMap<FlowId, GmodRealm>,
-    pub index_ref_origin_type_cache: HashMap<VarRefId, CacheEntry<LuaType>>,
-    pub expr_var_ref_id_cache: HashMap<LuaSyntaxId, VarRefId>,
+    pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,
+    pub index_ref_origin_type_cache: FxHashMap<VarRefId, CacheEntry<LuaType>>,
+    pub expr_var_ref_id_cache: FxHashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
     pub scoped_scripted_global_cache: Option<Option<(String, String)>>,
     pub pending_str_tpl_type_decls: Vec<PendingStrTplTypeDecl>,
     /// Cache for `self` type per enclosing method (keyed by LuaFuncStat syntax_id).
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
     /// within the same method body.
-    pub self_type_cache: HashMap<LuaSyntaxId, Option<LuaType>>,
+    pub self_type_cache: FxHashMap<LuaSyntaxId, Option<LuaType>>,
     /// Cache for `find_decl` results so that multiple diagnostic checkers
     /// processing the same file don't redo the full member-resolution chain.
-    pub decl_cache: HashMap<LuaSyntaxId, Option<LuaSemanticDeclId>>,
+    pub decl_cache: FxHashMap<LuaSyntaxId, Option<LuaSemanticDeclId>>,
     /// Cache for resolved generic-for variable types. For `pairs` loops over
     /// templated tables, each use of the loop value can otherwise re-run the
     /// full iterator inference from the enclosing `for` statement.
-    pub for_range_iter_var_type_cache: HashMap<LuaDeclId, CacheEntry<LuaType>>,
-    pub dynamic_field_metatable_cache: HashMap<VarRefId, Vec<(TextRange, LuaType)>>,
+    pub for_range_iter_var_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
+    pub dynamic_field_metatable_cache: FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>,
     pub dynamic_field_resolution_cache:
-        HashMap<(LuaType, LuaMemberKey), Option<(LuaType, Option<LuaSemanticDeclId>)>>,
-    pub dynamic_field_type_cache: HashMap<LuaMemberId, Option<LuaType>>,
+        FxHashMap<(LuaType, LuaMemberKey), Option<(LuaType, Option<LuaSemanticDeclId>)>>,
+    pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
     /// Tracks total flow nodes visited during flow analysis for profiling.
     pub flow_nodes_visited: u32,
@@ -79,6 +78,51 @@ pub struct LuaInferCache {
     pub prof_condition_errors_recursive: u32,
     pub prof_condition_errors_unresolved: u32,
     pub prof_multi_ante_from_condition: u32,
+    // Detailed infer_expr sub-type timing (zero-cost when not profiled — only written to
+    // when the caller checks log_enabled; reads are gated behind the same check)
+    pub prof_infer_index_time_ns: u64,
+    pub prof_infer_call_time_ns: u64,
+    pub prof_infer_name_time_ns: u64,
+    pub prof_infer_table_time_ns: u64,
+    pub prof_infer_other_time_ns: u64,
+    pub prof_infer_index_calls: u32,
+    pub prof_infer_call_calls: u32,
+    pub prof_infer_name_calls: u32,
+    pub prof_infer_table_calls: u32,
+    // Name inference sub-path profiling
+    pub prof_name_local_calls: u32,
+    pub prof_name_narrow_calls: u32,
+    pub prof_name_global_calls: u32,
+    pub prof_name_self_calls: u32,
+    pub prof_name_narrow_time_ns: u64,
+    // Expr cache profiling
+    pub prof_expr_cache_removals: u32,
+    pub prof_unique_inferred: u32,
+    // Infer_expr recursion depth profiling
+    pub prof_infer_expr_depth: u32,
+    pub prof_infer_expr_recursive_calls: u32,
+    pub prof_infer_expr_max_depth: u32,
+    // Flow walk depth profiling (per get_type_at_flow call)
+    pub prof_flow_walk_depth_sum: u64,
+    pub prof_flow_walk_max_depth: u32,
+    // Re-inference tracking: how many syntax_ids are inferred more than once
+    pub prof_reinferred: u32,
+    // Error type breakdown during analysis
+    pub prof_err_field_not_found: u32,
+    pub prof_err_other: u32,
+    // Detailed error breakdown
+    pub prof_err_unresolve_expr: u32,
+    pub prof_err_unresolve_decl_type: u32,
+    pub prof_err_unresolve_member_type: u32,
+    pub prof_err_unresolve_type_decl: u32,
+    pub prof_err_unresolve_operator: u32,
+    pub prof_err_unresolve_module: u32,
+    pub prof_err_unresolve_sig_return: u32,
+    // UnResolveDeclType sample logging
+    pub prof_unresolve_decl_sample_count: u32,
+    pub prof_unresolve_decl_names: Vec<String>,
+    // Track unique decl_ids causing UnResolveDeclType
+    pub prof_unresolve_decl_ids: FxHashMap<u32, u32>, // position -> count
 }
 
 impl LuaInferCache {
@@ -86,23 +130,23 @@ impl LuaInferCache {
         Self {
             file_id,
             config,
-            expr_cache: HashMap::new(),
-            call_cache: HashMap::new(),
-            call_arg_types_cache: HashMap::new(),
-            flow_node_cache: HashMap::new(),
+            expr_cache: FxHashMap::default(),
+            call_cache: FxHashMap::default(),
+            call_arg_types_cache: FxHashMap::default(),
+            flow_node_cache: FxHashMap::default(),
             flow_query_realm: None,
-            flow_node_realm_cache: HashMap::new(),
-            index_ref_origin_type_cache: HashMap::new(),
-            expr_var_ref_id_cache: HashMap::new(),
+            flow_node_realm_cache: FxHashMap::default(),
+            index_ref_origin_type_cache: FxHashMap::default(),
+            expr_var_ref_id_cache: FxHashMap::default(),
             narrow_by_literal_stop_position_cache: HashSet::new(),
             scoped_scripted_global_cache: None,
             pending_str_tpl_type_decls: Vec::new(),
-            self_type_cache: HashMap::new(),
-            decl_cache: HashMap::new(),
-            for_range_iter_var_type_cache: HashMap::new(),
-            dynamic_field_metatable_cache: HashMap::new(),
-            dynamic_field_resolution_cache: HashMap::new(),
-            dynamic_field_type_cache: HashMap::new(),
+            self_type_cache: FxHashMap::default(),
+            decl_cache: FxHashMap::default(),
+            for_range_iter_var_type_cache: FxHashMap::default(),
+            dynamic_field_metatable_cache: FxHashMap::default(),
+            dynamic_field_resolution_cache: FxHashMap::default(),
+            dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::new(),
             flow_nodes_visited: 0,
             prof_infer_expr_calls: 0,
@@ -117,6 +161,40 @@ impl LuaInferCache {
             prof_condition_errors_recursive: 0,
             prof_condition_errors_unresolved: 0,
             prof_multi_ante_from_condition: 0,
+            prof_infer_index_time_ns: 0,
+            prof_infer_call_time_ns: 0,
+            prof_infer_name_time_ns: 0,
+            prof_infer_table_time_ns: 0,
+            prof_infer_other_time_ns: 0,
+            prof_infer_index_calls: 0,
+            prof_infer_call_calls: 0,
+            prof_infer_name_calls: 0,
+            prof_infer_table_calls: 0,
+            prof_name_local_calls: 0,
+            prof_name_narrow_calls: 0,
+            prof_name_global_calls: 0,
+            prof_name_self_calls: 0,
+            prof_name_narrow_time_ns: 0,
+            prof_expr_cache_removals: 0,
+            prof_unique_inferred: 0,
+            prof_infer_expr_depth: 0,
+            prof_infer_expr_recursive_calls: 0,
+            prof_infer_expr_max_depth: 0,
+            prof_flow_walk_depth_sum: 0,
+            prof_flow_walk_max_depth: 0,
+            prof_reinferred: 0,
+            prof_err_field_not_found: 0,
+            prof_err_other: 0,
+            prof_err_unresolve_expr: 0,
+            prof_err_unresolve_decl_type: 0,
+            prof_err_unresolve_member_type: 0,
+            prof_err_unresolve_type_decl: 0,
+            prof_err_unresolve_operator: 0,
+            prof_err_unresolve_module: 0,
+            prof_err_unresolve_sig_return: 0,
+            prof_unresolve_decl_sample_count: 0,
+            prof_unresolve_decl_names: Vec::new(),
+            prof_unresolve_decl_ids: FxHashMap::default(),
         }
     }
 

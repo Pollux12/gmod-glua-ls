@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
@@ -23,9 +23,9 @@ struct SpecialCallDirectBinding {
 
 #[derive(Debug, Default)]
 pub(in crate::compilation::analyzer) struct SpecialCallDirectMatcher {
-    special_signatures: HashSet<LuaSignatureId>,
-    name_expr_names: HashMap<String, Vec<SpecialCallDirectBinding>>,
-    access_paths: HashMap<String, Vec<SpecialCallDirectBinding>>,
+    special_signatures: FxHashSet<LuaSignatureId>,
+    name_expr_names: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
+    access_paths: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
 }
 
 impl SpecialCallDirectMatcher {
@@ -103,7 +103,7 @@ fn is_workspace_visible_to(
 
 pub(in crate::compilation::analyzer) fn build_special_call_direct_matcher(
     db: &DbIndex,
-    roots: &std::collections::HashMap<FileId, glua_parser::LuaChunk>,
+    roots: &FxHashMap<FileId, glua_parser::LuaChunk>,
 ) -> SpecialCallDirectMatcher {
     let mut matcher = SpecialCallDirectMatcher {
         special_signatures: db
@@ -413,7 +413,7 @@ fn decl_value_matches_direct_special_call(
     decl_id: crate::LuaDeclId,
     caller_position: TextSize,
 ) -> bool {
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     decl_value_matches_direct_special_call_inner(analyzer, decl_id, caller_position, &mut visited)
 }
 
@@ -421,7 +421,7 @@ fn decl_value_matches_direct_special_call_inner(
     analyzer: &LuaAnalyzer,
     decl_id: crate::LuaDeclId,
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if !visited.insert(decl_id) {
         return false;
@@ -454,7 +454,7 @@ fn expr_matches_direct_special_call(
     expr_file_id: FileId,
     node: &glua_parser::LuaSyntaxNode,
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if let Some(closure) = LuaClosureExpr::cast(node.clone()) {
         let signature_id = LuaSignatureId::from_closure(expr_file_id, &closure);
@@ -516,7 +516,7 @@ fn index_expr_matches_direct_special_call(
     expr_file_id: FileId,
     index_expr: &LuaIndexExpr,
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if let Some(access_path) = index_expr.get_access_path()
         && analyzer.special_call_direct_matcher.matches_access_path(
@@ -552,7 +552,7 @@ fn expr_matches_direct_special_call_with_member_chain(
     expr: &LuaExpr,
     member_chain: &[LuaMemberKey],
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if member_chain.is_empty() {
         return expr_matches_direct_special_call(
@@ -646,7 +646,7 @@ fn decl_value_matches_direct_special_call_member_chain(
     decl_id: crate::LuaDeclId,
     member_chain: &[LuaMemberKey],
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if !visited.insert(decl_id) {
         return false;
@@ -696,7 +696,7 @@ fn table_expr_member_chain_matches_direct_special_call(
     table_expr: &LuaTableExpr,
     member_chain: &[LuaMemberKey],
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     let Some((member_key, remaining_chain)) = member_chain.split_first() else {
         return false;
@@ -778,7 +778,7 @@ fn call_expr_matches_direct_special_call(
     expr_file_id: FileId,
     call_expr: &LuaCallExpr,
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return false;
