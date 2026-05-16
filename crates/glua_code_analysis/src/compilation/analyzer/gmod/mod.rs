@@ -65,12 +65,10 @@ impl GmodKeywords {
     }
 }
 
-fn scan_gmod_keywords(content: &str, hook_method_prefixes: &[String]) -> GmodKeywords {
+fn scan_gmod_keywords(content: &str, formatted_hook_prefixes: &[String]) -> GmodKeywords {
     let has_gm_func = content.contains("GM:")
         || content.contains("GAMEMODE:")
-        || hook_method_prefixes
-            .iter()
-            .any(|p| content.contains(&format!("{p}:")));
+        || formatted_hook_prefixes.iter().any(|p| content.contains(p));
     GmodKeywords {
         has_hook: content.contains("hook"),
         has_net: content.contains("net."),
@@ -126,15 +124,24 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         // file in `tree_list`, but helpers can live in any file.
         let helper_registry = build_helper_registry(db);
 
+        // Pre-format hook method prefixes once to avoid per-file `format!("{p}:")` allocations
+        let formatted_hook_prefixes: Vec<String> = db
+            .get_emmyrc()
+            .gmod
+            .hook_mappings
+            .method_prefixes
+            .iter()
+            .map(|p| format!("{p}:"))
+            .collect();
+
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
 
             // Pre-scan file source for gmod-relevant keywords to skip unnecessary AST walks
-            let method_prefixes = &db.get_emmyrc().gmod.hook_mappings.method_prefixes;
             let keywords = db
                 .get_vfs()
                 .get_file_content(&in_filed_tree.file_id)
-                .map(|c| scan_gmod_keywords(c, method_prefixes))
+                .map(|c| scan_gmod_keywords(c, &formatted_hook_prefixes))
                 .unwrap_or_default();
             if let Some(profile) = profile.as_mut() {
                 profile.files_scanned += 1;
@@ -142,12 +149,14 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             }
 
             let s = do_profile.then(std::time::Instant::now);
+            let mut local_fns = LocalFnCache::default();
             let (gm_method_realms, receive_flows) = if keywords.needs_hook_metadata() {
                 collect_hook_metadata(
                     db,
                     in_filed_tree.file_id,
                     in_filed_tree.value.clone(),
                     &helper_registry,
+                    &mut local_fns,
                 )
             } else {
                 if let Some(profile) = profile.as_mut() {
@@ -171,6 +180,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     in_filed_tree.value.clone(),
                     receive_flows,
                     &helper_registry,
+                    &mut local_fns,
                 );
             } else if let Some(profile) = profile.as_mut() {
                 profile.netflow_skips += 1;
@@ -406,22 +416,6 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
     }
 }
 
-/// Workspace-global registry of helper function definitions, used as a
-/// fallback when same-file helper resolution doesn't find a definition.
-///
-/// Keyed by:
-/// - bare-name globals: `"helperFn"` for `function helperFn() end` or
-///   `helperFn = function() end` at module top-level
-/// - dotted globals: `"Module.fn"` for `function Module.fn() end` or
-///   `Module.fn = function() end`
-///
-/// Locals are intentionally excluded — they can only be referenced from
-/// within their defining file, so the same-file lookup already covers them.
-///
-/// The chunk that owns each helper body is stored alongside the block so
-/// that further nested helper calls inside the body can be resolved against
-/// the owning file's tree (preserving local-shadows-global semantics in
-/// each step of the walk).
 struct HelperRegistry {
     map: HashMap<String, (LuaChunk, LuaBlock)>,
 }
@@ -430,7 +424,16 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
     let mut map: HashMap<String, (LuaChunk, LuaBlock)> = HashMap::new();
 
     let vfs = db.get_vfs();
-    let mut candidate_file_ids = vfs.get_all_file_ids();
+    // Filter to files containing "net." BEFORE sorting, to avoid allocating
+    // path strings for the vast majority of files that don't contain net helpers.
+    let mut candidate_file_ids: Vec<FileId> = vfs
+        .get_all_file_ids()
+        .into_iter()
+        .filter(|file_id| {
+            vfs.get_file_content(file_id)
+                .is_some_and(|c| c.contains("net."))
+        })
+        .collect();
     candidate_file_ids.sort_by_cached_key(|file_id| {
         let raw_path = vfs
             .get_file_path(file_id)
@@ -444,15 +447,6 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
     });
 
     for file_id in candidate_file_ids {
-        // Skip files that obviously can't contain net helper bodies. Any
-        // helper that wraps a net write/read must contain `net.` literally,
-        // so this prunes the vast majority of files cheaply.
-        let Some(content) = vfs.get_file_content(&file_id) else {
-            continue;
-        };
-        if !content.contains("net.") {
-            continue;
-        }
         let Some(tree) = vfs.get_syntax_tree(&file_id) else {
             continue;
         };
@@ -653,10 +647,10 @@ fn collect_hook_metadata(
     file_id: FileId,
     root: LuaChunk,
     helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) -> (Vec<(String, GmodRealm)>, Vec<NetReceiveFlow>) {
     let mut gm_method_realms = Vec::new();
     let mut receive_flows = Vec::new();
-    let mut local_fns = LocalFnCache::default();
 
     // Single descendants walk dispatching by node kind. Avoids two separate
     // O(N) walks for the LuaCallExpr and LuaFuncStat passes.
@@ -667,7 +661,7 @@ fn collect_hook_metadata(
             }
 
             if let Some(receive_flow) =
-                collect_net_receive_flow(&root, &call_expr, helper_registry, &mut local_fns)
+                collect_net_receive_flow(&root, &call_expr, helper_registry, local_fns)
             {
                 receive_flows.push(receive_flow);
             }
@@ -703,13 +697,13 @@ fn collect_network_flow_metadata(
     root: LuaChunk,
     receive_flows: Vec<NetReceiveFlow>,
     helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) {
-    let mut local_fns = LocalFnCache::default();
-    let mut send_flows = collect_net_send_flows(&root, helper_registry, &mut local_fns);
+    let mut send_flows = collect_net_send_flows(&root, helper_registry, local_fns);
     send_flows.extend(collect_wrapped_net_send_flows(
         &root,
         helper_registry,
-        &mut local_fns,
+        local_fns,
     ));
     send_flows.sort_by_key(|flow| flow.start_range.start());
 
