@@ -158,6 +158,145 @@ mod test {
     }
 
     #[test]
+    fn test_inline_default_boolean_and_string_in_param_context() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@param flag boolean=true
+        ---@param name string="default"
+        function Example:Run(flag, name)
+        end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let db = semantic_model.get_db();
+
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure");
+        let signature_id = crate::LuaSignatureId::from_closure(file_id, &closure);
+        let signature = db
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature");
+
+        let flag_idx = signature
+            .find_param_idx("flag")
+            .expect("missing flag param");
+        let flag_default = signature
+            .param_docs
+            .get(&flag_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(flag_default, Some(LuaDocDefaultValue::Boolean(true)));
+
+        let name_idx = signature
+            .find_param_idx("name")
+            .expect("missing name param");
+        let name_default = signature
+            .param_docs
+            .get(&name_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            name_default,
+            Some(LuaDocDefaultValue::String("default".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_inline_default_float_in_param_context() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@param rate number=3.14
+        function Example:SetRate(rate)
+        end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let db = semantic_model.get_db();
+
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure");
+        let signature_id = crate::LuaSignatureId::from_closure(file_id, &closure);
+        let signature = db
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature");
+
+        let rate_idx = signature
+            .find_param_idx("rate")
+            .expect("missing rate param");
+        let rate_default = signature
+            .param_docs
+            .get(&rate_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            rate_default,
+            Some(LuaDocDefaultValue::Number("3.14".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_inline_default_hex_in_param_context() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@param flags integer=0xFF
+        function Example:SetFlags(flags)
+        end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let db = semantic_model.get_db();
+
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure");
+        let signature_id = crate::LuaSignatureId::from_closure(file_id, &closure);
+        let signature = db
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature");
+
+        let flags_idx = signature
+            .find_param_idx("flags")
+            .expect("missing flags param");
+        let flags_default = signature
+            .param_docs
+            .get(&flags_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            flags_default,
+            Some(LuaDocDefaultValue::Number("0xFF".to_string()))
+        );
+    }
+
+    #[test]
     fn test_inline_default_metadata_storage_for_local_function() {
         let mut ws = VirtualWorkspace::new();
 

@@ -15,8 +15,8 @@ All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These co
 |---|---|---|---|
 | `gmod.enabled` | `boolean` | `true` | Enable all GMod-specific analysis. Set `false` to use as a generic Lua LS |
 | `gmod.defaultRealm` | `string` | `"shared"` | Realm assumed for files with no realm signal. Use `"client"`, `"server"`, or `"shared"` |
-| `gmod.detectRealmFromFilename` | `boolean` | `true` | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
-| `gmod.detectRealmFromCalls` | `boolean` | `true` | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, and `require` |
+| `gmod.detectRealmFromFilename` | `boolean \| null` | `null` (resolves to `true`) | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
+| `gmod.detectRealmFromCalls` | `boolean \| null` | `null` (resolves to `true`) | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, and `require` |
 | `gmod.inferDynamicFields` | `boolean` | `true` | Track fields dynamically assigned to GMod objects |
 | `gmod.dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files. Set `false` to scope them per-file |
 | `gmod.fileParamDefaults` | `object` | built-in map | Parameter-name → type fallback, applied to params without explicit `@param`. Editable in the Settings UI. Set a value to `""` to remove a built-in default |
@@ -133,6 +133,7 @@ To **override** a built-in definition, add an entry with its `id` and only the f
 |---|---|---|---|
 | `gmod.network.enabled` | `boolean` | `true` | Enable all network flow analysis |
 | `gmod.network.completion.smartReadSuggestions` | `boolean` | `true` | Suggest net.Read* calls in expected order inside receive callbacks |
+| `gmod.network.codeLensEnabled` | `boolean` | `true` | Show code lens actions on net message receivers |
 | `gmod.network.completion.mismatchHints` | `boolean` | `true` | Annotate suggestions with hints when expected read doesn't match current |
 
 <Note>
@@ -188,5 +189,6 @@ These settings can also be configured via VS Code's settings (`gluals.*` prefix)
 | `gluals.gmod.annotationsBranch` | VS Code only | `string` | `gluals-annotations` | Git branch for automatic annotation downloads |
 | `gluals.gmod.autoDetectGamemodeBase` | `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Auto-detect base gamemodes from the gamemode `.txt` file |
 | `gluals.gmod.templatePath` | `gmod.templatePath` | `string` | `null` | Custom scaffolding template path |
+| `gluals.gmod.network.codeLensEnabled` | `gmod.network.codeLensEnabled` | `boolean` | `true` | Network code lens |
 | `gluals.gmod.vgui.codeLensEnabled` | `gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI code lens |
 | `gluals.gmod.vgui.inlayHintEnabled` | `gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI inlay hints |

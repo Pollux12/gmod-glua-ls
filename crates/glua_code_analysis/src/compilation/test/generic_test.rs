@@ -904,4 +904,53 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_std_split_constant_strings() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@return std.Split<",", "x,y">
+            function split_comma() end
+        "#,
+        );
+
+        ws.def(
+            r#"
+            result = split_comma()
+        "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        assert_eq!(ws.humanize_type_detailed(result_ty), r#"("x","y")"#);
+    }
+
+    #[test]
+    fn test_std_split_non_constant_falls_back() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@generic Sep, Str
+            ---@param sep Sep
+            ---@param str Str
+            ---@return std.Split<Sep, Str>
+            function split_fn(sep, str) end
+        "#,
+        );
+
+        ws.def(
+            r#"
+            ---@type string
+            local sep
+            ---@type string
+            local str_val
+            result = split_fn(sep, str_val)
+        "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        assert_eq!(ws.humanize_type(result_ty), "string[]");
+    }
 }

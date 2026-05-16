@@ -1911,10 +1911,10 @@ fn find_and_resolve_getmember_delegations(
 }
 
 /// Extract (class_name, method_name) from a `scripted_ents.GetMember` call expression.
-/// `require_parenthesized` controls whether we also check for parenthesized calls.
+/// `reject_parenthesized` controls whether parenthesized calls are rejected.
 fn extract_getmember_call(
     call_expr: &LuaCallExpr,
-    require_parenthesized: bool,
+    reject_parenthesized: bool,
 ) -> Option<(String, String)> {
     let prefix_expr = call_expr.get_prefix_expr()?;
 
@@ -1924,7 +1924,7 @@ fn extract_getmember_call(
         if !matches!(inner, LuaExpr::IndexExpr(_)) {
             return None;
         }
-        if require_parenthesized {
+        if reject_parenthesized {
             return None;
         }
     }

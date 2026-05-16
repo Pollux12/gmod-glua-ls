@@ -865,52 +865,6 @@ fn find_require_call_binding_semantic(
     None
 }
 
-#[allow(unused)]
-fn filter_duplicate_and_covered_locations(locations: Vec<Location>) -> Vec<Location> {
-    if locations.is_empty() {
-        return locations;
-    }
-    let mut sorted_locations = locations;
-    sorted_locations.sort_by(|a, b| {
-        a.uri
-            .to_string()
-            .cmp(&b.uri.to_string())
-            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
-            .then_with(|| b.range.end.line.cmp(&a.range.end.line))
-    });
-
-    let mut result = Vec::new();
-    let mut seen_lines_by_uri: HashMap<String, HashSet<u32>> = HashMap::new();
-
-    for location in sorted_locations {
-        let uri_str = location.uri.to_string();
-        let seen_lines = seen_lines_by_uri.entry(uri_str).or_default();
-
-        let start_line = location.range.start.line;
-        let end_line = location.range.end.line;
-
-        let is_covered = (start_line..=end_line).any(|line| seen_lines.contains(&line));
-
-        if !is_covered {
-            for line in start_line..=end_line {
-                seen_lines.insert(line);
-            }
-            result.push(location);
-        }
-    }
-
-    // 最终按位置排序
-    result.sort_by(|a, b| {
-        a.uri
-            .to_string()
-            .cmp(&b.uri.to_string())
-            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
-            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
-    });
-
-    result
-}
-
 fn enqueue_semantic_id(
     ctx: &mut ReferenceSearchContext,
     worklist: &mut Vec<LuaSemanticDeclId>,
