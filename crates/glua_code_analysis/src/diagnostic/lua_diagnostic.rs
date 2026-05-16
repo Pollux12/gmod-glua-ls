@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use log::info;
+use rustc_hash::FxHashMap;
 
 pub use super::checker::DiagnosticContext;
 use super::checker::SharedDiagnosticData;
@@ -12,6 +13,7 @@ use super::checker::precompute_gm_method_realms;
 use super::checker::precompute_missing_required_fields;
 use super::checker::precompute_nodiscard_candidates;
 use super::checker::precompute_param_type_candidates;
+use super::checker::precompute_sorted_send_flows;
 use super::checker::precompute_subclass_fields;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::semantic::LuaAnalysisPhase;
@@ -128,6 +130,15 @@ impl LuaDiagnostic {
         let param_type_candidates = precompute_param_type_candidates(db);
         let nodiscard_candidates = precompute_nodiscard_candidates(db);
 
+        // Precompute decl annotation realms for all workspace files
+        let decl_annotation_realms = precompute_decl_annotation_realms(db, &workspace_file_ids);
+
+        // Precompute sorted send flows so each file doesn't re-sort them.
+        let sorted_send_flows = Arc::new(precompute_sorted_send_flows(
+            db.get_gmod_network_index(),
+            db.get_vfs(),
+        ));
+
         Arc::new(SharedDiagnosticData {
             workspace_file_ids: Arc::new(workspace_file_ids),
             gm_method_realms,
@@ -137,6 +148,8 @@ impl LuaDiagnostic {
             await_candidates: Arc::new(await_candidates),
             param_type_candidates: Arc::new(param_type_candidates),
             nodiscard_candidates: Arc::new(nodiscard_candidates),
+            decl_annotation_realms: Arc::new(decl_annotation_realms),
+            sorted_send_flows,
         })
     }
 
@@ -232,4 +245,19 @@ impl LuaDiagnostic {
 
         Some(context.get_diagnostics())
     }
+}
+
+fn precompute_decl_annotation_realms(
+    db: &crate::DbIndex,
+    workspace_file_ids: &[FileId],
+) -> FxHashMap<FileId, Vec<super::checker::AnnotatedRealmRange>> {
+    use super::checker::collect_decl_annotation_realms_for_file_precompute;
+    let mut cache = FxHashMap::default();
+    for &file_id in workspace_file_ids {
+        let realms = collect_decl_annotation_realms_for_file_precompute(db, &file_id);
+        if !realms.is_empty() {
+            cache.insert(file_id, realms);
+        }
+    }
+    cache
 }

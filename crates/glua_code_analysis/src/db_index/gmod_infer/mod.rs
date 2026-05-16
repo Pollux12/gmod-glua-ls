@@ -186,6 +186,17 @@ pub struct GmodScopedClassInfo {
     pub class_name_prefix: Option<String>,
 }
 
+/// Workspace-global registry of helper function definitions, used as a
+/// fallback when same-file helper resolution doesn't find a definition.
+///
+/// Keyed by:
+/// - bare-name globals: `"helperFn"` for `function helperFn() end` or
+///   `helperFn = function() end` at module top-level
+/// - dotted globals: `"Module.fn"` for `function Module.fn() end` or
+///   `Module.fn = function() end`
+///
+/// Locals are intentionally excluded — they can only be referenced from
+/// within their defining file, so the same-file lookup already covers them.
 #[derive(Debug, Default)]
 pub struct GmodInferIndex {
     hook_file_metadata: HashMap<FileId, GmodHookFileMetadata>,

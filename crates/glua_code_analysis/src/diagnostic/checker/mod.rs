@@ -54,6 +54,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use rustc_hash::FxHashMap;
+
 use crate::{
     FileId, LuaSemanticDeclId, LuaType, LuaTypeDeclId, RenderLevel, SemanticDeclLevel, WorkspaceId,
     db_index::DbIndex, humanize_type, semantic::SemanticModel,
@@ -68,8 +70,12 @@ use super::{
 pub use await_in_sync::{PrecomputedAwaitCandidates, precompute_await_candidates};
 pub use check_field::precompute_subclass_fields;
 pub use discard_returns::{PrecomputedNoDiscardCandidates, precompute_nodiscard_candidates};
+pub use gmod_network::SortedSendFlowCache;
+pub use gmod_network::precompute_sorted_send_flows;
+pub use gmod_realm_misuse::AnnotatedRealmRange;
 pub use gmod_realm_misuse::GmMethodRealmMap;
 pub use gmod_realm_misuse::PrecomputedCalleeRealmMap;
+pub(crate) use gmod_realm_misuse::collect_decl_annotation_realms_for_file_precompute;
 pub use gmod_realm_misuse::precompute_callee_realms_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 pub use missing_fields::precompute_missing_required_fields;
@@ -261,6 +267,12 @@ pub struct SharedDiagnosticData {
     pub param_type_candidates: Arc<PrecomputedParamTypeCandidates>,
     /// Static callee names whose signatures are marked @nodiscard.
     pub nodiscard_candidates: Arc<PrecomputedNoDiscardCandidates>,
+    /// Precomputed declaration annotation realms for all workspace files.
+    /// Avoids re-scanning syntax trees for @realm annotations per file.
+    pub decl_annotation_realms: Arc<FxHashMap<FileId, Vec<AnnotatedRealmRange>>>,
+    /// Precomputed sorted send flows by message name. Built once per batch
+    /// run instead of per-file, avoiding repeated VFS path lookups and sorts.
+    pub sorted_send_flows: Arc<SortedSendFlowCache>,
 }
 
 pub struct DiagnosticContext<'a> {
