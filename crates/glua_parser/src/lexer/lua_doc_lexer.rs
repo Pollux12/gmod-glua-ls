@@ -306,10 +306,7 @@ impl LuaDocLexer<'_> {
                     LuaTokenKind::TkDocDetail
                 }
             }
-            ch if ch.is_ascii_digit() => {
-                reader.eat_while(|ch| ch.is_ascii_digit());
-                LuaTokenKind::TkInt
-            }
+            ch if ch.is_ascii_digit() => lex_doc_number(reader),
             ch if ch == '"' || ch == '\'' => {
                 reader.bump();
                 reader.eat_while(|c| c != ch);
@@ -643,10 +640,7 @@ impl LuaDocLexer<'_> {
                 }
                 LuaTokenKind::TkString
             }
-            ch if ch.is_ascii_digit() => {
-                reader.eat_while(|ch| ch.is_ascii_digit());
-                LuaTokenKind::TkInt
-            }
+            ch if ch.is_ascii_digit() => lex_doc_number(reader),
             ch if is_name_start(ch) => {
                 reader.bump();
                 reader.eat_while(is_name_continue);
@@ -811,6 +805,38 @@ fn is_source_continue(ch: char) -> bool {
         || ch == ':'
         || ch == '#'
         || ch == '\\'
+}
+
+fn lex_doc_number(reader: &mut Reader) -> LuaTokenKind {
+    if reader.current_char() == '0' && matches!(reader.next_char(), 'x' | 'X') {
+        reader.bump();
+        reader.bump();
+        reader.eat_while(|ch| ch.is_ascii_hexdigit());
+        LuaTokenKind::TkInt
+    } else {
+        reader.eat_while(|ch| ch.is_ascii_digit());
+        if reader.current_char() == '.' && reader.next_char().is_ascii_digit() {
+            reader.bump();
+            reader.eat_while(|ch| ch.is_ascii_digit());
+            if matches!(reader.current_char(), 'e' | 'E') {
+                reader.bump();
+                if matches!(reader.current_char(), '+' | '-') {
+                    reader.bump();
+                }
+                reader.eat_while(|ch| ch.is_ascii_digit());
+            }
+            LuaTokenKind::TkFloat
+        } else if matches!(reader.current_char(), 'e' | 'E') {
+            reader.bump();
+            if matches!(reader.current_char(), '+' | '-') {
+                reader.bump();
+            }
+            reader.eat_while(|ch| ch.is_ascii_digit());
+            LuaTokenKind::TkFloat
+        } else {
+            LuaTokenKind::TkInt
+        }
+    }
 }
 
 #[cfg(test)]
