@@ -65,6 +65,13 @@ pub fn get_type_at_flow(
         &mut visited_flow_ids,
     );
 
+    // Track flow walk depth for profiling
+    let walk_depth = visited_flow_ids.len() as u32;
+    cache.prof_flow_walk_depth_sum += walk_depth as u64;
+    if walk_depth > cache.prof_flow_walk_max_depth {
+        cache.prof_flow_walk_max_depth = walk_depth;
+    }
+
     // RecursiveInfer errors are transient (cycle detection) and must NOT be
     // cached — they'd poison future non-recursive queries.
     match &result {

@@ -26,7 +26,10 @@ pub fn infer_name_expr(
     let name_token = name_expr.get_name_token().ok_or(InferFailReason::None)?;
     let name = name_token.get_name_text();
     match name {
-        "self" => return infer_self(db, cache, name_expr),
+        "self" => {
+            cache.prof_name_self_calls += 1;
+            return infer_self(db, cache, name_expr);
+        }
         "_G" => return Ok(LuaType::Global),
         _ => {}
     }
@@ -38,6 +41,7 @@ pub fn infer_name_expr(
         .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&range));
     let result = if let Some(decl_id) = decl_id {
+        cache.prof_name_local_calls += 1;
         infer_local_decl_name_type(db, cache, &name_expr, decl_id)
     } else {
         if let Some(implicit_module_type) =
@@ -56,12 +60,28 @@ pub fn infer_name_expr(
 
         match get_name_expr_var_ref_id(db, cache, &name_expr) {
             Some(var_ref_id) => {
-                infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id)
-                    .or_else(|_| {
-                        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-                    })
+                cache.prof_name_narrow_calls += 1;
+                let narrow_start =
+                    log::log_enabled!(log::Level::Info).then(std::time::Instant::now);
+                let result = infer_expr_narrow_type(
+                    db,
+                    cache,
+                    LuaExpr::NameExpr(name_expr.clone()),
+                    var_ref_id,
+                )
+                .or_else(|_| {
+                    cache.prof_name_global_calls += 1;
+                    infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+                });
+                if let Some(start) = narrow_start {
+                    cache.prof_name_narrow_time_ns += start.elapsed().as_nanos() as u64;
+                }
+                result
             }
-            None => infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name),
+            None => {
+                cache.prof_name_global_calls += 1;
+                infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+            }
         }
     };
 

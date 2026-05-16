@@ -163,6 +163,21 @@ pub fn get_var_ref_type(
             return Ok(result);
         }
 
+        // Collect unique UnResolveDeclType decl names for profiling
+        cache.prof_unresolve_decl_sample_count += 1;
+        if cache.prof_unresolve_decl_names.len() < 30 {
+            let name = decl.get_name().to_string();
+            let key = format!("{}:{}", name, u32::from(decl.get_id().position));
+            if !cache.prof_unresolve_decl_names.contains(&key) {
+                cache.prof_unresolve_decl_names.push(key);
+            }
+        }
+        // Track per-decl-id counts
+        *cache
+            .prof_unresolve_decl_ids
+            .entry(u32::from(decl.get_id().position))
+            .or_insert(0) += 1;
+
         Err(InferFailReason::UnResolveDeclType(decl.get_id()))
     } else if let Some(member_id) = var_ref_id.get_member_id_ref() {
         find_decl_member_type(db, member_id)
