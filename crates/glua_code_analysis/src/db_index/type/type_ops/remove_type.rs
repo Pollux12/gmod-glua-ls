@@ -1,4 +1,4 @@
-use crate::{DbIndex, LuaType, get_real_type};
+use crate::{DbIndex, LuaInstanceType, LuaType, get_real_type};
 
 pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Option<LuaType> {
     if source == removed_type {
@@ -148,6 +148,20 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
             .filter_map(|t| remove_type(db, real_type.clone(), t.clone()))
             .collect::<Vec<_>>();
         return Some(LuaType::from_vec(types));
+    }
+
+    // Instance types wrap an inner base type (e.g., `(instance) T|NULL` creates
+    // Instance(T|NULL)). We must recurse into the Instance to remove types from
+    // its base, preserving the Instance wrapper with the narrowed base type.
+    if let LuaType::Instance(instance_type) = real_type {
+        if let Some(new_base) = remove_type(db, instance_type.get_base().clone(), removed_type) {
+            return Some(LuaType::Instance(LuaInstanceType::new(
+                new_base,
+                instance_type.get_range().clone(),
+            ).into()));
+        }
+        // If the entire base was removed, the Instance has no valid type.
+        return Some(LuaType::Never);
     }
 
     Some(source.clone())

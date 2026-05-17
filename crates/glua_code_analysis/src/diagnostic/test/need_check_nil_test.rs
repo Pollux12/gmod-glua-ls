@@ -1526,6 +1526,165 @@ mod test {
     }
 
     #[gtest]
+    fn test_isvalid_not_narrows_entity_null_early_return() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field SetModel fun(self: Entity, model: string)
+
+            ---@class prop_vehicle_prisoner_pod : Entity
+
+            ---@class NULL : Entity
+
+            ---@return prop_vehicle_prisoner_pod|NULL
+            function ents_Create() end
+            "#,
+        );
+
+        // After "if not IsValid(seat) then return end", seat should be narrowed
+        // to prop_vehicle_prisoner_pod (no NULL)
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local seat = ents_Create()
+                if not IsValid(seat) then
+                    return
+                end
+                seat:SetModel("models/nova/airboat_seat.mdl")
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    /// Regression test: IsValid must narrow Instance(T|NULL) to Instance(T).
+    ///
+    /// Production pattern from `ents.Create` which uses `@generic T : Entity`
+    /// and `@return (instance) T|NULL`. The `(instance)` modifier wraps the
+    /// return type in a LuaInstanceType, so the NULL is inside the Instance
+    /// wrapper: `Instance(T|NULL)`. The `remove_type` function must recurse
+    /// into Instance types to remove NULL from the inner union.
+    #[gtest]
+    fn test_isvalid_narrows_instance_type_union_null() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field SetModel fun(self: Entity, modelName: string)
+
+            ---@class prop_vehicle_prisoner_pod : Entity
+
+            ---@class NULL : Entity
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents_Create(class) end
+            "#,
+        );
+
+        // `if not IsValid(seat) then return end` should narrow
+        // Instance(prop_vehicle_prisoner_pod|NULL) to Instance(prop_vehicle_prisoner_pod)
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local seat = ents_Create("prop_vehicle_prisoner_pod")
+
+                if not IsValid(seat) then
+                    return
+                end
+
+                seat:SetModel("models/nova/airboat_seat.mdl")
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    /// Same as above but using `if IsValid(seat) then` (positive branch).
+    #[gtest]
+    fn test_isvalid_narrows_instance_type_union_null_positive_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field SetModel fun(self: Entity, modelName: string)
+
+            ---@class prop_vehicle_prisoner_pod : Entity
+
+            ---@class NULL : Entity
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents_Create(class) end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local seat = ents_Create("prop_vehicle_prisoner_pod")
+
+                if IsValid(seat) then
+                    seat:SetModel("models/nova/airboat_seat.mdl")
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    /// Instance(T|NULL) without IsValid guard should still produce a diagnostic.
+    #[gtest]
+    fn test_instance_type_union_null_without_isvalid_still_diagnoses() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field SetModel fun(self: Entity, modelName: string)
+
+            ---@class prop_vehicle_prisoner_pod : Entity
+
+            ---@class NULL : Entity
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents_Create(class) end
+            "#,
+        );
+
+        // Without IsValid guard, diagnostic should fire
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local seat = ents_Create("prop_vehicle_prisoner_pod")
+                seat:SetModel("models/nova/airboat_seat.mdl")
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
     fn test_bracket_index_need_check_nil_range_covers_full_prefix_name() {
         let mut ws = VirtualWorkspace::new();
         let code = r#"
