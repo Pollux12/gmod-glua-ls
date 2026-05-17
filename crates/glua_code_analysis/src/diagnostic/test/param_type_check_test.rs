@@ -2699,7 +2699,7 @@ mod test {
     // --- GMod NULL compatibility tests ---
 
     #[test]
-    fn test_core_null_type_is_not_assignable_to_entity() {
+    fn test_core_null_type_is_assignable_to_entity() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -2714,11 +2714,13 @@ mod test {
 
         let null_ty = ws.ty("NULL");
         let entity_ty = ws.ty("Entity");
-        assert!(!ws.check_type(&null_ty, &entity_ty));
+        // In GMod, NULL is the "zero value" of Entity — an invalid/empty Entity.
+        // NULL is assignable to Entity (and vice versa) because they are the same type family.
+        assert!(ws.check_type(&null_ty, &entity_ty));
     }
 
     #[test]
-    fn test_null_expr_type_is_not_assignable_to_entity() {
+    fn test_null_expr_type_is_assignable_to_entity() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -2735,11 +2737,12 @@ mod test {
 
         let null_expr_ty = ws.expr_ty("NULL");
         let entity_ty = ws.ty("Entity");
-        assert!(!ws.check_type(&null_expr_ty, &entity_ty));
+        // In GMod, NULL is the "zero value" of Entity — assignable to Entity.
+        assert!(ws.check_type(&null_expr_ty, &entity_ty));
     }
 
     #[test]
-    fn test_null_param_rejects_entity_gmod() {
+    fn test_null_param_accepts_entity_gmod() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -2756,12 +2759,14 @@ mod test {
 
         let null_ty = ws.ty("NULL");
         let entity_ty = ws.ty("Entity");
-        assert!(!ws.check_type(&entity_ty, &null_ty));
+        // In GMod, Entity is assignable to NULL (replacing a NULL placeholder with a real Entity).
+        assert!(ws.check_type(&entity_ty, &null_ty));
     }
 
-    /// NULL should NOT be compatible with unrelated subclasses like Player.
+    /// NULL should be compatible with Entity subclasses like Player in GMod,
+    /// since NULL is the "zero value" of the Entity type hierarchy.
     #[test]
-    fn test_null_not_compatible_with_player() {
+    fn test_null_compatible_with_player() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -2777,7 +2782,8 @@ mod test {
 
         let null_ty = ws.ty("NULL");
         let player_ty = ws.ty("Player");
-        assert!(!ws.check_type(&null_ty, &player_ty));
+        // In GMod, NULL and Player are both in the Entity family, so they are compatible.
+        assert!(ws.check_type(&null_ty, &player_ty));
     }
 
     // --- Union coercion suppression tests ---
@@ -2866,6 +2872,60 @@ mod test {
             ---@type any|string|nil
             local val
             f(val)
+        "#
+        ));
+    }
+
+    /// In GMod, Entity is used as a generic stand-in for many things (network vars,
+    /// etc.), so passing Entity where a more specific subtype is expected should not
+    /// produce false-positive param-type-mismatch diagnostics.
+    #[test]
+    fn test_entity_accepted_for_child_type_param() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            ---@class base_glide : Entity
+
+            ---@param e base_glide?
+            local function takes_base_glide(e)
+            end
+
+            ---@type Entity
+            local ent = nil
+
+            takes_base_glide(ent)
+        "#
+        ));
+    }
+
+    /// Entity should also be accepted for non-nullable child type params in GMod.
+    #[test]
+    fn test_entity_accepted_for_nonnullable_child_type_param() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            ---@class base_glide : Entity
+
+            ---@param e base_glide
+            local function takes_base_glide(e)
+            end
+
+            ---@type Entity
+            local ent = nil
+
+            takes_base_glide(ent)
         "#
         ));
     }

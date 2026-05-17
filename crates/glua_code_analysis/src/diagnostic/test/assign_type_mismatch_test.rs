@@ -662,7 +662,9 @@ local b = a
             "#
         ));
 
-        assert!(!ws.check_code_for_namespace(
+        // With GMod enabled (default), assigning a supertype value to a subtype
+        // variable is allowed to reduce false positives (Entity as generic stand-in).
+        assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
 ---@class A
@@ -788,7 +790,9 @@ return t
         config.strict.array_index = true;
         ws.analysis.update_config(config.into());
 
-        assert!(!ws.check_code_for_namespace(
+        // With GMod enabled (default), assigning a supertype value to a subtype
+        // variable is allowed to reduce false positives (Entity as generic stand-in).
+        assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
             ---@class A
@@ -2512,6 +2516,130 @@ fn test_doc_string_union_with_legacy_wrapped_literals_stays_strict() {
         register_privilege({
             MinAccess = "root"
         })
+        "#
+    ));
+}
+
+// In GMod, NULL is the "zero value" of Entity. Assigning an Entity subtype
+// to a NULL-typed slot is valid — the pattern `filter = { NULL, NULL };
+// filter[1] = self` is common and correct.
+#[test]
+fn test_entity_subtype_assignable_to_null_typed_slot() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@class glide_missile : Entity
+        local glide_missile = {}
+
+        ---@type glide_missile
+        local self
+
+        local traceData = {
+            filter = { NULL, NULL },
+        }
+
+        traceData.filter[1] = self
+        traceData.filter[2] = self
+        "#
+    ));
+}
+
+// NULL should be assignable to Entity-typed slots (NULL is a valid Entity value).
+#[test]
+fn test_null_assignable_to_entity_typed_slot() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@type Entity
+        local ent
+
+        ent = NULL
+        "#
+    ));
+}
+
+// NULL should NOT be assignable to unrelated types (e.g., string).
+#[test]
+fn test_null_not_assignable_to_unrelated_type() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(!ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@type string
+        local s
+
+        s = NULL
+        "#
+    ));
+}
+
+// Non-Entity types should NOT be assignable to NULL-typed slots.
+#[test]
+fn test_non_entity_not_assignable_to_null_slot() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(!ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@type NULL
+        local slot
+
+        ---@type string
+        local s
+
+        slot = s
+        "#
+    ));
+}
+
+// Direct Entity subtype → NULL local variable assignment should be valid.
+#[test]
+fn test_entity_subtype_assignable_to_null_local() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@class glide_missile : Entity
+        local glide_missile = {}
+
+        ---@type NULL
+        local slot
+
+        ---@type glide_missile
+        local self
+
+        slot = self
         "#
     ));
 }
