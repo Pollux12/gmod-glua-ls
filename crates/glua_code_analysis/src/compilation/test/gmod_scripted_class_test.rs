@@ -5521,7 +5521,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_getmember_delegation_prefers_exact_init_over_cl_init() {
+    fn test_getmember_delegation_copies_network_vars_from_all_class_files() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -5569,11 +5569,77 @@ mod test {
 
         assert!(
             member_names.contains(&"GetServerSpeed".to_string()),
-            "missing GetServerSpeed from exact init.lua in {member_names:?}"
+            "missing GetServerSpeed from init.lua in {member_names:?}"
         );
         assert!(
-            !member_names.contains(&"GetClientOnlySpeed".to_string()),
-            "unexpected GetClientOnlySpeed copied from cl_init.lua in {member_names:?}"
+            member_names.contains(&"GetClientOnlySpeed".to_string()),
+            "missing GetClientOnlySpeed from cl_init.lua in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_copies_network_vars_from_shared_target_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:Initialize()
+                end
+            "#,
+            ),
+            (
+                "lua/entities/target_ent/shared.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "SharedSpeed")
+                    self:NetworkVar("Bool", 0, "SharedActive")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    local SetupDataTables = scripted_ents.GetMember("target_ent", "SetupDataTables")
+                    SetupDataTables(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("delegating_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on delegating_ent");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetSharedSpeed".to_string()),
+            "missing GetSharedSpeed from shared.lua in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetSharedSpeed".to_string()),
+            "missing SetSharedSpeed from shared.lua in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetSharedActive".to_string()),
+            "missing GetSharedActive from shared.lua in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetSharedActive".to_string()),
+            "missing SetSharedActive from shared.lua in {member_names:?}"
         );
     }
 

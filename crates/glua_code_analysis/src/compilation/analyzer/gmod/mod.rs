@@ -1743,7 +1743,7 @@ fn resolve_getmember_network_var_delegations(
         return;
     }
 
-    // Build class_name -> file_id reverse mapping only when there are
+    // Build class_name -> file_ids reverse mapping only when there are
     // delegating files to resolve; this avoids a full VFS scan on ordinary edits.
     let class_file_map = build_class_file_map(db);
 
@@ -1752,9 +1752,8 @@ fn resolve_getmember_network_var_delegations(
     }
 }
 
-/// Build a mapping from class_name to (file_id, class_decl_id) for all known
-/// scripted entity classes.
-fn build_class_file_map(db: &DbIndex) -> HashMap<String, (FileId, LuaTypeDeclId)> {
+/// Build a mapping from class_name to all file ids for known scripted entity classes.
+fn build_class_file_map(db: &DbIndex) -> HashMap<String, Vec<FileId>> {
     let mut map = HashMap::new();
     let gmod_infer = db.get_gmod_infer_index();
     let vfs = db.get_vfs();
@@ -1762,18 +1761,15 @@ fn build_class_file_map(db: &DbIndex) -> HashMap<String, (FileId, LuaTypeDeclId)
 
     for file_id in all_file_ids {
         if let Some(info) = gmod_infer.get_scoped_class_info(&file_id) {
-            let class_decl_id = LuaTypeDeclId::global(&info.class_name);
-            // Prefer init.lua files (canonical class file) over secondary files
             let is_init = vfs
                 .get_file_path(&file_id)
                 .and_then(|p| p.file_name().and_then(|name| name.to_str()))
                 .is_some_and(|name| name == "init.lua");
+            let file_ids = map.entry(info.class_name.clone()).or_insert_with(Vec::new);
             if is_init {
-                map.insert(info.class_name.clone(), (file_id, class_decl_id));
+                file_ids.insert(0, file_id);
             } else {
-                // Only insert if no init.lua entry exists for this class yet
-                map.entry(info.class_name.clone())
-                    .or_insert((file_id, class_decl_id));
+                file_ids.push(file_id);
             }
         }
     }
@@ -1789,7 +1785,7 @@ fn find_and_resolve_getmember_delegations(
     current_file_id: FileId,
     current_class_decl_id: &LuaTypeDeclId,
     chunk: &LuaChunk,
-    class_file_map: &HashMap<String, (FileId, LuaTypeDeclId)>,
+    class_file_map: &HashMap<String, Vec<FileId>>,
 ) {
     // Collect local variable names assigned from scripted_ents.GetMember calls.
     // Map: local_name -> (target_class_name, target_method_name)
@@ -1858,14 +1854,12 @@ fn find_and_resolve_getmember_delegations(
             // will match either way.
 
             // Look up the target class
-            if let Some(&(target_file_id, ref _target_class_decl_id)) =
-                class_file_map.get(target_class)
-            {
+            if let Some(target_file_ids) = class_file_map.get(target_class) {
                 copy_network_var_calls_from(
                     db,
                     current_file_id,
                     current_class_decl_id,
-                    target_file_id,
+                    target_file_ids,
                 );
             }
         }
@@ -1892,12 +1886,12 @@ fn find_and_resolve_getmember_delegations(
                 continue;
             };
 
-            if let Some(&(target_file_id, _)) = class_file_map.get(&target_class) {
+            if let Some(target_file_ids) = class_file_map.get(&target_class) {
                 copy_network_var_calls_from(
                     db,
                     current_file_id,
                     current_class_decl_id,
-                    target_file_id,
+                    target_file_ids,
                 );
             }
         }
@@ -1987,32 +1981,38 @@ fn copy_network_var_calls_from(
     db: &mut DbIndex,
     current_file_id: FileId,
     _current_class_decl_id: &LuaTypeDeclId,
-    target_file_id: FileId,
+    target_file_ids: &[FileId],
 ) {
-    let target_metadata = match db
-        .get_gmod_class_metadata_index()
-        .get_file_metadata(&target_file_id)
-    {
-        Some(m) => m.clone(),
-        None => return,
-    };
+    let target_metadata: Vec<_> = target_file_ids
+        .iter()
+        .filter_map(|target_file_id| {
+            db.get_gmod_class_metadata_index()
+                .get_file_metadata(target_file_id)
+                .cloned()
+        })
+        .collect();
+    if target_metadata.is_empty() {
+        return;
+    }
 
     let metadata_index = db.get_gmod_class_metadata_index_mut();
 
-    for nv_call in &target_metadata.network_var_calls {
-        metadata_index.add_call(
-            current_file_id,
-            GmodScriptedClassCallKind::NetworkVar,
-            nv_call.clone(),
-        );
-    }
+    for target_metadata in &target_metadata {
+        for nv_call in &target_metadata.network_var_calls {
+            metadata_index.add_call(
+                current_file_id,
+                GmodScriptedClassCallKind::NetworkVar,
+                nv_call.clone(),
+            );
+        }
 
-    for nve_call in &target_metadata.network_var_element_calls {
-        metadata_index.add_call(
-            current_file_id,
-            GmodScriptedClassCallKind::NetworkVarElement,
-            nve_call.clone(),
-        );
+        for nve_call in &target_metadata.network_var_element_calls {
+            metadata_index.add_call(
+                current_file_id,
+                GmodScriptedClassCallKind::NetworkVarElement,
+                nve_call.clone(),
+            );
+        }
     }
 }
 
