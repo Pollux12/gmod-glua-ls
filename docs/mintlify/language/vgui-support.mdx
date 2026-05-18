@@ -7,13 +7,13 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-GLuaLS has built-in support for VGUI (GMod's panel GUI system). It understands `vgui.Create()` calls, the panel inheritance hierarchy, and provides rich IDE features for VGUI development.
+GLuaLS supports VGUI, GMod's panel GUI system. It understands `vgui.Create()` calls and the panel inheritance hierarchy, and it provides IDE features for VGUI development.
 
 ---
 
 ## Panel type inference
 
-When you call `vgui.Create("Type")`, GLuaLS automatically types the returned value as the corresponding panel class:
+When you call `vgui.Create("Type")`, GLuaLS types the returned value as the matching panel class:
 
 ```lua
 local frame = vgui.Create("DFrame")   -- typed as DFrame
@@ -77,17 +77,17 @@ vgui.Register("MyPanel", PANEL, "DPanel")
 -- that inherits from DPanel
 ```
 
-After `vgui.Register(name, PANEL, base)`, the name `"MyPanel"` is recognized in subsequent `vgui.Create("MyPanel")` calls with all methods from `PANEL` table plus inherited `DPanel` methods.
+After `vgui.Register(name, PANEL, base)`, GLuaLS recognizes `"MyPanel"` in later `vgui.Create("MyPanel")` calls. The panel type includes all methods from the `PANEL` table plus inherited `DPanel` methods.
 
 ---
 
 ## Scripted Entity Explorer
 
-VGUI Panels are registered within the Scripted Class Explorer for easy navigation. Clicking on a panel class in the explorer will navigate to its definition.
+The Scripted Class Explorer lists VGUI panels for navigation. Click a panel class in the explorer to open its definition.
 
 ## VSCode integration
 
-VGUI features work automatically. The Class Explorer sidebar shows registered panel types under the Classes section. Configure in the [settings panel](/configuration/overview#settings-panel-recommended) — see [GMod settings](/configuration/gmod#vgui) for the full reference.
+VGUI features work after the extension starts. The Class Explorer sidebar shows registered panel types under the Classes section. Configure VGUI support in the [settings panel](/configuration/overview#settings-panel-recommended). See [GMod settings](/configuration/gmod#vgui) for the full reference.
 
 ## Configuration
 

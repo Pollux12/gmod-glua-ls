@@ -24,7 +24,7 @@ Diagnostics appear as squiggly underlines in the editor and in the **Problems** 
 
 ## Configuring diagnostic severity
 
-Change the severity of any diagnostic code, or disable it entirely:
+Change the severity of any diagnostic code, or disable it:
 
 <ConfigTip />
 ```json .gluarc.json
@@ -42,7 +42,7 @@ Change the severity of any diagnostic code, or disable it entirely:
 ```
 
 <Tip>
-Use the [interactive settings panel](/configuration/overview#settings-panel-recommended) to toggle diagnostics and change severity with checkboxes and dropdowns — no JSON editing required.
+Use the [interactive settings panel](/configuration/overview#settings-panel-recommended) to toggle diagnostics and change severity with checkboxes and dropdowns. You do not need to edit JSON.
 </Tip>
 
 ---
@@ -78,37 +78,37 @@ Use the [interactive settings panel](/configuration/overview#settings-panel-reco
 |---|---|---|
 | `unused` | Hint | Local variable or function is never used |
 | `unused-self` | Off | `self` parameter is never used in a method |
-| `unreachable-code` | Hint | Code after a `return` or `error()` that can never execute |
+| `unreachable-code` | Hint | Code after a `return` or `error()` cannot execute |
 | `deprecated` | Hint | Using a deprecated function or field |
 | `duplicate-require` | Hint | Module is `require()`d more than once in the same scope |
 | `redefined-local` | Hint | Local variable shadows an outer local with the same name |
-| `redefined-label` | Warning | Goto label is defined more than once |
+| `redefined-label` | Warning | Code defines the same goto label more than once |
 | `duplicate-index` | Warning | Table literal has the same key more than once |
-| `duplicate-set-field` | Off | A field is assigned more than once |
-| `duplicate-type` | Off | Same type name declared in multiple places |
+| `duplicate-set-field` | Off | Code assigns a field more than once |
+| `duplicate-type` | Off | Code declares the same type name in multiple places |
 | `unbalanced-assignments` | Warning | Left-hand and right-hand sides of an assignment have different counts |
-| `local-const-reassign` | Error | Reassigning a `<const>` local |
-| `read-only` | Warning | Writing to a value declared as read-only |
+| `local-const-reassign` | Error | Code reassigns a `<const>` local |
+| `read-only` | Warning | Code writes to a value declared as read-only |
 
 ### Documentation
 
 | Code | Default | Description |
 |---|---|---|
-| `annotation-usage-error` | Error | Annotation used incorrectly (wrong syntax, wrong context) |
+| `annotation-usage-error` | Error | Annotation has wrong syntax or appears in the wrong context |
 | `doc-syntax-error` | Error | Annotation comment has a syntax error |
-| `undefined-doc-param` | Warning | Documented parameter doesn't exist on the function |
-| `duplicate-doc-field` | Warning | Same field documented more than once in `@class` |
-| `incomplete-signature-doc` | Off | Function is missing parameter or return documentation |
-| `missing-global-doc` | Off | Global function or variable is missing documentation |
+| `undefined-doc-param` | Warning | Documentation names a parameter that the function does not have |
+| `duplicate-doc-field` | Warning | `@class` documents the same field more than once |
+| `incomplete-signature-doc` | Off | Function lacks parameter or return documentation |
+| `missing-global-doc` | Off | Global function or variable lacks documentation |
 | `unknown-doc-tag` | Off | Unknown `@tag` in an annotation comment |
-| `inject-field` | Off | Field added to a type outside its class definition |
+| `inject-field` | Off | Code adds a field to a type outside its class definition |
 
 ### Access control
 
 | Code | Default | Description |
 |---|---|---|
 | `access-invisible` | Warning | Accessing a `private` or `protected` member outside its class |
-| `discard-returns` | Warning | Return value from a `@nodiscard` function is not used |
+| `discard-returns` | Warning | Code ignores the return value from a `@nodiscard` function |
 
 ### GMod-specific
 
@@ -117,9 +117,9 @@ Use the [interactive settings panel](/configuration/overview#settings-panel-reco
 | `gmod-realm-mismatch` | Error | Calling a realm-specific function from the wrong realm |
 | `gmod-realm-mismatch-heuristic` | Error | Likely realm mismatch based on inferred evidence |
 | `gmod-unknown-realm` | Hint | Realm could not be resolved for a realm-aware call |
-| `gmod-invalid-hook-name` | Warning | Hook name is not a recognized GMod hook |
+| `gmod-invalid-hook-name` | Warning | Hook name does not match a recognized GMod hook |
 | `gmod-unknown-net-message` | Warning | `net.Start(name)` uses an unregistered message name |
-| `gmod-net-missing-network-counterpart` | Warning | `net.Start` has no `net.Receive` in the expected opposite realm |
+| `gmod-net-missing-network-counterpart` | Warning | `net.Start` lacks a matching `net.Receive` in the expected opposite realm |
 | `gmod-net-read-write-order-mismatch` | Warning | `net.Read*` calls don't match the order of `net.Write*` calls |
 | `gmod-net-read-write-type-mismatch` | Warning | `net.Read*` type doesn't match the corresponding `net.Write*` |
 | `gmod-net-read-write-bits-mismatch` | Warning | Literal bit-width differs between a matched write/read pair |
@@ -152,7 +152,7 @@ See the [`@diagnostic` annotation reference](/annotations/diagnostic) for full d
 
 ## Global whitelist
 
-Add globals that your code uses but GLuaLS doesn't know about (e.g., from another module that's loaded separately):
+Add globals that your code uses but GLuaLS does not know about, such as globals from a module loaded by another file:
 
 <ConfigTip />
 ```json .gluarc.json

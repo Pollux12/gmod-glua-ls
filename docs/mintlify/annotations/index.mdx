@@ -5,7 +5,7 @@ description: EmmyLua/LuaCATS type annotations supported by GLuaLS.
 
 ## What are annotations?
 
-Annotations are comments that start with `---@`. They give type information to the language server.
+Annotations are comments that start with `---@`. They give GLuaLS type information.
 
 Put them above functions, variables, and class definitions so GLuaLS can provide better completion, type checking, and hover docs.
 
@@ -19,7 +19,7 @@ end
 
 Annotations do not affect runtime. Garry's Mod treats them as normal comments.
 
-GLuaLS follows EmmyLua-style annotations, with extra support for GMod-specific cases. Compatibility with EmmyLua and LuaLS is kept where possible.
+GLuaLS follows EmmyLua-style annotations and adds support for GMod-specific cases. It keeps compatibility with EmmyLua and LuaLS where possible.
 
 ---
 
@@ -71,7 +71,7 @@ GLuaLS follows EmmyLua-style annotations, with extra support for GMod-specific c
 
 ## Type expression syntax
 
-Annotations use a common type expression syntax across all `@` tags:
+Annotations use the same type expression syntax across all `@` tags:
 
 | Syntax | Meaning |
 |---|---|

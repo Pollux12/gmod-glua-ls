@@ -7,7 +7,7 @@ description: Install the GLua Language Server VSCode extension and get set up in
 
 ## VSCode extension (recommended)
 
-The VS Code extension is the recommended way to use GLuaLS. It handles setup automatically:
+Use the VS Code extension for GLuaLS setup. It handles:
 - downloads the language server binary
 - downloads GMod wiki annotations
 - installs server and client debugger (optional)
@@ -23,14 +23,14 @@ The VS Code extension is the recommended way to use GLuaLS. It handles setup aut
     For working on multiple addons at once, use a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces).
   </Step>
   <Step title="Let the extension initialize">
-    On first launch, the extension automatically:
+    On first launch, the extension:
     - Downloads the language server binary
     - Downloads the latest GMod wiki annotations
     - Sets up the `.gluarc.json` configuration file if needed
 
     A notification in the bottom-right corner confirms when initialization is complete.
 
-    If you want to setup the debugger, continue to [Debugger setup](/debugger/setup).
+    If you want to set up the debugger, continue to [Debugger setup](/debugger/setup).
   </Step>
 </Steps>
 
@@ -40,7 +40,7 @@ Do not install other Lua language server extensions alongside GLuaLS. Extensions
 
 ## Workspace structure
 
-GLuaLS works best when each workspace folder represents a single addon or gamemode. The extension auto-detects the structure and configures itself accordingly.
+GLuaLS works best when each workspace folder contains one addon or gamemode. The extension detects the structure and configures itself.
 
 <Tip>
 If you are working on a gamemode with multiple addons, add each addon as its own folder in a multi-root workspace instead of opening the whole `garrysmod/` folder.
@@ -73,14 +73,14 @@ Each VS Code workspace root should match one folder shown above. Use one root fo
 All folders within the multi-root workspace must be from the same game directory. Do not mix some folders from client and some from SRCDS.
 </Warning>
 
-For example, if you are working on a gamemode with two addons, you would open each individually into VSCode as separate workspaces.
+For example, if you work on a gamemode with two addons, open each folder in VS Code as a separate workspace root.
 
-This would be a multi-root workspace with three folders added:
+Your multi-root workspace would have three folders:
 - `garrysmod/addons/my-addon-1/`
 - `garrysmod/addons/my-addon-2/`
 - `garrysmod/gamemodes/my-gamemode/`
 
-With this setup, your VSCode explorer should look similar to this:
+With this setup, your VS Code explorer should look like this:
 
 <Tree>
   <Tree.Folder name="my-addon-1" defaultOpen>
@@ -100,14 +100,14 @@ With this setup, your VSCode explorer should look similar to this:
 </Tree>
 
 <Tip>
-If you're using a multi-root workspace, you only need to set the debugger up for one of the folders. The same configuration will be valid for anything within the same Garry's Mod directory.
+If you use a multi-root workspace, set up the debugger for one folder. The same configuration works for the other folders in the same Garry's Mod directory.
 </Tip>
 
 ---
 
 ## Verify everything is working
 
-Open any `.lua` file in your project. You should immediately see:
+Open any `.lua` file in your project. You should see:
 
 - **Syntax highlighting** with semantic token coloring
 - **Autocomplete** as you type (press `Ctrl+Space` to trigger manually)
@@ -118,7 +118,7 @@ Open any `.lua` file in your project. You should immediately see:
 Workspace indexing usually finishes in a few seconds after extension startup, even on larger projects.
 
 <Tip>
-If you are not seeing any diagnostics but expected to, check the Garry's Mod Language Server section in the output panel for any errors.
+If you expected diagnostics but do not see any, check the Garry's Mod Language Server section in the output panel for errors.
 </Tip>
 
 ---
@@ -175,10 +175,10 @@ If you are not seeing any diagnostics but expected to, check the Garry's Mod Lan
 
 ## Other editors
 
-GLuaLS works with any LSP-compatible editor, but many advanced features (debugger, Class Explorer, settings UI, and more) are VS Code extension features.
+GLuaLS works with any LSP-compatible editor, but advanced features like the debugger, Class Explorer, and settings UI are VS Code extension features.
 
 <Note>
-Zed support is planned. It will have fewer features than the VSCode extension due to Zed's more limited extension API. Other editors are not currently planned.
+Zed support is planned. It will have fewer features than the VS Code extension because Zed has a smaller extension API. Other editors are not planned.
 </Note>
 
 ### Install the binary
@@ -201,14 +201,14 @@ The binary is at `target/release/glua_ls` (or `glua_ls.exe` on Windows).
 
 ### Standalone LSP Server Configuration
 
-When running `glua_ls` outside of the VSCode extension, you can specify the path to GMod annotations using the `--gmod-annotations-path` flag:
+When you run `glua_ls` outside of the VS Code extension, specify the GMod annotations path with the `--gmod-annotations-path` flag:
 
 ```bash
 glua_ls --gmod-annotations-path /path/to/gmod/annotations
 ```
 
 <Note>
-  The `--gmod-annotations-path` flag accepts a path to the folder containing the GMod API annotations (typically downloaded by the VSCode extension). Use `none` to explicitly disable annotations loading.
+  The `--gmod-annotations-path` flag accepts a path to the folder containing the GMod API annotations. The VS Code extension usually downloads these files. Use `none` to disable annotation loading.
 </Note>
 
 **Precedence for annotations path:**

@@ -5,7 +5,7 @@ description: Configure the built-in Lua formatter with presets, style overrides,
 
 ## Overview
 
-The `format` section controls how the language server formats Lua files. You can use a built-in preset, customise individual style rules, or delegate entirely to an external tool like StyLua.
+The `format` section controls how the language server formats Lua files. Use a built-in preset, customize individual style rules, or delegate formatting to an external tool like StyLua.
 
 ---
 
@@ -28,7 +28,7 @@ The `format` section controls how the language server formats Lua files. You can
 |---|---|
 | `"default"` | Standard style matching the EmmyLua Analyzer defaults |
 | `"cfc"` | CFC Labs style (common in community GMod development) |
-| `"custom"` | Starts from a clean slate — all rules must be set in `styleOverrides` |
+| `"custom"` | Starts from a clean slate. Set all rules in `styleOverrides` |
 
 ---
 
@@ -48,7 +48,7 @@ Delegate all formatting to an external tool:
 }
 ```
 
-The file contents are passed via stdin and the formatter writes to stdout.
+GLuaLS passes the file contents through stdin. The formatter writes the result to stdout.
 
 ---
 
@@ -56,7 +56,7 @@ The file contents are passed via stdin and the formatter writes to stdout.
 
 `styleOverrides` keys use `snake_case` matching the EmmyLuaCodeStyle style. They are applied on top of the selected `preset`.
 
-> Note: This page shows common settings. For the complete list, inspect the JSON schema at `crates/glua_code_analysis/resources/schema.json` under `EmmyrcFormatStyleOverrides`.
+> This page shows common settings. For the complete list, inspect the JSON schema at `crates/glua_code_analysis/resources/schema.json` under `EmmyrcFormatStyleOverrides`.
 
 ### Basic
 
@@ -159,7 +159,7 @@ These keys accept string expressions: `"keep"`, `"fixed(n)"`, `"min(n)"`, `"max(
 
 ## VSCode extension settings
 
-There are no `gluals.format.*` VSCode settings — formatting is configured entirely through `.gluarc.json`. You can enable format-on-save with these built-in VS Code settings:
+GLuaLS does not provide `gluals.format.*` VS Code settings. Configure formatting through `.gluarc.json`. You can enable format-on-save with these built-in VS Code settings:
 
 | VSCode Setting | Description |
 |---|---|

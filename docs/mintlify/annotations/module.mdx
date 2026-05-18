@@ -5,7 +5,7 @@ description: Declare a file as a named module for documentation and namespace or
 
 ## Overview
 
-`@module` declares a file as a named module. It provides a module identity for documentation generation, namespace organization, and tooling that processes annotation files.
+`@module` declares a file as a named module. Documentation tools use that name when they build module pages or process annotation files.
 
 ---
 
@@ -39,12 +39,12 @@ return utils
 
 - In library files that are consumed via `require()`
 - In generated stubs and meta declaration files
-- When you want documentation tools to identify the module by name
+- When documentation tools need a module name
 
-For most addon development, `@module` is optional — the language server resolves modules by file path regardless. It is most useful when generating documentation or building definition files for distribution.
+For most addon development, you can skip `@module`. GLuaLS resolves modules by file path. Use `@module` when you generate docs or build definition files for distribution.
 
 ---
 
 ## See also
 
-- [@meta](/annotations/meta) — Mark a file as a type-only declaration file (not runtime code)
+- [@meta](/annotations/meta): Mark a file as a type-only declaration file (not runtime code)

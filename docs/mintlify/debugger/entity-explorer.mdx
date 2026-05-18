@@ -5,7 +5,7 @@ description: Browse all entities, their NetworkVars, and table properties in a l
 
 ## Overview
 
-The **Entity Explorer** panel (in the GLuaLS sidebar) shows all entities currently in the server world. You can browse their properties, NetworkVars, and arbitrary table fields in a tree view — without writing any `print` calls.
+The **Entity Explorer** panel in the GLuaLS sidebar shows all entities in the server world. You can browse their properties, NetworkVars, and table fields in a tree view without writing `print` calls.
 
 {/* TODO: Add screenshot */}
 
@@ -13,12 +13,12 @@ The **Entity Explorer** panel (in the GLuaLS sidebar) shows all entities current
 
 ## Opening the explorer
 
-The Entity Explorer is available at any time when the debugger is connected:
+You can use the Entity Explorer whenever the debugger is connected:
 
 1. Click the **GLuaLS** icon in the sidebar
 2. Open the **Entity Explorer** section
 
-The list refreshes automatically every second while connected.
+The list refreshes every second while connected.
 
 ---
 
@@ -30,7 +30,7 @@ The top level shows all entities grouped or listed by class. Each entity shows:
 - **Class name** (e.g., `prop_physics`)
 - **Map model or description** if available
 
-Entities are updated live — spawning or removing an entity in-game reflects in the explorer.
+The explorer updates as entities spawn or leave the game.
 
 ---
 
@@ -56,7 +56,7 @@ When the debugger is **paused** (at a breakpoint), you can edit entity propertie
 4. Press Enter
 
 <Note>
-Editing is only available while paused. When running, the explorer is read-only to avoid race conditions.
+You can edit only while paused. When the game runs, the explorer is read-only to avoid race conditions.
 </Note>
 
 ---

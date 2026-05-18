@@ -5,7 +5,7 @@ description: Define classes with inheritance, generics, and field access control
 
 ## Overview
 
-`@class` defines a named type that other annotations can reference. Classes support single and multiple inheritance, generic type parameters, access control, and field definitions.
+`@class` defines a named type that other annotations can use. Classes support inheritance, generic type parameters, access control, and field definitions.
 
 ---
 
@@ -39,7 +39,7 @@ end
 
 ## Inheritance <a id="inheritance" />
 
-Use `: ParentClass` to extend another class. The child class inherits all fields and methods from the parent.
+Use `: ParentClass` to extend another class. The child class gets the parent's fields and methods.
 
 ```lua
 ---@class Dog : Animal
@@ -68,10 +68,10 @@ end
 
 ## Exact classes <a id="exact-classes" />
 
-Mark a class as `(exact)` to prevent dynamic field additions. Any field assigned outside the class definition causes a diagnostic:
+Mark a class as `(exact)` to prevent dynamic field additions. GLuaLS can report a diagnostic when code assigns a field outside the class definition:
 
 <Info>
-In GLuaLS, this annotation has no effect. All classes are partial by default, and related diagnostics are off. It is kept for EmmyLua compatibility.
+In GLuaLS, this annotation has no effect. GLuaLS treats all classes as partial by default and turns related diagnostics off. GLuaLS keeps it for EmmyLua compatibility.
 </Info>
 
 ```lua
@@ -87,10 +87,10 @@ p.z = 3 -- ❌ Error: cannot add field 'z' to exact type Point
 
 ## Partial classes <a id="partial-classes" />
 
-Use `(partial)` to extend an existing class without redeclaring all its fields:
+`(partial)` extends an existing class without relisting all fields:
 
 <Info>
-In GLuaLS, this annotation has no effect. All classes are partial by default, and related diagnostics are off. It is kept for EmmyLua compatibility.
+In GLuaLS, this annotation has no effect. GLuaLS treats all classes as partial by default and turns related diagnostics off. GLuaLS keeps it for EmmyLua compatibility.
 </Info>
 
 
@@ -107,7 +107,7 @@ In GLuaLS, this annotation has no effect. All classes are partial by default, an
 
 ## Generic classes <a id="generic-classes" />
 
-Add type parameters with angle brackets. Type parameters can be used in field types:
+Add type parameters with angle brackets. You can use type parameters in field types:
 
 ```lua
 ---@class Container<T>
@@ -126,7 +126,7 @@ stringContainer.items[1] = "hello" -- ✅ typed as string
 Use access modifiers in `@field`:
 
 <Info>
-Access modifiers do not change runtime behavior and are optional. The language server still checks them and can report diagnostics when private/protected fields are used from the wrong place. Treat them as type/style rules, not runtime access control.
+Access modifiers are optional. They affect type checking only, not runtime behavior. GLuaLS checks them and can report diagnostics when code uses private or protected fields from the wrong place.
 </Info>
 
 ```lua
@@ -136,13 +136,13 @@ Access modifiers do not change runtime behavior and are optional. The language s
 ---@field protected m_parent MyClass Accessible in subclasses
 ```
 
-See [@field](/annotations/field) for more information.
+See [@field](/annotations/field) for details.
 
 ---
 
 ## Attaching a class to a local variable <a id="attaching-a-class-to-a-local-variable" />
 
-The class annotation immediately above a `local` statement attaches to that variable. The type becomes an instance of the class:
+When you place `---@class` above a `local` statement, GLuaLS types that variable as an instance of the class:
 
 ```lua
 ---@class Player
@@ -150,7 +150,7 @@ local Player = {}
 -- Player is now typed as "instance of Player class"
 ```
 
-To type as a *constructor* table instead, use `@type`:
+To type a *constructor* table instead, use `@type`:
 
 ```lua
 local Player = {}

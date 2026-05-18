@@ -6,25 +6,25 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-GLuaLS ships without bundled GMod API definitions — instead, the VSCode extension automatically downloads the latest annotations generated from the Garry's Mod wiki. This means your API definitions stay current without waiting for extension updates.
+GLuaLS ships without bundled GMod API definitions. The VS Code extension downloads the latest annotations generated from the Garry's Mod wiki, so your API definitions stay current without extension updates.
 
 ---
 
 ## How it works
 
-On first launch and periodically thereafter, the extension:
+On first launch and on later checks, the extension:
 
 1. Checks the remote metadata for the [gluals-annotations](https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations) branch
 2. If the annotations are outdated or missing, downloads and extracts the latest ZIP
-3. Points the language server at the annotations path automatically
+3. Points the language server at the annotations path
 
-Annotations are stored in VS Code's global extension storage (separate from your project), so they are shared across all workspaces.
+VS Code stores annotations in global extension storage, separate from your project. All workspaces share them.
 
 ---
 
 ## Annotation source
 
-By default, the extension downloads annotations from `Pollux12/annotations-gmod-glua-ls` on the `gluals-annotations` branch. You can point automatic downloads at another compatible GitHub repository or branch from VS Code settings:
+By default, the extension downloads annotations from `Pollux12/annotations-gmod-glua-ls` on the `gluals-annotations` branch. You can point downloads at another compatible GitHub repository or branch from VS Code settings:
 
 | VSCode Setting | Default | Description |
 |---|---|---|
@@ -94,10 +94,10 @@ Point GLuaLS at your own annotations folder instead of the auto-downloaded ones:
 }
 ```
 
-The path can be absolute or relative to the workspace root. When `annotationsPath` is set, the auto-downloaded annotations are not used for that workspace.
+The path can be absolute or relative to the workspace root. When you set `annotationsPath`, GLuaLS does not use the downloaded annotations for that workspace.
 
 <Note>
-`gmod.annotationsPath` takes precedence over the extension's auto-download setting on a per-workspace basis. Set `gmod.autoLoadAnnotations: false` in `.gluarc.json` to fully disable auto-loading for that workspace regardless of extension settings or CLI-provided annotation paths.
+`gmod.annotationsPath` takes precedence over the extension's auto-download setting for that workspace. Set `gmod.autoLoadAnnotations: false` in `.gluarc.json` to disable auto-loading for that workspace, including extension settings and CLI-provided annotation paths.
 </Note>
 
 ---

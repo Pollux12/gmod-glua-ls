@@ -5,7 +5,7 @@ description: Mark a function as an accessor generator that synthesizes Get/Set p
 
 ## Overview
 
-`@accessorfunc` marks a function as an accessor generator. When it is called, GLuaLS creates `GetPropertyName()` and `SetPropertyName()` methods on the target class. This matches GMod's built-in `AccessorFunc()`.
+`@accessorfunc` marks a function as an accessor generator. When you call that function, GLuaLS creates `GetPropertyName()` and `SetPropertyName()` methods on the target class. This matches GMod's built-in `AccessorFunc()`.
 
 ---
 
@@ -17,7 +17,7 @@ description: Mark a function as an accessor generator that synthesizes Get/Set p
 ```
 
 - Without `N`: the first argument of the call is treated as the accessor name
-- `N`: a 1-indexed position specifying which argument provides the accessor name
+- `N`: a 1-indexed position for the argument that provides the accessor name
 
 ---
 
@@ -34,7 +34,7 @@ AccessorFunc(ENT, "m_bOrient", "Orient", FORCE_BOOL)
 -- ENT:SetOrient(value: any) -> nil
 ```
 
-At present, getter/setter values are typed as `any` in the implementation; stronger inference from the backing field is planned.
+GLuaLS types getter and setter values as `any`. Future versions will infer stronger types from the backing field.
 
 ---
 
@@ -75,7 +75,7 @@ end
 
 ## Current limitations
 
-- Synthesized getters return `any` and setters accept `any` — the types are not inferred from the field name or var type yet
+- Synthesized getters return `any` and setters accept `any`; GLuaLS does not infer these types from the field name or var type yet
 - Works on any class, not just GMod scripted entities
 - Not gated by `gmod.enabled`
 
@@ -83,4 +83,4 @@ end
 
 ## See also
 
-- [NetworkVar synthesis](/language/scripted-classes#networkvar-synthesis) — how `self:NetworkVar(...)` generates typed accessors automatically
+- [NetworkVar synthesis](/language/scripted-classes#networkvar-synthesis) - how `self:NetworkVar(...)` generates typed accessors

@@ -7,7 +7,7 @@ description: The GLuaLS debugger lets you set breakpoints, inspect variables, an
 
 GLuaLS includes a full **source-level debugger** for Garry's Mod servers. You can set breakpoints, step code, inspect variables, edit values, and run Lua from VS Code while the game is running.
 
-The VS Code extension also includes an automatic setup flow that can download the right `gm_rdb` build and guide you through installation.
+The VS Code extension can download the right `gm_rdb` build and guide you through installation.
 
 ---
 
@@ -15,8 +15,8 @@ The VS Code extension also includes an automatic setup flow that can download th
 
 The debugger uses the **LRDB** (Lua Remote Debugger) protocol over TCP:
 
-1. **gm_rdb** — a Garry's Mod binary module loaded by SRCDS. It talks to the game engine and exposes a TCP debug endpoint.
-2. **GLuaLS Extension** — the VS Code extension connects to the TCP endpoint started by the binary module. It sends commands and receives data.
+1. **gm_rdb**: a Garry's Mod binary module loaded by SRCDS. It talks to the game engine and exposes a TCP debug endpoint.
+2. **GLuaLS Extension**: the VS Code extension connects to the TCP endpoint started by the binary module. It sends commands and receives data.
 
 Your Lua files are served from source paths in your workspace, so local breakpoints map to the running code.
 
@@ -25,7 +25,7 @@ Your Lua files are served from source paths in your workspace, so local breakpoi
 ## Requirements
 
 <Warning>
-The debugger is fully supported only on **SRCDS** (dedicated server). Clientside support is still limited. Listen servers are not supported.
+The debugger supports **SRCDS** (dedicated server). Clientside support is still limited. Listen servers are not supported.
 </Warning>
 
 - SRCDS (dedicated server) running on Windows or Linux
@@ -47,7 +47,7 @@ The debugger is fully supported only on **SRCDS** (dedicated server). Clientside
 | **Variable inspection** | Locals, globals, and upvalues at each stack frame |
 | **Variable editing** | Modify variable values while paused |
 | **Expression evaluation** | Evaluate Lua expressions in the Debug Console |
-| **Stop on error** | Pause automatically when a Lua error is thrown |
+| **Stop on error** | Pause when Lua throws an error |
 | **Stop on entry** | Pause at the first line when connecting |
 | **Lua execution** | Run Lua code, files, or commands from the debug toolbar |
 | **Entity explorer** | Browse entity properties and NetworkVars in a tree view |

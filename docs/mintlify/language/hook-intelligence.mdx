@@ -5,7 +5,7 @@ description: GLuaLS validates hook names, infers parameter types, and autocomple
 
 ## Overview
 
-GMod's hook system is central to almost every addon and gamemode. GLuaLS understands `hook.Add`, `hook.Remove`, `hook.Run`, `hook.Call`, and `GM:` definitions — providing completions, type inference, and validation for all of them.
+GMod addons use hooks to respond to game events. GLuaLS understands `hook.Add`, `hook.Remove`, `hook.Run`, `hook.Call`, and `GM:` definitions. It provides completions, type inference, and validation for each one.
 
 ---
 
@@ -19,17 +19,17 @@ hook.Add("PlayerSpan", "MyAddon", function(ply) -- ❌ did you mean PlayerSpawn?
 end)
 ```
 
-All base gmod hooks are recognised via the base gmod hook definitions. Custom hooks defined elsewhere in your workspace via `hook.Run("MyCustomHook", ...)` are also tracked.
+GLuaLS recognizes base GMod hooks from the built-in hook definitions. It also tracks custom hooks in your workspace when your code calls `hook.Run("MyCustomHook", ...)`.
 
 <Info>
-For custom hooks, while autocomplete will work as long as it has been used once, it will lack any "Goto" definition, parameter type inference, or other advanced hook features unless a `GM:` function has been defined for that hook.
+For custom hooks, autocomplete works after code uses the hook once. Go to definition, parameter type inference, and other advanced hook features need a `GM:` function for that hook.
 </Info>
 
 ---
 
 ## Parameter type inference
 
-When GLuaLS knows the hook name, it automatically types the callback parameters:
+When GLuaLS knows the hook name, it types the callback parameters:
 
 ```lua
 hook.Add("PlayerSpawn", "MyAddon", function(ply)
@@ -49,7 +49,7 @@ end)
 
 ## Callback snippet completion
 
-When you type `hook.Add("HookName",` and trigger completion on the callback argument, GLuaLS inserts a fully typed function snippet:
+When you type `hook.Add("HookName",` and trigger completion on the callback argument, GLuaLS inserts a typed function snippet:
 
 ```lua
 -- Accepting completion for hook.Add("PlayerSpawn") inserts:
@@ -64,7 +64,7 @@ The snippet includes the correct number of parameters with their names.
 
 ## GM: hook definitions
 
-Files in a gamemode context (e.g., `gamemodes/*/gamemode/`) define `GM` as the gamemode table. GLuaLS recognizes `function GM:HookName()` as a hook override:
+Files in a gamemode context, such as `gamemodes/*/gamemode/`, define `GM` as the gamemode table. GLuaLS recognizes `function GM:HookName()` as a hook override:
 
 ```lua
 function GM:PlayerSpawn(ply)
@@ -89,7 +89,7 @@ hook.Run("PlayerSpawn", ply)  -- "PlayerSpawn" autocompletes
 
 ## Custom hooks
 
-Hooks created by your code (or your library) are also tracked:
+GLuaLS also tracks hooks created by your code or your library:
 
 ```lua
 -- Somewhere in your code:
@@ -102,18 +102,18 @@ end)
 ```
 
 <Info>
-Advanced features such as parameter type inference, hover descriptions, function validation, usages and view definitions will only work for custom hooks if a `GM:` definition has been created for that hook.
+For advanced features (parameter type inference, hover descriptions, function validation), define a `GM:` method for each custom hook.
 </Info>
 
 ---
 
 ## VSCode integration
 
-Hook intelligence works automatically when you use `hook.Add`, `hook.Run`, or define `GM:` methods. Configure validation behavior in the [settings panel](/configuration/overview#settings-panel-recommended) — see [GMod settings](/configuration/gmod#hooks) for the full reference.
+Hook intelligence works when you use `hook.Add`, `hook.Run`, or define `GM:` methods. Configure validation behavior in the [settings panel](/configuration/overview#settings-panel-recommended). See [GMod settings](/configuration/gmod#hooks) for the full reference.
 
 ## Configuration
 
-Hook validation and mappings are now controlled through the `gmod` section in `.gluarc.json`, in particular `gmod.hookMappings` and the global diagnostics settings.
+Control hook validation and mappings through the `gmod` section in `.gluarc.json`, especially `gmod.hookMappings` and the global diagnostics settings.
 
 | Setting | Default | Description |
 |---|---|---|
@@ -121,4 +121,3 @@ Hook validation and mappings are now controlled through the `gmod` section in `.
 | `gmod.hookMappings.emitterToHook` | `{}` | Map custom emitter functions to hook names |
 | `gmod.hookMappings.methodPrefixes` | `[]` | Custom method prefixes for inferred `GM:` hook methods |
 | `diagnostics.disable` | `[]` | Disable individual diagnostics (e.g., `"gmod-invalid-hook-name"`) |
-

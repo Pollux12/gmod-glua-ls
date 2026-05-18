@@ -5,7 +5,7 @@ description: Mark a Lua table as an enumeration with named values.
 
 ## Overview
 
-`@enum` marks a local table as an enum type. Table values become valid enum members. GLuaLS can report invalid enum usage with `enum-value-mismatch` (when enabled).
+`@enum` marks a local table as an enum type. Table values become valid enum members. GLuaLS can report invalid enum values with `enum-value-mismatch` when you enable that diagnostic.
 
 ---
 
@@ -55,7 +55,7 @@ local GameState = {
 
 ## `(key)` modifier
 
-Using `(key)` treats the **keys** of the table as the enum values (rather than the values):
+Use `(key)` when the table **keys** are the enum values:
 
 ```lua
 ---@enum (key) Direction
@@ -75,9 +75,9 @@ local d2 = "up"   -- ❌ not a Direction
 
 ## Enum vs. @alias
 
-Both `@enum` and `@alias` with `---|` can model a fixed set of values. Use:
-- `@enum` when you have an actual Lua table with named constants that you reference at runtime
-- `@alias` with `---|` when you just want to document that a string parameter must be one of a specific set
+Both `@enum` and `@alias` with `---|` can describe a fixed set of values. Use:
+- `@enum` when your addon has a Lua table of named constants that code reads at runtime
+- `@alias` with `---|` when a string parameter accepts a fixed set of text values
 
 ---
 
@@ -94,4 +94,4 @@ local DAMAGE = {
 }
 ```
 
-In practice, GMod's built-in enums (like `DAMAGE`, `TEAM`, `MOVETYPE`) come from the auto-downloaded annotations and don't need to be redeclared.
+GMod's built-in enums, such as `DAMAGE`, `TEAM`, and `MOVETYPE`, come from the downloaded annotations. You do not need to redeclare them.

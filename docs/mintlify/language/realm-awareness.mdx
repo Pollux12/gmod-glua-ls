@@ -11,13 +11,13 @@ Garry's Mod Lua runs in two **realms**: client (`CLIENT`) and server (`SERVER`).
 
 Many GMod API functions only exist in one realm (for example, `LocalPlayer()` is client-only). Calling them in the wrong realm is a common bug.
 
-GLuaLS automatically detects which realm each file runs in and issues diagnostics when you call realm-restricted functions from the wrong realm.
+GLuaLS detects which realm each file runs in and reports diagnostics when you call realm-restricted functions from the wrong realm.
 
 ---
 
 ## Realm detection
 
-GLuaLS detects realm using multiple signals. It usually works without extra setup.
+GLuaLS detects realm using multiple signals. Most projects need no extra setup.
 
 GLuaLS infers realm with this **5-level priority** system (highest to lowest):
 
@@ -39,7 +39,7 @@ See the [`@realm` annotation reference](/annotations/realm) for full syntax. `@r
 
 ### 2. Filename prefix detection
 
-Files beginning with `cl_`, `sv_`, or `sh_` are assigned their realm automatically:
+GLuaLS assigns realms to files that begin with `cl_`, `sv_`, or `sh_`:
 
 | Prefix | Realm |
 |---|---|
@@ -49,7 +49,7 @@ Files beginning with `cl_`, `sv_`, or `sh_` are assigned their realm automatical
 
 ### 3. Directory-based detection
 
-Files in well-known directories are assigned a realm:
+GLuaLS assigns realms to files in common GMod directories:
 
 | Path pattern | Realm |
 |---|---|
@@ -82,7 +82,7 @@ end
 
 ### 5. Heuristic inference (lowest priority)
 
-If none of the above apply, GLuaLS can infer realm from code usage (for example, calling a server-only API suggests server realm). This heuristic may be wrong in some cases.
+When no other rule applies, GLuaLS infers realm from code usage. Calling a server-only API suggests server realm. This heuristic is less reliable than explicit detection.
 
 ---
 
@@ -103,7 +103,7 @@ When call-based detection is on, GLuaLS also looks at file-loading calls:
 
 ## Loading defaults
 
-Default path-based realm rules are based on Garry's Mod's usual loading conventions (or very similar patterns). See [Lua Loading Order](https://wiki.facepunch.com/gmod/Lua_Loading_Order) for reference.
+Default path-based realm rules follow Garry's Mod's usual loading conventions and similar addon patterns. See [Lua Loading Order](https://wiki.facepunch.com/gmod/Lua_Loading_Order) for reference.
 
 ---
 
@@ -120,7 +120,7 @@ Default path-based realm rules are based on Garry's Mod's usual loading conventi
 ## Disabling realm checks
 
 <Warning>
-Do not disable realm checks unless you really need to. Other features depend on them. In most cases, disable only specific diagnostics from settings.
+Disable realm checks only when necessary. Other features depend on realm detection. In most cases, disable only specific diagnostics from settings.
 </Warning>
 
 Disable realm diagnostics workspace-wide:
@@ -156,7 +156,7 @@ function MyAddon.ServerAction()
 end
 ```
 
-Use function-level overrides when possible. This is faster because the language server can skip expensive inference when annotations are present.
+Use function-level overrides when possible. They help the language server skip expensive inference when annotations are present.
 
 ---
 
@@ -164,9 +164,9 @@ Use function-level overrides when possible. This is faster because the language 
 
 Every hover tooltip for a GMod API function includes a realm badge showing where it runs:
 
-- **Client** badge — function is clientside only
-- **Server** badge — function is serverside only
-- **Shared** badge — function is available on both realms
+- **Client** badge: function is clientside only
+- **Server** badge: function is serverside only
+- **Shared** badge: function is available on both realms
 
 The badge appears in completions as well, so you can check a function's realm before inserting it.
 

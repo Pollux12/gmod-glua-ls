@@ -7,7 +7,7 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-`@fileparam` sets a default type for any parameter with a matching name across all functions in the current file. Functions that don't have an explicit `@param` for that name fall back to the file-level default.
+`@fileparam` sets a default type for any parameter with the same name in the current file. Functions without an explicit `@param` for that name use the file-level default.
 
 ---
 
@@ -43,17 +43,17 @@ end
 
 ## Precedence
 
-If GLuaLS cannot already infer the parameter type from the function signature or owning type, it falls back in this order:
+If GLuaLS cannot infer the parameter type from the function signature or owning type, it checks these sources in order:
 
 1. **Explicit `@param`** annotation on the function itself
 2. **`@fileparam`** for the current file
-3. **`gmod.fileParamDefaults`** in `.gluarc.json` — workspace-wide defaults
+3. **`gmod.fileParamDefaults`** in `.gluarc.json`: workspace-wide defaults
 
 ---
 
 ## Override with @param
 
-If one function in the file needs a different type for the same parameter name, add an explicit `@param`:
+If one function in the file needs a different type for the same parameter name, add `@param` to that function:
 
 ```lua
 ---@fileparam vehicle Vehicle
@@ -74,7 +74,7 @@ end
 
 ## Workspace defaults
 
-Configure defaults that apply to all files in the workspace:
+Set defaults for all files in the workspace:
 
 <ConfigTip />
 ```json .gluarc.json
@@ -93,7 +93,7 @@ Configure defaults that apply to all files in the workspace:
 
 ## Common patterns
 
-In GMod addon development, certain parameter names are almost always the same type. Using `@fileparam` or workspace defaults cuts down on repeated `@param` annotations:
+GMod addons reuse parameter names such as `ply`, `attacker`, and `victim`. Use `@fileparam` or workspace defaults to avoid repeated `@param` annotations:
 
 ```lua
 ---@fileparam ply Player

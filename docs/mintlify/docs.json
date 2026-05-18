@@ -102,6 +102,7 @@
             "pages": [
               "annotations/param",
               "annotations/return",
+              "annotations/outparam",
               "annotations/overload",
               "annotations/async",
               "annotations/nodiscard"

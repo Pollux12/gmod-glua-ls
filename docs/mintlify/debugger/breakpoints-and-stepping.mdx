@@ -20,11 +20,11 @@ Right-click in the gutter (or on an existing breakpoint) and choose **Edit Break
 ply:Health() < 10
 ```
 
-The condition is evaluated as a Lua expression in the context of the paused stack frame. Execution only pauses when the expression returns a truthy value.
+The debugger evaluates the condition as a Lua expression in the paused stack frame. Execution pauses only when the expression returns a truthy value.
 
 ### Logpoints
 
-Instead of pausing, a logpoint prints a message to the Debug Console when execution reaches that line. Right-click in the gutter and choose **Add Logpoint**:
+A logpoint prints a message to the Debug Console when execution reaches that line. Right-click in the gutter and choose **Add Logpoint**:
 
 ```
 Player {ply:Nick()} took damage: {dmg:GetDamage()}
@@ -70,7 +70,7 @@ Set `"stopOnEntry": true` in `launch.json` (default: `true`) to pause at the fir
 
 Set `"stopOnError": true` in `launch.json` to pause when a Lua error is thrown anywhere on the server, including unhandled errors in hook callbacks.
 
-The call stack at the moment of the error is preserved so you can inspect the full execution context.
+GLuaLS preserves the call stack at the moment of the error so you can inspect the full execution context.
 
 ---
 

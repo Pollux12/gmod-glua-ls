@@ -7,13 +7,13 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-These settings control the visual editor hints overlaid on code, the documentation shown on hover, and the appearance of semantic syntax highlighting.
+These settings control editor hints, hover documentation, and semantic syntax highlighting.
 
 ---
 
 ## Inlay hints (`hint.*`)
 
-Inlay hints are inline type/name annotations shown inside the editor alongside code.
+Inlay hints show inline type and name annotations beside your code.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -77,7 +77,7 @@ Hover documentation shows:
 
 ## Semantic tokens (`semanticTokens.*`)
 
-Semantic tokens provide richer syntax highlighting based on type analysis — variables are coloured by role (local, global, field, method, etc.) rather than lexical category.
+Semantic tokens provide syntax highlighting based on type analysis. GLuaLS colors variables by role, such as local, global, field, or method, instead of lexical category.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -106,7 +106,7 @@ Semantic tokens provide richer syntax highlighting based on type analysis — va
 
 ## VSCode extension settings
 
-These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
 | VSCode Setting | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|---|

@@ -10,14 +10,14 @@ GLuaLS includes a built-in **MCP (Model Context Protocol) server**. It exposes y
 When the debugger is connected, GitHub Copilot Chat (and other MCP-capable tools) can run Lua code, fetch console output, read errors, and check debug state without leaving chat.
 
 <Note>
-AI features have been tested primarily with GitHub Copilot Chat. Other AI providers supporting MCP may work but are not officially supported.
+The GLuaLS team tests AI features with GitHub Copilot Chat. Other MCP AI providers may work, but GLuaLS does not support them.
 </Note>
 
 ---
 
 ## Available MCP tools
 
-When the debugger is connected, the following tools are available to AI agents:
+When the debugger is connected, AI agents can use these tools:
 
 | Tool | Description |
 |---|---|
@@ -32,7 +32,7 @@ When the debugger is connected, the following tools are available to AI agents:
 
 ## Setting up
 
-The MCP server starts automatically when the extension loads. The extension also registers tools with GitHub Copilot automatically.
+The extension starts the MCP server when it loads. It also registers tools with GitHub Copilot.
 
 To connect Copilot:
 
@@ -41,7 +41,7 @@ To connect Copilot:
     Code execution tools (`run_lua`, `run_command`, `run_file`) require an active debug session. `get_output`, `get_errors`, and `get_debug_state` can work whenever the MCP server is running.
   </Step>
   <Step title="Configure Copilot to use the MCP server">
-    This is usually done automatically by the VS Code extension. Check that the "Garry's Mod Language Server" toolset is enabled.
+    The VS Code extension usually handles this step. Check that the "Garry's Mod Language Server" toolset is enabled.
   </Step>
   <Step title="Use Copilot Chat">
     Once connected, Copilot can do things like:

@@ -5,7 +5,7 @@ description: Define multiple signatures for a single function.
 
 ## Overview
 
-`@overload` allows a single function to have multiple type signatures. GLuaLS uses overloads to type-check calls and infer return types based on which overload matches.
+`@overload` defines multiple type signatures for a single function. GLuaLS uses overloads to type-check calls and infer return types from the matching overload.
 
 ---
 
@@ -47,7 +47,7 @@ end
 
 ## Optional parameters via overloads
 
-Overloads are an alternative to optional `?` parameters when different parameter combinations have meaningfully different types:
+Use overloads instead of optional `?` parameters when parameter combinations have different types:
 
 ```lua
 ---@overload fun(name: string): Player | nil
@@ -80,6 +80,6 @@ function Player:IsFriendsWith(target) end
 
 ## Tips
 
-- The primary `@param`/`@return` annotations define the most general signature
-- `@overload` provides the specific, narrower signatures
-- Overloads are matched in order — put more specific overloads first
+- The primary `@param`/`@return` annotations define the general signature
+- `@overload` adds specific, narrower signatures
+- GLuaLS checks overloads in order, so put more specific overloads first

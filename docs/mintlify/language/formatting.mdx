@@ -11,13 +11,13 @@ GLuaLS includes an opinionated Lua formatter. Format the current file with `Shif
 
 ## Built-in presets
 
-Three built-in presets cover common style choices across the GMod community:
+GLuaLS includes three presets for common GMod style choices:
 
 | Preset | Description |
 |---|---|
 | `default` | Standard, no specific style |
 | `cfc` | [Follows CFC-Servers style guidelines](https://github.com/CFC-Servers/cfc_glua_style_guidelines) |
-| `custom` | Fall through to `styleOverrides` entirely |
+| `custom` | Use only `styleOverrides` |
 
 Set the preset in `.gluarc.json`:
 
@@ -33,7 +33,7 @@ Set the preset in `.gluarc.json`:
 
 ## Style overrides
 
-Override individual rules within a preset using `styleOverrides`:
+Use `styleOverrides` to change individual rules within a preset:
 
 <ConfigTip />
 ```json .gluarc.json
@@ -69,7 +69,7 @@ See [Configuration: Formatting](/configuration/formatting) for the full list.
 
 ## External formatter
 
-Use an external formatting tool (e.g., `stylua` or `GLuaFixer`) instead of the built-in formatter:
+Use an external formatting tool, such as `stylua` or `GLuaFixer`, instead of the built-in formatter:
 
 <ConfigTip />
 ```json .gluarc.json
@@ -89,7 +89,7 @@ The external formatter receives file content over stdin and must write the forma
 
 ## EditorConfig
 
-GLuaLS can read `.editorconfig` indent settings. Those values can override matching `styleOverrides` entries, depending on your configured priority between `.editorconfig` and `.gluarc.json`.
+GLuaLS can read `.editorconfig` indent settings. Those values can override matching `styleOverrides` entries based on your priority setting between `.editorconfig` and `.gluarc.json`.
 
 
 ## Format on save

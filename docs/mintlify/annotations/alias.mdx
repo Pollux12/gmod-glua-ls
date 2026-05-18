@@ -5,7 +5,7 @@ description: Create named type aliases for use across your codebase.
 
 ## Overview
 
-`@alias` creates a named alias for a type expression, letting you give meaningful names to complex or frequently-used types.
+`@alias` gives a type expression a name. Use it for long types or types you reuse across your addon.
 
 ---
 
@@ -29,7 +29,7 @@ description: Create named type aliases for use across your codebase.
 ---@alias Callback fun(result: any): nil
 ```
 
-Once defined, use the alias name anywhere a type expression is expected:
+After you define an alias, use its name anywhere GLuaLS expects a type:
 
 ```lua
 ---@param id ID
@@ -50,7 +50,7 @@ function GetPlayerName(id) end
 
 ## String literal enumerations
 
-Use the `---|` syntax to define a set of allowed string values:
+Use `---|` to list allowed string values:
 
 ```lua
 ---@alias Realm
@@ -62,7 +62,7 @@ Use the `---|` syntax to define a set of allowed string values:
 function SetDefaultRealm(realm) end
 ```
 
-When this alias is used as a parameter type, completions will suggest only the defined string values.
+When you use this alias as a parameter type, completions show the listed string values.
 
 ---
 

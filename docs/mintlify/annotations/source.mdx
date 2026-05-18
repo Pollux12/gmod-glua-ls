@@ -7,11 +7,11 @@ description: Link generated annotations to source files or external documentatio
 
 `@source` links generated annotations back to their original source.
 
-For local source URIs such as `file:///...`, GLuaLS uses this as a **Go to Definition** redirect. For web URLs such as `https://...`, GLuaLS treats the URL as external documentation only, so hover can show it as a clickable **Source** link without replacing the real code definition target.
+For local source URIs such as `file:///...`, GLuaLS uses `@source` as a **Go to Definition** redirect. For web URLs such as `https://...`, GLuaLS treats the URL as external documentation. Hover can show it as a clickable **Source** link without replacing the real code definition target.
 
-When a symbol with `@source` is shown in hover, GLuaLS also renders the source URI as a clickable Markdown link.
+When hover shows a symbol with `@source`, GLuaLS renders the source URI as a clickable Markdown link.
 
-This is mainly useful in generated annotation files that point back to a real source file or to an external reference page.
+Use this in generated annotation files that point back to a real source file or an external reference page.
 
 ---
 
@@ -34,7 +34,7 @@ This is mainly useful in generated annotation files that point back to a real so
 
 ## Usage
 
-This is most commonly used in generated stubs where you want **Go to Definition** on a stub to jump to the real implementation.
+Use this in generated stubs when you want **Go to Definition** to jump from a stub to the real implementation.
 
 ```lua
 -- In some generated definition file:

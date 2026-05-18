@@ -6,7 +6,7 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-`@deprecated` marks a function, field, or class as deprecated. Using that symbol triggers a `deprecated` diagnostic (hint by default) and shows strikethrough in completions.
+`@deprecated` marks a function, field, or class as deprecated. When your code uses that symbol, GLuaLS reports a `deprecated` diagnostic (hint by default) and shows strikethrough in completions.
 
 ---
 
@@ -28,13 +28,13 @@ function OldPlayerJoin(ply)
 end
 ```
 
-Any call to `OldPlayerJoin` will show a deprecation hint.
+Calls to `OldPlayerJoin` show a deprecation hint.
 
 ---
 
 ## With a migration message
 
-The message appears in the diagnostic and in hover documentation:
+GLuaLS shows the message in the diagnostic and hover documentation:
 
 ```lua
 ---@deprecated Use PLUGIN:OnPlayerSpawn(ply) instead
@@ -67,7 +67,7 @@ local OldPlayerManager = {}
 
 ## Severity
 
-The `deprecated` diagnostic defaults to `hint` severity (subtle underline). You can change it:
+The `deprecated` diagnostic uses `hint` severity by default (subtle underline). You can change it:
 
 <ConfigTip />
 

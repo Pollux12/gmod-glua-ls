@@ -5,7 +5,7 @@ description: Mark a function as coroutine-based or asynchronous.
 
 ## Overview
 
-`@async` marks a function as asynchronous. In practice, this usually means the function uses `coroutine.yield` and should run inside a coroutine. It is documentation-only and helps async-aware diagnostics.
+`@async` marks a function as asynchronous. In GLua, this often means the function calls `coroutine.yield` and must run inside a coroutine. The annotation affects documentation and async-aware diagnostics. It does not change runtime behavior.
 
 ---
 
@@ -43,7 +43,7 @@ end
 
 ## Common GMod patterns
 
-GLuaLS supports async-style workflows with coroutines and callbacks. GMod has no built-in `await()`, but many addons use helper wrappers to get similar behavior.
+GLuaLS supports async-style code that uses coroutines and callbacks. GMod has no built-in `await()`, but many addons use helper wrappers for the same pattern.
 
 ```lua
 ---@async

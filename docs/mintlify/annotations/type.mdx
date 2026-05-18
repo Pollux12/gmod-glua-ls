@@ -5,7 +5,7 @@ description: Declare the type of a variable or expression.
 
 ## Overview
 
-`@type` annotates a local variable, global, or table field with a specific type. Use it when GLuaLS cannot infer the type automatically (e.g., external data, dynamic construction).
+`@type` annotates a local variable, global, or table field with a specific type. Use it when GLuaLS cannot infer the type from code, such as external data or dynamic construction.
 
 ---
 
@@ -91,7 +91,7 @@ local predicate = IsAdmin
 
 ## `(instance)` modifier
 
-When `(instance)` is used, fields added to the variable after this annotation are scoped to *only that variable* — they don't modify the global class definition:
+When you use `(instance)`, GLuaLS keeps fields added after this annotation on *only that variable*. It does not modify the global class definition:
 
 ```lua
 ---@type (instance) Panel
@@ -104,7 +104,7 @@ function myPanel:Refresh() end  -- Only exists on myPanel, not all Panels
 
 ## `(definition)` modifier
 
-When `(definition)` is used, fields added to the variable are treated as global additions to the class:
+When you use `(definition)`, GLuaLS treats fields added to the variable as global additions to the class:
 
 ```lua
 ---@type (definition) Entity

@@ -5,7 +5,7 @@ description: Configure autocomplete behavior, call snippets, postfix triggers, a
 
 ## Overview
 
-The `completion` section controls how the language server generates autocomplete suggestions. Options here adjust snippet expansion, require insertion, and the postfix trigger character.
+The `completion` section controls autocomplete suggestions. These options adjust snippet expansion, require insertion, and the postfix trigger character.
 
 ---
 
@@ -39,7 +39,7 @@ end)
 
 ### Staged snippets
 
-`stagedCallSnippets` enables split-stage completion for known GMod callbacks. After accepting a hook name, the system knows the expected hook signature and populates parameter names automatically. Set `false` to always use a generic placeholder.
+`stagedCallSnippets` enables split-stage completion for known GMod callbacks. After you accept a hook name, GLuaLS uses the expected hook signature and fills parameter names. Set `false` to use a generic placeholder.
 
 ---
 
@@ -58,7 +58,7 @@ Change the trigger character if `@` conflicts with your code style.
 
 ## Auto-require
 
-When you accept a completion from an imported module, `autoRequire` inserts a `require()` at the top of the file automatically:
+When you accept a completion from an imported module, `autoRequire` inserts a `require()` at the top of the file:
 
 ```lua
 -- Accepting `mylib.doThing` inserts:
@@ -79,7 +79,7 @@ Set `autoRequireFunction` to your project's custom loader if you use one:
 
 ## VSCode extension settings
 
-These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
 | VSCode Setting | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|---|
