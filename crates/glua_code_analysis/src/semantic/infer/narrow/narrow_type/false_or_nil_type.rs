@@ -1,4 +1,6 @@
-use crate::{DbIndex, LuaInstanceType, LuaType, semantic::infer::narrow::narrow_type::narrow_down_type};
+use crate::{
+    DbIndex, LuaInstanceType, LuaType, semantic::infer::narrow::narrow_type::narrow_down_type,
+};
 
 /// Narrows a type to only its falsy parts (false or nil).
 ///
@@ -86,7 +88,9 @@ pub fn remove_false_or_nil(t: LuaType) -> LuaType {
             if new_base.is_unknown() {
                 LuaType::Unknown
             } else {
-                LuaType::Instance(LuaInstanceType::new(new_base, instance_type.get_range().clone()).into())
+                LuaType::Instance(
+                    LuaInstanceType::new(new_base, instance_type.get_range().clone()).into(),
+                )
             }
         }
         _ => t,

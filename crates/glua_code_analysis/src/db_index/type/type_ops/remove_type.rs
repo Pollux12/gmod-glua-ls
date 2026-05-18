@@ -155,10 +155,9 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
     // its base, preserving the Instance wrapper with the narrowed base type.
     if let LuaType::Instance(instance_type) = real_type {
         if let Some(new_base) = remove_type(db, instance_type.get_base().clone(), removed_type) {
-            return Some(LuaType::Instance(LuaInstanceType::new(
-                new_base,
-                instance_type.get_range().clone(),
-            ).into()));
+            return Some(LuaType::Instance(
+                LuaInstanceType::new(new_base, instance_type.get_range().clone()).into(),
+            ));
         }
         // If the entire base was removed, the Instance has no valid type.
         return Some(LuaType::Never);

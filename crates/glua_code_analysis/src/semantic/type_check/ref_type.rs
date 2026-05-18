@@ -20,8 +20,7 @@ use super::{
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
 
 fn is_exact_gmod_null_decl_id(context: &TypeCheckContext, type_id: &LuaTypeDeclId) -> bool {
-    context.db.get_emmyrc().gmod.enabled
-        && type_id.get_simple_name() == GMOD_NULL_TYPE_NAME
+    context.db.get_emmyrc().gmod.enabled && type_id.get_simple_name() == GMOD_NULL_TYPE_NAME
 }
 
 /// In GMod, NULL is the "zero value" of Entity — an invalid/empty Entity.
@@ -224,9 +223,7 @@ fn check_ref_class(
             // but is a pragmatic choice to reduce noise in GMod codebases.
             // is_sub_type_of(db, source_id, id) checks: is source a subtype of compact?
             // If yes, source is more specific than compact → allow in GMod mode.
-            if context.db.get_emmyrc().gmod.enabled
-                && is_sub_type_of(context.db, source_id, id)
-            {
+            if context.db.get_emmyrc().gmod.enabled && is_sub_type_of(context.db, source_id, id) {
                 return Ok(());
             }
 
