@@ -342,4 +342,118 @@ foo({})
             "#
         ));
     }
+
+    #[test]
+    fn test_defaulted_field_not_required_for_table_literal() {
+        let mut ws = VirtualWorkspace::new();
+        // Defaulted field should be omit-able in a table literal.
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class TraceResult
+            ---@field Hit boolean=false
+            ---@field HitPos number
+
+            ---@type TraceResult
+            local tr = { HitPos = 1 }
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_defaulted_field_not_required_in_call_argument() {
+        let mut ws = VirtualWorkspace::new();
+        // Reported shape: partial table to a function param should not
+        // trigger missing-fields for defaulted class fields.
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class FontData
+            ---@field font string
+            ---@field size number=14
+            ---@field weight number=500
+            ---@field antialias boolean=true
+
+            ---@param data FontData
+            local function CreateFont(data) end
+
+            CreateFont({ font = "Arial", size = 48 })
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_defaulted_generic_field_not_required() {
+        let mut ws = VirtualWorkspace::new();
+        // Defaulted fields on generic classes should also be optional-for-writing.
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Container<T>
+            ---@field value T
+            ---@field count number=0
+
+            ---@type Container<string>
+            local c = { value = "hello" }
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_child_default_suppresses_parent_required() {
+        let mut ws = VirtualWorkspace::new();
+        // Child redeclares a parent-required field with a default;
+        // the default should make it optional-for-writing.
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Base
+            ---@field a number
+
+            ---@class Derived: Base
+            ---@field a number=0
+
+            ---@type Derived
+            local d = {}
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_child_required_overrides_parent_default() {
+        let mut ws = VirtualWorkspace::new();
+        // Child redeclares a parent-defaulted field WITHOUT a default;
+        // it should still be required.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Base
+            ---@field a number=0
+
+            ---@class Derived: Base
+            ---@field a number
+
+            ---@type Derived
+            local d = {}
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_defaulted_field_still_required_when_provided_is_still_checked() {
+        let mut ws = VirtualWorkspace::new();
+        // When the defaulted field IS provided, other non-defaulted fields
+        // are still required.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Config
+            ---@field name string
+            ---@field debug boolean=false
+
+            ---@type Config
+            local cfg = { debug = true }
+            "#
+        ));
+    }
 }

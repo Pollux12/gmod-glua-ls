@@ -6,8 +6,8 @@ use std::{
 use glua_parser::{LuaAstNode, LuaIndexKey, LuaTableExpr, LuaTableField};
 
 use crate::{
-    DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaType, LuaTypeCache,
-    LuaTypeDeclId, SemanticModel,
+    DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId, LuaType,
+    LuaTypeCache, LuaTypeDeclId, SemanticModel,
 };
 
 use super::{Checker, DiagnosticContext, PrecomputedMissingRequiredFields, humanize_lint_type};
@@ -311,6 +311,27 @@ fn get_required_fields_for_types(
                 .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))
                 .as_type()
                 .clone();
+
+            // Treat fields with documented defaults as optional-for-writing,
+            // matching the semantic table-compatibility rule in type_check.
+            let has_default = {
+                let owner_id = LuaSemanticDeclId::Member(member.get_id());
+                db.get_property_index()
+                    .get_property(&owner_id)
+                    .is_some_and(|p| p.default_value().is_some())
+                    || match &decl_type {
+                        LuaType::Signature(sig_id) => db
+                            .get_property_index()
+                            .get_property(&LuaSemanticDeclId::Signature(sig_id.clone()))
+                            .is_some_and(|p| p.default_value().is_some()),
+                        _ => false,
+                    }
+            };
+            if has_default {
+                optional_type.insert(name);
+                continue;
+            }
+
             record_required_fields(required_fields, optional_type, name, decl_type);
         }
 
