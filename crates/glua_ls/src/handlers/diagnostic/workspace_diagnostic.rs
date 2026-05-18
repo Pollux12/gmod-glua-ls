@@ -15,6 +15,10 @@ pub async fn on_pull_workspace_diagnostic(
 ) -> WorkspaceDiagnosticReport {
     // Wait for any pending/in-flight document changes to finish before diagnosing.
     if !context.debounced_analysis().wait_until_fresh(&token).await {
+        // Cancellation — return empty items rather than stale data,
+        // since workspace diagnostics replace per-URI state and
+        // returning stale could mask real issues. The client will
+        // re-pull after the next refresh signal.
         return WorkspaceDiagnosticReport { items: vec![] };
     }
 
