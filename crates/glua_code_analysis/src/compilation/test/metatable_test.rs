@@ -6,11 +6,7 @@ mod test {
 
     use crate::{DiagnosticCode, LuaSignatureId, LuaType, VirtualWorkspace};
 
-    fn signature_return_type(
-        ws: &VirtualWorkspace,
-        file_id: crate::FileId,
-        name: &str,
-    ) -> LuaType {
+    fn signature_return_type(ws: &VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
         let semantic_model = ws
             .analysis
             .compilation
