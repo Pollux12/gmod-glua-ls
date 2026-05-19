@@ -86,6 +86,15 @@ pub fn resolve_signature_by_args(
 
             let match_result = if param_type.is_any() {
                 ParamMatchResult::Any
+            } else if expr_type.is_never() {
+                // `Never` (bottom type) is the result of unreachable
+                // expressions such as indexing a `nil` base. A `Never` value
+                // cannot exist at runtime, so it should not cause overload
+                // resolution to reject an otherwise-matching signature.
+                // Without this, calls like `Vector(nilVar[1], nilVar[2], nilVar[3])`
+                // (3 args of type `Never`) end up incorrectly resolved to a
+                // 1-arg overload via the fallback path below.
+                ParamMatchResult::Type
             } else if is_exact_param_match(&param_type, expr_type) {
                 ParamMatchResult::Exact
             } else if check_type_compact(db, &param_type, expr_type).is_ok() {

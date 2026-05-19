@@ -237,4 +237,135 @@ mod test {
             "#
         ));
     }
+
+    // Real-world repro: `Vector(seat.GlideExitPos[1], -seat.GlideExitPos[2], seat.GlideExitPos[3])`
+    // where `seat.GlideExitPos` is inferred as `Vector | nil` after an `if cond then ... else nil end`
+    // on an unannotated (unknown) parameter. The 3-arg call must NOT be matched against a 1-arg
+    // overload of Vector. Two related bugs:
+    //   1) Field type collapses to `nil` instead of `Vector?` when condition has type `unknown`.
+    //   2) Overload resolution falls back to the first overload (1-arg Vector) when args are nil,
+    //      bypassing the count-based filter that should keep the 3-param base signature.
+    #[test]
+    fn test_vector_overload_with_optional_field_assigned_in_branches() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ---@class Vector
+            local Vector = {}
+
+            ---@overload fun(vector: Vector): Vector
+            ---@overload fun(vectorString: string): Vector
+            ---@param x? number
+            ---@param y? number
+            ---@param z? number
+            ---@return Vector
+            function _G.Vector(x, y, z) end
+
+            ---@class Seat
+            ---@field GlideExitPos? Vector
+            local seat = {}
+
+            -- unannotated param => `unknown`. Branches assign Vector / nil.
+            local function set_exit(exitPos)
+                if exitPos then
+                    seat.GlideExitPos = Vector(exitPos[1], exitPos[2], exitPos[3])
+                else
+                    seat.GlideExitPos = nil
+                end
+            end
+
+            local pos = Vector(seat.GlideExitPos[1], -seat.GlideExitPos[2], seat.GlideExitPos[3])
+            "#
+        ));
+    }
+
+    // Even simpler: no annotation on Seat at all. Field type comes purely from the if/else
+    // assignments. This is the closest to the user's actual scenario.
+    #[test]
+    fn test_vector_overload_with_field_collapsing_to_nil_in_branches() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ---@class Vector
+            local Vector = {}
+
+            ---@overload fun(vector: Vector): Vector
+            ---@overload fun(vectorString: string): Vector
+            ---@param x? number
+            ---@param y? number
+            ---@param z? number
+            ---@return Vector
+            function _G.Vector(x, y, z) end
+
+            local seat = {}
+
+            local function set_exit(exitPos)
+                if exitPos then
+                    seat.GlideExitPos = Vector(exitPos[1], exitPos[2], exitPos[3])
+                else
+                    seat.GlideExitPos = nil
+                end
+            end
+
+            local pos = Vector(seat.GlideExitPos[1], -seat.GlideExitPos[2], seat.GlideExitPos[3])
+            "#
+        ));
+    }
+
+    // Minimal repro: even without the if/else flow, calling Vector(a, b, c) where the args are
+    // typed `nil` must not pick the 1-arg `fun(vector: Vector): Vector` overload.
+    #[test]
+    fn test_vector_three_nil_args_does_not_pick_one_arg_overload() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ---@class Vector
+            local Vector = {}
+
+            ---@overload fun(vector: Vector): Vector
+            ---@overload fun(vectorString: string): Vector
+            ---@param x? number
+            ---@param y? number
+            ---@param z? number
+            ---@return Vector
+            function _G.Vector(x, y, z) end
+
+            ---@type nil
+            local n = nil
+            local pos = Vector(n, n, n)
+            "#
+        ));
+    }
+
+    // Repro where args come from indexing a `nil` value, producing `Never`-typed args.
+    #[test]
+    fn test_vector_three_never_args_does_not_pick_one_arg_overload() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ---@class Vector
+            local Vector = {}
+
+            ---@overload fun(vector: Vector): Vector
+            ---@overload fun(vectorString: string): Vector
+            ---@param x? number
+            ---@param y? number
+            ---@param z? number
+            ---@return Vector
+            function _G.Vector(x, y, z) end
+
+            ---@type nil
+            local nilVal = nil
+            local pos = Vector(nilVal[1], -nilVal[2], nilVal[3])
+            "#
+        ));
+    }
 }
