@@ -46,6 +46,66 @@ mod test {
             .expect("expected semantic info for index expr")
     }
 
+    fn index_expr_prefix_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaIndexExpr>()
+            .find(|index_expr| index_expr.syntax().text() == expr_text)
+            .expect("expected index expr");
+        let prefix_expr = index_expr.get_prefix_expr().expect("expected prefix expr");
+
+        semantic_model
+            .infer_expr(prefix_expr)
+            .expect("expected inferred prefix expr type")
+    }
+
+    fn assign_value_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        lhs_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let assign_stat = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaAssignStat>()
+            .find(|assign_stat| {
+                assign_stat
+                    .get_var_and_expr_list()
+                    .0
+                    .into_iter()
+                    .any(|var| var.syntax().text() == lhs_text)
+            })
+            .expect("expected assignment stat");
+        let (vars, exprs) = assign_stat.get_var_and_expr_list();
+        let index = vars
+            .iter()
+            .position(|var| var.syntax().text() == lhs_text)
+            .expect("expected matching LHS variable");
+        let expr = exprs
+            .get(index)
+            .cloned()
+            .expect("expected corresponding assignment value");
+
+        semantic_model
+            .infer_expr(expr)
+            .expect("expected inferred assignment value type")
+    }
+
     fn local_name_type(ws: &mut VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
         let semantic_model = ws
             .analysis
@@ -3822,6 +3882,156 @@ mod test {
         assert_eq!(
             index_expr_type(&mut ws, file_id, "shadowTbl.state"),
             LuaType::Nil
+        );
+    }
+
+    #[gtest]
+    fn test_gettable_alias_or_assignment_preserves_tableof_self_for_nullable_table_param() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+
+        let file_id = ws.def_file(
+            "cityrp/entities/entities/base_glide/sv_input.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---Returns a table containing all key-value pairs stored on this entity's Lua table.
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class base_glide : Entity
+                local ENT = {}
+
+                local getTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    self.inputFloats = {
+                        {
+                            1.0,
+                        },
+                    }
+                end
+
+                ---@param seatIndex number
+                ---@param action string
+                ---@param entTbl table|nil
+                function ENT:GetInputFloat(seatIndex, action, entTbl)
+                    entTbl = entTbl or getTable(self)
+
+                    local floats = entTbl.inputFloats[seatIndex]
+                    return floats[action]
+                end
+            "#,
+        );
+
+        let ent_tbl_assignment_type = assign_value_type(&mut ws, file_id, "entTbl");
+        let ent_tbl_type = index_expr_prefix_type(&mut ws, file_id, "entTbl.inputFloats");
+        let input_floats_type = index_expr_type(&mut ws, file_id, "entTbl.inputFloats");
+
+        assert_that!(
+            ws.humanize_type_detailed(ent_tbl_assignment_type).as_str(),
+            eq("(table|tableof<base_glide>)"),
+            "the raw `entTbl or getTable(self)` assignment should still include the tableof<self> branch before assignment-flow narrowing"
+        );
+        assert_that!(
+            ws.humanize_type_detailed(ent_tbl_type).as_str(),
+            eq("tableof<base_glide>"),
+            "the local should keep the GetTable(self) tableof<self> type after `entTbl = entTbl or getTable(self)`"
+        );
+        assert_that!(
+            ws.humanize_type(input_floats_type).as_str(),
+            eq("((1.0))"),
+            "entTbl.inputFloats should keep the scripted-class field type instead of degrading to generic table access"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("unchecked-nil-access".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_access,
+            is_empty(),
+            "entTbl.inputFloats[seatIndex] should not report unchecked-nil-access after the GetTable(self) fallback"
+        );
+    }
+
+    #[gtest]
+    fn test_gettable_alias_or_assignment_does_not_collapse_when_using_different_expression() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "cityrp/entities/entities/base_glide/sv_input.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---Returns a table containing all key-value pairs stored on this entity's Lua table.
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class base_glide : Entity
+                local ENT = {}
+
+                local getTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    self.inputFloats = {
+                        {
+                            1.0,
+                        },
+                    }
+                end
+
+                ---@return table|nil
+                local function getPlainTable() end
+
+                ---@param seatIndex number
+                ---@param action string
+                ---@param entTbl table|nil
+                function ENT:GetInputFloat(seatIndex, action, entTbl)
+                    entTbl = getPlainTable() or getTable(self)
+
+                    local floats = entTbl.inputFloats[seatIndex]
+                    return floats[action]
+                end
+            "#,
+        );
+
+        let ent_tbl_type = index_expr_prefix_type(&mut ws, file_id, "entTbl.inputFloats");
+
+        assert_that!(
+            ws.humanize_type_detailed(ent_tbl_type).as_str(),
+            eq("(table|tableof<base_glide>)"),
+            "should NOT collapse table|tableof<base_glide> since getPlainTable() is not the same variable"
         );
     }
 

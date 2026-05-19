@@ -2634,8 +2634,7 @@ mod tests {
             "LHS hover must include a nil marker (`?` or `| nil`), got: {value}"
         );
         assert!(
-            !value.contains("GlideExitPos: nil")
-                && !value.contains("GlideExitPos: never"),
+            !value.contains("GlideExitPos: nil") && !value.contains("GlideExitPos: never"),
             "LHS hover must not collapse to bare `nil` or `never`, got: {value}"
         );
         Ok(())

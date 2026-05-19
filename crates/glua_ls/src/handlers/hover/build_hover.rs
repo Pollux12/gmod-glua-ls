@@ -2,9 +2,9 @@ use std::collections::HashSet;
 
 use glua_code_analysis::humanize_type;
 use glua_code_analysis::{
-    DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
-    RenderLevel, SemanticDeclLevel, SemanticInfo, SemanticModel,
+    DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
+    SemanticDeclLevel, SemanticInfo, SemanticModel,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaSyntaxKind,
@@ -821,7 +821,6 @@ pub fn get_hover_type(builder: &HoverBuilder, semantic_model: &SemanticModel) ->
 
     None
 }
-
 
 #[allow(unused)]
 fn adjust_semantic_decls(

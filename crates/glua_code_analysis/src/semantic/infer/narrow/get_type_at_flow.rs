@@ -9,7 +9,7 @@ use rowan::TextSize;
 use crate::{
     AssignVarHint, CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
     GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, TypeOps, infer_expr,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaUnionType, TypeOps, infer_expr,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
         infer_name::infer_param,
@@ -881,7 +881,7 @@ fn get_type_at_assign_stat(
         }
 
         // Check if there's an explicit type annotation (not just inferred type)
-        let var_id = match var {
+        let var_id = match &var {
             LuaVarExpr::NameExpr(name_expr) => {
                 Some(LuaDeclId::new(cache.get_file_id(), name_expr.get_position()).into())
             }
@@ -928,7 +928,13 @@ fn get_type_at_assign_stat(
             narrow_down_type(db, source_type.clone(), expr_type.clone(), declared)
         };
 
-        let result_type = narrowed.unwrap_or(explicit_var_type.unwrap_or(expr_type));
+        let mut result_type = narrowed.unwrap_or(explicit_var_type.unwrap_or(expr_type));
+
+        if let Some(expr) = exprs.get(i) {
+            if is_self_coalescing_or_expr(db, cache, &maybe_ref_id, expr) {
+                result_type = prefer_table_of_over_bare_table(db, result_type);
+            }
+        }
 
         return Ok(ResultTypeOrContinue::Result(result_type));
     }
@@ -1161,4 +1167,45 @@ fn try_infer_decl_initializer_type(
     };
 
     Ok(Some(init_type))
+}
+
+fn is_self_coalescing_or_expr(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    var_ref_id: &VarRefId,
+    expr: &LuaExpr,
+) -> bool {
+    if let LuaExpr::BinaryExpr(bin_expr) = expr {
+        if let Some(op_token) = bin_expr.get_op_token() {
+            if op_token.get_op() == BinaryOperator::OpOr {
+                if let Some(left) = bin_expr.get_left_expr() {
+                    if let Some(left_ref_id) = get_var_expr_var_ref_id(db, cache, left) {
+                        return left_ref_id == *var_ref_id;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn prefer_table_of_over_bare_table(_db: &DbIndex, ty: LuaType) -> LuaType {
+    match ty {
+        LuaType::Union(u) => {
+            let mut types = u.into_vec();
+            let has_table_of = types.iter().any(|t| matches!(t, LuaType::TableOf(_)));
+            let has_bare_table = types.iter().any(|t| matches!(t, LuaType::Table));
+            if has_table_of && has_bare_table {
+                types.retain(|t| !matches!(t, LuaType::Table));
+                if types.len() == 1 {
+                    types.into_iter().next().unwrap_or(LuaType::Unknown)
+                } else {
+                    LuaUnionType::from_vec(types).into()
+                }
+            } else {
+                LuaType::Union(u)
+            }
+        }
+        _ => ty,
+    }
 }
