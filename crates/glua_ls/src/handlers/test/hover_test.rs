@@ -2485,4 +2485,233 @@ mod tests {
         }
         Ok(())
     }
+
+    #[gtest]
+    fn test_hover_branched_dynamic_field_unions_vector_real_shape() -> Result<()> {
+        // Repro of cityrp-vehicle-base/init.lua bug:
+        //   if exitPos then
+        //       seat.GlideExitPos = Vector(...)
+        //   else
+        //       seat.GlideExitPos = nil
+        //   end
+        // Reading `seat.GlideExitPos` later must hover as `Vector?` (i.e. Vector|nil),
+        // NOT bare `nil`. Pre-fix, `retain_only_member_for_owner_key` dropped the
+        // Vector-branch member because the `= nil` branch ran later.
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@param x? number
+                ---@param y? number
+                ---@param z? number
+                ---@return Vector
+                function _G.Vector(x, y, z) end
+
+                ---@param ent any
+                ---@return boolean
+                function _G.IsValid(ent) end
+
+                ---@class NULL
+                NULL = {}
+
+                _G.ents = {}
+                ---@generic T : Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function _G.ents.Create(class) end
+
+                ---@class Entity
+                local Entity = {}
+
+                function ENT:CreateSeat(exitPos)
+                    local seat = ents.Create("prop_vehicle_prisoner_pod")
+                    if not IsValid(seat) then return end
+                    if exitPos then
+                        seat.GlideExitPos = Vector(exitPos[1], exitPos[2], exitPos[3])
+                    else
+                        seat.GlideExitPos = nil
+                    end
+                end
+
+                function ENT:ReadSeat()
+                    local seat = ents.Create("prop_vehicle_prisoner_pod")
+                    if not IsValid(seat) then return end
+                    local v = seat.Glide<??>ExitPos
+                    return v
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        let has_vector = value.contains("Vector");
+        let has_nil_marker = value.contains("nil") || value.contains('?');
+        assert!(
+            has_vector && has_nil_marker,
+            "expected hover on read site to include Vector + nil marker, got: {value}"
+        );
+        Ok(())
+    }
+
+    /// Hover at the LHS of `seat.GlideExitPos = nil` (the offending line the
+    /// user is hovering on). Pre-fix this displayed `(field) GlideExitPos: nil`
+    /// because `get_hover_type` rewrote the displayed type to the RHS being
+    /// assigned. Post-fix, `lhs_indexed_member_union_type` recovers the
+    /// field's full union from the branched assignments so the hover correctly
+    /// shows `Vector?` (i.e. `Vector | nil`).
+    #[gtest]
+    fn test_hover_branched_dynamic_field_lhs_assign_does_not_collapse_field_type() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Hover directly on the `GlideExitPos` token in the `= nil` branch.
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@param x? number
+                ---@param y? number
+                ---@param z? number
+                ---@return Vector
+                function _G.Vector(x, y, z) end
+
+                ---@param ent any
+                ---@return boolean
+                function _G.IsValid(ent) end
+
+                ---@class NULL
+                NULL = {}
+
+                _G.ents = {}
+                ---@generic T : Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function _G.ents.Create(class) end
+
+                ---@class Entity
+                local Entity = {}
+
+                function ENT:CreateSeat(exitPos)
+                    local seat = ents.Create("prop_vehicle_prisoner_pod")
+                    if not IsValid(seat) then return end
+                    if exitPos then
+                        seat.GlideExitPos = Vector(exitPos[1], exitPos[2], exitPos[3])
+                    else
+                        seat.Glide<??>ExitPos = nil
+                    end
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        // Post-fix the LHS hover must show the field's full union, not bare
+        // `nil` or `never`. Accept either `Vector?` rendering or explicit
+        // `Vector | nil` / `Vector|nil`.
+        assert!(
+            value.contains("GlideExitPos"),
+            "hover should include field name, got: {value}"
+        );
+        assert!(
+            value.contains("Vector"),
+            "LHS hover must include `Vector` from the other branch, got: {value}"
+        );
+        let has_nil_marker = value.contains("Vector?")
+            || value.contains("Vector | nil")
+            || value.contains("Vector|nil")
+            || value.contains("nil");
+        assert!(
+            has_nil_marker,
+            "LHS hover must include a nil marker (`?` or `| nil`), got: {value}"
+        );
+        assert!(
+            !value.contains("GlideExitPos: nil")
+                && !value.contains("GlideExitPos: never"),
+            "LHS hover must not collapse to bare `nil` or `never`, got: {value}"
+        );
+        Ok(())
+    }
+
+    /// Read-site hover where the entity local comes from `self.seats[index]`
+    /// in a different method than the branched assignment. Mirrors
+    /// `cityrp-vehicle-base/init.lua:559` (`local seat = self.seats[index]`
+    /// then `seat.GlideExitPos[1]`). Failing red test pre-fix produced bare
+    /// `nil` or `never` because the branched dynamic-field assignment
+    /// collapsed to the last `= nil` branch.
+    #[gtest]
+    fn test_hover_branched_dynamic_field_read_via_self_seats_array() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@param x? number
+                ---@param y? number
+                ---@param z? number
+                ---@return Vector
+                function _G.Vector(x, y, z) end
+
+                ---@param ent any
+                ---@return boolean
+                function _G.IsValid(ent) end
+
+                ---@class NULL
+                NULL = {}
+
+                _G.ents = {}
+                ---@generic T : Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function _G.ents.Create(class) end
+
+                ---@class Entity
+                local Entity = {}
+
+                ---@class base_glide
+                ---@field seats prop_vehicle_prisoner_pod[]
+                local ENTCLASS = {}
+
+                function ENT:CreateSeat(exitPos, index)
+                    local seat = ents.Create("prop_vehicle_prisoner_pod")
+                    if not IsValid(seat) then return end
+                    if exitPos then
+                        seat.GlideExitPos = Vector(exitPos[1], exitPos[2], exitPos[3])
+                    else
+                        seat.GlideExitPos = nil
+                    end
+                    self.seats[index] = seat
+                end
+
+                function ENT:GetSeatExitPos(index)
+                    local seat = self.seats[index]
+                    if not IsValid(seat) then return end
+                    return seat.Glide<??>ExitPos
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        let has_vector = value.contains("Vector");
+        let has_nil_marker = value.contains("nil") || value.contains('?');
+        assert!(
+            has_vector && has_nil_marker,
+            "real-shape read via self.seats[i] must hover Vector|nil, got: {value}"
+        );
+        Ok(())
+    }
 }

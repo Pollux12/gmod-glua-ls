@@ -10,8 +10,8 @@ use crate::{
 };
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
-    LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaTableExpr, LuaTableField,
-    LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
+    LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaSyntaxKind, LuaTableExpr,
+    LuaTableField, LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
 
 use super::LuaAnalyzer;
@@ -578,6 +578,7 @@ fn assign_merge_type_owner_and_expr_type(
 
     if let LuaTypeOwner::Member(member_id) = type_owner
         && is_assignment_file_define_member(analyzer.db, member_id)
+        && !is_member_assignment_in_conditional_branch(analyzer, member_id)
     {
         analyzer
             .db
@@ -586,6 +587,49 @@ fn assign_merge_type_owner_and_expr_type(
     }
 
     Some(())
+}
+
+/// Returns true when the assignment that introduced this member sits inside a
+/// branching construct (if / while / repeat / for). In those cases we must not
+/// collapse to a single "latest write" member, because the assignments in
+/// sibling branches (or earlier loop iterations) are not dominated by this one
+/// and their types must remain available so reads can union them.
+///
+/// Without this guard, a pattern like
+///
+/// ```lua
+/// if cond then
+///     obj.field = Vector(...)
+/// else
+///     obj.field = nil
+/// end
+/// ```
+///
+/// would silently drop the `Vector` branch and hover `obj.field` as just `nil`.
+fn is_member_assignment_in_conditional_branch(
+    analyzer: &LuaAnalyzer,
+    member_id: LuaMemberId,
+) -> bool {
+    let Some(tree) = analyzer.db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+        return false;
+    };
+    let root = tree.get_red_root();
+    let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
+        return false;
+    };
+
+    node.ancestors().any(|ancestor| {
+        matches!(
+            ancestor.kind().into(),
+            LuaSyntaxKind::IfStat
+                | LuaSyntaxKind::ElseIfClauseStat
+                | LuaSyntaxKind::ElseClauseStat
+                | LuaSyntaxKind::WhileStat
+                | LuaSyntaxKind::RepeatStat
+                | LuaSyntaxKind::ForStat
+                | LuaSyntaxKind::ForRangeStat
+        )
+    })
 }
 
 fn get_widened_member_assignment_collection_type(

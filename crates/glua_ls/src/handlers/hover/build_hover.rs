@@ -2,9 +2,9 @@ use std::collections::HashSet;
 
 use glua_code_analysis::humanize_type;
 use glua_code_analysis::{
-    DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
-    SemanticDeclLevel, SemanticInfo, SemanticModel,
+    DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
+    RenderLevel, SemanticDeclLevel, SemanticInfo, SemanticModel,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaSyntaxKind,
@@ -375,8 +375,42 @@ fn build_member_hover(
             builder.set_type_description(format!("(field) {}: {}", member_name, const_value));
             builder.set_location_path(Some(member));
         } else {
-            let member_hover_type =
-                get_hover_type(builder, builder.semantic_model).unwrap_or(typ.clone());
+            // For fields with multiple definitions (e.g. dynamic-field
+            // assignments in mutually-exclusive branches), `get_hover_type`
+            // would override the displayed type to the *local* RHS at the
+            // assignment site — producing misleading hovers like
+            // `(field) GlideExitPos: nil` on the `= nil` branch even though
+            // the field's actual type is the union `Vector | nil`.
+            //
+            // Resolution order:
+            //   1. If `find_member_origin_owners` returned >1 distinct types
+            //      (read sites usually walk all definitions), union them.
+            //   2. If `typ` is already a union (richer info), prefer it.
+            //   3. If we're at the LHS of an assignment, re-derive the field's
+            //      full union type from the IndexExpr's prefix-type via
+            //      `get_member_info_with_key_at_offset` and union that.
+            //   4. Otherwise, fall back to `get_hover_type` (preserves generic-
+            //      instantiation behavior).
+            let unique_origin_types: Vec<LuaType> = {
+                let mut seen: Vec<LuaType> = Vec::new();
+                for (_, t) in &semantic_decls {
+                    if !seen.iter().any(|s| s == t) {
+                        seen.push(t.clone());
+                    }
+                }
+                seen
+            };
+            let member_hover_type = if unique_origin_types.len() > 1 {
+                let mut acc = unique_origin_types[0].clone();
+                for t in &unique_origin_types[1..] {
+                    acc = glua_code_analysis::TypeOps::Union.apply(db, &acc, t);
+                }
+                acc
+            } else if typ.is_union() {
+                typ.clone()
+            } else {
+                get_hover_type(builder, builder.semantic_model).unwrap_or(typ.clone())
+            };
             let level = if member_hover_type.is_module_ref() {
                 builder.detail_render_level
             } else {
@@ -787,6 +821,7 @@ pub fn get_hover_type(builder: &HoverBuilder, semantic_model: &SemanticModel) ->
 
     None
 }
+
 
 #[allow(unused)]
 fn adjust_semantic_decls(
