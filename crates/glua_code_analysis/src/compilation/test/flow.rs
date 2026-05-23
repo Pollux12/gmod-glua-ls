@@ -4155,6 +4155,82 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_unknown_key_read_from_untyped_registry_table_is_not_hard_nil() {
+        // A global registry initialized as an empty table can be populated
+        // elsewhere. Indexing it with an unknown runtime key must not prove
+        // the result is `nil`.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            Glide = Glide or {}
+            Glide.WeaponRegistry = Glide.WeaponRegistry or {}
+
+            local function RefreshInheritance(className)
+                local class = Glide.WeaponRegistry[className]
+                a = class
+            end
+            "#,
+        );
+
+        let typ = ws.expr_ty("a");
+        let desc = ws.humanize_type(typ);
+        assert_that!(
+            desc,
+            not(eq("nil")),
+            "unknown registry key read collapsed to nil: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_string_key_read_from_untyped_registry_table_is_not_hard_nil() {
+        // Same open-registry shape, but with a known broad string key type.
+        // This must not fall through the exact-member lookup path into `nil`.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            Glide = Glide or {}
+            Glide.WeaponRegistry = Glide.WeaponRegistry or {}
+
+            ---@param className string
+            local function RefreshInheritance(className)
+                local class = Glide.WeaponRegistry[className]
+                a = class
+            end
+            "#,
+        );
+
+        let typ = ws.expr_ty("a");
+        let desc = ws.humanize_type(typ);
+        assert_that!(
+            desc,
+            not(eq("nil")),
+            "string registry key read collapsed to nil: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_unknown_key_read_from_shaped_table_does_not_fallback_to_any() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local shaped = {
+                known = true,
+            }
+
+            ---@param index number
+            local function Read(index)
+                a = shaped[index]
+            end
+            "#,
+        );
+
+        let typ = ws.expr_ty("a");
+        assert_eq!(ws.humanize_type(typ), "nil");
+    }
+
+    #[gtest]
     fn test_undefined_global_guard_after_index_truthy_promotes_to_any() {
         // Reading `tmysql.Version` in an `if` condition implies `tmysql` is
         // non-nil/non-false in the truthy branch, so we promote the

@@ -286,7 +286,15 @@ fn infer_table_member(
 ) -> InferResult {
     let owner = LuaMemberOwner::Element(inst.clone());
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
-    let key = LuaMemberKey::from_index_key_or_unknown(db, cache, &index_key)?;
+    let key = match LuaMemberKey::from_index_key_or_unknown(db, cache, &index_key) {
+        Ok(key) => key,
+        Err(err)
+            if is_unknown_dynamic_key_without_table_data(db, &owner, &inst, &index_key, &err) =>
+        {
+            return Ok(nullable_any_type());
+        }
+        Err(err) => return Err(err),
+    };
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
         return member_item.resolve_type_with_realm_at_offset(
             db,
@@ -297,7 +305,7 @@ fn infer_table_member(
 
     match infer_owner_raw_member_type_with_realm(
         db,
-        owner,
+        owner.clone(),
         &key,
         cache.get_file_id(),
         Some(index_expr.get_position()),
@@ -308,6 +316,9 @@ fn infer_table_member(
                 resolve_dynamic_field_member(db, cache, &LuaType::TableConst(inst.clone()), &key)
             {
                 return Ok(dynamic_field.typ);
+            }
+            if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
+                return Ok(nullable_any_type());
             }
             if is_table_const_from_doc_tag(db, &inst) {
                 Ok(nullable_any_type())
@@ -329,6 +340,43 @@ fn is_table_const_from_doc_tag(db: &DbIndex, inst: &InFiled<TextRange>) -> bool 
 
 fn nullable_any_type() -> LuaType {
     LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into())
+}
+
+fn is_unknown_dynamic_key_without_table_data(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    inst: &InFiled<TextRange>,
+    index_key: &LuaIndexKey,
+    err: &InferFailReason,
+) -> bool {
+    matches!(index_key, LuaIndexKey::Expr(_))
+        && table_const_has_no_specific_data(db, owner, inst)
+        && matches!(
+            err,
+            InferFailReason::None
+                | InferFailReason::UnResolveDeclType(_)
+                | InferFailReason::UnResolveExpr(_)
+        )
+}
+
+fn is_dynamic_expr_key_without_table_data(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    inst: &InFiled<TextRange>,
+    key: &LuaMemberKey,
+) -> bool {
+    matches!(key, LuaMemberKey::ExprType(_)) && table_const_has_no_specific_data(db, owner, inst)
+}
+
+fn table_const_has_no_specific_data(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    inst: &InFiled<TextRange>,
+) -> bool {
+    !db.get_member_index()
+        .get_members(owner)
+        .is_some_and(|members| !members.is_empty())
+        && db.get_metatable_index().get(inst).is_none()
 }
 
 fn infer_plain_table_member(
