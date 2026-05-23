@@ -359,14 +359,11 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
                     .context
                     .infer_manager
                     .get_infer_cache(analyzer.file_id);
-                let Ok(member_key) = LuaMemberKey::from_index_key(analyzer.db, cache, &index_key)
+                let Ok(member_key) =
+                    LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
                 else {
                     return Some(());
                 };
-                if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
-                    return Some(());
-                }
-
                 let decl_feature = if analyzer.context.metas.contains(&analyzer.file_id) {
                     LuaMemberFeature::MetaDefine
                 } else {
@@ -967,7 +964,8 @@ fn find_related_member_ids(
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let member_key = LuaMemberKey::from_index_key(analyzer.db, cache, &index_key).ok()?;
+    let member_key =
+        LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key).ok()?;
     let members = if member_key.is_expr() {
         let access_key_type = member_key_as_expr_type(&member_key)?;
         analyzer

@@ -1339,4 +1339,53 @@ mod tests {
 
         Ok(())
     }
+
+    #[gtest]
+    fn test_setmetatable_return_hover_keeps_index_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                Glide = Glide or {}
+                Glide.WeaponRegistry = Glide.WeaponRegistry or {}
+
+                VSWEP = {}
+                function VSWEP:Initialize() end
+                function VSWEP:Fire() end
+
+                local function Register(className)
+                    Glide.WeaponRegistry[className] = VSWEP
+                end
+
+                Register("base")
+
+                function Glide.CreateVehicle<??>Weapon(className, data)
+                    local class = Glide.WeaponRegistry[className]
+                    assert(class, "Tried to create invalid weapon class: " .. className)
+
+                    return setmetatable(data or {}, { __index = class })
+                end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            !markup.value.contains("-> table"),
+            "setmetatable-returning function hover should not collapse to table: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("VSWEP") || markup.value.contains("Initialize"),
+            "setmetatable-returning function hover should include the __index type: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
 }

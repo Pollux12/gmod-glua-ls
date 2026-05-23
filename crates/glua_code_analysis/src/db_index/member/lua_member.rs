@@ -117,14 +117,35 @@ impl LuaMemberKey {
             LuaIndexKey::Idx(idx) => Ok(LuaMemberKey::Integer(*idx as i64)),
             LuaIndexKey::Expr(expr) => {
                 let expr_type = infer_expr(db, cache, expr.clone())?;
-                match expr_type {
-                    LuaType::StringConst(s) => Ok(LuaMemberKey::Name(s.deref().clone())),
-                    LuaType::DocStringConst(s) => Ok(LuaMemberKey::Name(s.deref().clone())),
-                    LuaType::IntegerConst(i) => Ok(LuaMemberKey::Integer(i)),
-                    LuaType::DocIntegerConst(i) => Ok(LuaMemberKey::Integer(i)),
-                    _ => Ok(LuaMemberKey::ExprType(expr_type)),
-                }
+                Ok(Self::from_expr_type(expr_type))
             }
+        }
+    }
+
+    pub fn from_index_key_or_unknown(
+        db: &DbIndex,
+        cache: &mut LuaInferCache,
+        key: &LuaIndexKey,
+    ) -> Result<Self, InferFailReason> {
+        match key {
+            LuaIndexKey::Expr(expr) => match infer_expr(db, cache, expr.clone()) {
+                Ok(expr_type) => Ok(Self::from_expr_type(expr_type)),
+                Err(reason) if reason.is_need_resolve() => {
+                    Ok(LuaMemberKey::ExprType(LuaType::Unknown))
+                }
+                Err(reason) => Err(reason),
+            },
+            _ => Self::from_index_key(db, cache, key),
+        }
+    }
+
+    fn from_expr_type(expr_type: LuaType) -> Self {
+        match expr_type {
+            LuaType::StringConst(s) => LuaMemberKey::Name(s.deref().clone()),
+            LuaType::DocStringConst(s) => LuaMemberKey::Name(s.deref().clone()),
+            LuaType::IntegerConst(i) => LuaMemberKey::Integer(i),
+            LuaType::DocIntegerConst(i) => LuaMemberKey::Integer(i),
+            _ => LuaMemberKey::ExprType(expr_type),
         }
     }
 

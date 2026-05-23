@@ -333,6 +333,12 @@ pub(crate) fn member_key_matches_type(
     access_key_type: &LuaType,
     member_key: &LuaMemberKey,
 ) -> bool {
+    if let LuaMemberKey::ExprType(member_key_type) = member_key
+        && member_key_type.is_unknown()
+    {
+        return unknown_index_key_matches_access(access_key_type);
+    }
+
     let Some(member_key_type) = member_key_as_type(member_key) else {
         return false;
     };
@@ -362,6 +368,20 @@ fn exact_literal_member_key_match(
         | (LuaType::DocBooleanConst(left), LuaType::BooleanConst(right))
         | (LuaType::DocBooleanConst(left), LuaType::DocBooleanConst(right)) => Some(left == right),
         _ => None,
+    }
+}
+
+fn unknown_index_key_matches_access(access_key_type: &LuaType) -> bool {
+    match access_key_type {
+        LuaType::Any | LuaType::Unknown | LuaType::String | LuaType::Number | LuaType::Integer => {
+            true
+        }
+        LuaType::TypeGuard(inner) => unknown_index_key_matches_access(inner),
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .any(unknown_index_key_matches_access),
+        _ => false,
     }
 }
 

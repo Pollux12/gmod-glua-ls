@@ -253,6 +253,33 @@ mod test {
     }
 
     #[gtest]
+    fn test_unknown_dynamic_key_does_not_match_exact_field_lookup() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        local test = {}
+
+        local function assign(key)
+            test[key] = true
+            B = test[key]
+        end
+
+        A = test.meow
+        "#,
+        );
+
+        let exact_lookup_ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(exact_lookup_ty), "nil");
+
+        let dynamic_lookup_ty = ws.expr_ty("B");
+        assert_that!(
+            ws.check_type(&dynamic_lookup_ty, &LuaType::Boolean),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_inferred_collection_integer_index_returns_element_union() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

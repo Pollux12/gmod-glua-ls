@@ -150,6 +150,7 @@ mod test {
         let ty = ws.expr_ty("A");
         assert_eq!(ws.humanize_type(ty), "Class.Config");
     }
+
     #[test]
     fn test_return_setmetatable_data_or_table_keeps_metatable_methods() {
         let mut ws = VirtualWorkspace::new();
@@ -218,6 +219,53 @@ mod test {
         assert!(
             undefined_field_diags.is_empty(),
             "unexpected UndefinedField diagnostics for metatable-backed weapon methods: {undefined_field_diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_setmetatable_return_signature_uses_index_type_not_table() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.WeaponRegistry = Glide.WeaponRegistry or {}
+
+            VSWEP = {}
+            function VSWEP:Initialize() end
+            function VSWEP:Fire() end
+
+            local function Register(className)
+                Glide.WeaponRegistry[className] = VSWEP
+            end
+
+            Register("base")
+
+            function Glide.CreateVehicleWeapon(className, data)
+                local class = Glide.WeaponRegistry[className]
+                assert(class, "Tried to create invalid weapon class: " .. className)
+
+                return setmetatable(data or {}, { __index = class })
+            end
+
+            local weapon = Glide.CreateVehicleWeapon("base")
+            A = weapon.Initialize
+            "#,
+        );
+
+        let return_ty = signature_return_type(&ws, file_id, "CreateVehicleWeapon");
+        assert!(
+            matches!(&return_ty, LuaType::Instance(_)),
+            "setmetatable return should be a metatable-backed instance, got {return_ty:?}"
+        );
+
+        let initialize_member_ty = ws.expr_ty("A");
+        assert!(
+            matches!(
+                initialize_member_ty,
+                LuaType::Signature(_) | LuaType::DocFunction(_)
+            ),
+            "expected returned weapon to expose Initialize from __index, got {initialize_member_ty:?}"
         );
     }
 }
