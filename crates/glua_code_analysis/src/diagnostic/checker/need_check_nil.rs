@@ -1,13 +1,13 @@
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr,
-    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaRepeatStat,
-    LuaWhileStat, UnaryOperator,
+    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaNameExpr, LuaRepeatStat,
+    LuaSyntaxKind, LuaSyntaxNode, LuaWhileStat, UnaryOperator,
 };
 use rowan::TextRange;
 
 use crate::{
     DiagnosticCode, LuaType, LuaUnionType, SemanticModel,
-    semantic::{contains_gmod_null_type, get_var_expr_var_ref_id},
+    semantic::{contains_gmod_null_type, get_var_expr_var_ref_id, resolve_global_decl_id},
 };
 
 use super::{
@@ -125,6 +125,10 @@ fn report_unsafe_receiver(
         return false;
     }
     if receiver_type.is_nullable() {
+        if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, receiver) {
+            return false;
+        }
+
         // Definite nil receivers should be warning-level unchecked access.
         // Nullable-but-not-definite receivers remain NeedCheckNil.
         let diagnostic_code = if receiver_type.is_nil()
@@ -145,6 +149,10 @@ fn report_unsafe_receiver(
     }
 
     if !contains_gmod_null_type(semantic_model.get_db(), &receiver_type) {
+        return false;
+    }
+
+    if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, receiver) {
         return false;
     }
 
@@ -256,6 +264,10 @@ fn check_index_expr(
 
     let prefix_type = semantic_model.infer_expr(prefix.clone()).ok()?;
     if prefix_type.is_nullable() {
+        if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, &prefix) {
+            return Some(());
+        }
+
         let diagnostic_code = if should_report_unchecked_nil_access(&prefix, &prefix_type) {
             DiagnosticCode::UncheckedNilAccess
         } else {
@@ -271,6 +283,216 @@ fn check_index_expr(
     }
 
     Some(())
+}
+
+fn is_expr_guarded_by_prior_isvalid_early_return(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> bool {
+    let Some(containing_stat) = expr.syntax().ancestors().find(|node| {
+        let kind: LuaSyntaxKind = node.kind().into();
+        matches!(
+            kind,
+            LuaSyntaxKind::LocalStat
+                | LuaSyntaxKind::AssignStat
+                | LuaSyntaxKind::CallExprStat
+                | LuaSyntaxKind::IfStat
+                | LuaSyntaxKind::ReturnStat
+        )
+    }) else {
+        return false;
+    };
+
+    let Some(parent) = containing_stat.parent() else {
+        return false;
+    };
+    let stat_start = containing_stat.text_range().start();
+
+    for sibling in parent.children() {
+        if sibling.text_range().start() >= stat_start {
+            break;
+        }
+
+        let kind: LuaSyntaxKind = sibling.kind().into();
+        if kind != LuaSyntaxKind::IfStat {
+            continue;
+        }
+
+        let Some(if_stat) = LuaIfStat::cast(sibling) else {
+            continue;
+        };
+        if !if_body_has_return(&if_stat) {
+            continue;
+        }
+        let Some(condition) = if_stat.get_condition_expr() else {
+            continue;
+        };
+        if condition_is_negative_isvalid_guard(semantic_model, &condition, expr)
+            && !guard_continuing_clauses_reassign_guarded_expr(semantic_model, expr, &if_stat)
+            && !guarded_expr_reassigned_between(
+                semantic_model,
+                expr,
+                &parent,
+                if_stat.syntax().text_range(),
+                stat_start,
+            )
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn guard_continuing_clauses_reassign_guarded_expr(
+    semantic_model: &SemanticModel,
+    guarded_expr: &LuaExpr,
+    if_stat: &LuaIfStat,
+) -> bool {
+    for elseif_clause in if_stat.get_else_if_clause_list() {
+        if elseif_clause.get_block().is_some_and(|block| {
+            block.descendants::<LuaAssignStat>().any(|assign_stat| {
+                assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
+            })
+        }) {
+            return true;
+        }
+    }
+
+    if if_stat.get_else_clause().is_some_and(|else_clause| {
+        else_clause.get_block().is_some_and(|block| {
+            block.descendants::<LuaAssignStat>().any(|assign_stat| {
+                assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
+            })
+        })
+    }) {
+        return true;
+    }
+
+    false
+}
+
+fn guarded_expr_reassigned_between(
+    semantic_model: &SemanticModel,
+    guarded_expr: &LuaExpr,
+    parent: &LuaSyntaxNode,
+    guard_range: TextRange,
+    stat_start: rowan::TextSize,
+) -> bool {
+    for sibling in parent.children() {
+        let sibling_range = sibling.text_range();
+        if sibling_range.start() <= guard_range.end() {
+            continue;
+        }
+        if sibling_range.start() >= stat_start {
+            break;
+        }
+
+        if let Some(assign_stat) = LuaAssignStat::cast(sibling.clone())
+            && assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
+        {
+            return true;
+        }
+
+        if sibling.descendants().any(|node| {
+            LuaAssignStat::cast(node).is_some_and(|assign_stat| {
+                assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
+            })
+        }) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn assign_stat_reassigns_guarded_expr(
+    semantic_model: &SemanticModel,
+    assign_stat: &LuaAssignStat,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    vars.into_iter().any(|var| {
+        assigned_expr_invalidates_guarded_expr(semantic_model, &var.to_expr(), guarded_expr)
+    })
+}
+
+fn assigned_expr_invalidates_guarded_expr(
+    semantic_model: &SemanticModel,
+    assigned_expr: &LuaExpr,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    if exprs_reference_same_var(semantic_model, assigned_expr, guarded_expr) {
+        return true;
+    }
+
+    let mut current = guarded_expr.clone();
+    while let LuaExpr::IndexExpr(index_expr) = current {
+        let Some(prefix) = index_expr.get_prefix_expr() else {
+            return false;
+        };
+        if exprs_reference_same_var(semantic_model, assigned_expr, &prefix) {
+            return true;
+        }
+        current = prefix;
+    }
+
+    false
+}
+
+fn if_body_has_return(if_stat: &LuaIfStat) -> bool {
+    if_stat.get_block().is_some_and(|block| {
+        block
+            .syntax()
+            .children()
+            .any(|child| LuaSyntaxKind::from(child.kind()) == LuaSyntaxKind::ReturnStat)
+    })
+}
+
+fn condition_is_negative_isvalid_guard(
+    semantic_model: &SemanticModel,
+    condition: &LuaExpr,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    match condition {
+        LuaExpr::UnaryExpr(unary_expr) => {
+            if !unary_expr
+                .get_op_token()
+                .is_some_and(|token| token.get_op() == UnaryOperator::OpNot)
+            {
+                return false;
+            }
+            let Some(inner_expr) = unary_expr.get_expr() else {
+                return false;
+            };
+            match inner_expr {
+                LuaExpr::CallExpr(call_expr) => {
+                    is_isvalid_call_guarding_var(semantic_model, &call_expr, guarded_expr)
+                }
+                LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_some_and(|expr| {
+                    condition_is_negative_isvalid_guard(semantic_model, &expr, guarded_expr)
+                }),
+                _ => false,
+            }
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let Some(op) = binary_expr.get_op_token().map(|token| token.get_op()) else {
+                return false;
+            };
+            if op != BinaryOperator::OpOr {
+                return false;
+            }
+            let Some((left, right)) = binary_expr.get_exprs() else {
+                return false;
+            };
+            condition_is_negative_isvalid_guard(semantic_model, &left, guarded_expr)
+                || condition_is_negative_isvalid_guard(semantic_model, &right, guarded_expr)
+        }
+        LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_some_and(|expr| {
+            condition_is_negative_isvalid_guard(semantic_model, &expr, guarded_expr)
+        }),
+        _ => false,
+    }
 }
 
 fn is_initialized_assignment_lhs_prefix(
@@ -625,7 +847,7 @@ fn is_isvalid_call_guarding_var(
 
     match prefix {
         LuaExpr::NameExpr(name_expr) => {
-            if name_expr.get_name_text().as_deref() != Some("IsValid") {
+            if !is_builtin_or_unresolved_isvalid_name(semantic_model, &name_expr) {
                 return false;
             }
 
@@ -659,6 +881,82 @@ fn is_isvalid_call_guarding_var(
         }
         _ => false,
     }
+}
+
+fn is_builtin_or_unresolved_isvalid_name(
+    semantic_model: &SemanticModel,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    if name_expr.get_name_text().as_deref() != Some("IsValid") {
+        return false;
+    }
+
+    let db = semantic_model.get_db();
+    let file_id = semantic_model.get_file_id();
+    let decl_id = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .or_else(|| {
+            db.get_decl_index()
+                .get_decl_tree(&file_id)
+                .and_then(|decl_tree| {
+                    decl_tree
+                        .find_local_decl("IsValid", name_expr.get_position())
+                        .map(|decl| decl.get_id())
+                })
+        });
+
+    let Some(decl_id) = decl_id else {
+        return is_builtin_or_unresolved_global_isvalid_name(semantic_model, name_expr);
+    };
+
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return false;
+    };
+    if db
+        .get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .is_some_and(|decl_refs| decl_refs.mutable)
+    {
+        return false;
+    }
+
+    let Some(value_syntax_id) = decl.get_value_syntax_id() else {
+        return false;
+    };
+    let Some(node) = value_syntax_id.to_node_from_root(semantic_model.get_root().syntax()) else {
+        return false;
+    };
+    let Some(LuaExpr::NameExpr(alias_name_expr)) = LuaExpr::cast(node) else {
+        return false;
+    };
+
+    is_builtin_or_unresolved_isvalid_name(semantic_model, &alias_name_expr)
+}
+
+fn is_builtin_or_unresolved_global_isvalid_name(
+    semantic_model: &SemanticModel,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    if name_expr.get_name_text().as_deref() != Some("IsValid") {
+        return false;
+    }
+
+    let db = semantic_model.get_db();
+    let mut cache = semantic_model.get_cache().borrow_mut();
+    let Some(global_decl_id) = resolve_global_decl_id(db, &mut cache, "IsValid", Some(name_expr))
+    else {
+        return true;
+    };
+
+    let Some(global_decl) = db.get_decl_index().get_decl(&global_decl_id) else {
+        return false;
+    };
+
+    let module_index = db.get_module_index();
+    module_index.is_std(&global_decl.get_file_id())
+        || module_index.is_library(&global_decl.get_file_id())
 }
 
 fn exprs_reference_same_var(
