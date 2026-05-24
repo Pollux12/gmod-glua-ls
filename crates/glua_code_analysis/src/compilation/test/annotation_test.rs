@@ -755,6 +755,151 @@ mod test {
     }
 
     #[test]
+    fn test_outparam_applies_through_local_callable_alias() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "trace.lua",
+            r#"
+                ---@class TraceResult
+                ---@field Hit boolean
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceLine(traceConfig) end
+                "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                local TraceLine = util.TraceLine
+                local ray = {}
+                local traceData = {
+                    output = ray,
+                }
+
+                TraceLine(traceData)
+                local hitFromRay = ray.Hit
+                "#,
+        );
+
+        assert_eq!(index_expr_ty(&ws, file_id, "ray.Hit"), ws.ty("boolean"));
+    }
+
+    #[test]
+    fn test_outparam_type_flows_to_alias_created_after_call() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "trace.lua",
+            r#"
+                ---@class TraceResult
+                ---@field Hit boolean
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceLine(traceConfig) end
+                "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                local ray = {}
+                local traceData = {
+                    output = ray,
+                }
+
+                util.TraceLine(traceData)
+                local primary = ray
+                local hitFromPrimary = primary.Hit
+                "#,
+        );
+
+        assert_eq!(index_expr_ty(&ws, file_id, "primary.Hit"), ws.ty("boolean"));
+    }
+
+    #[test]
+    fn test_outparam_alias_after_optional_call_stays_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "trace.lua",
+            r#"
+                ---@class TraceResult
+                ---@field Hit boolean
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceLine(traceConfig) end
+                "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                local ray = {}
+                local traceData = {
+                    output = ray,
+                }
+
+                if shouldTrace then
+                    util.TraceLine(traceData)
+                end
+
+                local primary = ray
+                local hitFromPrimary = primary.Hit
+                "#,
+        );
+
+        assert_eq!(
+            index_expr_ty(&ws, file_id, "primary.Hit"),
+            ws.ty("boolean|nil")
+        );
+    }
+
+    #[test]
+    fn test_outparam_alias_does_not_use_nested_closure_effect() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "trace.lua",
+            r#"
+                ---@class TraceResult
+                ---@field Hit boolean
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceLine(traceConfig) end
+                "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                local ray = {}
+                local traceData = {
+                    output = ray,
+                }
+
+                local function later()
+                    util.TraceLine(traceData)
+                end
+
+                local primary = ray
+                local hitFromPrimary = primary.Hit
+                "#,
+        );
+
+        assert_eq!(index_expr_ty(&ws, file_id, "primary.Hit"), LuaType::Nil);
+    }
+
+    #[test]
     fn test_outparam_updates_nested_output_field() {
         let mut ws = VirtualWorkspace::new();
         ws.def_file(

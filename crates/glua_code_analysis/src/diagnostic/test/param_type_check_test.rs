@@ -64,6 +64,133 @@ mod test {
     }
 
     #[test]
+    fn test_unannotated_angle_parameter_does_not_default_to_angle_object() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Angle
+
+            ---@param x number
+            ---@param y number
+            ---@param w number
+            ---@param h number
+            ---@param rotation number
+            function DrawTexturedRectRotated(x, y, w, h, rotation) end
+
+            local function DrawIcon(x, y, size, angle)
+                DrawTexturedRectRotated(x, y, size, size, angle or 0)
+            end
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_pcall_variadic_generic_accepts_class_arg_from_unresolved_callable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+
+            ---@type table[]
+            local indicators = {}
+
+            ---@param vehicle Entity
+            local function ResetHUDForVehicle(vehicle)
+                for _, indicator in ipairs(indicators) do
+                    if indicator.getValue then
+                        pcall(indicator.getValue, vehicle)
+                    end
+                end
+            end
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_required_table_field_assigned_from_reused_unresolved_local_is_not_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@class HullTrace
+            ---@field start Vector
+            ---@field endpos Vector
+
+            ---@param trace HullTrace
+            function TraceHull(trace) end
+
+            local pos
+            local traceData = {}
+
+            local function Fire(params)
+                pos = params.pos
+                traceData.start = pos
+                traceData.endpos = pos
+                TraceHull(traceData)
+            end
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_required_table_field_assigned_explicit_nil_still_mismatches() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@class HullTrace
+            ---@field start Vector
+            ---@field endpos Vector
+
+            ---@param trace HullTrace
+            function TraceHull(trace) end
+
+            local traceData = {}
+            traceData.start = nil
+            traceData.endpos = nil
+            TraceHull(traceData)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_required_table_field_assigned_known_wrong_type_still_mismatches() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@class HullTrace
+            ---@field start Vector
+            ---@field endpos Vector
+
+            ---@param trace HullTrace
+            function TraceHull(trace) end
+
+            local traceData = {}
+            traceData.start = "wrong"
+            traceData.endpos = "wrong"
+            TraceHull(traceData)
+        "#
+        ));
+    }
+
+    #[test]
     fn test_issue_85() {
         let mut ws = VirtualWorkspace::new();
 
@@ -1655,6 +1782,76 @@ mod test {
     }
 
     #[test]
+    fn test_vgui_instance_close_override_does_not_poison_sibling_dframe_close() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+
+        ws.def(
+            r#"
+            ---@class DFrame
+            local DFrame = {}
+
+            function DFrame:Close()
+            end
+
+            vgui = {}
+
+            ---@generic T: DFrame
+            ---@param className `T`
+            ---@return T
+            function vgui.Create(className)
+            end
+
+            function vgui.Register(name, tbl, base)
+            end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/vgui/editor.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.Close = function(s)
+                end
+            end
+
+            vgui.Register("EditorFrame", PANEL, "DFrame")
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/browser.lua",
+            r#"
+            local PANEL = {}
+
+            vgui.Register("BrowserFrame", PANEL, "DFrame")
+
+            local frame = vgui.Create("BrowserFrame")
+            frame:Close()
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics.iter().all(|diag| diag.code != param_type_code),
+            "unexpected param-type-mismatch diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn test_array_slots_reassigned_from_struct_literals_use_reassigned_type() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
@@ -2331,6 +2528,109 @@ mod test {
             local velUDt = 0
             local scratchVec2 = {} ---@type Vector
             VectorMul(scratchVec2, velUDt)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_vector_arithmetic_from_normalizing_helper_preserves_vector_result() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Vector
+            ---@operator add(Vector): Vector
+            ---@operator sub(Vector): Vector
+            ---@operator mul(number|Vector): Vector
+            ---@operator unm: Vector
+            local Vector = {}
+
+            ---@return number
+            function Vector:Length() end
+
+            ---@return Vector
+            function Vector:Cross(other) end
+
+            function Vector:Normalize() end
+
+            ---@return Vector
+            function Vector(x, y, z) end
+
+            render = {}
+
+            ---@param a Vector
+            ---@param b Vector
+            ---@param c Vector
+            ---@param d Vector
+            function render.DrawQuad(a, b, c, d) end
+
+            ---@return string
+            function type(value) end
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        let file_id = ws.def(
+            r#"
+            local function toVector(v)
+                if not v then return Vector(0, 0, 0) end
+                if type(v) == "Vector" then return v end
+                return Vector(0, 0, 0)
+            end
+
+            local function drawTraceBox(contactPos, contactNormal, fw, rt, radius)
+                radius = radius or 8
+
+                local halfWidth = radius * 1.1
+                local halfLen = radius * 1.75
+
+                local c1 = contactPos + -fw * (-halfLen) + rt * (-halfWidth)
+                local c2 = contactPos + -fw * (-halfLen) + rt * (halfWidth)
+                local c3 = contactPos + -fw * (halfLen) + rt * (halfWidth)
+                local c4 = contactPos + -fw * (halfLen) + rt * (-halfWidth)
+
+                local cn = toVector(contactNormal)
+                if cn:Length() < 1e-4 then cn = Vector(0, 0, 1) end
+                if cn.z < 0 then cn = -cn end
+                cn:Normalize()
+
+                local offset = cn * (radius * 0.2)
+
+                local o1 = c1 + offset
+                local o2 = c2 + offset
+                local o3 = c3 + offset
+                local o4 = c4 + offset
+                render.DrawQuad(o1, o2, o3, o4)
+            end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == code)
+            .map(|diag| diag.message.clone())
+            .collect();
+
+        assert!(messages.is_empty(), "{}", messages.join(" || "));
+    }
+
+    #[test]
+    fn test_unary_minus_definite_nil_still_mismatches_string_param() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value table
+            local function takes_table(value) end
+
+            local value = nil
+            takes_table(-value)
             "#,
         ));
     }

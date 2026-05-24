@@ -7,6 +7,31 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     #[test]
+    fn test_dynamic_table_param_return_or_empty_branch_keeps_fields_allowed() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@return table|nil
+            function JSONToTable(s) end
+
+            function CheckVersion(data)
+                if type(data.version) ~= "number" then
+                    return {}
+                end
+
+                return data
+            end
+
+            local data = JSONToTable("{}") or {}
+            data = CheckVersion(data)
+            print(data.carVolume)
+        "#
+        ));
+    }
+
+    #[test]
     fn test_1() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(

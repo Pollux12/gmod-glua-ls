@@ -246,4 +246,24 @@ mod test {
             "#
         ));
     }
+
+    #[gtest]
+    fn test_dynamic_field_defined_on_base_visible_to_subclass() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class DynTest10.Base
+            ---@class DynTest10.Child : DynTest10.Base
+
+            ---@type DynTest10.Base
+            local base
+            base.sharedDynamic = 1
+
+            ---@type DynTest10.Child
+            local child
+            local value = child.sharedDynamic
+            "#
+        ));
+    }
 }

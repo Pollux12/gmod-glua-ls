@@ -1057,6 +1057,190 @@ mod test {
     }
 
     #[gtest]
+    fn test_isvalid_narrows_loop_assigned_local_negative_branch() {
+        // GMod pattern: find an object in a loop, then guard it with IsValid before use.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class Player
+            ---@field ExitVehicle fun(self: Player)
+            ---@return Player[]
+            function getPlayers() end
+
+            local bot
+            for _, candidate in ipairs(getPlayers()) do
+                bot = candidate
+                break
+            end
+
+            if not IsValid(bot) then
+                return
+            end
+
+            bot:ExitVehicle()
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_isvalid_prior_guard_does_not_apply_after_reassignment() {
+        // A prior IsValid guard only proves the value held at the guard. If the
+        // local is assigned again before use, the later value still needs a check.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::UncheckedNilAccess,
+                r#"
+                ---@class Player
+                ---@field ExitVehicle fun(self: Player)
+
+                ---@type Player?
+                local bot
+                if not IsValid(bot) then
+                    return
+                end
+
+                bot = nil
+                bot:ExitVehicle()
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_shadowed_isvalid_prior_guard_does_not_suppress_nil_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@class Player
+                ---@field ExitVehicle fun(self: Player)
+                ---@return Player?
+                function maybePlayer() end
+
+                local function IsValid(_)
+                    return true
+                end
+
+                local bot = maybePlayer()
+                if not IsValid(bot) then
+                    return
+                end
+
+                bot:ExitVehicle()
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_prior_guard_does_not_apply_after_else_reassignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::UncheckedNilAccess,
+                r#"
+                ---@class Player
+                ---@field ExitVehicle fun(self: Player)
+
+                ---@type Player?
+                local bot
+                if not IsValid(bot) then
+                    return
+                else
+                    bot = nil
+                end
+
+                bot:ExitVehicle()
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_prior_guard_does_not_apply_after_elseif_reassignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@class Player
+                ---@field ExitVehicle fun(self: Player)
+
+                ---@type Player?
+                local bot
+                if not IsValid(bot) then
+                    return
+                elseif maybeReset then
+                    bot = nil
+                end
+
+                bot:ExitVehicle()
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_shadowed_isvalid_alias_prior_guard_does_not_suppress_nil_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@class Player
+                ---@field ExitVehicle fun(self: Player)
+                ---@return Player?
+                function maybePlayer() end
+
+                local function IsValid(_)
+                    return true
+                end
+
+                do
+                    local IsValid = IsValid
+                    local bot = maybePlayer()
+                    if not IsValid(bot) then
+                        return
+                    end
+
+                    bot:ExitVehicle()
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_cached_builtin_isvalid_prior_guard_suppresses_nil_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Player
+            ---@field ExitVehicle fun(self: Player)
+            ---@return Player?
+            function maybePlayer() end
+
+            local IsValid = IsValid
+            local bot = maybePlayer()
+            if not IsValid(bot) then
+                return
+            end
+
+            bot:ExitVehicle()
+            "#,
+        ));
+    }
+
+    #[gtest]
     fn test_isfunction_narrows_nil_from_nullable_type() {
         // Bug repro: isfunction(func) should narrow away nil in the true branch
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -1398,7 +1582,6 @@ mod test {
             "No NeedCheckNil expected: Entity has no GetFreeSeat"
         );
     }
-
     #[gtest]
     fn test_field_narrow_direct_definer_no_nil_on_method() {
         // After narrowing to the direct field definer, methods on that type should not trigger nil
