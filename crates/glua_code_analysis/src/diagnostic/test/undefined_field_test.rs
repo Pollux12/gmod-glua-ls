@@ -1534,6 +1534,24 @@ mod test {
     }
 
     #[test]
+    fn test_nil_guarded_field_if_condition_does_not_guard_elseif_body() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestConfigElseIf
+                local cfg = {}
+
+                if cfg.dynamicField then
+                    print(cfg.dynamicField)
+                elseif true then
+                    print(cfg.dynamicField)
+                end
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_nil_guarded_field_compound_and() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(

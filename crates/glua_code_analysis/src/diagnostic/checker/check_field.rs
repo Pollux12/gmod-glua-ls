@@ -1250,8 +1250,34 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                             }
                         }
                     }
+
+                    for elseif_clause in if_stat.get_else_if_clause_list() {
+                        if !elseif_clause.get_range().contains_range(node_range) {
+                            continue;
+                        }
+
+                        if let Some(condition_expr) = elseif_clause.get_condition_expr() {
+                            let cond_range = condition_expr.get_range();
+                            if cond_range.contains_range(node_range) {
+                                if is_truthy_check_in_condition(&condition_expr, &normalized_target)
+                                {
+                                    return true;
+                                }
+                            } else if condition_nil_guards_field(
+                                &condition_expr,
+                                &normalized_target,
+                            ) {
+                                if let Some(root_name) = target_root_name
+                                    && has_root_reassignment_before_usage(index_expr, root_name)
+                                {
+                                    break;
+                                }
+                                return true;
+                            }
+                        }
+                    }
                 }
-                break;
+                continue;
             }
             LuaSyntaxKind::ElseIfClauseStat => {
                 if let Some(elseif_clause) = LuaElseIfClauseStat::cast(ancestor) {
