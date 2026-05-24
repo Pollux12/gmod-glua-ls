@@ -46,7 +46,17 @@ pub fn infer_index_expr(
     pass_flow: bool,
 ) -> InferResult {
     let prefix_expr = index_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
-    let prefix_type = infer_expr(db, cache, prefix_expr.clone())?;
+    let mut prefix_is_unresolved_param = false;
+    let prefix_type = match infer_expr(db, cache, prefix_expr.clone()) {
+        Ok(prefix_type) => prefix_type,
+        Err(InferFailReason::UnResolveDeclType(decl_id))
+            if is_unresolved_param_decl(db, decl_id) =>
+        {
+            prefix_is_unresolved_param = true;
+            LuaType::Unknown
+        }
+        Err(err) => return Err(err),
+    };
     let index_member_expr = LuaIndexMemberExpr::IndexExpr(index_expr.clone());
 
     let reason = match infer_member_by_member_key(
@@ -96,14 +106,29 @@ pub fn infer_index_expr(
     }
 
     if pass_flow {
-        match infer_member_type_fallback_pass_flow(db, cache, index_expr) {
+        match infer_member_type_fallback_pass_flow(
+            db,
+            cache,
+            index_expr,
+            prefix_is_unresolved_param,
+        ) {
             Ok(member_type) => return Ok(member_type),
             Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
             Err(err) => return Err(err),
         }
     }
 
+    if prefix_is_unresolved_param {
+        return Ok(LuaType::Unknown);
+    }
+
     Err(reason)
+}
+
+fn is_unresolved_param_decl(db: &DbIndex, decl_id: LuaDeclId) -> bool {
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_param())
 }
 
 fn infer_member_type_pass_flow(
@@ -131,6 +156,7 @@ fn infer_member_type_fallback_pass_flow(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: LuaIndexExpr,
+    unknown_truthy_as_any: bool,
 ) -> InferResult {
     let Some(var_ref_id) = get_index_expr_var_ref_id(db, cache, &index_expr) else {
         return Err(InferFailReason::FieldNotFound);
@@ -141,6 +167,7 @@ fn infer_member_type_fallback_pass_flow(
         .insert(var_ref_id.clone(), CacheEntry::Cache(LuaType::Nil));
     match infer_expr_narrow_type(db, cache, LuaExpr::IndexExpr(index_expr), var_ref_id) {
         Ok(member_type) if !member_type.is_nil() && !member_type.is_unknown() => Ok(member_type),
+        Ok(member_type) if member_type.is_unknown() && unknown_truthy_as_any => Ok(LuaType::Any),
         Ok(_) | Err(InferFailReason::None) => Err(InferFailReason::FieldNotFound),
         Err(err) => Err(err),
     }
