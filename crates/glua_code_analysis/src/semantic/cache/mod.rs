@@ -2,7 +2,7 @@ mod cache_options;
 
 pub use cache_options::{CacheOptions, LuaAnalysisPhase};
 use glua_parser::LuaSyntaxId;
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashMap;
 use std::{collections::HashSet, sync::Arc};
 
@@ -58,8 +58,10 @@ pub struct LuaInferCache {
     /// full iterator inference from the enclosing `for` statement.
     pub for_range_iter_var_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
     pub dynamic_field_metatable_cache: FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>,
-    pub dynamic_field_resolution_cache:
-        FxHashMap<(LuaType, LuaMemberKey), Option<(LuaType, Option<LuaSemanticDeclId>)>>,
+    pub dynamic_field_resolution_cache: FxHashMap<
+        (LuaType, LuaMemberKey, Option<TextSize>),
+        Option<(LuaType, Option<LuaSemanticDeclId>)>,
+    >,
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
     /// Tracks total flow nodes visited during flow analysis for profiling.

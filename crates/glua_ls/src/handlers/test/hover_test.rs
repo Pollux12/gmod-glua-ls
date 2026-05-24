@@ -1592,6 +1592,201 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_dynamic_table_field_assignment_prefers_concrete_string_over_any() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@return table|nil
+                local function FromJSON()
+                end
+
+                ---@return table
+                local function ReadTable()
+                    return FromJSON() or {}
+                end
+
+                ---@param value string
+                ---@return string
+                local function FirstChar(value)
+                    return value
+                end
+
+                ---@param phrase string
+                ---@return string
+                local function GetPhrase(phrase)
+                    return phrase
+                end
+
+                local data = ReadTable()
+
+                if FirstChar(data.text) == "#" then
+                    data.te<??>xt = GetPhrase(data.text)
+                end
+            "##,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("text: string"),
+            "expected concrete string hover for dynamic table field assignment, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("any"),
+            "expected hover to avoid retaining open-table any in the field type, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_table_field_read_before_assignment_stays_open_table_any() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@return table|nil
+                local function FromJSON()
+                end
+
+                ---@return table
+                local function ReadTable()
+                    return FromJSON() or {}
+                end
+
+                ---@param value string
+                ---@return string
+                local function FirstChar(value)
+                    return value
+                end
+
+                ---@param phrase string
+                ---@return string
+                local function GetPhrase(phrase)
+                    return phrase
+                end
+
+                local data = ReadTable()
+
+                if FirstChar(data.text) == "#" then
+                    data.text = GetPhrase(data.te<??>xt)
+                end
+            "##,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("any?"),
+            "expected pre-assignment open-table field read to stay broad, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("string"),
+            "expected future assignment not to type a prior field read, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_table_field_call_arg_before_assignment_stays_open_table_any() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                util = {}
+
+                ---@return table?
+                function util.JSONToTable(s)
+                end
+
+                ---@return table
+                local function ReadTable()
+                    return util.JSONToTable("") or {}
+                end
+
+                ---@param value string
+                ---@return string
+                local function FirstChar(value)
+                    return value
+                end
+
+                ---@param phrase string
+                ---@return string
+                local function GetPhrase(phrase)
+                    return phrase
+                end
+
+                local data = ReadTable()
+
+                if FirstChar(data.te<??>xt) == "#" then
+                    data.text = GetPhrase(data.text)
+                end
+            "##,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("any?"),
+            "expected call-site pre-assignment field read to stay broad, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("string"),
+            "expected future assignment not to type the earlier call argument, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_table_field_read_after_assignment_uses_assigned_string() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@return table|nil
+                local function FromJSON()
+                end
+
+                ---@return table
+                local function ReadTable()
+                    return FromJSON() or {}
+                end
+
+                ---@param value string
+                ---@return string
+                local function GetPhrase(value)
+                    return value
+                end
+
+                local data = ReadTable()
+                data.text = GetPhrase(data.text)
+                local text = data.te<??>xt
+            "##,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("string"),
+            "expected post-assignment field read to use assigned string type, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("any"),
+            "expected post-assignment field read not to retain open-table any, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_local_gettable_call_uses_scoped_receiver_type() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

@@ -25,7 +25,7 @@ use glua_parser::{LuaAssignStat, LuaSyntaxKind, LuaTableExpr, LuaTableField};
 use glua_parser::{LuaAstNode, LuaIndexExpr};
 pub(crate) use infer_raw_member::infer_owner_raw_member_type_with_realm;
 pub use infer_raw_member::infer_raw_member_type;
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 use super::{
     InferFailReason, LuaInferCache, SemanticDeclLevel, infer_expr, infer_node_semantic_decl,
@@ -74,26 +74,29 @@ pub(crate) fn resolve_dynamic_field_member(
     cache: &mut LuaInferCache,
     prefix_type: &LuaType,
     member_key: &LuaMemberKey,
+    access_position: Option<TextSize>,
 ) -> Option<DynamicFieldResolution> {
     if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
         return None;
     }
 
-    if let Some(cached) = cache
-        .dynamic_field_resolution_cache
-        .get(&(prefix_type.clone(), member_key.clone()))
-    {
+    let cache_key = (prefix_type.clone(), member_key.clone(), access_position);
+    if let Some(cached) = cache.dynamic_field_resolution_cache.get(&cache_key) {
         return cached
             .clone()
             .map(|(typ, semantic_decl)| DynamicFieldResolution { typ, semantic_decl });
     }
 
     let field_name = member_key.get_name()?;
-    let definitions = dynamic_field_definitions(db, cache.get_file_id(), prefix_type, field_name);
+    let definitions = dynamic_field_definitions(
+        db,
+        cache.get_file_id(),
+        prefix_type,
+        field_name,
+        access_position,
+    );
     if definitions.is_empty() {
-        cache
-            .dynamic_field_resolution_cache
-            .insert((prefix_type.clone(), member_key.clone()), None);
+        cache.dynamic_field_resolution_cache.insert(cache_key, None);
         return None;
     }
 
@@ -117,10 +120,9 @@ pub(crate) fn resolve_dynamic_field_member(
         [only] => only.clone(),
         _ => LuaType::from_vec(member_types),
     };
-    cache.dynamic_field_resolution_cache.insert(
-        (prefix_type.clone(), member_key.clone()),
-        Some((typ.clone(), semantic_decl.clone())),
-    );
+    cache
+        .dynamic_field_resolution_cache
+        .insert(cache_key, Some((typ.clone(), semantic_decl.clone())));
     Some(DynamicFieldResolution { typ, semantic_decl })
 }
 
@@ -131,7 +133,7 @@ pub(crate) fn resolve_dynamic_field_member_for_file(
     member_key: &LuaMemberKey,
 ) -> Option<DynamicFieldResolution> {
     let mut cache = LuaInferCache::new(caller_file_id, Default::default());
-    resolve_dynamic_field_member(db, &mut cache, prefix_type, member_key)
+    resolve_dynamic_field_member(db, &mut cache, prefix_type, member_key, None)
 }
 
 fn dynamic_field_member_type(
@@ -209,6 +211,7 @@ fn dynamic_field_definitions(
     caller_file_id: FileId,
     prefix_type: &LuaType,
     field_name: &str,
+    access_position: Option<TextSize>,
 ) -> Vec<crate::InFiled<TextRange>> {
     match prefix_type {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => dynamic_field_definitions_for_owner(
@@ -216,16 +219,22 @@ fn dynamic_field_definitions(
             caller_file_id,
             &crate::DynamicFieldOwner::Type(type_id.clone()),
             field_name,
+            access_position,
         ),
         LuaType::TableConst(table_range) => dynamic_field_definitions_for_owner(
             db,
             caller_file_id,
             &crate::DynamicFieldOwner::Table(table_range.clone()),
             field_name,
+            access_position,
         ),
-        LuaType::Instance(instance) => {
-            dynamic_field_definitions(db, caller_file_id, instance.get_base(), field_name)
-        }
+        LuaType::Instance(instance) => dynamic_field_definitions(
+            db,
+            caller_file_id,
+            instance.get_base(),
+            field_name,
+            access_position,
+        ),
         _ => Vec::new(),
     }
 }
@@ -235,6 +244,7 @@ fn dynamic_field_definitions_for_owner(
     caller_file_id: FileId,
     owner: &crate::DynamicFieldOwner,
     field_name: &str,
+    access_position: Option<TextSize>,
 ) -> Vec<crate::InFiled<TextRange>> {
     let dynamic_fields_global = db.get_emmyrc().gmod.dynamic_fields_global;
     let caller_realm = infer_dynamic_field_caller_realm(db, &caller_file_id);
@@ -243,7 +253,52 @@ fn dynamic_field_definitions_for_owner(
         .into_iter()
         .filter(|definition| dynamic_fields_global || definition.file_id == caller_file_id)
         .filter(|definition| is_dynamic_field_realm_compatible(db, caller_realm, definition))
+        .filter(|definition| {
+            dynamic_field_definition_visible_at(db, caller_file_id, definition, access_position)
+        })
         .collect()
+}
+
+fn dynamic_field_definition_visible_at(
+    db: &DbIndex,
+    caller_file_id: FileId,
+    definition: &crate::InFiled<TextRange>,
+    access_position: Option<TextSize>,
+) -> bool {
+    let Some(access_position) = access_position else {
+        return true;
+    };
+    if definition.file_id != caller_file_id {
+        return true;
+    }
+    if definition.value.start() > access_position {
+        return false;
+    }
+    !definition_enclosing_assignment_contains(db, definition, access_position)
+}
+
+fn definition_enclosing_assignment_contains(
+    db: &DbIndex,
+    definition: &crate::InFiled<TextRange>,
+    access_position: TextSize,
+) -> bool {
+    let Some(root) = db.get_vfs().get_syntax_tree(&definition.file_id) else {
+        return false;
+    };
+    let root = root.get_red_root();
+    let Some(token) = root
+        .token_at_offset(definition.value.start())
+        .right_biased()
+    else {
+        return false;
+    };
+    token
+        .parent_ancestors()
+        .find_map(LuaAssignStat::cast)
+        .is_some_and(|assign_stat| {
+            let range = assign_stat.get_range();
+            range.contains(access_position) && range != definition.value
+        })
 }
 
 fn infer_dynamic_field_caller_realm(db: &DbIndex, caller_file_id: &FileId) -> GmodRealm {

@@ -238,6 +238,46 @@ mod test {
     }
 
     #[gtest]
+    fn test_dynamic_field_value_inference_is_position_aware() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+        util = {}
+
+        ---@return table?
+        function util.JSONToTable(s) end
+
+        ---@return table
+        local function read_table()
+            return util.JSONToTable("") or {}
+        end
+
+        ---@param value string
+        ---@return string
+        local function translate(value)
+            return value
+        end
+
+        local data = read_table()
+        A = data.text
+        data.text = translate(data.text)
+        B = data.text
+        "#,
+        );
+
+        let before_ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(before_ty), "any?");
+
+        let after_ty = ws.expr_ty("B");
+        assert_that!(ws.check_type(&after_ty, &LuaType::String), eq(true));
+    }
+
+    #[gtest]
     fn test_missing_plain_table_field_is_nil() {
         let mut ws = VirtualWorkspace::new();
 

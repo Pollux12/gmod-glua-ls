@@ -429,9 +429,13 @@ fn infer_custom_type_member_semantic_decl(
         };
     }
 
-    if let Some(dynamic_field) =
-        resolve_dynamic_field_member(db, cache, &LuaType::Ref(prefix_type_id.clone()), member_key)
-    {
+    if let Some(dynamic_field) = resolve_dynamic_field_member(
+        db,
+        cache,
+        &LuaType::Ref(prefix_type_id.clone()),
+        member_key,
+        member_access_position,
+    ) {
         return dynamic_field.semantic_decl;
     }
 

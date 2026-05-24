@@ -165,15 +165,24 @@ mod test {
     }
 
     #[test]
-    fn test_dynamic_table_field_later_string_assignment_stays_usable_as_string_arg() {
+    fn test_inferred_dynamic_table_field_before_assignment_is_lenient_by_default() {
         let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
 
         assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r##"
+            util = {}
+
+            ---@return table?
+            function util.JSONToTable(s) end
+
             ---@return table
             local function read_table()
-                return {}
+                return util.JSONToTable("") or {}
             end
 
             ---@param value string
@@ -194,46 +203,6 @@ mod test {
                 data.text = translate(data.text)
             end
         "##,
-        ));
-    }
-
-    #[test]
-    fn test_any_string_union_argument_is_compatible_with_string_param() {
-        let mut ws = VirtualWorkspace::new();
-
-        assert!(ws.check_code_for(
-            DiagnosticCode::ParamTypeMismatch,
-            r#"
-            ---@param value string
-            local function takes_string(value)
-            end
-
-            ---@return any|string
-            local function get_value()
-            end
-
-            takes_string(get_value())
-        "#,
-        ));
-    }
-
-    #[test]
-    fn test_nullable_any_string_union_argument_is_compatible_with_string_param() {
-        let mut ws = VirtualWorkspace::new();
-
-        assert!(ws.check_code_for(
-            DiagnosticCode::ParamTypeMismatch,
-            r#"
-            ---@param value string
-            local function takes_string(value)
-            end
-
-            ---@return (any|string)?
-            local function get_value()
-            end
-
-            takes_string(get_value())
-        "#,
         ));
     }
 

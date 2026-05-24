@@ -339,9 +339,13 @@ fn infer_table_member(
     ) {
         Ok(typ) => Ok(typ),
         Err(InferFailReason::FieldNotFound) => {
-            if let Some(dynamic_field) =
-                resolve_dynamic_field_member(db, cache, &LuaType::TableConst(inst.clone()), &key)
-            {
+            if let Some(dynamic_field) = resolve_dynamic_field_member(
+                db,
+                cache,
+                &LuaType::TableConst(inst.clone()),
+                &key,
+                Some(index_expr.get_position()),
+            ) {
                 return Ok(dynamic_field.typ);
             }
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
@@ -463,8 +467,14 @@ fn infer_gmod_plain_table_dynamic_field(
         return Some(member_type);
     }
 
-    resolve_dynamic_field_member(db, cache, &class_type, &member_key)
-        .map(|resolution| resolution.typ)
+    resolve_dynamic_field_member(
+        db,
+        cache,
+        &class_type,
+        &member_key,
+        Some(index_expr.get_position()),
+    )
+    .map(|resolution| resolution.typ)
 }
 
 fn is_gmod_gettable_alias_member_access(
@@ -697,9 +707,13 @@ fn infer_custom_type_member(
         return resolved;
     }
 
-    if let Some(dynamic_field) =
-        resolve_dynamic_field_member(db, cache, &LuaType::Ref(prefix_type_id.clone()), &key)
-    {
+    if let Some(dynamic_field) = resolve_dynamic_field_member(
+        db,
+        cache,
+        &LuaType::Ref(prefix_type_id.clone()),
+        &key,
+        Some(index_expr.get_position()),
+    ) {
         return Ok(dynamic_field.typ);
     }
 
