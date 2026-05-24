@@ -500,6 +500,10 @@ impl LuaType {
                     }
                 }
 
+                if result_types.len() > 1 && hash_set.remove(&LuaType::Unknown) {
+                    result_types.retain(|typ| !matches!(typ, LuaType::Unknown));
+                }
+
                 match result_types.len() {
                     0 => LuaType::Nil,
                     1 => result_types[0].clone(),
@@ -933,6 +937,10 @@ impl TypeVisitTrait for LuaUnionType {
 
 impl LuaUnionType {
     pub fn from_set(mut set: HashSet<LuaType>) -> Self {
+        if set.len() > 1 {
+            set.remove(&LuaType::Unknown);
+        }
+
         if set.len() == 2 && set.contains(&LuaType::Nil) {
             set.remove(&LuaType::Nil);
             if let Some(first) = set.iter().next() {
@@ -949,7 +957,11 @@ impl LuaUnionType {
         }
     }
 
-    pub fn from_vec(types: Vec<LuaType>) -> Self {
+    pub fn from_vec(mut types: Vec<LuaType>) -> Self {
+        if types.len() > 1 && types.iter().any(|typ| !matches!(typ, LuaType::Unknown)) {
+            types.retain(|typ| !matches!(typ, LuaType::Unknown));
+        }
+
         if types.len() == 2 {
             if types.contains(&LuaType::Nil) {
                 let non_nil_type = types.iter().find(|t| !matches!(t, LuaType::Nil));

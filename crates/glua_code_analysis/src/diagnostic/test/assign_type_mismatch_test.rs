@@ -1651,6 +1651,55 @@ return t
         ));
     }
 
+    #[test]
+    fn test_unknown_union_member_does_not_poison_assignable_known_members() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local target = false
+
+            ---@type false|unknown
+            local value
+
+            target = value
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .expect("diagnostics should be available");
+        let code_string = Some(NumberOrString::String(
+            DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
+        ));
+        let assign_diags = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == code_string)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            assign_diags.is_empty(),
+            "unexpected assign-type-mismatch diagnostics: {:?}",
+            assign_diags
+        );
+    }
+
+    #[test]
+    fn test_unknown_union_member_does_not_hide_incompatible_known_members() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local target = false
+
+            ---@type string|unknown
+            local value
+
+            target = value
+            "#
+        ));
+    }
+
     // RC-2 fix: local var (no init) used as upvalue in closure, assigned in different function.
     // Before fix: active bound to Nil → active.fade = Never → "Cannot assign integer to never"
     // After fix:  active (mutable) not bound to Nil → infer returns Err → no diagnostic

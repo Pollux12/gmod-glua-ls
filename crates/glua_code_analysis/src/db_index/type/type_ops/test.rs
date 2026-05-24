@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, TypeOps, VirtualWorkspace};
+    use crate::{DiagnosticCode, LuaType, LuaUnionType, TypeOps, VirtualWorkspace};
 
     #[test]
     fn test_custom_ops() {
@@ -135,6 +135,16 @@ mod tests {
                 TypeOps::Union.apply(ws.get_db_mut(), &type_one, &type_two),
                 ws.ty("1|2")
             );
+        }
+        {
+            assert_eq!(
+                LuaType::from_vec(vec![LuaType::Unknown, LuaType::String]),
+                LuaType::String
+            );
+        }
+        {
+            let union = LuaUnionType::from_vec(vec![LuaType::Unknown, LuaType::String]);
+            assert_eq!(union.into_vec(), vec![LuaType::String]);
         }
         {
             let type_string_number = ws.ty("string | number");
