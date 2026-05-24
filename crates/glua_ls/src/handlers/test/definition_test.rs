@@ -738,6 +738,56 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_inferred_dynamic_field_definition_keeps_future_same_file_assignment() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_definition(
+            r#"
+                ---@class DynGotoFuture.Entity
+                ---@type DynGotoFuture.Entity
+                local ent
+                local value = ent.te<??>stVar
+                ent.testVar = true
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 5,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_inferred_dynamic_field_definition_ignores_same_line_assignment_lhs() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class DynGotoSameLine.Entity
+                ---@type DynGotoSameLine.Entity
+                local ent
+                ent.testVar = ent.te<??>stVar
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position);
+        verify_that!(result, none())?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_inferred_dynamic_field_definition_respects_file_scope() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

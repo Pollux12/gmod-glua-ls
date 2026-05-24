@@ -119,7 +119,7 @@ pub fn definition(
         if !locations.is_empty() {
             use itertools::Itertools;
             let mut unique_locations: Vec<_> = locations.into_iter().unique().collect();
-            if let Some((_, prefix_type, field_name)) = &dynamic_lookup {
+            if let Some((index_expr, prefix_type, field_name)) = &dynamic_lookup {
                 let emmyrc = semantic_model.get_emmyrc();
                 if emmyrc.gmod.enabled
                     && emmyrc.gmod.infer_dynamic_fields
@@ -146,6 +146,11 @@ pub fn definition(
                         })
                     });
                 }
+                filter_current_line_dynamic_locations(
+                    &semantic_model,
+                    index_expr,
+                    &mut unique_locations,
+                );
             }
             if unique_locations.len() == 1 {
                 return Some(GotoDefinitionResponse::Scalar(unique_locations.remove(0)));
@@ -255,6 +260,7 @@ fn goto_inferred_dynamic_field_definition(
         semantic_model.get_file_id(),
         true,
     );
+    filter_current_line_dynamic_locations(semantic_model, &index_expr, &mut locations);
     if locations.is_empty() {
         return None;
     }
@@ -350,6 +356,29 @@ fn collect_dynamic_field_locations(
         }
         _ => {}
     }
+}
+
+fn filter_current_line_dynamic_locations(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+    locations: &mut Vec<Location>,
+) {
+    let Some(current_key_range) = index_expr.get_index_key().and_then(|key| key.get_range()) else {
+        return;
+    };
+    let document = semantic_model.get_document();
+    let current_uri = document.get_uri();
+    let Some(current_location) = document.to_lsp_location(current_key_range) else {
+        return;
+    };
+    locations.retain(|location| {
+        if location.uri != current_uri {
+            return true;
+        }
+
+        location.range != current_location.range
+            && location.range.start.line != current_location.range.start.line
+    });
 }
 
 fn resolve_dynamic_field_lookup(
