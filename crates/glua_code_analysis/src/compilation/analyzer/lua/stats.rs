@@ -464,12 +464,13 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         }
 
         let type_owner = get_var_owner(analyzer, var.clone());
-        set_index_expr_owner(analyzer, var.clone());
 
         if special_assign_pattern(analyzer, type_owner.clone(), var.clone(), expr.clone()).is_some()
         {
             continue;
         }
+
+        set_index_expr_owner(analyzer, var.clone());
 
         let expr_type = match analyzer.infer_expr(expr) {
             Ok(expr_type) => match expr_type {
@@ -1559,9 +1560,21 @@ fn special_assign_pattern(
         return None;
     }
 
-    match analyzer.infer_expr(&right) {
-        Ok(right_expr_type) => {
-            assign_merge_type_owner_and_expr_type(analyzer, type_owner, &right_expr_type, 0);
+    let use_full_or_type =
+        matches!(&right, LuaExpr::TableExpr(table_expr) if table_expr.is_empty());
+    let expr_type = if use_full_or_type {
+        analyzer.infer_expr(&LuaExpr::BinaryExpr(binary_expr))
+    } else {
+        set_index_expr_owner(analyzer, var.clone());
+        analyzer.infer_expr(&right)
+    };
+
+    match expr_type {
+        Ok(expr_type) => {
+            if use_full_or_type {
+                set_index_expr_owner(analyzer, var);
+            }
+            assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0);
         }
         Err(_) => return None,
     }

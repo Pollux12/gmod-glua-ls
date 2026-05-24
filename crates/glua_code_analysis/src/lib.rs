@@ -201,10 +201,16 @@ impl EmmyLuaAnalysis {
             .get_vfs_mut()
             .set_file_content(uri, text);
 
-        self.compilation.remove_index(vec![file_id]);
+        let reindex_file_ids = self.expand_reindex_file_ids(vec![file_id]);
+        self.compilation.remove_index(reindex_file_ids.clone());
 
-        if !is_removed {
-            self.compilation.update_index(vec![file_id]);
+        let update_file_ids = reindex_file_ids
+            .into_iter()
+            .filter(|id| !is_removed || *id != file_id)
+            .collect::<Vec<_>>();
+        if !update_file_ids.is_empty() {
+            self.compilation.update_index(update_file_ids.clone());
+            self.stabilize_cross_file_type_caches(&update_file_ids);
         }
 
         Some(file_id)
@@ -365,8 +371,63 @@ impl EmmyLuaAnalysis {
     /// Reindex specific files: remove old index entries + run full analysis pipeline.
     /// Call this after `update_file_text_only` once the user has paused typing.
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
+        let file_ids = self.expand_reindex_file_ids(file_ids);
         self.compilation.remove_index(file_ids.clone());
-        self.compilation.update_index(file_ids);
+        self.compilation.update_index(file_ids.clone());
+        self.stabilize_cross_file_type_caches(&file_ids);
+    }
+
+    fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        let mut expanded = file_ids.into_iter().collect::<HashSet<_>>();
+        loop {
+            let dependent_files = self
+                .compilation
+                .get_db()
+                .get_type_index()
+                .files_with_type_caches_referencing_files(&expanded);
+            let mut added = false;
+            for file_id in dependent_files {
+                added |= expanded.insert(file_id);
+            }
+
+            if !added {
+                break;
+            }
+        }
+
+        let mut expanded = expanded.into_iter().collect::<Vec<_>>();
+        expanded.sort_unstable();
+        expanded
+    }
+
+    fn stabilize_cross_file_type_caches(&mut self, file_ids: &[FileId]) {
+        if file_ids.is_empty() {
+            return;
+        }
+
+        let changed = file_ids.iter().copied().collect::<HashSet<_>>();
+        let mut dependents = self
+            .compilation
+            .get_db()
+            .get_type_index()
+            .files_with_cross_file_type_caches_referencing_files(&changed)
+            .into_iter()
+            .filter(|file_id| {
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        dependents.sort_unstable();
+        dependents.dedup();
+        if dependents.is_empty() {
+            return;
+        }
+
+        self.compilation.remove_index(dependents.clone());
+        self.compilation.update_index(dependents);
     }
 
     pub fn update_remote_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> FileId {
@@ -518,11 +579,19 @@ impl EmmyLuaAnalysis {
             return Vec::new();
         }
 
-        self.compilation
-            .remove_index(removed_files.into_iter().collect());
+        let removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
+        self.compilation.remove_index(removed_files.clone());
+        updated_files.extend(removed_files.into_iter().filter(|file_id| {
+            self.compilation
+                .get_db()
+                .get_vfs()
+                .get_syntax_tree(file_id)
+                .is_some()
+        }));
         let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
         updated_files.sort();
         self.compilation.update_index(updated_files.clone());
+        self.stabilize_cross_file_type_caches(&updated_files);
         updated_files
     }
 
@@ -577,11 +646,19 @@ impl EmmyLuaAnalysis {
             return Vec::new();
         }
 
-        self.compilation
-            .remove_index(removed_files.into_iter().collect());
+        let removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
+        self.compilation.remove_index(removed_files.clone());
+        updated_files.extend(removed_files.into_iter().filter(|file_id| {
+            self.compilation
+                .get_db()
+                .get_vfs()
+                .get_syntax_tree(file_id)
+                .is_some()
+        }));
         let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
         updated_files.sort();
         self.compilation.update_index(updated_files.clone());
+        self.stabilize_cross_file_type_caches(&updated_files);
         updated_files
     }
 

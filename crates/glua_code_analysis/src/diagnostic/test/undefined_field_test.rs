@@ -2809,4 +2809,185 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn test_cross_file_snapshot_record_undefined_field_stable_after_reindex() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "lua/includes/glua_stubs.lua",
+            r#"
+            net = {}
+            util = {}
+
+            ---@return number
+            function net.ReadUInt(bits) end
+
+            ---@return boolean
+            function net.ReadBool() end
+
+            ---@return string
+            function net.ReadString() end
+
+            ---@return number
+            function net.ReadFloat() end
+
+            ---@return table?
+            function util.JSONToTable(json) end
+
+            ---@class Vector
+            ---@return Vector
+            function Vector(x, y, z) end
+
+            ---@return number
+            function SysTime() end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.DebugNetwork = Glide.DebugNetwork or {}
+            local DebugNet = Glide.DebugNetwork
+            local TYPE = {
+                BOOL = 1,
+                FLOAT = 2,
+                STRING = 3,
+                VECTOR = 4,
+                JSON = 5,
+            }
+
+            local function readValue()
+                local typeId = net.ReadUInt(3)
+                if typeId == TYPE.BOOL then
+                    return net.ReadBool()
+                end
+                if typeId == TYPE.FLOAT then
+                    return net.ReadFloat()
+                end
+                if typeId == TYPE.STRING then
+                    return net.ReadString()
+                end
+                if typeId == TYPE.VECTOR then
+                    return Vector(net.ReadFloat(), net.ReadFloat(), net.ReadFloat())
+                end
+                if typeId == TYPE.JSON then
+                    local json = net.ReadString()
+                    local tbl = util.JSONToTable(json or "")
+                    return tbl or {}
+                end
+
+                return nil
+            end
+
+            function DebugNet.ReadSnapshot()
+                local entId = net.ReadUInt(16)
+                local hasVehicle = net.ReadBool()
+                local vehicleId = nil
+                if hasVehicle then
+                    vehicleId = net.ReadUInt(16)
+                    if vehicleId == 0 then vehicleId = nil end
+                end
+
+                local fieldCount = net.ReadUInt(6)
+                local fields = {}
+                for _ = 1, fieldCount do
+                    local key = net.ReadString()
+                    fields[key] = readValue()
+                end
+
+                return entId, vehicleId, fields
+            end
+            "#,
+        );
+
+        let network_source = r#"
+            local DebugNet = Glide.DebugNetwork
+            local commands = {}
+            Glide.CMD_DEBUG_SNAPSHOT = 1
+
+            commands[Glide.CMD_DEBUG_SNAPSHOT] = function()
+                local entId, vehicleId, fields = DebugNet.ReadSnapshot()
+                if not entId then return end
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+                local rec = Glide.DebugSnapshots[entId]
+                if not rec then
+                    rec = { data = {}, t = SysTime() }
+                    Glide.DebugSnapshots[entId] = rec
+                end
+
+                local data = rec.data
+
+                if vehicleId ~= nil then
+                    data.vehicle = vehicleId
+                else
+                    data.vehicle = nil
+                end
+
+                for key, value in pairs( fields ) do
+                    if key ~= "ent" then
+                        data[key] = value
+                    end
+                end
+            end
+        "#;
+        let network_file = ws.def_file("lua/glide/client/network.lua", network_source);
+
+        let debugging_source = r#"
+            local function draw()
+                local snaps = Glide.DebugSnapshots or {}
+
+                for entId, rec in pairs(snaps) do
+                    if not rec or not rec.data then return end
+
+                    local d = rec.data
+                    local contactPos = d.contactPos
+                end
+            end
+        "#;
+        let debugging_file = ws.def_file("lua/glide/client/debugging.lua", debugging_source);
+
+        let contact_pos_code = Some(lsp_types::NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let contact_pos_message = "Undefined field `contactPos`. ";
+        let initial_diagnostics = ws
+            .analysis
+            .diagnose_file(debugging_file, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            !initial_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == contact_pos_code
+                    && diagnostic.message == contact_pos_message),
+            "expected no initial undefined-field for contactPos, got {initial_diagnostics:?}"
+        );
+
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/glide/client/network.lua");
+        ws.analysis
+            .update_file_text_only(&uri, format!("\n{network_source}"));
+        ws.analysis.reindex_files(vec![network_file]);
+
+        let after_reindex_diagnostics = ws
+            .analysis
+            .diagnose_file(debugging_file, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            !after_reindex_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == contact_pos_code
+                    && diagnostic.message == contact_pos_message),
+            "expected no post-reindex undefined-field for contactPos, got {after_reindex_diagnostics:?}"
+        );
+    }
 }
