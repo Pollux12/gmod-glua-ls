@@ -53,14 +53,17 @@ impl DynamicFieldIndex {
             .entry(field_name.clone())
             .or_default();
         let definition = InFiled::new(file_id, range);
-        if !field_definitions.contains(&definition) {
+        let is_new_definition = !field_definitions.contains(&definition);
+        if is_new_definition {
             field_definitions.push(definition);
         }
 
-        self.file_contributions
-            .entry(file_id)
-            .or_default()
-            .push((owner, field_name, range));
+        if is_new_definition {
+            self.file_contributions
+                .entry(file_id)
+                .or_default()
+                .push((owner, field_name, range));
+        }
     }
 
     pub fn has_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {

@@ -40,96 +40,146 @@ pub struct DynamicFieldAnalysisPipeline;
 
 impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        let _p = Profile::cond_new("dynamic field analyze", context.tree_list.len() > 1);
-        let tree_list = context.tree_list.clone();
-        let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
-            Vec::new();
-        let profile_enabled = log::log_enabled!(log::Level::Info);
-        let mut profile = profile_enabled.then(DynamicFieldProfile::default);
+        analyze_dynamic_fields(db, context, DynamicFieldAnalysisMode::Full);
+    }
+}
 
-        for in_filed_tree in &tree_list {
-            let root = in_filed_tree.value.clone();
-            let file_id = in_filed_tree.file_id;
-            let cache = context.infer_manager.get_infer_cache(file_id);
-            let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> =
-                FxHashMap::default();
-            for assign in root.descendants::<LuaAssignStat>() {
+pub struct EarlyDynamicFieldAnalysisPipeline;
+
+impl AnalysisPipeline for EarlyDynamicFieldAnalysisPipeline {
+    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
+        analyze_dynamic_fields(db, context, DynamicFieldAnalysisMode::Early);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DynamicFieldAnalysisMode {
+    Early,
+    Full,
+}
+
+impl DynamicFieldAnalysisMode {
+    fn collect_declared_member_table_fields(self) -> bool {
+        true
+    }
+
+    fn collect_direct_assignments(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn collect_setmetatable_tables(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn propagate_to_super_types(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+fn analyze_dynamic_fields(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    mode: DynamicFieldAnalysisMode,
+) {
+    let _p = Profile::cond_new("dynamic field analyze", context.tree_list.len() > 1);
+    let tree_list = context.tree_list.clone();
+    let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
+        Vec::new();
+    let profile_enabled = log::log_enabled!(log::Level::Info);
+    let mut profile = profile_enabled.then(DynamicFieldProfile::default);
+
+    for in_filed_tree in &tree_list {
+        let root = in_filed_tree.value.clone();
+        let file_id = in_filed_tree.file_id;
+        let cache = context.infer_manager.get_infer_cache(file_id);
+        let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> =
+            FxHashMap::default();
+        for assign in root.descendants::<LuaAssignStat>() {
+            if let Some(profile) = profile.as_mut() {
+                profile.assignments_scanned += 1;
+            }
+            let (vars, exprs) = assign.get_var_and_expr_list();
+            for (var, value_expr) in vars.iter().zip(exprs.iter()) {
                 if let Some(profile) = profile.as_mut() {
-                    profile.assignments_scanned += 1;
+                    profile.vars_scanned += 1;
                 }
-                let (vars, _) = assign.get_var_and_expr_list();
-                for var in vars.iter() {
+                let LuaVarExpr::IndexExpr(index_expr) = var else {
+                    continue;
+                };
+                if let Some(profile) = profile.as_mut() {
+                    profile.index_candidates += 1;
+                }
+                let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+                    continue;
+                };
+                let field_names = get_field_names(db, cache, &index_expr);
+                if field_names.is_empty() {
                     if let Some(profile) = profile.as_mut() {
-                        profile.vars_scanned += 1;
+                        profile.no_field_name_skips += 1;
                     }
-                    let LuaVarExpr::IndexExpr(index_expr) = var else {
-                        continue;
-                    };
+                    continue;
+                };
+
+                let cache_key = PrefixCacheKey::from_expr(&*db, cache, &prefix_expr);
+                let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
                     if let Some(profile) = profile.as_mut() {
-                        profile.index_candidates += 1;
+                        profile.owner_cache_hits += 1;
                     }
-                    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+                    match cached_type {
+                        Some(prefix_type) => prefix_type.clone(),
+                        None => continue,
+                    }
+                } else {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.owner_cache_misses += 1;
+                    }
+                    let infer_start = profile_enabled.then(std::time::Instant::now);
+                    let inferred = infer_expr(&*db, cache, prefix_expr.clone()).ok();
+                    if let (Some(profile), Some(infer_start)) = (profile.as_mut(), infer_start) {
+                        profile.owner_infer_time += infer_start.elapsed();
+                    }
+                    prefix_type_cache.insert(cache_key, inferred.clone());
+                    let Some(prefix_type) = inferred else {
                         continue;
                     };
-                    let field_names = get_field_names(db, cache, &index_expr);
-                    if field_names.is_empty() {
-                        if let Some(profile) = profile.as_mut() {
-                            profile.no_field_name_skips += 1;
-                        }
-                        continue;
-                    };
+                    prefix_type
+                };
 
-                    let cache_key = PrefixCacheKey::from_expr(&*db, cache, &prefix_expr);
-                    let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
-                        if let Some(profile) = profile.as_mut() {
-                            profile.owner_cache_hits += 1;
-                        }
-                        match cached_type {
-                            Some(prefix_type) => prefix_type.clone(),
-                            None => continue,
-                        }
-                    } else {
-                        if let Some(profile) = profile.as_mut() {
-                            profile.owner_cache_misses += 1;
-                        }
-                        let infer_start = profile_enabled.then(std::time::Instant::now);
-                        let inferred = infer_expr(&*db, cache, prefix_expr.clone()).ok();
-                        if let (Some(profile), Some(infer_start)) = (profile.as_mut(), infer_start)
-                        {
-                            profile.owner_infer_time += infer_start.elapsed();
-                        }
-                        prefix_type_cache.insert(cache_key, inferred.clone());
-                        let Some(prefix_type) = inferred else {
-                            continue;
-                        };
-                        prefix_type
-                    };
+                let effective_type = if let Some(metatable_type) = infer_setmetatable_target_type(
+                    &*db,
+                    cache,
+                    &prefix_expr,
+                    index_expr.get_range(),
+                ) {
+                    metatable_type
+                } else {
+                    prefix_type
+                };
 
-                    let effective_type = if let Some(metatable_type) =
-                        infer_setmetatable_target_type(
+                // Store the index key range (e.g. just "forwardSpeed") rather
+                // than the full index expression range (e.g. "selfTbl.forwardSpeed")
+                // so that go-to-definition targets the field key precisely.
+                let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
+                else {
+                    continue;
+                };
+
+                for field_name in field_names {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.fields_collected += 1;
+                    }
+                    if mode.collect_declared_member_table_fields() {
+                        collect_assigned_table_fields_for_declared_member(
                             &*db,
                             cache,
-                            &prefix_expr,
-                            index_expr.get_range(),
-                        ) {
-                        metatable_type
-                    } else {
-                        prefix_type
-                    };
-
-                    // Store the index key range (e.g. just "forwardSpeed") rather
-                    // than the full index expression range (e.g. "selfTbl.forwardSpeed")
-                    // so that go-to-definition targets the field key precisely.
-                    let Some(definition_range) =
-                        index_expr.get_index_key().and_then(|k| k.get_range())
-                    else {
-                        continue;
-                    };
-
-                    for field_name in field_names {
-                        if let Some(profile) = profile.as_mut() {
-                            profile.fields_collected += 1;
-                        }
+                            &effective_type,
+                            &field_name,
+                            value_expr,
+                            file_id,
+                            &mut collected,
+                        );
+                    }
+                    if mode.collect_direct_assignments() {
                         collect_for_type(
                             &effective_type,
                             &field_name,
@@ -140,7 +190,9 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                     }
                 }
             }
+        }
 
+        if mode.collect_setmetatable_tables() {
             for call_expr in root.descendants::<LuaCallExpr>() {
                 if let Some(profile) = profile.as_mut() {
                     profile.calls_scanned += 1;
@@ -148,14 +200,16 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                 collect_setmetatable_table_fields(&*db, cache, &call_expr, file_id, &mut collected);
             }
         }
+    }
 
-        let propagate_start = profile_enabled.then(std::time::Instant::now);
-        // Propagate dynamic fields to parent types so that e.g. a field assigned
-        // on `base_glide` (which extends `Entity`) is also visible when the variable
-        // is typed as `Entity`.  This avoids false-positive `undefined-field` when
-        // user code accesses entity fields through a base-class reference.
-        let mut propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
-            Vec::new();
+    let propagate_start = profile_enabled.then(std::time::Instant::now);
+    // Propagate dynamic fields to parent types so that e.g. a field assigned
+    // on `base_glide` (which extends `Entity`) is also visible when the variable
+    // is typed as `Entity`.  This avoids false-positive `undefined-field` when
+    // user code accesses entity fields through a base-class reference.
+    let mut propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
+        Vec::new();
+    if mode.propagate_to_super_types() {
         for (owner, field_name, file_id, range) in &collected {
             let DynamicFieldOwner::Type(type_id) = owner else {
                 continue;
@@ -176,24 +230,24 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
                 }
             }
         }
-        if let (Some(profile), Some(propagate_start)) = (profile.as_mut(), propagate_start) {
-            profile.propagation_time += propagate_start.elapsed();
-        }
+    }
+    if let (Some(profile), Some(propagate_start)) = (profile.as_mut(), propagate_start) {
+        profile.propagation_time += propagate_start.elapsed();
+    }
 
-        let insert_start = profile_enabled.then(std::time::Instant::now);
-        let index = db.get_dynamic_field_index_mut();
-        for (owner, field_name, file_id, range) in &collected {
-            index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
-        }
-        for (owner, field_name, file_id, range) in &propagated {
-            index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
-        }
-        if let (Some(profile), Some(insert_start)) = (profile.as_mut(), insert_start) {
-            profile.insertion_time += insert_start.elapsed();
-        }
-        if let Some(profile) = profile {
-            profile.log(tree_list.len(), collected.len(), propagated.len());
-        }
+    let insert_start = profile_enabled.then(std::time::Instant::now);
+    let index = db.get_dynamic_field_index_mut();
+    for (owner, field_name, file_id, range) in &collected {
+        index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
+    }
+    for (owner, field_name, file_id, range) in &propagated {
+        index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
+    }
+    if let (Some(profile), Some(insert_start)) = (profile.as_mut(), insert_start) {
+        profile.insertion_time += insert_start.elapsed();
+    }
+    if let Some(profile) = profile {
+        profile.log(tree_list.len(), collected.len(), propagated.len());
     }
 }
 
@@ -308,6 +362,32 @@ fn collect_nested_table_field(
         let nested_owner = LuaType::TableConst(InFiled::new(file_id, table_expr.get_range()));
         for nested_field in table_expr.get_fields() {
             collect_nested_table_field(db, cache, &nested_field, &nested_owner, file_id, collected);
+        }
+    }
+}
+
+fn collect_assigned_table_fields_for_declared_member(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    owner_type: &LuaType,
+    field_name: &SmolStr,
+    value_expr: &LuaExpr,
+    file_id: crate::FileId,
+    collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+) {
+    let LuaExpr::TableExpr(table_expr) = value_expr else {
+        return;
+    };
+
+    let Some(member_infos) =
+        find_members_with_key(db, owner_type, LuaMemberKey::Name(field_name.clone()), true)
+    else {
+        return;
+    };
+
+    for member_info in member_infos {
+        for field in table_expr.get_fields() {
+            collect_nested_table_field(db, cache, &field, &member_info.typ, file_id, collected);
         }
     }
 }

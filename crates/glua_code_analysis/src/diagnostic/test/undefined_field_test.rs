@@ -2037,6 +2037,165 @@ mod test {
     }
 
     #[test]
+    fn test_outparam_updated_fallback_table_field_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "trace.lua",
+            r#"
+                ---@class Vector
+                local Vector = {}
+
+                ---@class TraceResult
+                ---@field HitPos Vector
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceHull(traceConfig) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/glide_wheel/init.lua",
+            r#"
+                ---@class Glide
+                Glide = Glide or {}
+
+                local ray = Glide.LastWheelTraceResult or {}
+                local traceData = {
+                    output = ray,
+                }
+
+                util.TraceHull(traceData)
+
+                local hitPos = ray.HitPos
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "undefined-field".to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "outparam-populated ray table should not produce undefined-field diagnostics: {undefined_fields:?}"
+        );
+    }
+
+    #[test]
+    fn test_outparam_updated_class_state_output_field_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "trace.lua",
+            r#"
+                ---@class Vector
+                local Vector = {}
+
+                ---@class TraceResult
+                ---@field Hit boolean
+                ---@field HitPos Vector
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceHull(traceConfig) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/glide_wheel/init.lua",
+            r#"
+                ---@class Glide
+                Glide = Glide or {}
+
+                ---@class GlideWheelState
+
+                ---@class glide_wheel : Entity
+                ---@field state GlideWheelState
+                local ENT = {}
+
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                function FindMetaTable(name)
+                    return Entity
+                end
+
+                local getTable = FindMetaTable("Entity").GetTable
+                local ray = Glide.LastWheelTraceResult or {}
+
+                function ENT:Initialize()
+                    ---@type glide_wheel
+                    local selfTbl = getTable(self)
+                    selfTbl.state = {
+                        traceData = {
+                            output = ray,
+                        },
+                    }
+                end
+
+                function ENT:OnPostThink()
+                    ---@type glide_wheel
+                    local selfTbl = getTable(self)
+                    local traceData = selfTbl.state.traceData
+                    util.TraceHull(traceData)
+
+                    local hit = ray.Hit
+                    local hitPos = ray.HitPos
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "undefined-field".to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "outparam-populated class state trace output should not produce undefined-field diagnostics: {undefined_fields:?}"
+        );
+    }
+
+    #[test]
     fn test_nil_guard_in_condition_truthy_check() {
         let mut ws = VirtualWorkspace::new();
         // Field used as truthy check in if condition should be suppressed

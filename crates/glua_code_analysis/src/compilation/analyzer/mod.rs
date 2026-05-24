@@ -60,6 +60,14 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
         run_analysis::<gmod::GmodPostAnalysisPipeline>(db, &mut context);
 
         synthesize_accessorfunc_members(db, &workspace_file_ids);
+        if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
+            // Special-call resolution needs dynamic fields that point at outparam
+            // tables, while some dynamic fields need unresolve-refined aliases.
+            // Seed only declared-member table fields before unresolve; the full
+            // dynamic pass still runs afterward.
+            run_analysis::<dynamic_field::EarlyDynamicFieldAnalysisPipeline>(db, &mut context);
+        }
+
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
 
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
