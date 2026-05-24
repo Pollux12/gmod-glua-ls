@@ -1745,6 +1745,223 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_glide_readtable_field_call_arg_stays_open_table_any_after_reindex() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (network_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                Glide.NetCommands = Glide.NetCommands or {}
+                local commands = Glide.NetCommands
+
+                commands[Glide.CMD_NOTIFY] = function()
+                    local data = Glide.ReadTable()
+
+                    if string.sub(data.te<??>xt, 1, 1) == "#" then
+                        data.text = language.GetPhrase(data.text)
+                    end
+                end
+            "##,
+        )?;
+
+        ws.def_files(vec![
+            (
+                "lua/autorun/sh_glide.lua",
+                r#"
+                ---@class Glide
+                Glide = Glide or {}
+                Glide.CMD_NOTIFY = 1
+
+                function Glide.FromJSON(s)
+                    if type(s) ~= "string" or s == "" then
+                        return {}
+                    end
+
+                    return util.JSONToTable(s) or {}
+                end
+                "#,
+            ),
+            (
+                "lua/glide/sh_network.lua",
+                r#"
+                function Glide.ReadTable()
+                    local data = net.ReadData(1)
+                    return Glide.FromJSON(data)
+                end
+                "#,
+            ),
+            (
+                "lua/includes/util.lua",
+                r#"
+                util = {}
+
+                ---@return table?
+                function util.JSONToTable(json)
+                end
+                "#,
+            ),
+            (
+                "lua/includes/net.lua",
+                r#"
+                net = {}
+
+                ---@return string
+                function net.ReadData(length)
+                end
+                "#,
+            ),
+            (
+                "lua/includes/language.lua",
+                r#"
+                language = {}
+
+                ---@param phrase string
+                ---@return string
+                function language.GetPhrase(phrase)
+                end
+                "#,
+            ),
+            (
+                "lua/includes/string.lua",
+                r#"
+                string = {}
+
+                ---@param s string
+                ---@param i integer
+                ---@param j integer?
+                ---@return string
+                function string.sub(s, i, j)
+                end
+                "#,
+            ),
+            ("lua/glide/client/network.lua", &network_content),
+        ]);
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/glide/client/network.lua");
+        let file_id = ws
+            .analysis
+            .get_file_id(&uri)
+            .expect("expected network.lua file id");
+
+        let initial = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            initial.contains("any?"),
+            "expected initial hover to stay broad, got: {}",
+            initial
+        );
+
+        ws.analysis
+            .update_file_text_only(&uri, format!("{network_content}\n"));
+
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let after_reindex = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            after_reindex.contains("any?"),
+            "expected post-reindex hover to stay broad, got: {}",
+            after_reindex
+        );
+        assert!(
+            !after_reindex.contains("string"),
+            "expected future assignment not to type the earlier call argument after reindex, got: {}",
+            after_reindex
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_table_field_rhs_does_not_use_lhs_assignment_member() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@param phrase string
+                ---@return string
+                local function GetPhrase(phrase)
+                    return phrase
+                end
+
+                ---@return table<any, any>
+                local function ReadTable()
+                    return {}
+                end
+
+                local data = ReadTable()
+                data.text = GetPhrase(data.te<??>xt)
+            "##,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/network.lua", &content);
+
+        let hover = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            hover.contains("any"),
+            "expected RHS read not to use the LHS assignment member, got: {}",
+            hover
+        );
+        assert!(
+            !hover.contains("string"),
+            "expected RHS read to remain broad before assignment value is applied, got: {}",
+            hover
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_class_field_read_does_not_use_later_same_file_assignment() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@class ReindexData
+
+                ---@type ReindexData
+                local data = {}
+
+                local before = data.te<??>xt
+                data.text = "later"
+            "##,
+        )?;
+        let file_name = "lua/glide/client/network.lua";
+        let file_id = ws.def_file(file_name, &content);
+
+        let initial = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            !initial.contains("(field)") && !initial.contains("string"),
+            "expected initial hover not to use the later assignment, got: {}",
+            initial
+        );
+
+        let uri = ws.virtual_url_generator.new_uri(file_name);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{content}\n"));
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let after_reindex = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            !after_reindex.contains("(field)") && !after_reindex.contains("string"),
+            "expected post-reindex hover not to use the later assignment, got: {}",
+            after_reindex
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_dynamic_table_field_read_after_assignment_uses_assigned_string() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
 

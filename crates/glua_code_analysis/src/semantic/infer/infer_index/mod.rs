@@ -8,7 +8,7 @@ use glua_parser::{
     LuaNameExpr, NumberResult, PathTrait,
 };
 use internment::ArcIntern;
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::{
@@ -676,18 +676,28 @@ fn infer_custom_type_member(
     let owner = LuaMemberOwner::Type(prefix_type_id.clone());
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
+    let access_position = index_expr.get_position();
 
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
-        return member_item.resolve_type_with_realm(db, &cache.get_file_id());
+        return member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            access_position,
+        );
     }
     let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
     if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, &key) {
-        let resolved = member_item.resolve_type_with_realm(db, &cache.get_file_id());
+        let resolved = member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            access_position,
+        );
         let decl_backed_type = resolve_decl_backed_global_path_member_type(
             db,
             member_item,
             &cache.get_file_id(),
             key.clone(),
+            Some(access_position),
         );
         if let Some(module_decl_type) = decl_backed_type.clone()
             && resolved
@@ -730,8 +740,11 @@ fn infer_custom_type_member(
             }
 
             if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key)
-                && let Ok(member_type) =
-                    member_item.resolve_type_with_realm(db, &cache.get_file_id())
+                && let Ok(member_type) = member_item.resolve_type_with_realm_at_offset(
+                    db,
+                    &cache.get_file_id(),
+                    access_position,
+                )
             {
                 result_types.push(member_type);
             }
@@ -768,8 +781,14 @@ fn resolve_decl_backed_global_path_member_type(
     member_item: &crate::db_index::LuaMemberIndexItem,
     caller_file_id: &crate::FileId,
     key: LuaMemberKey,
+    caller_position: Option<TextSize>,
 ) -> Option<LuaType> {
-    let visible_member_ids = member_item.visible_member_ids_with_realm(db, caller_file_id);
+    let visible_member_ids = match caller_position {
+        Some(position) => {
+            member_item.visible_member_ids_with_realm_at_offset(db, caller_file_id, position)
+        }
+        None => member_item.visible_member_ids_with_realm(db, caller_file_id),
+    };
     let mut result = LuaType::Unknown;
 
     for member_id in visible_member_ids {
@@ -1659,6 +1678,7 @@ fn infer_namespace_member(
             member_item,
             &cache.get_file_id(),
             member_key.clone(),
+            None,
         ) {
             return Ok(module_decl_type);
         }

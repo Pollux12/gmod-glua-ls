@@ -278,6 +278,124 @@ mod test {
     }
 
     #[gtest]
+    fn test_incremental_reindex_keeps_dynamic_field_value_inference_position_aware() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_name = "lua/glide/client/network.lua";
+        let source = r#"
+        util = {}
+
+        ---@return table?
+        function util.JSONToTable(s) end
+
+        ---@return table
+        local function read_table()
+            return util.JSONToTable("") or {}
+        end
+
+        ---@param value string
+        ---@return string
+        local function translate(value)
+            return value
+        end
+
+        local data = read_table()
+        local before = data.text
+        data.text = translate(data.text)
+        local after = data.text
+        "#;
+
+        let file_id = ws.def_file(file_name, source);
+
+        let before_ty = local_name_type(&mut ws, file_id, "before");
+        assert_eq!(ws.humanize_type(before_ty), "any?");
+
+        let uri = ws.virtual_url_generator.new_uri(file_name);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{source}\n"));
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let after_reindex_before_ty = local_name_type(&mut ws, file_id, "before");
+        assert_eq!(ws.humanize_type(after_reindex_before_ty), "any?");
+
+        let after_reindex_after_ty = local_name_type(&mut ws, file_id, "after");
+        assert_that!(
+            ws.check_type(&after_reindex_after_ty, &LuaType::String),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_reindex_keeps_later_dynamic_assignment_out_of_earlier_read() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let consumer_path = "lua/glide/client/network.lua";
+        let consumer_source = r#"
+        ---@param value string
+        local function use_string(value)
+        end
+
+        local data = Glide.ReadTable()
+        local before = data.text
+        use_string(data.text)
+        data.text = "translated"
+        local after = data.text
+        "#;
+
+        let consumer_file = ws.def_file(consumer_path, consumer_source);
+
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            Glide = Glide or {}
+
+            ---@return any
+            function Glide.FromJSON()
+            end
+
+            function Glide.ReadTable()
+                if net.ReadBool() then
+                    return {}
+                end
+
+                return Glide.FromJSON()
+            end
+            "#,
+        );
+
+        let initial_before_ty = local_name_type(&mut ws, consumer_file, "before");
+        assert_eq!(ws.humanize_type(initial_before_ty), "any");
+
+        let uri = ws.virtual_url_generator.new_uri(consumer_path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{consumer_source}\n"));
+        ws.analysis.reindex_files(vec![consumer_file]);
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::ParamTypeMismatch),
+            eq(false),
+            "reindexing only the consumer must not introduce a param mismatch for the earlier read"
+        );
+
+        let after_reindex_before_ty = local_name_type(&mut ws, consumer_file, "before");
+        assert_eq!(ws.humanize_type(after_reindex_before_ty), "any");
+
+        let after_reindex_after_ty = local_name_type(&mut ws, consumer_file, "after");
+        assert_that!(
+            ws.check_type(&after_reindex_after_ty, &LuaType::String),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_missing_plain_table_field_is_nil() {
         let mut ws = VirtualWorkspace::new();
 

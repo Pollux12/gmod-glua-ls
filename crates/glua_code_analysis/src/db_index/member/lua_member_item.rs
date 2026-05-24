@@ -1,9 +1,13 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     DbIndex, FileId, InferFailReason, LuaFunctionType, LuaSemanticDeclId, LuaType, TypeOps,
     db_index::gmod_infer::GmodRealm,
 };
+use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, PathTrait};
 use rowan::TextSize;
 
 use super::LuaMemberId;
@@ -88,7 +92,21 @@ impl LuaMemberIndexItem {
         caller_position: TextSize,
     ) -> Vec<LuaMemberId> {
         let member_ids = self.get_member_ids();
-        let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &member_ids);
+        let mut visible_member_ids =
+            visible_member_ids_at_offset(db, &member_ids, caller_file_id, caller_position);
+        if visible_member_ids.is_empty() {
+            let historical_member_ids =
+                expand_member_ids_with_owner_key_history(db, member_ids.clone());
+            if historical_member_ids != member_ids {
+                visible_member_ids = visible_member_ids_at_offset(
+                    db,
+                    &historical_member_ids,
+                    caller_file_id,
+                    caller_position,
+                );
+            }
+        }
+        let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &visible_member_ids);
         select_member_ids_by_workspace_and_realm(
             db,
             caller_file_id,
@@ -103,6 +121,162 @@ impl LuaMemberIndexItem {
             LuaMemberIndexItem::One(member_id) => vec![*member_id],
             LuaMemberIndexItem::Many(member_ids) => member_ids.clone(),
         }
+    }
+}
+
+fn visible_member_ids_at_offset(
+    db: &DbIndex,
+    member_ids: &[LuaMemberId],
+    caller_file_id: &FileId,
+    caller_position: TextSize,
+) -> Vec<LuaMemberId> {
+    member_ids
+        .iter()
+        .copied()
+        .filter(|member_id| {
+            member_visible_at_offset(db, *member_id, caller_file_id, caller_position)
+        })
+        .collect()
+}
+
+fn expand_member_ids_with_owner_key_history(
+    db: &DbIndex,
+    member_ids: Vec<LuaMemberId>,
+) -> Vec<LuaMemberId> {
+    let mut expanded = Vec::new();
+    let mut seen = HashSet::new();
+    let member_index = db.get_member_index();
+
+    for member_id in member_ids {
+        push_unique_member_id(&mut expanded, &mut seen, member_id);
+
+        let Some(member) = member_index.get_member(&member_id) else {
+            continue;
+        };
+        let Some(owner) = member_index.get_current_owner(&member_id) else {
+            continue;
+        };
+
+        for historical_member in
+            member_index.get_current_owner_members_for_key(owner, member.get_key())
+        {
+            push_unique_member_id(&mut expanded, &mut seen, historical_member.get_id());
+        }
+    }
+
+    expanded
+}
+
+fn push_unique_member_id(
+    member_ids: &mut Vec<LuaMemberId>,
+    seen: &mut HashSet<LuaMemberId>,
+    member_id: LuaMemberId,
+) {
+    if seen.insert(member_id) {
+        member_ids.push(member_id);
+    }
+}
+
+fn member_visible_at_offset(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    caller_file_id: &FileId,
+    caller_position: TextSize,
+) -> bool {
+    let Some(member) = db.get_member_index().get_member(&member_id) else {
+        return false;
+    };
+    if member_id.file_id != *caller_file_id || !member.get_feature().is_file_define() {
+        return true;
+    }
+    if !member.get_key().is_name() {
+        return true;
+    }
+
+    let member_range = member.get_range();
+    if member_range.contains(caller_position) {
+        return true;
+    }
+    if member_range.start() > caller_position {
+        return false;
+    }
+
+    !member_hidden_by_enclosing_assignment(db, member_id, caller_position)
+}
+
+fn member_hidden_by_enclosing_assignment(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    caller_position: TextSize,
+) -> bool {
+    let Some(root) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+        return false;
+    };
+    let root = root.get_red_root();
+    let Some(member) = db.get_member_index().get_member(&member_id) else {
+        return false;
+    };
+    let member_range = member.get_range();
+    let Some(token) = root.token_at_offset(member_range.start()).right_biased() else {
+        return false;
+    };
+
+    token
+        .parent_ancestors()
+        .find_map(LuaAssignStat::cast)
+        .is_some_and(|assign_stat| {
+            assign_stat.get_range().contains(caller_position)
+                && !member_range.contains(caller_position)
+                && !assignment_rhs_self_coalesces_member(
+                    &assign_stat,
+                    member_range,
+                    caller_position,
+                )
+        })
+}
+
+fn assignment_rhs_self_coalesces_member(
+    assign_stat: &LuaAssignStat,
+    member_range: rowan::TextRange,
+    caller_position: TextSize,
+) -> bool {
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    for (idx, var) in vars.iter().enumerate() {
+        if var.get_range() != member_range {
+            continue;
+        }
+
+        let Some(expr) = exprs.get(idx) else {
+            return false;
+        };
+        let LuaExpr::BinaryExpr(binary_expr) = expr else {
+            return false;
+        };
+        if binary_expr
+            .get_op_token()
+            .is_none_or(|token| token.get_op() != BinaryOperator::OpOr)
+        {
+            return false;
+        }
+
+        let Some((left_expr, _)) = binary_expr.get_exprs() else {
+            return false;
+        };
+        if !left_expr.get_range().contains(caller_position) {
+            return false;
+        }
+
+        return expr_access_path(&var.to_expr()) == expr_access_path(&left_expr);
+    }
+
+    false
+}
+
+fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
     }
 }
 
@@ -1271,6 +1445,154 @@ mod tests {
 
         assert_eq!(client_decl, Some(LuaSemanticDeclId::Member(client_member)));
         assert_eq!(server_decl, Some(LuaSemanticDeclId::Member(server_member)));
+    }
+
+    #[test]
+    fn visible_member_ids_at_offset_excludes_later_same_file_file_defines() {
+        let mut db = make_db();
+        let caller_file = FileId::new(10);
+        let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
+        let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OrderSensitiveOwner"));
+        let key = LuaMemberKey::Name("field".into());
+
+        db.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                earlier_member,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+        db.get_member_index_mut().add_member(
+            owner,
+            LuaMember::new(later_member, key, LuaMemberFeature::FileDefine, None),
+        );
+
+        let item = LuaMemberIndexItem::Many(vec![earlier_member, later_member]);
+        let visible =
+            item.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
+
+        assert_eq!(visible, vec![earlier_member]);
+
+        let future_only_member =
+            make_member_id_with_kind(caller_file, 50, LuaSyntaxKind::IndexExpr);
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::Type(LuaTypeDeclId::global("FutureOnlyOwner")),
+            LuaMember::new(
+                future_only_member,
+                LuaMemberKey::Name("field".into()),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+        assert!(
+            LuaMemberIndexItem::One(future_only_member)
+                .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn visible_member_ids_at_offset_keeps_later_same_file_declarations() {
+        let mut db = make_db();
+        let caller_file = FileId::new(10);
+        let declared_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::DocTagField);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OrderInsensitiveOwner"));
+
+        db.get_member_index_mut().add_member(
+            owner,
+            LuaMember::new(
+                declared_member,
+                LuaMemberKey::Name("field".into()),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+
+        let visible = LuaMemberIndexItem::One(declared_member)
+            .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
+
+        assert_eq!(visible, vec![declared_member]);
+    }
+
+    #[test]
+    fn visible_member_ids_at_offset_falls_back_to_assignment_history_when_latest_is_future() {
+        let mut db = make_db();
+        let caller_file = FileId::new(10);
+        let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
+        let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("AssignmentHistoryOwner"));
+        let key = LuaMemberKey::Name("field".into());
+
+        db.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                earlier_member,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+        db.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                later_member,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        let item = db
+            .get_member_index()
+            .get_member_item(&owner, &key)
+            .expect("runtime assignments collapse to the latest member");
+        assert_eq!(item, &LuaMemberIndexItem::One(later_member));
+
+        let visible =
+            item.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
+
+        assert_eq!(visible, vec![earlier_member]);
+    }
+
+    #[test]
+    fn visible_member_ids_at_offset_keeps_latest_assignment_when_it_is_visible() {
+        let mut db = make_db();
+        let caller_file = FileId::new(10);
+        let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
+        let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("LatestAssignmentOwner"));
+        let key = LuaMemberKey::Name("field".into());
+
+        db.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                earlier_member,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+        db.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                later_member,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        let item = db
+            .get_member_index()
+            .get_member_item(&owner, &key)
+            .expect("runtime assignments collapse to the latest member");
+        let visible =
+            item.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(40));
+
+        assert_eq!(visible, vec![later_member]);
     }
 
     #[test]

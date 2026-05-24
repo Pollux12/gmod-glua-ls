@@ -363,6 +363,26 @@ impl LuaMemberIndex {
             .collect()
     }
 
+    pub fn get_current_owner_members_for_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> Vec<&LuaMember> {
+        let mut members = self
+            .members
+            .values()
+            .filter(|member| {
+                member.get_key() == key
+                    && self
+                        .member_current_owner
+                        .get(&member.get_id())
+                        .is_some_and(|current_owner| current_owner == owner)
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| stable_member_sort_key(member));
+        members
+    }
+
     pub fn get_file_members(&self, file_id: FileId) -> Vec<&LuaMember> {
         let Some(member_or_owners) = self.in_filed.get(&file_id) else {
             return Vec::new();
