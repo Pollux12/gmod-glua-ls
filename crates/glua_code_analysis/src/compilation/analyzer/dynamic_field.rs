@@ -2,13 +2,13 @@ use rustc_hash::FxHashMap;
 use std::time::Duration;
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexKey, LuaSyntaxKind,
-    LuaTableField, LuaVarExpr,
+    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexKey,
+    LuaSyntaxKind, LuaTableField, LuaVarExpr,
 };
 use smol_str::SmolStr;
 
 use crate::{
-    InFiled, LuaMemberKey, LuaType, VarRefId,
+    InFiled, LuaMemberKey, LuaSignatureId, LuaType, VarRefId,
     db_index::{DbIndex, DynamicFieldOwner},
     profile::Profile,
     semantic::{
@@ -58,6 +58,12 @@ enum DynamicFieldAnalysisMode {
     Full,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FieldSetterHelper {
+    table_param_index: usize,
+    key_param_index: usize,
+}
+
 impl DynamicFieldAnalysisMode {
     fn collect_declared_member_table_fields(self) -> bool {
         true
@@ -87,6 +93,11 @@ fn analyze_dynamic_fields(
         Vec::new();
     let profile_enabled = log::log_enabled!(log::Level::Info);
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
+    let mut field_setter_helpers = if mode.collect_direct_assignments() {
+        collect_field_setter_helpers(&tree_list)
+    } else {
+        FxHashMap::default()
+    };
 
     for in_filed_tree in &tree_list {
         let root = in_filed_tree.value.clone();
@@ -197,6 +208,14 @@ fn analyze_dynamic_fields(
                 if let Some(profile) = profile.as_mut() {
                     profile.calls_scanned += 1;
                 }
+                collect_field_setter_helper_call_fields(
+                    &*db,
+                    cache,
+                    &call_expr,
+                    file_id,
+                    &mut field_setter_helpers,
+                    &mut collected,
+                );
                 collect_setmetatable_table_fields(&*db, cache, &call_expr, file_id, &mut collected);
             }
         }
@@ -249,6 +268,217 @@ fn analyze_dynamic_fields(
     if let Some(profile) = profile {
         profile.log(tree_list.len(), collected.len(), propagated.len());
     }
+}
+
+fn collect_field_setter_helpers(
+    tree_list: &[InFiled<glua_parser::LuaChunk>],
+) -> FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>> {
+    let mut helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>> = FxHashMap::default();
+
+    for in_filed_tree in tree_list {
+        let file_id = in_filed_tree.file_id;
+        let root = in_filed_tree.value.clone();
+        for closure in root.descendants::<LuaClosureExpr>() {
+            let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+            let patterns = collect_field_setter_helpers_in_closure(&closure);
+            if !patterns.is_empty() {
+                helpers.insert(signature_id, patterns);
+            }
+        }
+    }
+
+    helpers
+}
+
+fn collect_field_setter_helpers_in_closure(closure: &LuaClosureExpr) -> Vec<FieldSetterHelper> {
+    let Some(params_list) = closure.get_params_list() else {
+        return Vec::new();
+    };
+    let param_names = params_list
+        .get_params()
+        .filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|token| token.get_name_text().to_string())
+        })
+        .collect::<Vec<_>>();
+    if param_names.len() < 2 {
+        return Vec::new();
+    }
+
+    let Some(block) = closure.get_block() else {
+        return Vec::new();
+    };
+
+    let mut helpers = Vec::new();
+    for assign in block.descendants::<LuaAssignStat>() {
+        if assign.ancestors::<LuaClosureExpr>().next().as_ref() != Some(closure) {
+            continue;
+        }
+
+        let (vars, _) = assign.get_var_and_expr_list();
+        for var in vars.iter() {
+            let LuaVarExpr::IndexExpr(index_expr) = var else {
+                continue;
+            };
+            let Some(table_param_index) = index_expr
+                .get_prefix_expr()
+                .and_then(|expr| param_expr_index(&expr, &param_names))
+            else {
+                continue;
+            };
+            let Some(key_param_index) = index_expr
+                .get_index_key()
+                .and_then(|key| param_index_key_index(&key, &param_names))
+            else {
+                continue;
+            };
+
+            helpers.push(FieldSetterHelper {
+                table_param_index,
+                key_param_index,
+            });
+        }
+    }
+
+    helpers
+}
+
+fn collect_field_setter_helper_call_fields(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+    file_id: crate::FileId,
+    helpers: &mut FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
+    collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+) {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return;
+    };
+    let helper_patterns = helper_patterns_for_call(db, cache, &prefix_expr, helpers);
+    if helper_patterns.is_empty() {
+        return;
+    }
+
+    let Some(args_list) = call_expr.get_args_list() else {
+        return;
+    };
+    let args = args_list.get_args().collect::<Vec<_>>();
+    for helper in helper_patterns {
+        let Some(table_arg) = args.get(helper.table_param_index) else {
+            continue;
+        };
+        let Some(key_arg) = args.get(helper.key_param_index) else {
+            continue;
+        };
+        let field_names = field_names_from_key_arg(db, cache, key_arg);
+        if field_names.is_empty() {
+            continue;
+        }
+        let definition_range = key_arg.syntax().text_range();
+        let Ok(table_type) = infer_expr(db, cache, table_arg.clone()) else {
+            continue;
+        };
+
+        for field_name in field_names {
+            collect_for_type(
+                &table_type,
+                &field_name,
+                file_id,
+                definition_range,
+                collected,
+            );
+        }
+    }
+}
+
+fn field_names_from_key_arg(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    key_arg: &LuaExpr,
+) -> Vec<SmolStr> {
+    if let LuaExpr::LiteralExpr(literal_expr) = key_arg
+        && let Some(glua_parser::LuaLiteralToken::String(string_token)) = literal_expr.get_literal()
+    {
+        return vec![string_token.get_value().into()];
+    }
+
+    string_const_names(&infer_expr(db, cache, key_arg.clone()).ok())
+}
+
+fn helper_patterns_for_call(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    prefix_expr: &LuaExpr,
+    helpers: &mut FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
+) -> Vec<FieldSetterHelper> {
+    let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    collect_helper_patterns_from_type(db, &prefix_type, helpers, &mut result);
+    result
+}
+
+fn collect_helper_patterns_from_type(
+    db: &DbIndex,
+    typ: &LuaType,
+    helpers: &mut FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
+    result: &mut Vec<FieldSetterHelper>,
+) {
+    match typ {
+        LuaType::Signature(signature_id) => {
+            if let Some(patterns) = helpers.get(signature_id).cloned() {
+                result.extend(patterns);
+            } else {
+                let patterns = collect_field_setter_helpers_for_signature(db, *signature_id);
+                if !patterns.is_empty() {
+                    helpers.insert(*signature_id, patterns.clone());
+                }
+                result.extend(patterns);
+            }
+        }
+        LuaType::Union(union_type) => {
+            for typ in union_type.into_vec() {
+                collect_helper_patterns_from_type(db, &typ, helpers, result);
+            }
+        }
+        LuaType::TypeGuard(inner) => collect_helper_patterns_from_type(db, inner, helpers, result),
+        _ => {}
+    }
+}
+
+fn collect_field_setter_helpers_for_signature(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+) -> Vec<FieldSetterHelper> {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
+        return Vec::new();
+    };
+
+    tree.get_chunk_node()
+        .descendants::<LuaClosureExpr>()
+        .find(|closure| closure.get_position() == signature_id.get_position())
+        .map(|closure| collect_field_setter_helpers_in_closure(&closure))
+        .unwrap_or_default()
+}
+
+fn param_index_key_index(key: &LuaIndexKey, param_names: &[String]) -> Option<usize> {
+    match key {
+        LuaIndexKey::Expr(expr) => param_expr_index(expr, param_names),
+        _ => None,
+    }
+}
+
+fn param_expr_index(expr: &LuaExpr, param_names: &[String]) -> Option<usize> {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return None;
+    };
+    let name = name_expr.get_name_text()?;
+    param_names
+        .iter()
+        .position(|param_name| param_name == &name)
 }
 
 #[derive(Default)]

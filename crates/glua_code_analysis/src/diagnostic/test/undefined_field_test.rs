@@ -2196,6 +2196,82 @@ mod test {
     }
 
     #[test]
+    fn test_dynamic_field_setter_helper_call_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "lua/autorun/sh_helpers.lua",
+            r#"
+                Glide = {}
+
+                function Glide.SetNumber(t, k, v)
+                    t[k] = v
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/weapons/gmod_tool/stools/glide_make_amphibious.lua",
+            r#"
+                local data = {}
+                local SetNumber = Glide.SetNumber
+
+                SetNumber(data, "buoyancyOffsetZ", 1)
+
+                local offset = data.buoyancyOffsetZ
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "undefined-field".to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "table fields written through helper calls should not produce undefined-field diagnostics: {undefined_fields:?}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_field_setter_helper_unknown_key_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local function SetField(t, k, v)
+                    t[k] = v
+                end
+
+                local data = {}
+                local unknownKey = getKey()
+                SetField(data, unknownKey, 1)
+
+                local offset = data.buoyancyOffsetZ
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_nil_guard_in_condition_truthy_check() {
         let mut ws = VirtualWorkspace::new();
         // Field used as truthy check in if condition should be suppressed
