@@ -4563,6 +4563,345 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_gmod_vehicle_sound_alias_guards_are_same_after_batch_load_and_touch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+            function CSoundPatch:SetSoundLevel(level) end
+            function CSoundPatch:PlayEx(volume, pitch) end
+            function CSoundPatch:ChangeVolume(volume) end
+            ---@return number
+            function CSoundPatch:GetVolume() end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+        "#;
+
+        let base_shared_code = r#"
+            ENT.Type = "anim"
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:OnEngineStateChange()
+                local snd = self:CreateLoopingSound("start", "start.wav", 70, self)
+                snd:PlayEx(1, 100)
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    snd:SetSoundLevel(level)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+
+            function ENT:InternalDeactivateSounds()
+                local sounds = self.sounds
+
+                for k, snd in pairs(sounds) do
+                    snd:Stop()
+                    sounds[k] = nil
+                end
+            end
+        "#;
+
+        let car_shared_code = r#"
+            ENT.Type = "anim"
+            ENT.Base = "base_glide"
+            ENT.StopStartTailOnInput = false
+            ENT.HornSound = "horn.wav"
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:OnUpdateSounds()
+                local sounds = self.sounds
+                local dt = 0
+                local isHonking = false
+
+                if self.StopStartTailOnInput and sounds.startTail then
+                    sounds.startTail:Stop()
+                    sounds.startTail = nil
+                end
+
+                if isHonking and self.HornSound and self.HornSound ~= "" then
+                    if sounds.horn then
+                        sounds.horn:ChangeVolume(1)
+                    else
+                        local snd = self:CreateLoopingSound("horn", self.HornSound, 85, self)
+                        snd:PlayEx(1, 100)
+                    end
+                elseif sounds.horn then
+                    if sounds.horn:GetVolume() > 0 then
+                        sounds.horn:ChangeVolume(sounds.horn:GetVolume() - dt * 8)
+                    else
+                        sounds.horn:Stop()
+                        sounds.horn = nil
+                    end
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", base_shared_code),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            ("lua/entities/base_glide_car/shared.lua", car_shared_code),
+            (car_path, car_code),
+        ]);
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let initial_sounds_type = local_name_type(&mut ws, file_id, "sounds");
+        let initial_sounds_display = ws.humanize_type_detailed(initial_sounds_type);
+        assert_that!(
+            initial_sounds_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "cold batch load should type the sounds alias from dynamic sound assignments"
+        );
+        assert!(
+            !initial_sounds_display.contains("horn")
+                && !initial_sounds_display.contains("startTail")
+                && !initial_sounds_display.contains(": nil"),
+            "cleanup-only sound fields should not pollute the cold sounds alias hover type: {initial_sounds_display}"
+        );
+
+        let initial_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let initial_undefined_fields = initial_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("undefined-field".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert_that!(
+            initial_undefined_fields,
+            is_empty(),
+            "guarded sound fields should not produce undefined-field diagnostics on cold batch load"
+        );
+
+        ws.analysis
+            .update_file_by_uri(&car_uri, Some(format!("{car_code}\n")))
+            .expect("expected touched car cl_init file id");
+
+        let touched_sounds_type = local_name_type(&mut ws, file_id, "sounds");
+        let touched_sounds_display = ws.humanize_type_detailed(touched_sounds_type);
+        assert_that!(
+            touched_sounds_display.as_str(),
+            eq(initial_sounds_display.as_str()),
+            "touching the file should not change the sounds alias hover type"
+        );
+
+        let touched_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let touched_undefined_fields = touched_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("undefined-field".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert_that!(
+            touched_undefined_fields,
+            is_empty(),
+            "guarded sound fields should not produce undefined-field diagnostics after touching the file"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_self_index_local_unknown_reassignment_does_not_fall_back_to_initializer() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@return unknown
+            function MakeUnknown() end
+
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:Test()
+                local sounds = self.sounds
+                sounds = MakeUnknown()
+                local after = sounds
+            end
+        "#;
+
+        let path = "lua/entities/base_glide/cl_init.lua";
+        ws.def_file(path, code);
+        let uri = ws.virtual_url_generator.new_uri(path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&uri)
+            .expect("expected cl_init file id");
+
+        let reassignment_type = assign_value_type(&mut ws, file_id, "sounds");
+        assert_that!(
+            ws.humanize_type_detailed(reassignment_type).as_str(),
+            eq("unknown"),
+            "the reassignment itself should be unknown"
+        );
+
+        let after_type = local_name_type(&mut ws, file_id, "after");
+        assert_that!(
+            ws.humanize_type_detailed(after_type).as_str(),
+            eq("unknown"),
+            "a later unknown assignment should remain the current flow result"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_self_field_local_alias_preserves_known_optional_panel_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let engine_code = r#"
+            local WebAudio = Glide.WebAudio
+
+            function WebAudio:Enable()
+                local panel = self.panel
+                if IsValid(panel) then
+                    return
+                end
+
+                panel = vgui.Create("HTML", GetHUDPanel())
+                self.panel = panel
+            end
+
+            function WebAudio:Disable()
+                self.panel = nil
+            end
+
+            function WebAudio:OnHTMLReady()
+                local readyPanel = self.panel
+                readyPanel:NewObject("webaudio")
+            end
+            "#;
+        ws.def_files(vec![
+            ("lua/glide/client/engine_stream_webaudio.lua", engine_code),
+            (
+                "lua/autorun/sh_glide.lua",
+                r#"
+                Glide = {}
+
+                if CLIENT then
+                    ---@class WebAudio
+                    Glide.WebAudio = Glide.WebAudio or {}
+                end
+                "#,
+            ),
+            (
+                "lua/includes/gmod_vgui.lua",
+                r#"
+                ---@class Panel
+                ---@class HTML : Panel
+                local HTML = {}
+                function HTML:NewObject(name) end
+
+                vgui = {}
+                ---@generic T : Panel
+                ---@param className `T`
+                ---@return T
+                function vgui.Create(className, parent) end
+
+                ---@return Panel
+                function GetHUDPanel() end
+                "#,
+            ),
+        ]);
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/glide/client/engine_stream_webaudio.lua");
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&uri)
+            .expect("expected WebAudio file id");
+
+        let create_panel_type = assign_value_type(&mut ws, file_id, "panel");
+        let create_panel_display = ws.humanize_type(create_panel_type);
+        let self_panel_assignment_type = assign_value_type(&mut ws, file_id, "self.panel");
+        let self_panel_assignment_display = ws.humanize_type(self_panel_assignment_type);
+        let panel_rhs_type = local_assignment_value_type(&mut ws, file_id, "readyPanel");
+        let panel_rhs_display = ws.humanize_type(panel_rhs_type);
+        let panel_type = local_name_type(&mut ws, file_id, "readyPanel");
+        let panel_display = ws.humanize_type(panel_type);
+        assert_that!(
+            panel_display.as_str(),
+            contains_substring("HTML"),
+            "local panel should preserve the known HTML half of self.panel, got {panel_display}; RHS was {panel_rhs_display}; create call was {create_panel_display}; self.panel assignment was {self_panel_assignment_display}"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("unchecked-nil-access".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_access,
+            is_empty(),
+            "HTML? should not degrade to opaque any? and produce unchecked-nil-access"
+        );
+    }
+
     /// Verify that a method defined in two entity files (init.lua + shared.lua CLIENT block)
     /// is stored as Many with both member IDs in the member index.
     #[gtest]

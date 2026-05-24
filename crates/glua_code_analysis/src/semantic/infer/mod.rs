@@ -25,6 +25,7 @@ pub use infer_index::infer_index_expr;
 pub(crate) use infer_index::infer_member_by_member_key;
 use infer_name::infer_name_expr;
 pub(crate) use infer_name::resolve_scoped_scripted_global_type_decl_id;
+pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
 pub use infer_name::{find_self_decl_or_member_id, infer_param};
 use infer_table::infer_table_expr;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};

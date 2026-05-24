@@ -900,6 +900,10 @@ fn get_type_at_assign_stat(
             return Ok(ResultTypeOrContinue::Continue);
         };
 
+        if explicit_var_type.is_none() && expr_type.is_unknown() {
+            return Ok(ResultTypeOrContinue::Result(expr_type));
+        }
+
         let source_type = if let Some(explicit) = explicit_var_type.clone() {
             explicit
         } else {

@@ -373,9 +373,9 @@ fn table_const_has_no_specific_data(
     owner: &LuaMemberOwner,
     inst: &InFiled<TextRange>,
 ) -> bool {
-    !db.get_member_index()
+    db.get_member_index()
         .get_members(owner)
-        .is_some_and(|members| !members.is_empty())
+        .is_none_or(|members| members.is_empty())
         && db.get_metatable_index().get(inst).is_none()
 }
 

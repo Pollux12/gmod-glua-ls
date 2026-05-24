@@ -70,6 +70,18 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 if let LuaType::Variadic(multi) = expr_type {
                     expr_type = multi.get_type(0)?.clone();
                 }
+                if expr_type.is_nil() && should_defer_nil_gmod_expr(analyzer, &expr) {
+                    let unresolve = UnResolveDecl {
+                        file_id: analyzer.file_id,
+                        decl_id,
+                        expr: expr.clone(),
+                        ret_idx: 0,
+                    };
+                    analyzer
+                        .context
+                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    continue;
+                }
                 if should_defer_nil_gmod_self_index(analyzer, &expr, &expr_type) {
                     clear_index_expr_type_cache(analyzer, &expr);
                     let unresolve = UnResolveDecl {
@@ -112,10 +124,22 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 );
             }
             Err(InferFailReason::None) => {
-                analyzer
-                    .db
-                    .get_type_index_mut()
-                    .bind_type(decl_id.into(), LuaTypeCache::InferType(LuaType::Nil));
+                if should_defer_none_infer_expr(&expr) {
+                    let unresolve = UnResolveDecl {
+                        file_id: analyzer.file_id,
+                        decl_id,
+                        expr: expr.clone(),
+                        ret_idx: 0,
+                    };
+                    analyzer
+                        .context
+                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                } else {
+                    analyzer
+                        .db
+                        .get_type_index_mut()
+                        .bind_type(decl_id.into(), LuaTypeCache::InferType(LuaType::Nil));
+                }
             }
             Err(reason) => {
                 let unresolve = UnResolveDecl {
@@ -260,7 +284,6 @@ fn should_defer_nil_gmod_self_index(
     if !analyzer.gmod_enabled
         || !analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
         || !expr_type.is_nil()
-        || !analyzer.is_scripted_class_scope
     {
         return false;
     }
@@ -268,7 +291,22 @@ fn should_defer_nil_gmod_self_index(
     let LuaExpr::IndexExpr(index_expr) = expr else {
         return false;
     };
-    nested_index_root_is_self(index_expr)
+    if analyzer.is_scripted_class_scope {
+        nested_index_root_is_self(index_expr)
+    } else {
+        index_expr_prefix_is_self(index_expr)
+    }
+}
+
+fn index_expr_prefix_is_self(index_expr: &LuaIndexExpr) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    matches!(
+        prefix_expr,
+        LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self")
+    )
 }
 
 fn nested_index_root_is_self(index_expr: &LuaIndexExpr) -> bool {
@@ -421,6 +459,10 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         }
         let expr = expr?;
 
+        if should_skip_nil_table_shape_assignment(analyzer, &var, expr) {
+            continue;
+        }
+
         let type_owner = get_var_owner(analyzer, var.clone());
         set_index_expr_owner(analyzer, var.clone());
 
@@ -433,6 +475,16 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             Ok(expr_type) => match expr_type {
                 LuaType::Variadic(multi) => multi.get_type(0)?.clone(),
                 other => {
+                    if other.is_nil() && should_defer_nil_gmod_expr(analyzer, expr) {
+                        add_unresolve_for_assignment(
+                            analyzer,
+                            type_owner,
+                            &var,
+                            expr.clone(),
+                            InferFailReason::FieldNotFound,
+                        );
+                        continue;
+                    }
                     if other.is_unknown() && is_undefined_global_name_expr(analyzer, expr) {
                         // See note in analyze_local_stat: undefined-global RHS
                         // is `nil` at runtime, not "unknown".
@@ -445,35 +497,21 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             // Reading an undefined global yields `nil` at runtime, so the
             // assignment target's value is `nil` (not unknown). This mirrors
             // the local-stat path above so hover/inference stays consistent.
-            Err(InferFailReason::None) => LuaType::Nil,
-            Err(reason) => {
-                match type_owner {
-                    LuaTypeOwner::Decl(decl_id) => {
-                        let unresolve_decl = UnResolveDecl {
-                            file_id: analyzer.file_id,
-                            decl_id,
-                            expr: expr.clone(),
-                            ret_idx: 0,
-                        };
-
-                        analyzer
-                            .context
-                            .add_unresolve(unresolve_decl.into(), reason);
-                    }
-                    LuaTypeOwner::Member(member_id) => {
-                        let unresolve_member = UnResolveMember {
-                            file_id: analyzer.file_id,
-                            member_id,
-                            expr: Some(expr.clone()),
-                            prefix: None,
-                            ret_idx: 0,
-                        };
-                        analyzer
-                            .context
-                            .add_unresolve(unresolve_member.into(), reason);
-                    }
-                    _ => {}
+            Err(InferFailReason::None) => {
+                if should_defer_none_infer_expr(expr) {
+                    add_unresolve_for_assignment(
+                        analyzer,
+                        type_owner,
+                        &var,
+                        expr.clone(),
+                        InferFailReason::FieldNotFound,
+                    );
+                    continue;
                 }
+                LuaType::Nil
+            }
+            Err(reason) => {
+                add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone(), reason);
                 continue;
             }
         };
@@ -542,6 +580,158 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
     }
 
     Some(())
+}
+
+fn should_skip_nil_table_shape_assignment(
+    analyzer: &mut LuaAnalyzer,
+    var: &LuaVarExpr,
+    expr: &LuaExpr,
+) -> bool {
+    if !is_nil_literal_expr(expr) {
+        return false;
+    }
+
+    let LuaVarExpr::IndexExpr(index_expr) = var else {
+        return false;
+    };
+
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    let Ok(prefix_type) = analyzer.infer_expr(&prefix_expr) else {
+        return false;
+    };
+
+    if !is_table_shape_cleanup_type(&prefix_type) {
+        return false;
+    }
+
+    let Some((owner, _)) = resolve_index_expr_member_owner(&prefix_type) else {
+        return false;
+    };
+
+    let Some(index_key) = index_expr.get_index_key() else {
+        return false;
+    };
+
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let Ok(member_key) = LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
+    else {
+        return false;
+    };
+
+    let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+    !analyzer
+        .db
+        .get_member_index()
+        .get_members_for_owner_key(&owner, &member_key)
+        .into_iter()
+        .any(|member| member.get_id() != member_id)
+}
+
+fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => {
+            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
+        }
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|expr| is_nil_literal_expr(&expr)),
+        _ => false,
+    }
+}
+
+fn is_table_shape_cleanup_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Table
+        | LuaType::TableConst(_)
+        | LuaType::TableGeneric(_)
+        | LuaType::Array(_)
+        | LuaType::Tuple(_)
+        | LuaType::TableOf(_) => true,
+        LuaType::TypeGuard(inner) => is_table_shape_cleanup_type(inner),
+        LuaType::Union(union) => {
+            let types = union.into_vec();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|typ| typ.is_nil() || typ.is_never() || is_table_shape_cleanup_type(typ))
+        }
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .all(is_table_shape_cleanup_type),
+        LuaType::MultiLineUnion(union) => {
+            let types = union.get_unions();
+            !types.is_empty()
+                && types.iter().all(|(typ, _)| {
+                    typ.is_nil() || typ.is_never() || is_table_shape_cleanup_type(typ)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn should_defer_none_infer_expr(expr: &LuaExpr) -> bool {
+    matches!(expr, LuaExpr::CallExpr(_))
+}
+
+fn should_defer_nil_gmod_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
+    if !analyzer.gmod_enabled {
+        return false;
+    }
+
+    matches!(expr, LuaExpr::CallExpr(_))
+}
+
+fn add_unresolve_for_assignment(
+    analyzer: &mut LuaAnalyzer,
+    type_owner: LuaTypeOwner,
+    var: &LuaVarExpr,
+    expr: LuaExpr,
+    reason: InferFailReason,
+) {
+    match type_owner {
+        LuaTypeOwner::Decl(decl_id) => {
+            let unresolve_decl = UnResolveDecl {
+                file_id: analyzer.file_id,
+                decl_id,
+                expr,
+                ret_idx: 0,
+            };
+
+            analyzer
+                .context
+                .add_unresolve(unresolve_decl.into(), reason);
+        }
+        LuaTypeOwner::Member(member_id) => {
+            let prefix = if !analyzer.is_scripted_class_scope {
+                match var {
+                    LuaVarExpr::IndexExpr(index_expr) if index_expr_prefix_is_self(index_expr) => {
+                        index_expr.get_prefix_expr()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let unresolve_member = UnResolveMember {
+                file_id: analyzer.file_id,
+                member_id,
+                expr: Some(expr),
+                prefix,
+                ret_idx: 0,
+            };
+            analyzer
+                .context
+                .add_unresolve(unresolve_member.into(), reason);
+        }
+        _ => {}
+    }
 }
 
 fn assign_merge_type_owner_and_expr_type(

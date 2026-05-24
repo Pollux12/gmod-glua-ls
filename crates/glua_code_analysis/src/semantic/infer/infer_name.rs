@@ -1,6 +1,6 @@
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaNameExpr,
-    LuaVarExpr,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr,
+    LuaNameExpr, LuaVarExpr,
 };
 use rowan::TextSize;
 
@@ -117,8 +117,14 @@ fn infer_local_decl_name_type(
     let var_ref_id = VarRefId::VarRef(decl_id);
     let result =
         infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id);
-    if result.as_ref().is_ok_and(|typ| typ.is_never())
-        && let Some(initializer_type) = try_infer_local_initializer_type(db, cache, decl_id)
+    if let Ok(typ) = &result
+        && let Some(initializer_type) = try_local_decl_initializer_fallback_type(
+            db,
+            cache,
+            decl_id,
+            typ,
+            name_expr.get_position(),
+        )
     {
         return Ok(initializer_type);
     }
@@ -172,11 +178,111 @@ fn try_infer_enclosing_for_range_iter_type(
     Some(ret_type)
 }
 
+pub(crate) fn try_local_decl_initializer_fallback_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+    current_type: &LuaType,
+    query_position: TextSize,
+) -> Option<LuaType> {
+    if current_type.is_never() {
+        if has_local_reassignment_between(db, decl_id, query_position) {
+            return None;
+        }
+
+        return try_infer_local_initializer_type(db, cache, decl_id);
+    }
+
+    if !((current_type.is_unknown() || current_type.is_nil())
+        && is_gmod_self_index_initializer(db, decl_id))
+    {
+        return None;
+    }
+
+    if has_local_reassignment_between(db, decl_id, query_position) {
+        return None;
+    }
+
+    let initializer_type = try_infer_local_initializer_type(db, cache, decl_id)?;
+    (!initializer_type.is_never() && !initializer_type.is_nil() && !initializer_type.is_unknown())
+        .then_some(initializer_type)
+}
+
+fn has_local_reassignment_between(
+    db: &DbIndex,
+    decl_id: LuaDeclId,
+    query_position: TextSize,
+) -> bool {
+    if query_position <= decl_id.position {
+        return false;
+    }
+
+    let root = match db.get_vfs().get_syntax_tree(&decl_id.file_id) {
+        Some(tree) => tree.get_red_root(),
+        None => return false,
+    };
+    let references = db
+        .get_reference_index()
+        .get_local_reference(&decl_id.file_id);
+    for assign_stat in root.descendants().filter_map(LuaAssignStat::cast) {
+        let position = assign_stat.get_position();
+        if position <= decl_id.position || position >= query_position {
+            continue;
+        }
+
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        for var in vars {
+            let LuaVarExpr::NameExpr(name_expr) = var else {
+                continue;
+            };
+
+            if references
+                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
+                .is_some_and(|assigned_decl_id| assigned_decl_id == decl_id)
+                || assignment_name_resolves_to_decl(db, decl_id, &name_expr)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn assignment_name_resolves_to_decl(
+    db: &DbIndex,
+    decl_id: LuaDeclId,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+
+    db.get_decl_index()
+        .get_decl_tree(&decl_id.file_id)
+        .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
+        .is_some_and(|decl| decl.get_id() == decl_id)
+}
+
 fn try_infer_local_initializer_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     decl_id: LuaDeclId,
 ) -> Option<LuaType> {
+    let (initializer_ret_idx, expr) = local_initializer_expr(db, decl_id)?;
+    let init_type = match infer_expr(db, cache, expr).ok()? {
+        LuaType::Variadic(variadic) => variadic
+            .get_type(initializer_ret_idx)
+            .cloned()
+            .unwrap_or(LuaType::Nil),
+        ty if initializer_ret_idx == 0 => ty,
+        _ => LuaType::Nil,
+    };
+
+    (!init_type.is_never() && !init_type.is_nil()).then_some(init_type)
+}
+
+fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let initializer = decl.get_initializer()?;
     let root = db
@@ -184,17 +290,37 @@ fn try_infer_local_initializer_type(
         .get_syntax_tree(&decl_id.file_id)?
         .get_red_root();
     let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
-    let expr = LuaExpr::cast(node)?;
-    let init_type = match infer_expr(db, cache, expr).ok()? {
-        LuaType::Variadic(variadic) => variadic
-            .get_type(initializer.get_ret_idx())
-            .cloned()
-            .unwrap_or(LuaType::Nil),
-        ty if initializer.get_ret_idx() == 0 => ty,
-        _ => LuaType::Nil,
+    Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
+}
+
+fn is_gmod_self_index_initializer(db: &DbIndex, decl_id: LuaDeclId) -> bool {
+    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+        return false;
+    }
+
+    let Some((_, LuaExpr::IndexExpr(index_expr))) = local_initializer_expr(db, decl_id) else {
+        return false;
     };
 
-    (!init_type.is_never() && !init_type.is_nil()).then_some(init_type)
+    index_expr_root_is_self(&index_expr)
+}
+
+fn index_expr_root_is_self(index_expr: &LuaIndexExpr) -> bool {
+    let Some(mut prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    while let LuaExpr::IndexExpr(prefix_index_expr) = prefix_expr {
+        let Some(next_prefix_expr) = prefix_index_expr.get_prefix_expr() else {
+            return false;
+        };
+        prefix_expr = next_prefix_expr;
+    }
+
+    matches!(
+        prefix_expr,
+        LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self")
+    )
 }
 
 fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Option<LuaType> {
