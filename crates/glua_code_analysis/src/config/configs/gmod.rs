@@ -22,7 +22,6 @@ const FILE_PARAM_DEFAULTS: &[(&str, &str)] = &[
     ("trace", "TraceResult"),
     ("tr", "TraceResult"),
     ("ang", "Angle"),
-    ("angle", "Angle"),
     ("vec", "Vector"),
     ("pos", "Vector"),
     ("color", "Color"),
