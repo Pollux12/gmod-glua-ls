@@ -2004,6 +2004,74 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_branch_initialized_indexed_record_assignment() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/sh_glide.lua",
+            r#"
+            ---@class Glide
+            Glide = Glide or {}
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            Glide.DebugNetwork = Glide.DebugNetwork or {}
+
+            if CLIENT then
+                local DebugNet = Glide.DebugNetwork
+
+                function DebugNet.ReadSnapshot()
+                    local entId = net.ReadUInt(16)
+                    local vehicleId = nil
+                    local fields = {}
+                    return entId, vehicleId, fields
+                end
+            end
+        "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            local DebugNet = Glide.DebugNetwork
+
+            local function receive()
+                local entId, vehicleId, fields = DebugNet.ReadSnapshot()
+                if not entId then return end
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+                local rec = Glide.DebugSnapshots[entId]
+                if not rec then
+                    re<??>c = { data = {}, t = SysTime() }
+                    Glide.DebugSnapshots[entId] = rec
+                end
+
+                local data = rec.data
+                print(data, rec)
+            end
+        "#,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/network.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("data"),
+            "expected assignment hover to include record table shape, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("any"),
+            "expected assignment hover not to collapse record table to any, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_local_gettable_call_uses_scoped_receiver_type() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

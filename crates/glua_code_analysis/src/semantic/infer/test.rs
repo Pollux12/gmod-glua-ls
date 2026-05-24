@@ -401,6 +401,110 @@ mod test {
     }
 
     #[test]
+    fn test_branch_initialized_indexed_record_alias_preserves_shape() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/sh_glide.lua",
+            r#"
+            ---@class Glide
+            Glide = Glide or {}
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            Glide.DebugNetwork = Glide.DebugNetwork or {}
+
+            if CLIENT then
+                local DebugNet = Glide.DebugNetwork
+
+                function DebugNet.ReadSnapshot()
+                    local entId = net.ReadUInt(16)
+                    local vehicleId = nil
+                    local fields = {}
+                    return entId, vehicleId, fields
+                end
+            end
+        "#,
+        );
+        let file_id = ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            local DebugNet = Glide.DebugNetwork
+
+            local function receive()
+                local entId, vehicleId, fields = DebugNet.ReadSnapshot()
+                if not entId then return end
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+                local rec = Glide.DebugSnapshots[entId]
+                if not rec then
+                    rec = { data = {}, t = SysTime() }
+                    Glide.DebugSnapshots[entId] = rec
+                end
+
+                local data = rec.data
+                print(data, rec)
+            end
+        "#,
+        );
+        let ty = infer_last_name_expr_type_in_file(&ws, file_id, "rec");
+
+        assert!(
+            matches!(ty, LuaType::TableConst(_)),
+            "Branch-initialized record alias should preserve its table shape, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
+    fn test_flow_merge_preserves_explicit_any_over_table_shape() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@type any
+            local value
+            if condition then
+                value = {}
+            end
+
+            print(value)
+            "#,
+            "value",
+        );
+
+        assert_eq!(ty, ws.ty("any"));
+    }
+
+    #[test]
+    fn test_flow_merge_keeps_inferred_any_over_specific_non_table_assignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return any
+            local function read()
+            end
+
+            local value = read()
+            if condition then
+                value = "translated"
+            end
+
+            print(value)
+            "#,
+            "value",
+        );
+
+        assert_eq!(ty, ws.ty("any"));
+    }
+
+    #[test]
     fn test_pairs_value_preserves_cross_file_indexed_assignment_table_field() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();

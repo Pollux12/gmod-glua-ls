@@ -604,8 +604,8 @@ fn merge_antecedent_types(
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
     });
 
-    let mut result_type = LuaType::Never;
     let mut accepted_any = false;
+    let mut branch_types = Vec::new();
     for &flow_id in &antecedents {
         let Some(antecedent_node) = tree.get_flow_node(flow_id) else {
             continue;
@@ -630,13 +630,14 @@ fn merge_antecedent_types(
         if branch_type.is_unknown() {
             return Ok(LuaType::Unknown);
         }
-        result_type = TypeOps::Union.apply(db, &result_type, &branch_type);
+        branch_types.push(branch_type);
     }
 
     if accepted_any {
-        return Ok(result_type);
+        return Ok(merge_flow_branch_types(db, var_ref_id, branch_types));
     }
 
+    let mut branch_types = Vec::new();
     for &flow_id in &antecedents {
         let Some(antecedent_node) = tree.get_flow_node(flow_id) else {
             continue;
@@ -654,10 +655,87 @@ fn merge_antecedent_types(
         if branch_type.is_unknown() {
             return Ok(LuaType::Unknown);
         }
-        result_type = TypeOps::Union.apply(db, &result_type, &branch_type);
+        branch_types.push(branch_type);
     }
 
-    Ok(result_type)
+    Ok(merge_flow_branch_types(db, var_ref_id, branch_types))
+}
+
+fn merge_flow_branch_types(
+    db: &DbIndex,
+    var_ref_id: &VarRefId,
+    mut branch_types: Vec<LuaType>,
+) -> LuaType {
+    if branch_types.is_empty() {
+        return LuaType::Never;
+    }
+
+    if !var_ref_has_explicit_any(db, var_ref_id)
+        && branch_types.iter().any(is_table_shape_type)
+        && branch_types
+            .iter()
+            .all(is_inferred_any_or_table_shape_branch)
+    {
+        let concrete_types = branch_types
+            .iter()
+            .filter(|typ| !is_bare_any_branch(typ))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !concrete_types.is_empty() {
+            branch_types = concrete_types;
+        }
+    }
+
+    let mut result_type = LuaType::Never;
+    for branch_type in branch_types {
+        result_type = TypeOps::Union.apply(db, &result_type, &branch_type);
+    }
+    result_type
+}
+
+fn var_ref_has_explicit_any(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+    let type_cache = var_ref_id
+        .get_decl_id_ref()
+        .map(|decl_id| decl_id.into())
+        .or_else(|| {
+            var_ref_id
+                .get_member_id_ref()
+                .map(|member_id| member_id.into())
+        })
+        .and_then(|owner| db.get_type_index().get_type_cache(&owner));
+
+    type_cache.is_some_and(|cache| cache.is_doc() && type_contains_bare_any(cache.as_type()))
+}
+
+fn type_contains_bare_any(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any => true,
+        LuaType::Union(union) => union.into_vec().iter().any(type_contains_bare_any),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .any(|(typ, _)| type_contains_bare_any(typ)),
+        _ => false,
+    }
+}
+
+fn is_bare_any_branch(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Any)
+}
+
+fn is_inferred_any_or_table_shape_branch(typ: &LuaType) -> bool {
+    is_bare_any_branch(typ)
+        || typ.is_nil()
+        || typ.is_never()
+        || is_table_shape_type(typ)
+        || matches!(typ, LuaType::Union(union) if union
+            .into_vec()
+            .iter()
+            .all(is_inferred_any_or_table_shape_branch))
+}
+
+fn is_table_shape_type(typ: &LuaType) -> bool {
+    typ.is_table() || matches!(typ, LuaType::Object(_) | LuaType::Instance(_))
 }
 
 fn get_merged_flow_type_or_nil(

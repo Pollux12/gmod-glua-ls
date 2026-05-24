@@ -52,6 +52,31 @@ pub fn build_semantic_info_hover(
     }
 }
 
+pub fn build_assignment_target_hover(
+    compilation: &LuaCompilation,
+    semantic_model: &SemanticModel,
+    db: &DbIndex,
+    document: &LuaDocument,
+    token: LuaSyntaxToken,
+) -> Option<Hover> {
+    let typ = get_assignment_target_type(&token, semantic_model)?;
+    let range = token.text_range();
+    if let Some(semantic_decl) = get_assignment_target_semantic_decl(db, semantic_model, &token) {
+        let hover_builder = build_hover_content(
+            compilation,
+            semantic_model,
+            db,
+            Some(typ),
+            semantic_decl,
+            false,
+            Some(token.clone()),
+        )?;
+        return hover_builder.build_hover_result(document.to_lsp_range(range));
+    }
+
+    build_hover_without_property(db, semantic_model, document, token, typ)
+}
+
 fn build_hover_without_property(
     db: &DbIndex,
     semantic_model: &SemanticModel,
@@ -836,6 +861,43 @@ fn get_assignment_target_type(
                 Err(_) => return None,
             }
         }
+    }
+
+    None
+}
+
+fn get_assignment_target_semantic_decl(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    trigger_token: &LuaSyntaxToken,
+) -> Option<LuaSemanticDeclId> {
+    let file_id = semantic_model.get_file_id();
+    let mut ancestor = trigger_token.parent();
+    let assign_stat = loop {
+        let node = ancestor?;
+        if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
+            break assign_stat;
+        }
+        ancestor = node.parent();
+    };
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    for var in vars {
+        if !token_is_assignment_target(&var, trigger_token) {
+            continue;
+        }
+
+        return match var {
+            LuaVarExpr::NameExpr(name_expr) => {
+                let decl_id = db
+                    .get_reference_index()
+                    .get_var_reference_decl(&file_id, name_expr.get_range())?;
+                Some(LuaSemanticDeclId::LuaDecl(decl_id))
+            }
+            LuaVarExpr::IndexExpr(index_expr) => Some(LuaSemanticDeclId::Member(LuaMemberId::new(
+                index_expr.get_syntax_id(),
+                file_id,
+            ))),
+        };
     }
 
     None
