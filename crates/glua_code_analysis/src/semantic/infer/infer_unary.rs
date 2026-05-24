@@ -43,7 +43,13 @@ fn infer_unary_custom_operator(
     }
 
     match op {
-        LuaOperatorMetaMethod::Unm => Ok(LuaType::Number),
+        LuaOperatorMetaMethod::Unm => {
+            if inner.is_any() || inner.is_unknown() {
+                Ok(LuaType::Any)
+            } else {
+                Ok(LuaType::Number)
+            }
+        }
         // GMod: unreachable — Lua 5.3+ operator disabled in parser
         LuaOperatorMetaMethod::BNot => Ok(LuaType::Integer),
         _ => Ok(LuaType::Nil),
