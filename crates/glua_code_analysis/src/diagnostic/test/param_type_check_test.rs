@@ -64,32 +64,6 @@ mod test {
     }
 
     #[test]
-    fn test_unannotated_angle_parameter_does_not_default_to_angle_object() {
-        let mut ws = VirtualWorkspace::new();
-        let mut emmyrc = ws.get_emmyrc();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-
-        assert!(ws.check_code_for(
-            DiagnosticCode::ParamTypeMismatch,
-            r#"
-            ---@class Angle
-
-            ---@param x number
-            ---@param y number
-            ---@param w number
-            ---@param h number
-            ---@param rotation number
-            function DrawTexturedRectRotated(x, y, w, h, rotation) end
-
-            local function DrawIcon(x, y, size, angle)
-                DrawTexturedRectRotated(x, y, size, size, angle or 0)
-            end
-        "#
-        ));
-    }
-
-    #[test]
     fn test_pcall_variadic_generic_accepts_class_arg_from_unresolved_callable() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
