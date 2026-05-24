@@ -96,6 +96,24 @@ impl LuaFlowIndex {
             .get(&position)
             .map(|effects| effects.as_slice())
     }
+
+    pub fn has_special_call_effect_before(
+        &self,
+        file_id: &FileId,
+        position: TextSize,
+        target: &VarRefId,
+    ) -> bool {
+        self.special_call_effects
+            .get(file_id)
+            .is_some_and(|effects_by_position| {
+                effects_by_position
+                    .iter()
+                    .any(|(effect_position, effects)| {
+                        *effect_position < position
+                            && effects.iter().any(|effect| &effect.target == target)
+                    })
+            })
+    }
 }
 
 impl LuaIndex for LuaFlowIndex {

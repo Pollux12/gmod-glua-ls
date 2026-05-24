@@ -193,6 +193,16 @@ pub(crate) fn try_local_decl_initializer_fallback_type(
         return try_infer_local_initializer_type(db, cache, decl_id);
     }
 
+    if let Some(alias_type) = try_infer_flow_sensitive_alias_initializer_type(
+        db,
+        cache,
+        decl_id,
+        current_type,
+        query_position,
+    ) {
+        return Some(alias_type);
+    }
+
     if !((current_type.is_unknown() || current_type.is_nil())
         && is_gmod_self_index_initializer(db, decl_id))
     {
@@ -206,6 +216,47 @@ pub(crate) fn try_local_decl_initializer_fallback_type(
     let initializer_type = try_infer_local_initializer_type(db, cache, decl_id)?;
     (!initializer_type.is_never() && !initializer_type.is_nil() && !initializer_type.is_unknown())
         .then_some(initializer_type)
+}
+
+fn try_infer_flow_sensitive_alias_initializer_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+    current_type: &LuaType,
+    query_position: TextSize,
+) -> Option<LuaType> {
+    if !(current_type.is_unknown() || current_type.is_nil() || current_type.is_table()) {
+        return None;
+    }
+
+    if has_local_reassignment_between(db, decl_id, query_position) {
+        return None;
+    }
+
+    let (_, initializer_expr) = local_initializer_expr(db, decl_id)?;
+    if !matches!(
+        initializer_expr,
+        LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)
+    ) {
+        return None;
+    }
+
+    let initializer_ref =
+        super::narrow::get_var_expr_var_ref_id(db, cache, initializer_expr.clone())?;
+    if !db.get_flow_index().has_special_call_effect_before(
+        &decl_id.file_id,
+        decl_id.position,
+        &initializer_ref,
+    ) {
+        return None;
+    }
+
+    let initializer_type = infer_expr(db, cache, initializer_expr).ok()?;
+    (!initializer_type.is_never()
+        && !initializer_type.is_nil()
+        && !initializer_type.is_unknown()
+        && !initializer_type.is_table())
+    .then_some(initializer_type)
 }
 
 fn has_local_reassignment_between(
