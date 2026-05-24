@@ -134,10 +134,12 @@ fn check_general_type_compact(
     {
         match union_type.deref() {
             LuaUnionType::Nullable(non_nullable_type) => {
+                let non_nullable_type =
+                    strip_dynamic_any_when_specific_union_members_remain(non_nullable_type);
                 return check_general_type_compact(
                     context,
                     source,
-                    non_nullable_type,
+                    &non_nullable_type,
                     check_guard.next_level()?,
                 );
             }
@@ -153,7 +155,9 @@ fn check_general_type_compact(
                         .next()
                         .expect("non_nil has exactly 1 element")
                 } else {
-                    LuaType::Union(LuaUnionType::Multi(non_nil).into())
+                    strip_dynamic_any_when_specific_union_members_remain(&LuaType::Union(
+                        LuaUnionType::Multi(non_nil).into(),
+                    ))
                 };
                 return check_general_type_compact(
                     context,
@@ -334,6 +338,28 @@ fn escape_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
     }
 
     None
+}
+
+fn strip_dynamic_any_when_specific_union_members_remain(typ: &LuaType) -> LuaType {
+    let LuaType::Union(union) = typ else {
+        return typ.clone();
+    };
+
+    let members = union.into_vec();
+    if !members.iter().any(|member| matches!(member, LuaType::Any))
+        || !members
+            .iter()
+            .any(|member| !matches!(member, LuaType::Any | LuaType::Nil))
+    {
+        return typ.clone();
+    }
+
+    LuaType::from_vec(
+        members
+            .into_iter()
+            .filter(|member| !matches!(member, LuaType::Any))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
