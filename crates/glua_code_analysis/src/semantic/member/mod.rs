@@ -211,27 +211,12 @@ fn dynamic_field_definitions(
     field_name: &str,
 ) -> Vec<crate::InFiled<TextRange>> {
     match prefix_type {
-        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
-            let mut definitions = dynamic_field_definitions_for_owner(
-                db,
-                caller_file_id,
-                &crate::DynamicFieldOwner::Type(type_id.clone()),
-                field_name,
-            );
-            let mut super_types = Vec::new();
-            type_id.collect_super_types(db, &mut super_types);
-            for super_type in super_types {
-                if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
-                    definitions.extend(dynamic_field_definitions_for_owner(
-                        db,
-                        caller_file_id,
-                        &crate::DynamicFieldOwner::Type(super_id),
-                        field_name,
-                    ));
-                }
-            }
-            definitions
-        }
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => dynamic_field_definitions_for_owner(
+            db,
+            caller_file_id,
+            &crate::DynamicFieldOwner::Type(type_id.clone()),
+            field_name,
+        ),
         LuaType::TableConst(table_range) => dynamic_field_definitions_for_owner(
             db,
             caller_file_id,
