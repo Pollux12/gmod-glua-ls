@@ -405,10 +405,17 @@ fn collect_field_setter_helper_call_fields(
     let Some(args_list) = call_expr.get_args_list() else {
         return;
     };
-    let args = args_list.get_args().collect::<Vec<_>>();
-    if args.len() < 2 {
+    let mut args_iter = args_list.get_args();
+    let Some(first_arg) = args_iter.next() else {
         return;
-    }
+    };
+    let Some(second_arg) = args_iter.next() else {
+        return;
+    };
+    let mut args = Vec::with_capacity(2 + args_iter.size_hint().0);
+    args.push(first_arg);
+    args.push(second_arg);
+    args.extend(args_iter);
 
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return;
