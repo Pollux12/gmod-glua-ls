@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Duration;
 
 use glua_parser::{
@@ -64,6 +64,44 @@ struct FieldSetterHelper {
     key_param_index: usize,
 }
 
+#[derive(Default)]
+struct FieldSetterHelperCache {
+    helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
+    non_helpers: FxHashSet<LuaSignatureId>,
+}
+
+impl FieldSetterHelperCache {
+    fn from_tree_list(tree_list: &[InFiled<glua_parser::LuaChunk>]) -> Self {
+        Self {
+            helpers: collect_field_setter_helpers(tree_list),
+            non_helpers: FxHashSet::default(),
+        }
+    }
+
+    fn patterns_for_signature(
+        &mut self,
+        db: &DbIndex,
+        signature_id: LuaSignatureId,
+    ) -> Vec<FieldSetterHelper> {
+        if let Some(patterns) = self.helpers.get(&signature_id) {
+            return patterns.clone();
+        }
+
+        if self.non_helpers.contains(&signature_id) {
+            return Vec::new();
+        }
+
+        let patterns = collect_field_setter_helpers_for_signature(db, signature_id);
+        if patterns.is_empty() {
+            self.non_helpers.insert(signature_id);
+        } else {
+            self.helpers.insert(signature_id, patterns.clone());
+        }
+
+        patterns
+    }
+}
+
 impl DynamicFieldAnalysisMode {
     fn collect_declared_member_table_fields(self) -> bool {
         true
@@ -96,9 +134,9 @@ fn analyze_dynamic_fields(
     let profile_enabled = log::log_enabled!(log::Level::Info);
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
     let mut field_setter_helpers = if mode.collect_direct_assignments() {
-        collect_field_setter_helpers(&tree_list)
+        FieldSetterHelperCache::from_tree_list(&tree_list)
     } else {
-        FxHashMap::default()
+        FieldSetterHelperCache::default()
     };
 
     for in_filed_tree in &tree_list {
@@ -361,7 +399,7 @@ fn collect_field_setter_helper_call_fields(
     cache: &mut crate::LuaInferCache,
     call_expr: &LuaCallExpr,
     file_id: crate::FileId,
-    helpers: &mut FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
+    helpers: &mut FieldSetterHelperCache,
     collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
 ) {
     let Some(args_list) = call_expr.get_args_list() else {
@@ -425,8 +463,14 @@ fn helper_patterns_for_call(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     prefix_expr: &LuaExpr,
-    helpers: &mut FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
+    helpers: &mut FieldSetterHelperCache,
 ) -> Vec<FieldSetterHelper> {
+    if let LuaExpr::NameExpr(name_expr) = prefix_expr
+        && let Some(signature_id) = direct_name_expr_signature_id(db, cache, name_expr)
+    {
+        return helpers.patterns_for_signature(db, signature_id);
+    }
+
     let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
         return Vec::new();
     };
@@ -439,20 +483,12 @@ fn helper_patterns_for_call(
 fn collect_helper_patterns_from_type(
     db: &DbIndex,
     typ: &LuaType,
-    helpers: &mut FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
+    helpers: &mut FieldSetterHelperCache,
     result: &mut Vec<FieldSetterHelper>,
 ) {
     match typ {
         LuaType::Signature(signature_id) => {
-            if let Some(patterns) = helpers.get(signature_id).cloned() {
-                result.extend(patterns);
-            } else {
-                let patterns = collect_field_setter_helpers_for_signature(db, *signature_id);
-                if !patterns.is_empty() {
-                    helpers.insert(*signature_id, patterns.clone());
-                }
-                result.extend(patterns);
-            }
+            result.extend(helpers.patterns_for_signature(db, *signature_id));
         }
         LuaType::Union(union_type) => {
             for typ in union_type.into_vec() {
@@ -462,6 +498,25 @@ fn collect_helper_patterns_from_type(
         LuaType::TypeGuard(inner) => collect_helper_patterns_from_type(db, inner, helpers, result),
         _ => {}
     }
+}
+
+fn direct_name_expr_signature_id(
+    db: &DbIndex,
+    cache: &crate::LuaInferCache,
+    name_expr: &glua_parser::LuaNameExpr,
+) -> Option<LuaSignatureId> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+    let value_expr = LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)?;
+    let LuaExpr::ClosureExpr(closure) = value_expr else {
+        return None;
+    };
+
+    Some(LuaSignatureId::from_closure(decl.get_file_id(), &closure))
 }
 
 fn collect_field_setter_helpers_for_signature(
