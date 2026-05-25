@@ -166,6 +166,19 @@ fn check_general_type_compact(
         }
     }
 
+    if let LuaType::Union(union_type) = compact_type {
+        for compact_sub_type in union_type.into_vec() {
+            check_general_type_compact(
+                context,
+                source,
+                &compact_sub_type,
+                check_guard.next_level()?,
+            )?;
+        }
+
+        return Ok(());
+    }
+
     match source {
         LuaType::Unknown | LuaType::Any => Ok(()),
         // simple type
