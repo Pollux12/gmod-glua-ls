@@ -59,6 +59,25 @@ function FindPlayer(name) end
 
 ---
 
+## Default return values
+
+You can specify a default value for a return type using the `=value` syntax:
+
+```lua
+---@return boolean=false success Whether the operation succeeded
+function SaveData() end
+```
+
+This tells GLuaLS what the value defaults to.
+
+<Warning>
+  The default value must come directly after the type, before the name:
+  - `---@return boolean=false success` — ✅ Correct.
+  - `---@return boolean success=false` — ❌ Incorrect. (This makes `=false` part of the description instead).
+</Warning>
+
+---
+
 ## Generic return values
 
 ```lua
