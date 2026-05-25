@@ -68,13 +68,22 @@ struct FieldSetterHelper {
 struct FieldSetterHelperCache {
     helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
     non_helpers: FxHashSet<LuaSignatureId>,
+    member_names: FxHashSet<SmolStr>,
 }
 
 impl FieldSetterHelperCache {
-    fn from_tree_list(tree_list: &[InFiled<glua_parser::LuaChunk>]) -> Self {
+    fn from_tree_list(
+        tree_list: &[InFiled<glua_parser::LuaChunk>],
+        enable_member_name_prefilter: bool,
+    ) -> Self {
+        let (helpers, mut member_names) = collect_field_setter_helpers(tree_list);
+        if !enable_member_name_prefilter {
+            member_names.clear();
+        }
         Self {
-            helpers: collect_field_setter_helpers(tree_list),
+            helpers,
             non_helpers: FxHashSet::default(),
+            member_names,
         }
     }
 
@@ -99,6 +108,21 @@ impl FieldSetterHelperCache {
         }
 
         patterns
+    }
+
+    fn definitely_not_member_helper_call(&self, prefix_expr: &LuaExpr) -> bool {
+        if self.member_names.is_empty() {
+            return false;
+        }
+
+        let LuaExpr::IndexExpr(index_expr) = prefix_expr else {
+            return false;
+        };
+        let Some(member_name) = simple_index_key_name(index_expr) else {
+            return false;
+        };
+
+        !self.member_names.contains(&member_name)
     }
 }
 
@@ -134,7 +158,10 @@ fn analyze_dynamic_fields(
     let profile_enabled = log::log_enabled!(log::Level::Info);
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
     let mut field_setter_helpers = if mode.collect_direct_assignments() {
-        FieldSetterHelperCache::from_tree_list(&tree_list)
+        FieldSetterHelperCache::from_tree_list(
+            &tree_list,
+            context_covers_workspace(&*db, context, &tree_list),
+        )
     } else {
         FieldSetterHelperCache::default()
     };
@@ -322,8 +349,12 @@ fn analyze_dynamic_fields(
 
 fn collect_field_setter_helpers(
     tree_list: &[InFiled<glua_parser::LuaChunk>],
-) -> FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>> {
+) -> (
+    FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
+    FxHashSet<SmolStr>,
+) {
     let mut helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>> = FxHashMap::default();
+    let mut member_names = FxHashSet::default();
 
     for in_filed_tree in tree_list {
         let file_id = in_filed_tree.file_id;
@@ -333,11 +364,92 @@ fn collect_field_setter_helpers(
             let patterns = collect_field_setter_helpers_in_closure(&closure);
             if !patterns.is_empty() {
                 helpers.insert(signature_id, patterns);
+                collect_helper_member_names_for_closure(&closure, &mut member_names);
             }
         }
     }
 
-    helpers
+    (helpers, member_names)
+}
+
+fn context_covers_workspace(
+    db: &DbIndex,
+    context: &AnalyzeContext,
+    tree_list: &[InFiled<glua_parser::LuaChunk>],
+) -> bool {
+    let Some(workspace_id) = context.workspace_id else {
+        return false;
+    };
+
+    let tree_file_ids = tree_list
+        .iter()
+        .map(|in_filed_tree| in_filed_tree.file_id)
+        .collect::<FxHashSet<_>>();
+    let mut found_workspace_file = false;
+    for file_id in db.get_vfs().get_all_file_ids() {
+        if db.get_vfs().get_syntax_tree(&file_id).is_none() {
+            continue;
+        }
+
+        if db.get_module_index().get_workspace_id(file_id) != Some(workspace_id) {
+            continue;
+        }
+
+        found_workspace_file = true;
+        if !tree_file_ids.contains(&file_id) {
+            return false;
+        }
+    }
+
+    found_workspace_file
+}
+
+fn collect_helper_member_names_for_closure(
+    closure: &LuaClosureExpr,
+    member_names: &mut FxHashSet<SmolStr>,
+) {
+    for ancestor in closure.syntax().ancestors().skip(1) {
+        if let Some(func_stat) = LuaFuncStat::cast(ancestor.clone()) {
+            if let Some(func_name) = func_stat.get_func_name() {
+                collect_helper_member_name_from_var(&func_name, member_names);
+            }
+            return;
+        }
+
+        if let Some(assign) = LuaAssignStat::cast(ancestor.clone()) {
+            let (vars, exprs) = assign.get_var_and_expr_list();
+            for (var, expr) in vars.iter().zip(exprs.iter()) {
+                if expr.syntax() == closure.syntax() {
+                    collect_helper_member_name_from_var(var, member_names);
+                }
+            }
+            return;
+        }
+
+        if LuaTableField::can_cast(ancestor.kind().into()) {
+            if let Some(field) = LuaTableField::cast(ancestor) {
+                if let Some(field_key) = field.get_field_key() {
+                    collect_helper_member_name_from_key(&field_key, member_names);
+                }
+            }
+            return;
+        }
+    }
+}
+
+fn collect_helper_member_name_from_var(var: &LuaVarExpr, member_names: &mut FxHashSet<SmolStr>) {
+    let LuaVarExpr::IndexExpr(index_expr) = var else {
+        return;
+    };
+    if let Some(member_name) = simple_index_key_name(index_expr) {
+        member_names.insert(member_name);
+    }
+}
+
+fn collect_helper_member_name_from_key(key: &LuaIndexKey, member_names: &mut FxHashSet<SmolStr>) {
+    if let Some(member_name) = simple_key_name(key) {
+        member_names.insert(member_name);
+    }
 }
 
 fn collect_field_setter_helpers_in_closure(closure: &LuaClosureExpr) -> Vec<FieldSetterHelper> {
@@ -478,6 +590,10 @@ fn helper_patterns_for_call(
         return helpers.patterns_for_signature(db, signature_id);
     }
 
+    if helpers.definitely_not_member_helper_call(prefix_expr) {
+        return Vec::new();
+    }
+
     let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
         return Vec::new();
     };
@@ -524,6 +640,18 @@ fn direct_name_expr_signature_id(
     };
 
     Some(LuaSignatureId::from_closure(decl.get_file_id(), &closure))
+}
+
+fn simple_index_key_name(index_expr: &glua_parser::LuaIndexExpr) -> Option<SmolStr> {
+    simple_key_name(&index_expr.get_index_key()?)
+}
+
+fn simple_key_name(key: &LuaIndexKey) -> Option<SmolStr> {
+    match key {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
+        LuaIndexKey::String(string) => Some(string.get_value().into()),
+        _ => None,
+    }
 }
 
 fn collect_field_setter_helpers_for_signature(
