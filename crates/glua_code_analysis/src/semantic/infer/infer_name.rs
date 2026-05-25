@@ -9,7 +9,7 @@ use crate::{
     CacheEntry, FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId,
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel,
     TypeOps,
-    compilation::analyzer::infer_for_range_iter_expr_func,
+    compilation::{analyzer::infer_for_range_iter_expr_func, get_scripted_class_type_decl_id},
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
     semantic::{
@@ -416,7 +416,7 @@ pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
         return None;
     }
 
-    Some(LuaTypeDeclId::global(&class_name))
+    Some(get_scripted_class_type_decl_id(&global_name, &class_name))
 }
 
 fn detect_scoped_global_from_path_cached(

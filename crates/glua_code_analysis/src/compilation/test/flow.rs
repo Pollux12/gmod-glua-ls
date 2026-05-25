@@ -4038,6 +4038,200 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_scripted_tool_name_collision_does_not_pollute_entity_vehicle_table() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+
+        ws.def_files(vec![
+            (
+                "lua/includes/gmod_defs.lua",
+                r#"
+                ---@class Vector
+
+                ---@class Entity
+                local Entity = {}
+                ---@return Entity
+                function Entity:GetParent() end
+                ---@return string
+                function Entity:GetClass() end
+                ---@return Vector
+                function Entity:GetForward() end
+                ---@return Vector
+                function Entity:GetRight() end
+                ---@return Vector
+                function Entity:GetUp() end
+                ---@return Vector
+                function Entity:GetLocalPos() end
+                ---@return number
+                function Entity:EntIndex() end
+                ---@return Vector
+                function Entity:OBBCenter() end
+                ---@param pos Vector
+                ---@return Vector
+                function Entity:LocalToWorld(pos) end
+
+                ---@class ENT: Entity
+                ENT = {}
+
+                ---@class Tool
+                local Tool = {}
+                function Tool:Allowed() end
+
+                ---@class TOOL: Tool
+                TOOL = Tool
+
+                ---@param x any
+                ---@return boolean
+                function IsValid(x) end
+
+                ---@param id number
+                ---@return Entity
+                function _G.Entity(id) end
+                "#,
+            ),
+            (
+                "lua/entities/base_glide/shared.lua",
+                r#"
+                ENT.Base = "base_anim"
+                ENT.IsGlideVehicle = true
+                "#,
+            ),
+            (
+                "lua/entities/glide_missile_launcher.lua",
+                r#"
+                ENT.Base = "base_anim"
+                "#,
+            ),
+            (
+                "lua/entities/glide_projectile_launcher.lua",
+                r#"
+                ENT.Base = "base_anim"
+                "#,
+            ),
+            (
+                "lua/weapons/gmod_tool/stools/glide_missile_launcher.lua",
+                r#"
+                TOOL.Name = "Missile Launcher"
+
+                local function IsGlideMissileLauncher(ent)
+                    return IsValid(ent) and ent:GetClass() == "glide_missile_launcher"
+                end
+
+                function TOOL:UpdateMissileLauncher(ent)
+                    ent:SetReloadDelay(1)
+                end
+
+                function TOOL:LeftClick(trace)
+                    return IsGlideMissileLauncher(trace.Entity)
+                end
+
+                function TOOL:RightClick(trace)
+                    local ent = trace.Entity
+                    if not IsGlideMissileLauncher(ent) then return false end
+                    self:UpdateMissileLauncher(ent)
+                    return true
+                end
+                "#,
+            ),
+            (
+                "lua/weapons/gmod_tool/stools/glide_projectile_launcher.lua",
+                r#"
+                TOOL.Name = "Projectile Launcher"
+
+                local function IsGlideProjectileLauncher(ent)
+                    return IsValid(ent) and ent:GetClass() == "glide_projectile_launcher"
+                end
+
+                function TOOL:UpdateProjectileLauncher(ent)
+                    ent:SetReloadDelay(1)
+                end
+
+                function TOOL:RightClick(trace)
+                    local ent = trace.Entity
+                    if not IsGlideProjectileLauncher(ent) then return false end
+                    self:UpdateProjectileLauncher(ent)
+                    return true
+                end
+                "#,
+            ),
+        ]);
+
+        let file_id = ws.def_file(
+            "lua/glide/client/debugging.lua",
+            r#"
+            local vehicles = {}
+
+            local entObj = Entity(1)
+            local fw = nil
+            local rt = nil
+            local up = nil
+            if IsValid(entObj) then
+                if entObj.IsGlideVehicle then
+                    vehicles[1] = entObj
+                end
+
+                local parent = entObj:GetParent()
+                if IsValid(parent) then
+                    local up = parent.GetUp and parent:GetUp()
+                    if entObj.GetLocalPos and parent.LocalToWorld then
+                        local lp = entObj:GetLocalPos()
+                        if lp then
+                            local axlePos = parent:LocalToWorld(lp)
+                        end
+                    end
+                    fw = parent.GetForward and parent:GetForward() or fw
+                    rt = parent.GetRight and parent:GetRight() or rt
+                    up = parent.GetUp and parent:GetUp() or up
+                    local vid = parent:EntIndex()
+                    vehicles[vid] = parent
+                    parent_type_snapshot = parent
+                end
+            end
+
+            for vid, veh in pairs(vehicles) do
+                if not IsValid(veh) then
+                    goto continue
+                end
+
+                local centerWorld = veh:LocalToWorld(veh:OBBCenter())
+                veh_type_snapshot = veh
+
+                ::continue::
+            end
+            "#,
+        );
+
+        let veh_type = ws.expr_ty("veh_type_snapshot");
+        let veh_desc = ws.humanize_type(veh_type);
+        let parent_type = ws.expr_ty("parent_type_snapshot");
+        let parent_desc = ws.humanize_type(parent_type);
+
+        assert_that!(
+            parent_desc.as_str(),
+            eq("Entity"),
+            "field guard on an Entity-owned method should not narrow parent to unrelated subclasses: {}",
+            parent_desc
+        );
+        assert_that!(
+            veh_desc.as_str(),
+            not(contains_substring("glide_missile_launcher")),
+            "vehicle table iteration should not include unrelated tool classes: {}",
+            veh_desc
+        );
+        assert_that!(
+            veh_desc.as_str(),
+            not(contains_substring("glide_projectile_launcher")),
+            "vehicle table iteration should not include unrelated tool classes: {}",
+            veh_desc
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(false)
+        );
+    }
+
+    #[gtest]
     fn test_field_narrow_drops_wrong_realm_subclass_in_serverside_scope() {
         // Realm-aware narrow: in server scope, drop EFFECT (client `Foo`)
         // from a `[EFFECT, ENT]` narrow union; keep ENT (server `Foo`).

@@ -3427,6 +3427,84 @@ mod test {
     }
 
     #[gtest]
+    fn test_stool_and_entity_same_name_do_not_share_type_identity() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/includes/custom_classes.lua",
+            r#"
+                ---@class Entity
+
+                ---@class ENT : Entity
+                ENT = {}
+
+                ---@class Tool
+
+                ---@class TOOL : Tool
+                TOOL = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/shared_name.lua",
+            r#"
+                ENT.Base = "base_anim"
+            "#,
+        );
+        ws.def_file(
+            "lua/weapons/gmod_tool/stools/shared_name.lua",
+            r#"
+                TOOL.Name = "Shared Name"
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let entity_class_id = LuaTypeDeclId::global("shared_name");
+        let stool_class_id = LuaTypeDeclId::global("TOOL.shared_name");
+
+        assert!(
+            db.get_type_index()
+                .get_type_decl(&entity_class_id)
+                .is_some(),
+            "expected the entity class to keep the runtime class name"
+        );
+        assert!(
+            db.get_type_index().get_type_decl(&stool_class_id).is_some(),
+            "expected the STool class to use a scoped type id"
+        );
+
+        let entity_supers = db
+            .get_type_index()
+            .get_super_types(&entity_class_id)
+            .unwrap_or_default();
+        assert!(
+            entity_supers
+                .iter()
+                .any(|ty| matches!(ty, LuaType::Ref(id) if id == &LuaTypeDeclId::global("Entity"))),
+            "entity class should inherit Entity, got {entity_supers:?}"
+        );
+        assert!(
+            !entity_supers.iter().any(|ty| {
+                matches!(ty, LuaType::Ref(id) if id == &LuaTypeDeclId::global("TOOL") || id == &LuaTypeDeclId::global("Tool"))
+            }),
+            "entity class must not inherit TOOL/Tool from the same-named STool, got {entity_supers:?}"
+        );
+
+        let stool_supers = db
+            .get_type_index()
+            .get_super_types(&stool_class_id)
+            .unwrap_or_default();
+        assert!(
+            stool_supers
+                .iter()
+                .any(|ty| matches!(ty, LuaType::Ref(id) if id == &LuaTypeDeclId::global("TOOL"))),
+            "STool class should inherit TOOL, got {stool_supers:?}"
+        );
+    }
+
+    #[gtest]
     fn test_stool_buildcpanel_from_field_annotation_only() {
         // Reproduces the real scenario with exact annotation structure from glua-api-snippets.
         // @field BuildCPanel fun(panel: ControlPanel) is on Tool class (not TOOL).

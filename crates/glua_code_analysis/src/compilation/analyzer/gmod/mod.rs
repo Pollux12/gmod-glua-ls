@@ -1681,7 +1681,7 @@ fn ensure_scoped_class_type_decl(
     global_name: &str,
     range: rowan::TextRange,
 ) -> LuaTypeDeclId {
-    let class_decl_id = LuaTypeDeclId::global(class_name);
+    let class_decl_id = get_scripted_class_type_decl_id(global_name, class_name);
     if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
         db.get_type_index_mut().add_type_decl(
             file_id,
@@ -1723,6 +1723,21 @@ fn ensure_scoped_class_type_decl(
         );
     }
     class_decl_id
+}
+
+pub(crate) fn get_scripted_class_type_decl_id(
+    global_name: &str,
+    class_name: &str,
+) -> LuaTypeDeclId {
+    if scoped_class_uses_global_namespace(global_name) {
+        LuaTypeDeclId::global(&format!("{global_name}.{class_name}"))
+    } else {
+        LuaTypeDeclId::global(class_name)
+    }
+}
+
+fn scoped_class_uses_global_namespace(global_name: &str) -> bool {
+    matches!(global_name, "TOOL" | "EFFECT")
 }
 
 fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
@@ -1796,7 +1811,10 @@ fn resolve_getmember_network_var_delegations(
                     .get_gmod_infer_index()
                     .get_scoped_class_info(&t.file_id)
                     .cloned()?;
-                let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+                let class_decl_id = get_scripted_class_type_decl_id(
+                    &scope_match.global_name,
+                    &scope_match.class_name,
+                );
                 Some((t.file_id, t.value.clone(), class_decl_id))
             })
             .collect()
@@ -2105,7 +2123,8 @@ fn synthesize_scripted_class_members(
         };
 
         if let Some(ref scope_match) = scope_match {
-            let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+            let class_decl_id =
+                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             if let Some((effective_base_name, is_derive)) = resolve_effective_inheritance_base(
                 &metadata,
                 scope_match.class_name_prefix.as_deref(),
@@ -2139,7 +2158,8 @@ fn synthesize_scripted_class_members(
 
         // AccessorFunc: synthesize Get/Set/field members
         if let Some(ref scope_match) = scope_match {
-            let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+            let class_decl_id =
+                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.accessor_func_calls {
                 synthesize_accessor_func(db, file_id, &class_decl_id, call);
             }
@@ -2147,7 +2167,8 @@ fn synthesize_scripted_class_members(
 
         // NetworkVar: synthesize Get/Set members
         if let Some(ref scope_match) = scope_match {
-            let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+            let class_decl_id =
+                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.network_var_calls {
                 synthesize_network_var(db, file_id, &class_decl_id, call);
             }
@@ -2155,7 +2176,8 @@ fn synthesize_scripted_class_members(
 
         // NetworkVarElement: synthesize Get/Set members (always number type)
         if let Some(ref scope_match) = scope_match {
-            let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+            let class_decl_id =
+                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.network_var_element_calls {
                 synthesize_network_var_element(db, file_id, &class_decl_id, call);
             }
@@ -2369,7 +2391,8 @@ fn synthesize_network_var_wrappers(
             continue;
         };
 
-        let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+        let class_decl_id =
+            get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
 
         // Step 1: Collect wrapper definitions from method definitions
         let wrappers = collect_network_var_wrappers(root, &scope_match.global_name);

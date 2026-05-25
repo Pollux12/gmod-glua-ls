@@ -14,7 +14,7 @@ use smol_str::SmolStr;
 use crate::{
     CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
     LuaDeclOrMemberId, LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
-    compilation::get_scripted_class_info_for_file,
+    compilation::{get_scripted_class_info_for_file, get_scripted_class_type_decl_id},
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaObjectType,
         LuaOperatorMetaMethod, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType,
@@ -452,11 +452,11 @@ fn infer_gmod_plain_table_dynamic_field(
         return None;
     }
 
-    let (class_name, _) = get_scripted_class_info_for_file(db, cache.get_file_id())?;
+    let (class_name, global_name) = get_scripted_class_info_for_file(db, cache.get_file_id())?;
 
     let index_key = index_expr.get_index_key()?;
     let member_key = LuaMemberKey::from_index_key(db, cache, &index_key).ok()?;
-    let class_type = LuaType::Ref(LuaTypeDeclId::global(&class_name));
+    let class_type = LuaType::Ref(get_scripted_class_type_decl_id(&global_name, &class_name));
     if let Ok(member_type) = infer_member_by_member_key(
         db,
         cache,
