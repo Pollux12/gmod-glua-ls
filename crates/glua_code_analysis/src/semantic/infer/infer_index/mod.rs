@@ -330,6 +330,25 @@ fn infer_table_member(
         );
     }
 
+    if db.get_emmyrc().gmod.enabled
+        && db.get_emmyrc().gmod.infer_dynamic_fields
+        && is_literal_table_field_access(&index_key)
+    {
+        if let Some(dynamic_field) = resolve_dynamic_field_member(
+            db,
+            cache,
+            &LuaType::TableConst(inst.clone()),
+            &key,
+            Some(index_expr.get_position()),
+        ) {
+            return Ok(dynamic_field.typ);
+        }
+
+        if table_has_cross_file_matching_expr_key_member(db, &owner, &key, cache.get_file_id()) {
+            return Ok(nullable_any_type());
+        }
+    }
+
     match infer_owner_raw_member_type_with_realm(
         db,
         owner.clone(),
@@ -359,6 +378,62 @@ fn infer_table_member(
         }
         Err(err) => Err(err),
     }
+}
+
+fn is_literal_table_field_access(index_key: &LuaIndexKey) -> bool {
+    matches!(index_key, LuaIndexKey::Name(_) | LuaIndexKey::String(_))
+}
+
+fn table_has_cross_file_matching_expr_key_member(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    access_file_id: FileId,
+) -> bool {
+    if !db.get_emmyrc().gmod.dynamic_fields_global {
+        return false;
+    }
+
+    let Some(access_key_type) = crate::semantic::member::member_key_as_type(key) else {
+        return false;
+    };
+    let access_realm = db
+        .get_gmod_infer_index()
+        .get_realm_file_metadata(&access_file_id)
+        .map(|metadata| metadata.inferred_realm)
+        .unwrap_or(crate::GmodRealm::Unknown);
+
+    db.get_member_index()
+        .get_members(owner)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                member.get_key().is_expr()
+                    && member.get_file_id() != access_file_id
+                    && is_dynamic_field_fallback_realm_compatible(
+                        db,
+                        access_realm,
+                        member.get_file_id(),
+                        member.get_id().get_position(),
+                    )
+                    && member_key_matches_type(db, &access_key_type, member.get_key())
+            })
+        })
+}
+
+fn is_dynamic_field_fallback_realm_compatible(
+    db: &DbIndex,
+    access_realm: crate::GmodRealm,
+    definition_file_id: FileId,
+    definition_position: TextSize,
+) -> bool {
+    let definition_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&definition_file_id, definition_position);
+    !matches!(
+        (access_realm, definition_realm),
+        (crate::GmodRealm::Client, crate::GmodRealm::Server)
+            | (crate::GmodRealm::Server, crate::GmodRealm::Client)
+    )
 }
 
 fn is_table_const_from_doc_tag(db: &DbIndex, inst: &InFiled<TextRange>) -> bool {

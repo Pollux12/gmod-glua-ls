@@ -3,8 +3,12 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::test_lib::DiagnosticSnapshot;
-    use crate::{DiagnosticCode, Emmyrc, FileId, VirtualWorkspace, WorkspaceId};
+    use crate::{
+        DiagnosticCode, Emmyrc, FileId, RenderLevel, VirtualWorkspace, WorkspaceId, humanize_type,
+    };
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
     use googletest::prelude::*;
+    use tokio_util::sync::CancellationToken;
 
     fn synthetic_files() -> BTreeMap<&'static str, &'static str> {
         BTreeMap::from([
@@ -190,6 +194,26 @@ mod tests {
             .collect()
     }
 
+    fn inferred_field_type(ws: &VirtualWorkspace, file_id: FileId, field_name: &str) -> String {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let root = semantic_model.get_root();
+        let target = root
+            .descendants::<LuaIndexExpr>()
+            .find(|expr| {
+                expr.get_index_key()
+                    .is_some_and(|key| key.get_path_part() == field_name)
+            })
+            .expect("field access should exist");
+        let ty = semantic_model
+            .infer_expr(LuaExpr::IndexExpr(target))
+            .unwrap_or(crate::LuaType::Unknown);
+        humanize_type(ws.analysis.compilation.get_db(), &ty, RenderLevel::Detailed)
+    }
+
     #[gtest]
     fn determinism_assign_type_mismatch_across_registration_and_parallel_diagnostics() {
         assert_deterministic_for_code(DiagnosticCode::AssignTypeMismatch);
@@ -296,5 +320,216 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_that!(precomputed.is_empty(), eq(false));
+    }
+
+    #[gtest]
+    fn gmod_dynamic_table_named_field_fallback_does_not_leak_expr_key_values_after_noop_edit() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.diagnostics.enables = vec![DiagnosticCode::ParamTypeMismatch];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+
+            ---@return string
+            local function readKey()
+            end
+
+            local function readValue()
+                if unknown then
+                    return "text"
+                end
+                return 1
+            end
+
+            local rec = { data = {}, t = 0 }
+            local data = rec.data
+            local key = readKey()
+            data[key] = readValue()
+            Glide.DebugSnapshots[1] = rec
+            "#,
+        );
+
+        let debug_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/glide/client/debugging.lua");
+        let original = r#"
+            ---@param value number
+            local function takesNumber(value) end
+            takesNumber("still a stable mismatch")
+
+            local snaps = Glide.DebugSnapshots or {}
+            for entId, rec in pairs(snaps) do
+                local d = rec.data
+                local engineTypeId = d.engineTypeId or 1
+                local engineTypeNames = {}
+                local _ = engineTypeNames[engineTypeId]
+                Glide.DebugSnapshots[entId] = nil
+            end
+            "#;
+        let debug_id = ws
+            .analysis
+            .update_file_by_uri(&debug_uri, Some(original.to_string()))
+            .expect("debug file id");
+
+        fn param_snapshots(ws: &VirtualWorkspace, file_id: FileId) -> BTreeSet<DiagnosticSnapshot> {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            ws.diagnostic_snapshots_for_file(file_id, diagnostics)
+                .into_iter()
+                .filter(|snapshot| {
+                    snapshot.code == Some(DiagnosticCode::ParamTypeMismatch.get_name().to_string())
+                })
+                .collect()
+        }
+
+        fn line_independent_snapshots(
+            snapshots: &BTreeSet<DiagnosticSnapshot>,
+        ) -> BTreeSet<(u32, u32, Option<i32>, Option<String>, String)> {
+            snapshots
+                .iter()
+                .map(|snapshot| {
+                    (
+                        snapshot.range_start_character,
+                        snapshot.range_end_character,
+                        snapshot.severity,
+                        snapshot.code.clone(),
+                        snapshot.message.clone(),
+                    )
+                })
+                .collect()
+        }
+
+        let baseline = param_snapshots(&ws, debug_id);
+        let baseline_engine_type = inferred_field_type(&ws, debug_id, "engineTypeId");
+
+        ws.analysis
+            .update_file_by_uri(&debug_uri, Some(format!("\n{original}")));
+        let after_add = param_snapshots(&ws, debug_id);
+        let after_add_engine_type = inferred_field_type(&ws, debug_id, "engineTypeId");
+
+        ws.analysis
+            .update_file_by_uri(&debug_uri, Some(original.to_string()));
+        let after_remove = param_snapshots(&ws, debug_id);
+        let after_remove_engine_type = inferred_field_type(&ws, debug_id, "engineTypeId");
+
+        assert_that!(baseline.is_empty(), eq(false));
+        assert_eq!(baseline, after_remove);
+        assert_eq!(
+            line_independent_snapshots(&baseline),
+            line_independent_snapshots(&after_add)
+        );
+        assert_that!(
+            after_add
+                .iter()
+                .all(|snapshot| !snapshot.message.contains("engineTypeId")),
+            eq(true)
+        );
+        assert_that!(
+            after_remove
+                .iter()
+                .all(|snapshot| !snapshot.message.contains("engineTypeId")),
+            eq(true)
+        );
+        for engine_type in [
+            &baseline_engine_type,
+            &after_add_engine_type,
+            &after_remove_engine_type,
+        ] {
+            assert_that!(engine_type.contains("text"), eq(false));
+            assert_that!(engine_type.contains('1'), eq(false));
+        }
+    }
+
+    #[gtest]
+    fn gmod_dynamic_table_named_field_fallback_respects_non_global_dynamic_fields() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = false;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+
+            ---@return string
+            local function readKey()
+            end
+
+            local rec = { data = {} }
+            local data = rec.data
+            local key = readKey()
+            data[key] = 1
+            Glide.DebugSnapshots[1] = rec
+            "#,
+        );
+
+        let debug_file = ws.def_file(
+            "lua/glide/client/debugging.lua",
+            r#"
+            local snaps = Glide.DebugSnapshots or {}
+            for _, rec in pairs(snaps) do
+                local d = rec.data
+                local engineTypeId = d.engineTypeId
+            end
+            "#,
+        );
+
+        let engine_type = inferred_field_type(&ws, debug_file, "engineTypeId");
+        assert_that!(engine_type.contains("any"), eq(false));
+    }
+
+    #[gtest]
+    fn gmod_dynamic_table_named_field_fallback_respects_realm_visibility() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/glide/server/network.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+
+            ---@return string
+            local function readKey()
+            end
+
+            local rec = { data = {} }
+            local data = rec.data
+            local key = readKey()
+            data[key] = 1
+            Glide.DebugSnapshots[1] = rec
+            "#,
+        );
+
+        let debug_file = ws.def_file(
+            "lua/glide/client/debugging.lua",
+            r#"
+            local snaps = Glide.DebugSnapshots or {}
+            for _, rec in pairs(snaps) do
+                local d = rec.data
+                local engineTypeId = d.engineTypeId
+            end
+            "#,
+        );
+
+        let engine_type = inferred_field_type(&ws, debug_file, "engineTypeId");
+        assert_that!(engine_type.contains("any"), eq(false));
     }
 }

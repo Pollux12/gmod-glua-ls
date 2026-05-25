@@ -624,6 +624,9 @@ fn should_skip_nil_table_shape_assignment(
     else {
         return false;
     };
+    if member_key.is_expr() {
+        return true;
+    }
 
     let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
     !analyzer

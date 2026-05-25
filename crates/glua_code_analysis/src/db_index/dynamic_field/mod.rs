@@ -142,48 +142,56 @@ impl DynamicFieldIndex {
         definitions.dedup();
         definitions
     }
+
+    fn rebuild_derived_state(&mut self) {
+        self.owner_fields.clear();
+        self.file_contributions.clear();
+        self.wildcard_file_contributions.clear();
+
+        for (owner, fields) in &self.field_definitions {
+            for (field_name, definitions) in fields {
+                for definition in definitions {
+                    self.owner_fields
+                        .entry(owner.clone())
+                        .or_default()
+                        .entry(field_name.clone())
+                        .or_default()
+                        .insert(definition.file_id);
+                    self.file_contributions
+                        .entry(definition.file_id)
+                        .or_default()
+                        .push((owner.clone(), field_name.clone(), definition.value));
+                }
+            }
+        }
+
+        for (owner, definitions) in &self.wildcard_definitions {
+            for definition in definitions {
+                self.wildcard_file_contributions
+                    .entry(definition.file_id)
+                    .or_default()
+                    .push((owner.clone(), definition.value));
+            }
+        }
+    }
 }
 
 impl LuaIndex for DynamicFieldIndex {
     fn remove(&mut self, file_id: FileId) {
-        if let Some(contributions) = self.file_contributions.remove(&file_id) {
-            for (owner, field_name, range) in contributions {
-                if let Some(fields) = self.owner_fields.get_mut(&owner) {
-                    if let Some(files) = fields.get_mut(&field_name) {
-                        files.remove(&file_id);
-                        if files.is_empty() {
-                            fields.remove(&field_name);
-                        }
-                    }
-                    if fields.is_empty() {
-                        self.owner_fields.remove(&owner);
-                    }
-                }
+        self.field_definitions.retain(|_, fields| {
+            fields.retain(|_, definitions| {
+                definitions.retain(|definition| definition.file_id != file_id);
+                !definitions.is_empty()
+            });
+            !fields.is_empty()
+        });
 
-                if let Some(field_map) = self.field_definitions.get_mut(&owner) {
-                    if let Some(definitions) = field_map.get_mut(&field_name) {
-                        definitions.retain(|def| !(def.file_id == file_id && def.value == range));
-                        if definitions.is_empty() {
-                            field_map.remove(&field_name);
-                        }
-                    }
-                    if field_map.is_empty() {
-                        self.field_definitions.remove(&owner);
-                    }
-                }
-            }
-        }
+        self.wildcard_definitions.retain(|_, definitions| {
+            definitions.retain(|definition| definition.file_id != file_id);
+            !definitions.is_empty()
+        });
 
-        if let Some(contributions) = self.wildcard_file_contributions.remove(&file_id) {
-            for (owner, range) in contributions {
-                if let Some(definitions) = self.wildcard_definitions.get_mut(&owner) {
-                    definitions.retain(|def| !(def.file_id == file_id && def.value == range));
-                    if definitions.is_empty() {
-                        self.wildcard_definitions.remove(&owner);
-                    }
-                }
-            }
-        }
+        self.rebuild_derived_state();
     }
 
     fn clear(&mut self) {
@@ -192,5 +200,79 @@ impl LuaIndex for DynamicFieldIndex {
         self.file_contributions.clear();
         self.wildcard_definitions.clear();
         self.wildcard_file_contributions.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rowan::{TextRange, TextSize};
+    use smol_str::SmolStr;
+
+    use super::*;
+    use crate::LuaTypeDeclId;
+
+    fn range(start: u32, end: u32) -> TextRange {
+        TextRange::new(TextSize::from(start), TextSize::from(end))
+    }
+
+    #[test]
+    fn remove_prunes_orphaned_field_definitions_without_contribution_entries() {
+        let file_to_remove = FileId::new(1);
+        let remaining_file = FileId::new(2);
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynFieldTest"));
+        let field = SmolStr::new("value");
+
+        let mut index = DynamicFieldIndex::new();
+        index
+            .field_definitions
+            .entry(owner.clone())
+            .or_default()
+            .entry(field.clone())
+            .or_default()
+            .extend([
+                InFiled::new(file_to_remove, range(1, 2)),
+                InFiled::new(remaining_file, range(3, 4)),
+            ]);
+        index
+            .wildcard_definitions
+            .entry(owner.clone())
+            .or_default()
+            .extend([
+                InFiled::new(file_to_remove, range(5, 6)),
+                InFiled::new(remaining_file, range(7, 8)),
+            ]);
+
+        index.remove(file_to_remove);
+
+        assert_eq!(index.get_field_definitions(&owner, &field).len(), 1);
+        assert_eq!(
+            index.get_field_definitions(&owner, &field)[0].file_id,
+            remaining_file
+        );
+        assert_eq!(index.get_wildcard_definitions(&owner).len(), 1);
+        assert_eq!(
+            index.get_wildcard_definitions(&owner)[0].file_id,
+            remaining_file
+        );
+        assert_eq!(
+            index.get_fields_in_file(&owner, file_to_remove),
+            Vec::<&SmolStr>::new()
+        );
+        assert_eq!(
+            index.get_fields_in_file(&owner, remaining_file),
+            vec![&field]
+        );
+        assert!(!index.file_contributions.contains_key(&file_to_remove));
+        assert!(
+            !index
+                .wildcard_file_contributions
+                .contains_key(&file_to_remove)
+        );
+        assert!(index.file_contributions.contains_key(&remaining_file));
+        assert!(
+            index
+                .wildcard_file_contributions
+                .contains_key(&remaining_file)
+        );
     }
 }
