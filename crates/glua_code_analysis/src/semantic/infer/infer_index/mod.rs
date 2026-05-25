@@ -28,7 +28,6 @@ use crate::{
             infer_name::get_name_expr_var_ref_id, narrow::infer_expr_narrow_type,
         },
         is_doc_tag_table_const,
-        member::file_define_expr_key_matches_precise_access,
         member::get_buildin_type_map_type_id,
         member::infer_owner_raw_member_type_with_realm,
         member::intersect_member_types,
@@ -1326,12 +1325,6 @@ fn infer_member_by_index_table(
                 let mut result_type = LuaType::Unknown;
                 let mut matched_inferred_index_key = false;
                 for member in members {
-                    if member.get_feature().is_file_define()
-                        && file_define_expr_key_matches_precise_access(&key_type, member.get_key())
-                    {
-                        continue;
-                    }
-
                     if member_key_matches_type(db, &key_type, member.get_key()) {
                         matched_inferred_index_key |=
                             is_inferred_index_member_key(member.get_key());

@@ -648,71 +648,52 @@ mod test {
     }
 
     #[test]
-    fn test_dynamic_string_key_write_does_not_type_every_named_field() {
+    fn test_dynamic_string_key_field_read_uses_index_value_type() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
 
-        let consumer_file = ws.def_file(
-            "lua/glide/client/debugging.lua",
-            r#"
-            local function draw()
-                local snaps = Glide.DebugSnapshots or {}
-                for entId, rec in pairs(snaps) do
-                    if not rec or not rec.data then continue end
-                    local d = rec.data
-                    print(d.forwardSlip)
-                end
-            end
-        "#,
-        );
-        ws.def_file(
-            "lua/glide/sh_network.lua",
-            r#"
-            if CLIENT then
-                local function readValue()
-                    if flag then
-                        return Vector(1, 2, 3)
-                    end
-
-                    return "not a number"
-                end
-
-                function Glide.ReadFields()
-                    local fields = {}
-                    local key = net.ReadString()
-                    fields[key] = readValue()
-                    return fields
-                end
-            end
-        "#,
-        );
-        ws.def_file(
+        let file_id = ws.def_file(
             "lua/glide/client/network.lua",
             r#"
-            local fields = Glide.ReadFields()
-            Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+            ---@class Vector
+            local Vector = {}
+            ---@return Vector
+            function _G.Vector() end
 
-            local rec = Glide.DebugSnapshots[1]
-            if not rec then
-                rec = { data = {}, t = 0 }
-                Glide.DebugSnapshots[1] = rec
+            net = {}
+            ---@return string
+            function net.ReadString() end
+
+            local function readValue()
+                if flag then
+                    return Vector()
+                end
+
+                return "not a number"
             end
 
+            local rec = { data = {}, t = 0 }
             local data = rec.data
-            for key, value in pairs(fields) do
-                data[key] = value
-            end
+            local key = net.ReadString()
+            data[key] = readValue()
+
+            local d = rec.data
+            print(d.forwardSlip)
         "#,
         );
 
-        let ty = infer_last_index_expr_type_in_file(&ws, consumer_file, "forwardSlip");
+        let ty = infer_last_index_expr_type_in_file(&ws, file_id, "forwardSlip");
+        let display = ws.humanize_type(ty.clone());
         assert!(
-            ty.is_unknown(),
-            "A dynamic string-key write should not type arbitrary named fields, got: {:?}",
-            ty
+            !ty.is_unknown() && !ty.is_nil(),
+            "A dynamic string-key field read should use the index value type, got: {display}"
+        );
+        assert!(
+            display.contains("Vector") && display.contains("\"not a number\""),
+            "A dynamic string-key field read should include the indexed value union, got: {display}"
         );
     }
 

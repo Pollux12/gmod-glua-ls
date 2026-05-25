@@ -2133,6 +2133,87 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_dynamic_string_key_field_uses_index_value_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@return Vector
+                function _G.Vector() end
+
+                net = {}
+                ---@return string
+                function net.ReadString() end
+
+                Glide = {}
+
+                local function readValue()
+                    if flag == 1 then
+                        return Vector()
+                    end
+
+                    if flag == 2 then
+                        return true
+                    end
+
+                    if flag == 3 then
+                        return {}
+                    end
+
+                    if flag == 4 then
+                        return "text"
+                    end
+
+                    return 1
+                end
+
+                local fields = {}
+                fields[net.ReadString()] = readValue()
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+                local rec = Glide.DebugSnapshots[1]
+                if not rec then
+                    rec = { data = {}, t = 0 }
+                    Glide.DebugSnapshots[1] = rec
+                end
+
+                local data = rec.data
+                data.vehicle = 1
+
+                for key, value in pairs(fields) do
+                    data[key] = value
+                end
+
+                local d = rec.data
+                print(d.for<??>wardForce)
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/debugging.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            !value.contains(": nil"),
+            "dynamic string-key field hover must not collapse to nil, got: {value}"
+        );
+        assert!(
+            value.contains("Vector")
+                && value.contains("true")
+                && value.contains("1")
+                && value.contains("\"text\"")
+                && value.contains("table"),
+            "expected field hover to use the dynamic string index value union, got: {value}"
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_local_gettable_call_uses_scoped_receiver_type() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

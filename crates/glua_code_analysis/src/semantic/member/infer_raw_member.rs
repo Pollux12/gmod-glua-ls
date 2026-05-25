@@ -11,8 +11,8 @@ use crate::{
 };
 
 use super::{
-    RawGetMemberTypeResult, file_define_expr_key_matches_precise_access,
-    get_buildin_type_map_type_id, member_key_as_type, member_key_matches_type,
+    RawGetMemberTypeResult, get_buildin_type_map_type_id, member_key_as_type,
+    member_key_matches_type,
 };
 
 pub fn infer_raw_member_type(
@@ -105,12 +105,6 @@ fn infer_owner_raw_member_type(
 
     let mut result_type = LuaType::Unknown;
     for member in owner_members {
-        if member.get_feature().is_file_define()
-            && file_define_expr_key_matches_precise_access(&access_key_type, member.get_key())
-        {
-            continue;
-        }
-
         if !member_key_matches_type(db, &access_key_type, member.get_key()) {
             continue;
         }
@@ -161,12 +155,6 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
 
     let mut result_type = LuaType::Unknown;
     for member in owner_members {
-        if member.get_feature().is_file_define()
-            && file_define_expr_key_matches_precise_access(&access_key_type, member.get_key())
-        {
-            continue;
-        }
-
         if !member_key_matches_type(db, &access_key_type, member.get_key()) {
             continue;
         }

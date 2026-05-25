@@ -3267,7 +3267,7 @@ mod test {
     }
 
     #[test]
-    fn test_dynamic_string_key_write_does_not_type_every_named_field() {
+    fn test_inferred_dynamic_string_key_field_does_not_report_param_mismatch() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
@@ -3304,7 +3304,7 @@ mod test {
         ));
         assert!(
             diagnostics.iter().all(|diag| diag.code != param_type_code),
-            "dynamic key write should not make every named field a broad union: {diagnostics:?}"
+            "inferred dynamic key field values should respect inferred mismatch diagnostics policy: {diagnostics:?}"
         );
     }
 }

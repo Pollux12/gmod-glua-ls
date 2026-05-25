@@ -390,19 +390,6 @@ pub(crate) fn member_key_matches_type(
         || check_type_compact(db, &member_key_type, access_key_type).is_ok()
 }
 
-pub(crate) fn file_define_expr_key_matches_precise_access(
-    access_key_type: &LuaType,
-    member_key: &LuaMemberKey,
-) -> bool {
-    matches!(
-        (access_key_type, member_key),
-        (
-            LuaType::StringConst(_) | LuaType::DocStringConst(_),
-            LuaMemberKey::ExprType(LuaType::String | LuaType::DocStringConst(_))
-        )
-    )
-}
-
 fn exact_literal_member_key_match(
     access_key_type: &LuaType,
     member_key_type: &LuaType,
@@ -587,23 +574,4 @@ fn resolve_table_field_through_type_inference(
         .first()
         .cloned()
         .and_then(|m| m.property_owner_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use smol_str::SmolStr;
-
-    use super::file_define_expr_key_matches_precise_access;
-    use crate::{LuaMemberKey, LuaType};
-
-    #[test]
-    fn file_define_expr_key_is_detected_as_precise_access_skip() {
-        let access_key_type = LuaType::StringConst(SmolStr::new("forwardSlip").into());
-        let member_key = LuaMemberKey::ExprType(LuaType::String);
-
-        assert!(
-            file_define_expr_key_matches_precise_access(&access_key_type, &member_key),
-            "an observed dynamic string-key write is not proof that every named field has that value type"
-        );
-    }
 }
