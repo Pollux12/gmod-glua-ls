@@ -255,16 +255,21 @@ pub(crate) fn apply_gamemode_base_detection(
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn make_workspace() -> PathBuf {
         let mut dir = std::env::temp_dir();
+        let n = WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
         dir.push(format!(
-            "glua_check_gmbase_{}_{}",
+            "glua_check_gmbase_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            n
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
