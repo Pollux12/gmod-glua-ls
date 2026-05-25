@@ -364,18 +364,21 @@ fn collect_field_setter_helper_call_fields(
     helpers: &mut FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
     collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
 ) {
+    let Some(args_list) = call_expr.get_args_list() else {
+        return;
+    };
+    let args = args_list.get_args().collect::<Vec<_>>();
+    if args.len() < 2 {
+        return;
+    }
+
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return;
     };
     let helper_patterns = helper_patterns_for_call(db, cache, &prefix_expr, helpers);
     if helper_patterns.is_empty() {
         return;
-    }
-
-    let Some(args_list) = call_expr.get_args_list() else {
-        return;
     };
-    let args = args_list.get_args().collect::<Vec<_>>();
     for helper in helper_patterns {
         let Some(table_arg) = args.get(helper.table_param_index) else {
             continue;
