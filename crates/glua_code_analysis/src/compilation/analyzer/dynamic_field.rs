@@ -2,8 +2,8 @@ use rustc_hash::FxHashMap;
 use std::time::Duration;
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexKey,
-    LuaSyntaxKind, LuaTableField, LuaVarExpr,
+    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat, LuaFuncStat,
+    LuaIndexKey, LuaSyntaxKind, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use smol_str::SmolStr;
 
@@ -832,9 +832,75 @@ fn get_field_names(
     match key {
         LuaIndexKey::Name(name) => vec![name.get_name_text().into()],
         LuaIndexKey::String(s) => vec![s.get_value().into()],
-        LuaIndexKey::Expr(expr) => string_const_names(&infer_expr(db, cache, expr).ok()),
+        LuaIndexKey::Expr(expr) => {
+            let names = string_const_names(&infer_expr(db, cache, expr.clone()).ok());
+            if names.is_empty() {
+                field_names_from_for_range_pairs_key(expr)
+            } else {
+                names
+            }
+        }
         _ => Vec::new(),
     }
+}
+
+fn field_names_from_for_range_pairs_key(key_expr: LuaExpr) -> Vec<SmolStr> {
+    let LuaExpr::NameExpr(name_expr) = key_expr else {
+        return Vec::new();
+    };
+    let Some(name_text) = name_expr.get_name_text() else {
+        return Vec::new();
+    };
+    let Some(for_range) = name_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaForRangeStat::cast)
+    else {
+        return Vec::new();
+    };
+
+    let is_first_iter_var = for_range
+        .get_var_name_list()
+        .next()
+        .is_some_and(|iter_name| iter_name.get_name_text() == name_text);
+    if !is_first_iter_var {
+        return Vec::new();
+    }
+
+    let mut iter_exprs = for_range.get_expr_list();
+    let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.next() else {
+        return Vec::new();
+    };
+    if iter_exprs.next().is_some() || call_expr.get_access_path().as_deref() != Some("pairs") {
+        return Vec::new();
+    }
+
+    let Some(args_list) = call_expr.get_args_list() else {
+        return Vec::new();
+    };
+    let mut args = args_list.get_args();
+    let Some(LuaExpr::TableExpr(table_expr)) = args.next() else {
+        return Vec::new();
+    };
+    if args.next().is_some() {
+        return Vec::new();
+    }
+
+    field_names_from_table_expr_keys(&table_expr)
+}
+
+fn field_names_from_table_expr_keys(table_expr: &LuaTableExpr) -> Vec<SmolStr> {
+    table_expr
+        .get_fields()
+        .filter_map(|field| {
+            let field_key = field.get_field_key()?;
+            match field_key {
+                LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
+                LuaIndexKey::String(string) => Some(string.get_value().into()),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn is_dynamic_index_key(index_expr: &glua_parser::LuaIndexExpr) -> bool {

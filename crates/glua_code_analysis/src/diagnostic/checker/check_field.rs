@@ -1816,7 +1816,11 @@ fn has_dynamic_field_for_type(
 ) -> bool {
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
-            if index.has_field(&crate::DynamicFieldOwner::Type(id.clone()), field_name) {
+            let owner = crate::DynamicFieldOwner::Type(id.clone());
+            if index.has_field(&owner, field_name)
+                || owner_has_named_dynamic_fields(index, &owner)
+                    && !index.get_wildcard_definitions(&owner).is_empty()
+            {
                 return true;
             }
             // Walk parent types: dynamic fields registered on a parent class
@@ -1826,19 +1830,21 @@ fn has_dynamic_field_for_type(
             id.collect_super_types(db, &mut super_types);
             super_types.iter().any(|super_type| {
                 if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
-                    index.has_field(
-                        &crate::DynamicFieldOwner::Type(super_id.clone()),
-                        field_name,
-                    )
+                    let owner = crate::DynamicFieldOwner::Type(super_id.clone());
+                    index.has_field(&owner, field_name)
+                        || owner_has_named_dynamic_fields(index, &owner)
+                            && !index.get_wildcard_definitions(&owner).is_empty()
                 } else {
                     false
                 }
             })
         }
-        LuaType::TableConst(table_range) => index.has_field(
-            &crate::DynamicFieldOwner::Table(table_range.clone()),
-            field_name,
-        ),
+        LuaType::TableConst(table_range) => {
+            let owner = crate::DynamicFieldOwner::Table(table_range.clone());
+            index.has_field(&owner, field_name)
+                || owner_has_named_dynamic_fields(index, &owner)
+                    && !index.get_wildcard_definitions(&owner).is_empty()
+        }
         LuaType::Instance(instance) => {
             has_dynamic_field_for_type(db, index, instance.get_base(), field_name)
         }
@@ -1849,6 +1855,15 @@ fn has_dynamic_field_for_type(
             .any(|t| has_dynamic_field_for_type(db, index, t, field_name)),
         _ => false,
     }
+}
+
+fn owner_has_named_dynamic_fields(
+    index: &crate::DynamicFieldIndex,
+    owner: &crate::DynamicFieldOwner,
+) -> bool {
+    index
+        .get_fields(owner)
+        .is_some_and(|fields| !fields.is_empty())
 }
 
 /// Check if a field exists on any subclass of the given prefix type.

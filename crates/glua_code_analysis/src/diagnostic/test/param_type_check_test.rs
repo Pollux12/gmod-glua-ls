@@ -3265,4 +3265,46 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn test_dynamic_string_key_write_does_not_type_every_named_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+
+        let file_id = ws.def(
+            r#"
+                local function readValue()
+                    if flag then
+                        return Vector(1, 2, 3)
+                    end
+
+                    return "not a number"
+                end
+
+                local rec = { data = {} }
+                local data = rec.data
+                local key = net.ReadString()
+                data[key] = readValue()
+
+                local d = rec.data
+                math.abs(d.forwardSlip or 0)
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics.iter().all(|diag| diag.code != param_type_code),
+            "dynamic key write should not make every named field a broad union: {diagnostics:?}"
+        );
+    }
 }

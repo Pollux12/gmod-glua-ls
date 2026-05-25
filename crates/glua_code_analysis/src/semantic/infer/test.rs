@@ -4,7 +4,7 @@ mod test {
         DiagnosticCode, FileId, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaType,
         LuaUnionType, VirtualWorkspace, semantic::infer_owner_raw_member_type_with_realm,
     };
-    use glua_parser::{LuaAstNode, LuaExpr, LuaNameExpr};
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaNameExpr};
 
     fn infer_last_name_expr_type(
         ws: &mut VirtualWorkspace,
@@ -35,6 +35,32 @@ mod test {
 
         semantic_model
             .infer_expr(LuaExpr::NameExpr(target))
+            .unwrap_or(crate::LuaType::Unknown)
+    }
+
+    fn infer_last_index_expr_type_in_file(
+        ws: &VirtualWorkspace,
+        file_id: FileId,
+        field_name: &str,
+    ) -> crate::LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let target = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .filter(|expr| {
+                expr.get_index_key()
+                    .is_some_and(|key| key.get_path_part() == field_name)
+            })
+            .collect::<Vec<_>>()
+            .pop()
+            .expect("Target index expr must exist");
+
+        semantic_model
+            .infer_expr(LuaExpr::IndexExpr(target))
             .unwrap_or(crate::LuaType::Unknown)
     }
 
@@ -617,6 +643,75 @@ mod test {
         assert!(
             matches!(ty, LuaType::TableConst(_)),
             "Cross-file guarded field from pairs value should preserve the assigned data table, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
+    fn test_dynamic_string_key_write_does_not_type_every_named_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let consumer_file = ws.def_file(
+            "lua/glide/client/debugging.lua",
+            r#"
+            local function draw()
+                local snaps = Glide.DebugSnapshots or {}
+                for entId, rec in pairs(snaps) do
+                    if not rec or not rec.data then continue end
+                    local d = rec.data
+                    print(d.forwardSlip)
+                end
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            if CLIENT then
+                local function readValue()
+                    if flag then
+                        return Vector(1, 2, 3)
+                    end
+
+                    return "not a number"
+                end
+
+                function Glide.ReadFields()
+                    local fields = {}
+                    local key = net.ReadString()
+                    fields[key] = readValue()
+                    return fields
+                end
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            local fields = Glide.ReadFields()
+            Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+
+            local rec = Glide.DebugSnapshots[1]
+            if not rec then
+                rec = { data = {}, t = 0 }
+                Glide.DebugSnapshots[1] = rec
+            end
+
+            local data = rec.data
+            for key, value in pairs(fields) do
+                data[key] = value
+            end
+        "#,
+        );
+
+        let ty = infer_last_index_expr_type_in_file(&ws, consumer_file, "forwardSlip");
+        assert!(
+            ty.is_unknown(),
+            "A dynamic string-key write should not type arbitrary named fields, got: {:?}",
             ty
         );
     }
