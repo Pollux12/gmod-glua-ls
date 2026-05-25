@@ -418,10 +418,13 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
 
 struct HelperRegistry {
     map: HashMap<String, (LuaChunk, LuaBlock)>,
+    methods: HashMap<String, (LuaChunk, LuaBlock)>,
 }
 
 fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
     let mut map: HashMap<String, (LuaChunk, LuaBlock)> = HashMap::new();
+    let mut methods: HashMap<String, (LuaChunk, LuaBlock)> = HashMap::new();
+    let mut duplicate_methods = HashSet::new();
 
     let vfs = db.get_vfs();
     // Filter to files containing "net." BEFORE sorting, to avoid allocating
@@ -466,15 +469,28 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
                     continue;
                 };
 
-                let key = match func_name {
+                let key = match &func_name {
                     LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
-                    LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(&index_expr),
+                    LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(index_expr),
+                };
+                let method_name = match &func_name {
+                    LuaVarExpr::IndexExpr(index_expr) => index_field_name(index_expr),
+                    _ => None,
                 };
 
                 if let Some(key) = key {
                     // Deterministic duplicate winner rule:
                     // the first helper discovered in sorted path order wins.
-                    map.entry(key).or_insert_with(|| (chunk.clone(), block));
+                    map.entry(key)
+                        .or_insert_with(|| (chunk.clone(), block.clone()));
+                }
+                if let Some(method_name) = method_name {
+                    if methods
+                        .insert(method_name.clone(), (chunk.clone(), block.clone()))
+                        .is_some()
+                    {
+                        duplicate_methods.insert(method_name);
+                    }
                 }
                 continue;
             }
@@ -493,18 +509,35 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
                         LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
                         LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(index_expr),
                     };
+                    let method_name = match var {
+                        LuaVarExpr::IndexExpr(index_expr) => index_field_name(index_expr),
+                        _ => None,
+                    };
 
                     if let Some(key) = key {
                         // Deterministic duplicate winner rule:
                         // the first helper discovered in sorted path order wins.
-                        map.entry(key).or_insert_with(|| (chunk.clone(), block));
+                        map.entry(key)
+                            .or_insert_with(|| (chunk.clone(), block.clone()));
+                    }
+                    if let Some(method_name) = method_name {
+                        if methods
+                            .insert(method_name.clone(), (chunk.clone(), block.clone()))
+                            .is_some()
+                        {
+                            duplicate_methods.insert(method_name);
+                        }
                     }
                 }
             }
         }
     }
 
-    HelperRegistry { map }
+    for duplicate_method in duplicate_methods {
+        methods.remove(&duplicate_method);
+    }
+
+    HelperRegistry { map, methods }
 }
 
 /// Per-file function definition lookup. Built once and reused for all
@@ -516,6 +549,11 @@ struct FileFunctionMap {
     /// Method bodies, keyed `"Prefix.Field"`:
     /// `function M.f() end`, `M.f = function() end`.
     dotted: HashMap<String, LuaBlock>,
+    /// Colon-callable method bodies keyed by field name:
+    /// `function M:f() end`, `function ENT:f() end`, `M.f = function() end`.
+    /// Used only as a conservative same-file/cross-file fallback for net flow
+    /// expansion through `obj:f()` calls.
+    methods: HashMap<String, LuaBlock>,
     /// All top-level function-defining blocks in source order, including
     /// duplicates and unnamed closures. Lets callers that need to scan every
     /// function body in the file skip running 4 separate `descendants` walks.
@@ -526,6 +564,7 @@ impl FileFunctionMap {
     fn build(root: &LuaChunk) -> Self {
         let mut bare: HashMap<String, LuaBlock> = HashMap::new();
         let mut dotted: HashMap<String, LuaBlock> = HashMap::new();
+        let mut methods: HashMap<String, LuaBlock> = HashMap::new();
         let mut all_blocks: Vec<LuaBlock> = Vec::new();
         for node in root.syntax().descendants() {
             if let Some(local_func_stat) = LuaLocalFuncStat::cast(node.clone()) {
@@ -573,6 +612,9 @@ impl FileFunctionMap {
                         if let Some(key) = dotted_global_key(&index_expr) {
                             dotted.entry(key).or_insert_with(|| block.clone());
                         }
+                        if let Some(method_name) = index_field_name(&index_expr) {
+                            methods.entry(method_name).or_insert_with(|| block.clone());
+                        }
                     }
                     None => {}
                 }
@@ -599,6 +641,9 @@ impl FileFunctionMap {
                                 if let Some(key) = dotted_global_key(index_expr) {
                                     dotted.entry(key).or_insert_with(|| block.clone());
                                 }
+                                if let Some(method_name) = index_field_name(index_expr) {
+                                    methods.entry(method_name).or_insert_with(|| block.clone());
+                                }
                             }
                         }
                     }
@@ -609,6 +654,7 @@ impl FileFunctionMap {
         FileFunctionMap {
             bare,
             dotted,
+            methods,
             all_blocks,
         }
     }
@@ -640,6 +686,13 @@ fn dotted_global_key(index_expr: &glua_parser::LuaIndexExpr) -> Option<String> {
     };
     let field_text = field_token.get_name_text();
     Some(format!("{prefix_text}.{field_text}"))
+}
+
+fn index_field_name(index_expr: &glua_parser::LuaIndexExpr) -> Option<String> {
+    let LuaIndexKey::Name(field_token) = index_expr.get_index_key()? else {
+        return None;
+    };
+    Some(field_token.get_name_text().to_string())
 }
 
 fn collect_hook_metadata(
@@ -1037,6 +1090,16 @@ fn resolve_call_to_function_block<'a>(
                 .map(|(chunk, block)| (name.clone(), block.clone(), chunk))
         }
         LuaExpr::IndexExpr(index_expr) => {
+            if call_expr.is_colon_call()
+                && let Some(method_name) = index_field_name(&index_expr)
+            {
+                if let Some(block) = local_fns.get(root).methods.get(&method_name).cloned() {
+                    return Some((format!(":{method_name}"), block, root));
+                }
+                if let Some((chunk, block)) = helper_registry.methods.get(&method_name) {
+                    return Some((format!(":{method_name}"), block.clone(), chunk));
+                }
+            }
             let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
                 return None;
             };
