@@ -873,6 +873,32 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_definition_does_not_treat_unknown_dynamic_key_as_named_field_definition()
+    -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local rec = { data = {} }
+                local data = rec.data
+                local key = net.ReadString()
+                data[key] = 1
+                local d = rec.data
+                print(d.forw<??>ardSlip)
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position);
+        verify_that!(result, none())?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_prefers_same_file_scripted_class_field_definition() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
