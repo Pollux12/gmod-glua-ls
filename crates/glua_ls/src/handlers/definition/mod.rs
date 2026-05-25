@@ -8,8 +8,9 @@ use glua_code_analysis::{
     EmmyLuaAnalysis, FileId, LuaCompilation, LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
 };
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaDocDescription, LuaDocTagSee,
-    LuaGeneralToken, LuaIndexExpr, LuaLiteralExpr, LuaStringToken, LuaTokenKind, PathTrait,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaDocDescription,
+    LuaDocTagSee, LuaGeneralToken, LuaIndexExpr, LuaLiteralExpr, LuaStringToken, LuaTokenKind,
+    PathTrait,
 };
 pub use goto_def_definition::goto_def_definition;
 use goto_def_definition::goto_str_tpl_ref_definition;
@@ -355,14 +356,31 @@ fn filter_current_line_dynamic_locations(
     let Some(current_location) = document.to_lsp_location(current_key_range) else {
         return;
     };
+    let current_assignment_range = index_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaAssignStat::cast)
+        .and_then(|assign_stat| document.to_lsp_range(assign_stat.get_range()));
     locations.retain(|location| {
         if location.uri != current_uri {
             return true;
         }
 
         location.range != current_location.range
-            && location.range.start.line != current_location.range.start.line
+            && current_assignment_range
+                .as_ref()
+                .is_none_or(|assignment_range| {
+                    !range_contains_range(assignment_range, &location.range)
+                })
     });
+}
+
+fn range_contains_range(outer: &lsp_types::Range, inner: &lsp_types::Range) -> bool {
+    position_le(&outer.start, &inner.start) && position_le(&inner.end, &outer.end)
+}
+
+fn position_le(left: &Position, right: &Position) -> bool {
+    left.line < right.line || (left.line == right.line && left.character <= right.character)
 }
 
 fn resolve_dynamic_field_lookup(

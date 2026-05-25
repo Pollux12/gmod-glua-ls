@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat, LuaFuncStat,
-    LuaIndexKey, LuaSyntaxKind, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaIndexKey, LuaSyntaxKind, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use smol_str::SmolStr;
 
@@ -112,7 +112,7 @@ fn analyze_dynamic_fields(
                 profile.assignments_scanned += 1;
             }
             let (vars, exprs) = assign.get_var_and_expr_list();
-            for (var, value_expr) in vars.iter().zip(exprs.iter()) {
+            for (idx, var) in vars.iter().enumerate() {
                 if let Some(profile) = profile.as_mut() {
                     profile.vars_scanned += 1;
                 }
@@ -186,7 +186,9 @@ fn analyze_dynamic_fields(
                     if let Some(profile) = profile.as_mut() {
                         profile.fields_collected += 1;
                     }
-                    if mode.collect_declared_member_table_fields() {
+                    if mode.collect_declared_member_table_fields()
+                        && let Some(value_expr) = exprs.get(idx)
+                    {
                         collect_assigned_table_fields_for_declared_member(
                             &*db,
                             cache,
@@ -673,12 +675,7 @@ fn collect_setmetatable_bindings(
     prefix_expr: &LuaExpr,
     prefix_var_ref_id: VarRefId,
 ) -> Vec<(rowan::TextRange, LuaType)> {
-    let Some(scope) = prefix_expr.syntax().ancestors().find(|node| {
-        matches!(
-            node.kind().into(),
-            LuaSyntaxKind::ClosureExpr | LuaSyntaxKind::FuncStat | LuaSyntaxKind::LocalFuncStat
-        )
-    }) else {
+    let Some(scope) = nearest_dynamic_field_binding_scope(prefix_expr.syntax()) else {
         return Vec::new();
     };
 
@@ -687,12 +684,7 @@ fn collect_setmetatable_bindings(
         let Some(call_expr) = LuaCallExpr::cast(node) else {
             continue;
         };
-        let Some(call_scope) = call_expr.syntax().ancestors().find(|node| {
-            matches!(
-                node.kind().into(),
-                LuaSyntaxKind::ClosureExpr | LuaSyntaxKind::FuncStat | LuaSyntaxKind::LocalFuncStat
-            )
-        }) else {
+        let Some(call_scope) = nearest_dynamic_field_binding_scope(call_expr.syntax()) else {
             continue;
         };
         if call_scope != scope {
@@ -726,6 +718,18 @@ fn collect_setmetatable_bindings(
 
     bindings.sort_by_key(|(range, _)| range.start());
     bindings
+}
+
+fn nearest_dynamic_field_binding_scope(node: &LuaSyntaxNode) -> Option<LuaSyntaxNode> {
+    node.ancestors().find(|ancestor| {
+        matches!(
+            ancestor.kind().into(),
+            LuaSyntaxKind::Chunk
+                | LuaSyntaxKind::ClosureExpr
+                | LuaSyntaxKind::FuncStat
+                | LuaSyntaxKind::LocalFuncStat
+        )
+    })
 }
 
 fn infer_metatable_index_type_for_dynamic_field(

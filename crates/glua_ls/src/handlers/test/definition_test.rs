@@ -738,6 +738,37 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_inferred_dynamic_field_definition_for_top_level_setmetatable_binding() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_definition(
+            r#"
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                local instance = {}
+                setmetatable(instance, LOCATION)
+                instance._OriginalName = true
+
+                function LOCATION:GetOriginalName()
+                    return self._Origi<??>nalName
+                end
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 6,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_inferred_dynamic_field_definition_keeps_future_same_file_assignment() -> Result<()>
     {
         let mut ws = ProviderVirtualWorkspace::new();
@@ -783,6 +814,31 @@ mod tests {
         let file_id = ws.def(&content);
         let result = crate::handlers::definition::definition(&ws.analysis, file_id, position);
         verify_that!(result, none())?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_inferred_dynamic_field_definition_keeps_prior_same_line_assignment() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_definition(
+            r#"
+                ---@class DynGotoPriorSameLine.Entity
+                ---@type DynGotoPriorSameLine.Entity
+                local ent
+                ent.testVar = true; local value = ent.te<??>stVar
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 4,
+            }],
+        ));
 
         Ok(())
     }
