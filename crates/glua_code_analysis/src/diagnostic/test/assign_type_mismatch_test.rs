@@ -1252,6 +1252,59 @@ return t
     }
 
     #[test]
+    fn test_realm_split_dynamic_command_table_keeps_realm_local_callback_signature() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::AssignTypeMismatch);
+
+        ws.def_file(
+            "lua/glide/server/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+
+            commands[1] = function(ply) end
+
+            ---@param commandId number
+            ---@param handler fun(ply: Player)
+            function Glide.AddCommandHandler(commandId, handler)
+                commands[commandId] = handler
+            end
+            "#,
+        );
+
+        let client_file_id = ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+
+            ---@param commandId number
+            ---@param handler fun(len: number)
+            function Glide.AddCommandHandler(commandId, handler)
+                commands[commandId] = handler
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(client_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
+        ));
+        assert!(
+            !diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "unexpected assign-type-mismatch diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn test_ref_index_access_assign_class_to_object_mismatch() {
         let mut ws = crate::VirtualWorkspace::new();
 

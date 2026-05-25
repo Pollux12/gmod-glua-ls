@@ -391,25 +391,30 @@ fn member_flags_before_position(
     position: rowan::TextSize,
     include_current_position: bool,
 ) -> Option<(bool, bool)> {
-    member_flags_for_member_ids(
-        semantic_model,
-        semantic_model
-            .get_db()
-            .get_member_index()
-            .get_members_for_owner_key(owner, member_key)
-            .into_iter()
-            .filter(|member| {
-                if member.get_id().file_id != semantic_model.get_file_id() {
-                    return true;
-                }
-                if include_current_position {
-                    member.get_id().get_position() <= position
-                } else {
-                    member.get_id().get_position() < position
-                }
-            })
-            .map(|member| member.get_id()),
-    )
+    let member_ids = semantic_model
+        .get_db()
+        .get_member_index()
+        .get_members_for_owner_key(owner, member_key)
+        .into_iter()
+        .filter(|member| {
+            if member.get_id().file_id != semantic_model.get_file_id() {
+                return true;
+            }
+            if include_current_position {
+                member.get_id().get_position() <= position
+            } else {
+                member.get_id().get_position() < position
+            }
+        })
+        .map(|member| member.get_id())
+        .collect();
+    let visible_member_ids = crate::LuaMemberIndexItem::Many(member_ids)
+        .visible_member_ids_with_realm_at_offset(
+            semantic_model.get_db(),
+            &semantic_model.get_file_id(),
+            position,
+        );
+    member_flags_for_member_ids(semantic_model, visible_member_ids)
 }
 
 fn member_flags_for_member_ids<I>(

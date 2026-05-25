@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr,
-    LuaFuncStat, LuaGeneralToken, LuaIndexExpr, LuaLiteralToken, LuaNameExpr, LuaTableField,
+    LuaFuncStat, LuaGeneralToken, LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaNameExpr,
+    LuaTableField,
 };
 
 use crate::{
@@ -186,6 +187,10 @@ fn check_call_expr(
         }
 
         if !miss_parameter_info.is_empty() {
+            if call_args_count == 0 && is_nonliteral_index_dispatch_call(&call_expr) {
+                return Some(());
+            }
+
             let right_paren = call_expr
                 .get_args_list()?
                 .tokens::<LuaGeneralToken>()
@@ -263,6 +268,14 @@ fn check_call_expr(
     }
 
     Some(())
+}
+
+fn is_nonliteral_index_dispatch_call(call_expr: &LuaCallExpr) -> bool {
+    let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_)))
 }
 
 fn is_dots_expr(expr: &LuaExpr) -> bool {

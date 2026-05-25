@@ -1,6 +1,12 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+
+    fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+    }
 
     #[test]
     fn test_issue_276() {
@@ -19,6 +25,64 @@ mod test {
                 local a = myfun2('string')
         "#
         ));
+    }
+
+    #[test]
+    fn test_realm_split_dynamic_command_table_call_does_not_use_opposite_realm_signature() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::MissingParameter);
+
+        ws.def_file(
+            "lua/glide/server/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+
+            commands[1] = function(ply) end
+            "#,
+        );
+
+        let client_file_id = ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+
+            commands[1] = function() end
+
+            ---@param commandId number
+            ---@param handler fun(len: number)
+            function Glide.AddCommandHandler(commandId, handler)
+                commands[commandId] = handler
+            end
+
+            net.Receive("glide.command", function()
+                local cmd = net.ReadUInt(8)
+                if commands[cmd] then
+                    commands[cmd]()
+                end
+            end)
+            "#,
+        );
+
+        ws.def_file(
+            "lua/glide/client/repair_hud.lua",
+            r#"
+            Glide.AddCommandHandler(2, function(len) end)
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(client_file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected missing-parameter diagnostics: {diagnostics:?}"
+        );
     }
 
     #[test]

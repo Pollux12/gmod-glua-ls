@@ -762,8 +762,7 @@ fn select_member_ids_by_workspace_and_realm(
         let compatible_member_ids = tier_member_ids
             .into_iter()
             .filter(|member_id| {
-                let member_realm =
-                    infer_index.get_realm_at_offset(&member_id.file_id, member_id.get_position());
+                let member_realm = member_effective_realm(infer_index, member_id);
                 is_realm_compatible(caller_realm, member_realm)
             })
             .collect::<Vec<_>>();
@@ -801,7 +800,7 @@ fn select_member_ids_by_workspace_and_realm(
         }
     }
 
-    if result.is_empty() {
+    if result.is_empty() && !matches!(caller_realm, GmodRealm::Client | GmodRealm::Server) {
         return fallback_member_ids;
     }
 
@@ -816,8 +815,7 @@ fn sort_member_ids_for_caller(
 ) {
     let infer_index = db.get_gmod_infer_index();
     member_ids.sort_by_key(|member_id| {
-        let member_realm =
-            infer_index.get_realm_at_offset(&member_id.file_id, member_id.get_position());
+        let member_realm = member_effective_realm(infer_index, member_id);
         (
             realm_match_rank(caller_realm, member_realm),
             member_id.file_id.id,
@@ -826,6 +824,17 @@ fn sort_member_ids_for_caller(
             member_id.get_syntax_id().get_kind() as u16,
         )
     });
+}
+
+fn member_effective_realm(
+    infer_index: &crate::GmodInferIndex,
+    member_id: &LuaMemberId,
+) -> GmodRealm {
+    infer_index
+        .get_member_annotation_realm_at_offset(&member_id.file_id, member_id.get_position())
+        .unwrap_or_else(|| {
+            infer_index.get_realm_at_offset(&member_id.file_id, member_id.get_position())
+        })
 }
 
 fn realm_match_rank(caller_realm: GmodRealm, member_realm: GmodRealm) -> u8 {
@@ -1215,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn select_member_ids_by_workspace_and_realm_falls_back_to_best_tier_when_needed() {
+    fn select_member_ids_by_workspace_and_realm_does_not_fallback_to_opposite_strict_realm() {
         let mut db = make_db();
         let server_member = make_member_id(FileId::new(20), 1);
         let unknown_member = make_member_id(FileId::new(21), 2);
@@ -1235,7 +1244,7 @@ mod tests {
             GmodRealm::Client,
         );
 
-        assert_eq!(selected, vec![server_member]);
+        assert!(selected.is_empty());
     }
 
     #[test]
