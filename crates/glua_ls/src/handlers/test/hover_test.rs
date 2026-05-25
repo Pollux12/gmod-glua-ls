@@ -2072,6 +2072,67 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_dynamic_key_table_shape_omits_unnamed_wildcard_value_row() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@return Vector
+                function _G.Vector() end
+
+                net = {}
+                ---@return string
+                function net.ReadString() end
+
+                local function readValue()
+                    if flag == 1 then
+                        return Vector()
+                    end
+
+                    if flag == 2 then
+                        return "text"
+                    end
+
+                    return 1
+                end
+
+                local rec = { data = {}, t = 0 }
+                local data = rec.data
+                data.vehicle = 1
+
+                local key = net.ReadString()
+                data[key] = readValue()
+
+                local d = rec.da<??>ta
+                print(d)
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/network.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("vehicle"),
+            "expected hover to retain concrete named fields, got: {value}"
+        );
+        assert!(
+            !value.contains("\n    ("),
+            "dynamic-key value type should not render as an unnamed table field, got: {value}"
+        );
+        assert!(
+            value.contains("[string]"),
+            "expected dynamic string-key values to render as an indexed table entry, got: {value}"
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_local_gettable_call_uses_scoped_receiver_type() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
