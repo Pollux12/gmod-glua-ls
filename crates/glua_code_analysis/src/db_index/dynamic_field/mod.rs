@@ -25,6 +25,10 @@ pub struct DynamicFieldIndex {
     field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     /// file → list of (owner, field_name) pairs contributed by this file
     file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
+    /// owner → assignment locations for writes through non-literal keys.
+    wildcard_definitions: HashMap<DynamicFieldOwner, Vec<InFiled<TextRange>>>,
+    /// file → wildcard assignments contributed by this file.
+    wildcard_file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, TextRange)>>,
 }
 
 impl DynamicFieldIndex {
@@ -66,6 +70,24 @@ impl DynamicFieldIndex {
         }
     }
 
+    pub fn add_wildcard_definition(
+        &mut self,
+        owner: DynamicFieldOwner,
+        file_id: FileId,
+        range: TextRange,
+    ) {
+        let definitions = self.wildcard_definitions.entry(owner.clone()).or_default();
+        let definition = InFiled::new(file_id, range);
+        let is_new_definition = !definitions.contains(&definition);
+        if is_new_definition {
+            definitions.push(definition);
+            self.wildcard_file_contributions
+                .entry(file_id)
+                .or_default()
+                .push((owner, range));
+        }
+    }
+
     pub fn has_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {
         self.owner_fields
             .get(owner)
@@ -102,6 +124,24 @@ impl DynamicFieldIndex {
             .cloned()
             .unwrap_or_default()
     }
+
+    pub fn get_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> Vec<InFiled<TextRange>> {
+        self.wildcard_definitions
+            .get(owner)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn get_all_wildcard_definitions(&self) -> Vec<InFiled<TextRange>> {
+        let mut definitions = self
+            .wildcard_definitions
+            .values()
+            .flat_map(|definitions| definitions.iter().cloned())
+            .collect::<Vec<_>>();
+        definitions.sort_by_key(|definition| (definition.file_id, definition.value.start()));
+        definitions.dedup();
+        definitions
+    }
 }
 
 impl LuaIndex for DynamicFieldIndex {
@@ -133,11 +173,24 @@ impl LuaIndex for DynamicFieldIndex {
                 }
             }
         }
+
+        if let Some(contributions) = self.wildcard_file_contributions.remove(&file_id) {
+            for (owner, range) in contributions {
+                if let Some(definitions) = self.wildcard_definitions.get_mut(&owner) {
+                    definitions.retain(|def| !(def.file_id == file_id && def.value == range));
+                    if definitions.is_empty() {
+                        self.wildcard_definitions.remove(&owner);
+                    }
+                }
+            }
+        }
     }
 
     fn clear(&mut self) {
         self.owner_fields.clear();
         self.field_definitions.clear();
         self.file_contributions.clear();
+        self.wildcard_definitions.clear();
+        self.wildcard_file_contributions.clear();
     }
 }

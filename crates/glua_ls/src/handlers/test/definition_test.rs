@@ -846,6 +846,33 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_inferred_dynamic_field_definition_through_table_alias() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_definition(
+            r#"
+                local rec = { data = {} }
+                local data = rec.data
+                for key, value in pairs({ forwardSlip = 1, sideSlip = 2 }) do
+                    data[key] = value
+                end
+                local d = rec.data
+                math.abs(d.forw<??>ardSlip or 0)
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 4,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_prefers_same_file_scripted_class_field_definition() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

@@ -91,6 +91,8 @@ fn analyze_dynamic_fields(
     let tree_list = context.tree_list.clone();
     let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
+    let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
+        Vec::new();
     let profile_enabled = log::log_enabled!(log::Level::Info);
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
     let mut field_setter_helpers = if mode.collect_direct_assignments() {
@@ -123,14 +125,6 @@ fn analyze_dynamic_fields(
                 let Some(prefix_expr) = index_expr.get_prefix_expr() else {
                     continue;
                 };
-                let field_names = get_field_names(db, cache, &index_expr);
-                if field_names.is_empty() {
-                    if let Some(profile) = profile.as_mut() {
-                        profile.no_field_name_skips += 1;
-                    }
-                    continue;
-                };
-
                 let cache_key = PrefixCacheKey::from_expr(&*db, cache, &prefix_expr);
                 let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
                     if let Some(profile) = profile.as_mut() {
@@ -167,11 +161,24 @@ fn analyze_dynamic_fields(
                     prefix_type
                 };
 
-                // Store the index key range (e.g. just "forwardSpeed") rather
-                // than the full index expression range (e.g. "selfTbl.forwardSpeed")
-                // so that go-to-definition targets the field key precisely.
                 let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
                 else {
+                    continue;
+                };
+
+                let field_names = get_field_names(db, cache, &index_expr);
+                if field_names.is_empty() {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.no_field_name_skips += 1;
+                    }
+                    if mode.collect_direct_assignments() && is_dynamic_index_key(&index_expr) {
+                        collect_wildcard_for_type(
+                            &effective_type,
+                            file_id,
+                            definition_range,
+                            &mut collected_wildcards,
+                        );
+                    }
                     continue;
                 };
 
@@ -261,6 +268,9 @@ fn analyze_dynamic_fields(
     }
     for (owner, field_name, file_id, range) in &propagated {
         index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
+    }
+    for (owner, file_id, range) in &collected_wildcards {
+        index.add_wildcard_definition(owner.clone(), *file_id, *range);
     }
     if let (Some(profile), Some(insert_start)) = (profile.as_mut(), insert_start) {
         profile.insertion_time += insert_start.elapsed();
@@ -827,6 +837,10 @@ fn get_field_names(
     }
 }
 
+fn is_dynamic_index_key(index_expr: &glua_parser::LuaIndexExpr) -> bool {
+    matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_)))
+}
+
 fn string_const_names(typ: &Option<LuaType>) -> Vec<SmolStr> {
     match typ {
         Some(LuaType::StringConst(name)) | Some(LuaType::DocStringConst(name)) => {
@@ -838,6 +852,38 @@ fn string_const_names(typ: &Option<LuaType>) -> Vec<SmolStr> {
             .flat_map(|typ| string_const_names(&Some(typ.clone())))
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+fn collect_wildcard_for_type(
+    typ: &LuaType,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    result: &mut Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+) {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => {
+            result.push((DynamicFieldOwner::Type(id.clone()), file_id, range));
+        }
+        LuaType::TableConst(table_range) => {
+            result.push((
+                DynamicFieldOwner::Table(table_range.clone()),
+                file_id,
+                range,
+            ));
+        }
+        LuaType::Instance(instance) => {
+            collect_wildcard_for_type(instance.get_base(), file_id, range, result);
+        }
+        LuaType::TableOf(inner) => {
+            collect_wildcard_for_type(inner, file_id, range, result);
+        }
+        LuaType::Union(union_type) => {
+            for t in union_type.into_vec() {
+                collect_wildcard_for_type(&t, file_id, range, result);
+            }
+        }
+        _ => {}
     }
 }
 

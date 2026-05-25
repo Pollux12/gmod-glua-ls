@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualLocation, check};
+    use glua_code_analysis::Emmyrc;
     use googletest::prelude::*;
 
     #[gtest]
@@ -176,6 +177,32 @@ mod tests {
                     line: 6,
                 },
             ],
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_dynamic_key_table_field_implementation() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_implementation(
+            r#"
+                local rec = { data = {} }
+                local data = rec.data
+                for key, value in pairs({ forwardSlip = 1, sideSlip = 2 }) do
+                    data[key] = value
+                end
+                local d = rec.data
+                math.abs(d.forw<??>ardSlip or 0)
+            "#,
+            vec![VirtualLocation {
+                file: "".to_string(),
+                line: 4,
+            }],
         ));
         Ok(())
     }

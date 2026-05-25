@@ -396,6 +396,44 @@ mod tests {
         Ok(())
     }
 
+    #[gtest]
+    fn test_dynamic_key_table_field_references_include_key_source() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_references(
+            r#"
+                local rec = { data = {} }
+                local data = rec.data
+                for key, value in pairs({ forwardSlip = 1, sideSlip = 2 }) do
+                    data[key] = value
+                end
+                local d = rec.data
+                math.abs(d.forw<??>ardSlip or 0)
+                print(d.forwardSlip)
+            "#,
+            vec![],
+            vec![
+                VirtualLocation {
+                    file: "".to_string(),
+                    line: 3,
+                },
+                VirtualLocation {
+                    file: "".to_string(),
+                    line: 7,
+                },
+                VirtualLocation {
+                    file: "".to_string(),
+                    line: 8,
+                },
+            ],
+        ));
+        Ok(())
+    }
+
     /// Test A: references includeDeclaration=false for globals
     #[gtest]
     fn test_global_references_exclude_declaration_when_flag_false() -> Result<()> {

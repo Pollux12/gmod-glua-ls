@@ -11,6 +11,7 @@ use glua_parser::{
 use lsp_types::Location;
 use tokio_util::sync::CancellationToken;
 
+use crate::handlers::definition::goto_inferred_dynamic_field_definition;
 use crate::handlers::hover::find_member_origin_owners;
 
 pub fn search_implementations(
@@ -46,6 +47,14 @@ pub fn search_implementations(
                 );
             }
             _ => {}
+        }
+    } else if let Some(dynamic_response) =
+        goto_inferred_dynamic_field_definition(semantic_model, &token)
+    {
+        match dynamic_response {
+            lsp_types::GotoDefinitionResponse::Scalar(location) => result.push(location),
+            lsp_types::GotoDefinitionResponse::Array(locations) => result.extend(locations),
+            lsp_types::GotoDefinitionResponse::Link(_) => {}
         }
     }
 

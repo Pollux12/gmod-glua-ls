@@ -5,8 +5,7 @@ mod goto_module_file;
 mod goto_path;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, FileId, LuaCompilation, LuaMemberKey, LuaType, SemanticDeclLevel,
-    SemanticModel, WorkspaceId,
+    EmmyLuaAnalysis, FileId, LuaCompilation, LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaDocDescription, LuaDocTagSee,
@@ -228,7 +227,7 @@ pub fn definition(
     None
 }
 
-fn goto_inferred_dynamic_field_definition(
+pub(crate) fn goto_inferred_dynamic_field_definition(
     semantic_model: &SemanticModel,
     token: &glua_parser::LuaSyntaxToken,
 ) -> Option<GotoDefinitionResponse> {
@@ -239,17 +238,6 @@ fn goto_inferred_dynamic_field_definition(
 
     let (index_expr, prefix_type, field_name) =
         resolve_dynamic_field_lookup(semantic_model, token)?;
-    let key = LuaMemberKey::Name(field_name.clone().into());
-    let is_visible_dynamic_field = semantic_model
-        .get_member_info_with_key_at_offset(&prefix_type, key, true, index_expr.get_position())
-        .is_some_and(|members| {
-            members
-                .iter()
-                .any(|member| member.property_owner_id.is_none())
-        });
-    if !is_visible_dynamic_field {
-        return None;
-    }
 
     let mut locations = Vec::new();
     collect_dynamic_field_locations(
@@ -279,13 +267,17 @@ fn collect_dynamic_field_locations(
     let dynamic_fields_global = semantic_model.get_emmyrc().gmod.dynamic_fields_global;
     match typ {
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
-            let definitions = semantic_model
+            let owner = glua_code_analysis::DynamicFieldOwner::Type(type_decl_id.clone());
+            let mut definitions = semantic_model
                 .get_db()
                 .get_dynamic_field_index()
-                .get_field_definitions(
-                    &glua_code_analysis::DynamicFieldOwner::Type(type_decl_id.clone()),
-                    field_name,
-                );
+                .get_field_definitions(&owner, field_name);
+            if definitions.is_empty() {
+                definitions = semantic_model
+                    .get_db()
+                    .get_dynamic_field_index()
+                    .get_wildcard_definitions(&owner);
+            }
             for definition in definitions {
                 if respect_file_scope
                     && !dynamic_fields_global
@@ -301,13 +293,17 @@ fn collect_dynamic_field_locations(
             }
         }
         LuaType::TableConst(table_range) => {
-            let definitions = semantic_model
+            let owner = glua_code_analysis::DynamicFieldOwner::Table(table_range.clone());
+            let mut definitions = semantic_model
                 .get_db()
                 .get_dynamic_field_index()
-                .get_field_definitions(
-                    &glua_code_analysis::DynamicFieldOwner::Table(table_range.clone()),
-                    field_name,
-                );
+                .get_field_definitions(&owner, field_name);
+            if definitions.is_empty() {
+                definitions = semantic_model
+                    .get_db()
+                    .get_dynamic_field_index()
+                    .get_wildcard_definitions(&owner);
+            }
             for definition in definitions {
                 if respect_file_scope
                     && !dynamic_fields_global
@@ -341,6 +337,25 @@ fn collect_dynamic_field_locations(
                 caller_file_id,
                 respect_file_scope,
             );
+        }
+        LuaType::Object(object_type) if !object_type.get_index_access().is_empty() => {
+            let definitions = semantic_model
+                .get_db()
+                .get_dynamic_field_index()
+                .get_all_wildcard_definitions();
+            for definition in definitions {
+                if respect_file_scope
+                    && !dynamic_fields_global
+                    && definition.file_id != caller_file_id
+                {
+                    continue;
+                }
+                if let Some(document) = semantic_model.get_document_by_file_id(definition.file_id)
+                    && let Some(location) = document.to_lsp_location(definition.value)
+                {
+                    locations.push(location);
+                }
+            }
         }
         LuaType::Union(union_type) => {
             for union_member in union_type.into_vec() {
