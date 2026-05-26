@@ -1,8 +1,8 @@
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBlock, LuaBreakStat, LuaCallArgList,
     LuaCallExprStat, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat, LuaFuncStat, LuaGotoStat,
-    LuaIfStat, LuaLabelStat, LuaLocalStat, LuaRepeatStat, LuaReturnStat, LuaVarExpr, LuaWhileStat,
-    PathTrait,
+    LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLabelStat, LuaLiteralToken, LuaLocalStat,
+    LuaRepeatStat, LuaReturnStat, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait, UnaryOperator,
 };
 
 use crate::{
@@ -116,13 +116,92 @@ fn collect_assignment_flow_info(vars: &[LuaVarExpr]) -> AssignmentFlowInfo {
         };
 
         match index_expr.get_access_path() {
-            Some(path) => info
-                .index_paths
-                .push(internment::ArcIntern::from(smol_str::SmolStr::new(&path))),
+            Some(path) => push_assignment_index_path(&mut info, path),
             None => info.has_unknown_index_target = true,
+        }
+
+        if is_collection_append_write(index_expr) {
+            let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+                info.has_unknown_index_target = true;
+                continue;
+            };
+            match expr_access_path(&prefix_expr) {
+                Some(path) => push_assignment_index_path(&mut info, path),
+                None => info.has_unknown_index_target = true,
+            }
         }
     }
     info
+}
+
+fn push_assignment_index_path(info: &mut AssignmentFlowInfo, path: String) {
+    let path = internment::ArcIntern::from(smol_str::SmolStr::new(&path));
+    if !info.index_paths.iter().any(|existing| *existing == path) {
+        info.index_paths.push(path);
+    }
+}
+
+fn is_collection_append_write(index_expr: &LuaIndexExpr) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(prefix_path) = expr_access_path(&prefix_expr) else {
+        return false;
+    };
+    let Some(LuaIndexKey::Expr(index_key_expr)) = index_expr.get_index_key() else {
+        return false;
+    };
+    let LuaExpr::BinaryExpr(binary_expr) = index_key_expr else {
+        return false;
+    };
+    if binary_expr
+        .get_op_token()
+        .is_none_or(|token| token.get_op() != BinaryOperator::OpAdd)
+    {
+        return false;
+    }
+
+    let Some((left, right)) = binary_expr.get_exprs() else {
+        return false;
+    };
+    if !is_literal_integer_one(&right) {
+        return false;
+    }
+
+    let LuaExpr::UnaryExpr(unary_expr) = left else {
+        return false;
+    };
+    if unary_expr
+        .get_op_token()
+        .is_none_or(|token| token.get_op() != UnaryOperator::OpLen)
+    {
+        return false;
+    }
+
+    let Some(len_expr) = unary_expr.get_expr() else {
+        return false;
+    };
+    expr_access_path(&len_expr).is_some_and(|len_path| len_path == prefix_path)
+}
+
+fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn is_literal_integer_one(expr: &LuaExpr) -> bool {
+    let LuaExpr::LiteralExpr(literal_expr) = expr else {
+        return false;
+    };
+
+    matches!(
+        literal_expr.get_literal(),
+        Some(LuaLiteralToken::Number(number))
+            if matches!(number.get_number_value(), NumberResult::Int(1))
+    )
 }
 
 pub fn bind_call_expr_stat(
@@ -526,4 +605,39 @@ pub fn bind_for_stat(binder: &mut FlowBinder, for_stat: LuaForStat, current: Flo
     }
 
     current
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Deref;
+
+    use glua_parser::{LuaAstNode, LuaParser, ParserConfig};
+
+    use super::*;
+
+    #[test]
+    fn assignment_flow_info_tracks_collection_append_prefix_path() {
+        let tree = LuaParser::parse(
+            "holder.items[#holder.items + 1] = value",
+            ParserConfig::default(),
+        );
+        let root = tree.get_chunk_node();
+        let assign_stat = root
+            .descendants::<LuaAssignStat>()
+            .next()
+            .expect("expected assignment");
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+
+        let info = collect_assignment_flow_info(&vars);
+        let paths = info
+            .index_paths
+            .iter()
+            .map(|path| path.deref().as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            paths.contains(&"holder.items"),
+            "collection append should mark prefix path as affected: {paths:?}"
+        );
+    }
 }

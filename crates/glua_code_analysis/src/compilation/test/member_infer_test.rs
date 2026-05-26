@@ -467,6 +467,31 @@ mod test {
     }
 
     #[gtest]
+    fn test_member_collection_append_preserves_prefix_flow_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        local holder = {}
+        holder.items = {}
+
+        holder.items[#holder.items + 1] = "created"
+
+        local after = holder.items
+        "#,
+        );
+
+        let ty = local_name_type(&mut ws, file_id, "after");
+        let expected = ws.ty("string[]");
+        assert_that!(
+            ws.check_type(&ty, &expected),
+            eq(true),
+            "expected holder.items to include appended string array, got {}",
+            ws.humanize_type(ty)
+        );
+    }
+
+    #[gtest]
     fn test_flow_fallback_prefers_latest_dynamic_field_assignment() {
         let mut ws = VirtualWorkspace::new();
 
