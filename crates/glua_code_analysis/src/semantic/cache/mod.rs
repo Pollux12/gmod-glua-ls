@@ -59,9 +59,8 @@ pub struct LuaInferCache {
     pub for_range_iter_var_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
     pub local_reassignment_positions_cache: FxHashMap<LuaDeclId, Vec<TextSize>>,
     pub local_reassignments_indexed: bool,
-    pub dynamic_field_metatable_cache: FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>,
-    pub dynamic_field_global_metatable_cache:
-        FxHashMap<(VarRefId, TextRange), Vec<(TextRange, LuaType)>>,
+    pub dynamic_field_scope_metatable_cache:
+        FxHashMap<TextRange, FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>>,
     pub dynamic_field_resolution_cache: FxHashMap<
         (LuaType, LuaMemberKey, Option<TextSize>),
         Option<(LuaType, Option<LuaSemanticDeclId>)>,
@@ -166,8 +165,7 @@ impl LuaInferCache {
             for_range_iter_var_type_cache: FxHashMap::default(),
             local_reassignment_positions_cache: FxHashMap::default(),
             local_reassignments_indexed: false,
-            dynamic_field_metatable_cache: FxHashMap::default(),
-            dynamic_field_global_metatable_cache: FxHashMap::default(),
+            dynamic_field_scope_metatable_cache: FxHashMap::default(),
             dynamic_field_resolution_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::new(),
@@ -291,8 +289,7 @@ impl LuaInferCache {
         self.for_range_iter_var_type_cache.clear();
         self.local_reassignment_positions_cache.clear();
         self.local_reassignments_indexed = false;
-        self.dynamic_field_metatable_cache.clear();
-        self.dynamic_field_global_metatable_cache.clear();
+        self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_resolving.clear();

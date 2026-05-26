@@ -847,43 +847,21 @@ fn infer_setmetatable_target_type(
     assignment_range: rowan::TextRange,
 ) -> Option<LuaType> {
     let prefix_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr.clone())?;
-    if matches!(prefix_var_ref_id, VarRefId::GlobalName(_, _)) {
-        let scope = nearest_dynamic_field_binding_scope(prefix_expr.syntax())?;
-        let scope_range = scope.text_range();
-        let cache_key = (prefix_var_ref_id.clone(), scope_range);
-        if !cache
-            .dynamic_field_global_metatable_cache
-            .contains_key(&cache_key)
-        {
-            let bindings =
-                collect_setmetatable_bindings_in_scope(db, cache, &scope, prefix_var_ref_id);
-            cache
-                .dynamic_field_global_metatable_cache
-                .insert(cache_key.clone(), bindings);
-        }
-
-        return cache
-            .dynamic_field_global_metatable_cache
-            .get(&cache_key)?
-            .iter()
-            .take_while(|(range, _)| range.end() <= assignment_range.start())
-            .last()
-            .map(|(_, target_type)| target_type.clone());
-    }
-
+    let scope = nearest_dynamic_field_binding_scope(prefix_expr.syntax())?;
+    let scope_range = scope.text_range();
     if !cache
-        .dynamic_field_metatable_cache
-        .contains_key(&prefix_var_ref_id)
+        .dynamic_field_scope_metatable_cache
+        .contains_key(&scope_range)
     {
-        let bindings =
-            collect_setmetatable_bindings(db, cache, prefix_expr, prefix_var_ref_id.clone());
+        let bindings = collect_setmetatable_bindings_by_var_in_scope(db, cache, &scope);
         cache
-            .dynamic_field_metatable_cache
-            .insert(prefix_var_ref_id.clone(), bindings);
+            .dynamic_field_scope_metatable_cache
+            .insert(scope_range, bindings);
     }
 
     cache
-        .dynamic_field_metatable_cache
+        .dynamic_field_scope_metatable_cache
+        .get(&scope_range)?
         .get(&prefix_var_ref_id)?
         .iter()
         .take_while(|(range, _)| range.end() <= assignment_range.start())
@@ -891,26 +869,13 @@ fn infer_setmetatable_target_type(
         .map(|(_, target_type)| target_type.clone())
 }
 
-fn collect_setmetatable_bindings(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    prefix_expr: &LuaExpr,
-    prefix_var_ref_id: VarRefId,
-) -> Vec<(rowan::TextRange, LuaType)> {
-    let Some(scope) = nearest_dynamic_field_binding_scope(prefix_expr.syntax()) else {
-        return Vec::new();
-    };
-
-    collect_setmetatable_bindings_in_scope(db, cache, &scope, prefix_var_ref_id)
-}
-
-fn collect_setmetatable_bindings_in_scope(
+fn collect_setmetatable_bindings_by_var_in_scope(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     scope: &LuaSyntaxNode,
-    prefix_var_ref_id: VarRefId,
-) -> Vec<(rowan::TextRange, LuaType)> {
-    let mut bindings = Vec::new();
+) -> FxHashMap<VarRefId, Vec<(rowan::TextRange, LuaType)>> {
+    let mut bindings_by_var: FxHashMap<VarRefId, Vec<(rowan::TextRange, LuaType)>> =
+        FxHashMap::default();
     for node in scope.descendants() {
         let Some(call_expr) = LuaCallExpr::cast(node) else {
             continue;
@@ -937,18 +902,21 @@ fn collect_setmetatable_bindings_in_scope(
         let Some(target_var_ref_id) = get_var_expr_var_ref_id(db, cache, args[0].clone()) else {
             continue;
         };
-        if target_var_ref_id != prefix_var_ref_id {
-            continue;
-        }
 
         if let Some(target_type) = infer_metatable_index_type_for_dynamic_field(db, cache, &args[1])
         {
-            bindings.push((call_expr.get_range(), target_type));
+            bindings_by_var
+                .entry(target_var_ref_id)
+                .or_default()
+                .push((call_expr.get_range(), target_type));
         }
     }
 
-    bindings.sort_by_key(|(range, _)| range.start());
-    bindings
+    for bindings in bindings_by_var.values_mut() {
+        bindings.sort_by_key(|(range, _)| range.start());
+    }
+
+    bindings_by_var
 }
 
 fn nearest_dynamic_field_binding_scope(node: &LuaSyntaxNode) -> Option<LuaSyntaxNode> {
