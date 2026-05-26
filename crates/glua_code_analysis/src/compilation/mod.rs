@@ -41,7 +41,7 @@ impl LuaCompilation {
         ))
     }
 
-    pub fn update_index(&mut self, file_ids: Vec<FileId>) {
+    pub fn update_index(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
         let mut need_analyzed_files = vec![];
         for file_id in file_ids {
             let tree = match self.db.get_vfs().get_syntax_tree(&file_id) {
@@ -57,7 +57,12 @@ impl LuaCompilation {
             });
         }
 
-        analyzer::analyze(&mut self.db, need_analyzed_files, self.emmyrc.clone());
+        let mut stabilization_candidates =
+            analyzer::analyze(&mut self.db, need_analyzed_files, self.emmyrc.clone())
+                .into_iter()
+                .collect::<Vec<_>>();
+        stabilization_candidates.sort_unstable();
+        stabilization_candidates
     }
 
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {

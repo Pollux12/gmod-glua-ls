@@ -58,6 +58,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
         let decl_id = LuaDeclId::new(analyzer.file_id, position);
 
         if let Some(reason) = should_defer_guarded_index_alias(analyzer, &expr) {
+            analyzer.context.request_stabilization(analyzer.file_id);
             let unresolve = UnResolveDecl {
                 file_id: analyzer.file_id,
                 decl_id,
@@ -86,6 +87,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                     continue;
                 }
                 if should_defer_nil_gmod_self_index(analyzer, &expr, &expr_type) {
+                    analyzer.context.request_stabilization(analyzer.file_id);
                     clear_index_expr_type_cache(analyzer, &expr);
                     let unresolve = UnResolveDecl {
                         file_id: analyzer.file_id,
@@ -145,6 +147,12 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 }
             }
             Err(reason) => {
+                if matches!(reason, InferFailReason::FieldNotFound)
+                    && should_defer_gmod_self_index(analyzer, &expr)
+                {
+                    analyzer.context.request_stabilization(analyzer.file_id);
+                }
+
                 let unresolve = UnResolveDecl {
                     file_id: analyzer.file_id,
                     decl_id,
@@ -284,10 +292,11 @@ fn should_defer_nil_gmod_self_index(
     expr: &LuaExpr,
     expr_type: &LuaType,
 ) -> bool {
-    if !analyzer.gmod_enabled
-        || !analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
-        || !expr_type.is_nil()
-    {
+    expr_type.is_nil() && should_defer_gmod_self_index(analyzer, expr)
+}
+
+fn should_defer_gmod_self_index(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
+    if !analyzer.gmod_enabled || !analyzer.db.get_emmyrc().gmod.infer_dynamic_fields {
         return false;
     }
 
@@ -643,6 +652,11 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             }
             Err(reason) => {
                 record_assign_elapsed(analyzer, step_start, AssignProfileStep::InferRhs);
+                if matches!(reason, InferFailReason::FieldNotFound)
+                    && should_defer_gmod_self_index(analyzer, expr)
+                {
+                    analyzer.context.request_stabilization(analyzer.file_id);
+                }
                 add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone(), reason);
                 continue;
             }

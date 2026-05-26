@@ -25,12 +25,17 @@ use glua_parser::LuaChunk;
 use infer_cache_manager::InferCacheManager;
 use unresolve::UnResolve;
 
-pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, config: Arc<Emmyrc>) {
+pub fn analyze(
+    db: &mut DbIndex,
+    need_analyzed_files: Vec<InFiled<LuaChunk>>,
+    config: Arc<Emmyrc>,
+) -> HashSet<FileId> {
     if need_analyzed_files.is_empty() {
-        return;
+        return HashSet::new();
     }
 
     let contexts = module_analyze(db, need_analyzed_files, config);
+    let mut stabilization_candidates = HashSet::new();
 
     for (workspace_id, mut context) in contexts {
         context.workspace_id = Some(workspace_id);
@@ -73,7 +78,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
         }
+
+        stabilization_candidates.extend(context.stabilization_candidates.iter().copied());
     }
+
+    stabilization_candidates
 }
 
 fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
@@ -240,6 +249,7 @@ pub struct AnalyzeContext {
     scripted_scope_files: Option<Arc<HashSet<FileId>>>,
     scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
+    stabilization_candidates: HashSet<FileId>,
     infer_manager: InferCacheManager,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -253,6 +263,7 @@ impl AnalyzeContext {
             scripted_scope_files: None,
             scripted_scope_infos: None,
             unresolves: Vec::new(),
+            stabilization_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
             workspace_id: None,
         }
@@ -268,6 +279,10 @@ impl AnalyzeContext {
 
     pub fn add_unresolve(&mut self, un_resolve: UnResolve, reason: InferFailReason) {
         self.unresolves.push((un_resolve, reason));
+    }
+
+    pub fn request_stabilization(&mut self, file_id: FileId) {
+        self.stabilization_candidates.insert(file_id);
     }
 
     pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> Arc<HashSet<FileId>> {

@@ -209,8 +209,8 @@ impl EmmyLuaAnalysis {
             .filter(|id| !is_removed || *id != file_id)
             .collect::<Vec<_>>();
         if !update_file_ids.is_empty() {
-            self.compilation.update_index(update_file_ids.clone());
-            self.stabilize_cross_file_type_caches(&update_file_ids);
+            let stabilization_candidates = self.compilation.update_index(update_file_ids.clone());
+            self.stabilize_cross_file_type_caches(&update_file_ids, &stabilization_candidates);
         }
 
         Some(file_id)
@@ -373,8 +373,8 @@ impl EmmyLuaAnalysis {
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
         let file_ids = self.expand_reindex_file_ids(file_ids);
         self.compilation.remove_index(file_ids.clone());
-        self.compilation.update_index(file_ids.clone());
-        self.stabilize_cross_file_type_caches(&file_ids);
+        let stabilization_candidates = self.compilation.update_index(file_ids.clone());
+        self.stabilize_cross_file_type_caches(&file_ids, &stabilization_candidates);
     }
 
     fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
@@ -400,18 +400,30 @@ impl EmmyLuaAnalysis {
         expanded
     }
 
-    fn stabilize_cross_file_type_caches(&mut self, file_ids: &[FileId]) {
+    fn stabilize_cross_file_type_caches(
+        &mut self,
+        file_ids: &[FileId],
+        stabilization_candidates: &[FileId],
+    ) {
         if file_ids.is_empty() {
             return;
         }
 
         let changed = file_ids.iter().copied().collect::<HashSet<_>>();
-        let mut dependents = self
+        let same_batch_stabilization_candidates = stabilization_candidates
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let all_dependents = self
             .compilation
             .get_db()
             .get_type_index()
-            .files_with_cross_file_type_caches_referencing_files(&changed)
+            .files_with_cross_file_type_caches_referencing_files(&changed);
+        let mut dependents = all_dependents
             .into_iter()
+            .filter(|file_id| {
+                !changed.contains(file_id) || same_batch_stabilization_candidates.contains(file_id)
+            })
             .filter(|file_id| {
                 self.compilation
                     .get_db()
@@ -590,8 +602,8 @@ impl EmmyLuaAnalysis {
         }));
         let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
         updated_files.sort();
-        self.compilation.update_index(updated_files.clone());
-        self.stabilize_cross_file_type_caches(&updated_files);
+        let stabilization_candidates = self.compilation.update_index(updated_files.clone());
+        self.stabilize_cross_file_type_caches(&updated_files, &stabilization_candidates);
         updated_files
     }
 
@@ -657,8 +669,8 @@ impl EmmyLuaAnalysis {
         }));
         let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
         updated_files.sort();
-        self.compilation.update_index(updated_files.clone());
-        self.stabilize_cross_file_type_caches(&updated_files);
+        let stabilization_candidates = self.compilation.update_index(updated_files.clone());
+        self.stabilize_cross_file_type_caches(&updated_files, &stabilization_candidates);
         updated_files
     }
 
