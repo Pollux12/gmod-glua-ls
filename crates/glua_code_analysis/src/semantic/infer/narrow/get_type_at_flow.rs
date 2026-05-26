@@ -223,16 +223,7 @@ fn get_type_at_flow_walk(
                 }
             }
             FlowNodeKind::Assignment(assign_ptr, assign_hint) => {
-                let can_match_assignment = matches!(
-                    (assign_hint, var_ref_id),
-                    (AssignVarHint::Mixed, _)
-                        | (AssignVarHint::NameOnly, VarRefId::VarRef(_))
-                        | (AssignVarHint::NameOnly, VarRefId::GlobalName(_, _))
-                        | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
-                        | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
-                );
-
-                if !can_match_assignment {
+                if !assignment_hint_can_match_var_ref(assign_hint, var_ref_id) {
                     if let Some(merged_type) =
                         try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
                     {
@@ -994,6 +985,8 @@ fn get_type_at_assign_stat(
 
         let source_type = if let Some(explicit) = explicit_var_type.clone() {
             explicit
+        } else if can_treat_assignment_antecedent_as_nil(tree, cache, var_ref_id, flow_node) {
+            LuaType::Nil
         } else {
             match get_antecedent_type_for_flow_node(db, tree, cache, root, var_ref_id, flow_node) {
                 Ok(ty) => ty,
@@ -1054,6 +1047,68 @@ fn assignment_flow_info_cannot_match(
         .index_paths
         .iter()
         .any(|path| path.deref().as_str() == query_path.deref().as_str())
+}
+
+fn assignment_hint_can_match_var_ref(assign_hint: &AssignVarHint, var_ref_id: &VarRefId) -> bool {
+    matches!(
+        (assign_hint, var_ref_id),
+        (AssignVarHint::Mixed, _)
+            | (AssignVarHint::NameOnly, VarRefId::VarRef(_))
+            | (AssignVarHint::NameOnly, VarRefId::GlobalName(_, _))
+            | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
+            | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
+    )
+}
+
+fn can_treat_assignment_antecedent_as_nil(
+    tree: &FlowTree,
+    cache: &LuaInferCache,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+) -> bool {
+    let VarRefId::IndexRef(_, _) = var_ref_id else {
+        return false;
+    };
+
+    if !matches!(
+        cache.index_ref_origin_type_cache.get(var_ref_id),
+        Some(CacheEntry::Cache(origin_type)) if origin_type.is_nil()
+    ) {
+        return false;
+    }
+
+    !has_prior_possible_assignment_to_var_ref(tree, flow_node, var_ref_id)
+}
+
+fn has_prior_possible_assignment_to_var_ref(
+    tree: &FlowTree,
+    flow_node: &FlowNode,
+    var_ref_id: &VarRefId,
+) -> bool {
+    let Ok(mut antecedent_flow_id) = get_single_antecedent(tree, flow_node) else {
+        return true;
+    };
+
+    loop {
+        let Some(antecedent_node) = tree.get_flow_node(antecedent_flow_id) else {
+            return true;
+        };
+
+        match &antecedent_node.kind {
+            FlowNodeKind::Start | FlowNodeKind::Unreachable => return false,
+            FlowNodeKind::Assignment(_, assign_hint)
+                if !assignment_hint_can_match_var_ref(assign_hint, var_ref_id)
+                    || assignment_flow_info_cannot_match(tree, antecedent_flow_id, var_ref_id) =>
+            {
+                let Ok(next_flow_id) = get_single_antecedent(tree, antecedent_node) else {
+                    return true;
+                };
+                antecedent_flow_id = next_flow_id;
+            }
+            FlowNodeKind::Assignment(_, _) => return true,
+            _ => return true,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
