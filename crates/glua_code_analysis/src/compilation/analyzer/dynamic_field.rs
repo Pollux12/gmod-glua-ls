@@ -848,11 +848,27 @@ fn infer_setmetatable_target_type(
 ) -> Option<LuaType> {
     let prefix_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr.clone())?;
     if matches!(prefix_var_ref_id, VarRefId::GlobalName(_, _)) {
-        return collect_setmetatable_bindings(db, cache, prefix_expr, prefix_var_ref_id)
-            .into_iter()
+        let scope = nearest_dynamic_field_binding_scope(prefix_expr.syntax())?;
+        let scope_range = scope.text_range();
+        let cache_key = (prefix_var_ref_id.clone(), scope_range);
+        if !cache
+            .dynamic_field_global_metatable_cache
+            .contains_key(&cache_key)
+        {
+            let bindings =
+                collect_setmetatable_bindings_in_scope(db, cache, &scope, prefix_var_ref_id);
+            cache
+                .dynamic_field_global_metatable_cache
+                .insert(cache_key.clone(), bindings);
+        }
+
+        return cache
+            .dynamic_field_global_metatable_cache
+            .get(&cache_key)?
+            .iter()
             .take_while(|(range, _)| range.end() <= assignment_range.start())
             .last()
-            .map(|(_, target_type)| target_type);
+            .map(|(_, target_type)| target_type.clone());
     }
 
     if !cache
@@ -885,6 +901,15 @@ fn collect_setmetatable_bindings(
         return Vec::new();
     };
 
+    collect_setmetatable_bindings_in_scope(db, cache, &scope, prefix_var_ref_id)
+}
+
+fn collect_setmetatable_bindings_in_scope(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    scope: &LuaSyntaxNode,
+    prefix_var_ref_id: VarRefId,
+) -> Vec<(rowan::TextRange, LuaType)> {
     let mut bindings = Vec::new();
     for node in scope.descendants() {
         let Some(call_expr) = LuaCallExpr::cast(node) else {
@@ -893,7 +918,7 @@ fn collect_setmetatable_bindings(
         let Some(call_scope) = nearest_dynamic_field_binding_scope(call_expr.syntax()) else {
             continue;
         };
-        if call_scope != scope {
+        if call_scope != scope.clone() {
             continue;
         }
 

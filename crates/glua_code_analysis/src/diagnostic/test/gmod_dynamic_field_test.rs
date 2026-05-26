@@ -266,4 +266,36 @@ mod test {
             "#
         ));
     }
+
+    #[gtest]
+    fn test_global_setmetatable_dynamic_fields_stay_scope_local() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class DynTest11.Meta
+            DYNTEST_META = {}
+            DYNTEST_META.__index = DYNTEST_META
+
+            function BuildDynTestA()
+                DYNTEST_OBJ = {}
+                setmetatable(DYNTEST_OBJ, DYNTEST_META)
+                DYNTEST_OBJ.scopedField = true
+            end
+
+            function DYNTEST_META:ReadScoped()
+                return self.scopedField
+            end
+
+            function BuildDynTestB()
+                DYNTEST_OBJ = {}
+                DYNTEST_OBJ.otherScopeField = true
+            end
+
+            function DYNTEST_META:ReadOtherScope()
+                return self.otherScopeField
+            end
+            "#
+        ));
+    }
 }
