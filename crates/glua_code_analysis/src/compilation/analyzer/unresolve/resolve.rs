@@ -137,7 +137,19 @@ pub fn try_resolve_member(
     }
 
     if let Some(expr) = unresolve_member.expr.clone() {
-        let expr_type = infer_expr(db, cache, expr)?;
+        let expr_type = match infer_expr(db, cache, expr.clone()) {
+            Ok(typ) => typ,
+            Err(reason) => {
+                if reason.is_need_resolve()
+                    && let Some(cached_type) =
+                        cached_local_name_expr_type(db, unresolve_member.file_id, &expr)
+                {
+                    cached_type
+                } else {
+                    return Err(reason);
+                }
+            }
+        };
         let expr_type = match &expr_type {
             LuaType::Variadic(multi) => multi
                 .get_type(unresolve_member.ret_idx)
@@ -151,6 +163,35 @@ pub fn try_resolve_member(
     }
 
     Ok(())
+}
+
+fn cached_local_name_expr_type(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Option<LuaType> {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return None;
+    };
+    let decl_id = db
+        .get_reference_index()
+        .get_local_reference(&file_id)?
+        .get_decl_id(&name_expr.get_range())?;
+    db.get_type_index()
+        .get_type_cache(&decl_id.into())
+        .map(|cache| cache.as_type().clone())
+        .filter(local_cached_type_is_informative)
+}
+
+fn local_cached_type_is_informative(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => false,
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .any(local_cached_type_is_informative),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .any(|(typ, _)| local_cached_type_is_informative(typ)),
+        _ => true,
+    }
 }
 
 pub fn try_resolve_table_field(
@@ -2091,7 +2132,7 @@ mod tests {
     use rowan::{TextRange, TextSize};
 
     use super::{
-        find_str_tpl_ref, get_operator_id_priority_tiers,
+        find_str_tpl_ref, get_operator_id_priority_tiers, local_cached_type_is_informative,
         select_operator_ids_by_workspace_and_realm,
     };
     use crate::{
@@ -2150,6 +2191,28 @@ mod tests {
                 })
                 .collect(),
         );
+    }
+
+    #[test]
+    fn local_cached_type_informative_accepts_nullable_concrete_unions() {
+        let typ = LuaType::Union(
+            LuaUnionType::from_vec(vec![
+                LuaType::Nil,
+                LuaType::Ref(LuaTypeDeclId::global("base_glide")),
+            ])
+            .into(),
+        );
+
+        assert!(local_cached_type_is_informative(&typ));
+    }
+
+    #[test]
+    fn local_cached_type_informative_rejects_weak_only_unions() {
+        let typ = LuaType::Union(
+            LuaUnionType::from_vec(vec![LuaType::Nil, LuaType::Unknown, LuaType::Any]).into(),
+        );
+
+        assert!(!local_cached_type_is_informative(&typ));
     }
 
     #[test]
