@@ -136,7 +136,7 @@ fn collect_assignment_flow_info(vars: &[LuaVarExpr]) -> AssignmentFlowInfo {
 
 fn push_assignment_index_path(info: &mut AssignmentFlowInfo, path: String) {
     let path = internment::ArcIntern::from(smol_str::SmolStr::new(&path));
-    if !info.index_paths.iter().any(|existing| *existing == path) {
+    if !info.index_paths.contains(&path) {
         info.index_paths.push(path);
     }
 }

@@ -364,9 +364,7 @@ fn assignment_name_decl_id(
     decl_tree: Option<&crate::LuaDeclarationTree>,
     name_expr: &LuaNameExpr,
 ) -> Option<LuaDeclId> {
-    let Some(name) = name_expr.get_name_text() else {
-        return None;
-    };
+    let name = name_expr.get_name_text()?;
 
     decl_tree
         .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
