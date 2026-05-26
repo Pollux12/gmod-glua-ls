@@ -16,7 +16,7 @@ use crate::{
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{InferConditionFlow, get_type_at_condition_flow},
-            get_multi_antecedents, get_single_antecedent,
+            get_single_antecedent,
             get_type_at_cast_flow::get_type_at_cast_flow,
             get_var_ref_type, narrow_down_type,
             var_ref_id::get_var_expr_var_ref_id,
@@ -606,7 +606,17 @@ fn merge_antecedent_types(
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
 ) -> InferResult {
-    let antecedents = get_multi_antecedents(tree, flow_node)?;
+    let single_antecedent;
+    let antecedents = match &flow_node.antecedent {
+        Some(FlowAntecedent::Single(id)) => {
+            single_antecedent = [*id];
+            &single_antecedent[..]
+        }
+        Some(FlowAntecedent::Multiple(multi_id)) => tree
+            .get_multi_antecedents(*multi_id)
+            .ok_or(InferFailReason::None)?,
+        None => return Err(InferFailReason::None),
+    };
     cache.prof_merge_calls += 1;
     cache.prof_merge_total_antecedents += antecedents.len() as u32;
     let target_realm = cache.flow_query_realm.unwrap_or_else(|| {
@@ -615,8 +625,8 @@ fn merge_antecedent_types(
     });
 
     let mut accepted_any = false;
-    let mut branch_types = Vec::new();
-    for &flow_id in &antecedents {
+    let mut branch_types = Vec::with_capacity(antecedents.len());
+    for &flow_id in antecedents {
         let Some(antecedent_node) = tree.get_flow_node(flow_id) else {
             continue;
         };
@@ -647,8 +657,8 @@ fn merge_antecedent_types(
         return Ok(merge_flow_branch_types(db, var_ref_id, branch_types));
     }
 
-    let mut branch_types = Vec::new();
-    for &flow_id in &antecedents {
+    let mut branch_types = Vec::with_capacity(antecedents.len());
+    for &flow_id in antecedents {
         let Some(antecedent_node) = tree.get_flow_node(flow_id) else {
             continue;
         };

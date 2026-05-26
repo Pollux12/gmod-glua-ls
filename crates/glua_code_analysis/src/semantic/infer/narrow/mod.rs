@@ -232,21 +232,6 @@ fn get_single_antecedent(tree: &FlowTree, flow: &FlowNode) -> Result<FlowId, Inf
     }
 }
 
-fn get_multi_antecedents(tree: &FlowTree, flow: &FlowNode) -> Result<Vec<FlowId>, InferFailReason> {
-    match &flow.antecedent {
-        Some(antecedent) => match antecedent {
-            FlowAntecedent::Single(id) => Ok(vec![*id]),
-            FlowAntecedent::Multiple(multi_id) => {
-                let multi_flow = tree
-                    .get_multi_antecedents(*multi_id)
-                    .ok_or(InferFailReason::None)?;
-                Ok(multi_flow.to_vec())
-            }
-        },
-        None => Err(InferFailReason::None),
-    }
-}
-
 #[derive(Debug)]
 pub enum ResultTypeOrContinue {
     Result(LuaType),
