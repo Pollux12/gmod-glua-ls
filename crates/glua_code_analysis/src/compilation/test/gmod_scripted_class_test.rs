@@ -4894,6 +4894,189 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_guarded_dynamic_field_local_alias_matches_rhs_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let consumer_path = "lua/weapons/glide_refueler_base.lua";
+        let consumer_code = r#"
+            ---@class Angle
+            local Angle = {}
+
+            ---@class Entity
+            local Entity = {}
+
+            ---@return Angle
+            function Entity:GetAngles() end
+
+            ---@param ang Angle
+            ---@return Angle
+            function Entity:LocalToWorldAngles(ang) end
+
+            ---@class Angle
+            ---@return Vector
+            function Angle:Forward() end
+
+            ---@return Vector
+            function Angle:Up() end
+
+            ---@return Vector
+            function Angle:Right() end
+
+            ---@class FillPort
+            ---@field worldPos Vector
+            ---@field ang Angle
+
+            ---@return FillPort
+            local function getPort()
+                ---@type FillPort
+                local port = { ang = Angle }
+                port.worldAng = Entity:LocalToWorldAngles(port.ang)
+                return port
+            end
+
+            local function draw()
+                local port = getPort()
+                local veh = Entity
+                if not port or not port.worldPos or not port.worldAng then return end
+
+                local pos = port.worldPos
+                local vehAng = veh:GetAngles()
+                local portAng = port.worldAng
+                local normal = portAng:Forward()
+                local upAxis = vehAng:Up()
+                local rightAxis = vehAng:Right()
+                print(pos, vehAng, portAng, normal, upAxis, rightAxis)
+            end
+        "#;
+        let consumer_file = ws.def_file(consumer_path, consumer_code);
+
+        let rhs_type = local_assignment_value_type(&mut ws, consumer_file, "portAng");
+        let alias_type = local_name_type(&mut ws, consumer_file, "portAng");
+        let pos_type = local_name_type(&mut ws, consumer_file, "pos");
+        let veh_ang_type = local_name_type(&mut ws, consumer_file, "vehAng");
+        let normal_type = local_name_type(&mut ws, consumer_file, "normal");
+        let up_axis_type = local_name_type(&mut ws, consumer_file, "upAxis");
+        let right_axis_type = local_name_type(&mut ws, consumer_file, "rightAxis");
+
+        assert_that!(
+            ws.humanize_type(rhs_type).as_str(),
+            eq("Angle"),
+            "port.worldAng RHS should infer as Angle"
+        );
+        assert_that!(ws.humanize_type(pos_type).as_str(), eq("Vector"));
+        assert_that!(ws.humanize_type(veh_ang_type).as_str(), eq("Angle"));
+        assert_that!(
+            ws.humanize_type(alias_type).as_str(),
+            eq("Angle"),
+            "local portAng should keep the same Angle type as its RHS"
+        );
+        assert_that!(ws.humanize_type(normal_type).as_str(), eq("Vector"));
+        assert_that!(ws.humanize_type(up_axis_type).as_str(), eq("Vector"));
+        assert_that!(ws.humanize_type(right_axis_type).as_str(), eq("Vector"));
+
+        let consumer_uri = ws.virtual_url_generator.new_uri(consumer_path);
+        ws.analysis
+            .update_file_by_uri(&consumer_uri, Some(format!("{consumer_code}\n")))
+            .expect("expected touched consumer file id");
+
+        let touched_pos_type = local_name_type(&mut ws, consumer_file, "pos");
+        let touched_veh_ang_type = local_name_type(&mut ws, consumer_file, "vehAng");
+        let touched_port_ang_type = local_name_type(&mut ws, consumer_file, "portAng");
+        let touched_normal_type = local_name_type(&mut ws, consumer_file, "normal");
+        let touched_up_axis_type = local_name_type(&mut ws, consumer_file, "upAxis");
+        let touched_right_axis_type = local_name_type(&mut ws, consumer_file, "rightAxis");
+
+        assert_that!(
+            ws.humanize_type(touched_pos_type).as_str(),
+            eq("Vector"),
+            "touching the file should not change pos"
+        );
+        assert_that!(
+            ws.humanize_type(touched_veh_ang_type).as_str(),
+            eq("Angle"),
+            "touching the file should not change vehAng"
+        );
+        assert_that!(
+            ws.humanize_type(touched_port_ang_type).as_str(),
+            eq("Angle"),
+            "touching the file should not change portAng"
+        );
+        assert_that!(
+            ws.humanize_type(touched_normal_type).as_str(),
+            eq("Vector"),
+            "touching the file should not change normal"
+        );
+        assert_that!(
+            ws.humanize_type(touched_up_axis_type).as_str(),
+            eq("Vector"),
+            "touching the file should not change upAxis"
+        );
+        assert_that!(
+            ws.humanize_type(touched_right_axis_type).as_str(),
+            eq("Vector"),
+            "touching the file should not change rightAxis"
+        );
+        assert_that!(
+            {
+                ws.analysis
+                    .diagnostic
+                    .enable_only(DiagnosticCode::UncheckedNilAccess);
+                ws.analysis
+                    .diagnose_file(consumer_file, CancellationToken::new())
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|diagnostic| {
+                        diagnostic.code
+                            == Some(NumberOrString::String(
+                                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                            ))
+                    })
+            },
+            eq(false),
+            "portAng:Forward() should not report unchecked-nil-access"
+        );
+    }
+
+    #[test]
+    fn test_gmod_dynamic_initializer_fallback_respects_explicit_unknown_annotation() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Angle
+            local Angle = {}
+
+            ---@class Entity
+            local Entity = {}
+
+            ---@return Angle
+            function Entity:GetAngles() end
+
+            local veh = Entity
+
+            ---@type unknown
+            local vehAng = veh:GetAngles()
+            print(vehAng)
+        "#,
+        );
+
+        let annotated_type = local_name_type(&mut ws, file_id, "vehAng");
+        assert_that!(
+            ws.humanize_type_detailed(annotated_type).as_str(),
+            eq("unknown"),
+            "explicit unknown annotations should not be replaced by dynamic initializer fallback"
+        );
+    }
+
     #[gtest]
     fn test_gmod_self_index_local_unknown_reassignment_does_not_fall_back_to_initializer() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

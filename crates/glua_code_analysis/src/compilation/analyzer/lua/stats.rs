@@ -86,7 +86,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
                     continue;
                 }
-                if should_defer_nil_gmod_self_index(analyzer, &expr, &expr_type) {
+                if should_defer_nil_gmod_index_alias(analyzer, &expr, &expr_type) {
                     analyzer.context.request_stabilization(analyzer.file_id);
                     clear_index_expr_type_cache(analyzer, &expr);
                     let unresolve = UnResolveDecl {
@@ -287,12 +287,15 @@ fn call_expr_has_effect_table_arg(expr: &LuaExpr) -> Option<()> {
     None
 }
 
-fn should_defer_nil_gmod_self_index(
+fn should_defer_nil_gmod_index_alias(
     analyzer: &LuaAnalyzer,
     expr: &LuaExpr,
     expr_type: &LuaType,
 ) -> bool {
-    expr_type.is_nil() && should_defer_gmod_self_index(analyzer, expr)
+    expr_type.is_nil()
+        && analyzer.gmod_enabled
+        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        && matches!(expr, LuaExpr::IndexExpr(_))
 }
 
 fn should_defer_gmod_self_index(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {

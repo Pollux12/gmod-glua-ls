@@ -204,7 +204,8 @@ pub(crate) fn try_local_decl_initializer_fallback_type(
     }
 
     if !((current_type.is_unknown() || current_type.is_nil())
-        && is_gmod_self_index_initializer(db, decl_id))
+        && local_decl_type_cache_is_inferred(db, decl_id)
+        && is_gmod_dynamic_initializer(db, decl_id))
     {
         return None;
     }
@@ -400,33 +401,20 @@ fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, Lu
     Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
 }
 
-fn is_gmod_self_index_initializer(db: &DbIndex, decl_id: LuaDeclId) -> bool {
+fn local_decl_type_cache_is_inferred(db: &DbIndex, decl_id: LuaDeclId) -> bool {
+    db.get_type_index()
+        .get_type_cache(&decl_id.into())
+        .is_some_and(|type_cache| type_cache.is_infer())
+}
+
+fn is_gmod_dynamic_initializer(db: &DbIndex, decl_id: LuaDeclId) -> bool {
     if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
         return false;
     }
 
-    let Some((_, LuaExpr::IndexExpr(index_expr))) = local_initializer_expr(db, decl_id) else {
-        return false;
-    };
-
-    index_expr_root_is_self(&index_expr)
-}
-
-fn index_expr_root_is_self(index_expr: &LuaIndexExpr) -> bool {
-    let Some(mut prefix_expr) = index_expr.get_prefix_expr() else {
-        return false;
-    };
-
-    while let LuaExpr::IndexExpr(prefix_index_expr) = prefix_expr {
-        let Some(next_prefix_expr) = prefix_index_expr.get_prefix_expr() else {
-            return false;
-        };
-        prefix_expr = next_prefix_expr;
-    }
-
     matches!(
-        prefix_expr,
-        LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self")
+        local_initializer_expr(db, decl_id),
+        Some((_, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_)))
     )
 }
 
