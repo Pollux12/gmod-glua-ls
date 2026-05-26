@@ -75,12 +75,8 @@ impl Checker for GmodRealmMisuseChecker {
             if let Some(profile) = profile.as_mut() {
                 profile.calls_scanned += 1;
             }
-            let call_realm = resolve_realm_at_offset(
-                infer_index,
-                &file_id,
-                file_realm_metadata,
-                call_expr.get_range().start(),
-            );
+            let call_realm =
+                resolve_realm_at_offset(file_realm_metadata, call_expr.get_range().start());
             if call_realm.realm == GmodRealm::Shared {
                 if let Some(profile) = profile.as_mut() {
                     profile.shared_call_skips += 1;
@@ -543,12 +539,7 @@ fn resolve_decl_realm(
         });
     }
 
-    Some(resolve_realm_at_offset(
-        infer_index,
-        &decl_file_id,
-        metadata,
-        decl_offset,
-    ))
+    Some(resolve_realm_at_offset(metadata, decl_offset))
 }
 
 fn resolve_decl_annotation_realm_at_offset(
@@ -960,27 +951,29 @@ fn semantic_decl_position(semantic_decl: &LuaSemanticDeclId) -> Option<(FileId, 
     }
 }
 
-fn resolve_realm_at_offset(
-    infer_index: &crate::GmodInferIndex,
-    file_id: &FileId,
-    metadata: &GmodRealmFileMetadata,
-    offset: TextSize,
-) -> ResolvedRealm {
-    ResolvedRealm {
-        realm: infer_index.get_realm_at_offset(file_id, offset),
-        evidence: realm_evidence_at_offset(metadata, offset),
-    }
-}
-
-fn realm_evidence_at_offset(metadata: &GmodRealmFileMetadata, offset: TextSize) -> RealmEvidence {
-    if metadata
+fn resolve_realm_at_offset(metadata: &GmodRealmFileMetadata, offset: TextSize) -> ResolvedRealm {
+    let branch_realm = metadata
         .branch_realm_ranges
         .iter()
-        .any(|range| range.range.contains(offset))
-    {
-        return RealmEvidence::ExplicitBranch;
-    }
+        .find(|range| range.range.contains(offset))
+        .map(|range| range.realm);
+    let realm = branch_realm.unwrap_or_else(|| {
+        if metadata.inferred_realm != GmodRealm::Unknown {
+            metadata.inferred_realm
+        } else {
+            metadata.annotation_realm.unwrap_or(GmodRealm::Unknown)
+        }
+    });
+    let evidence = if branch_realm.is_some() {
+        RealmEvidence::ExplicitBranch
+    } else {
+        file_realm_evidence(metadata)
+    };
 
+    ResolvedRealm { realm, evidence }
+}
+
+fn file_realm_evidence(metadata: &GmodRealmFileMetadata) -> RealmEvidence {
     if metadata.annotation_realm.is_some() {
         return RealmEvidence::ExplicitAnnotation;
     }
@@ -1107,8 +1100,9 @@ fn resolve_precomputed_decl_realm(
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Option<ResolvedRealm> {
     let (decl_file_id, decl_offset) = semantic_decl_position(semantic_decl)?;
-    let infer_index = db.get_gmod_infer_index();
-    let metadata = infer_index.get_realm_file_metadata(&decl_file_id)?;
+    let metadata = db
+        .get_gmod_infer_index()
+        .get_realm_file_metadata(&decl_file_id)?;
     if let Some(annotation_realm) = resolve_decl_annotation_realm_at_offset_from_db(
         db,
         &decl_file_id,
@@ -1121,12 +1115,7 @@ fn resolve_precomputed_decl_realm(
         });
     }
 
-    Some(resolve_realm_at_offset(
-        infer_index,
-        &decl_file_id,
-        metadata,
-        decl_offset,
-    ))
+    Some(resolve_realm_at_offset(metadata, decl_offset))
 }
 
 /// Precompute declaration/member/signature realm facts for workspace diagnostics.
