@@ -537,10 +537,6 @@ fn collect_field_setter_helper_call_fields(
     let Some(second_arg) = args_iter.next() else {
         return;
     };
-    let mut args = Vec::with_capacity(2 + args_iter.size_hint().0);
-    args.push(first_arg);
-    args.push(second_arg);
-    args.extend(args_iter);
 
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return;
@@ -549,6 +545,10 @@ fn collect_field_setter_helper_call_fields(
     if helper_patterns.is_empty() {
         return;
     };
+    let mut args = Vec::with_capacity(2 + args_iter.size_hint().0);
+    args.push(first_arg);
+    args.push(second_arg);
+    args.extend(args_iter);
     for helper in helper_patterns {
         let Some(table_arg) = args.get(helper.table_param_index) else {
             continue;
