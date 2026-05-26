@@ -145,6 +145,45 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_reassigned_field_initialized_local_stays_local_after_isvalid_guard() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Weapon
+                ---@field activeVehicle nil
+
+                ---@type Weapon
+                local wep
+                local veh = wep.activeVehicle
+                if not IsValid(veh) then
+                    veh = select(1, wep:GetTargetVehicle())
+                end
+                if not IsValid(veh) then return end
+                local narrowed = ve<??>h
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            hover.contains("local veh: unknown"),
+            "expected later local hover to stay on veh instead of source field, got: {}",
+            hover
+        );
+        assert!(
+            !hover.contains("(field) activeVehicle"),
+            "later local hover must not bind back to the source field, got: {}",
+            hover
+        );
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_outparam_updates_trace_output_field() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(

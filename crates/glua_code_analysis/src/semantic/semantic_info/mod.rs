@@ -105,7 +105,7 @@ pub fn infer_node_semantic_info(
                 cache,
                 expr,
                 SemanticDeclGuard::default(),
-                SemanticDeclLevel::default(),
+                SemanticDeclLevel::NoTrace,
             );
             Some(SemanticInfo {
                 typ,

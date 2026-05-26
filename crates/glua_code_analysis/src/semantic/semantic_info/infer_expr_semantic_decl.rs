@@ -49,6 +49,9 @@ pub fn infer_expr_semantic_decl(
             semantic_guard.next_level()?,
             level,
         ),
+        LuaExpr::CallExpr(call_expr) if call_expr.is_require() => {
+            infer_require_module_semantic_decl(db, cache, call_expr)
+        }
         _ => {
             let member_id = LuaMemberId::new(expr.get_syntax_id(), file_id);
             if db.get_member_index().get_member(&member_id).is_some() {

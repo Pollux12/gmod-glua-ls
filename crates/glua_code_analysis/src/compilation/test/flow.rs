@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaSemanticDeclId, LuaType, VirtualWorkspace};
     use glua_parser::{LuaAstNode, LuaNameExpr};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
@@ -54,6 +54,58 @@ mod test {
             .get_semantic_info(name_expr.syntax().clone().into())
             .expect("expected semantic info for name expression")
             .typ
+    }
+
+    fn nth_name_expr_semantic_decl_from_end(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth_from_end: usize,
+    ) -> Option<LuaSemanticDeclId> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let name_exprs = root
+            .clone()
+            .descendants::<LuaNameExpr>()
+            .filter(|expr| expr.get_name_text().as_deref() == Some(name))
+            .collect::<Vec<_>>();
+        let name_expr = name_exprs
+            .into_iter()
+            .rev()
+            .nth(nth_from_end)
+            .expect("expected matching name expression");
+        semantic_model
+            .get_semantic_info(name_expr.syntax().clone().into())
+            .expect("expected semantic info for name expression")
+            .semantic_decl
+    }
+
+    fn nth_name_expr_semantic_decl(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth: usize,
+    ) -> Option<LuaSemanticDeclId> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let name_expr = root
+            .clone()
+            .descendants::<LuaNameExpr>()
+            .filter(|expr| expr.get_name_text().as_deref() == Some(name))
+            .nth(nth)
+            .expect("expected matching name expression");
+        semantic_model
+            .get_semantic_info(name_expr.syntax().clone().into())
+            .expect("expected semantic info for name expression")
+            .semantic_decl
     }
 
     #[test]
@@ -2292,6 +2344,42 @@ _2 = a[1]
 
         let a = ws.expr_ty("a");
         assert_eq!(a, LuaType::Any);
+    }
+
+    #[test]
+    fn test_reassigned_field_initialized_local_keeps_own_semantic_identity_after_isvalid() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Weapon
+            ---@field activeVehicle nil
+
+            ---@type Weapon
+            local wep
+            local veh = wep.activeVehicle
+            if not IsValid(veh) then
+                veh = select(1, wep:GetTargetVehicle())
+            end
+            if not IsValid(veh) then return end
+            local narrowed = veh
+            "#,
+        );
+
+        let declared_veh = nth_name_expr_semantic_decl(&mut ws, file_id, "veh", 0)
+            .expect("expected semantic declaration for local veh");
+        let later_veh = nth_name_expr_semantic_decl_from_end(&mut ws, file_id, "veh", 0)
+            .expect("expected semantic declaration for later veh use");
+
+        assert_that!(
+            declared_veh,
+            matches_pattern!(LuaSemanticDeclId::LuaDecl(_))
+        );
+        assert_eq!(later_veh, declared_veh);
     }
 
     #[test]
