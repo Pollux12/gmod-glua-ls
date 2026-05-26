@@ -6,7 +6,7 @@ use glua_parser::{
 use rowan::TextRange;
 
 use crate::{
-    DiagnosticCode, LuaType, LuaUnionType, SemanticModel,
+    DiagnosticCode, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel,
     semantic::{contains_gmod_null_type, get_var_expr_var_ref_id, resolve_global_decl_id},
 };
 
@@ -264,6 +264,13 @@ fn check_index_expr(
 
     let prefix_type = semantic_model.infer_expr(prefix.clone()).ok()?;
     if prefix_type.is_nullable() {
+        if !prefix_type.is_nil()
+            && let LuaExpr::IndexExpr(prefix_index_expr) = &prefix
+            && index_expr_has_non_nullable_current_member(semantic_model, prefix_index_expr)
+        {
+            return Some(());
+        }
+
         if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, &prefix) {
             return Some(());
         }
@@ -283,6 +290,55 @@ fn check_index_expr(
     }
 
     Some(())
+}
+
+fn index_expr_has_non_nullable_current_member(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Ok(prefix_type) = semantic_model.infer_expr(prefix_expr) else {
+        return false;
+    };
+    let Some(owner) = member_owner_for_type(prefix_type) else {
+        return false;
+    };
+    let Some(key) = literal_member_key(index_expr) else {
+        return false;
+    };
+
+    let db = semantic_model.get_db();
+    let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) else {
+        return false;
+    };
+    let Ok(member_type) = member_item.resolve_type_with_realm_at_offset(
+        db,
+        &semantic_model.get_file_id(),
+        index_expr.get_position(),
+    ) else {
+        return false;
+    };
+
+    !member_type.is_nullable()
+}
+
+fn member_owner_for_type(typ: LuaType) -> Option<LuaMemberOwner> {
+    match typ {
+        LuaType::TableConst(in_file_range) => Some(LuaMemberOwner::Element(in_file_range)),
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(LuaMemberOwner::Type(def_id)),
+        LuaType::Instance(instance) => Some(LuaMemberOwner::Element(instance.get_range().clone())),
+        _ => None,
+    }
+}
+
+fn literal_member_key(index_expr: &LuaIndexExpr) -> Option<LuaMemberKey> {
+    match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => Some(LuaMemberKey::Name(name.get_name_text().into())),
+        LuaIndexKey::String(string) => Some(LuaMemberKey::Name(string.get_value().into())),
+        _ => None,
+    }
 }
 
 fn is_expr_guarded_by_prior_isvalid_early_return(

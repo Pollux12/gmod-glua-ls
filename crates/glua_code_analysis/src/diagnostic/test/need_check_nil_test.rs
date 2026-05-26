@@ -1891,4 +1891,100 @@ mod test {
             "need-check-nil on `lastNick[i]` should span full `lastNick`"
         );
     }
+
+    #[gtest]
+    fn test_reassigned_table_literal_field_is_not_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/sh_glide.lua",
+            r#"
+            Glide = Glide or {}
+
+            function Glide.FromJSON(s)
+                if type(s) ~= "string" or s == "" then
+                    return {}
+                end
+
+                return util.JSONToTable(s) or {}
+            end
+
+            function Glide.ToJSON(t, prettyPrint)
+                return util.TableToJSON(t, prettyPrint)
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_utils.lua",
+            r#"
+            function Glide.ValidateStreamData(data)
+                if type(data) ~= "table" then
+                    return false, "Preset is not a table!"
+                end
+
+                local layers = data.layers
+                if type(layers) ~= "table" then
+                    return false, "Preset does not have valid layer data!"
+                end
+
+                return true
+            end
+            "#,
+        );
+
+        let engine_stream_source = r#"
+                local EngineStream = {}
+
+                function EngineStream:LoadJSON(data)
+                    data = Glide.FromJSON(data)
+
+                    local success, errorMessage = Glide.ValidateStreamData(data)
+                    if not success then
+                        return
+                    end
+
+                    for id, layer in SortedPairs(data.layers) do
+                        self:AddLayer(id, layer.path, layer.controllers, layer.redline == true)
+                    end
+
+                    if self.isWebAudio then
+                        data = {
+                            kv = data.kv,
+                            layers = {}
+                        }
+
+                        for id, layer in pairs(self.layers) do
+                            data.layers[id] = {
+                                path = layer.path,
+                                redline = layer.redline,
+                                controllers = layer.controllers
+                            }
+                        end
+
+                        self.updateWebJSON = Glide.ToJSON(data, false)
+                    end
+                end
+                "#;
+
+        assert_that!(
+            ws.check_file_for(
+                DiagnosticCode::UncheckedNilAccess,
+                "lua/glide/client/engine_stream.lua",
+                engine_stream_source,
+            ),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_file_for(
+                DiagnosticCode::NeedCheckNil,
+                "lua/glide/client/engine_stream_need_check.lua",
+                engine_stream_source,
+            ),
+            eq(true)
+        );
+    }
 }
