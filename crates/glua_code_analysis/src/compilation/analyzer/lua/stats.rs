@@ -86,6 +86,30 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
                     continue;
                 }
+                if should_defer_pending_local_alias(analyzer, &expr, &expr_type) {
+                    let unresolve = UnResolveDecl {
+                        file_id: analyzer.file_id,
+                        decl_id,
+                        expr: expr.clone(),
+                        ret_idx: 0,
+                    };
+                    analyzer
+                        .context
+                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    continue;
+                }
+                if should_defer_weak_gmod_call_expr(analyzer, &expr, &expr_type) {
+                    let unresolve = UnResolveDecl {
+                        file_id: analyzer.file_id,
+                        decl_id,
+                        expr: expr.clone(),
+                        ret_idx: 0,
+                    };
+                    analyzer
+                        .context
+                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    continue;
+                }
                 if should_defer_nil_gmod_index_alias(analyzer, &expr, &expr_type) {
                     analyzer.context.request_stabilization(analyzer.file_id);
                     clear_index_expr_type_cache(analyzer, &expr);
@@ -615,28 +639,49 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
 
         let step_start = profile_enabled.then(std::time::Instant::now);
         let expr_type = match analyzer.infer_expr(expr) {
-            Ok(expr_type) => match expr_type {
-                LuaType::Variadic(multi) => multi.get_type(0)?.clone(),
-                other => {
-                    if other.is_nil() && should_defer_nil_gmod_expr(analyzer, expr) {
-                        add_unresolve_for_assignment(
-                            analyzer,
-                            type_owner,
-                            &var,
-                            expr.clone(),
-                            InferFailReason::FieldNotFound,
-                        );
-                        continue;
-                    }
-                    if other.is_unknown() && is_undefined_global_name_expr(analyzer, expr) {
-                        // See note in analyze_local_stat: undefined-global RHS
-                        // is `nil` at runtime, not "unknown".
-                        LuaType::Nil
-                    } else {
-                        other
-                    }
+            Ok(mut expr_type) => {
+                if let LuaType::Variadic(multi) = expr_type {
+                    expr_type = multi.get_type(0)?.clone();
                 }
-            },
+
+                if expr_type.is_nil() && should_defer_nil_gmod_expr(analyzer, expr) {
+                    add_unresolve_for_assignment(
+                        analyzer,
+                        type_owner,
+                        &var,
+                        expr.clone(),
+                        InferFailReason::FieldNotFound,
+                    );
+                    continue;
+                }
+                if should_defer_pending_local_alias(analyzer, expr, &expr_type) {
+                    add_unresolve_for_assignment(
+                        analyzer,
+                        type_owner,
+                        &var,
+                        expr.clone(),
+                        InferFailReason::FieldNotFound,
+                    );
+                    continue;
+                }
+                if should_defer_weak_gmod_call_expr(analyzer, expr, &expr_type) {
+                    add_unresolve_for_assignment(
+                        analyzer,
+                        type_owner,
+                        &var,
+                        expr.clone(),
+                        InferFailReason::FieldNotFound,
+                    );
+                    continue;
+                }
+                if expr_type.is_unknown() && is_undefined_global_name_expr(analyzer, expr) {
+                    // See note in analyze_local_stat: undefined-global RHS
+                    // is `nil` at runtime, not "unknown".
+                    LuaType::Nil
+                } else {
+                    expr_type
+                }
+            }
             // Reading an undefined global yields `nil` at runtime, so the
             // assignment target's value is `nil` (not unknown). This mirrors
             // the local-stat path above so hover/inference stays consistent.
@@ -875,6 +920,78 @@ fn should_defer_nil_gmod_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
     matches!(expr, LuaExpr::CallExpr(_))
 }
 
+fn should_defer_weak_gmod_call_expr(
+    analyzer: &LuaAnalyzer,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    if !(expr_type.is_any() || expr_type.is_unknown())
+        || !analyzer.gmod_enabled
+        || !analyzer.is_scripted_class_scope
+    {
+        return false;
+    }
+
+    let LuaExpr::CallExpr(call_expr) = expr else {
+        return false;
+    };
+
+    weak_call_has_nested_call_argument(call_expr) || weak_call_is_scoped_method_call(call_expr)
+}
+
+fn weak_call_has_nested_call_argument(call_expr: &glua_parser::LuaCallExpr) -> bool {
+    call_expr.get_args_list().is_some_and(|args| {
+        args.get_args().any(|arg| {
+            arg.descendants::<LuaExpr>()
+                .any(|expr| matches!(expr, LuaExpr::CallExpr(_)))
+        })
+    })
+}
+
+fn weak_call_is_scoped_method_call(call_expr: &glua_parser::LuaCallExpr) -> bool {
+    let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    if !index_expr
+        .get_index_token()
+        .is_some_and(|token| token.is_colon())
+    {
+        return false;
+    }
+
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    matches!(
+        prefix_expr,
+        LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self")
+    )
+}
+
+fn should_defer_pending_local_alias(
+    analyzer: &LuaAnalyzer,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    if !(expr_type.is_any() || expr_type.is_unknown() || expr_type.is_nil()) {
+        return false;
+    }
+
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    let Some(decl_id) = analyzer
+        .db
+        .get_reference_index()
+        .get_local_reference(&analyzer.file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+    else {
+        return false;
+    };
+
+    analyzer.context.has_pending_decl_unresolve(decl_id)
+}
+
 fn add_unresolve_for_assignment(
     analyzer: &mut LuaAnalyzer,
     type_owner: LuaTypeOwner,
@@ -953,6 +1070,7 @@ fn assign_merge_type_owner_and_expr_type(
     if let LuaTypeOwner::Member(member_id) = type_owner
         && is_assignment_file_define_member(analyzer.db, member_id)
         && !is_member_assignment_in_conditional_branch(analyzer, member_id)
+        && !is_member_assignment_in_function_scope(analyzer, member_id)
     {
         analyzer
             .db
@@ -961,6 +1079,29 @@ fn assign_merge_type_owner_and_expr_type(
     }
 
     Some(())
+}
+
+fn is_member_assignment_in_function_scope(analyzer: &LuaAnalyzer, member_id: LuaMemberId) -> bool {
+    let Some(tree) = analyzer.db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+        return false;
+    };
+    let root = tree.get_red_root();
+    let Some(member) = analyzer.db.get_member_index().get_member(&member_id) else {
+        return false;
+    };
+    let Some(token) = root
+        .token_at_offset(member.get_range().start())
+        .right_biased()
+    else {
+        return false;
+    };
+
+    token.parent_ancestors().any(|ancestor| {
+        matches!(
+            ancestor.kind().into(),
+            LuaSyntaxKind::FuncStat | LuaSyntaxKind::LocalFuncStat | LuaSyntaxKind::ClosureExpr
+        )
+    })
 }
 
 /// Returns true when the assignment that introduced this member sits inside a

@@ -56,6 +56,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         infer_manager.clear();
 
         // Use FxHashMap for O(1) reason grouping (matching upstream)
+        let had_unresolves = !context.unresolves.is_empty();
         let mut reason_resolve: FxHashMap<InferFailReason, Vec<UnResolve>> = FxHashMap::default();
         for (unresolve, reason) in context.unresolves.drain(..) {
             reason_resolve.entry(reason).or_default().push(unresolve);
@@ -145,8 +146,15 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             loop_count += 1;
         }
 
+        // Resolving deferred items mutates type/member indexes, so any inference
+        // cached while resolution was still in progress can be stale.
+        if had_unresolves {
+            infer_manager.clear();
+        }
+
         // Return the infer_manager so later phases (e.g. dynamic field) can
-        // reuse cached inference results rather than recomputing from scratch.
+        // reuse cached inference results rather than recomputing from scratch
+        // when no deferred resolution changed the indexes.
         context.infer_manager = infer_manager;
     }
 }

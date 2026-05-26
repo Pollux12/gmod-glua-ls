@@ -7,7 +7,7 @@ mod test {
 
     use crate::{
         DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral,
-        LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
     };
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
@@ -5039,6 +5039,324 @@ mod test {
             },
             eq(false),
             "portAng:Forward() should not report unchecked-nil-access"
+        );
+    }
+
+    #[gtest]
+    fn test_scripted_weapon_field_read_unions_assignment_history_in_same_file() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/sh_glide.lua",
+                r#"
+                ---@class Glide
+                Glide = Glide or {}
+                "#,
+            ),
+            (
+                "lua/weapons/glide_refueler_base.lua",
+                r#"
+            ---@class Entity
+            ---@return Entity
+            function Entity:GetParent() end
+
+            ---@class Player: Entity
+            ---@return TraceResult
+            function Player:GetEyeTrace() end
+
+            ---@class TraceResult
+            ---@field Entity Entity
+
+            ---@class ENT: Entity
+            ---@class base_glide: ENT
+            ---@field IsGlideVehicle boolean
+            ---@class base_glide_car: base_glide
+            ---@class fl_bmw_i3: base_glide_car
+
+            ---@return Player?
+            function SWEP:GetOwner() end
+
+            function SWEP:Deploy()
+                Glide.RefuelerHUDWeapon = self
+            end
+
+            function SWEP:StartFueling()
+                if CLIENT then return end
+                local vehicle = nil
+                vehicle = select(1, self:GetTargetVehicle())
+                if not IsValid(vehicle) then return end
+                self.activeVehicle = vehicle
+            end
+
+            local function resolveVehicle(ent)
+                if not IsValid(ent) then return nil end
+                if ent.IsGlideVehicle then return ent end
+
+                local parent = ent:GetParent()
+                if IsValid(parent) and parent.IsGlideVehicle then
+                    return parent
+                end
+
+                return nil
+            end
+
+            function SWEP:GetTargetVehicle()
+                local owner = self:GetOwner()
+                if not IsValid(owner) then return nil, nil end
+
+                local trace = owner:GetEyeTrace()
+                local vehicle = resolveVehicle(trace.Entity)
+                return vehicle, trace
+            end
+
+            ---@realm server
+            function SWEP:CancelFueling()
+                self.activeVehicle = nil
+                if Glide.RefuelerHUDWeapon == self then
+                    Glide.RefuelerHUDWeapon = nil
+                end
+            end
+
+            ---@realm shared
+            function SWEP:Holster()
+                self.activeVehicle = nil
+                if Glide.RefuelerHUDWeapon == self then
+                    Glide.RefuelerHUDWeapon = nil
+                end
+            end
+
+            ---@realm client
+            if CLIENT then
+                local function draw()
+                    local wep = Glide.RefuelerHUDWeapon
+                    if not IsValid(wep) then return end
+
+                    local veh = wep.activeVehicle
+                end
+            end
+            "#,
+            ),
+        ]);
+        let file_id = file_ids[1];
+
+        let assigned_member_id = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let active_vehicle_assignment = semantic_model
+                .get_root()
+                .descendants::<glua_parser::LuaAssignStat>()
+                .find_map(|assign_stat| {
+                    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+                    vars.iter()
+                        .enumerate()
+                        .find(|(_, var)| var.syntax().text() == "self.activeVehicle")
+                        .and_then(|(idx, var)| {
+                            let expr = exprs.get(idx)?;
+                            (expr.syntax().text() == "vehicle").then(|| var.clone())
+                        })
+                })
+                .expect("expected self.activeVehicle = vehicle assignment");
+
+            LuaMemberId::new(active_vehicle_assignment.get_syntax_id(), file_id)
+        };
+        let assigned_type = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_type_cache(&assigned_member_id.into())
+            .expect("expected activeVehicle assignment type")
+            .as_type()
+            .clone();
+        let assigned_desc = ws.humanize_type(assigned_type);
+        assert_that!(
+            assigned_desc.as_str(),
+            contains_substring("base_glide"),
+            "self.activeVehicle = vehicle cache should keep the resolved guarded vehicle type, got {}",
+            assigned_desc
+        );
+        assert_that!(
+            assigned_desc.as_str(),
+            not(any!(eq("nil"), eq("any"), eq("unknown"))),
+            "self.activeVehicle = vehicle cache should not fossilize a weak early RHS type"
+        );
+
+        let rhs_type = local_assignment_value_type(&mut ws, file_id, "veh");
+        let rhs_desc = ws.humanize_type(rhs_type);
+        assert_that!(
+            rhs_desc.as_str(),
+            all!(contains_substring("base_glide"), contains_substring("?")),
+            "activeVehicle read should union all visible assignments, got {}",
+            rhs_desc
+        );
+
+        let semantic_decl = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let active_vehicle_expr = semantic_model
+                .get_root()
+                .descendants::<glua_parser::LuaIndexExpr>()
+                .find(|index_expr| index_expr.syntax().text() == "wep.activeVehicle")
+                .expect("expected activeVehicle index expression");
+            semantic_model
+                .get_semantic_info(active_vehicle_expr.syntax().clone().into())
+                .expect("expected semantic info for activeVehicle")
+                .semantic_decl
+                .expect("expected activeVehicle semantic declaration")
+        };
+        let decl_type = match semantic_decl {
+            crate::LuaSemanticDeclId::Member(member_id) => ws
+                .get_db_mut()
+                .get_type_index()
+                .get_type_cache(&member_id.into())
+                .expect("expected member type")
+                .as_type()
+                .clone(),
+            other => panic!("expected member semantic declaration, got {other:?}"),
+        };
+        let decl_desc = ws.humanize_type(decl_type);
+        assert_that!(
+            decl_desc.as_str(),
+            not(eq("nil")),
+            "activeVehicle semantic declaration should not point at a nil-only assignment"
+        );
+
+        let veh_type = local_name_type(&mut ws, file_id, "veh");
+        let veh_desc = ws.humanize_type(veh_type);
+        assert_that!(
+            veh_desc.as_str(),
+            all!(contains_substring("base_glide"), contains_substring("?")),
+            "local veh should retain the activeVehicle assignment union, got {}",
+            veh_desc
+        );
+    }
+
+    #[gtest]
+    fn test_scripted_weapon_same_function_member_read_uses_latest_assignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/weapons/glide_refueler_base.lua",
+            r#"
+            ---@class ENT
+            ---@class base_glide: ENT
+
+            function SWEP:Test(vehicle)
+                self.activeVehicle = nil
+                self.activeVehicle = vehicle
+                local veh = self.activeVehicle
+            end
+            "#,
+        );
+
+        let veh_type = local_name_type(&mut ws, file_id, "veh");
+        let veh_desc = ws.humanize_type(veh_type);
+        assert_that!(
+            veh_desc.as_str(),
+            not(contains_substring("nil")),
+            "same-function field flow should keep the latest assignment precise, got {}",
+            veh_desc
+        );
+    }
+
+    #[gtest]
+    fn test_scripted_weapon_field_semantic_decl_prefers_informative_history() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/sh_glide.lua",
+                r#"
+                ---@class Glide
+                Glide = Glide or {}
+                "#,
+            ),
+            (
+                "lua/weapons/glide_refueler_base.lua",
+                r#"
+            ---@class ENT
+            ---@class base_glide: ENT
+
+            function SWEP:Deploy()
+                Glide.RefuelerHUDWeapon = self
+            end
+
+            ---@realm shared
+            function SWEP:Reset()
+                self.activeVehicle = nil
+            end
+
+            ---@param vehicle base_glide
+            function SWEP:StartFueling(vehicle)
+                if CLIENT then return end
+                if not IsValid(vehicle) then return end
+                self.activeVehicle = vehicle
+            end
+
+            ---@realm client
+            if CLIENT then
+                local function draw()
+                    local wep = Glide.RefuelerHUDWeapon
+                    if not IsValid(wep) then return end
+
+                    local veh = wep.activeVehicle
+                end
+            end
+            "#,
+            ),
+        ]);
+        let file_id = file_ids[1];
+
+        let semantic_decl = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let active_vehicle_expr = semantic_model
+                .get_root()
+                .descendants::<glua_parser::LuaIndexExpr>()
+                .find(|index_expr| index_expr.syntax().text() == "wep.activeVehicle")
+                .expect("expected activeVehicle index expression");
+            semantic_model
+                .get_semantic_info(active_vehicle_expr.syntax().clone().into())
+                .expect("expected semantic info for activeVehicle")
+                .semantic_decl
+                .expect("expected activeVehicle semantic declaration")
+        };
+        let decl_type = match semantic_decl {
+            crate::LuaSemanticDeclId::Member(member_id) => ws
+                .get_db_mut()
+                .get_type_index()
+                .get_type_cache(&member_id.into())
+                .expect("expected member type")
+                .as_type()
+                .clone(),
+            other => panic!("expected member semantic declaration, got {other:?}"),
+        };
+        let decl_desc = ws.humanize_type(decl_type);
+        assert_that!(
+            decl_desc.as_str(),
+            contains_substring("base_glide"),
+            "semantic declaration should prefer informative assignment history, got {}",
+            decl_desc
         );
     }
 

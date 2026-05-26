@@ -94,7 +94,14 @@ impl LuaMemberIndexItem {
         let member_ids = self.get_member_ids();
         let mut visible_member_ids =
             visible_member_ids_at_offset(db, &member_ids, caller_file_id, caller_position);
-        if visible_member_ids.is_empty() {
+        if visible_member_ids.is_empty()
+            || should_expand_function_assignment_history(
+                db,
+                &visible_member_ids,
+                caller_file_id,
+                caller_position,
+            )
+        {
             let historical_member_ids =
                 expand_member_ids_with_owner_key_history(db, member_ids.clone());
             if historical_member_ids != member_ids {
@@ -122,6 +129,93 @@ impl LuaMemberIndexItem {
             LuaMemberIndexItem::Many(member_ids) => member_ids.clone(),
         }
     }
+}
+
+fn should_expand_function_assignment_history(
+    db: &DbIndex,
+    member_ids: &[LuaMemberId],
+    caller_file_id: &FileId,
+    caller_position: TextSize,
+) -> bool {
+    member_ids.iter().copied().any(|member_id| {
+        is_function_scoped_assignment_file_define(db, member_id)
+            && !member_assignment_shares_enclosing_function(
+                db,
+                member_id,
+                caller_file_id,
+                caller_position,
+            )
+    })
+}
+
+fn is_function_scoped_assignment_file_define(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    let Some(member) = db.get_member_index().get_member(&member_id) else {
+        return false;
+    };
+    if !member.get_feature().is_file_define()
+        || member.get_syntax_id().get_kind() != glua_parser::LuaSyntaxKind::IndexExpr
+    {
+        return false;
+    }
+
+    let Some(root) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+        return false;
+    };
+    let root = root.get_red_root();
+    let Some(token) = root
+        .token_at_offset(member.get_range().start())
+        .right_biased()
+    else {
+        return false;
+    };
+
+    token.parent_ancestors().any(|ancestor| {
+        matches!(
+            ancestor.kind().into(),
+            glua_parser::LuaSyntaxKind::FuncStat
+                | glua_parser::LuaSyntaxKind::LocalFuncStat
+                | glua_parser::LuaSyntaxKind::ClosureExpr
+        )
+    })
+}
+
+fn member_assignment_shares_enclosing_function(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    caller_file_id: &FileId,
+    caller_position: TextSize,
+) -> bool {
+    if member_id.file_id != *caller_file_id {
+        return false;
+    }
+
+    let Some(member) = db.get_member_index().get_member(&member_id) else {
+        return false;
+    };
+    let member_function =
+        enclosing_function_range_at_position(db, member_id.file_id, member.get_range().start());
+    let caller_function =
+        enclosing_function_range_at_position(db, *caller_file_id, caller_position);
+
+    member_function.is_some() && member_function == caller_function
+}
+
+fn enclosing_function_range_at_position(
+    db: &DbIndex,
+    file_id: FileId,
+    position: TextSize,
+) -> Option<rowan::TextRange> {
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
+    let token = root.token_at_offset(position).right_biased()?;
+    token.parent_ancestors().find_map(|ancestor| {
+        matches!(
+            ancestor.kind().into(),
+            glua_parser::LuaSyntaxKind::FuncStat
+                | glua_parser::LuaSyntaxKind::LocalFuncStat
+                | glua_parser::LuaSyntaxKind::ClosureExpr
+        )
+        .then(|| ancestor.text_range())
+    })
 }
 
 fn visible_member_ids_at_offset(
@@ -804,8 +898,51 @@ fn select_member_ids_by_workspace_and_realm(
         return fallback_member_ids;
     }
 
+    supplement_function_assignment_shape_members(db, &fallback_member_ids, &mut result);
+
     sort_member_ids_for_caller(db, caller_realm, &mut result);
     result
+}
+
+fn supplement_function_assignment_shape_members(
+    db: &DbIndex,
+    fallback_member_ids: &[LuaMemberId],
+    result: &mut Vec<LuaMemberId>,
+) {
+    if result.is_empty()
+        || !result
+            .iter()
+            .all(|member_id| member_type_is_uninformative(db, *member_id))
+    {
+        return;
+    }
+
+    let supplements = fallback_member_ids
+        .iter()
+        .copied()
+        .filter(|member_id| !result.contains(member_id))
+        .filter(|member_id| is_function_scoped_assignment_file_define(db, *member_id))
+        .filter(|member_id| !member_type_is_uninformative(db, *member_id))
+        .collect::<Vec<_>>();
+    result.extend(supplements);
+}
+
+fn member_type_is_uninformative(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    db.get_type_index()
+        .get_type_cache(&member_id.into())
+        .is_none_or(|cache| type_is_uninformative(cache.as_type()))
+}
+
+fn type_is_uninformative(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
+        LuaType::Union(union) => union.into_vec().iter().all(type_is_uninformative),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(typ, _)| type_is_uninformative(typ)),
+        _ => false,
+    }
 }
 
 fn sort_member_ids_for_caller(
@@ -1003,14 +1140,7 @@ fn resolve_member_semantic_id(
                     Some(last_valid_member)
                 }
                 MemberSemanticDeclResolveState::FirstDefine => {
-                    for member in &members {
-                        let feature = member.get_feature();
-                        if feature.is_file_define() {
-                            return Some(LuaSemanticDeclId::Member(member.get_id()));
-                        }
-                    }
-
-                    None
+                    resolve_file_define_semantic_member(db, &members)
                 }
                 MemberSemanticDeclResolveState::FileDecl => {
                     for member in &members {
@@ -1025,6 +1155,25 @@ fn resolve_member_semantic_id(
             }
         }
     }
+}
+
+fn resolve_file_define_semantic_member(
+    db: &DbIndex,
+    members: &[&crate::LuaMember],
+) -> Option<LuaSemanticDeclId> {
+    let file_defines = members
+        .iter()
+        .copied()
+        .filter(|member| member.get_feature().is_file_define())
+        .collect::<Vec<_>>();
+
+    let informative = file_defines
+        .iter()
+        .copied()
+        .find(|member| !member_type_is_uninformative(db, member.get_id()));
+    informative
+        .or_else(|| file_defines.first().copied())
+        .map(|member| LuaSemanticDeclId::Member(member.get_id()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -18,7 +18,7 @@ use crate::{
     LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel,
     SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
-        common::{add_member, bind_type},
+        common::{add_member, bind_resolved_type},
         lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
         unresolve::UnResolveSpecialCall,
     },
@@ -56,7 +56,7 @@ pub fn try_resolve_decl(
         _ => expr_type,
     };
 
-    bind_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
+    bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
     Ok(())
 }
 
@@ -147,7 +147,7 @@ pub fn try_resolve_member(
         };
 
         let member_id = unresolve_member.member_id;
-        bind_type(db, member_id.into(), LuaTypeCache::InferType(expr_type));
+        bind_resolved_type(db, member_id.into(), LuaTypeCache::InferType(expr_type));
     }
 
     Ok(())

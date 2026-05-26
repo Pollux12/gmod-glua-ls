@@ -16,8 +16,9 @@ use std::{
 };
 
 use crate::{
-    AsyncState, Emmyrc, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaFunctionType,
-    LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, WorkspaceId,
+    AsyncState, Emmyrc, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId,
+    LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache,
+    WorkspaceId,
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
 };
@@ -249,6 +250,7 @@ pub struct AnalyzeContext {
     scripted_scope_files: Option<Arc<HashSet<FileId>>>,
     scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
+    pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     stabilization_candidates: HashSet<FileId>,
     infer_manager: InferCacheManager,
     pub workspace_id: Option<WorkspaceId>,
@@ -263,6 +265,7 @@ impl AnalyzeContext {
             scripted_scope_files: None,
             scripted_scope_infos: None,
             unresolves: Vec::new(),
+            pending_unresolve_decl_ids: HashSet::new(),
             stabilization_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
             workspace_id: None,
@@ -278,7 +281,14 @@ impl AnalyzeContext {
     }
 
     pub fn add_unresolve(&mut self, un_resolve: UnResolve, reason: InferFailReason) {
+        if let UnResolve::Decl(decl) = &un_resolve {
+            self.pending_unresolve_decl_ids.insert(decl.decl_id);
+        }
         self.unresolves.push((un_resolve, reason));
+    }
+
+    pub fn has_pending_decl_unresolve(&self, decl_id: LuaDeclId) -> bool {
+        self.pending_unresolve_decl_ids.contains(&decl_id)
     }
 
     pub fn request_stabilization(&mut self, file_id: FileId) {
