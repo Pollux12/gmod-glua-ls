@@ -58,6 +58,7 @@ pub struct LuaInferCache {
     /// full iterator inference from the enclosing `for` statement.
     pub for_range_iter_var_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
     pub local_reassignment_positions_cache: FxHashMap<LuaDeclId, Vec<TextSize>>,
+    pub local_reassignments_indexed: bool,
     pub dynamic_field_metatable_cache: FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>,
     pub dynamic_field_global_metatable_cache:
         FxHashMap<(VarRefId, TextRange), Vec<(TextRange, LuaType)>>,
@@ -164,6 +165,7 @@ impl LuaInferCache {
             decl_cache: FxHashMap::default(),
             for_range_iter_var_type_cache: FxHashMap::default(),
             local_reassignment_positions_cache: FxHashMap::default(),
+            local_reassignments_indexed: false,
             dynamic_field_metatable_cache: FxHashMap::default(),
             dynamic_field_global_metatable_cache: FxHashMap::default(),
             dynamic_field_resolution_cache: FxHashMap::default(),
@@ -288,6 +290,7 @@ impl LuaInferCache {
         self.decl_cache.clear();
         self.for_range_iter_var_type_cache.clear();
         self.local_reassignment_positions_cache.clear();
+        self.local_reassignments_indexed = false;
         self.dynamic_field_metatable_cache.clear();
         self.dynamic_field_global_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();

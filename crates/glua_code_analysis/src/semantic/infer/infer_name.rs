@@ -277,15 +277,8 @@ fn has_local_reassignment_between(
         return false;
     }
 
-    if !cache
-        .local_reassignment_positions_cache
-        .contains_key(&decl_id)
-    {
-        let positions =
-            collect_local_reassignment_positions(db, cache, decl_id, profile_start.is_some());
-        cache
-            .local_reassignment_positions_cache
-            .insert(decl_id, positions);
+    if !cache.local_reassignments_indexed {
+        collect_local_reassignment_positions(db, cache, profile_start.is_some());
     }
 
     let result = cache
@@ -301,29 +294,25 @@ fn has_local_reassignment_between(
 fn collect_local_reassignment_positions(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    decl_id: LuaDeclId,
     profile_enabled: bool,
-) -> Vec<TextSize> {
+) {
+    cache.local_reassignments_indexed = true;
+    let file_id = cache.get_file_id();
     let Some(root) = db
         .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)
+        .get_syntax_tree(&file_id)
         .map(|tree| tree.get_red_root())
     else {
-        return Vec::new();
+        return;
     };
 
-    let references = db
-        .get_reference_index()
-        .get_local_reference(&decl_id.file_id);
-    let mut positions = Vec::new();
+    let references = db.get_reference_index().get_local_reference(&file_id);
+    let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
     for assign_stat in root.descendants().filter_map(LuaAssignStat::cast) {
         if profile_enabled {
             cache.prof_local_reassign_assign_scans += 1;
         }
         let position = assign_stat.get_position();
-        if position <= decl_id.position {
-            continue;
-        }
 
         let (vars, _) = assign_stat.get_var_and_expr_list();
         for var in vars {
@@ -334,20 +323,28 @@ fn collect_local_reassignment_positions(
                 continue;
             };
 
-            if references
+            let assigned_decl_id = references
                 .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
-                .is_some_and(|assigned_decl_id| assigned_decl_id == decl_id)
-                || assignment_name_resolves_to_decl(db, decl_id, &name_expr)
-            {
-                positions.push(position);
-                break;
+                .or_else(|| assignment_name_decl_id(decl_tree, &name_expr));
+            let Some(assigned_decl_id) = assigned_decl_id else {
+                continue;
+            };
+            if assigned_decl_id.file_id != file_id || position <= assigned_decl_id.position {
+                continue;
             }
+
+            cache
+                .local_reassignment_positions_cache
+                .entry(assigned_decl_id)
+                .or_default()
+                .push(position);
         }
     }
 
-    positions.sort_unstable();
-    positions.dedup();
-    positions
+    for positions in cache.local_reassignment_positions_cache.values_mut() {
+        positions.sort_unstable();
+        positions.dedup();
+    }
 }
 
 fn finish_local_reassignment_profile(
@@ -363,19 +360,17 @@ fn finish_local_reassignment_profile(
     }
 }
 
-fn assignment_name_resolves_to_decl(
-    db: &DbIndex,
-    decl_id: LuaDeclId,
+fn assignment_name_decl_id(
+    decl_tree: Option<&crate::LuaDeclarationTree>,
     name_expr: &LuaNameExpr,
-) -> bool {
+) -> Option<LuaDeclId> {
     let Some(name) = name_expr.get_name_text() else {
-        return false;
+        return None;
     };
 
-    db.get_decl_index()
-        .get_decl_tree(&decl_id.file_id)
+    decl_tree
         .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
-        .is_some_and(|decl| decl.get_id() == decl_id)
+        .map(|decl| decl.get_id())
 }
 
 fn try_infer_local_initializer_type(
