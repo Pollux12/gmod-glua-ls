@@ -2272,7 +2272,7 @@ _2 = a[1]
     }
 
     #[test]
-    fn test_local_cached_isvalid_keeps_unknown_unknown() {
+    fn test_local_cached_isvalid_promotes_unknown_to_any() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -2291,7 +2291,7 @@ _2 = a[1]
         );
 
         let a = ws.expr_ty("a");
-        assert_eq!(a, LuaType::Unknown);
+        assert_eq!(a, LuaType::Any);
     }
 
     #[test]

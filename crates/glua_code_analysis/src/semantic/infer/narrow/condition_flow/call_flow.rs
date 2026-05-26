@@ -825,13 +825,21 @@ fn try_narrow_isvalid(
     let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
 
     let result_type = match condition_flow {
-        InferConditionFlow::TrueCondition => {
-            remove_gmod_null_type(db, remove_false_or_nil(antecedent_type))
-        }
+        InferConditionFlow::TrueCondition => promote_unknown_isvalid_success_to_any(
+            remove_gmod_null_type(db, remove_false_or_nil(antecedent_type)),
+        ),
         InferConditionFlow::FalseCondition => antecedent_type,
     };
 
     Ok(Some(result_type))
+}
+
+fn promote_unknown_isvalid_success_to_any(narrowed_type: LuaType) -> LuaType {
+    if narrowed_type.is_unknown() {
+        LuaType::Any
+    } else {
+        narrowed_type
+    }
 }
 
 /// Known GMod type-checking function names handled by name-based narrowing fallback.

@@ -5077,6 +5077,57 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_isvalid_guard_promotes_hard_nil_local_to_any_after_early_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            local veh = nil
+            if not IsValid(veh) then return end
+
+            local narrowed = veh
+            print(narrowed)
+            "#,
+        );
+
+        let narrowed_type = local_name_type(&mut ws, file_id, "narrowed");
+        assert_eq!(
+            narrowed_type,
+            LuaType::Any,
+            "a successful IsValid guard proves even a previously hard-nil local is usable"
+        );
+    }
+
+    #[test]
+    fn test_isvalid_alias_guard_promotes_hard_nil_local_to_any_after_early_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            local iv = IsValid
+            local veh = nil
+            if not iv(veh) then return end
+
+            local narrowed = veh
+            print(narrowed)
+            "#,
+        );
+
+        let narrowed_type = local_name_type(&mut ws, file_id, "narrowed");
+        assert_eq!(
+            narrowed_type,
+            LuaType::Any,
+            "an aliased successful IsValid guard should also promote a hard-nil local"
+        );
+    }
+
     #[gtest]
     fn test_gmod_self_index_local_unknown_reassignment_does_not_fall_back_to_initializer() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
