@@ -142,6 +142,13 @@ impl DynamicFieldAnalysisMode {
     fn propagate_to_super_types(self) -> bool {
         matches!(self, Self::Full)
     }
+
+    fn collects_only_declared_member_table_fields(self) -> bool {
+        self.collect_declared_member_table_fields()
+            && !self.collect_direct_assignments()
+            && !self.collect_setmetatable_tables()
+            && !self.propagate_to_super_types()
+    }
 }
 
 fn analyze_dynamic_fields(
@@ -186,6 +193,12 @@ fn analyze_dynamic_fields(
                 };
                 if let Some(profile) = profile.as_mut() {
                     profile.index_candidates += 1;
+                }
+                let value_expr = exprs.get(idx);
+                if mode.collects_only_declared_member_table_fields()
+                    && !matches!(value_expr, Some(LuaExpr::TableExpr(_)))
+                {
+                    continue;
                 }
                 let Some(prefix_expr) = index_expr.get_prefix_expr() else {
                     continue;
@@ -252,7 +265,7 @@ fn analyze_dynamic_fields(
                         profile.fields_collected += 1;
                     }
                     if mode.collect_declared_member_table_fields()
-                        && let Some(value_expr) = exprs.get(idx)
+                        && let Some(value_expr) = value_expr
                     {
                         collect_assigned_table_fields_for_declared_member(
                             &*db,
