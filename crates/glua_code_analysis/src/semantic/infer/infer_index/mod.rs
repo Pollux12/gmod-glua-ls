@@ -138,6 +138,10 @@ fn infer_member_type_pass_flow(
     // prefix_type: &LuaType,
     member_type: LuaType,
 ) -> InferResult {
+    if !index_expr_has_flow_node(db, cache, &index_expr) {
+        return Ok(member_type);
+    }
+
     let Some(var_ref_id) = get_index_expr_var_ref_id(db, cache, &index_expr) else {
         return Ok(member_type.clone());
     };
@@ -158,6 +162,10 @@ fn infer_member_type_fallback_pass_flow(
     index_expr: LuaIndexExpr,
     unknown_truthy_as_any: bool,
 ) -> InferResult {
+    if !index_expr_has_flow_node(db, cache, &index_expr) {
+        return Err(InferFailReason::FieldNotFound);
+    }
+
     let Some(var_ref_id) = get_index_expr_var_ref_id(db, cache, &index_expr) else {
         return Err(InferFailReason::FieldNotFound);
     };
@@ -171,6 +179,16 @@ fn infer_member_type_fallback_pass_flow(
         Ok(_) | Err(InferFailReason::None) => Err(InferFailReason::FieldNotFound),
         Err(err) => Err(err),
     }
+}
+
+fn index_expr_has_flow_node(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    db.get_flow_index()
+        .get_flow_tree(&cache.get_file_id())
+        .is_some_and(|flow_tree| flow_tree.get_flow_id(index_expr.get_syntax_id()).is_some())
 }
 
 pub fn get_index_expr_var_ref_id(
