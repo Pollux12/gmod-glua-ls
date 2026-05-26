@@ -1,9 +1,12 @@
 use crate::{
     CacheEntry, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId,
     LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
-    compilation::analyzer::{
-        common::{add_member, bind_type},
-        unresolve::{UnResolveDecl, UnResolveMember},
+    compilation::{
+        analyzer::{
+            common::{add_member, bind_type},
+            unresolve::{UnResolveDecl, UnResolveMember},
+        },
+        get_scripted_class_type_decl_id,
     },
     db_index::{LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType},
     semantic::member_key_matches_type,
@@ -379,59 +382,27 @@ fn get_var_owner(analyzer: &mut LuaAnalyzer, var: LuaVarExpr) -> LuaTypeOwner {
 }
 
 fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Option<()> {
-    let file_id = analyzer.file_id;
     let index_expr = LuaIndexExpr::cast(var_expr.syntax().clone())?;
     let prefix_expr = index_expr.get_prefix_expr()?;
+
+    if let Some((member_owner, set_owner_only)) =
+        try_resolve_scoped_class_prefix_member_owner(analyzer, &prefix_expr)
+    {
+        apply_index_expr_member_owner(analyzer, index_expr, member_owner, set_owner_only);
+        return Some(());
+    }
+
     match analyzer.infer_expr(&prefix_expr.clone()) {
         Ok(prefix_type) => {
-            let index_key = index_expr.get_index_key()?;
-            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
             let (member_owner, set_owner_only) = resolve_index_expr_member_owner(&prefix_type)?;
-            if analyzer
-                .db
-                .get_member_index()
-                .get_member(&member_id)
-                .is_none()
-            {
-                let cache = analyzer
-                    .context
-                    .infer_manager
-                    .get_infer_cache(analyzer.file_id);
-                let Ok(member_key) =
-                    LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
-                else {
-                    return Some(());
-                };
-                let decl_feature = if analyzer.context.metas.contains(&analyzer.file_id) {
-                    LuaMemberFeature::MetaDefine
-                } else {
-                    LuaMemberFeature::FileDefine
-                };
-                let member = LuaMember::new(member_id, member_key, decl_feature, None);
-                analyzer
-                    .db
-                    .get_member_index_mut()
-                    .add_member(member_owner, member);
-                return Some(());
-            }
-
-            if set_owner_only {
-                analyzer.db.get_member_index_mut().set_member_owner(
-                    member_owner,
-                    member_id.file_id,
-                    member_id,
-                );
-                return Some(());
-            }
-
-            add_member(analyzer.db, member_owner, member_id);
+            apply_index_expr_member_owner(analyzer, index_expr, member_owner, set_owner_only);
         }
         Err(InferFailReason::None) => {}
         Err(reason) => {
             // record unresolve
             let unresolve_member = UnResolveMember {
                 file_id: analyzer.file_id,
-                member_id: LuaMemberId::new(var_expr.get_syntax_id(), file_id),
+                member_id: LuaMemberId::new(var_expr.get_syntax_id(), analyzer.file_id),
                 expr: None,
                 prefix: Some(prefix_expr),
                 ret_idx: 0,
@@ -441,6 +412,131 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
                 .add_unresolve(unresolve_member.into(), reason);
         }
     }
+
+    Some(())
+}
+
+fn try_resolve_scoped_class_prefix_member_owner(
+    analyzer: &LuaAnalyzer,
+    prefix_expr: &LuaExpr,
+) -> Option<(LuaMemberOwner, bool)> {
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return None;
+    };
+
+    let name = name_expr.get_name_text()?;
+    let decl_tree = analyzer
+        .db
+        .get_decl_index()
+        .get_decl_tree(&analyzer.file_id)?;
+    if name != "self" {
+        if !name_expr_resolves_to_seeded_class_local(analyzer, name_expr) {
+            return None;
+        }
+
+        return scoped_class_global_member_owner(analyzer, &name).map(|owner| (owner, false));
+    }
+
+    let self_decl = decl_tree.find_local_decl("self", name_expr.get_position())?;
+    if !self_decl.is_implicit_self() {
+        return None;
+    }
+
+    let func_stat = name_expr.ancestors::<LuaFuncStat>().next()?;
+    let LuaVarExpr::IndexExpr(func_name) = func_stat.get_func_name()? else {
+        return None;
+    };
+    if !func_name.get_index_token()?.is_colon() {
+        return None;
+    }
+
+    let LuaExpr::NameExpr(class_name_expr) = func_name.get_prefix_expr()? else {
+        return None;
+    };
+    let class_global = class_name_expr.get_name_text()?;
+    if !name_expr_resolves_to_seeded_class_local(analyzer, &class_name_expr) {
+        return None;
+    }
+
+    scoped_class_global_member_owner(analyzer, &class_global).map(|owner| (owner, false))
+}
+
+fn name_expr_resolves_to_seeded_class_local(
+    analyzer: &LuaAnalyzer,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    analyzer
+        .db
+        .get_reference_index()
+        .get_local_reference(&analyzer.file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .and_then(|decl_id| analyzer.db.get_decl_index().get_decl(&decl_id))
+        .is_some_and(|decl| decl.is_seeded_class_local())
+}
+
+fn scoped_class_global_member_owner(analyzer: &LuaAnalyzer, name: &str) -> Option<LuaMemberOwner> {
+    if !analyzer.db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let info = analyzer
+        .db
+        .get_gmod_infer_index()
+        .get_scoped_class_info(&analyzer.file_id)?;
+    (info.global_name == name).then(|| {
+        LuaMemberOwner::Type(get_scripted_class_type_decl_id(
+            &info.global_name,
+            &info.class_name,
+        ))
+    })
+}
+
+fn apply_index_expr_member_owner(
+    analyzer: &mut LuaAnalyzer,
+    index_expr: LuaIndexExpr,
+    member_owner: LuaMemberOwner,
+    set_owner_only: bool,
+) -> Option<()> {
+    let index_key = index_expr.get_index_key()?;
+    let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+    if analyzer
+        .db
+        .get_member_index()
+        .get_member(&member_id)
+        .is_none()
+    {
+        let cache = analyzer
+            .context
+            .infer_manager
+            .get_infer_cache(analyzer.file_id);
+        let Ok(member_key) =
+            LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
+        else {
+            return Some(());
+        };
+        let decl_feature = if analyzer.context.metas.contains(&analyzer.file_id) {
+            LuaMemberFeature::MetaDefine
+        } else {
+            LuaMemberFeature::FileDefine
+        };
+        let member = LuaMember::new(member_id, member_key, decl_feature, None);
+        analyzer
+            .db
+            .get_member_index_mut()
+            .add_member(member_owner, member);
+        return Some(());
+    }
+
+    if set_owner_only {
+        analyzer.db.get_member_index_mut().set_member_owner(
+            member_owner,
+            member_id.file_id,
+            member_id,
+        );
+        return Some(());
+    }
+
+    add_member(analyzer.db, member_owner, member_id);
 
     Some(())
 }

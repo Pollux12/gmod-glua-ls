@@ -606,6 +606,79 @@ mod test {
     }
 
     #[gtest]
+    fn test_entity_scope_shadowed_ent_assignment_does_not_bind_scoped_class_member() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "entities/entities/shadowed_ent/init.lua",
+            r#"
+            local ENT = {}
+            ENT.LocalOnly = 1
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let member_names: Vec<_> = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("shadowed_ent")))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            !member_names.contains(&"LocalOnly".to_string()),
+            "shadowed local ENT assignment should not bind to scripted class members: {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_entity_scope_shadowed_ent_method_self_does_not_bind_scoped_class_member() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "entities/entities/shadowed_method_ent/init.lua",
+            r#"
+            local ENT = {}
+            function ENT:Build()
+                self.LocalOnly = 1
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let member_names: Vec<_> = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global(
+                "shadowed_method_ent",
+            )))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            !member_names.contains(&"Build".to_string())
+                && !member_names.contains(&"LocalOnly".to_string()),
+            "shadowed local ENT method should not bind to scripted class members: {member_names:?}"
+        );
+    }
+
+    #[gtest]
     fn test_entity_scope_creates_class_decl_without_ent_base_assignment() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, ops::Deref};
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey,
@@ -233,6 +233,16 @@ fn get_type_at_flow_walk(
                 );
 
                 if !can_match_assignment {
+                    if let Some(merged_type) =
+                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
+                    {
+                        return Ok(merged_type);
+                    }
+                    antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    continue;
+                }
+
+                if assignment_flow_info_cannot_match(tree, antecedent_flow_id, var_ref_id) {
                     if let Some(merged_type) =
                         try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
                     {
@@ -1022,6 +1032,28 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+fn assignment_flow_info_cannot_match(
+    tree: &FlowTree,
+    flow_id: FlowId,
+    var_ref_id: &VarRefId,
+) -> bool {
+    let VarRefId::IndexRef(_, query_path) = var_ref_id else {
+        return false;
+    };
+
+    let Some(info) = tree.get_assignment_flow_info(flow_id) else {
+        return false;
+    };
+    if info.has_unknown_index_target {
+        return false;
+    }
+
+    !info
+        .index_paths
+        .iter()
+        .any(|path| path.deref().as_str() == query_path.deref().as_str())
 }
 
 #[allow(clippy::too_many_arguments)]

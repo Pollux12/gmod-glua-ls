@@ -1625,7 +1625,9 @@ fn collect_scripted_scope_type_bindings_with(
                 continue;
             }
 
-            if decl.is_local() || decl.is_global() {
+            let is_scoped_local = decl.is_local()
+                && (decl.is_seeded_class_local() || scope_match.global_name == "PLUGIN");
+            if is_scoped_local || decl.is_global() {
                 decls.push((decl.get_id(), decl.get_range()));
             }
         }

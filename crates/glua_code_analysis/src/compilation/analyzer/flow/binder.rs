@@ -6,8 +6,8 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    AnalyzeError, AssignVarHint, BranchLabelInfo, DbIndex, FileId, FlowAntecedent, FlowId,
-    FlowNode, FlowNodeKind, FlowTree, LuaClosureId, LuaDeclId,
+    AnalyzeError, AssignVarHint, AssignmentFlowInfo, BranchLabelInfo, DbIndex, FileId,
+    FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, LuaClosureId, LuaDeclId,
 };
 
 /// Snapshot of the modification counters, used to detect what was created
@@ -37,6 +37,7 @@ pub struct FlowBinder<'a> {
     goto_stats: Vec<GotoCache>,
     bindings: HashMap<LuaSyntaxId, FlowId>,
     branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+    assignment_flow_info: Vec<AssignmentFlowInfo>,
     // Counters for tracking modifications inside branch blocks.
     name_assign_count: u32,
     index_assign_count: u32,
@@ -62,6 +63,7 @@ impl<'a> FlowBinder<'a> {
             true_target: FlowId::default(),
             false_target: FlowId::default(),
             branch_label_info: HashMap::new(),
+            assignment_flow_info: Vec::new(),
             name_assign_count: 0,
             index_assign_count: 0,
             cast_or_implfunc_count: 0,
@@ -105,6 +107,8 @@ impl<'a> FlowBinder<'a> {
             antecedent: None,
         };
         self.flow_nodes.push(flow_node);
+        self.assignment_flow_info
+            .push(AssignmentFlowInfo::default());
         id
     }
 
@@ -247,6 +251,14 @@ impl<'a> FlowBinder<'a> {
         self.branch_label_info.insert(label_id, info);
     }
 
+    pub fn set_assignment_flow_info(&mut self, flow_id: FlowId, info: AssignmentFlowInfo) {
+        if !info.is_empty()
+            && let Some(slot) = self.assignment_flow_info.get_mut(flow_id.0 as usize)
+        {
+            *slot = info;
+        }
+    }
+
     pub fn report_error(&mut self, error: AnalyzeError) {
         self.db
             .get_diagnostic_index_mut()
@@ -261,6 +273,7 @@ impl<'a> FlowBinder<'a> {
             // self.labels,
             self.bindings,
             self.branch_label_info,
+            self.assignment_flow_info,
         )
     }
 }

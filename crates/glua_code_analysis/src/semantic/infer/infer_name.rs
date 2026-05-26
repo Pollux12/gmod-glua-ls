@@ -589,6 +589,16 @@ fn infer_scoped_implicit_self_type_inner(
         return None;
     };
     let prefix_name = prefix_name_expr.get_name_text()?;
+    let file_id = cache.get_file_id();
+    let prefix_decl = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&prefix_name_expr.get_range()))
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))?;
+    if !prefix_decl.is_seeded_class_local() {
+        return None;
+    }
+
     let class_decl_id = resolve_scoped_scripted_global_type_decl_id(db, cache, &prefix_name)?;
     Some(LuaType::Def(class_decl_id))
 }

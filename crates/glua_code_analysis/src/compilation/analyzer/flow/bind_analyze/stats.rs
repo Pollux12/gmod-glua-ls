@@ -2,11 +2,12 @@ use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBlock, LuaBreakStat, LuaCallArgList,
     LuaCallExprStat, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat, LuaFuncStat, LuaGotoStat,
     LuaIfStat, LuaLabelStat, LuaLocalStat, LuaRepeatStat, LuaReturnStat, LuaVarExpr, LuaWhileStat,
+    PathTrait,
 };
 
 use crate::{
-    AnalyzeError, AssignVarHint, BranchLabelInfo, DiagnosticCode, FlowId, FlowNodeKind,
-    LuaClosureId, LuaDeclId,
+    AnalyzeError, AssignVarHint, AssignmentFlowInfo, BranchLabelInfo, DiagnosticCode, FlowId,
+    FlowNodeKind, LuaClosureId, LuaDeclId,
     compilation::analyzer::flow::{
         bind_analyze::{
             bind_block, bind_each_child, bind_node,
@@ -98,11 +99,30 @@ pub fn bind_assign_stat(
         (false, true) => AssignVarHint::IndexOnly,
         _ => AssignVarHint::Mixed,
     };
+    let assignment_flow_info = collect_assignment_flow_info(&vars);
     let assignment_kind = FlowNodeKind::Assignment(assign_stat.to_ptr(), hint);
     let flow_id = binder.create_node(assignment_kind);
+    binder.set_assignment_flow_info(flow_id, assignment_flow_info);
     binder.add_antecedent(flow_id, current);
 
     flow_id
+}
+
+fn collect_assignment_flow_info(vars: &[LuaVarExpr]) -> AssignmentFlowInfo {
+    let mut info = AssignmentFlowInfo::default();
+    for var in vars {
+        let LuaVarExpr::IndexExpr(index_expr) = var else {
+            continue;
+        };
+
+        match index_expr.get_access_path() {
+            Some(path) => info
+                .index_paths
+                .push(internment::ArcIntern::from(smol_str::SmolStr::new(&path))),
+            None => info.has_unknown_index_target = true,
+        }
+    }
+    info
 }
 
 pub fn bind_call_expr_stat(
