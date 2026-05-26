@@ -186,7 +186,7 @@ pub(crate) fn try_local_decl_initializer_fallback_type(
     query_position: TextSize,
 ) -> Option<LuaType> {
     if current_type.is_never() {
-        if has_local_reassignment_between(db, decl_id, query_position) {
+        if has_local_reassignment_between(db, cache, decl_id, query_position) {
             return None;
         }
 
@@ -209,7 +209,7 @@ pub(crate) fn try_local_decl_initializer_fallback_type(
         return None;
     }
 
-    if has_local_reassignment_between(db, decl_id, query_position) {
+    if has_local_reassignment_between(db, cache, decl_id, query_position) {
         return None;
     }
 
@@ -229,7 +229,7 @@ fn try_infer_flow_sensitive_alias_initializer_type(
         return None;
     }
 
-    if has_local_reassignment_between(db, decl_id, query_position) {
+    if has_local_reassignment_between(db, cache, decl_id, query_position) {
         return None;
     }
 
@@ -261,28 +261,75 @@ fn try_infer_flow_sensitive_alias_initializer_type(
 
 fn has_local_reassignment_between(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     decl_id: LuaDeclId,
     query_position: TextSize,
 ) -> bool {
+    let profile_start = if log::log_enabled!(log::Level::Info) {
+        cache.prof_local_reassign_calls += 1;
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     if query_position <= decl_id.position {
+        finish_local_reassignment_profile(cache, profile_start, false);
         return false;
     }
 
-    let root = match db.get_vfs().get_syntax_tree(&decl_id.file_id) {
-        Some(tree) => tree.get_red_root(),
-        None => return false,
+    if !cache
+        .local_reassignment_positions_cache
+        .contains_key(&decl_id)
+    {
+        let positions =
+            collect_local_reassignment_positions(db, cache, decl_id, profile_start.is_some());
+        cache
+            .local_reassignment_positions_cache
+            .insert(decl_id, positions);
+    }
+
+    let result = cache
+        .local_reassignment_positions_cache
+        .get(&decl_id)
+        .and_then(|positions| positions.first())
+        .is_some_and(|position| *position < query_position);
+
+    finish_local_reassignment_profile(cache, profile_start, result);
+    result
+}
+
+fn collect_local_reassignment_positions(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+    profile_enabled: bool,
+) -> Vec<TextSize> {
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return Vec::new();
     };
+
     let references = db
         .get_reference_index()
         .get_local_reference(&decl_id.file_id);
+    let mut positions = Vec::new();
     for assign_stat in root.descendants().filter_map(LuaAssignStat::cast) {
+        if profile_enabled {
+            cache.prof_local_reassign_assign_scans += 1;
+        }
         let position = assign_stat.get_position();
-        if position <= decl_id.position || position >= query_position {
+        if position <= decl_id.position {
             continue;
         }
 
         let (vars, _) = assign_stat.get_var_and_expr_list();
         for var in vars {
+            if profile_enabled {
+                cache.prof_local_reassign_var_checks += 1;
+            }
             let LuaVarExpr::NameExpr(name_expr) = var else {
                 continue;
             };
@@ -292,12 +339,28 @@ fn has_local_reassignment_between(
                 .is_some_and(|assigned_decl_id| assigned_decl_id == decl_id)
                 || assignment_name_resolves_to_decl(db, decl_id, &name_expr)
             {
-                return true;
+                positions.push(position);
+                break;
             }
         }
     }
 
-    false
+    positions.sort_unstable();
+    positions.dedup();
+    positions
+}
+
+fn finish_local_reassignment_profile(
+    cache: &mut LuaInferCache,
+    profile_start: Option<std::time::Instant>,
+    hit: bool,
+) {
+    if let Some(start) = profile_start {
+        cache.prof_local_reassign_time_ns += start.elapsed().as_nanos() as u64;
+        if hit {
+            cache.prof_local_reassign_hits += 1;
+        }
+    }
 }
 
 fn assignment_name_resolves_to_decl(

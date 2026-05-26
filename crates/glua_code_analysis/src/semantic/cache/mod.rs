@@ -57,6 +57,7 @@ pub struct LuaInferCache {
     /// templated tables, each use of the loop value can otherwise re-run the
     /// full iterator inference from the enclosing `for` statement.
     pub for_range_iter_var_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
+    pub local_reassignment_positions_cache: FxHashMap<LuaDeclId, Vec<TextSize>>,
     pub dynamic_field_metatable_cache: FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>,
     pub dynamic_field_resolution_cache: FxHashMap<
         (LuaType, LuaMemberKey, Option<TextSize>),
@@ -97,6 +98,20 @@ pub struct LuaInferCache {
     pub prof_name_global_calls: u32,
     pub prof_name_self_calls: u32,
     pub prof_name_narrow_time_ns: u64,
+    pub prof_local_reassign_calls: u32,
+    pub prof_local_reassign_hits: u32,
+    pub prof_local_reassign_time_ns: u64,
+    pub prof_local_reassign_assign_scans: u64,
+    pub prof_local_reassign_var_checks: u64,
+    pub prof_assign_stat_calls: u32,
+    pub prof_assign_slots: u32,
+    pub prof_assign_special_hits: u32,
+    pub prof_assign_skip_nil_ns: u64,
+    pub prof_assign_get_owner_ns: u64,
+    pub prof_assign_special_ns: u64,
+    pub prof_assign_set_owner_ns: u64,
+    pub prof_assign_infer_rhs_ns: u64,
+    pub prof_assign_merge_ns: u64,
     // Expr cache profiling
     pub prof_expr_cache_removals: u32,
     pub prof_unique_inferred: u32,
@@ -146,6 +161,7 @@ impl LuaInferCache {
             self_type_cache: FxHashMap::default(),
             decl_cache: FxHashMap::default(),
             for_range_iter_var_type_cache: FxHashMap::default(),
+            local_reassignment_positions_cache: FxHashMap::default(),
             dynamic_field_metatable_cache: FxHashMap::default(),
             dynamic_field_resolution_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
@@ -177,6 +193,20 @@ impl LuaInferCache {
             prof_name_global_calls: 0,
             prof_name_self_calls: 0,
             prof_name_narrow_time_ns: 0,
+            prof_local_reassign_calls: 0,
+            prof_local_reassign_hits: 0,
+            prof_local_reassign_time_ns: 0,
+            prof_local_reassign_assign_scans: 0,
+            prof_local_reassign_var_checks: 0,
+            prof_assign_stat_calls: 0,
+            prof_assign_slots: 0,
+            prof_assign_special_hits: 0,
+            prof_assign_skip_nil_ns: 0,
+            prof_assign_get_owner_ns: 0,
+            prof_assign_special_ns: 0,
+            prof_assign_set_owner_ns: 0,
+            prof_assign_infer_rhs_ns: 0,
+            prof_assign_merge_ns: 0,
             prof_expr_cache_removals: 0,
             prof_unique_inferred: 0,
             prof_infer_expr_depth: 0,
@@ -254,6 +284,7 @@ impl LuaInferCache {
         self.self_type_cache.clear();
         self.decl_cache.clear();
         self.for_range_iter_var_type_cache.clear();
+        self.local_reassignment_positions_cache.clear();
         self.dynamic_field_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
         self.dynamic_field_type_cache.clear();
