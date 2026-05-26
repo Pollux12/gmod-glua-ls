@@ -462,14 +462,25 @@ pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
     cache: &mut LuaInferCache,
     name: &str,
 ) -> Option<LuaTypeDeclId> {
-    if !db.get_emmyrc().gmod.enabled
-        || !db
-            .get_emmyrc()
-            .gmod
-            .scripted_class_scopes
-            .resolved_definitions()
-            .iter()
-            .any(|definition| definition.class_global == name)
+    if !db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    if let Some(info) = db
+        .get_gmod_infer_index()
+        .get_scoped_class_info(&cache.get_file_id())
+    {
+        return (info.global_name == name)
+            .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name));
+    }
+
+    if !db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions()
+        .iter()
+        .any(|definition| definition.class_global == name)
     {
         return None;
     }
