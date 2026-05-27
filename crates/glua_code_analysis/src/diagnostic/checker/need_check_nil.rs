@@ -6,7 +6,8 @@ use glua_parser::{
 use rowan::TextRange;
 
 use crate::{
-    DiagnosticCode, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel,
+    DiagnosticCode, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType,
+    SemanticModel,
     semantic::{contains_gmod_null_type, get_var_expr_var_ref_id, resolve_global_decl_id},
 };
 
@@ -118,12 +119,16 @@ fn report_unsafe_receiver(
     semantic_model: &SemanticModel,
     receiver: &LuaExpr,
 ) -> bool {
-    let Ok(receiver_type) = semantic_model.infer_expr(receiver.clone()) else {
-        return false;
+    let receiver_type = match semantic_model.infer_expr(receiver.clone()) {
+        Ok(receiver_type) => receiver_type,
+        // During diagnostics, unresolved fields keep a `FieldNotFound` error to avoid
+        // mutating caches globally. For nil-access checks on method receivers we still
+        // need runtime semantics: a missing field read evaluates to `nil`.
+        Err(InferFailReason::FieldNotFound) if matches!(receiver, LuaExpr::IndexExpr(_)) => {
+            LuaType::Nil
+        }
+        Err(_) => return false,
     };
-    if is_gmod_self_index_local_alias(semantic_model, receiver) {
-        return false;
-    }
     if receiver_type.is_nullable() {
         if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, receiver) {
             return false;
@@ -167,69 +172,6 @@ fn report_unsafe_receiver(
         None,
     );
     true
-}
-
-fn is_gmod_self_index_local_alias(semantic_model: &SemanticModel, receiver: &LuaExpr) -> bool {
-    let db = semantic_model.get_db();
-    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
-        return false;
-    }
-
-    let LuaExpr::NameExpr(name_expr) = receiver else {
-        return false;
-    };
-
-    let file_id = semantic_model.get_file_id();
-    let decl_id = db
-        .get_reference_index()
-        .get_local_reference(&file_id)
-        .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
-        .or_else(|| {
-            let name = name_expr.get_name_text()?;
-            db.get_decl_index()
-                .get_decl_tree(&file_id)
-                .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
-                .map(|decl| decl.get_id())
-        });
-
-    let Some(decl_id) = decl_id else {
-        return false;
-    };
-    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
-        return false;
-    };
-    let Some(initializer) = decl.get_initializer() else {
-        return false;
-    };
-    let Some(root) = db.get_vfs().get_syntax_tree(&decl_id.file_id) else {
-        return false;
-    };
-    let root = root.get_red_root();
-    let Some(node) = initializer.get_expr_syntax_id().to_node_from_root(&root) else {
-        return false;
-    };
-    let Some(LuaExpr::IndexExpr(index_expr)) = LuaExpr::cast(node) else {
-        return false;
-    };
-
-    index_expr_root_is_self(&index_expr)
-}
-
-fn index_expr_root_is_self(index_expr: &LuaIndexExpr) -> bool {
-    let Some(mut prefix_expr) = index_expr.get_prefix_expr() else {
-        return false;
-    };
-    while let LuaExpr::IndexExpr(prefix_index) = prefix_expr {
-        let Some(next_prefix) = prefix_index.get_prefix_expr() else {
-            return false;
-        };
-        prefix_expr = next_prefix;
-    }
-
-    matches!(
-        prefix_expr,
-        LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self")
-    )
 }
 
 fn should_skip_deferred_nullable_function_call(call_expr: &LuaCallExpr, prefix: &LuaExpr) -> bool {

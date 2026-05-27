@@ -1582,6 +1582,66 @@ mod test {
             "No NeedCheckNil expected: Entity has no GetFreeSeat"
         );
     }
+
+    #[gtest]
+    fn test_missing_receiver_field_method_call_reports_unchecked_nil_access() {
+        // Repro: unresolved receiver field in method call should still produce
+        // an unchecked nil access diagnostic on the receiver expression.
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@class VSWEP
+            ---@field SlotIndex integer
+            local VSWEP = {}
+
+            function VSWEP:PrimaryAttackInternal()
+                local allowDefaultBehaviour = self.Vehicle:OnWeaponFire(self, self.SlotIndex)
+            end
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(false),
+            "expected unchecked-nil-access for self.Vehicle receiver in colon call"
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true),
+            "definite nil receiver should escalate to unchecked-nil-access, not need-check-nil"
+        );
+    }
+
+    #[gtest]
+    fn test_missing_self_field_local_alias_method_call_reports_unchecked_nil_access() {
+        // Repro: `local vehicle = self.Vehicle` followed by `vehicle:...` should
+        // still report nil access for the local receiver alias.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class VSWEP
+            local VSWEP = {}
+
+            function VSWEP:PrimaryAttackInternal()
+                local vehicle = self.Vehicle
+                vehicle:FireBullet({})
+            end
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(false),
+            "expected unchecked-nil-access for local alias of self.Vehicle in colon call"
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true),
+            "definite nil alias receiver should escalate to unchecked-nil-access, not need-check-nil"
+        );
+    }
+
     #[gtest]
     fn test_field_narrow_direct_definer_no_nil_on_method() {
         // After narrowing to the direct field definer, methods on that type should not trigger nil
