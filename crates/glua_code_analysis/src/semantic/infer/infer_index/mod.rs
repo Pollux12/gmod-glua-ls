@@ -428,9 +428,7 @@ fn infer_cross_file_matching_expr_key_member_type(
         return None;
     }
 
-    let Some(access_key_type) = crate::semantic::member::member_key_as_type(key) else {
-        return None;
-    };
+    let access_key_type = crate::semantic::member::member_key_as_type(key)?;
     let access_realm = db
         .get_gmod_infer_index()
         .get_realm_file_metadata(&access_file_id)
