@@ -139,6 +139,7 @@ pub enum LuaTokenKind {
     TkTagAttribute,  // attribute
     TkTagRealm,      // realm
     TkTagFileparam,  // fileparam
+    TkTagOutparam,   // outparam
     TkCallGeneric,   // call generic. function_name--[[@<type>]](...)
 
     TkDocOr,              // |
@@ -217,6 +218,18 @@ impl LuaTokenKind {
                 | LuaTokenKind::TkAmpAssign
                 | LuaTokenKind::TkShiftLeftAssign
                 | LuaTokenKind::TkShiftRightAssign
+        )
+    }
+
+    pub fn is_trivia(self) -> bool {
+        matches!(
+            self,
+            LuaTokenKind::TkShortComment
+                | LuaTokenKind::TkLongComment
+                | LuaTokenKind::TkEndOfLine
+                | LuaTokenKind::TkWhitespace
+                | LuaTokenKind::TkShebang
+                | LuaTokenKind::TkDocContinue
         )
     }
 }

@@ -6,7 +6,7 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-Inlay hints are small labels that appear **inside your code** without modifying it, providing extra context like parameter names for positional arguments, inferred types for untyped locals, and index keys in large tables.
+Inlay hints show small labels **inside your code** without changing the file. They can show parameter names for positional arguments, inferred types for untyped locals, and index keys in large tables.
 
 
 ## Types of hints
@@ -88,7 +88,7 @@ Enable with `hint.overrideHint`.
 
 ### Closing end hints
 
-Show what a `do...end` or `function...end` block belongs to, useful for deeply nested code:
+Show which `do...end` or `function...end` block an `end` closes. This helps in nested code:
 
 ```lua
 function MyAddon.LongFunction()
@@ -105,7 +105,7 @@ Enable with `hint.closingEndHint`.
 
 ## Global configuration
 
-All hint types can be toggled individually. A full example:
+You can toggle each hint type. This example shows the available settings:
 
 <ConfigTip />
 ```json .gluarc.json
@@ -131,7 +131,7 @@ All hint types can be toggled individually. A full example:
 | `hint.enumParamHint` | `false` | Show named enum values for numeric arguments matching enum types |
 | `hint.metaCallHint` | `true` | Show call hints for `__call` metamethod invocations |
 | `hint.closingEndHintControlFlow` | `false` | Include control flow constructs in closing-end hints |
-| `hint.closingEndHintMinLines` | `15` | Minimum number of lines before closing-end hints are shown |
+| `hint.closingEndHintMinLines` | `15` | Minimum number of lines before GLuaLS shows closing-end hints |
 
 ### Strict mode array index hints
 
@@ -148,7 +148,7 @@ All hint types can be toggled individually. A full example:
 
 ## Inline values
 
-During a debug session, GLuaLS can show the current values of local variables alongside the code (similar to a debugger's variable inspector but inline):
+During a debug session, GLuaLS can show current local variable values beside the code, like an inline variable inspector:
 
 ```lua
 local hp = ply:Health()  -- 75
@@ -168,4 +168,4 @@ Enable with:
 
 ## VSCode integration
 
-Inlay hints are shown inline in the editor when enabled. Configure which hint types to display in the [settings panel](/configuration/overview#settings-panel-recommended) — see [Hints & Hover settings](/configuration/hints-and-hover) for the full reference.
+When enabled, inlay hints appear inline in the editor. Choose which hint types to display in the [settings panel](/configuration/overview#settings-panel-recommended). See [Hints & Hover settings](/configuration/hints-and-hover) for the full reference.

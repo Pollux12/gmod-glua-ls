@@ -1,8 +1,8 @@
 mod false_or_nil_type;
 
 use crate::{
-    DbIndex, LuaInstanceType, LuaIntersectionType, LuaType, TypeOps, get_real_type,
-    semantic::type_check::is_sub_type_of,
+    DbIndex, LuaInstanceType, LuaIntersectionType, LuaType, TypeOps, check_type_compact,
+    get_real_type, semantic::type_check::is_sub_type_of,
 };
 pub use false_or_nil_type::{narrow_false_or_nil, remove_false_or_nil};
 
@@ -191,6 +191,21 @@ pub fn narrow_down_type(
             | LuaType::TableGeneric(_) => return Some(source),
             _ => {}
         },
+        LuaType::TableOf(_) => match real_source_ref {
+            LuaType::TableOf(_) => {
+                if check_type_compact(db, &target, &source).is_ok() {
+                    return Some(target.clone());
+                }
+
+                if check_type_compact(db, &source, &target).is_ok() {
+                    return Some(source);
+                }
+            }
+            LuaType::Table | LuaType::Any | LuaType::Unknown => {
+                return Some(target.clone());
+            }
+            _ => {}
+        },
         LuaType::Instance(base) => {
             return narrow_down_type(db, source, base.get_base().clone(), declared);
         }
@@ -207,6 +222,7 @@ pub fn narrow_down_type(
                 .into_iter()
                 .filter_map(|t| narrow_down_type(db, real_source_ref.clone(), t, declared.clone()))
                 .collect::<Vec<_>>();
+
             let mut result_type = LuaType::Unknown;
             for source_type in source_types {
                 result_type = TypeOps::Union.apply(db, &result_type, &source_type);

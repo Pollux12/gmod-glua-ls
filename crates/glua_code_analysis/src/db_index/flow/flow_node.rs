@@ -1,6 +1,6 @@
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstPtr, LuaChunk, LuaClosureExpr, LuaDocTagCast, LuaExpr,
-    LuaForStat, LuaFuncStat, LuaSyntaxKind, LuaSyntaxNode,
+    LuaAssignStat, LuaAstNode, LuaAstPtr, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaDocTagCast,
+    LuaExpr, LuaForStat, LuaFuncStat, LuaSyntaxKind, LuaSyntaxNode,
 };
 use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
@@ -56,6 +56,8 @@ pub enum FlowNodeKind {
     DeclPosition(TextSize),
     /// Variable assignment with a hint about what kinds of LHS variables it contains
     Assignment(LuaAstPtr<LuaAssignStat>, AssignVarHint),
+    /// Function call expression that may introduce flow-scoped side effects
+    Call(LuaAstPtr<LuaCallExpr>),
     /// Conditional flow (type guards, existence checks)
     TrueCondition(LuaAstPtr<LuaExpr>),
     /// Conditional flow (type guards, existence checks)

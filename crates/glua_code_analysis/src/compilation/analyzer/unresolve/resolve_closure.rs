@@ -83,6 +83,7 @@ pub fn try_resolve_call_closure_params(
             LuaDocParamInfo {
                 name: name.clone(),
                 type_ref: type_ref.clone().unwrap_or(LuaType::Any),
+                default_value: None,
                 description: None,
                 nullable: false,
                 attributes: None,
@@ -166,6 +167,7 @@ pub fn try_resolve_closure_return(
     signature.return_docs.push(LuaDocReturnInfo {
         name: None,
         type_ref: ret_type.clone(),
+        default_value: None,
         description: None,
         attributes: None,
         return_kind: ReturnTypeKind::default(),
@@ -638,6 +640,7 @@ fn resolve_doc_function(
             LuaDocParamInfo {
                 name: name.clone(),
                 type_ref: param.1.clone().unwrap_or(LuaType::Any),
+                default_value: None,
                 description: None,
                 nullable: false,
                 attributes: None,
@@ -660,6 +663,7 @@ fn resolve_doc_function(
         signature.return_docs.push(LuaDocReturnInfo {
             name: None,
             type_ref: doc_return.clone(),
+            default_value: None,
             description: None,
             attributes: None,
             return_kind: ReturnTypeKind::default(),
@@ -719,7 +723,8 @@ fn filter_signature_type(
                                 sig.is_vararg,
                                 params,
                                 ret,
-                            );
+                            )
+                            .with_optional_params(sig.get_param_optional_flags());
                             result.push(Arc::new(doc_func));
                         }
                     }

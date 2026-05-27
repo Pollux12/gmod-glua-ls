@@ -97,7 +97,10 @@ impl VarRefId {
             VarRefId::SelfRef(ref_decl_or_member_id) => *ref_decl_or_member_id == decl_or_member_id,
             VarRefId::IndexRef(ref_decl_or_member_id, prefix_path) => {
                 *ref_decl_or_member_id == decl_or_member_id
-                    && path.starts_with(prefix_path.deref().as_str())
+                    && (path == *prefix_path
+                        || path
+                            .strip_prefix(prefix_path.deref().as_str())
+                            .is_some_and(|rest| rest.starts_with('.')))
             }
             VarRefId::GlobalName(_, _) => false,
         }

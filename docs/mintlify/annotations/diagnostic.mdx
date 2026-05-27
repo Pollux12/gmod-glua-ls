@@ -7,7 +7,7 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-`@diagnostic` controls which warnings are active for a specific line, the next line, or a block of code. Use it to suppress false positives without disabling diagnostics globally.
+`@diagnostic` controls warnings for one line, the next line, or a block of code. Suppress false positives without disabling diagnostics for your entire addon.
 
 ---
 
@@ -36,7 +36,7 @@ print(anotherGlobal)       -- NOT suppressed
 
 ## disable-line
 
-Suppress diagnostics on the **current line** (can be placed inline):
+Suppress diagnostics on the **current line**. Place it inline:
 
 ```lua
 print(someGlobal) ---@diagnostic disable-line: undefined-global
@@ -46,7 +46,7 @@ print(someGlobal) ---@diagnostic disable-line: undefined-global
 
 ## Block disable/enable
 
-Disable diagnostics for an entire section, then re-enable them:
+Disable diagnostics for a section, then enable them again:
 
 ```lua
 ---@diagnostic disable: undefined-global
@@ -60,7 +60,7 @@ GLOBAL_C = true
 
 ## File-wide disable
 
-A `---@diagnostic disable` with no matching `enable` suppresses for the rest of the file:
+A `---@diagnostic disable` with no matching `enable` suppresses diagnostics for the rest of the file:
 
 ```lua
 ---@diagnostic disable: undefined-global
@@ -85,7 +85,7 @@ legacyFunction(someGlobal)
 | Code | When to suppress |
 |---|---|
 | `undefined-global` | Global used that's defined externally (e.g., from another file loaded at runtime) |
-| `param-type-mismatch` | Intentional duck-typing or known false positive |
+| `param-type-mismatch` | Passing a compatible type that differs from the annotation, or a known false positive |
 | `unused` | Variable used as documentation or placeholder |
 | `inject-field` | Adding fields to a type outside its definition intentionally |
 
@@ -93,7 +93,7 @@ legacyFunction(someGlobal)
 
 ## Alternative: configure globally
 
-If you find yourself suppressing the same diagnostic frequently, disable or change its severity in `.gluarc.json` instead:
+If you suppress the same diagnostic often, disable it or change its severity in `.gluarc.json`:
 
 <ConfigTip />
 ```json .gluarc.json
@@ -107,4 +107,4 @@ If you find yourself suppressing the same diagnostic frequently, disable or chan
 }
 ```
 
-See [Diagnostics configuration](/configuration/diagnostics) for the full reference.
+See [Diagnostics configuration](/configuration/diagnostics) for all options.

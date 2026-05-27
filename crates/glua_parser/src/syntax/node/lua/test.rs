@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaNameExpr, LuaParser, LuaSyntaxTree, ParserConfig,
-        PathTrait,
+        LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaIndexKey, LuaNameExpr, LuaParser, LuaSyntaxTree,
+        LuaTableField, ParserConfig, PathTrait,
     };
 
     fn get_tree(code: &str) -> LuaSyntaxTree {
@@ -54,5 +54,55 @@ mod tests {
         let root = tree.get_chunk_node();
         let index_expr = root.descendants::<LuaIndexExpr>().next().unwrap();
         assert_eq!(index_expr.get_access_path().unwrap(), "name.[okok.yes]");
+    }
+
+    #[test]
+    fn test_index_expr_get_index_key_with_whitespace() {
+        let code = "local a = t[ 1 ]";
+        let tree = get_tree(code);
+        let root = tree.get_chunk_node();
+        let index_expr = root.descendants::<LuaIndexExpr>().next().unwrap();
+        let key = index_expr.get_index_key().unwrap();
+        assert!(matches!(key, LuaIndexKey::Integer(_)));
+    }
+
+    #[test]
+    fn test_index_expr_get_index_key_compact() {
+        let code = "local a = t[1]";
+        let tree = get_tree(code);
+        let root = tree.get_chunk_node();
+        let index_expr = root.descendants::<LuaIndexExpr>().next().unwrap();
+        let key = index_expr.get_index_key().unwrap();
+        assert!(matches!(key, LuaIndexKey::Integer(_)));
+    }
+
+    #[test]
+    fn test_index_expr_get_index_key_string_with_whitespace() {
+        let code = "local a = t[ 'foo' ]";
+        let tree = get_tree(code);
+        let root = tree.get_chunk_node();
+        let index_expr = root.descendants::<LuaIndexExpr>().next().unwrap();
+        let key = index_expr.get_index_key().unwrap();
+        assert!(matches!(key, LuaIndexKey::String(_)));
+    }
+
+    #[test]
+    fn test_table_field_get_field_key_with_whitespace() {
+        let code = "local a = { [ 1 ] = 'x' }";
+        let tree = get_tree(code);
+        let root = tree.get_chunk_node();
+        let field = root.descendants::<LuaTableField>().next().unwrap();
+        let key = field.get_field_key().unwrap();
+        assert!(matches!(key, LuaIndexKey::Integer(_)));
+    }
+
+    #[test]
+    fn test_table_field_get_field_key_compact() {
+        let code = "local a = { [1] = 'x' }";
+        let tree = get_tree(code);
+        let root = tree.get_chunk_node();
+        let field = root.descendants::<LuaTableField>().next().unwrap();
+        let key = field.get_field_key().unwrap();
+        assert!(matches!(key, LuaIndexKey::Integer(_)));
     }
 }

@@ -7,13 +7,13 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Autocomplete
 
-GLuaLS provides context-aware completions for GMod API functions, local variables, class members, hook names, net message names, and more.
+GLuaLS suggests GMod API functions, local variables, class members, hook names, net message names, and other symbols based on your cursor position.
 
-**Triggers automatically** as you type. Press `Ctrl+Space` to trigger manually.
+**Triggers as you type.** Press `Ctrl+Space` to trigger it yourself.
 
 ### Call snippets
 
-When completing a function call, GLuaLS inserts a snippet with tab stops for each parameter:
+When you complete a function call, GLuaLS inserts a snippet with tab stops for each parameter:
 
 ```lua
 hook.Add("PlayerSpawn", "MyAddon", function(|ply|) -- cursor placed on first param
@@ -34,7 +34,7 @@ Disable call snippets if you prefer plain completions:
 
 ### Staged snippets
 
-For well-known GMod functions with complex signatures (`hook.Add`, `net.Receive`, `timer.Create`, etc.), GLuaLS generates a more complete snippet with the full expected body:
+For GMod functions with complex signatures (`hook.Add`, `net.Receive`, `timer.Create`, etc.), GLuaLS generates a snippet with the expected callback body:
 
 ```lua
 -- Typing net.Receive and accepting the staged snippet generates:
@@ -58,7 +58,7 @@ The default postfix trigger is `@`. Change it in `.gluarc.json` with `completion
 
 ### Auto-require
 
-When completing an identifier from another module, GLuaLS can insert a `require()` at the top of the file automatically:
+When you complete an identifier from another module, GLuaLS can insert a `require()` at the top of the file:
 
 <ConfigTip />
 ```json .gluarc.json
@@ -80,7 +80,7 @@ Hover over any GMod API function, variable, or annotated symbol to see its docum
 - **Function signature** with parameter names and types
 - **Return type**
 - **Description** (from wiki or `---` comment)
-- **Realm badge** — **Client** / **Server** / **Shared** indicator
+- **Realm badge**: **Client** / **Server** / **Shared** indicator
 - **Deprecation notice** if applicable
 
 ---
@@ -100,7 +100,7 @@ ents.Create(|classname|)
 
 Press `F12` or right-click → **Go to Definition** to jump to where a function or variable is defined. Works for:
 
-- GMod API functions (opens the annotations file)
+- GMod API functions, which open the annotations file
 - Your own functions and classes
 - `require()`d modules
 
@@ -143,11 +143,11 @@ Enable or disable with `semanticTokens.enable` in `.gluarc.json`.
 
 Code lens annotations appear above functions and class definitions:
 
-- **References count** — how many places call this function
-- **VGUI panel indicator** — links to the panel definition for VGUI components
+- **References count**: how many places call this function
+- **VGUI panel indicator**: links to the panel definition for VGUI components
 
 Configure with `codeLens.enable` and `gmod.vgui.codeLensEnabled` in `.gluarc.json`.
 
 ## VSCode integration
 
-Code intelligence features work automatically in VS Code. Autocomplete, hover documentation, and go-to-definition are available as soon as the extension initializes. Use the [settings panel](/configuration/overview#settings-panel-recommended) or `.gluarc.json` to configure behavior — see [Completion settings](/configuration/completion) and [Hints & Hover settings](/configuration/hints-and-hover) for the full reference.
+Code intelligence features work in VS Code after the extension starts. Use the [settings panel](/configuration/overview#settings-panel-recommended) or `.gluarc.json` to configure autocomplete, hover documentation, and go-to-definition. See [Completion settings](/configuration/completion) and [Hints & Hover settings](/configuration/hints-and-hover) for the full reference.

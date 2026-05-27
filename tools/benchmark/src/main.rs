@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files, load_configs,
+    EmmyLuaAnalysis, Emmyrc, WorkspaceFolder, collect_workspace_files, load_configs,
     update_code_style,
 };
 use tokio_util::sync::CancellationToken;
@@ -194,18 +194,6 @@ async fn main() {
     let main_file_ids = db.get_module_index().get_main_workspace_file_ids();
     let diag_file_count = main_file_ids.len();
 
-    // Log file paths for debugging slow files
-    for &fid in &[
-        FileId { id: 1747 },
-        FileId { id: 1857 },
-        FileId { id: 2017 },
-        FileId { id: 2044 },
-    ] {
-        if let Some(path) = db.get_vfs().get_file_path(&fid) {
-            log::info!("FileId {} → {}", fid.id, path.display());
-        }
-    }
-
     // Precompute shared diagnostic data once (avoids per-file workspace-wide scans)
     let shared_data = analysis.precompute_diagnostic_shared_data();
 
@@ -303,12 +291,14 @@ async fn main() {
     eprintln!("{:<45} {:>12}", "Phase", "Duration");
     eprintln!("{}", "-".repeat(60));
 
+    let warning_threshold = std::time::Duration::from_secs(2);
+    let error_threshold = std::time::Duration::from_secs(10);
     let mut total = std::time::Duration::ZERO;
     for result in &results {
         total += result.duration;
-        let status = if result.duration.as_secs() >= 10 {
+        let status = if result.duration >= error_threshold {
             "❌"
-        } else if result.duration.as_secs() >= 2 {
+        } else if result.duration >= warning_threshold {
             "⚠️"
         } else {
             "✅"
@@ -323,7 +313,7 @@ async fn main() {
     eprintln!("{}", "-".repeat(60));
 
     let index_diag_total = indexing_duration + diagnostics_duration;
-    let target_status = if index_diag_total.as_secs() <= 10 {
+    let target_status = if index_diag_total <= error_threshold {
         "✅ TARGET MET"
     } else {
         "❌ TARGET NOT MET"

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use glua_parser::{LuaAstPtr, LuaExpr, LuaSyntaxId};
+use internment::ArcIntern;
+use smol_str::SmolStr;
 
 use crate::{FlowId, FlowNode, LuaDeclId};
 
@@ -31,6 +33,18 @@ pub struct BranchLabelInfo {
     pub has_inner_conditions: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AssignmentFlowInfo {
+    pub index_paths: Vec<ArcIntern<SmolStr>>,
+    pub has_unknown_index_target: bool,
+}
+
+impl AssignmentFlowInfo {
+    pub fn is_empty(&self) -> bool {
+        self.index_paths.is_empty() && !self.has_unknown_index_target
+    }
+}
+
 #[derive(Debug)]
 pub struct FlowTree {
     decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
@@ -40,6 +54,7 @@ pub struct FlowTree {
     bindings: HashMap<LuaSyntaxId, FlowId>,
     /// Per-BranchLabel metadata used to skip redundant merges.
     branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+    assignment_flow_info: Vec<AssignmentFlowInfo>,
 }
 
 impl FlowTree {
@@ -50,6 +65,7 @@ impl FlowTree {
         // labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
         bindings: HashMap<LuaSyntaxId, FlowId>,
         branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+        assignment_flow_info: Vec<AssignmentFlowInfo>,
     ) -> Self {
         Self {
             decl_bind_expr_ref,
@@ -57,6 +73,7 @@ impl FlowTree {
             multiple_antecedents,
             bindings,
             branch_label_info,
+            assignment_flow_info,
         }
     }
 
@@ -80,5 +97,10 @@ impl FlowTree {
 
     pub fn get_branch_label_info(&self, flow_id: FlowId) -> Option<&BranchLabelInfo> {
         self.branch_label_info.get(&flow_id)
+    }
+
+    pub fn get_assignment_flow_info(&self, flow_id: FlowId) -> Option<&AssignmentFlowInfo> {
+        let info = self.assignment_flow_info.get(flow_id.0 as usize)?;
+        (!info.is_empty()).then_some(info)
     }
 }

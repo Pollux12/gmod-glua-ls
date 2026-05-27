@@ -11,7 +11,8 @@ use glua_parser::{
 use lsp_types::Location;
 use tokio_util::sync::CancellationToken;
 
-use crate::handlers::hover::find_member_origin_owner;
+use crate::handlers::definition::goto_inferred_dynamic_field_definition;
+use crate::handlers::hover::find_member_origin_owners;
 
 pub fn search_implementations(
     semantic_model: &SemanticModel,
@@ -47,6 +48,14 @@ pub fn search_implementations(
             }
             _ => {}
         }
+    } else if let Some(dynamic_response) =
+        goto_inferred_dynamic_field_definition(semantic_model, &token)
+    {
+        match dynamic_response {
+            lsp_types::GotoDefinitionResponse::Scalar(location) => result.push(location),
+            lsp_types::GotoDefinitionResponse::Array(locations) => result.extend(locations),
+            lsp_types::GotoDefinitionResponse::Link(_) => {}
+        }
     }
 
     Some(result)
@@ -72,13 +81,34 @@ pub fn search_member_implementations(
 
     let mut semantic_cache = HashMap::new();
 
-    let property_owner = find_member_origin_owner(compilation, semantic_model, member_id)
-        .unwrap_or(LuaSemanticDeclId::Member(member_id));
+    // Collect all same-named member IDs to check references against.
+    let property_owners =
+        match find_member_origin_owners(compilation, semantic_model, member_id, true, None) {
+            crate::handlers::hover::DeclOriginResult::Multiple(ids) => ids,
+            crate::handlers::hover::DeclOriginResult::Single(id) => vec![id],
+        };
+
+    // Resolve the class type that owns the field, so we can match
+    // assignments on tables associated with the class.
+    let origin_class_id = property_owners.iter().find_map(|id| match id {
+        LuaSemanticDeclId::Member(mid) => semantic_model
+            .get_db()
+            .get_member_index()
+            .get_current_owner(mid)
+            .and_then(|owner| match owner {
+                glua_code_analysis::LuaMemberOwner::Type(type_decl_id) => {
+                    Some(type_decl_id.clone())
+                }
+                _ => None,
+            }),
+        _ => None,
+    });
+
     for in_filed_syntax_id in index_references {
         if cancel_token.is_cancelled() {
             return None;
         }
-        let semantic_model =
+        let reference_semantic_model =
             if let Some(semantic_model) = semantic_cache.get_mut(&in_filed_syntax_id.file_id) {
                 semantic_model
             } else {
@@ -86,18 +116,77 @@ pub fn search_member_implementations(
                 semantic_cache.insert(in_filed_syntax_id.file_id, semantic_model);
                 semantic_cache.get_mut(&in_filed_syntax_id.file_id)?
             };
-        let root = semantic_model.get_root();
+        let root = reference_semantic_model.get_root();
         let node = in_filed_syntax_id.value.to_node_from_root(root.syntax())?;
-        if let Some(is_signature) = check_member_reference(semantic_model, node.clone()) {
-            if !semantic_model.is_reference_to(
-                node,
-                property_owner.clone(),
-                SemanticDeclLevel::default(),
-            ) {
+        if let Some(is_signature) = check_member_reference(reference_semantic_model, node.clone()) {
+            // Check if this reference semantically matches any of the origin owners.
+            let matches_owner = property_owners.iter().any(|owner| {
+                reference_semantic_model.is_reference_to(
+                    node.clone(),
+                    owner.clone(),
+                    SemanticDeclLevel::default(),
+                )
+            });
+
+            // Also check if the prefix of the index expression resolves to a
+            // decl whose type corresponds to the origin class. This catches
+            // cases like `local MyClass = {}; MyClass.myField = 1` where
+            // `MyClass` is a local table that implements the @class MyClass,
+            // but does NOT match by name text alone (which would cause false
+            // positives from unrelated locals/tables with the same name).
+            let matches_prefix = if !matches_owner && LuaIndexExpr::can_cast(node.kind().into()) {
+                if let Some(class_id) = &origin_class_id {
+                    let expr = LuaIndexExpr::cast(node.clone());
+                    expr.and_then(|e| e.get_prefix_expr())
+                        .is_some_and(|prefix| {
+                            if let LuaExpr::NameExpr(name_expr) = prefix {
+                                // Resolve the prefix to its semantic decl and
+                                // verify the decl's type corresponds to the
+                                // origin class, rather than just matching the
+                                // name text.
+                                reference_semantic_model
+                                    .find_decl(
+                                        name_expr.syntax().clone().into(),
+                                        SemanticDeclLevel::default(),
+                                    )
+                                    .is_some_and(|prefix_decl| match prefix_decl {
+                                        LuaSemanticDeclId::LuaDecl(prefix_decl_id) => {
+                                            let prefix_type = reference_semantic_model
+                                                .get_type(prefix_decl_id.into());
+                                            match &prefix_type {
+                                                LuaType::Ref(tid) | LuaType::Def(tid) => {
+                                                    tid == class_id
+                                                }
+                                                LuaType::TableConst(_) => {
+                                                    // Pure name-text matching for
+                                                    // TableConst is too loose — it
+                                                    // accepts unrelated locals/tables
+                                                    // that happen to share the class
+                                                    // name. Require a semantic type
+                                                    // annotation (Ref/Def) instead.
+                                                    false
+                                                }
+                                                _ => false,
+                                            }
+                                        }
+                                        _ => false,
+                                    })
+                            } else {
+                                false
+                            }
+                        })
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !matches_owner && !matches_prefix {
                 continue;
             }
 
-            let document = semantic_model.get_document();
+            let document = reference_semantic_model.get_document();
             let range = in_filed_syntax_id.value.get_range();
             let location = document.to_lsp_location(range)?;
             // 由于允许函数声明重载, 所以需要将签名放在前面
@@ -116,7 +205,7 @@ fn check_member_reference(semantic_model: &SemanticModel, node: LuaSyntaxNode) -
     match &node {
         expr_node if LuaIndexExpr::can_cast(expr_node.kind().into()) => {
             let expr = LuaIndexExpr::cast(expr_node.clone())?;
-            let prefix_type = semantic_model.infer_expr(expr.get_prefix_expr()?).ok()?;
+            let _prefix_type = semantic_model.infer_expr(expr.get_prefix_expr()?).ok()?;
             let mut is_signature = false;
             if let Some(current_type) = semantic_model
                 .infer_expr(LuaExpr::IndexExpr(expr.clone()))
@@ -125,24 +214,6 @@ fn check_member_reference(semantic_model: &SemanticModel, node: LuaSyntaxNode) -
             {
                 is_signature = true;
             }
-            // TODO: 需要实现更复杂的逻辑, 即当为`Ref`时, 针对指定的实例定义到其实现
-            /*
-               ---@class A
-               ---@field a number -- 这里寻找实现只匹配到`A.a`, 不能穿透到`a.a`与`b.a`
-               local A = {}
-               A.a = 1
-
-               ---@type A
-               local a = {}
-               a.a = 1 -- 这里寻找实现不能匹配到`b.a`
-
-               ---@type A
-               local b = a
-               b.a = 2 -- 这里寻找实现不能匹配到`a.a`
-            */
-            if let LuaType::Ref(_) = prefix_type {
-                return None;
-            };
             // 往上寻找 stat 节点
             let stat = expr.ancestors::<LuaStat>().next()?;
             match stat {

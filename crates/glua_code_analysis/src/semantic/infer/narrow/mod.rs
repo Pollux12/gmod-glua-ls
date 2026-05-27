@@ -6,7 +6,9 @@ mod var_ref_id;
 
 use crate::{
     CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason,
-    LuaInferCache, LuaType, infer_param,
+    LuaInferCache, LuaType, TypeOps,
+    db_index::LuaTypeDeclId,
+    get_real_type, infer_param,
     semantic::infer::{
         InferResult,
         infer_name::{find_decl_member_type, infer_global_type},
@@ -16,6 +18,74 @@ pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
 pub use narrow_type::{narrow_down_type, narrow_false_or_nil, remove_false_or_nil};
 pub use var_ref_id::{VarRefId, get_var_expr_var_ref_id};
+
+const GMOD_NULL_TYPE_NAME: &str = "NULL";
+
+fn gmod_null_decl_id() -> LuaTypeDeclId {
+    LuaTypeDeclId::global(GMOD_NULL_TYPE_NAME)
+}
+
+pub(crate) fn gmod_null_type() -> LuaType {
+    LuaType::Ref(gmod_null_decl_id())
+}
+
+pub(crate) fn gmod_null_type_is_defined(db: &DbIndex) -> bool {
+    if !db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+
+    db.get_type_index()
+        .get_type_decl(&gmod_null_decl_id())
+        .is_some()
+}
+
+pub(crate) fn contains_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
+    if !db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+
+    let real_type = get_real_type(db, typ).unwrap_or(typ);
+    match real_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id == &gmod_null_decl_id(),
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(|member| contains_gmod_null_type(db, member)),
+        LuaType::MultiLineUnion(multi_union) => multi_union
+            .get_unions()
+            .iter()
+            .any(|(member, _)| contains_gmod_null_type(db, member)),
+        LuaType::Instance(instance_type) => contains_gmod_null_type(db, instance_type.get_base()),
+        _ => false,
+    }
+}
+
+pub(crate) fn remove_gmod_null_type(db: &DbIndex, typ: LuaType) -> LuaType {
+    if !db.get_emmyrc().gmod.enabled {
+        return typ;
+    }
+
+    if is_gmod_null_type(db, &typ) {
+        return LuaType::Never;
+    }
+
+    let removed_ref = TypeOps::Remove.apply(db, &typ, &gmod_null_type());
+    let null_def = LuaType::Def(gmod_null_decl_id());
+    TypeOps::Remove.apply(db, &removed_ref, &null_def)
+}
+
+fn is_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
+    if !db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+
+    let real_type = get_real_type(db, typ).unwrap_or(typ);
+    match real_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id == &gmod_null_decl_id(),
+        LuaType::Instance(instance_type) => is_gmod_null_type(db, instance_type.get_base()),
+        _ => false,
+    }
+}
 
 pub fn infer_expr_narrow_type(
     db: &DbIndex,
@@ -70,6 +140,10 @@ pub fn get_var_ref_type(
         }
 
         if decl.is_global() {
+            if decl.get_name() == GMOD_NULL_TYPE_NAME && gmod_null_type_is_defined(db) {
+                return Ok(gmod_null_type());
+            }
+
             if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
                 let typ = type_cache.as_type();
                 return if typ.contain_tpl() {
@@ -88,6 +162,21 @@ pub fn get_var_ref_type(
             // 不要在此阶段展开泛型别名, 必须让后续的泛型匹配阶段基于声明形态完成推断
             return Ok(result);
         }
+
+        // Collect unique UnResolveDeclType decl names for profiling
+        cache.prof_unresolve_decl_sample_count += 1;
+        if cache.prof_unresolve_decl_names.len() < 30 {
+            let name = decl.get_name().to_string();
+            let key = format!("{}:{}", name, u32::from(decl.get_id().position));
+            if !cache.prof_unresolve_decl_names.contains(&key) {
+                cache.prof_unresolve_decl_names.push(key);
+            }
+        }
+        // Track per-decl-id counts
+        *cache
+            .prof_unresolve_decl_ids
+            .entry(u32::from(decl.get_id().position))
+            .or_insert(0) += 1;
 
         Err(InferFailReason::UnResolveDeclType(decl.get_id()))
     } else if let Some(member_id) = var_ref_id.get_member_id_ref() {
@@ -137,21 +226,6 @@ fn get_single_antecedent(tree: &FlowTree, flow: &FlowNode) -> Result<FlowId, Inf
                 } else {
                     Err(InferFailReason::None)
                 }
-            }
-        },
-        None => Err(InferFailReason::None),
-    }
-}
-
-fn get_multi_antecedents(tree: &FlowTree, flow: &FlowNode) -> Result<Vec<FlowId>, InferFailReason> {
-    match &flow.antecedent {
-        Some(antecedent) => match antecedent {
-            FlowAntecedent::Single(id) => Ok(vec![*id]),
-            FlowAntecedent::Multiple(multi_id) => {
-                let multi_flow = tree
-                    .get_multi_antecedents(*multi_id)
-                    .ok_or(InferFailReason::None)?;
-                Ok(multi_flow.to_vec())
             }
         },
         None => Err(InferFailReason::None),

@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod test {
+    use glua_parser::{LuaAstNode, LuaCallExpr};
 
     use crate::{DiagnosticCode, VirtualWorkspace};
 
@@ -392,6 +393,37 @@ mod test {
     }
 
     #[test]
+    fn test_duplicate_library_annotated_globals_preserve_value_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+
+        ws.def_files(vec![
+            (
+                "library/output/_globals.lua",
+                r#"
+                ---@meta
+                ---@type string
+                ---Contains the version number of GMod.
+                VERSION = nil
+                "#,
+            ),
+            (
+                "library/custom/_globals.lua",
+                r#"
+                ---@meta
+                ---@type string
+                ---Contains the version number of GMod.
+                VERSION = nil
+                "#,
+            ),
+        ]);
+
+        let ty = ws.expr_ty("VERSION");
+        assert_eq!(ws.humanize_type(ty), "string");
+    }
+
+    #[test]
     fn test_wrapped_local_shadow_does_not_leak_library_special_call() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let library_root = ws.virtual_url_generator.base.join("library");
@@ -593,5 +625,38 @@ mod test {
         end
         "#
         ));
+    }
+
+    #[test]
+    fn test_defaulted_param_is_omittable_during_overload_resolution() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param retries number=3
+            ---@return boolean
+            ---@overload fun(name: string): string
+            local function pick(retries)
+            end
+
+            pick()
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let call_expr = semantic_model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .next()
+            .expect("expected call");
+        let func = semantic_model
+            .infer_call_expr_func(call_expr, None)
+            .expect("expected callable");
+
+        assert_eq!(func.get_ret(), &ws.ty("boolean"));
     }
 }

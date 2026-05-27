@@ -7,13 +7,13 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-All language server behavior is configured through a `.gluarc.json` file placed in your workspace root. The file has full JSON schema support, so your editor will validate settings and provide completions as you type.
+Configure language server behavior in a `.gluarc.json` file at your workspace root. The file has full JSON schema support, so your editor validates settings and provides completions.
 
 GLuaLS provides two ways to manage configuration:
-- **Settings panel** (recommended) — an interactive VSCode UI that edits `.gluarc.json` for you
-- **Manual editing** — directly editing `.gluarc.json` with full IDE validation
+- **Settings panel** (recommended): an interactive VS Code UI that edits `.gluarc.json` for you
+- **Manual editing**: edit `.gluarc.json` with full IDE validation
 
-Both methods write to the same file and stay in sync automatically.
+Both methods write to the same file and stay in sync.
 
 ---
 
@@ -23,7 +23,7 @@ The GLua Settings panel lets you configure GLuaLS without touching JSON. Changes
 
 ### Opening the panel
 
-There are three ways to open the settings panel:
+You can open the settings panel in three ways:
 
 1. **Command Palette** (`Ctrl+Shift+P`) → **GLua: Open Settings**
 2. Click the **GLuaLS** item in the status bar
@@ -33,7 +33,7 @@ The panel opens as a tab in your editor. In a multi-root workspace, you'll be pr
 
 ### Panel layout
 
-The settings panel is organized into collapsible sections matching the `.gluarc.json` structure:
+The settings panel uses collapsible sections that match the `.gluarc.json` structure:
 
 | Section | What it configures |
 |---|---|
@@ -49,20 +49,20 @@ The settings panel is organized into collapsible sections matching the `.gluarc.
 
 Every control maps directly to a `.gluarc.json` property:
 
-- **Toggles** — boolean options
-- **Dropdowns** — enum options (e.g., severity levels)
-- **Text fields** — string and number options
-- **Tables** — array and map options (e.g., file param defaults, scripted class definitions)
+- **Toggles**: boolean options
+- **Dropdowns**: enum options (e.g., severity levels)
+- **Text fields**: string and number options
+- **Tables**: array and map options (e.g., file param defaults, scripted class definitions)
 
 Changes are saved to `.gluarc.json` after a short debounce (5 seconds by default). You can also click **Save now** at any time.
 
 <Tip>
-If you want to inspect the raw JSON being generated, open `.gluarc.json` directly. You can edit both the settings panel and the JSON file — they stay in sync.
+If you want to inspect the generated JSON, open `.gluarc.json` directly. You can edit both the settings panel and the JSON file, and they stay in sync.
 </Tip>
 
 ### Auto-save behavior
 
-Auto-save is off by default so you can review changes before writing them. To save, click **Save** in the bottom-left after you finish editing.
+Auto-save is off by default. Click **Save** after editing.
 
 To change auto-save behavior, toggle **Auto-save settings** in the panel header or set `gluals.gmod.settingsAutoSave` in your VS Code settings.
 
@@ -84,7 +84,7 @@ Create a `.gluarc.json` file at the root of your workspace:
 
 The `$schema` property enables IDE validation and autocomplete for the file itself.
 
-Alternatively, the settings panel can generate a starter configuration — open **GLua: Open Settings**, then click **Edit in JSON** at the bottom of the panel.
+The settings panel can also generate a starter configuration. Open **GLua: Open Settings**, then click **Edit in JSON** at the bottom of the panel.
 
 ### Recommended starter config
 
@@ -115,14 +115,14 @@ This configuration is suitable for most GMod addon projects:
 
 ### Config file priority
 
-When multiple config files are present, GLuaLS follows this priority order (highest first):
+When a workspace has multiple config files, GLuaLS uses this priority order (highest first):
 
 1. `.gluarc.json`
 2. `.luarc.json`
 3. `.emmyrc.json`
 4. `.emmyrc.lua`
 
-`.gluarc.json` is exclusive — if present, all other config files are ignored.
+`.gluarc.json` is exclusive. If it exists, GLuaLS ignores all other config files.
 
 ---
 
@@ -175,6 +175,7 @@ Some settings are specific to the VSCode extension and are not part of `.gluarc.
 | `gluals.gmod.mcp.port` | `integer` | `0` | MCP server port (0 = random ephemeral) |
 | `gluals.gmod.mcp.rateLimitPerMinute` | `integer` | `60` | Max MCP requests per minute per client |
 | `gluals.gmod.templatePath` | `string` | `null` | Path to custom scaffolding templates |
+| `gluals.gmod.network.codeLensEnabled` | `boolean` | `true` | Network code lens |
 | `gluals.gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI panel code lens |
 | `gluals.gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI panel inlay hints |
 | `gluals.ls.executablePath` | `string` | `""` | Override language server binary path |

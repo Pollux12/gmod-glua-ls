@@ -7,7 +7,7 @@ mod test {
 
     use crate::{
         DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral,
-        LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
     };
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
@@ -44,6 +44,132 @@ mod test {
                 _ => None,
             })
             .expect("expected semantic info for index expr")
+    }
+
+    fn index_expr_prefix_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaIndexExpr>()
+            .find(|index_expr| index_expr.syntax().text() == expr_text)
+            .expect("expected index expr");
+        let prefix_expr = index_expr.get_prefix_expr().expect("expected prefix expr");
+
+        semantic_model
+            .infer_expr(prefix_expr)
+            .expect("expected inferred prefix expr type")
+    }
+
+    fn assign_value_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        lhs_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let assign_stat = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaAssignStat>()
+            .find(|assign_stat| {
+                assign_stat
+                    .get_var_and_expr_list()
+                    .0
+                    .into_iter()
+                    .any(|var| var.syntax().text() == lhs_text)
+            })
+            .expect("expected assignment stat");
+        let (vars, exprs) = assign_stat.get_var_and_expr_list();
+        let index = vars
+            .iter()
+            .position(|var| var.syntax().text() == lhs_text)
+            .expect("expected matching LHS variable");
+        let expr = exprs
+            .get(index)
+            .cloned()
+            .expect("expected corresponding assignment value");
+
+        semantic_model
+            .infer_expr(expr)
+            .expect("expected inferred assignment value type")
+    }
+
+    fn local_name_type(ws: &mut VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("expected local name");
+        let token = local_name
+            .get_name_token()
+            .expect("expected local name token");
+
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .map(|info| info.typ)
+            .expect("expected semantic info for local name")
+    }
+
+    fn local_assignment_value_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let local_stat = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaLocalStat>()
+            .find(|local_stat| {
+                local_stat.get_local_name_list().any(|local_name| {
+                    local_name
+                        .get_name_token()
+                        .is_some_and(|token| token.get_name_text() == name)
+                })
+            })
+            .expect("expected local assignment");
+        let name_index = local_stat
+            .get_local_name_list()
+            .position(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("expected local name in assignment");
+        let expr = local_stat
+            .get_value_exprs()
+            .nth(name_index)
+            .expect("expected local assignment value");
+
+        semantic_model
+            .infer_expr(expr)
+            .expect("expected inferred local assignment value type")
     }
 
     fn super_types_of(ws: &mut VirtualWorkspace, class_name: &str) -> Vec<LuaType> {
@@ -476,6 +602,79 @@ mod test {
         assert!(
             !has_ent_global_refs_in_file,
             "expected no global ENT references for scripted-scope file"
+        );
+    }
+
+    #[gtest]
+    fn test_entity_scope_shadowed_ent_assignment_does_not_bind_scoped_class_member() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "entities/entities/shadowed_ent/init.lua",
+            r#"
+            local ENT = {}
+            ENT.LocalOnly = 1
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let member_names: Vec<_> = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("shadowed_ent")))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            !member_names.contains(&"LocalOnly".to_string()),
+            "shadowed local ENT assignment should not bind to scripted class members: {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_entity_scope_shadowed_ent_method_self_does_not_bind_scoped_class_member() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "entities/entities/shadowed_method_ent/init.lua",
+            r#"
+            local ENT = {}
+            function ENT:Build()
+                self.LocalOnly = 1
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let member_names: Vec<_> = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global(
+                "shadowed_method_ent",
+            )))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            !member_names.contains(&"Build".to_string())
+                && !member_names.contains(&"LocalOnly".to_string()),
+            "shadowed local ENT method should not bind to scripted class members: {member_names:?}"
         );
     }
 
@@ -1647,6 +1846,67 @@ mod test {
                 .iter()
                 .all(|diag| diag.code != undefined_field_code),
             "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_baseclass_calls_no_false_positive_diagnostics() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+        ws.enable_check(DiagnosticCode::MissingParameter);
+
+        ws.def(
+            r#"
+            ---@class DProgress
+            local DProgress = {}
+
+            function DProgress:Init()
+            end
+
+            ---@param width number
+            ---@param height number
+            function DProgress:PerformLayout(width, height)
+            end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/baseclass_panel.lua",
+            r#"
+            local PROGRESS = {}
+
+            function PROGRESS:Init()
+                self.BaseClass.Init(self)
+            end
+
+            function PROGRESS:PerformLayout(width, height)
+                self.BaseClass.PerformLayout(self, width, height)
+            end
+
+            vgui.Register("BaseClassProgress", PROGRESS, "DProgress")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let false_positive_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::NeedCheckNil,
+            DiagnosticCode::MissingParameter,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| !false_positive_codes.contains(&diag.code)),
+            "unexpected BaseClass diagnostics: {diagnostics:?}"
         );
     }
 
@@ -3240,6 +3500,84 @@ mod test {
     }
 
     #[gtest]
+    fn test_stool_and_entity_same_name_do_not_share_type_identity() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/includes/custom_classes.lua",
+            r#"
+                ---@class Entity
+
+                ---@class ENT : Entity
+                ENT = {}
+
+                ---@class Tool
+
+                ---@class TOOL : Tool
+                TOOL = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/shared_name.lua",
+            r#"
+                ENT.Base = "base_anim"
+            "#,
+        );
+        ws.def_file(
+            "lua/weapons/gmod_tool/stools/shared_name.lua",
+            r#"
+                TOOL.Name = "Shared Name"
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let entity_class_id = LuaTypeDeclId::global("shared_name");
+        let stool_class_id = LuaTypeDeclId::global("TOOL.shared_name");
+
+        assert!(
+            db.get_type_index()
+                .get_type_decl(&entity_class_id)
+                .is_some(),
+            "expected the entity class to keep the runtime class name"
+        );
+        assert!(
+            db.get_type_index().get_type_decl(&stool_class_id).is_some(),
+            "expected the STool class to use a scoped type id"
+        );
+
+        let entity_supers = db
+            .get_type_index()
+            .get_super_types(&entity_class_id)
+            .unwrap_or_default();
+        assert!(
+            entity_supers
+                .iter()
+                .any(|ty| matches!(ty, LuaType::Ref(id) if id == &LuaTypeDeclId::global("Entity"))),
+            "entity class should inherit Entity, got {entity_supers:?}"
+        );
+        assert!(
+            !entity_supers.iter().any(|ty| {
+                matches!(ty, LuaType::Ref(id) if id == &LuaTypeDeclId::global("TOOL") || id == &LuaTypeDeclId::global("Tool"))
+            }),
+            "entity class must not inherit TOOL/Tool from the same-named STool, got {entity_supers:?}"
+        );
+
+        let stool_supers = db
+            .get_type_index()
+            .get_super_types(&stool_class_id)
+            .unwrap_or_default();
+        assert!(
+            stool_supers
+                .iter()
+                .any(|ty| matches!(ty, LuaType::Ref(id) if id == &LuaTypeDeclId::global("TOOL"))),
+            "STool class should inherit TOOL, got {stool_supers:?}"
+        );
+    }
+
+    #[gtest]
     fn test_stool_buildcpanel_from_field_annotation_only() {
         // Reproduces the real scenario with exact annotation structure from glua-api-snippets.
         // @field BuildCPanel fun(panel: ControlPanel) is on Tool class (not TOOL).
@@ -3554,6 +3892,300 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_gettable_alias_preserves_typed_nested_state_fields_in_scripted_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "cityrp/entities/entities/glide_wheel/init.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class GlideTraceData
+                ---@field start number
+
+                ---@class GlideWheelState
+                ---@field traceData GlideTraceData
+
+                local getTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    ---@type GlideWheelState
+                    self.state = {
+                        traceData = {
+                            start = 1,
+                        },
+                    }
+                end
+
+                function ENT:Think(selfTbl)
+                    selfTbl = selfTbl or getTable(self)
+                    local traceData = selfTbl.state.traceData
+                    return traceData.start
+                end
+            "#,
+        );
+
+        let expected_state = ws.ty("GlideWheelState");
+        let expected_trace = ws.ty("GlideTraceData");
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "selfTbl.state"),
+            expected_state
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "selfTbl.state.traceData"),
+            expected_trace
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == undefined_field)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect();
+
+        assert!(
+            !messages.iter().any(|message| {
+                message.contains("state")
+                    || message.contains("traceData")
+                    || message.contains("start")
+            }),
+            "unexpected UndefinedField diagnostics for nested typed state access: {messages:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_gettable_alias_uses_shadowed_self_argument_type_instead_of_receiver() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "cityrp/entities/entities/glide_wheel/init.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class GlideWheelState
+                ---@field traceData table
+
+                ---@class ShadowedSelfTable
+                ---@field other number
+
+                local getTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    ---@type GlideWheelState
+                    self.state = {
+                        traceData = {},
+                    }
+                end
+
+                function ENT:Think()
+                    ---@type ShadowedSelfTable
+                    local self = {
+                        other = 1,
+                    }
+
+                    local shadowTbl = getTable(self)
+                    local keep = shadowTbl.other
+                    local notReceiverState = shadowTbl.state
+                end
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "shadowTbl.other"),
+            ws.ty("number")
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "shadowTbl.state"),
+            LuaType::Nil
+        );
+    }
+
+    #[gtest]
+    fn test_gettable_alias_or_assignment_preserves_tableof_self_for_nullable_table_param() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+
+        let file_id = ws.def_file(
+            "cityrp/entities/entities/base_glide/sv_input.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---Returns a table containing all key-value pairs stored on this entity's Lua table.
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class base_glide : Entity
+                local ENT = {}
+
+                local getTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    self.inputFloats = {
+                        {
+                            1.0,
+                        },
+                    }
+                end
+
+                ---@param seatIndex number
+                ---@param action string
+                ---@param entTbl table|nil
+                function ENT:GetInputFloat(seatIndex, action, entTbl)
+                    entTbl = entTbl or getTable(self)
+
+                    local floats = entTbl.inputFloats[seatIndex]
+                    return floats[action]
+                end
+            "#,
+        );
+
+        let ent_tbl_assignment_type = assign_value_type(&mut ws, file_id, "entTbl");
+        let ent_tbl_type = index_expr_prefix_type(&mut ws, file_id, "entTbl.inputFloats");
+        let input_floats_type = index_expr_type(&mut ws, file_id, "entTbl.inputFloats");
+
+        assert_that!(
+            ws.humanize_type_detailed(ent_tbl_assignment_type).as_str(),
+            eq("(table|tableof<base_glide>)"),
+            "the raw `entTbl or getTable(self)` assignment should still include the tableof<self> branch before assignment-flow narrowing"
+        );
+        assert_that!(
+            ws.humanize_type_detailed(ent_tbl_type).as_str(),
+            eq("tableof<base_glide>"),
+            "the local should keep the GetTable(self) tableof<self> type after `entTbl = entTbl or getTable(self)`"
+        );
+        assert_that!(
+            ws.humanize_type(input_floats_type).as_str(),
+            eq("((1.0))"),
+            "entTbl.inputFloats should keep the scripted-class field type instead of degrading to generic table access"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("unchecked-nil-access".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_access,
+            is_empty(),
+            "entTbl.inputFloats[seatIndex] should not report unchecked-nil-access after the GetTable(self) fallback"
+        );
+    }
+
+    #[gtest]
+    fn test_gettable_alias_or_assignment_does_not_collapse_when_using_different_expression() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "cityrp/entities/entities/base_glide/sv_input.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---Returns a table containing all key-value pairs stored on this entity's Lua table.
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class base_glide : Entity
+                local ENT = {}
+
+                local getTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    self.inputFloats = {
+                        {
+                            1.0,
+                        },
+                    }
+                end
+
+                ---@return table|nil
+                local function getPlainTable() end
+
+                ---@param seatIndex number
+                ---@param action string
+                ---@param entTbl table|nil
+                function ENT:GetInputFloat(seatIndex, action, entTbl)
+                    entTbl = getPlainTable() or getTable(self)
+
+                    local floats = entTbl.inputFloats[seatIndex]
+                    return floats[action]
+                end
+            "#,
+        );
+
+        let ent_tbl_type = index_expr_prefix_type(&mut ws, file_id, "entTbl.inputFloats");
+
+        assert_that!(
+            ws.humanize_type_detailed(ent_tbl_type).as_str(),
+            eq("(table|tableof<base_glide>)"),
+            "should NOT collapse table|tableof<base_glide> since getPlainTable() is not the same variable"
+        );
+    }
+
     #[test]
     fn test_dynamic_field_table_typed_in_class_file() {
         // When selfTbl is typed as `table` (e.g. from Entity:GetTable()),
@@ -3581,7 +4213,7 @@ mod test {
                 ---@class base_glide_car
                 local ENT = {}
 
-                ---@return table
+                ---@return tableof<self>
                 local function getTable(e) return {} end
 
                 function ENT:BrakeInit()
@@ -3687,6 +4319,1483 @@ mod test {
         assert!(
             !field_names.iter().any(|m| m.contains("`[i]`")),
             "numeric for index into inferred ENT weapons table should not trigger undefined-field: {field_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_seat_table_index_is_deterministic_for_self_and_gettable_alias() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.strict.array_index = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "annotations/vehicle.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@class Vehicle : Entity
+                local Vehicle = {}
+
+                ---@return Entity
+                function Vehicle:GetDriver() end
+
+                ---@class prop_vehicle_prisoner_pod : Vehicle
+
+                ---@class NotEntity
+                local NotEntity = {}
+
+                ---@return table
+                function NotEntity:GetTable() end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/entities/base_glide/shared.lua",
+            r#"
+                ---@class base_glide : Entity
+                local ENT = {}
+            "#,
+        );
+
+        let init_code = r#"
+            ---@class base_glide
+            local ENT = {}
+
+            ---@type Entity
+            local EntityMeta = {}
+            local getTable = EntityMeta.GetTable
+            ---@type NotEntity
+            local NotEntityMeta = {}
+            local nonEntityGetTable = NotEntityMeta.GetTable
+            ---@return table
+            local function makePlainTable() end
+
+            function ENT:Initialize()
+                self.seats = {}
+            end
+
+            function ENT:Use()
+                local earlyDriverSeatSelf = self.seats[1]
+            end
+
+            ---@param index integer
+            function ENT:CreateSeat(index)
+                ---@type prop_vehicle_prisoner_pod
+                local seat
+                self.seats[index] = seat
+            end
+
+            function ENT:Think()
+                local selfTbl = getTable(self)
+                ---@type table
+                local unrelated = {}
+                local unrelatedSeats = unrelated.seats
+                if #selfTbl.seats > 0 then
+                    local driverSeatAlias = selfTbl.seats[1]
+                    local driverSeatSelf = self.seats[1]
+                    local driver = IsValid(driverSeatAlias) and driverSeatAlias:GetDriver() or NULL
+                end
+                if #selfTbl.seats > 0 then
+                    local driverSeatSelfOnly = self.seats[1]
+                    local driver = IsValid(driverSeatSelfOnly) and driverSeatSelfOnly:GetDriver() or NULL
+                end
+                local nonEntityTbl = nonEntityGetTable(self)
+                local nonEntitySeats = nonEntityTbl.seats
+                local reassignedTbl = getTable(self)
+                reassignedTbl = makePlainTable()
+                local reassignedSeats = reassignedTbl.seats
+                do
+                    ---@type table
+                    local selfTbl = {}
+                    local namedSelfTblSeats = selfTbl.seats
+                end
+            end
+        "#;
+
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", init_code);
+        let expected = ws.ty("prop_vehicle_prisoner_pod");
+        let expected_seats = ws.ty("prop_vehicle_prisoner_pod[]");
+
+        let alias_seats_type = index_expr_type(&mut ws, file_id, "selfTbl.seats");
+        let self_seats_type = index_expr_type(&mut ws, file_id, "self.seats");
+        let expected_seats_display = "{\n    prop_vehicle_prisoner_pod,\n}";
+
+        assert_that!(
+            ws.check_type(&alias_seats_type, &expected_seats),
+            eq(true),
+            "selfTbl.seats should be a prop_vehicle_prisoner_pod array, got {}",
+            ws.humanize_type_detailed(alias_seats_type.clone())
+        );
+        let alias_seats_display = ws.humanize_type_detailed(alias_seats_type.clone());
+        assert_that!(alias_seats_display.as_str(), eq(expected_seats_display));
+        assert_that!(
+            ws.check_type(&self_seats_type, &expected_seats),
+            eq(true),
+            "self.seats should be a prop_vehicle_prisoner_pod array, got {}",
+            ws.humanize_type_detailed(self_seats_type.clone())
+        );
+        let self_seats_display = ws.humanize_type_detailed(self_seats_type.clone());
+        assert_that!(self_seats_display.as_str(), eq(expected_seats_display));
+
+        let alias_type = local_name_type(&mut ws, file_id, "driverSeatAlias");
+        let self_type = local_name_type(&mut ws, file_id, "driverSeatSelf");
+        let alias_expr_type = local_assignment_value_type(&mut ws, file_id, "driverSeatAlias");
+        let self_expr_type = local_assignment_value_type(&mut ws, file_id, "driverSeatSelf");
+        let self_only_type = local_name_type(&mut ws, file_id, "driverSeatSelfOnly");
+        let self_only_expr_type =
+            local_assignment_value_type(&mut ws, file_id, "driverSeatSelfOnly");
+        let early_self_type = local_name_type(&mut ws, file_id, "earlyDriverSeatSelf");
+        let unrelated_type = local_name_type(&mut ws, file_id, "unrelatedSeats");
+        let named_self_tbl_type = local_name_type(&mut ws, file_id, "namedSelfTblSeats");
+        let non_entity_get_table_type = local_name_type(&mut ws, file_id, "nonEntitySeats");
+        let reassigned_get_table_type = local_name_type(&mut ws, file_id, "reassignedSeats");
+        let expected_driver_seat_display = "prop_vehicle_prisoner_pod";
+
+        assert_that!(
+            ws.check_type(&alias_type, &expected),
+            eq(true),
+            "selfTbl.seats[1] should be prop_vehicle_prisoner_pod after the length guard, got {}",
+            ws.humanize_type_detailed(alias_type.clone())
+        );
+        let alias_display = ws.humanize_type(alias_type.clone());
+        assert_that!(alias_display.as_str(), eq(expected_driver_seat_display));
+        assert_that!(
+            ws.humanize_type(alias_expr_type).as_str(),
+            eq(expected_driver_seat_display),
+            "selfTbl.seats[1] expression should match hover RHS inference"
+        );
+        assert_that!(
+            ws.check_type(&expected, &alias_type),
+            eq(true),
+            "selfTbl.seats[1] should not include stale any/table members, got {}",
+            ws.humanize_type_detailed(alias_type)
+        );
+        assert_that!(
+            ws.check_type(&self_type, &expected),
+            eq(true),
+            "self.seats[1] should be prop_vehicle_prisoner_pod after the length guard, got {}",
+            ws.humanize_type_detailed(self_type.clone())
+        );
+        let self_display = ws.humanize_type(self_type.clone());
+        assert_that!(self_display.as_str(), eq(expected_driver_seat_display));
+        assert_that!(
+            ws.humanize_type(self_expr_type).as_str(),
+            eq(expected_driver_seat_display),
+            "self.seats[1] expression should match hover RHS inference"
+        );
+        assert_that!(
+            ws.check_type(&expected, &self_type),
+            eq(true),
+            "self.seats[1] should not collapse to nil, got {}",
+            ws.humanize_type_detailed(self_type)
+        );
+        assert_that!(
+            ws.humanize_type(self_only_type).as_str(),
+            eq(expected_driver_seat_display),
+            "self.seats[1] should work when it is the only driverSeat assignment"
+        );
+        assert_that!(
+            ws.humanize_type(self_only_expr_type).as_str(),
+            eq(expected_driver_seat_display),
+            "self.seats[1] RHS hover type should work without a sibling selfTbl.seats[1] expression"
+        );
+        assert_that!(
+            ws.humanize_type(early_self_type).as_str(),
+            eq(expected_driver_seat_display),
+            "an early self.seats[1] read must not remain cached as nil before later seat writes are analyzed"
+        );
+        let unrelated_display = ws.humanize_type(unrelated_type);
+        assert_that!(
+            unrelated_display.as_str(),
+            eq("any?"),
+            "plain tables unrelated to Entity:GetTable(self) must not inherit scripted-class fields"
+        );
+        let named_self_tbl_display = ws.humanize_type(named_self_tbl_type);
+        assert_that!(
+            named_self_tbl_display.as_str(),
+            eq("any?"),
+            "a table named selfTbl must not inherit scripted-class fields unless it comes from Entity:GetTable(self)"
+        );
+        let non_entity_get_table_display = ws.humanize_type(non_entity_get_table_type);
+        assert_that!(
+            non_entity_get_table_display.as_str(),
+            eq("any?"),
+            "a non-Entity GetTable(self) alias must not inherit scripted-class fields"
+        );
+        let reassigned_get_table_display = ws.humanize_type_detailed(reassigned_get_table_type);
+        assert_that!(
+            reassigned_get_table_display.as_str(),
+            eq("any?"),
+            "a reassigned GetTable(self) alias must not keep scripted-class field provenance"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("unchecked-nil-access".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_access,
+            is_empty(),
+            "IsValid(driverSeatAlias) should narrow the indexed seat receiver"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_seat_table_index_is_same_after_batch_load_and_touch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.strict.array_index = true;
+        ws.update_emmyrc(emmyrc);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@return tableof<self>
+            function Entity:GetTable() end
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+
+            ---@class Vehicle : Entity
+            local Vehicle = {}
+
+            ---@return Entity
+            function Vehicle:GetDriver() end
+
+            ---@class prop_vehicle_prisoner_pod : Vehicle
+
+            ---@return table
+            function Entity:GetTable() end
+        "#;
+
+        let shared_code = r#"
+            ---@class base_glide : Entity
+            local ENT = {}
+        "#;
+
+        let cl_init_code = r#"
+            function ENT:RefreshSeats()
+                local seats = {}
+                self.seats = table.Reverse(seats)
+            end
+
+            function ENT:OnRemove()
+                self.seats = nil
+            end
+        "#;
+
+        let init_path = "lua/entities/base_glide/init.lua";
+        let init_code = r#"
+            ---@class base_glide
+            local ENT = {}
+
+            local EntityMeta = FindMetaTable("Entity")
+            local getTable = EntityMeta.GetTable
+
+            function ENT:Initialize()
+                self.seats = self.seats or {}
+            end
+
+            function ENT:Use()
+                local earlyDriverSeatSelf = self.seats[1]
+            end
+
+            ---@param index integer
+            function ENT:CreateSeat(index)
+                ---@type prop_vehicle_prisoner_pod
+                local seat
+                self.seats[index] = seat
+            end
+
+            function ENT:Think()
+                local selfTbl = getTable(self)
+                if #selfTbl.seats > 0 then
+                    local driverSeatAlias = selfTbl.seats[1]
+                    local driverSeatSelf = self.seats[1]
+                    local driver = IsValid(driverSeatAlias) and driverSeatAlias:GetDriver() or NULL
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/vehicle.lua", annotations_code),
+            ("lua/entities/base_glide/cl_init.lua", cl_init_code),
+            ("lua/entities/base_glide/shared.lua", shared_code),
+            (init_path, init_code),
+        ]);
+        let init_uri = ws.virtual_url_generator.new_uri(init_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&init_uri)
+            .expect("expected init file id");
+
+        let expected = ws.ty("prop_vehicle_prisoner_pod");
+        let expected_seats_display = "{\n    prop_vehicle_prisoner_pod,\n}";
+
+        let alias_seats_initial = index_expr_type(&mut ws, file_id, "selfTbl.seats");
+        let alias_initial = local_name_type(&mut ws, file_id, "driverSeatAlias");
+        let self_initial = local_name_type(&mut ws, file_id, "driverSeatSelf");
+        let self_expr_initial = local_assignment_value_type(&mut ws, file_id, "driverSeatSelf");
+        let early_self_initial = local_name_type(&mut ws, file_id, "earlyDriverSeatSelf");
+
+        assert_that!(
+            ws.humanize_type_detailed(alias_seats_initial).as_str(),
+            eq(expected_seats_display),
+            "cold batch load should not produce stale table unions for selfTbl.seats"
+        );
+        assert_that!(
+            ws.check_type(&alias_initial, &expected),
+            eq(true),
+            "cold batch load should type selfTbl.seats[1] as the vehicle seat"
+        );
+        assert_that!(
+            ws.check_type(&self_initial, &expected),
+            eq(true),
+            "cold batch load should type self.seats[1] as the vehicle seat"
+        );
+        assert_that!(
+            ws.humanize_type(self_expr_initial).as_str(),
+            eq("prop_vehicle_prisoner_pod"),
+            "cold batch load should type self.seats[1] RHS for hover"
+        );
+        assert_that!(
+            ws.humanize_type(early_self_initial).as_str(),
+            eq("prop_vehicle_prisoner_pod"),
+            "an early self.seats[1] read must be revisited after later seat writes are analyzed"
+        );
+
+        ws.analysis
+            .update_file_by_uri(&init_uri, Some(format!("{init_code}\n")))
+            .expect("expected touched init file id");
+
+        let alias_seats_after_touch = index_expr_type(&mut ws, file_id, "selfTbl.seats");
+        let alias_after_touch = local_name_type(&mut ws, file_id, "driverSeatAlias");
+        let self_after_touch = local_name_type(&mut ws, file_id, "driverSeatSelf");
+        let self_expr_after_touch = local_assignment_value_type(&mut ws, file_id, "driverSeatSelf");
+        let early_self_after_touch = local_name_type(&mut ws, file_id, "earlyDriverSeatSelf");
+
+        assert_that!(
+            ws.humanize_type_detailed(alias_seats_after_touch).as_str(),
+            eq(expected_seats_display),
+            "touching the file should not change selfTbl.seats type"
+        );
+        assert_that!(ws.check_type(&alias_after_touch, &expected), eq(true));
+        assert_that!(ws.check_type(&self_after_touch, &expected), eq(true));
+        assert_that!(
+            ws.humanize_type(self_expr_after_touch).as_str(),
+            eq("prop_vehicle_prisoner_pod"),
+            "touching the file should not change self.seats[1] RHS hover type"
+        );
+        assert_that!(
+            ws.humanize_type(early_self_after_touch).as_str(),
+            eq("prop_vehicle_prisoner_pod")
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_sound_alias_guards_are_same_after_batch_load_and_touch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+            function CSoundPatch:SetSoundLevel(level) end
+            function CSoundPatch:PlayEx(volume, pitch) end
+            function CSoundPatch:ChangeVolume(volume) end
+            ---@return number
+            function CSoundPatch:GetVolume() end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+        "#;
+
+        let base_shared_code = r#"
+            ENT.Type = "anim"
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:OnEngineStateChange()
+                local snd = self:CreateLoopingSound("start", "start.wav", 70, self)
+                snd:PlayEx(1, 100)
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    snd:SetSoundLevel(level)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+
+            function ENT:InternalDeactivateSounds()
+                local sounds = self.sounds
+
+                for k, snd in pairs(sounds) do
+                    snd:Stop()
+                    sounds[k] = nil
+                end
+            end
+        "#;
+
+        let car_shared_code = r#"
+            ENT.Type = "anim"
+            ENT.Base = "base_glide"
+            ENT.StopStartTailOnInput = false
+            ENT.HornSound = "horn.wav"
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:OnUpdateSounds()
+                local sounds = self.sounds
+                local dt = 0
+                local isHonking = false
+
+                if self.StopStartTailOnInput and sounds.startTail then
+                    sounds.startTail:Stop()
+                    sounds.startTail = nil
+                end
+
+                if isHonking and self.HornSound and self.HornSound ~= "" then
+                    if sounds.horn then
+                        sounds.horn:ChangeVolume(1)
+                    else
+                        local snd = self:CreateLoopingSound("horn", self.HornSound, 85, self)
+                        snd:PlayEx(1, 100)
+                    end
+                elseif sounds.horn then
+                    if sounds.horn:GetVolume() > 0 then
+                        sounds.horn:ChangeVolume(sounds.horn:GetVolume() - dt * 8)
+                    else
+                        sounds.horn:Stop()
+                        sounds.horn = nil
+                    end
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", base_shared_code),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            ("lua/entities/base_glide_car/shared.lua", car_shared_code),
+            (car_path, car_code),
+        ]);
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let initial_sounds_type = local_name_type(&mut ws, file_id, "sounds");
+        let initial_sounds_display = ws.humanize_type_detailed(initial_sounds_type);
+        assert_that!(
+            initial_sounds_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "cold batch load should type the sounds alias from dynamic sound assignments"
+        );
+        assert!(
+            !initial_sounds_display.contains("horn")
+                && !initial_sounds_display.contains("startTail")
+                && !initial_sounds_display.contains(": nil"),
+            "cleanup-only sound fields should not pollute the cold sounds alias hover type: {initial_sounds_display}"
+        );
+
+        let initial_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let initial_undefined_fields = initial_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("undefined-field".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert_that!(
+            initial_undefined_fields,
+            is_empty(),
+            "guarded sound fields should not produce undefined-field diagnostics on cold batch load"
+        );
+
+        ws.analysis
+            .update_file_by_uri(&car_uri, Some(format!("{car_code}\n")))
+            .expect("expected touched car cl_init file id");
+
+        let touched_sounds_type = local_name_type(&mut ws, file_id, "sounds");
+        let touched_sounds_display = ws.humanize_type_detailed(touched_sounds_type);
+        assert_that!(
+            touched_sounds_display.as_str(),
+            eq(initial_sounds_display.as_str()),
+            "touching the file should not change the sounds alias hover type"
+        );
+
+        let touched_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let touched_undefined_fields = touched_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("undefined-field".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert_that!(
+            touched_undefined_fields,
+            is_empty(),
+            "guarded sound fields should not produce undefined-field diagnostics after touching the file"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_sound_guarded_starttail_call_has_no_unchecked_nil_and_non_any_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+            function CSoundPatch:SetSoundLevel(level) end
+            function CSoundPatch:PlayEx(volume, pitch) end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+
+            ---@return string
+            function GetDynamicSoundId() end
+        "#;
+
+        let base_shared_code = r#"
+            ENT.Type = "anim"
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:OnEngineStateChange()
+                local snd = self:CreateLoopingSound("start", "start.wav", 70, self)
+                snd:PlayEx(1, 100)
+
+                local dynamicId = GetDynamicSoundId()
+                local dynamicSound = self:CreateLoopingSound(dynamicId, "dynamic.wav", 70, self)
+                dynamicSound:PlayEx(1, 100)
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    snd:SetSoundLevel(level)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+
+            function ENT:InternalDeactivateSounds()
+                local sounds = self.sounds
+
+                for k, snd in pairs(sounds) do
+                    snd:Stop()
+                    sounds[k] = nil
+                end
+            end
+        "#;
+
+        let car_shared_code = r#"
+            ENT.Type = "anim"
+            ENT.Base = "base_glide"
+            ENT.StopStartTailOnInput = false
+            ENT.HornSound = "horn.wav"
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:OnUpdateSounds()
+                local sounds = self.sounds
+                local dt = 0
+                local isHonking = false
+                local startTailPreview = sounds.startTail
+
+                if self.StopStartTailOnInput and sounds.startTail then
+                    local guardedStartTail = sounds.startTail
+                    guardedStartTail:Stop()
+                    sounds.startTail:Stop()
+                    sounds["startTail"] = nil
+                end
+
+                if isHonking and self.HornSound and self.HornSound ~= "" then
+                    if sounds.horn then
+                        sounds.horn:ChangeVolume(1)
+                    else
+                        local snd = self:CreateLoopingSound("horn", self.HornSound, 85, self)
+                        snd:PlayEx(1, 100)
+                    end
+                elseif sounds.horn then
+                    if sounds.horn:GetVolume() > 0 then
+                        sounds.horn:ChangeVolume(sounds.horn:GetVolume() - dt * 8)
+                    else
+                        sounds.horn:Stop()
+                        sounds.horn = nil
+                    end
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", base_shared_code),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            ("lua/entities/base_glide_car/shared.lua", car_shared_code),
+            (car_path, car_code),
+        ]);
+
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let start_tail_type = index_expr_type(&mut ws, file_id, "sounds.startTail");
+        let start_tail_display = ws.humanize_type_detailed(start_tail_type);
+        assert_that!(
+            start_tail_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "sounds.startTail should keep inferred sound patch type from dynamic map indexing"
+        );
+        assert_that!(
+            start_tail_display.contains("any"),
+            eq(false),
+            "sounds.startTail should not widen to any"
+        );
+        let sounds_type = local_name_type(&mut ws, file_id, "sounds");
+        let sounds_display = ws.humanize_type_detailed(sounds_type);
+        assert_that!(
+            sounds_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "sounds alias should keep inferred CSoundPatch map value type"
+        );
+        let preview_start_tail_type = local_name_type(&mut ws, file_id, "startTailPreview");
+        let preview_start_tail_display = ws.humanize_type_detailed(preview_start_tail_type);
+        assert_that!(
+            preview_start_tail_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "unguarded sounds.startTail access should use map value type"
+        );
+        assert_that!(
+            preview_start_tail_display.contains("any"),
+            eq(false),
+            "unguarded sounds.startTail access should not widen to any"
+        );
+
+        let guarded_start_tail_type = local_name_type(&mut ws, file_id, "guardedStartTail");
+        let guarded_start_tail_display = ws.humanize_type_detailed(guarded_start_tail_type);
+        assert_that!(
+            guarded_start_tail_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "guarded local alias should preserve concrete sound patch type"
+        );
+        assert_that!(
+            guarded_start_tail_display.contains("any"),
+            eq(false),
+            "guarded local alias should not widen to any"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_diagnostics = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_diagnostics,
+            is_empty(),
+            "guarded sounds.startTail call should not report unchecked-nil-access"
+        );
+    }
+
+    #[test]
+    fn test_guarded_dynamic_field_local_alias_matches_rhs_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let consumer_path = "lua/weapons/glide_refueler_base.lua";
+        let consumer_code = r#"
+            ---@class Angle
+            local Angle = {}
+
+            ---@class Entity
+            local Entity = {}
+
+            ---@return Angle
+            function Entity:GetAngles() end
+
+            ---@param ang Angle
+            ---@return Angle
+            function Entity:LocalToWorldAngles(ang) end
+
+            ---@class Angle
+            ---@return Vector
+            function Angle:Forward() end
+
+            ---@return Vector
+            function Angle:Up() end
+
+            ---@return Vector
+            function Angle:Right() end
+
+            ---@class FillPort
+            ---@field worldPos Vector
+            ---@field ang Angle
+
+            ---@return FillPort
+            local function getPort()
+                ---@type FillPort
+                local port = { ang = Angle }
+                port.worldAng = Entity:LocalToWorldAngles(port.ang)
+                return port
+            end
+
+            local function draw()
+                local port = getPort()
+                local veh = Entity
+                if not port or not port.worldPos or not port.worldAng then return end
+
+                local pos = port.worldPos
+                local vehAng = veh:GetAngles()
+                local portAng = port.worldAng
+                local normal = portAng:Forward()
+                local upAxis = vehAng:Up()
+                local rightAxis = vehAng:Right()
+                print(pos, vehAng, portAng, normal, upAxis, rightAxis)
+            end
+        "#;
+        let consumer_file = ws.def_file(consumer_path, consumer_code);
+
+        let rhs_type = local_assignment_value_type(&mut ws, consumer_file, "portAng");
+        let alias_type = local_name_type(&mut ws, consumer_file, "portAng");
+        let pos_type = local_name_type(&mut ws, consumer_file, "pos");
+        let veh_ang_type = local_name_type(&mut ws, consumer_file, "vehAng");
+        let normal_type = local_name_type(&mut ws, consumer_file, "normal");
+        let up_axis_type = local_name_type(&mut ws, consumer_file, "upAxis");
+        let right_axis_type = local_name_type(&mut ws, consumer_file, "rightAxis");
+
+        assert_that!(
+            ws.humanize_type(rhs_type).as_str(),
+            eq("Angle"),
+            "port.worldAng RHS should infer as Angle"
+        );
+        assert_that!(ws.humanize_type(pos_type).as_str(), eq("Vector"));
+        assert_that!(ws.humanize_type(veh_ang_type).as_str(), eq("Angle"));
+        assert_that!(
+            ws.humanize_type(alias_type).as_str(),
+            eq("Angle"),
+            "local portAng should keep the same Angle type as its RHS"
+        );
+        assert_that!(ws.humanize_type(normal_type).as_str(), eq("Vector"));
+        assert_that!(ws.humanize_type(up_axis_type).as_str(), eq("Vector"));
+        assert_that!(ws.humanize_type(right_axis_type).as_str(), eq("Vector"));
+
+        let consumer_uri = ws.virtual_url_generator.new_uri(consumer_path);
+        ws.analysis
+            .update_file_by_uri(&consumer_uri, Some(format!("{consumer_code}\n")))
+            .expect("expected touched consumer file id");
+
+        let touched_pos_type = local_name_type(&mut ws, consumer_file, "pos");
+        let touched_veh_ang_type = local_name_type(&mut ws, consumer_file, "vehAng");
+        let touched_port_ang_type = local_name_type(&mut ws, consumer_file, "portAng");
+        let touched_normal_type = local_name_type(&mut ws, consumer_file, "normal");
+        let touched_up_axis_type = local_name_type(&mut ws, consumer_file, "upAxis");
+        let touched_right_axis_type = local_name_type(&mut ws, consumer_file, "rightAxis");
+
+        assert_that!(
+            ws.humanize_type(touched_pos_type).as_str(),
+            eq("Vector"),
+            "touching the file should not change pos"
+        );
+        assert_that!(
+            ws.humanize_type(touched_veh_ang_type).as_str(),
+            eq("Angle"),
+            "touching the file should not change vehAng"
+        );
+        assert_that!(
+            ws.humanize_type(touched_port_ang_type).as_str(),
+            eq("Angle"),
+            "touching the file should not change portAng"
+        );
+        assert_that!(
+            ws.humanize_type(touched_normal_type).as_str(),
+            eq("Vector"),
+            "touching the file should not change normal"
+        );
+        assert_that!(
+            ws.humanize_type(touched_up_axis_type).as_str(),
+            eq("Vector"),
+            "touching the file should not change upAxis"
+        );
+        assert_that!(
+            ws.humanize_type(touched_right_axis_type).as_str(),
+            eq("Vector"),
+            "touching the file should not change rightAxis"
+        );
+        assert_that!(
+            {
+                ws.analysis
+                    .diagnostic
+                    .enable_only(DiagnosticCode::UncheckedNilAccess);
+                ws.analysis
+                    .diagnose_file(consumer_file, CancellationToken::new())
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|diagnostic| {
+                        diagnostic.code
+                            == Some(NumberOrString::String(
+                                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                            ))
+                    })
+            },
+            eq(false),
+            "portAng:Forward() should not report unchecked-nil-access"
+        );
+    }
+
+    #[gtest]
+    fn test_scripted_weapon_field_read_unions_assignment_history_in_same_file() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/sh_glide.lua",
+                r#"
+                ---@class Glide
+                Glide = Glide or {}
+                "#,
+            ),
+            (
+                "lua/weapons/glide_refueler_base.lua",
+                r#"
+            ---@class Entity
+            ---@return Entity
+            function Entity:GetParent() end
+
+            ---@class Player: Entity
+            ---@return TraceResult
+            function Player:GetEyeTrace() end
+
+            ---@class TraceResult
+            ---@field Entity Entity
+
+            ---@class ENT: Entity
+            ---@class base_glide: ENT
+            ---@field IsGlideVehicle boolean
+            ---@class base_glide_car: base_glide
+            ---@class fl_bmw_i3: base_glide_car
+
+            ---@return Player?
+            function SWEP:GetOwner() end
+
+            function SWEP:Deploy()
+                Glide.RefuelerHUDWeapon = self
+            end
+
+            function SWEP:StartFueling()
+                if CLIENT then return end
+                local vehicle = nil
+                vehicle = select(1, self:GetTargetVehicle())
+                if not IsValid(vehicle) then return end
+                self.activeVehicle = vehicle
+            end
+
+            local function resolveVehicle(ent)
+                if not IsValid(ent) then return nil end
+                if ent.IsGlideVehicle then return ent end
+
+                local parent = ent:GetParent()
+                if IsValid(parent) and parent.IsGlideVehicle then
+                    return parent
+                end
+
+                return nil
+            end
+
+            function SWEP:GetTargetVehicle()
+                local owner = self:GetOwner()
+                if not IsValid(owner) then return nil, nil end
+
+                local trace = owner:GetEyeTrace()
+                local vehicle = resolveVehicle(trace.Entity)
+                return vehicle, trace
+            end
+
+            ---@realm server
+            function SWEP:CancelFueling()
+                self.activeVehicle = nil
+                if Glide.RefuelerHUDWeapon == self then
+                    Glide.RefuelerHUDWeapon = nil
+                end
+            end
+
+            ---@realm shared
+            function SWEP:Holster()
+                self.activeVehicle = nil
+                if Glide.RefuelerHUDWeapon == self then
+                    Glide.RefuelerHUDWeapon = nil
+                end
+            end
+
+            ---@realm client
+            if CLIENT then
+                local function draw()
+                    local wep = Glide.RefuelerHUDWeapon
+                    if not IsValid(wep) then return end
+
+                    local veh = wep.activeVehicle
+                end
+            end
+            "#,
+            ),
+        ]);
+        let file_id = file_ids[1];
+
+        let assigned_member_id = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let active_vehicle_assignment = semantic_model
+                .get_root()
+                .descendants::<glua_parser::LuaAssignStat>()
+                .find_map(|assign_stat| {
+                    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+                    vars.iter()
+                        .enumerate()
+                        .find(|(_, var)| var.syntax().text() == "self.activeVehicle")
+                        .and_then(|(idx, var)| {
+                            let expr = exprs.get(idx)?;
+                            (expr.syntax().text() == "vehicle").then(|| var.clone())
+                        })
+                })
+                .expect("expected self.activeVehicle = vehicle assignment");
+
+            LuaMemberId::new(active_vehicle_assignment.get_syntax_id(), file_id)
+        };
+        let assigned_type = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_type_cache(&assigned_member_id.into())
+            .expect("expected activeVehicle assignment type")
+            .as_type()
+            .clone();
+        let assigned_desc = ws.humanize_type(assigned_type);
+        assert_that!(
+            assigned_desc.as_str(),
+            contains_substring("base_glide"),
+            "self.activeVehicle = vehicle cache should keep the resolved guarded vehicle type, got {}",
+            assigned_desc
+        );
+        assert_that!(
+            assigned_desc.as_str(),
+            not(any!(eq("nil"), eq("any"), eq("unknown"))),
+            "self.activeVehicle = vehicle cache should not fossilize a weak early RHS type"
+        );
+
+        let rhs_type = local_assignment_value_type(&mut ws, file_id, "veh");
+        let rhs_desc = ws.humanize_type(rhs_type);
+        assert_that!(
+            rhs_desc.as_str(),
+            all!(contains_substring("base_glide"), contains_substring("?")),
+            "activeVehicle read should union all visible assignments, got {}",
+            rhs_desc
+        );
+
+        let semantic_decl = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let active_vehicle_expr = semantic_model
+                .get_root()
+                .descendants::<glua_parser::LuaIndexExpr>()
+                .find(|index_expr| index_expr.syntax().text() == "wep.activeVehicle")
+                .expect("expected activeVehicle index expression");
+            semantic_model
+                .get_semantic_info(active_vehicle_expr.syntax().clone().into())
+                .expect("expected semantic info for activeVehicle")
+                .semantic_decl
+                .expect("expected activeVehicle semantic declaration")
+        };
+        let decl_type = match semantic_decl {
+            crate::LuaSemanticDeclId::Member(member_id) => ws
+                .get_db_mut()
+                .get_type_index()
+                .get_type_cache(&member_id.into())
+                .expect("expected member type")
+                .as_type()
+                .clone(),
+            other => panic!("expected member semantic declaration, got {other:?}"),
+        };
+        let decl_desc = ws.humanize_type(decl_type);
+        assert_that!(
+            decl_desc.as_str(),
+            not(eq("nil")),
+            "activeVehicle semantic declaration should not point at a nil-only assignment"
+        );
+
+        let veh_type = local_name_type(&mut ws, file_id, "veh");
+        let veh_desc = ws.humanize_type(veh_type);
+        assert_that!(
+            veh_desc.as_str(),
+            all!(contains_substring("base_glide"), contains_substring("?")),
+            "local veh should retain the activeVehicle assignment union, got {}",
+            veh_desc
+        );
+    }
+
+    #[gtest]
+    fn test_scripted_weapon_same_function_member_read_uses_latest_assignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/weapons/glide_refueler_base.lua",
+            r#"
+            ---@class ENT
+            ---@class base_glide: ENT
+
+            function SWEP:Test(vehicle)
+                self.activeVehicle = nil
+                self.activeVehicle = vehicle
+                local veh = self.activeVehicle
+            end
+            "#,
+        );
+
+        let veh_type = local_name_type(&mut ws, file_id, "veh");
+        let veh_desc = ws.humanize_type(veh_type);
+        assert_that!(
+            veh_desc.as_str(),
+            not(contains_substring("nil")),
+            "same-function field flow should keep the latest assignment precise, got {}",
+            veh_desc
+        );
+    }
+
+    #[gtest]
+    fn test_scripted_weapon_field_semantic_decl_prefers_informative_history() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/sh_glide.lua",
+                r#"
+                ---@class Glide
+                Glide = Glide or {}
+                "#,
+            ),
+            (
+                "lua/weapons/glide_refueler_base.lua",
+                r#"
+            ---@class ENT
+            ---@class base_glide: ENT
+
+            function SWEP:Deploy()
+                Glide.RefuelerHUDWeapon = self
+            end
+
+            ---@realm shared
+            function SWEP:Reset()
+                self.activeVehicle = nil
+            end
+
+            ---@param vehicle base_glide
+            function SWEP:StartFueling(vehicle)
+                if CLIENT then return end
+                if not IsValid(vehicle) then return end
+                self.activeVehicle = vehicle
+            end
+
+            ---@realm client
+            if CLIENT then
+                local function draw()
+                    local wep = Glide.RefuelerHUDWeapon
+                    if not IsValid(wep) then return end
+
+                    local veh = wep.activeVehicle
+                end
+            end
+            "#,
+            ),
+        ]);
+        let file_id = file_ids[1];
+
+        let semantic_decl = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let active_vehicle_expr = semantic_model
+                .get_root()
+                .descendants::<glua_parser::LuaIndexExpr>()
+                .find(|index_expr| index_expr.syntax().text() == "wep.activeVehicle")
+                .expect("expected activeVehicle index expression");
+            semantic_model
+                .get_semantic_info(active_vehicle_expr.syntax().clone().into())
+                .expect("expected semantic info for activeVehicle")
+                .semantic_decl
+                .expect("expected activeVehicle semantic declaration")
+        };
+        let decl_type = match semantic_decl {
+            crate::LuaSemanticDeclId::Member(member_id) => ws
+                .get_db_mut()
+                .get_type_index()
+                .get_type_cache(&member_id.into())
+                .expect("expected member type")
+                .as_type()
+                .clone(),
+            other => panic!("expected member semantic declaration, got {other:?}"),
+        };
+        let decl_desc = ws.humanize_type(decl_type);
+        assert_that!(
+            decl_desc.as_str(),
+            contains_substring("base_glide"),
+            "semantic declaration should prefer informative assignment history, got {}",
+            decl_desc
+        );
+    }
+
+    #[test]
+    fn test_gmod_dynamic_initializer_fallback_respects_explicit_unknown_annotation() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Angle
+            local Angle = {}
+
+            ---@class Entity
+            local Entity = {}
+
+            ---@return Angle
+            function Entity:GetAngles() end
+
+            local veh = Entity
+
+            ---@type unknown
+            local vehAng = veh:GetAngles()
+            print(vehAng)
+        "#,
+        );
+
+        let annotated_type = local_name_type(&mut ws, file_id, "vehAng");
+        assert_that!(
+            ws.humanize_type_detailed(annotated_type).as_str(),
+            eq("unknown"),
+            "explicit unknown annotations should not be replaced by dynamic initializer fallback"
+        );
+    }
+
+    #[test]
+    fn test_isvalid_guard_promotes_hard_nil_local_to_any_after_early_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            local veh = nil
+            if not IsValid(veh) then return end
+
+            local narrowed = veh
+            print(narrowed)
+            "#,
+        );
+
+        let narrowed_type = local_name_type(&mut ws, file_id, "narrowed");
+        assert_eq!(
+            narrowed_type,
+            LuaType::Any,
+            "a successful IsValid guard proves even a previously hard-nil local is usable"
+        );
+    }
+
+    #[test]
+    fn test_isvalid_alias_guard_promotes_hard_nil_local_to_any_after_early_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            local iv = IsValid
+            local veh = nil
+            if not iv(veh) then return end
+
+            local narrowed = veh
+            print(narrowed)
+            "#,
+        );
+
+        let narrowed_type = local_name_type(&mut ws, file_id, "narrowed");
+        assert_eq!(
+            narrowed_type,
+            LuaType::Any,
+            "an aliased successful IsValid guard should also promote a hard-nil local"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_self_index_local_unknown_reassignment_does_not_fall_back_to_initializer() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@return unknown
+            function MakeUnknown() end
+
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:Test()
+                local sounds = self.sounds
+                sounds = MakeUnknown()
+                local after = sounds
+            end
+        "#;
+
+        let path = "lua/entities/base_glide/cl_init.lua";
+        ws.def_file(path, code);
+        let uri = ws.virtual_url_generator.new_uri(path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&uri)
+            .expect("expected cl_init file id");
+
+        let reassignment_type = assign_value_type(&mut ws, file_id, "sounds");
+        assert_that!(
+            ws.humanize_type_detailed(reassignment_type).as_str(),
+            eq("unknown"),
+            "the reassignment itself should be unknown"
+        );
+
+        let after_type = local_name_type(&mut ws, file_id, "after");
+        assert_that!(
+            ws.humanize_type_detailed(after_type).as_str(),
+            eq("unknown"),
+            "a later unknown assignment should remain the current flow result"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_self_field_local_alias_preserves_known_optional_panel_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let engine_code = r#"
+            local WebAudio = Glide.WebAudio
+
+            function WebAudio:Enable()
+                local panel = self.panel
+                if IsValid(panel) then
+                    return
+                end
+
+                panel = vgui.Create("HTML", GetHUDPanel())
+                self.panel = panel
+            end
+
+            function WebAudio:Disable()
+                self.panel = nil
+            end
+
+            function WebAudio:OnHTMLReady()
+                local readyPanel = self.panel
+                readyPanel:NewObject("webaudio")
+            end
+            "#;
+        ws.def_files(vec![
+            ("lua/glide/client/engine_stream_webaudio.lua", engine_code),
+            (
+                "lua/autorun/sh_glide.lua",
+                r#"
+                Glide = {}
+
+                if CLIENT then
+                    ---@class WebAudio
+                    Glide.WebAudio = Glide.WebAudio or {}
+                end
+                "#,
+            ),
+            (
+                "lua/includes/gmod_vgui.lua",
+                r#"
+                ---@class Panel
+                ---@class HTML : Panel
+                local HTML = {}
+                function HTML:NewObject(name) end
+
+                vgui = {}
+                ---@generic T : Panel
+                ---@param className `T`
+                ---@return T
+                function vgui.Create(className, parent) end
+
+                ---@return Panel
+                function GetHUDPanel() end
+                "#,
+            ),
+        ]);
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/glide/client/engine_stream_webaudio.lua");
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&uri)
+            .expect("expected WebAudio file id");
+
+        let create_panel_type = assign_value_type(&mut ws, file_id, "panel");
+        let create_panel_display = ws.humanize_type(create_panel_type);
+        let self_panel_assignment_type = assign_value_type(&mut ws, file_id, "self.panel");
+        let self_panel_assignment_display = ws.humanize_type(self_panel_assignment_type);
+        let panel_rhs_type = local_assignment_value_type(&mut ws, file_id, "readyPanel");
+        let panel_rhs_display = ws.humanize_type(panel_rhs_type);
+        let panel_type = local_name_type(&mut ws, file_id, "readyPanel");
+        let panel_display = ws.humanize_type(panel_type);
+        assert_that!(
+            panel_display.as_str(),
+            contains_substring("HTML"),
+            "local panel should preserve the known HTML half of self.panel, got {panel_display}; RHS was {panel_rhs_display}; create call was {create_panel_display}; self.panel assignment was {self_panel_assignment_display}"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("unchecked-nil-access".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_access,
+            is_empty(),
+            "HTML? should not degrade to opaque any? and produce unchecked-nil-access"
         );
     }
 
@@ -4558,5 +6667,462 @@ mod test {
             crate::LuaMemberIndexItem::Many(ids) => ids.len(),
         };
         assert_eq!(count, 1);
+    }
+
+    // --- scripted_ents.GetMember delegation tests ---
+
+    #[gtest]
+    fn test_getmember_delegation_copies_network_vars_to_delegating_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Simulate the real edit_sky / env_skypaint pattern
+        ws.def_files(vec![
+            (
+                "lua/entities/env_skypaint/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "TopColorR")
+                    self:NetworkVar("Float", 0, "TopColorG")
+                    self:NetworkVar("Float", 0, "TopColorB")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/edit_sky/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    local SetupDataTables = scripted_ents.GetMember("env_skypaint", "SetupDataTables")
+                    SetupDataTables(self)
+                end
+            "#,
+            ),
+        ]);
+
+        // Verify the delegating entity has the NetworkVar members from the target
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("edit_sky");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on edit_sky class");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetTopColorR".to_string()),
+            "missing GetTopColorR in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetTopColorR".to_string()),
+            "missing SetTopColorR in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetTopColorG".to_string()),
+            "missing GetTopColorG in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetTopColorG".to_string()),
+            "missing SetTopColorG in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetTopColorB".to_string()),
+            "missing GetTopColorB in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetTopColorB".to_string()),
+            "missing SetTopColorB in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_no_undefined_field_diagnostics() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/env_skypaint/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Int", 0, "SkyTopColor")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/edit_sky/shared.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    local SetupDataTables = scripted_ents.GetMember("env_skypaint", "SetupDataTables")
+                    SetupDataTables(self)
+                end
+            "#,
+            ),
+            (
+                "lua/entities/edit_sky/cl_init.lua",
+                r#"
+                function ENT:Think()
+                    local color = self:GetSkyTopColor()
+                    self:SetSkyTopColor(color + 1)
+                end
+            "#,
+            ),
+        ]);
+
+        let target_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/entities/edit_sky/cl_init.lua");
+        let target_file_id = ws
+            .analysis
+            .get_file_id(&target_uri)
+            .expect("expected file id");
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(target_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "unexpected undefined-field diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_with_direct_call_pattern() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Test direct call: scripted_ents.GetMember("class", "method")(self)
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("String", "Label")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    scripted_ents.GetMember("target_ent", "SetupDataTables")(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("delegating_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetLabel".to_string()),
+            "missing GetLabel in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetLabel".to_string()),
+            "missing SetLabel in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_preserves_target_entity_network_vars() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Verify the target entity still has its own NetworkVar members
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "Speed")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    local f = scripted_ents.GetMember("target_ent", "SetupDataTables")
+                    f(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+
+        // Target should still have its members
+        let target_class_id = LuaTypeDeclId::global("target_ent");
+        let target_owner = LuaMemberOwner::Type(target_class_id);
+        let target_members = db
+            .get_member_index()
+            .get_members(&target_owner)
+            .expect("expected members on target_ent");
+        let target_names: Vec<_> = target_members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+        assert!(
+            target_names.contains(&"GetSpeed".to_string()),
+            "target_ent missing GetSpeed in {target_names:?}"
+        );
+
+        // Delegating entity should also have the members
+        let deleg_class_id = LuaTypeDeclId::global("delegating_ent");
+        let deleg_owner = LuaMemberOwner::Type(deleg_class_id);
+        let deleg_members = db
+            .get_member_index()
+            .get_members(&deleg_owner)
+            .expect("expected members on delegating_ent");
+        let deleg_names: Vec<_> = deleg_members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+        assert!(
+            deleg_names.contains(&"GetSpeed".to_string()),
+            "delegating_ent missing GetSpeed in {deleg_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_ignores_non_setupdatatables_method() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "Speed")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:Think()
+                    local Think = scripted_ents.GetMember("target_ent", "Think")
+                    Think(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("delegating_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on delegating_ent");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            !member_names.contains(&"GetSpeed".to_string()),
+            "unexpected copied GetSpeed from non-SetupDataTables delegation in {member_names:?}"
+        );
+        assert!(
+            !member_names.contains(&"SetSpeed".to_string()),
+            "unexpected copied SetSpeed from non-SetupDataTables delegation in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_copies_network_vars_from_all_class_files() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "ServerSpeed")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/target_ent/cl_init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "ClientOnlySpeed")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    scripted_ents.GetMember("target_ent", "SetupDataTables")(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("delegating_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on delegating_ent");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetServerSpeed".to_string()),
+            "missing GetServerSpeed from init.lua in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetClientOnlySpeed".to_string()),
+            "missing GetClientOnlySpeed from cl_init.lua in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_copies_network_vars_from_shared_target_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/target_ent/init.lua",
+                r#"
+                function ENT:Initialize()
+                end
+            "#,
+            ),
+            (
+                "lua/entities/target_ent/shared.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Float", 0, "SharedSpeed")
+                    self:NetworkVar("Bool", 0, "SharedActive")
+                end
+            "#,
+            ),
+            (
+                "lua/entities/delegating_ent/init.lua",
+                r#"
+                function ENT:SetupDataTables()
+                    local SetupDataTables = scripted_ents.GetMember("target_ent", "SetupDataTables")
+                    SetupDataTables(self)
+                end
+            "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("delegating_ent");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on delegating_ent");
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        assert!(
+            member_names.contains(&"GetSharedSpeed".to_string()),
+            "missing GetSharedSpeed from shared.lua in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetSharedSpeed".to_string()),
+            "missing SetSharedSpeed from shared.lua in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"GetSharedActive".to_string()),
+            "missing GetSharedActive from shared.lua in {member_names:?}"
+        );
+        assert!(
+            member_names.contains(&"SetSharedActive".to_string()),
+            "missing SetSharedActive from shared.lua in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getmember_delegation_target_not_found_does_not_crash() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Delegation to a nonexistent class should not crash
+        ws.def_file(
+            "lua/entities/edit_sky/init.lua",
+            r#"
+            function ENT:SetupDataTables()
+                local f = scripted_ents.GetMember("nonexistent_class", "SetupDataTables")
+                f(self)
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("edit_sky");
+        let owner = LuaMemberOwner::Type(class_id);
+        let members = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members");
+        // Should not have get/set members from the nonexistent class
+        let member_names: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+        assert!(
+            !member_names.contains(&"GetSpeed".to_string()),
+            "unexpected GetSpeed from nonexistent target in {member_names:?}"
+        );
     }
 }

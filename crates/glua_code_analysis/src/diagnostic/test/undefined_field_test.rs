@@ -7,6 +7,31 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     #[test]
+    fn test_dynamic_table_param_return_or_empty_branch_keeps_fields_allowed() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@return table|nil
+            function JSONToTable(s) end
+
+            function CheckVersion(data)
+                if type(data.version) ~= "number" then
+                    return {}
+                end
+
+                return data
+            end
+
+            local data = JSONToTable("{}") or {}
+            data = CheckVersion(data)
+            print(data.carVolume)
+        "#
+        ));
+    }
+
+    #[test]
     fn test_1() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(
@@ -287,6 +312,49 @@ mod test {
             ---@type number
             local n
             local c = str[n]
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_dynamic_index_on_empty_table_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local tbl = {}
+                local id = 1
+                local _ = tbl[id]
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_gamemode_pairs_copy_fields_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class GM
+                ---@type GM
+                GAMEMODE = {}
+
+                local source = {
+                    soundA = "ambient/water/drip1.wav",
+                    soundB = "ambient/water/drip2.wav",
+                }
+
+                for key, val in pairs(source) do
+                    GAMEMODE[key] = val
+                end
+
+                local _a = GAMEMODE.soundA
+                local _b = GAMEMODE.soundB
             "#
         ));
     }
@@ -863,6 +931,23 @@ mod test {
             DiagnosticCode::UndefinedField,
             r#"
                 local test = {}
+                print(test.meow)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_unknown_dynamic_key_does_not_suppress_exact_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local test = {}
+
+                local function assign(key)
+                    test[key] = true
+                end
+
                 print(test.meow)
             "#
         ));
@@ -1474,6 +1559,24 @@ mod test {
     }
 
     #[test]
+    fn test_nil_guarded_field_if_condition_does_not_guard_elseif_body() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestConfigElseIf
+                local cfg = {}
+
+                if cfg.dynamicField then
+                    print(cfg.dynamicField)
+                elseif true then
+                    print(cfg.dynamicField)
+                end
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_nil_guarded_field_compound_and() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(
@@ -1934,6 +2037,241 @@ mod test {
     }
 
     #[test]
+    fn test_outparam_updated_fallback_table_field_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "trace.lua",
+            r#"
+                ---@class Vector
+                local Vector = {}
+
+                ---@class TraceResult
+                ---@field HitPos Vector
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceHull(traceConfig) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/glide_wheel/init.lua",
+            r#"
+                ---@class Glide
+                Glide = Glide or {}
+
+                local ray = Glide.LastWheelTraceResult or {}
+                local traceData = {
+                    output = ray,
+                }
+
+                util.TraceHull(traceData)
+
+                local hitPos = ray.HitPos
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "undefined-field".to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "outparam-populated ray table should not produce undefined-field diagnostics: {undefined_fields:?}"
+        );
+    }
+
+    #[test]
+    fn test_outparam_updated_class_state_output_field_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "trace.lua",
+            r#"
+                ---@class Vector
+                local Vector = {}
+
+                ---@class TraceResult
+                ---@field Hit boolean
+                ---@field HitPos Vector
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceHull(traceConfig) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/glide_wheel/init.lua",
+            r#"
+                ---@class Glide
+                Glide = Glide or {}
+
+                ---@class GlideWheelState
+
+                ---@class glide_wheel : Entity
+                ---@field state GlideWheelState
+                local ENT = {}
+
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                function FindMetaTable(name)
+                    return Entity
+                end
+
+                local getTable = FindMetaTable("Entity").GetTable
+                local ray = Glide.LastWheelTraceResult or {}
+
+                function ENT:Initialize()
+                    ---@type glide_wheel
+                    local selfTbl = getTable(self)
+                    selfTbl.state = {
+                        traceData = {
+                            output = ray,
+                        },
+                    }
+                end
+
+                function ENT:OnPostThink()
+                    ---@type glide_wheel
+                    local selfTbl = getTable(self)
+                    local traceData = selfTbl.state.traceData
+                    util.TraceHull(traceData)
+
+                    local hit = ray.Hit
+                    local hitPos = ray.HitPos
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "undefined-field".to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "outparam-populated class state trace output should not produce undefined-field diagnostics: {undefined_fields:?}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_field_setter_helper_call_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "lua/autorun/sh_helpers.lua",
+            r#"
+                Glide = {}
+
+                function Glide.SetNumber(t, k, v)
+                    t[k] = v
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/weapons/gmod_tool/stools/glide_make_amphibious.lua",
+            r#"
+                local data = {}
+                local SetNumber = Glide.SetNumber
+
+                SetNumber(data, "buoyancyOffsetZ", 1)
+
+                local offset = data.buoyancyOffsetZ
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "undefined-field".to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "table fields written through helper calls should not produce undefined-field diagnostics: {undefined_fields:?}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_field_setter_helper_unknown_key_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local function SetField(t, k, v)
+                    t[k] = v
+                end
+
+                local data = {}
+                local unknownKey = getKey()
+                SetField(data, unknownKey, 1)
+
+                local offset = data.buoyancyOffsetZ
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_nil_guard_in_condition_truthy_check() {
         let mut ws = VirtualWorkspace::new();
         // Field used as truthy check in if condition should be suppressed
@@ -1944,6 +2282,136 @@ mod test {
                 local obj = {}
                 if obj.unknownField then
                     print("exists")
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_constructor_field_visible_to_sibling_method_with_index() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestLocationInfo
+                ---@field Name string
+
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                ---@param loc_id integer
+                ---@param loc_info TestLocationInfo
+                function LOCATION:Init(loc_id, loc_info)
+                    local instance = loc_info
+                    setmetatable(instance, self)
+                    instance._OriginalName = loc_info.Name
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._OriginalName
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_constructor_field_without_index_still_undefined() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class TestLocationInfoNoIndex
+                ---@field Name string
+
+                local LOCATION = {}
+
+                ---@param loc_id integer
+                ---@param loc_info TestLocationInfoNoIndex
+                function LOCATION:Init(loc_id, loc_info)
+                    local instance = loc_info
+                    setmetatable(instance, self)
+                    instance._OriginalName = loc_info.Name
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._OriginalName
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_constructor_field_shadowed_instance_stays_undefined() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                function LOCATION:Init()
+                    local instance = {}
+                    do
+                        local instance = {}
+                        setmetatable(instance, self)
+                    end
+
+                    instance._OriginalName = true
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._OriginalName
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_constructor_field_nested_closure_stays_undefined() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                function LOCATION:Init()
+                    local instance = {}
+
+                    local function attach()
+                        setmetatable(instance, self)
+                    end
+
+                    attach()
+                    instance._OriginalName = true
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._OriginalName
                 end
             "#
         ));
@@ -2304,5 +2772,222 @@ mod test {
                 ))
         });
         assert!(!has_undefined, "Expected no undefined-field, but got one");
+    }
+
+    #[test]
+    fn test_return_table_numeric_index_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        // Numeric indexing on a value from ---@return table should not trigger
+        // undefined-field (the table is generic/open, not a tracked literal).
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@param s string
+            ---@return table
+            local function string_Split(s) end
+
+            local VecComp = string_Split("1 2 3", " ")
+            local ang = VecComp[1]
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_return_table_string_index_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        // String-key indexing (dot and bracket) on a value from ---@return table
+        // should not trigger undefined-field.
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@return table
+            local function getConfig() end
+
+            local cfg = getConfig()
+            local a = cfg.foo
+            local b = cfg["bar"]
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_cross_file_snapshot_record_undefined_field_stable_after_reindex() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "lua/includes/glua_stubs.lua",
+            r#"
+            net = {}
+            util = {}
+
+            ---@return number
+            function net.ReadUInt(bits) end
+
+            ---@return boolean
+            function net.ReadBool() end
+
+            ---@return string
+            function net.ReadString() end
+
+            ---@return number
+            function net.ReadFloat() end
+
+            ---@return table?
+            function util.JSONToTable(json) end
+
+            ---@class Vector
+            ---@return Vector
+            function Vector(x, y, z) end
+
+            ---@return number
+            function SysTime() end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            Glide = Glide or {}
+            Glide.DebugNetwork = Glide.DebugNetwork or {}
+            local DebugNet = Glide.DebugNetwork
+            local TYPE = {
+                BOOL = 1,
+                FLOAT = 2,
+                STRING = 3,
+                VECTOR = 4,
+                JSON = 5,
+            }
+
+            local function readValue()
+                local typeId = net.ReadUInt(3)
+                if typeId == TYPE.BOOL then
+                    return net.ReadBool()
+                end
+                if typeId == TYPE.FLOAT then
+                    return net.ReadFloat()
+                end
+                if typeId == TYPE.STRING then
+                    return net.ReadString()
+                end
+                if typeId == TYPE.VECTOR then
+                    return Vector(net.ReadFloat(), net.ReadFloat(), net.ReadFloat())
+                end
+                if typeId == TYPE.JSON then
+                    local json = net.ReadString()
+                    local tbl = util.JSONToTable(json or "")
+                    return tbl or {}
+                end
+
+                return nil
+            end
+
+            function DebugNet.ReadSnapshot()
+                local entId = net.ReadUInt(16)
+                local hasVehicle = net.ReadBool()
+                local vehicleId = nil
+                if hasVehicle then
+                    vehicleId = net.ReadUInt(16)
+                    if vehicleId == 0 then vehicleId = nil end
+                end
+
+                local fieldCount = net.ReadUInt(6)
+                local fields = {}
+                for _ = 1, fieldCount do
+                    local key = net.ReadString()
+                    fields[key] = readValue()
+                end
+
+                return entId, vehicleId, fields
+            end
+            "#,
+        );
+
+        let network_source = r#"
+            local DebugNet = Glide.DebugNetwork
+            local commands = {}
+            Glide.CMD_DEBUG_SNAPSHOT = 1
+
+            commands[Glide.CMD_DEBUG_SNAPSHOT] = function()
+                local entId, vehicleId, fields = DebugNet.ReadSnapshot()
+                if not entId then return end
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+                local rec = Glide.DebugSnapshots[entId]
+                if not rec then
+                    rec = { data = {}, t = SysTime() }
+                    Glide.DebugSnapshots[entId] = rec
+                end
+
+                local data = rec.data
+
+                if vehicleId ~= nil then
+                    data.vehicle = vehicleId
+                else
+                    data.vehicle = nil
+                end
+
+                for key, value in pairs( fields ) do
+                    if key ~= "ent" then
+                        data[key] = value
+                    end
+                end
+            end
+        "#;
+        let network_file = ws.def_file("lua/glide/client/network.lua", network_source);
+
+        let debugging_source = r#"
+            local function draw()
+                local snaps = Glide.DebugSnapshots or {}
+
+                for entId, rec in pairs(snaps) do
+                    if not rec or not rec.data then return end
+
+                    local d = rec.data
+                    local contactPos = d.contactPos
+                end
+            end
+        "#;
+        let debugging_file = ws.def_file("lua/glide/client/debugging.lua", debugging_source);
+
+        let contact_pos_code = Some(lsp_types::NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let contact_pos_message = "Undefined field `contactPos`. ";
+        let initial_diagnostics = ws
+            .analysis
+            .diagnose_file(debugging_file, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            !initial_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == contact_pos_code
+                    && diagnostic.message == contact_pos_message),
+            "expected no initial undefined-field for contactPos, got {initial_diagnostics:?}"
+        );
+
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/glide/client/network.lua");
+        ws.analysis
+            .update_file_text_only(&uri, format!("\n{network_source}"));
+        ws.analysis.reindex_files(vec![network_file]);
+
+        let after_reindex_diagnostics = ws
+            .analysis
+            .diagnose_file(debugging_file, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            !after_reindex_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == contact_pos_code
+                    && diagnostic.message == contact_pos_message),
+            "expected no post-reindex undefined-field for contactPos, got {after_reindex_diagnostics:?}"
+        );
     }
 }

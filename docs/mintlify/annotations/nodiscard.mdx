@@ -5,7 +5,7 @@ description: Warn when a function's return value is discarded.
 
 ## Overview
 
-`@nodiscard` marks a function whose return value should always be used. Calling the function and ignoring the return value triggers a `discard-returns` diagnostic.
+`@nodiscard` marks a function whose return value callers should use. If you call the function and ignore the return value, GLuaLS reports `discard-returns`.
 
 ---
 
@@ -38,7 +38,7 @@ local token = GetPlayerToken(ply)  -- ✅
 
 ## With a custom message
 
-Provide a string to explain why the return value matters:
+Add a string to explain why the return value matters:
 
 ```lua
 ---@nodiscard "Use the returned handle to cancel the timer"
@@ -55,8 +55,8 @@ The message appears in the diagnostic.
 ## When to use
 
 Use `@nodiscard` on functions where:
-- Silently ignoring the return value is almost always a bug (e.g., getting a handle, getting a result that must be checked)
-- The return value performs a side-effect or cleanup that callers must manage
+- Ignoring the return value is usually a bug, such as getting a handle or a result you must check
+- Callers must manage work tied to the return value, such as cleanup or cancellation
 
 Common candidates in GMod:
 - Functions returning an `Entity` that the caller is expected to configure

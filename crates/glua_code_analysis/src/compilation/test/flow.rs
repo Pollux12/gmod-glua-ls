@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaSemanticDeclId, LuaType, VirtualWorkspace};
     use glua_parser::{LuaAstNode, LuaNameExpr};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
@@ -54,6 +54,58 @@ mod test {
             .get_semantic_info(name_expr.syntax().clone().into())
             .expect("expected semantic info for name expression")
             .typ
+    }
+
+    fn nth_name_expr_semantic_decl_from_end(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth_from_end: usize,
+    ) -> Option<LuaSemanticDeclId> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let name_exprs = root
+            .clone()
+            .descendants::<LuaNameExpr>()
+            .filter(|expr| expr.get_name_text().as_deref() == Some(name))
+            .collect::<Vec<_>>();
+        let name_expr = name_exprs
+            .into_iter()
+            .rev()
+            .nth(nth_from_end)
+            .expect("expected matching name expression");
+        semantic_model
+            .get_semantic_info(name_expr.syntax().clone().into())
+            .expect("expected semantic info for name expression")
+            .semantic_decl
+    }
+
+    fn nth_name_expr_semantic_decl(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth: usize,
+    ) -> Option<LuaSemanticDeclId> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let name_expr = root
+            .clone()
+            .descendants::<LuaNameExpr>()
+            .filter(|expr| expr.get_name_text().as_deref() == Some(name))
+            .nth(nth)
+            .expect("expected matching name expression");
+        semantic_model
+            .get_semantic_info(name_expr.syntax().clone().into())
+            .expect("expected semantic info for name expression")
+            .semantic_decl
     }
 
     #[test]
@@ -1914,6 +1966,25 @@ _2 = a[1]
     }
 
     #[test]
+    fn test_gmod_func_param_name_hint_infers_function_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            local function run(func)
+                A = func
+            end
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedGlobal, code));
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "function");
+    }
+
+    #[test]
     fn test_explicit_param_annotation_overrides_gmod_name_fallback() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
@@ -2253,7 +2324,7 @@ _2 = a[1]
     }
 
     #[test]
-    fn test_local_cached_isvalid_keeps_unknown_unknown() {
+    fn test_local_cached_isvalid_promotes_unknown_to_any() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -2272,7 +2343,43 @@ _2 = a[1]
         );
 
         let a = ws.expr_ty("a");
-        assert_eq!(a, LuaType::Unknown);
+        assert_eq!(a, LuaType::Any);
+    }
+
+    #[test]
+    fn test_reassigned_field_initialized_local_keeps_own_semantic_identity_after_isvalid() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Weapon
+            ---@field activeVehicle nil
+
+            ---@type Weapon
+            local wep
+            local veh = wep.activeVehicle
+            if not IsValid(veh) then
+                veh = select(1, wep:GetTargetVehicle())
+            end
+            if not IsValid(veh) then return end
+            local narrowed = veh
+            "#,
+        );
+
+        let declared_veh = nth_name_expr_semantic_decl(&mut ws, file_id, "veh", 0)
+            .expect("expected semantic declaration for local veh");
+        let later_veh = nth_name_expr_semantic_decl_from_end(&mut ws, file_id, "veh", 0)
+            .expect("expected semantic declaration for later veh use");
+
+        assert_that!(
+            declared_veh,
+            matches_pattern!(LuaSemanticDeclId::LuaDecl(_))
+        );
+        assert_eq!(later_veh, declared_veh);
     }
 
     #[test]
@@ -4019,6 +4126,200 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_scripted_tool_name_collision_does_not_pollute_entity_vehicle_table() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+
+        ws.def_files(vec![
+            (
+                "lua/includes/gmod_defs.lua",
+                r#"
+                ---@class Vector
+
+                ---@class Entity
+                local Entity = {}
+                ---@return Entity
+                function Entity:GetParent() end
+                ---@return string
+                function Entity:GetClass() end
+                ---@return Vector
+                function Entity:GetForward() end
+                ---@return Vector
+                function Entity:GetRight() end
+                ---@return Vector
+                function Entity:GetUp() end
+                ---@return Vector
+                function Entity:GetLocalPos() end
+                ---@return number
+                function Entity:EntIndex() end
+                ---@return Vector
+                function Entity:OBBCenter() end
+                ---@param pos Vector
+                ---@return Vector
+                function Entity:LocalToWorld(pos) end
+
+                ---@class ENT: Entity
+                ENT = {}
+
+                ---@class Tool
+                local Tool = {}
+                function Tool:Allowed() end
+
+                ---@class TOOL: Tool
+                TOOL = Tool
+
+                ---@param x any
+                ---@return boolean
+                function IsValid(x) end
+
+                ---@param id number
+                ---@return Entity
+                function _G.Entity(id) end
+                "#,
+            ),
+            (
+                "lua/entities/base_glide/shared.lua",
+                r#"
+                ENT.Base = "base_anim"
+                ENT.IsGlideVehicle = true
+                "#,
+            ),
+            (
+                "lua/entities/glide_missile_launcher.lua",
+                r#"
+                ENT.Base = "base_anim"
+                "#,
+            ),
+            (
+                "lua/entities/glide_projectile_launcher.lua",
+                r#"
+                ENT.Base = "base_anim"
+                "#,
+            ),
+            (
+                "lua/weapons/gmod_tool/stools/glide_missile_launcher.lua",
+                r#"
+                TOOL.Name = "Missile Launcher"
+
+                local function IsGlideMissileLauncher(ent)
+                    return IsValid(ent) and ent:GetClass() == "glide_missile_launcher"
+                end
+
+                function TOOL:UpdateMissileLauncher(ent)
+                    ent:SetReloadDelay(1)
+                end
+
+                function TOOL:LeftClick(trace)
+                    return IsGlideMissileLauncher(trace.Entity)
+                end
+
+                function TOOL:RightClick(trace)
+                    local ent = trace.Entity
+                    if not IsGlideMissileLauncher(ent) then return false end
+                    self:UpdateMissileLauncher(ent)
+                    return true
+                end
+                "#,
+            ),
+            (
+                "lua/weapons/gmod_tool/stools/glide_projectile_launcher.lua",
+                r#"
+                TOOL.Name = "Projectile Launcher"
+
+                local function IsGlideProjectileLauncher(ent)
+                    return IsValid(ent) and ent:GetClass() == "glide_projectile_launcher"
+                end
+
+                function TOOL:UpdateProjectileLauncher(ent)
+                    ent:SetReloadDelay(1)
+                end
+
+                function TOOL:RightClick(trace)
+                    local ent = trace.Entity
+                    if not IsGlideProjectileLauncher(ent) then return false end
+                    self:UpdateProjectileLauncher(ent)
+                    return true
+                end
+                "#,
+            ),
+        ]);
+
+        let file_id = ws.def_file(
+            "lua/glide/client/debugging.lua",
+            r#"
+            local vehicles = {}
+
+            local entObj = Entity(1)
+            local fw = nil
+            local rt = nil
+            local up = nil
+            if IsValid(entObj) then
+                if entObj.IsGlideVehicle then
+                    vehicles[1] = entObj
+                end
+
+                local parent = entObj:GetParent()
+                if IsValid(parent) then
+                    local up = parent.GetUp and parent:GetUp()
+                    if entObj.GetLocalPos and parent.LocalToWorld then
+                        local lp = entObj:GetLocalPos()
+                        if lp then
+                            local axlePos = parent:LocalToWorld(lp)
+                        end
+                    end
+                    fw = parent.GetForward and parent:GetForward() or fw
+                    rt = parent.GetRight and parent:GetRight() or rt
+                    up = parent.GetUp and parent:GetUp() or up
+                    local vid = parent:EntIndex()
+                    vehicles[vid] = parent
+                    parent_type_snapshot = parent
+                end
+            end
+
+            for vid, veh in pairs(vehicles) do
+                if not IsValid(veh) then
+                    goto continue
+                end
+
+                local centerWorld = veh:LocalToWorld(veh:OBBCenter())
+                veh_type_snapshot = veh
+
+                ::continue::
+            end
+            "#,
+        );
+
+        let veh_type = ws.expr_ty("veh_type_snapshot");
+        let veh_desc = ws.humanize_type(veh_type);
+        let parent_type = ws.expr_ty("parent_type_snapshot");
+        let parent_desc = ws.humanize_type(parent_type);
+
+        assert_that!(
+            parent_desc.as_str(),
+            eq("Entity"),
+            "field guard on an Entity-owned method should not narrow parent to unrelated subclasses: {}",
+            parent_desc
+        );
+        assert_that!(
+            veh_desc.as_str(),
+            not(contains_substring("glide_missile_launcher")),
+            "vehicle table iteration should not include unrelated tool classes: {}",
+            veh_desc
+        );
+        assert_that!(
+            veh_desc.as_str(),
+            not(contains_substring("glide_projectile_launcher")),
+            "vehicle table iteration should not include unrelated tool classes: {}",
+            veh_desc
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(false)
+        );
+    }
+
+    #[gtest]
     fn test_field_narrow_drops_wrong_realm_subclass_in_serverside_scope() {
         // Realm-aware narrow: in server scope, drop EFFECT (client `Foo`)
         // from a `[EFFECT, ENT]` narrow union; keep ENT (server `Foo`).
@@ -4133,6 +4434,82 @@ _2 = a[1]
             "table index read collapsed to nil: {}",
             desc
         );
+    }
+
+    #[gtest]
+    fn test_unknown_key_read_from_untyped_registry_table_is_not_hard_nil() {
+        // A global registry initialized as an empty table can be populated
+        // elsewhere. Indexing it with an unknown runtime key must not prove
+        // the result is `nil`.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            Glide = Glide or {}
+            Glide.WeaponRegistry = Glide.WeaponRegistry or {}
+
+            local function RefreshInheritance(className)
+                local class = Glide.WeaponRegistry[className]
+                a = class
+            end
+            "#,
+        );
+
+        let typ = ws.expr_ty("a");
+        let desc = ws.humanize_type(typ);
+        assert_that!(
+            desc,
+            not(eq("nil")),
+            "unknown registry key read collapsed to nil: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_string_key_read_from_untyped_registry_table_is_not_hard_nil() {
+        // Same open-registry shape, but with a known broad string key type.
+        // This must not fall through the exact-member lookup path into `nil`.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            Glide = Glide or {}
+            Glide.WeaponRegistry = Glide.WeaponRegistry or {}
+
+            ---@param className string
+            local function RefreshInheritance(className)
+                local class = Glide.WeaponRegistry[className]
+                a = class
+            end
+            "#,
+        );
+
+        let typ = ws.expr_ty("a");
+        let desc = ws.humanize_type(typ);
+        assert_that!(
+            desc,
+            not(eq("nil")),
+            "string registry key read collapsed to nil: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_unknown_key_read_from_shaped_table_does_not_fallback_to_any() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local shaped = {
+                known = true,
+            }
+
+            ---@param index number
+            local function Read(index)
+                a = shaped[index]
+            end
+            "#,
+        );
+
+        let typ = ws.expr_ty("a");
+        assert_eq!(ws.humanize_type(typ), "nil");
     }
 
     #[gtest]

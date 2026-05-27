@@ -5,11 +5,11 @@ description: Restrict a definition to specific Lua versions.
 
 ## Overview
 
-`@version` marks a definition as only available on certain Lua versions.
+`@version` marks a definition for specific Lua versions.
 
-GLuaLS uses this together with `runtime.version` when it decides whether a field or function should be visible.
+GLuaLS compares this annotation with `runtime.version` before it shows a field or function.
 
-Garry's Mod projects usually target LuaJIT, so this annotation is mostly useful in shared annotation files and standard-library docs.
+Garry's Mod projects target LuaJIT. Use this annotation in shared annotation files and standard-library docs.
 
 ---
 
@@ -40,4 +40,4 @@ function string.pack(fmt, ...) end
 
 ## Compatibility
 
-Set the workspace version with `runtime.version`. In a Garry's Mod project, that usually means LuaJIT.
+Set your workspace version with `runtime.version`. In a Garry's Mod project, choose LuaJIT.

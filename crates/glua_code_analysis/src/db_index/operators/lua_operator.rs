@@ -146,7 +146,8 @@ impl LuaOperator {
                         signature.is_vararg,
                         params,
                         return_type,
-                    );
+                    )
+                    .with_optional_params(signature.get_param_optional_flags());
                     return LuaType::DocFunction(Arc::new(func_type));
                 }
 

@@ -10,7 +10,6 @@ use crate::{
 };
 
 use super::{AnalyzeContext, gmod::ensure_scoped_class_type_decl_for_file};
-use crate::db_index::GmodScopedClassInfo;
 use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaSyntaxKind, LuaVarExpr};
 use rowan::{TextRange, TextSize, WalkEvent};
 
@@ -30,37 +29,29 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         let _p = Profile::cond_new("decl analyze", context.tree_list.len() > 1);
         let tree_list = context.tree_list.clone();
-        let scripted_scope_files = if db.get_emmyrc().gmod.enabled {
-            Some(context.get_or_compute_scripted_scope_files(db).clone())
+
+        let scripted_scope_infos = if db.get_emmyrc().gmod.enabled {
+            Some(context.get_or_compute_scripted_scope_infos(db).clone())
         } else {
             None
         };
+
         for in_filed_tree in tree_list.iter() {
             // Detect scoped class once here and cache in GmodInferIndex for gmod_pre reuse.
-            let scoped_class_global_name = if let Some(scripted_scope_files) =
-                scripted_scope_files.as_ref()
-                && scripted_scope_files.contains(&in_filed_tree.file_id)
+            let scoped_class_global_name = if let Some(scripted_scope_infos) =
+                scripted_scope_infos.as_ref()
+                && let Some(info) = scripted_scope_infos.get(&in_filed_tree.file_id)
             {
-                if let Some((class_name, global_name, class_name_prefix)) =
-                    super::gmod::get_scripted_class_info_with_prefix(db, in_filed_tree.file_id)
-                {
-                    db.get_gmod_infer_index_mut().set_scoped_class_info(
-                        in_filed_tree.file_id,
-                        GmodScopedClassInfo {
-                            class_name,
-                            global_name: global_name.clone(),
-                            class_name_prefix,
-                        },
-                    );
-                    Some(global_name)
-                } else {
-                    None
-                }
+                db.get_gmod_infer_index_mut()
+                    .set_scoped_class_info(in_filed_tree.file_id, info.clone());
+                Some(info.global_name.clone())
             } else {
                 None
             };
+
             db.get_reference_index_mut()
                 .create_local_reference(in_filed_tree.file_id);
+
             let mut analyzer = DeclAnalyzer::new(
                 db,
                 in_filed_tree.file_id,
@@ -71,8 +62,8 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
             analyzer.analyze();
             let decl_tree = analyzer.get_decl_tree();
             // Register the scoped class type (must happen during decl, before doc/flow phases)
-            if let Some(scripted_scope_files) = scripted_scope_files.as_ref()
-                && scripted_scope_files.contains(&in_filed_tree.file_id)
+            if let Some(scripted_scope_infos) = scripted_scope_infos.as_ref()
+                && scripted_scope_infos.contains_key(&in_filed_tree.file_id)
             {
                 ensure_scoped_class_type_decl_for_file(
                     db,
@@ -80,6 +71,7 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
                     in_filed_tree.value.syntax().text_range(),
                 );
             }
+
             db.get_decl_index_mut().add_decl_tree(decl_tree);
         }
     }
@@ -225,7 +217,7 @@ impl<'a> DeclAnalyzer<'a> {
         }
     }
 
-    pub fn analyze(&mut self) {
+    fn analyze(&mut self) {
         let root = self.root.clone();
         for walk_event in root.walk_descendants::<LuaAst>() {
             match walk_event {
@@ -352,10 +344,18 @@ impl<'a> DeclAnalyzer<'a> {
     }
 
     pub fn get_legacy_module_env_at(&self, position: TextSize) -> Option<&LegacyModuleEnv> {
-        self.legacy_module_envs
-            .iter()
-            .rev()
-            .find(|env| position > env.activation_position)
+        // Binary search: find the rightmost env where activation_position < position.
+        // The vector is sorted by activation_position ascending.
+        let envs = &self.legacy_module_envs;
+        if envs.is_empty() {
+            return None;
+        }
+        let pos_u32 = u32::from(position);
+        let idx = envs.partition_point(|env| u32::from(env.activation_position) < pos_u32);
+        if idx == 0 {
+            return None;
+        }
+        Some(&envs[idx - 1])
     }
 
     fn maybe_seed_scoped_class_local_decl(&mut self, chunk_range: TextRange) {

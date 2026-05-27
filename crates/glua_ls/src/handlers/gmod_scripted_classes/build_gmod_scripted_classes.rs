@@ -1,11 +1,8 @@
-use std::path::Path;
-
 use glua_code_analysis::{
     DbIndex, FileId, GmodClassCallLiteral, GmodScriptedClassCallMetadata, LuaDocument,
     file_path_to_uri,
 };
 use tokio_util::sync::CancellationToken;
-use wax::Pattern;
 
 use super::gmod_scripted_classes_request::{GmodScriptedClassEntry, GmodScriptedClassesResult};
 
@@ -19,61 +16,26 @@ pub fn build_gmod_scripted_classes(
 
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
     let definitions = scopes.resolved_definitions();
-    let include_patterns = scopes.include_patterns();
-    let exclude_patterns = scopes.exclude_patterns();
-    let include_glob = if include_patterns.is_empty() {
-        None
-    } else {
-        match wax::any(
-            include_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(glob) => Some(glob),
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
-                None
-            }
-        }
-    };
 
-    let exclude_glob = if exclude_patterns.is_empty() {
-        None
-    } else {
-        match wax::any(
-            exclude_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(glob) => Some(glob),
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");
-                return Some(GmodScriptedClassesResult {
-                    definitions,
-                    entries: Vec::new(),
-                });
-            }
-        }
-    };
-
-    let mut entries = Vec::new();
+    let mut file_paths = Vec::new();
     for file_id in db.get_vfs().get_all_local_file_ids() {
         if cancel_token.is_cancelled() {
             return None;
         }
 
-        if !is_file_in_scope(db, file_id, include_glob.as_ref(), exclude_glob.as_ref()) {
-            continue;
+        if let Some(file_path) = db.get_vfs().get_file_path(&file_id) {
+            file_paths.push((file_id, file_path.as_path()));
+        }
+    }
+
+    let (_, scoped_matches) = scopes.scan_scripted_class_scope_files(file_paths);
+
+    let mut entries = Vec::new();
+    for (file_id, scope_match) in scoped_matches {
+        if cancel_token.is_cancelled() {
+            return None;
         }
 
-        let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
-            continue;
-        };
-        let Some(scope_match) = scopes.detect_class_for_path(file_path) else {
-            continue;
-        };
         let Some(uri) = file_uri_string(db, file_id) else {
             continue;
         };
@@ -169,76 +131,6 @@ fn extract_vgui_panel_name(call: &GmodScriptedClassCallMetadata) -> Option<&str>
     }
 }
 
-fn is_file_in_scope(
-    db: &DbIndex,
-    file_id: FileId,
-    include_glob: Option<&wax::Any<'_>>,
-    exclude_glob: Option<&wax::Any<'_>>,
-) -> bool {
-    let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
-        return include_glob.is_none();
-    };
-
-    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
-    let mut candidate_paths = Vec::new();
-    push_path_candidates(&mut candidate_paths, &normalized_path);
-
-    let normalized_lower = normalized_path.to_ascii_lowercase();
-    if let Some(lua_idx) = normalized_lower.find("/lua/") {
-        let lua_relative_path = normalized_path[lua_idx + 1..].to_string();
-        push_path_candidates(&mut candidate_paths, &lua_relative_path);
-        if let Some(stripped) = lua_relative_path.strip_prefix("lua/") {
-            push_path_candidates(&mut candidate_paths, stripped);
-        }
-    }
-
-    if let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) {
-        push_candidate_path(&mut candidate_paths, file_name);
-    }
-
-    if let Some(include) = include_glob
-        && !candidate_paths
-            .iter()
-            .any(|path| include.is_match(Path::new(path)))
-    {
-        return false;
-    }
-
-    if let Some(exclude) = exclude_glob
-        && candidate_paths
-            .iter()
-            .any(|path| exclude.is_match(Path::new(path)))
-    {
-        return false;
-    }
-
-    true
-}
-
-fn push_path_candidates(candidate_paths: &mut Vec<String>, path: &str) {
-    push_candidate_path(candidate_paths, path);
-
-    let segments = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    for idx in 0..segments.len() {
-        push_candidate_path(candidate_paths, &segments[idx..].join("/"));
-    }
-}
-
-fn push_candidate_path(candidate_paths: &mut Vec<String>, candidate: &str) {
-    if candidate.is_empty() {
-        return;
-    }
-
-    if candidate_paths.iter().any(|existing| existing == candidate) {
-        return;
-    }
-
-    candidate_paths.push(candidate.to_string());
-}
-
 #[cfg(test)]
 mod tests {
     use glua_code_analysis::{Emmyrc, VirtualWorkspace};
@@ -285,6 +177,32 @@ mod tests {
         verify_that!(
             entries.iter().any(|entry| entry.class_name == "ignored"),
             eq(false)
+        )
+    }
+
+    #[gtest]
+    fn build_gmod_scripted_classes_uses_per_definition_excludes_for_stools() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/weapons/gmod_tool/stools/hoverball.lua",
+            "local TOOL = {}",
+        );
+
+        let entries = build_gmod_scripted_classes(ws.get_db_mut(), &CancellationToken::new())
+            .or_fail()?
+            .entries;
+
+        verify_that!(
+            entries.iter().any(|entry| {
+                entry.class_type == "TOOL"
+                    && entry.class_name == "hoverball"
+                    && entry.definition_id.as_deref() == Some("stools")
+            }),
+            eq(true)
         )
     }
 

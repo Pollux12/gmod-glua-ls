@@ -4,6 +4,7 @@ use glua_parser::{
     LuaAst, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaComment, LuaDocTagReturn,
     LuaFuncStat, LuaStat, LuaSyntaxKind, LuaVarExpr,
 };
+use rowan::TextRange;
 
 use crate::{
     DbIndex, InferFailReason, LuaInferCache, LuaType, ReturnTypeKind, SignatureReturnStatus,
@@ -12,7 +13,7 @@ use crate::{
         UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
         UnResolveParentClosureParams, UnResolveReturn,
     },
-    db_index::{LuaDocReturnInfo, LuaSignatureId},
+    db_index::{LuaDocReturnInfo, LuaMemberOwner, LuaSignatureId},
     infer_expr,
 };
 
@@ -154,6 +155,7 @@ fn analyze_return(
         Err(InferFailReason::None) => {
             vec![LuaDocReturnInfo {
                 type_ref: LuaType::Unknown,
+                default_value: None,
                 description: None,
                 name: None,
                 attributes: None,
@@ -273,6 +275,7 @@ pub fn analyze_return_point(
 
     Ok(vec![LuaDocReturnInfo {
         type_ref: return_type.unwrap_or(LuaType::Unknown),
+        default_value: None,
         description: None,
         name: None,
         attributes: None,
@@ -282,6 +285,26 @@ pub fn analyze_return_point(
 
 fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
     match (&left, &right) {
+        (LuaType::TableConst(empty), LuaType::Table)
+            if table_const_has_no_known_members(db, empty) =>
+        {
+            LuaType::Table
+        }
+        (LuaType::Table, LuaType::TableConst(empty))
+            if table_const_has_no_known_members(db, empty) =>
+        {
+            LuaType::Table
+        }
+        (LuaType::TableConst(empty), LuaType::Any | LuaType::Unknown)
+            if table_const_has_no_known_members(db, empty) =>
+        {
+            right.clone()
+        }
+        (LuaType::Any | LuaType::Unknown, LuaType::TableConst(empty))
+            if table_const_has_no_known_members(db, empty) =>
+        {
+            left.clone()
+        }
         (LuaType::Any, right) if should_union_any_as_unknown(right) => {
             LuaType::from_vec(vec![LuaType::Unknown, right.clone()])
         }
@@ -371,6 +394,12 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
         }
         _ => TypeOps::Union.apply(db, &left, &right),
     }
+}
+
+fn table_const_has_no_known_members(db: &DbIndex, table: &crate::InFiled<TextRange>) -> bool {
+    db.get_member_index()
+        .get_members(&LuaMemberOwner::Element(table.clone()))
+        .is_none_or(|members| members.is_empty())
 }
 
 fn should_union_any_as_unknown(typ: &LuaType) -> bool {

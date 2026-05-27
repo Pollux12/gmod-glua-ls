@@ -12,9 +12,10 @@ use super::RegisterCapabilities;
 use crate::context::ServerContextSnapshot;
 use crate::util::{find_ref_at, resolve_ref_single};
 pub use build_hover::build_hover_content_for_completion;
-use build_hover::build_semantic_info_hover;
+use build_hover::{build_assignment_target_hover, build_semantic_info_hover};
 pub use find_origin::{
-    find_all_same_named_members, find_member_origin_owner, find_member_origin_owners,
+    DeclOriginResult, find_all_same_named_members, find_member_origin_owner,
+    find_member_origin_owners,
 };
 use glua_code_analysis::{
     EmmyLuaAnalysis, FileId, GmodRealm, LuaMemberKey, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
@@ -185,9 +186,17 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
                 return Some(hook_hover);
             }
 
-            let semantic_info = semantic_model.get_semantic_info(token.clone().into())?;
             let db = semantic_model.get_db();
             let document = semantic_model.get_document();
+            let Some(semantic_info) = semantic_model.get_semantic_info(token.clone().into()) else {
+                return build_assignment_target_hover(
+                    &analysis.compilation,
+                    &semantic_model,
+                    db,
+                    &document,
+                    token,
+                );
+            };
             let range = token.text_range();
 
             build_semantic_info_hover(
@@ -195,10 +204,19 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
                 &semantic_model,
                 db,
                 &document,
-                token,
+                token.clone(),
                 semantic_info,
                 range,
             )
+            .or_else(|| {
+                build_assignment_target_hover(
+                    &analysis.compilation,
+                    &semantic_model,
+                    db,
+                    &document,
+                    token,
+                )
+            })
         }
     }
 }

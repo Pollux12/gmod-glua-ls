@@ -5,7 +5,7 @@ description: Add generic type parameters to functions for type-safe reuse.
 
 ## Overview
 
-`@generic` adds type parameters to a function, allowing GLuaLS to infer and propagate types through generic operations like `filter`, `map`, or wrapper functions.
+`@generic` adds type parameters to a function. GLuaLS uses them to carry types through helpers such as `filter`, `map`, and wrapper functions.
 
 ---
 
@@ -52,7 +52,7 @@ end
 
 ## Generic with constraint
 
-Use `: ConstraintType` to restrict what types `T` can be:
+Use `: ConstraintType` to restrict the types that `T` accepts:
 
 ```lua
 ---@generic T : Entity
@@ -88,20 +88,20 @@ local players = filter(player.GetAll(), function(ply) return ply:IsAdmin() end)
 
 ## When to use generics
 
-Generics are most useful when:
-- A function transforms a value but keeps its type
-- A function filters or maps over a typed list
-- A function takes a callback and returns its result type
+Generics work best for:
+- Functions that transform a value but keep its type
+- Functions that filter or map over a typed list
+- Functions that take a callback and return its result type
 
-For simpler cases, a union type or `any` is often easier to read.
+For simple cases, a union type or `any` can be easier to read.
 
 ---
 
 ## String-template capture (GLuaLS)
 
-Use backticks when a string argument should pick a class or type.
+Use backticks when a string argument names a class or type.
 
-Use this when a function takes a class name as text and should return that class type:
+Use this when a function takes a class name as text and returns that class type:
 
 ```lua
 ---@class Entity
@@ -124,7 +124,7 @@ For collection-returning functions:
 function ents.FindByClass(class) end
 ```
 
-Quick rule:
+Rule:
 - `T` uses the normal Lua value type (`"x"` becomes `string`)
 - `` `T` `` uses the string text as a class or type name (`"sent_npc"` becomes `sent_npc`)
 

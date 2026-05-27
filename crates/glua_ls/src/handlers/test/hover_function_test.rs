@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualHoverResult, check};
+    use glua_code_analysis::Emmyrc;
     use googletest::prelude::*;
     use lsp_types::HoverContents;
 
@@ -430,6 +431,58 @@ mod tests {
     }
 
     #[gtest]
+    fn test_defaulted_param_and_return_hover() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(
+            ws.check_hover(
+                r#"
+                ---@param retries number=3
+                ---@return boolean=false
+                local function run(retries)
+                    return true
+                end
+
+                local <??>alias = run
+            "#,
+                VirtualHoverResult {
+                    value: "```lua\nlocal function run(retries: number=3) -> boolean=false\n```"
+                        .to_string(),
+                },
+            )
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_member_function_defaulted_param_and_return_hover() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(
+            ws.check_hover(
+                r#"
+                ---@class Runner
+                local Runner = {}
+
+                ---@param retries number=3
+                ---@return boolean=false
+                function Runner:run(retries)
+                    return true
+                end
+
+                ---@type Runner
+                local runner
+
+                runner:ru<??>n()
+            "#,
+                VirtualHoverResult {
+                    value: "```lua\n(method) Runner:run(retries: number=3) -> boolean=false\n```"
+                        .to_string(),
+                },
+            )
+        );
+        Ok(())
+    }
+
+    #[gtest]
     fn test_other_file_function() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         ws.def_file(
@@ -475,7 +528,7 @@ mod tests {
                 RingBuffer:<??>get(1)
             "#,
             VirtualHoverResult {
-                value: "```lua\n(method) RingBuffer:get(index: integer) -> string?\n```\n\n---\n\n@*param* `index` — 索引".to_string(),
+                value: "```lua\n(method) RingBuffer:get(index: integer)\n  -> item: string?\n\n```\n\n---\n\n@*param* `index` — 索引".to_string(),
             },
         ));
         Ok(())
@@ -717,6 +770,275 @@ mod tests {
     }
 
     #[gtest]
+    fn test_ents_create_override_hover_keeps_annotated_docs_and_signatures() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "ents_meta.lua",
+            r#"
+                ---@class Entity
+
+                ---Create entity from classname.
+                ---@realm server
+                ---@param class string Entity class name.
+                ---@return Entity ent Created entity instance.
+                function ents.Create(class) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ents = ents or {}
+                local originalCreate = ents.Create
+
+                function ents.Create(name, safety)
+                    if originalCreate then
+                        return originalCreate(name)
+                    end
+                    return nil
+                end
+
+                local alias = ents.Cr<??>eate
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        let docs_pos = markup.value.find("Create entity from classname.");
+        assert!(
+            docs_pos.is_some(),
+            "expected annotated description in hover, got: {}",
+            markup.value
+        );
+        let docs_pos = docs_pos.expect("docs position should exist");
+        let top_section = &markup.value[..docs_pos];
+
+        assert!(
+            top_section.matches("```lua").count() >= 2,
+            "expected both override and annotated signatures at top, got: {}",
+            markup.value
+        );
+        assert!(
+            top_section.contains("function Create(name, safety)"),
+            "expected override signature in top section, got: {}",
+            markup.value
+        );
+        assert!(
+            top_section.contains("safety"),
+            "expected extra override parameter in top section, got: {}",
+            markup.value
+        );
+        assert!(
+            top_section.contains("function Create(class: string)"),
+            "expected annotated signature in top section, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Entity class name."),
+            "expected annotated param docs in hover, got: {}",
+            markup.value
+        );
+        assert!(
+            markup
+                .value
+                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+            "expected SERVER badge from annotated realm, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+            "did not expect SHARED badge for annotated server realm, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("**SERVER**"),
+            "expected SERVER label text with realm badge, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_ents_create_same_signature_override_keeps_annotated_server_realm() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "ents_meta.lua",
+            r#"
+                ---@class Entity
+
+                ---@realm server
+                ---Create entity from classname.
+                ---@param class string Entity class name.
+                ---@return Entity ent Created entity instance.
+                function ents.Create(class) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ents = ents or {}
+
+                ---Override keeps same signature but adds local docs.
+                function ents.Create(class)
+                    return nil
+                end
+
+                local alias = ents.Cr<??>eate
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/shared.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup
+                .value
+                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+            "expected SERVER badge from annotated realm, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup
+                .value
+                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+            "did not expect SHARED badge when annotated realm is server, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("**SERVER**"),
+            "expected SERVER label text with realm badge, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_ents_create_server_override_uses_shared_original_outside_server_realm() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "library/lua/includes/extensions/sh_ents_meta.lua",
+            r#"
+                ---@class Entity
+
+                ---@realm shared
+                ---Create entity from classname.
+                ---@param class string Entity class name.
+                ---@return Entity ent Created entity instance.
+                function ents.Create(class) end
+            "#,
+        );
+
+        ws.def_file(
+            "gamemode/modules/workarounds/sh_workarounds.lua",
+            r#"
+                ents = ents or {}
+                if SERVER then
+                    function ents.Create(name, safety)
+                        return nil
+                    end
+                end
+            "#,
+        );
+
+        let (server_content, server_position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ents = ents or {}
+                if SERVER then
+                    local alias = ents.Cr<??>eate
+                end
+            "#,
+        )?;
+        let server_file_id = ws.def_file("gamemode/init.lua", &server_content);
+        let server_hover =
+            crate::handlers::hover::hover(&ws.analysis, server_file_id, server_position)
+                .ok_or("expected server hover")
+                .or_fail()?;
+
+        let HoverContents::Markup(server_markup) = server_hover.contents else {
+            return fail!("expected HoverContents::Markup for server hover");
+        };
+        assert!(
+            server_markup
+                .value
+                .contains("function Create(name, safety)"),
+            "expected server hover to include server override signature, got: {}",
+            server_markup.value
+        );
+
+        let (client_content, client_position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ents = ents or {}
+                if CLIENT then
+                    local alias = ents.Cr<??>eate
+                end
+            "#,
+        )?;
+        let client_file_id = ws.def_file("gamemode/cl_init.lua", &client_content);
+        let client_hover =
+            crate::handlers::hover::hover(&ws.analysis, client_file_id, client_position)
+                .ok_or("expected client hover")
+                .or_fail()?;
+
+        let HoverContents::Markup(client_markup) = client_hover.contents else {
+            return fail!("expected HoverContents::Markup for client hover");
+        };
+        assert!(
+            client_markup
+                .value
+                .contains("function Create(class: string)"),
+            "expected client hover to show shared annotated signature, got: {}",
+            client_markup.value
+        );
+        assert!(
+            client_markup
+                .value
+                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+            "expected client hover to show SHARED badge from original signature, got: {}",
+            client_markup.value
+        );
+        assert!(
+            client_markup.value.contains("**SHARED**"),
+            "expected client hover to include SHARED label text, got: {}",
+            client_markup.value
+        );
+        assert!(
+            !client_markup
+                .value
+                .contains("function Create(name, safety)"),
+            "did not expect server-only override signature in client hover, got: {}",
+            client_markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_require_module_member_rich_hover() -> Result<()> {
         // Regression test for required module hovers using the module export owner.
         let mut ws = ProviderVirtualWorkspace::new();
@@ -900,6 +1222,167 @@ mod tests {
         assert!(
             markup.value.contains("Send a net message"),
             "expected method docs to be preserved, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_member_alias_preserves_alias_identity() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---Returns the entity class name.
+                ---@return string class
+                function Entity:GetClass()
+                end
+
+                ---@generic T: table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName)
+                end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local ENTITY = FindMetaTable("Entity")
+                ENTITY.Te<??>st1Alias = ENTITY.GetClass
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("Test1Alias"),
+            "expected hover to keep alias member identity, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("GetClass"),
+            "expected hover to retain aliased method context, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("Returns the entity class name."),
+            "expected hover to preserve aliased docs, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_duplicate_library_annotated_global_preserves_type_and_docs() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+
+        ws.def_files(vec![
+            (
+                "library/output/_globals.lua",
+                r#"
+                    ---@meta
+                    ---@type string
+                    ---Contains the version number of GMod.
+                    VERSION = nil
+                "#,
+            ),
+            (
+                "library/custom/_globals.lua",
+                r#"
+                    ---@meta
+                    ---@type string
+                    ---Contains the version number of GMod.
+                    VERSION = nil
+                "#,
+            ),
+        ]);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                print(VER<??>SION)
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("(global) VERSION: string"),
+            "expected annotated global type in hover, got: {}",
+            markup.value
+        );
+        assert!(
+            markup
+                .value
+                .contains("Contains the version number of GMod."),
+            "expected annotated global docs in hover, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_setmetatable_return_hover_keeps_index_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                Glide = Glide or {}
+                Glide.WeaponRegistry = Glide.WeaponRegistry or {}
+
+                VSWEP = {}
+                function VSWEP:Initialize() end
+                function VSWEP:Fire() end
+
+                local function Register(className)
+                    Glide.WeaponRegistry[className] = VSWEP
+                end
+
+                Register("base")
+
+                function Glide.CreateVehicle<??>Weapon(className, data)
+                    local class = Glide.WeaponRegistry[className]
+                    assert(class, "Tried to create invalid weapon class: " .. className)
+
+                    return setmetatable(data or {}, { __index = class })
+                end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            !markup.value.contains("-> table"),
+            "setmetatable-returning function hover should not collapse to table: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("VSWEP") || markup.value.contains("Initialize"),
+            "setmetatable-returning function hover should include the __index type: {}",
             markup.value
         );
 

@@ -5,7 +5,7 @@ description: EmmyLua/LuaCATS type annotations supported by GLuaLS.
 
 ## What are annotations?
 
-Annotations are comments that start with `---@`. They give type information to the language server.
+Annotations are comments that start with `---@`. They give GLuaLS type information.
 
 Put them above functions, variables, and class definitions so GLuaLS can provide better completion, type checking, and hover docs.
 
@@ -19,7 +19,7 @@ end
 
 Annotations do not affect runtime. Garry's Mod treats them as normal comments.
 
-GLuaLS follows EmmyLua-style annotations, with extra support for GMod-specific cases. Compatibility with EmmyLua and LuaLS is kept where possible.
+GLuaLS follows EmmyLua-style annotations and adds support for GMod-specific cases. It keeps compatibility with EmmyLua and LuaLS where possible.
 
 ---
 
@@ -51,6 +51,7 @@ GLuaLS follows EmmyLua-style annotations, with extra support for GMod-specific c
 |---|---|---|
 | [`@realm`](/annotations/realm) | Declare which realm code runs in | `---@realm server` |
 | [`@hook`](/annotations/hook) | Mark a function or method as a hook handler | `---@hook PlayerSpawn` |
+| [`@outparam`](/annotations/outparam) | Document a parameter table field modified by a function | `---@outparam cfg.output TraceResult` |
 | [`@fileparam`](/annotations/fileparam) | Set a file-wide parameter type default | `---@fileparam ply Player` |
 | [`@accessorfunc`](/annotations/accessorfunc) | Mark a function as an accessor generator | `---@accessorfunc` |
 
@@ -71,7 +72,7 @@ GLuaLS follows EmmyLua-style annotations, with extra support for GMod-specific c
 
 ## Type expression syntax
 
-Annotations use a common type expression syntax across all `@` tags:
+Annotations use the same type expression syntax across all `@` tags:
 
 | Syntax | Meaning |
 |---|---|

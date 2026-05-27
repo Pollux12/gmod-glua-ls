@@ -10,14 +10,41 @@ mod type_ref_tags;
 
 use super::AnalyzeContext;
 use crate::{
-    FileId, LuaSemanticDeclId, WorkspaceId,
+    FileId, LuaDocDefaultValue, LuaSemanticDeclId, LuaType, TypeOps, WorkspaceId,
     compilation::analyzer::AnalysisPipeline,
     db_index::{DbIndex, LuaTypeDeclId},
     profile::Profile,
 };
 use file_generic_index::FileGenericIndex;
-use glua_parser::{LuaAstNode, LuaComment, LuaSyntaxNode};
+use glua_parser::{
+    LuaAstNode, LuaComment, LuaDocTagDefaultValue as ParsedDocDefaultValue, LuaSyntaxNode,
+};
 use tags::get_owner_id;
+
+pub(super) fn convert_doc_default_value(default: ParsedDocDefaultValue) -> LuaDocDefaultValue {
+    match default {
+        ParsedDocDefaultValue::Nil => LuaDocDefaultValue::Nil,
+        ParsedDocDefaultValue::Boolean(value) => LuaDocDefaultValue::Boolean(value),
+        ParsedDocDefaultValue::Number(value) => LuaDocDefaultValue::Number(value),
+        ParsedDocDefaultValue::String(value) => LuaDocDefaultValue::String(value),
+    }
+}
+
+pub(super) fn apply_nullable_doc_default(
+    analyzer: &mut DocAnalyzer,
+    type_ref: LuaType,
+    nullable: bool,
+    default_value: Option<&LuaDocDefaultValue>,
+) -> LuaType {
+    if (nullable || matches!(default_value, Some(LuaDocDefaultValue::Nil)))
+        && !type_ref.is_nullable()
+    {
+        TypeOps::Union.apply(analyzer.db, &type_ref, &LuaType::Nil)
+    } else {
+        type_ref
+    }
+}
+
 pub struct DocAnalysisPipeline;
 
 impl AnalysisPipeline for DocAnalysisPipeline {

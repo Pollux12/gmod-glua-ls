@@ -50,6 +50,25 @@ mod test {
     }
 
     #[test]
+    fn test_initialized_assignment_chain_does_not_report_inject_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::InjectField,
+            r#"
+            WepHolster = {}
+            WepHolster.defData = {}
+            WepHolster.defData["weapon_pistol"] = {}
+            WepHolster.defData["weapon_pistol"].Model = "models/weapons/w_pistol.mdl"
+            WepHolster.defData["weapon_pistol"].Bone = "ValveBiped.Bip01_Pelvis"
+        "#
+        ));
+    }
+
+    #[test]
     fn test_class_def_dynamic_key_in_method_is_allowed() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(

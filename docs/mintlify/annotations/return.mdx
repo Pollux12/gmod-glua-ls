@@ -5,7 +5,7 @@ description: Document function return value types and descriptions.
 
 ## Overview
 
-`@return` declares the type(s) a function returns. Lua functions can return multiple values — add one `@return` per return value.
+`@return` declares the type or types a function returns. Lua functions can return multiple values, so add one `@return` line for each return value.
 
 ---
 
@@ -59,6 +59,25 @@ function FindPlayer(name) end
 
 ---
 
+## Default return values
+
+You can specify a default value for a return type using the `=value` syntax:
+
+```lua
+---@return boolean=false success Whether the operation succeeded
+function SaveData() end
+```
+
+This tells GLuaLS what the value defaults to.
+
+<Warning>
+  The default value must come directly after the type, before the name:
+  - `---@return boolean=false success` — ✅ Correct.
+  - `---@return boolean success=false` — ❌ Incorrect. (This makes `=false` part of the description instead).
+</Warning>
+
+---
+
 ## Generic return values
 
 ```lua
@@ -103,10 +122,10 @@ function GetFormatter() end
 ## `(instance)` modifier
 
 <Danger>
-This annotation is mainly for internal use. Most projects do not need this modifier.
+This annotation is for internal use. Most projects do not need this modifier.
 </Danger>
 
-When a function returns `(instance)`, fields and methods assigned to the returned variable are scoped to that specific variable only — they do not pollute the global class:
+When a function returns `(instance)`, GLuaLS keeps fields and methods on that returned variable. It does not add them to the global class:
 
 ```lua
 ---@return (instance) Panel
@@ -121,17 +140,17 @@ local other = CreateMyPanel()
 other:Refresh()  -- ❌ Error: Refresh doesn't exist here
 ```
 
-This is useful for factory functions that return panels or entities with custom methods attached.
+Use this for factory functions that return panels or entities with custom methods.
 
 ---
 
 ## `(definition)` modifier
 
 <Danger>
-This annotation is mainly for internal use. Most projects do not need this modifier.
+This annotation is for internal use. Most projects do not need this modifier.
 </Danger>
 
-When a function returns `(definition)`, fields added to the returned variable are registered globally on the class:
+When a function returns `(definition)`, GLuaLS registers fields on the returned variable as global class fields:
 
 ```lua
 ---@return (definition) Entity

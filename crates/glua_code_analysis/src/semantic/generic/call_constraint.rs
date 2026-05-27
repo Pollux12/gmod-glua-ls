@@ -4,7 +4,8 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr};
 
 use crate::{
     DbIndex, DocTypeInferContext, GenericTplId, LuaFunctionType, LuaSemanticDeclId, LuaType,
-    SemanticDeclLevel, SemanticModel, TypeOps, TypeSubstitutor, VariadicType, infer_doc_type,
+    LuaUnionType, SemanticDeclLevel, SemanticModel, TypeOps, TypeSubstitutor, VariadicType,
+    infer_doc_type,
 };
 
 // 泛型约束上下文
@@ -21,6 +22,7 @@ pub fn build_call_constraint_context(
     let doc_func = infer_call_doc_function(semantic_model, call_expr)?;
     let mut params = doc_func.get_params().to_vec();
     let mut arg_infos = get_arg_infos(semantic_model, call_expr)?;
+
     let mut substitutor = TypeSubstitutor::new();
 
     // 读取显式传入的泛型实参
@@ -228,16 +230,51 @@ fn get_constraint_type(
             if depth > 1 {
                 return None;
             }
-            let mut result = LuaType::Unknown;
-            for union_member_type in union_type.into_vec().iter() {
-                let extend_type = get_constraint_type(semantic_model, union_member_type, depth + 1)
-                    .unwrap_or(union_member_type.clone());
-                result = TypeOps::Union.apply(semantic_model.get_db(), &result, &extend_type);
-            }
-            Some(result)
+            get_union_constraint_type(semantic_model, union_type, depth)
         }
         _ => None,
     }
+}
+
+fn get_union_constraint_type(
+    semantic_model: &SemanticModel,
+    union_type: &LuaUnionType,
+    depth: usize,
+) -> Option<LuaType> {
+    match union_type {
+        LuaUnionType::Nullable(typ) => {
+            let constraint_type = get_constraint_type(semantic_model, typ, depth + 1)?;
+            Some(TypeOps::Union.apply(semantic_model.get_db(), &constraint_type, &LuaType::Nil))
+        }
+        LuaUnionType::Multi(types) => {
+            let mut constraint_types = None;
+            for (idx, typ) in types.iter().enumerate() {
+                if let Some(constraint_type) = get_constraint_type(semantic_model, typ, depth + 1) {
+                    let constraint_types = constraint_types.get_or_insert_with(|| {
+                        let mut mapped = Vec::with_capacity(types.len());
+                        mapped.extend(types[..idx].iter().cloned());
+                        mapped
+                    });
+                    constraint_types.push(constraint_type);
+                } else if let Some(constraint_types) = &mut constraint_types {
+                    constraint_types.push(typ.clone());
+                }
+            }
+
+            rebuild_constraint_union(semantic_model, constraint_types?)
+        }
+    }
+}
+
+fn rebuild_constraint_union(
+    semantic_model: &SemanticModel,
+    constraint_types: Vec<LuaType>,
+) -> Option<LuaType> {
+    let mut result = LuaType::Unknown;
+    for constraint_type in constraint_types {
+        result = TypeOps::Union.apply(semantic_model.get_db(), &result, &constraint_type);
+    }
+    Some(result)
 }
 
 // 将多个表达式推导为具体类型列表

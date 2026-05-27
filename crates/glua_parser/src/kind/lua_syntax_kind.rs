@@ -96,6 +96,7 @@ pub enum LuaSyntaxKind {
     DocTagAttributeUse, // '@['
     DocTagRealm,
     DocTagFileparam,
+    DocTagOutparam,
     DocTagCallGeneric,
     DocTagSchema,
 
@@ -142,6 +143,7 @@ pub enum LuaSyntaxKind {
     DocOneLineField, // <type> # description
     DocDiagnosticCodeList, // unused-local, undefined-global ...
     // start with '#' or '@'
+    DocDefaultValue, // =<literal>
     DocDescription,
 
     // [<|>] [<framework>] <version>, <version> can be '5.1', '5.2', '5.3', '5.4', 'JIT', <framework> can be 'openresty'

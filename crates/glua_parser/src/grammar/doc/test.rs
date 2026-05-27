@@ -61,6 +61,29 @@ Syntax(Chunk)@0..83
     }
 
     #[test]
+    fn test_normal_doc_description_preserves_equals() {
+        let code = "---@param a number value = 1";
+        let result = r#"
+Syntax(Chunk)@0..28
+  Syntax(Block)@0..28
+    Syntax(Comment)@0..28
+      Token(TkDocStart)@0..4 "---@"
+      Syntax(DocTagParam)@4..18
+        Token(TkTagParam)@4..9 "param"
+        Token(TkWhitespace)@9..10 " "
+        Token(TkName)@10..11 "a"
+        Token(TkWhitespace)@11..12 " "
+        Syntax(TypeName)@12..18
+          Token(TkName)@12..18 "number"
+      Token(TkWhitespace)@18..19 " "
+      Syntax(DocDescription)@19..28
+        Token(TkDocDetail)@19..28 "value = 1"
+        "#;
+
+        assert_ast_eq!(code, result);
+    }
+
+    #[test]
     fn test_tag_with_description() {
         let code = r#"
         ---   hiihihi
@@ -812,6 +835,104 @@ Syntax(Chunk)@0..179
         Token(TkEnd)@167..170 "end"
     Token(TkEndOfLine)@170..171 "\n"
     Token(TkWhitespace)@171..179 "        "
+        "#;
+
+        assert_ast_eq!(code, result);
+    }
+
+    #[test]
+    fn test_inline_default_doc() {
+        let code = r#"
+        ---@field Contents=0 CONTENTS
+        ---@field Contents CONTENTS=0
+        ---@param retries=3 number
+        ---@param retries number=3
+        ---@return boolean=false
+        function f() end
+        "#;
+
+        let result = r#"
+Syntax(Chunk)@0..213
+  Syntax(Block)@0..213
+    Token(TkEndOfLine)@0..1 "\n"
+    Token(TkWhitespace)@1..9 "        "
+    Syntax(Comment)@9..179
+      Token(TkDocStart)@9..13 "---@"
+      Syntax(DocTagField)@13..38
+        Token(TkTagField)@13..18 "field"
+        Token(TkWhitespace)@18..19 " "
+        Token(TkName)@19..27 "Contents"
+        Syntax(DocDefaultValue)@27..29
+          Token(TkDocMatch)@27..28 "="
+          Token(TkInt)@28..29 "0"
+        Token(TkWhitespace)@29..30 " "
+        Syntax(TypeName)@30..38
+          Token(TkName)@30..38 "CONTENTS"
+      Token(TkEndOfLine)@38..39 "\n"
+      Token(TkWhitespace)@39..47 "        "
+      Token(TkDocStart)@47..51 "---@"
+      Syntax(DocTagField)@51..76
+        Token(TkTagField)@51..56 "field"
+        Token(TkWhitespace)@56..57 " "
+        Token(TkName)@57..65 "Contents"
+        Token(TkWhitespace)@65..66 " "
+        Syntax(TypeName)@66..74
+          Token(TkName)@66..74 "CONTENTS"
+        Syntax(DocDefaultValue)@74..76
+          Token(TkDocMatch)@74..75 "="
+          Token(TkInt)@75..76 "0"
+      Token(TkEndOfLine)@76..77 "\n"
+      Token(TkWhitespace)@77..85 "        "
+      Token(TkDocStart)@85..89 "---@"
+      Syntax(DocTagParam)@89..111
+        Token(TkTagParam)@89..94 "param"
+        Token(TkWhitespace)@94..95 " "
+        Token(TkName)@95..102 "retries"
+        Syntax(DocDefaultValue)@102..104
+          Token(TkDocMatch)@102..103 "="
+          Token(TkInt)@103..104 "3"
+        Token(TkWhitespace)@104..105 " "
+        Syntax(TypeName)@105..111
+          Token(TkName)@105..111 "number"
+      Token(TkEndOfLine)@111..112 "\n"
+      Token(TkWhitespace)@112..120 "        "
+      Token(TkDocStart)@120..124 "---@"
+      Syntax(DocTagParam)@124..146
+        Token(TkTagParam)@124..129 "param"
+        Token(TkWhitespace)@129..130 " "
+        Token(TkName)@130..137 "retries"
+        Token(TkWhitespace)@137..138 " "
+        Syntax(TypeName)@138..144
+          Token(TkName)@138..144 "number"
+        Syntax(DocDefaultValue)@144..146
+          Token(TkDocMatch)@144..145 "="
+          Token(TkInt)@145..146 "3"
+      Token(TkEndOfLine)@146..147 "\n"
+      Token(TkWhitespace)@147..155 "        "
+      Token(TkDocStart)@155..159 "---@"
+      Syntax(DocTagReturn)@159..179
+        Token(TkTagReturn)@159..165 "return"
+        Token(TkWhitespace)@165..166 " "
+        Syntax(TypeName)@166..173
+          Token(TkName)@166..173 "boolean"
+        Syntax(DocDefaultValue)@173..179
+          Token(TkDocMatch)@173..174 "="
+          Token(TkFalse)@174..179 "false"
+    Token(TkEndOfLine)@179..180 "\n"
+    Token(TkWhitespace)@180..188 "        "
+    Syntax(FuncStat)@188..204
+      Token(TkFunction)@188..196 "function"
+      Token(TkWhitespace)@196..197 " "
+      Syntax(NameExpr)@197..198
+        Token(TkName)@197..198 "f"
+      Syntax(ClosureExpr)@198..204
+        Syntax(ParamList)@198..200
+          Token(TkLeftParen)@198..199 "("
+          Token(TkRightParen)@199..200 ")"
+        Token(TkWhitespace)@200..201 " "
+        Token(TkEnd)@201..204 "end"
+    Token(TkEndOfLine)@204..205 "\n"
+    Token(TkWhitespace)@205..213 "        "
         "#;
 
         assert_ast_eq!(code, result);

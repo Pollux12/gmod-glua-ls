@@ -5,7 +5,7 @@ description: GLuaLS tracks net.Start / net.Receive pairs and validates message t
 
 ## Overview
 
-GLua networking requires manually matching `net.Start(name)` + `net.Write*` calls on one realm with `net.Receive(name)` + `net.Read*` calls on the other. GLuaLS tracks these matches statically across your entire workspace and reports mismatches before you run the game.
+GMod networking requires matching `net.Start(name)` and `net.Write*` calls on one realm with `net.Receive(name)` and `net.Read*` calls on the other. GLuaLS tracks these pairs across your workspace and reports mismatches before you run the game.
 
 ---
 
@@ -35,7 +35,7 @@ net.Broadcast()
 
 ### Missing counterpart
 
-Every `net.Start(name)` (sender) should usually have a matching `net.Receive(name)` (receiver) somewhere in your workspace:
+Each `net.Start(name)` sender should have a matching `net.Receive(name)` receiver somewhere in your workspace:
 
 ```lua
 -- sv_comms.lua: sends "PlayerInfo" to client
@@ -48,7 +48,7 @@ net.Send(ply)
 
 ### Read/write type mismatch
 
-The sequence of `net.Read*` calls must match the sequence of `net.Write*` calls for the same message type-wise:
+The `net.Read*` call sequence must match the `net.Write*` call sequence for the same message type:
 
 ```lua
 -- Server writes:
@@ -65,7 +65,7 @@ end)
 
 ### Read/write order mismatch
 
-The order in which reads occur must match the write order. GLuaLS analyzes the sequence of read calls and compares it against the write sequence.
+Read order must match write order. GLuaLS compares the read call sequence against the write call sequence.
 
 ---
 
@@ -74,7 +74,7 @@ The order in which reads occur must match the write order. GLuaLS analyzes the s
 | Code | Description |
 |---|---|
 | `gmod-unknown-net-message` | `net.Start(name)` uses a name not registered with `util.AddNetworkString` |
-| `gmod-net-missing-network-counterpart` | A sender or receiver exists, but no matching counterpart with the same message name was found |
+| `gmod-net-missing-network-counterpart` | A sender or receiver exists, but GLuaLS found no matching counterpart with the same message name |
 | `gmod-net-read-write-type-mismatch` | `net.Read*` type doesn't match the `net.Write*` type for the same sequence position |
 | `gmod-net-read-write-order-mismatch` | The order of reads doesn't match the order of writes |
 | `gmod-net-read-write-bits-mismatch` | Literal bit-width argument differs between a matched `net.WriteUInt`/`net.ReadUInt` (or similar) pair |
@@ -89,7 +89,7 @@ When typing the name argument to `net.Start()` or `net.Receive()`, GLuaLS autoco
 
 ## Cross-file tracking
 
-Network analysis works across files. Messages registered in one file, sent in a second, and received in a third are all tracked together.
+Network analysis works across files. GLuaLS tracks messages registered in one file, sent in a second, and received in a third as one flow.
 
 ---
 
@@ -97,7 +97,7 @@ Network analysis works across files. Messages registered in one file, sent in a 
 
 Most network flow checks are configured under `gmod.network`.
 
-You can disable all network flow analysis with `gmod.network.enabled`. To silence individual diagnostic codes, use `diagnostics.disable` with the relevant code name (e.g. `"gmod-net-read-write-type-mismatch"`).
+Disable all network flow analysis with `gmod.network.enabled`. To silence one diagnostic code, use `diagnostics.disable` with the code name, such as `"gmod-net-read-write-type-mismatch"`.
 
 See the [GMod settings](/configuration/gmod#network-analysis) for the full reference on network-related configuration options.
 
@@ -105,10 +105,10 @@ See the [GMod settings](/configuration/gmod#network-analysis) for the full refer
 
 ## Limitations
 
-- Dynamic message names computed at runtime (e.g., `net.Start("msg" .. id)`) cannot be statically verified and are skipped
-- Very complex conditional logic around `net.Write*` calls may not be fully modeled
-- Only files included in workspace analysis are considered; files outside the current analysis scope are not checked for counterparts
+- GLuaLS does not track dynamic message names computed at runtime, such as `net.Start("msg" .. id)`
+- GLuaLS does not track conditional logic around `net.Write*` calls
+- GLuaLS checks only files included in workspace analysis, so files outside the current analysis scope do not count as counterparts
 
 ## VSCode integration
 
-Network diagnostics run automatically in the background. Diagnostics appear as squiggly underlines and in the Problems panel. Configure in the [settings panel](/configuration/overview#settings-panel-recommended) — see [GMod settings](/configuration/gmod) for the full network configuration reference.
+Network diagnostics run in the background. Diagnostics appear as squiggly underlines and in the Problems panel. Configure them in the [settings panel](/configuration/overview#settings-panel-recommended). See [GMod settings](/configuration/gmod) for the full network configuration reference.

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::{
-    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, RenderLevel, humanize_type,
+    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
+    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, RenderLevel, humanize_type,
     semantic::{
         member::find_members,
         type_check::{
@@ -16,6 +16,44 @@ use super::{
     sub_type::get_base_type_id, type_check_fail_reason::TypeCheckFailReason,
     type_check_guard::TypeCheckGuard,
 };
+
+const GMOD_NULL_TYPE_NAME: &str = "NULL";
+
+fn is_exact_gmod_null_decl_id(context: &TypeCheckContext, type_id: &LuaTypeDeclId) -> bool {
+    context.db.get_emmyrc().gmod.enabled && type_id.get_simple_name() == GMOD_NULL_TYPE_NAME
+}
+
+/// In GMod, NULL is the "zero value" of Entity — an invalid/empty Entity.
+/// Types in the same family as NULL (subtypes of NULL's parent class, Entity)
+/// should be freely assignable to/from NULL. For example:
+/// - `Entity` subtype → `NULL` (replacing a NULL placeholder with a real Entity)
+/// - `NULL` → `Entity` (passing NULL where Entity is expected)
+///
+/// This checks whether `type_id` is in the same type family as the NULL class
+/// identified by `null_id`, by verifying that `type_id` is a subtype of one of
+/// NULL's parent classes (e.g., Entity).
+fn is_gmod_null_family_type(
+    db: &crate::DbIndex,
+    null_id: &LuaTypeDeclId,
+    type_id: &LuaTypeDeclId,
+) -> bool {
+    if type_id.get_simple_name() == GMOD_NULL_TYPE_NAME {
+        return true;
+    }
+    // Check if type_id is a subtype of any of NULL's parent classes.
+    // NULL is declared as `---@class NULL : Entity`, so its supers include Entity.
+    let type_index = db.get_type_index();
+    if let Some(supers) = type_index.get_super_types(null_id) {
+        for super_type in supers {
+            if let LuaType::Ref(super_id) = &super_type {
+                if is_sub_type_of(db, type_id, super_id) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 pub fn check_ref_type_compact(
     context: &mut TypeCheckContext,
@@ -151,12 +189,41 @@ fn check_ref_class(
                 return Ok(());
             }
 
-            // 检查子类型关系
+            // In GMod, NULL is the "zero value" of Entity. Entity subtypes (e.g.,
+            // glide_missile) should be assignable to NULL-typed slots — the pattern
+            // `filter = { NULL, NULL }; filter[1] = self` is valid and common.
+            if is_exact_gmod_null_decl_id(context, source_id)
+                && !is_exact_gmod_null_decl_id(context, id)
+            {
+                if is_gmod_null_family_type(context.db, source_id, id) {
+                    return Ok(());
+                }
+                return Err(TypeCheckFailReason::TypeNotMatch);
+            }
+
+            // NULL is a valid Entity value (just invalid/empty), so assigning NULL
+            // to an Entity-typed slot is valid in GMod.
+            if is_exact_gmod_null_decl_id(context, id) {
+                if is_gmod_null_family_type(context.db, id, source_id) {
+                    return Ok(());
+                }
+                return Err(TypeCheckFailReason::TypeNotMatch);
+            }
+
+            // Liskov substitution: is compact a subtype of source?
+            // If the actual value (compact) is a subtype of the expected type (source),
+            // then it can be used wherever source is expected. This is always correct OOP.
             if is_sub_type_of(context.db, id, source_id) {
                 return Ok(());
             }
-            // 这不是正确的逻辑. 但不假设超类会自动转换为子类, 则会过于严格
-            if is_sub_type_of(context.db, source_id, id) {
+
+            // In GMod, Entity is used as a generic stand-in for many things (network vars,
+            // etc.), so passing a supertype where a more specific subtype is expected should
+            // not produce false-positive diagnostics. This is not theoretically correct OOP,
+            // but is a pragmatic choice to reduce noise in GMod codebases.
+            // is_sub_type_of(db, source_id, id) checks: is source a subtype of compact?
+            // If yes, source is more specific than compact → allow in GMod mode.
+            if context.db.get_emmyrc().gmod.enabled && is_sub_type_of(context.db, source_id, id) {
                 return Ok(());
             }
 
@@ -277,15 +344,21 @@ fn check_ref_type_compact_table(
     };
 
     for source_member in source_type_members {
-        if !is_required_structural_member(Some(source_member.get_feature())) {
-            continue;
-        }
         let source_member_type = context
             .db
             .get_type_index()
             .get_type_cache(&source_member.get_id().into())
             .unwrap_or(&LuaTypeCache::InferType(LuaType::Any))
             .as_type();
+        let property_owner_id = LuaSemanticDeclId::Member(source_member.get_id());
+        if !is_required_structural_member(
+            context.db,
+            Some(source_member.get_feature()),
+            Some(&property_owner_id),
+            Some(source_member_type),
+        ) {
+            continue;
+        }
         let key = source_member.get_key();
 
         if context.is_key_checked(key) {
@@ -376,7 +449,12 @@ fn check_ref_type_compact_object(
     };
 
     for source_member in source_type_members {
-        if !is_required_structural_member(source_member.feature) {
+        if !is_required_structural_member(
+            context.db,
+            source_member.feature,
+            source_member.property_owner_id.as_ref(),
+            Some(&source_member.typ),
+        ) {
             continue;
         }
         let source_member_type = source_member.typ;

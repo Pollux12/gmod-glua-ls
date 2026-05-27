@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaSyntaxKind};
+use glua_parser::{
+    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr,
+    LuaSyntaxKind, LuaTableField,
+};
 use rowan::TextRange;
 
 use super::{
@@ -43,14 +46,30 @@ pub fn infer_call_expr_func(
 ) -> InferCallFuncResult {
     let syntax_id = call_expr.get_syntax_id();
     let key = (syntax_id, args_count, call_expr_type.clone());
-    if let Some(cache) = cache.call_cache.get(&key) {
-        match cache {
+    if let Some(cache_entry) = cache.call_cache.get(&key) {
+        match cache_entry {
             CacheEntry::Cache(ty) => return Ok(ty.clone()),
             _ => return Err(InferFailReason::RecursiveInfer),
         }
     }
 
     cache.call_cache.insert(key.clone(), CacheEntry::Ready);
+    if matches!(call_expr_type, LuaType::DocFunction(_))
+        && let Some(signature_id) = get_prefix_expr_signature_id(db, cache, &call_expr)
+        && should_prefer_signature_for_call(db, signature_id, &call_expr_type)
+    {
+        let result =
+            infer_signature_doc_function(db, cache, signature_id, call_expr.clone(), args_count);
+        cache.call_cache.insert(
+            key,
+            result
+                .as_ref()
+                .map(|it| CacheEntry::Cache(it.clone()))
+                .unwrap_or_else(|err| CacheEntry::Error(err.clone())),
+        );
+        return result;
+    }
+
     let result = match &call_expr_type {
         LuaType::DocFunction(func) => {
             infer_doc_function(db, cache, func, call_expr.clone(), args_count)
@@ -155,6 +174,7 @@ pub fn infer_call_expr_func(
                     func_ty.get_params().to_vec(),
                     new_ret,
                 )
+                .with_optional_params(func_ty.get_optional_params().to_vec())
                 .into()
             }),
         }
@@ -189,7 +209,7 @@ fn infer_wrapped_setmetatable_call(
     args_count: Option<usize>,
 ) -> Option<InferCallFuncResult> {
     match call_expr_type {
-        LuaType::TableConst(_) | LuaType::Instance(_) => {}
+        LuaType::Table | LuaType::TableConst(_) | LuaType::Instance(_) => {}
         _ => return None,
     }
 
@@ -235,6 +255,138 @@ fn wrapped_setmetatable_fallback_would_help(func_ty: &LuaFunctionType) -> bool {
     matches!(func_ty.get_ret(), LuaType::Unknown | LuaType::Nil) || func_ty.get_ret().contain_tpl()
 }
 
+fn should_prefer_signature_for_call(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    call_expr_type: &LuaType,
+) -> bool {
+    if matches!(call_expr_type, LuaType::Signature(current) if *current == signature_id) {
+        return false;
+    }
+
+    db.get_signature_index()
+        .get(&signature_id)
+        .is_some_and(|signature| match call_expr_type {
+            LuaType::DocFunction(func) => {
+                let missing_optional_default = signature
+                    .get_param_optional_flags()
+                    .into_iter()
+                    .enumerate()
+                    .any(|(idx, is_optional)| is_optional && !func.is_param_optional(idx));
+                let richer_return =
+                    func.get_ret().is_unknown() && !signature.get_return_type().is_unknown();
+
+                missing_optional_default
+                    || richer_return
+                    || !signature.overloads.is_empty()
+                    || !signature.out_params.is_empty()
+            }
+            _ => false,
+        })
+}
+
+fn get_prefix_expr_signature_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaSignatureId> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    if let LuaExpr::NameExpr(name_expr) = &prefix_expr
+        && let Some(signature_id) = get_local_name_signature_id(db, cache, name_expr)
+    {
+        return Some(signature_id);
+    }
+    let semantic_decl = infer_expr_semantic_decl(
+        db,
+        cache,
+        prefix_expr,
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    )?;
+    get_signature_id_from_semantic_decl_value_expr(db, semantic_decl)
+}
+
+fn get_local_name_signature_id(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaSignatureId> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+    let closure = LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)?;
+    let LuaExpr::ClosureExpr(closure) = closure else {
+        return None;
+    };
+    Some(LuaSignatureId::from_closure(decl.get_file_id(), &closure))
+}
+
+fn get_signature_id_from_semantic_decl_value_expr(
+    db: &DbIndex,
+    semantic_decl: crate::LuaSemanticDeclId,
+) -> Option<LuaSignatureId> {
+    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
+        return Some(signature_id);
+    }
+    let file_id = match semantic_decl {
+        crate::LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
+        crate::LuaSemanticDeclId::Member(member_id) => member_id.file_id,
+        crate::LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
+        crate::LuaSemanticDeclId::TypeDecl(_) => return None,
+    };
+    let LuaExpr::ClosureExpr(closure) = get_semantic_decl_value_expr(db, semantic_decl)? else {
+        return None;
+    };
+    Some(LuaSignatureId::from_closure(file_id, &closure))
+}
+
+fn get_semantic_decl_value_expr(
+    db: &DbIndex,
+    semantic_decl: crate::LuaSemanticDeclId,
+) -> Option<LuaExpr> {
+    match semantic_decl {
+        crate::LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(&decl_id)?;
+            let value_syntax_id = decl.get_value_syntax_id()?;
+            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
+        }
+        crate::LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
+        crate::LuaSemanticDeclId::Signature(_) | crate::LuaSemanticDeclId::TypeDecl(_) => None,
+    }
+}
+
+fn get_member_value_expr(db: &DbIndex, member_id: crate::LuaMemberId) -> Option<LuaExpr> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+
+    if let Some(field) = LuaTableField::cast(node.clone()) {
+        return field.get_value_expr();
+    }
+
+    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
+            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+            let value_idx = vars
+                .iter()
+                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
+            return value_exprs.get(value_idx).cloned();
+        }
+
+        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
+            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
+        }
+    }
+
+    None
+}
+
 fn infer_tpl_ref_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -267,13 +419,7 @@ fn infer_doc_function(
     // Handle self-type substitution for functions with SelfInfer in return type
     // (e.g., tableof<self>). This covers cases like `local getTable = Entity.GetTable; getTable(self)`
     if func.contain_self() {
-        let self_type = infer_self_type(db, cache, &call_expr).or_else(|| {
-            // For regular function calls (not method calls), infer self type from first arg
-            let args_list = call_expr.get_args_list()?;
-            let first_arg = args_list.get_args().next()?;
-            let arg_type = infer_expr(db, cache, first_arg).ok()?;
-            Some(build_self_type(db, &arg_type))
-        });
+        let self_type = infer_self_type(db, cache, &call_expr);
         if let Some(self_type) = self_type {
             let mut substitutor = crate::semantic::generic::TypeSubstitutor::new();
             substitutor.add_self_type(self_type);
@@ -328,7 +474,8 @@ fn infer_signature_doc_function(
             signature.is_vararg,
             signature.get_type_params(),
             signature.get_return_type(),
-        );
+        )
+        .with_optional_params(signature.get_param_optional_flags());
         if is_generic {
             fake_doc_function = instantiate_func_generic(db, cache, &fake_doc_function, call_expr)?;
         }
@@ -345,7 +492,8 @@ fn infer_signature_doc_function(
             signature.is_vararg,
             signature.get_type_params(),
             signature.get_return_type(),
-        );
+        )
+        .with_optional_params(signature.get_param_optional_flags());
         new_overloads.push(apply_signature_return_kinds_to_function(
             signature,
             &fake_doc_function,
@@ -551,7 +699,7 @@ fn infer_table_type_doc_function(db: &DbIndex, table: InFiled<TextRange>) -> Inf
         let func = operator.get_operator_func(db);
         match func {
             LuaType::DocFunction(func) => {
-                return Ok(func);
+                return Ok(normalize_call_operator_doc_function(func.as_ref()));
             }
             LuaType::Signature(signature_id) => {
                 let signature = db
@@ -572,6 +720,26 @@ fn infer_table_type_doc_function(db: &DbIndex, table: InFiled<TextRange>) -> Inf
     }
 
     Err(InferFailReason::None)
+}
+
+fn normalize_call_operator_doc_function(func: &LuaFunctionType) -> Arc<LuaFunctionType> {
+    let mut params = func.get_params().to_vec();
+    let mut optional_params = func.get_optional_params().to_vec();
+    if !params.is_empty() && !func.is_colon_define() {
+        params.remove(0);
+        optional_params.remove(0);
+    }
+
+    Arc::new(
+        LuaFunctionType::new(
+            func.get_async_state(),
+            false,
+            func.is_variadic(),
+            params,
+            func.get_ret().clone(),
+        )
+        .with_optional_params(optional_params),
+    )
 }
 
 fn infer_union(
@@ -615,7 +783,8 @@ fn infer_union(
                         signature.is_vararg,
                         signature.get_type_params(),
                         signature.get_return_type(),
-                    );
+                    )
+                    .with_optional_params(signature.get_param_optional_flags());
                     if signature.is_generic() {
                         fake_doc_function = instantiate_func_generic(
                             db,
@@ -661,14 +830,6 @@ pub(crate) fn unwrapp_return_type(
     call_expr: LuaCallExpr,
 ) -> InferResult {
     match &return_type {
-        LuaType::Table => {
-            let id = InFiled {
-                file_id: cache.get_file_id(),
-                value: call_expr.get_range(),
-            };
-
-            return Ok(LuaType::TableConst(id));
-        }
         LuaType::TableConst(inst) => {
             if is_need_wrap_instance(cache, &call_expr, inst) {
                 let id = InFiled {
@@ -848,13 +1009,16 @@ fn apply_signature_return_kinds_to_function(
 ) -> Arc<LuaFunctionType> {
     let return_type = apply_signature_return_kinds(signature, function.get_ret().clone());
 
-    Arc::new(LuaFunctionType::new(
-        function.get_async_state(),
-        function.is_colon_define(),
-        function.is_variadic(),
-        function.get_params().to_vec(),
-        return_type,
-    ))
+    Arc::new(
+        LuaFunctionType::new(
+            function.get_async_state(),
+            function.is_colon_define(),
+            function.is_variadic(),
+            function.get_params().to_vec(),
+            return_type,
+        )
+        .with_optional_params(function.get_optional_params().to_vec()),
+    )
 }
 
 fn apply_signature_return_kinds(signature: &LuaSignature, return_type: LuaType) -> LuaType {

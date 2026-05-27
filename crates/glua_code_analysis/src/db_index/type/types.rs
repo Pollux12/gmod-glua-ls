@@ -500,6 +500,10 @@ impl LuaType {
                     }
                 }
 
+                if result_types.len() > 1 && hash_set.remove(&LuaType::Unknown) {
+                    result_types.retain(|typ| !matches!(typ, LuaType::Unknown));
+                }
+
                 match result_types.len() {
                     0 => LuaType::Nil,
                     1 => result_types[0].clone(),
@@ -645,6 +649,7 @@ pub struct LuaFunctionType {
     is_colon_define: bool,
     is_variadic: bool,
     params: Vec<(String, Option<LuaType>)>,
+    optional_params: Vec<bool>,
     ret: LuaType,
 }
 
@@ -670,13 +675,21 @@ impl LuaFunctionType {
         params: Vec<(String, Option<LuaType>)>,
         ret: LuaType,
     ) -> Self {
+        let optional_params = vec![false; params.len()];
         Self {
             async_state,
             is_colon_define,
             is_variadic,
             params,
+            optional_params,
             ret,
         }
+    }
+
+    pub fn with_optional_params(mut self, optional_params: Vec<bool>) -> Self {
+        self.optional_params = optional_params;
+        self.optional_params.resize(self.params.len(), false);
+        self
     }
 
     pub fn get_async_state(&self) -> AsyncState {
@@ -689,6 +702,14 @@ impl LuaFunctionType {
 
     pub fn get_params(&self) -> &[(String, Option<LuaType>)] {
         &self.params
+    }
+
+    pub fn get_optional_params(&self) -> &[bool] {
+        &self.optional_params
+    }
+
+    pub fn is_param_optional(&self, idx: usize) -> bool {
+        self.optional_params.get(idx).copied().unwrap_or(false)
     }
 
     pub fn get_ret(&self) -> &LuaType {
@@ -916,6 +937,10 @@ impl TypeVisitTrait for LuaUnionType {
 
 impl LuaUnionType {
     pub fn from_set(mut set: HashSet<LuaType>) -> Self {
+        if set.len() > 1 {
+            set.remove(&LuaType::Unknown);
+        }
+
         if set.len() == 2 && set.contains(&LuaType::Nil) {
             set.remove(&LuaType::Nil);
             if let Some(first) = set.iter().next() {
@@ -924,14 +949,19 @@ impl LuaUnionType {
             Self::Nullable(LuaType::Unknown)
         } else {
             let mut types: Vec<LuaType> = set.into_iter().collect();
-            // Keep deterministic ordering while avoiding repeated debug formatting
-            // allocations during sort comparisons.
-            types.sort_by_cached_key(|ty| format!("{ty:?}"));
+            // Deterministic ordering using discriminant-based sort key.
+            // This avoids the expensive `format!("{ty:?}")` allocation that was
+            // previously used, while preserving stable ordering across runs.
+            types.sort_by_cached_key(lua_type_sort_key);
             Self::Multi(types)
         }
     }
 
-    pub fn from_vec(types: Vec<LuaType>) -> Self {
+    pub fn from_vec(mut types: Vec<LuaType>) -> Self {
+        if types.len() > 1 && types.iter().any(|typ| !matches!(typ, LuaType::Unknown)) {
+            types.retain(|typ| !matches!(typ, LuaType::Unknown));
+        }
+
         if types.len() == 2 {
             if types.contains(&LuaType::Nil) {
                 let non_nil_type = types.iter().find(|t| !matches!(t, LuaType::Nil));
@@ -1080,6 +1110,7 @@ pub enum LuaAliasCallKind {
     Unpack,
     RawGet,
     Merge,
+    Split,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1631,4 +1662,120 @@ impl LuaMappedType {
             is_optional,
         }
     }
+}
+
+/// Produces a deterministic, allocation-free sort key for `LuaType` variants.
+/// Used by `LuaUnionType::from_set` to ensure stable ordering without the
+/// cost of `format!("{ty:?}")`.
+///
+/// The key is `(discriminant_ordinal, variant_detail)` where
+/// `variant_detail` differentiates same-variant entries cheaply
+/// (e.g., by pointer address for Arc-wrapped types, or by value for Copy types).
+fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
+    let disc: u8 = match ty {
+        LuaType::Nil => 0,
+        LuaType::Boolean => 1,
+        LuaType::BooleanConst(_) => 2,
+        LuaType::DocBooleanConst(_) => 3,
+        LuaType::Integer => 4,
+        LuaType::IntegerConst(_) => 5,
+        LuaType::DocIntegerConst(_) => 6,
+        LuaType::Number => 7,
+        LuaType::FloatConst(_) => 8,
+        LuaType::String => 9,
+        LuaType::StringConst(_) => 10,
+        LuaType::DocStringConst(_) => 11,
+        LuaType::Table => 12,
+        LuaType::TableConst(_) => 13,
+        LuaType::TableOf(_) => 14,
+        LuaType::Userdata => 15,
+        LuaType::Function => 16,
+        LuaType::DocFunction(_) => 17,
+        LuaType::Thread => 18,
+        LuaType::SelfInfer => 19,
+        LuaType::Global => 20,
+        LuaType::Never => 21,
+        LuaType::Unknown => 22,
+        LuaType::Any => 23,
+        LuaType::Io => 24,
+        LuaType::Ref(_) => 25,
+        LuaType::Def(_) => 26,
+        LuaType::Array(_) => 27,
+        LuaType::Tuple(_) => 28,
+        LuaType::Object(_) => 29,
+        LuaType::Union(_) => 30,
+        LuaType::Intersection(_) => 31,
+        LuaType::Generic(_) => 32,
+        LuaType::TableGeneric(_) => 33,
+        LuaType::TplRef(_) => 34,
+        LuaType::StrTplRef(_) => 35,
+        LuaType::Variadic(_) => 36,
+        LuaType::Signature(_) => 37,
+        LuaType::Instance(_) => 38,
+        LuaType::Namespace(_) => 39,
+        LuaType::Call(_) => 40,
+        LuaType::MultiLineUnion(_) => 41,
+        LuaType::TypeGuard(_) => 42,
+        LuaType::ConstTplRef(_) => 43,
+        LuaType::Language(_) => 44,
+        LuaType::ModuleRef(_) => 45,
+        LuaType::DocAttribute(_) => 46,
+        LuaType::Conditional(_) => 47,
+        LuaType::ConditionalInfer(_) => 48,
+        LuaType::Mapped(_) => 49,
+    };
+
+    // For same-variant tiebreaking, use a deterministic identity value.
+    // Copy types use their value; Arc-wrapped types use content hashing
+    // for determinism (pointer addresses vary across runs/edits).
+    let detail: u64 = match ty {
+        LuaType::BooleanConst(b) => *b as u64,
+        LuaType::IntegerConst(n) => *n as u64,
+        LuaType::DocIntegerConst(n) => *n as u64,
+        LuaType::FloatConst(f) => f.to_bits(),
+        LuaType::DocBooleanConst(b) => *b as u64,
+        // String-like: hash the content for determinism
+        LuaType::StringConst(s) | LuaType::DocStringConst(s) => hash_str_content(s.as_str()),
+        LuaType::Ref(id) | LuaType::Def(id) => hash_str_content(id.get_name()),
+        LuaType::Signature(id) => u32::from(id.get_position()) as u64,
+        LuaType::ModuleRef(id) => id.id as u64,
+        LuaType::Namespace(s) | LuaType::Language(s) | LuaType::ConditionalInfer(s) => {
+            hash_str_content(s.as_str())
+        }
+        LuaType::TableConst(filed) => {
+            ((filed.file_id.id as u64) << 32) | (u32::from(filed.value.start()) as u64)
+        }
+        // Singleton variants: can never appear twice in a HashSet-derived union
+        // (LuaType derives Eq+Hash), so tiebreaking detail is unnecessary.
+        LuaType::Nil
+        | LuaType::Boolean
+        | LuaType::Integer
+        | LuaType::Number
+        | LuaType::String
+        | LuaType::Table
+        | LuaType::Userdata
+        | LuaType::Function
+        | LuaType::Thread
+        | LuaType::SelfInfer
+        | LuaType::Global
+        | LuaType::Never
+        | LuaType::Unknown
+        | LuaType::Any
+        | LuaType::Io => 0,
+        // Arc-wrapped complex types: hash Debug representation for determinism.
+        // Pointer addresses are non-deterministic across runs/edits.
+        _ => hash_str_content(&format!("{ty:?}")),
+    };
+
+    (disc, detail)
+}
+
+/// Deterministic hash of a string's content for use as a sort key detail.
+/// Uses `DefaultHasher` which produces consistent results within a single run
+/// and is deterministic for identical input strings.
+fn hash_str_content(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }

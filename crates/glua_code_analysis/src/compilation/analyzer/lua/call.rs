@@ -1,5 +1,4 @@
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
@@ -7,7 +6,6 @@ use glua_parser::{
     NumberResult, PathTrait,
 };
 use rowan::TextSize;
-use wax::Pattern;
 
 use crate::{
     AccessorFuncCallMetadata, DbIndex, FileId, GlobalId, GmodClassCallArg, GmodClassCallLiteral,
@@ -25,11 +23,16 @@ struct SpecialCallDirectBinding {
 
 #[derive(Debug, Default)]
 pub(in crate::compilation::analyzer) struct SpecialCallDirectMatcher {
-    name_expr_names: HashMap<String, Vec<SpecialCallDirectBinding>>,
-    access_paths: HashMap<String, Vec<SpecialCallDirectBinding>>,
+    special_signatures: FxHashSet<LuaSignatureId>,
+    name_expr_names: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
+    access_paths: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
 }
 
 impl SpecialCallDirectMatcher {
+    fn has_special_signature(&self, signature_id: &LuaSignatureId) -> bool {
+        self.special_signatures.contains(signature_id)
+    }
+
     fn matches_name(
         &self,
         db: &DbIndex,
@@ -100,17 +103,23 @@ fn is_workspace_visible_to(
 
 pub(in crate::compilation::analyzer) fn build_special_call_direct_matcher(
     db: &DbIndex,
-    roots: &std::collections::HashMap<FileId, glua_parser::LuaChunk>,
+    roots: &FxHashMap<FileId, glua_parser::LuaChunk>,
 ) -> SpecialCallDirectMatcher {
-    let mut matcher = SpecialCallDirectMatcher::default();
+    let mut matcher = SpecialCallDirectMatcher {
+        special_signatures: db
+            .get_signature_index()
+            .iter()
+            .filter_map(|(signature_id, signature)| {
+                signature.has_special_call_params().then_some(*signature_id)
+            })
+            .collect(),
+        ..Default::default()
+    };
 
     for (file_id, root) in roots {
         for closure in root.descendants::<LuaClosureExpr>() {
             let signature_id = LuaSignatureId::from_closure(*file_id, &closure);
-            let Some(signature) = db.get_signature_index().get(&signature_id) else {
-                continue;
-            };
-            if !signature.has_special_call_params() {
+            if !matcher.has_special_signature(&signature_id) {
                 continue;
             }
 
@@ -246,9 +255,10 @@ fn get_generic_expr_special_call_reason(
     expr: &LuaExpr,
 ) -> Option<InferFailReason> {
     let typ = analyzer.infer_expr(expr).ok()?;
-    if type_has_special_call_signature(analyzer.db, &typ)
+    if type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ)
         || type_has_special_call_operator_signature(
             analyzer.db,
+            analyzer.special_call_direct_matcher,
             analyzer.file_id,
             expr.get_position(),
             &typ,
@@ -265,12 +275,15 @@ fn get_name_expr_special_call_reason(
     name_expr: &LuaNameExpr,
 ) -> Option<InferFailReason> {
     match resolve_cached_name_expr_type(analyzer, name_expr) {
-        Ok(Some(typ)) if type_has_special_call_signature(analyzer.db, &typ) => {
+        Ok(Some(typ))
+            if type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ) =>
+        {
             Some(InferFailReason::None)
         }
         Ok(Some(typ))
             if type_has_special_call_operator_signature(
                 analyzer.db,
+                analyzer.special_call_direct_matcher,
                 analyzer.file_id,
                 name_expr.get_position(),
                 &typ,
@@ -324,12 +337,15 @@ fn get_index_expr_special_call_reason(
     index_expr: &LuaIndexExpr,
 ) -> Option<InferFailReason> {
     match resolve_cached_index_expr_type(analyzer, index_expr) {
-        Ok(Some(typ)) if type_has_special_call_signature(analyzer.db, &typ) => {
+        Ok(Some(typ))
+            if type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ) =>
+        {
             Some(InferFailReason::None)
         }
         Ok(Some(typ))
             if type_has_special_call_operator_signature(
                 analyzer.db,
+                analyzer.special_call_direct_matcher,
                 analyzer.file_id,
                 index_expr.get_position(),
                 &typ,
@@ -397,7 +413,7 @@ fn decl_value_matches_direct_special_call(
     decl_id: crate::LuaDeclId,
     caller_position: TextSize,
 ) -> bool {
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     decl_value_matches_direct_special_call_inner(analyzer, decl_id, caller_position, &mut visited)
 }
 
@@ -405,7 +421,7 @@ fn decl_value_matches_direct_special_call_inner(
     analyzer: &LuaAnalyzer,
     decl_id: crate::LuaDeclId,
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if !visited.insert(decl_id) {
         return false;
@@ -438,16 +454,13 @@ fn expr_matches_direct_special_call(
     expr_file_id: FileId,
     node: &glua_parser::LuaSyntaxNode,
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if let Some(closure) = LuaClosureExpr::cast(node.clone()) {
         let signature_id = LuaSignatureId::from_closure(expr_file_id, &closure);
         return analyzer
-            .db
-            .get_signature_index()
-            .get(&signature_id)
-            .map(|signature| signature.has_special_call_params())
-            .unwrap_or(false);
+            .special_call_direct_matcher
+            .has_special_signature(&signature_id);
     }
 
     if let Some(name_expr) = LuaNameExpr::cast(node.clone())
@@ -503,7 +516,7 @@ fn index_expr_matches_direct_special_call(
     expr_file_id: FileId,
     index_expr: &LuaIndexExpr,
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if let Some(access_path) = index_expr.get_access_path()
         && analyzer.special_call_direct_matcher.matches_access_path(
@@ -539,7 +552,7 @@ fn expr_matches_direct_special_call_with_member_chain(
     expr: &LuaExpr,
     member_chain: &[LuaMemberKey],
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if member_chain.is_empty() {
         return expr_matches_direct_special_call(
@@ -633,7 +646,7 @@ fn decl_value_matches_direct_special_call_member_chain(
     decl_id: crate::LuaDeclId,
     member_chain: &[LuaMemberKey],
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     if !visited.insert(decl_id) {
         return false;
@@ -683,7 +696,7 @@ fn table_expr_member_chain_matches_direct_special_call(
     table_expr: &LuaTableExpr,
     member_chain: &[LuaMemberKey],
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     let Some((member_key, remaining_chain)) = member_chain.split_first() else {
         return false;
@@ -765,7 +778,7 @@ fn call_expr_matches_direct_special_call(
     expr_file_id: FileId,
     call_expr: &LuaCallExpr,
     caller_position: TextSize,
-    visited: &mut HashSet<crate::LuaDeclId>,
+    visited: &mut FxHashSet<crate::LuaDeclId>,
 ) -> bool {
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return false;
@@ -849,9 +862,10 @@ fn resolve_cached_name_expr_type(
         for decl_id in candidate_decl_ids {
             match resolve_cached_decl_type(analyzer, decl_id, name_expr.get_position()) {
                 Ok(Some(typ)) => {
-                    if type_has_special_call_signature(analyzer.db, &typ)
+                    if type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ)
                         || type_has_special_call_operator_signature(
                             analyzer.db,
+                            analyzer.special_call_direct_matcher,
                             analyzer.file_id,
                             name_expr.get_position(),
                             &typ,
@@ -1000,38 +1014,35 @@ fn get_member_owner_for_cached_type(prefix_type: LuaType) -> Option<LuaMemberOwn
     }
 }
 
-fn type_has_special_call_signature(db: &DbIndex, typ: &LuaType) -> bool {
+fn type_has_special_call_signature(matcher: &SpecialCallDirectMatcher, typ: &LuaType) -> bool {
     match typ {
-        LuaType::Signature(signature_id) => db
-            .get_signature_index()
-            .get(signature_id)
-            .map(|signature| signature.has_special_call_params())
-            .unwrap_or(false),
+        LuaType::Signature(signature_id) => matcher.has_special_signature(signature_id),
         LuaType::DocFunction(func) => func.get_params().iter().any(|(_, param_type)| {
             param_type
                 .as_ref()
                 .map(type_contains_str_tpl_ref)
                 .unwrap_or(false)
         }),
-        LuaType::TypeGuard(inner) => type_has_special_call_signature(db, inner),
+        LuaType::TypeGuard(inner) => type_has_special_call_signature(matcher, inner),
         LuaType::Union(union) => union
             .into_vec()
             .iter()
-            .any(|union_type| type_has_special_call_signature(db, union_type)),
+            .any(|union_type| type_has_special_call_signature(matcher, union_type)),
         LuaType::Intersection(intersection) => intersection
             .get_types()
             .iter()
-            .any(|intersection_type| type_has_special_call_signature(db, intersection_type)),
+            .any(|intersection_type| type_has_special_call_signature(matcher, intersection_type)),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
-            .any(|(union_type, _)| type_has_special_call_signature(db, union_type)),
+            .any(|(union_type, _)| type_has_special_call_signature(matcher, union_type)),
         _ => false,
     }
 }
 
 fn type_has_special_call_operator_signature(
     db: &DbIndex,
+    matcher: &SpecialCallDirectMatcher,
     file_id: FileId,
     caller_position: TextSize,
     typ: &LuaType,
@@ -1043,6 +1054,7 @@ fn type_has_special_call_operator_signature(
             };
             operator_owner_has_special_call_signature(
                 db,
+                matcher,
                 file_id,
                 caller_position,
                 &LuaOperatorOwner::Table(meta_table.clone()),
@@ -1051,6 +1063,7 @@ fn type_has_special_call_operator_signature(
         LuaType::Def(type_decl_id) | LuaType::Ref(type_decl_id) => {
             operator_owner_has_special_call_signature(
                 db,
+                matcher,
                 file_id,
                 caller_position,
                 &LuaOperatorOwner::Type(type_decl_id.clone()),
@@ -1058,20 +1071,28 @@ fn type_has_special_call_operator_signature(
         }
         LuaType::Instance(instance) => type_has_special_call_operator_signature(
             db,
+            matcher,
             file_id,
             caller_position,
             instance.get_base(),
         ),
         LuaType::TypeGuard(inner) => {
-            type_has_special_call_operator_signature(db, file_id, caller_position, inner)
+            type_has_special_call_operator_signature(db, matcher, file_id, caller_position, inner)
         }
         LuaType::Union(union) => union.into_vec().iter().any(|union_type| {
-            type_has_special_call_operator_signature(db, file_id, caller_position, union_type)
+            type_has_special_call_operator_signature(
+                db,
+                matcher,
+                file_id,
+                caller_position,
+                union_type,
+            )
         }),
         LuaType::Intersection(intersection) => {
             intersection.get_types().iter().any(|intersection_type| {
                 type_has_special_call_operator_signature(
                     db,
+                    matcher,
                     file_id,
                     caller_position,
                     intersection_type,
@@ -1079,7 +1100,13 @@ fn type_has_special_call_operator_signature(
             })
         }
         LuaType::MultiLineUnion(union) => union.get_unions().iter().any(|(union_type, _)| {
-            type_has_special_call_operator_signature(db, file_id, caller_position, union_type)
+            type_has_special_call_operator_signature(
+                db,
+                matcher,
+                file_id,
+                caller_position,
+                union_type,
+            )
         }),
         _ => false,
     }
@@ -1087,6 +1114,7 @@ fn type_has_special_call_operator_signature(
 
 fn operator_owner_has_special_call_signature(
     db: &DbIndex,
+    matcher: &SpecialCallDirectMatcher,
     file_id: FileId,
     caller_position: TextSize,
     owner: &LuaOperatorOwner,
@@ -1117,7 +1145,7 @@ fn operator_owner_has_special_call_signature(
             return false;
         }
 
-        type_has_special_call_signature(db, &operator.get_operator_func(db))
+        type_has_special_call_signature(matcher, &operator.get_operator_func(db))
     })
 }
 
@@ -1388,130 +1416,6 @@ fn collect_gmod_vgui_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaCallExpr) {
             args,
         },
     );
-}
-
-/// Pre-compute which files are in the scripted class scope.
-/// Compiles glob patterns once and checks all files, avoiding per-file compilation.
-pub(in crate::compilation::analyzer) fn compute_scripted_class_files(
-    db: &DbIndex,
-    file_ids: &[FileId],
-) -> HashSet<FileId> {
-    let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-    let include_patterns = scopes.include_patterns();
-    let exclude_patterns = scopes.exclude_patterns();
-    if include_patterns.is_empty() && exclude_patterns.is_empty() {
-        return file_ids.iter().copied().collect();
-    }
-
-    let include_glob = if !include_patterns.is_empty() {
-        match wax::any(
-            include_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(g) => Some(g),
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
-                return file_ids.iter().copied().collect();
-            }
-        }
-    } else {
-        None
-    };
-
-    let exclude_glob = if !exclude_patterns.is_empty() {
-        match wax::any(
-            exclude_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(g) => Some(g),
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");
-                return HashSet::new();
-            }
-        }
-    } else {
-        None
-    };
-
-    file_ids
-        .iter()
-        .copied()
-        .filter(|file_id| check_file_in_scope(db, *file_id, &include_glob, &exclude_glob))
-        .collect()
-}
-
-fn check_file_in_scope(
-    db: &DbIndex,
-    file_id: FileId,
-    include_glob: &Option<wax::Any>,
-    exclude_glob: &Option<wax::Any>,
-) -> bool {
-    let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
-        return include_glob.is_none();
-    };
-
-    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
-    let mut candidate_paths = Vec::new();
-    push_path_candidates(&mut candidate_paths, &normalized_path);
-    let normalized_lower = normalized_path.to_ascii_lowercase();
-    if let Some(lua_idx) = normalized_lower.find("/lua/") {
-        let lua_relative_path = normalized_path[lua_idx + 1..].to_string();
-        push_path_candidates(&mut candidate_paths, &lua_relative_path);
-        if let Some(stripped) = lua_relative_path.strip_prefix("lua/") {
-            push_path_candidates(&mut candidate_paths, stripped);
-        }
-    }
-    if let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) {
-        push_candidate_path(&mut candidate_paths, file_name);
-    }
-
-    if let Some(include) = include_glob {
-        if !candidate_paths
-            .iter()
-            .any(|path| include.is_match(Path::new(path)))
-        {
-            return false;
-        }
-    }
-
-    if let Some(exclude) = exclude_glob {
-        if candidate_paths
-            .iter()
-            .any(|path| exclude.is_match(Path::new(path)))
-        {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn push_path_candidates(candidate_paths: &mut Vec<String>, path: &str) {
-    push_candidate_path(candidate_paths, path);
-
-    let segments = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    for idx in 0..segments.len() {
-        push_candidate_path(candidate_paths, &segments[idx..].join("/"));
-    }
-}
-
-fn push_candidate_path(candidate_paths: &mut Vec<String>, candidate: &str) {
-    if candidate.is_empty() {
-        return;
-    }
-
-    if candidate_paths.iter().any(|existing| existing == candidate) {
-        return;
-    }
-
-    candidate_paths.push(candidate.to_string());
 }
 
 fn extract_call_args(

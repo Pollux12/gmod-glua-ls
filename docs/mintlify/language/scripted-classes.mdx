@@ -7,18 +7,18 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-Garry's Mod uses a "scripted class" pattern where you use a global table (`ENT`, `SWEP`, etc.) in a specific file location and GMod registers it as a class. GLuaLS detects these classes automatically and provides:
+Garry's Mod uses a "scripted class" pattern. You define a global table, such as `ENT` or `SWEP`, in a specific file location, and GMod registers it as a class. GLuaLS detects these classes and provides:
 
-- Automatic class registration including inheritance
-- Automatic synthesis of `NetworkVar` getter/setter pairs
-- Automatic synthesis of `AccessorFunc` getter/setter pairs
+- Class registration including inheritance
+- Synthesis of `NetworkVar` getter/setter pairs
+- Synthesis of `AccessorFunc` getter/setter pairs
 - Better completions and type checking for scripted class code
 
 ---
 
 ## Automatic detection
 
-GLuaLS detects scripted classes by their **file path**. Any file under a recognized directory is treated as defining the appropriate table. For example:
+GLuaLS detects scripted classes by **file path**. It treats any file under a recognized directory as defining the matching table. For example:
 
 | Directory pattern | Class table | Base class |
 |---|---|---|
@@ -26,9 +26,9 @@ GLuaLS detects scripted classes by their **file path**. Any file under a recogni
 | `lua/weapons/**/` | `SWEP` | `Weapon` |
 | `lua/effects/**/` | `EFFECT` | (none) |
 
-The detected class table is automatically typed with the base class's methods and fields, so you get completions and type-checking without any annotation.
+GLuaLS types the detected class table with the base class's methods and fields, so you get completions and type checking without annotations.
 
-This table can be adjusted in settings.
+You can adjust this table in settings.
 
 ---
 
@@ -45,7 +45,7 @@ AccessorFunc(ENT, "m_bOrient", "Orient", FORCE_BOOL)
 -- ENT:SetOrient(value: boolean) -> nil
 ```
 
-This can be done via the annotation `---@accessorfunc` for custom getters/setters, see [@accessorfunc](/annotations/accessorfunc) for more details.
+Use the `---@accessorfunc` annotation for custom getters and setters. See [@accessorfunc](/annotations/accessorfunc) for details.
 
 ---
 
@@ -69,7 +69,7 @@ end
 -- ENT:SetName(value: string) -> nil
 ```
 
-This gives you completions and type checking for generated accessors without manual annotations.
+You get completions and type checking for generated accessors without manual annotations.
 
 ### Supported NetworkVar types
 
@@ -90,7 +90,7 @@ This gives you completions and type checking for generated accessors without man
 
 ## Base class inheritance
 
-Scripted classes in GMod inherit from base classes. GLuaLS understands this chain and provides completions for inherited methods. The scripted class table also gets the standard base type for that scope (`Entity`, `Weapon`, `Tool`, and so on). `DEFINE_BASECLASS(...)` and values like `ENT.Base` can refine that further.
+Scripted classes in GMod inherit from base classes. GLuaLS understands this chain and suggests inherited methods. The scripted class table also gets the standard base type for that scope, such as `Entity`, `Weapon`, or `Tool`. `DEFINE_BASECLASS(...)` and values like `ENT.Base` can refine that type further.
 
 ```lua
 function ENT:Use(ply)
@@ -99,13 +99,13 @@ function ENT:Use(ply)
 end
 ```
 
-For gamemodes that derive from another gamemode (for example, DarkRP derives from Sandbox), the parent's folder is added as a library automatically. See [Gamemode inheritance](/configuration/gmod#gamemode-inheritance) to configure or disable this.
+For gamemodes that derive from another gamemode, such as DarkRP deriving from Sandbox, GLuaLS adds the parent's folder as a library. See [Gamemode inheritance](/configuration/gmod#gamemode-inheritance) to configure or disable this.
 
 ---
 
 ## Hook overrides in scripted classes
 
-GLuaLS understands that functions defined in a scripted class table override the engine hooks for that class:
+GLuaLS treats functions defined in a scripted class table as engine hook overrides for that class:
 
 ```lua
 function ENT:Think()    -- override of ENTITY:Think hook
@@ -119,7 +119,7 @@ Completions suggest the correct signature for each override.
 
 ## Class Explorer integration
 
-Detected scripted classes are listed in the VS Code **Class Explorer**. You can browse groups (entities, weapons, effects, and custom scopes) and jump to class definitions quickly.
+The VS Code **Class Explorer** lists detected scripted classes. You can browse groups, such as entities, weapons, effects, and custom scopes, and jump to class definitions.
 
 Class grouping and labels come from `gmod.scriptedClassScopes.include`.
 
@@ -127,9 +127,9 @@ Class grouping and labels come from `gmod.scriptedClassScopes.include`.
 
 ## Scaffolding integration
 
-Scripted class scopes also drive class scaffolding. Each scope can define scaffold output files via `scaffold.files` and a `rootDir` in `gmod.scriptedClassScopes.include`.
+Scripted class scopes also control class scaffolding. Each scope can define scaffold output files with `scaffold.files` and a `rootDir` in `gmod.scriptedClassScopes.include`.
 
-This lets you create new classes with your own template layout while keeping class analysis, explorer grouping, and generated files in sync.
+You can create new classes with your own template layout while GLuaLS keeps class analysis, explorer grouping, and generated files in sync.
 
 See [GMod settings](/configuration/gmod#scripted-classes) for all supported fields.
 
@@ -143,7 +143,7 @@ See [GMod settings](/configuration/gmod#scripted-classes) for all supported fiel
 
 ### Built-in templates
 
-The VS Code extension ships with built-in templates for the standard scripted class types:
+The VS Code extension includes built-in templates for the standard scripted class types:
 
 | Class type | Generated files |
 |---|---|

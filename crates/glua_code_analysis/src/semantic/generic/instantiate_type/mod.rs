@@ -143,22 +143,50 @@ pub fn instantiate_doc_function(
                                 SubstitutorValue::Type(ty) => {
                                     let resolved_type = ty.default();
                                     // 如果参数是 `...: T...` 且类型是 tuple, 那么我们将展开 tuple
-                                    if origin_param.0 == "..."
-                                        && let LuaType::Tuple(tuple) = resolved_type
-                                    {
-                                        for (i, typ) in tuple.get_types().iter().enumerate() {
-                                            let param_name = format!("var{}", i);
-                                            new_params.push((param_name, Some(typ.clone())));
+                                    if origin_param.0 == "..." {
+                                        match resolved_type {
+                                            LuaType::Tuple(tuple) => {
+                                                for (i, typ) in tuple.get_types().iter().enumerate()
+                                                {
+                                                    let param_name = format!("var{}", i);
+                                                    new_params
+                                                        .push((param_name, Some(typ.clone())));
+                                                }
+                                                continue;
+                                            }
+                                            LuaType::Variadic(variadic) => match variadic.deref() {
+                                                VariadicType::Multi(types) => {
+                                                    for (i, typ) in types.iter().enumerate() {
+                                                        let param_name = format!("var{}", i);
+                                                        new_params
+                                                            .push((param_name, Some(typ.clone())));
+                                                    }
+                                                    continue;
+                                                }
+                                                VariadicType::Base(base) => {
+                                                    is_variadic = true;
+                                                    new_params.push((
+                                                        "...".to_string(),
+                                                        Some(LuaType::Variadic(
+                                                            VariadicType::Base(base.clone()).into(),
+                                                        )),
+                                                    ));
+                                                    continue;
+                                                }
+                                            },
+                                            _ => {
+                                                is_variadic = true;
+                                                new_params.push((
+                                                    "...".to_string(),
+                                                    Some(LuaType::Variadic(
+                                                        VariadicType::Base(resolved_type.clone())
+                                                            .into(),
+                                                    )),
+                                                ));
+                                                continue;
+                                            }
                                         }
-                                        continue;
                                     }
-                                    is_variadic = true;
-                                    new_params.push((
-                                        "...".to_string(),
-                                        Some(LuaType::Variadic(
-                                            VariadicType::Base(LuaType::Any).into(),
-                                        )),
-                                    ));
                                 }
                                 SubstitutorValue::Params(params) => {
                                     for (i, param) in params.iter().enumerate() {

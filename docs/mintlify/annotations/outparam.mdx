@@ -1,0 +1,210 @@
+---
+title: "@outparam"
+description: Tell the language server when a function writes results into a table argument.
+---
+
+## Overview
+
+Some functions write results into a table you pass in, instead of returning them. `@outparam` tells GLuaLS which field gets filled in, so you get proper types and autocomplete after the call.
+
+`util.TraceLine` is a common GMod example: it writes its result into the `output` field of the table you give it.
+
+---
+
+## Syntax
+
+```lua
+---@outparam paramName.fieldPath Type
+```
+
+- **`paramName`** — a parameter on the same function (must match an `@param`).
+- **`fieldPath`** — the field the function writes to. Use dots for nested fields.
+- **`Type`** — the type the field will have after the call.
+
+---
+
+## Basic usage
+
+```lua
+---@class TraceResult
+---@field Hit boolean
+---@field Fraction number
+local TraceResult = {}
+
+util = {}
+
+---@outparam traceConfig.output TraceResult
+---@param traceConfig table
+---@return TraceResult
+function util.TraceLine(traceConfig) end
+```
+
+After the call, the `output` field is typed as `TraceResult`:
+
+```lua
+local ray = {}
+local traceData = {
+    output = ray,
+}
+
+util.TraceLine(traceData)
+
+local hit = traceData.output.Hit  -- ✅ boolean
+local hitViaRay = ray.Hit         -- ✅ boolean (alias tracked)
+```
+
+---
+
+## Nested fields
+
+Use dots to target a field inside a field:
+
+```lua
+---@outparam config.inner.result TraceResult
+---@param config table
+function util.TraceNested(config) end
+```
+
+```lua
+local data = { inner = { result = {} } }
+util.TraceNested(data)
+local hit = data.inner.result.Hit  -- ✅ boolean
+```
+
+---
+
+## Multiple output fields
+
+One `@outparam` per field the function writes to:
+
+```lua
+---@outparam data.position Vector
+---@outparam data.angles Angle
+---@param data table
+function GetSpawnPoint(data) end
+```
+
+---
+
+## The field must already exist
+
+`@outparam` narrows the type of a field already on the table. It does not create missing fields. If the field is absent, it stays `nil` after the call:
+
+```lua
+local data = {}
+util.TraceLine(data)
+local hit = data.output.Hit  -- ❌ data.output is nil
+```
+
+Set the field before the call, either in the literal or with an assignment:
+
+```lua
+-- ✅ In the literal
+local data = { output = {} }
+util.TraceLine(data)
+local hit = data.output.Hit  -- ✅ boolean
+
+-- ✅ Assigned before the call
+local data = {}
+data.output = {}
+util.TraceLine(data)
+local hit = data.output.Hit  -- ✅ boolean
+```
+
+---
+
+## Only applies after the call
+
+The outparam type takes effect after the function runs, not before:
+
+```lua
+local data = { output = {} }
+local before = data.output.Hit  -- ❌ {} has no Hit field
+util.TraceLine(data)
+local after = data.output.Hit   -- ✅ boolean
+```
+
+---
+
+## Conditional calls
+
+Inside an `if` block, the type only applies in the branch where the call happens:
+
+```lua
+local data = { output = {} }
+
+if shouldTrace then
+    util.TraceLine(data)
+    local hit = data.output.Hit  -- ✅ boolean
+end
+
+local outside = data.output.Hit  -- ✅ boolean|nil
+```
+
+Short-circuit expressions like `false and util.TraceLine(data)` skip the type, because the call might never run.
+
+---
+
+## Aliasing
+
+Pass a different variable pointing to the same table and GLuaLS tracks it:
+
+```lua
+local data = { output = {} }
+local cfg = data
+util.TraceLine(cfg)
+local hit = data.output.Hit  -- ✅ boolean
+```
+
+Reassign the alias before the call and the link breaks:
+
+```lua
+local data = { output = {} }
+local cfg = data
+cfg = {}               -- no longer points to data
+util.TraceLine(cfg)
+local hit = data.output.Hit  -- ❌ type not applied to data
+```
+
+---
+
+## Duplicate tags
+
+Two `@outparam` tags for the same field: the second one wins.
+
+```lua
+---@outparam data.output TraceResultInt
+---@outparam data.output TraceResultStr   -- this one is used
+---@param data table
+function util.Process(data) end
+```
+
+---
+
+## Errors
+
+GLuaLS shows an error when:
+
+- The parameter name doesn't match any `@param` on the function.
+- You skip the field path (you can't target the parameter itself).
+
+```lua
+---@param data table
+---@outparam data TraceResult  -- ❌ needs a field, like data.output
+
+---@param data table
+---@outparam missing.field TraceResult  -- ❌ "missing" isn't a parameter
+```
+
+---
+
+## @outparam vs @return
+
+`@return` covers values the function returns. `@outparam` covers values the function writes into a table argument. A function can use both:
+
+```lua
+---@outparam traceConfig.output TraceResult
+---@param traceConfig table
+---@return TraceResult
+function util.TraceLine(traceConfig) end
+```

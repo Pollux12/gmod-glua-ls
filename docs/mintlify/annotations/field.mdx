@@ -5,7 +5,7 @@ description: Add typed fields to a class definition.
 
 ## Overview
 
-`@field` declares a class property, with optional access level, optional `?`, and description. It gives more accurate types and autocomplete than inference alone. You should annotate fields you use often.
+`@field` declares a class property. You can add an access level, a `?` for nilable fields, and a description. Annotate fields you use often so GLuaLS can give better types and autocomplete.
 
 ---
 
@@ -35,7 +35,7 @@ Place `@field` annotations immediately after a `@class` line:
 
 ## Optional fields
 
-Add `?` after the field name to mark it as potentially `nil`:
+Add `?` after the field name to mark it as `nil` sometimes:
 
 ```lua
 ---@class Player
@@ -44,14 +44,14 @@ Add `?` after the field name to mark it as potentially `nil`:
 ---@field clan? string Optional clan tag
 ```
 
-Accessing an optional field without a nil check will trigger `need-check-nil` when strict nil checking is enabled.
+If you access an optional field without a nil check, GLuaLS reports `need-check-nil` when you enable strict nil checking.
 
 ---
 
 ## Access control
 
 <Info>
-Access modifiers do not change runtime behavior and are optional. The language server still checks them and can report diagnostics when private/protected fields are used from the wrong place. Treat them as type/style rules, not runtime access control.
+Access modifiers do not change runtime behavior. GLuaLS checks them and can report diagnostics when code uses private or protected fields from the wrong place. Treat them as type and style rules, not runtime access control.
 </Info>
 
 | Modifier | Description |
@@ -72,7 +72,7 @@ Access modifiers do not change runtime behavior and are optional. The language s
 
 ## Index-type fields
 
-Define all keys of a type at once using `[keyType]` syntax:
+Use `[keyType]` syntax to define all keys of a type at once:
 
 ```lua
 ---@class Config
@@ -86,7 +86,7 @@ Define all keys of a type at once using `[keyType]` syntax:
 
 ## Function fields
 
-Fields can be function types:
+Fields can use function types:
 
 ```lua
 ---@class EventEmitter
@@ -96,13 +96,13 @@ Fields can be function types:
 ```
 
 <Tip>
-Use this when the function is added outside the Lua file (for example, by C++). If the function is defined in Lua, annotate the function directly to avoid duplicate definitions.
+Use this when code outside the Lua file adds the function, such as C++. If Lua defines the function, annotate the function itself to avoid duplicate definitions.
 </Tip>
 
 ---
 
 ## Tips and best practices
 
-- You should always place `@field` annotations directly after their `@class` declaration.
-- In GLuaLS, the `inject-field` diagnostic is disabled by default, with all classes acting as `(partial)` and allowing fields to be defined anywhere in the file. Fields are not required, but they improve type checking and autocomplete for the class.
+- Place `@field` annotations directly after their `@class` declaration.
+- GLuaLS disables the `inject-field` diagnostic by default. Classes act as `(partial)`, so you can define fields anywhere in the file. Fields are optional, but they improve type checking and autocomplete for the class.
 

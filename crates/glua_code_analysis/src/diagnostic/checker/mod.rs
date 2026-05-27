@@ -44,16 +44,20 @@ mod unnecessary_if;
 mod unused;
 
 use glua_parser::{
-    LuaAstNode, LuaClosureExpr, LuaComment, LuaExpr, LuaReturnStat, LuaStat, LuaSyntaxKind,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaClosureExpr, LuaComment, LuaExpr, LuaIndexExpr,
+    LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
 };
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
-use rowan::TextRange;
-use std::collections::HashMap;
+use rowan::{TextRange, TextSize};
+use smol_str::SmolStr;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use rustc_hash::FxHashMap;
+
 use crate::{
-    FileId, LuaSemanticDeclId, LuaType, RenderLevel, SemanticDeclLevel, WorkspaceId,
+    FileId, LuaSemanticDeclId, LuaType, LuaTypeDeclId, RenderLevel, SemanticDeclLevel, WorkspaceId,
     db_index::DbIndex, humanize_type, semantic::SemanticModel,
 };
 
@@ -63,10 +67,30 @@ use super::{
     lua_diagnostic_config::LuaDiagnosticConfig,
 };
 
+pub use await_in_sync::{PrecomputedAwaitCandidates, precompute_await_candidates};
+pub use check_field::precompute_subclass_fields;
+pub use discard_returns::{PrecomputedNoDiscardCandidates, precompute_nodiscard_candidates};
+pub use gmod_network::SortedSendFlowCache;
+pub use gmod_network::precompute_sorted_send_flows;
+pub use gmod_realm_misuse::AnnotatedRealmRange;
 pub use gmod_realm_misuse::GmMethodRealmMap;
 pub use gmod_realm_misuse::PrecomputedCalleeRealmMap;
+pub(crate) use gmod_realm_misuse::collect_decl_annotation_realms_for_file_precompute;
 pub use gmod_realm_misuse::precompute_callee_realms_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
+pub use missing_fields::precompute_missing_required_fields;
+pub use param_type_check::{PrecomputedParamTypeCandidates, precompute_param_type_candidates};
+
+pub type PrecomputedMissingRequiredFields = HashMap<LuaTypeDeclId, Arc<HashSet<String>>>;
+pub type PrecomputedSubclassFields = HashMap<LuaTypeDeclId, Arc<HashSet<SmolStr>>>;
+pub type AssignmentPrefixKey = (TextSize, TextSize, String);
+pub type AssignmentPrefixEvents = HashMap<AssignmentPrefixKey, Vec<AssignmentPrefixEvent>>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct AssignmentPrefixEvent {
+    pub offset: TextSize,
+    pub is_table_literal: bool,
+}
 
 pub trait Checker {
     const CODES: &[DiagnosticCode];
@@ -87,6 +111,11 @@ fn run_check<T: Checker>(
         .iter()
         .any(|code| context.is_checker_enable_by_code(code))
     {
+        if !log::log_enabled!(log::Level::Info) {
+            T::check(context, semantic_model);
+            return;
+        }
+
         let start = std::time::Instant::now();
         T::check(context, semantic_model);
         let elapsed = start.elapsed();
@@ -128,12 +157,9 @@ pub fn check_file(
         semantic_model,
         cancel_token,
     );
-    run_check::<discard_returns::DiscardReturnsChecker>(context, semantic_model, cancel_token);
-    run_check::<await_in_sync::AwaitInSyncChecker>(context, semantic_model, cancel_token);
     run_check::<call_non_callable::CallNonCallableChecker>(context, semantic_model, cancel_token);
     run_check::<missing_fields::MissingFieldsChecker>(context, semantic_model, cancel_token);
     run_check::<param_type_check::ParamTypeCheckChecker>(context, semantic_model, cancel_token);
-    run_check::<need_check_nil::NeedCheckNilChecker>(context, semantic_model, cancel_token);
     run_check::<code_style_check::CodeStyleCheckChecker>(context, semantic_model, cancel_token);
     run_check::<return_type_mismatch::ReturnTypeMismatch>(context, semantic_model, cancel_token);
     run_check::<undefined_doc_param::UndefinedDocParamChecker>(
@@ -144,6 +170,13 @@ pub fn check_file(
     run_check::<redefined_local::RedefinedLocalChecker>(context, semantic_model, cancel_token);
     run_check::<check_export::CheckExportChecker>(context, semantic_model, cancel_token);
     run_check::<check_field::CheckFieldChecker>(context, semantic_model, cancel_token);
+    // These checkers do broad expression/declaration lookups. Running them after
+    // ParamTypeCheck/CheckField lets them reuse warmed per-file inference caches.
+    run_check::<need_check_nil::NeedCheckNilChecker>(context, semantic_model, cancel_token);
+    run_check::<discard_returns::DiscardReturnsChecker>(context, semantic_model, cancel_token);
+    // AwaitInSync relies heavily on expression/call inference. Running it after
+    // the broad type/field checkers lets it reuse their warmed per-file cache.
+    run_check::<await_in_sync::AwaitInSyncChecker>(context, semantic_model, cancel_token);
     run_check::<circle_doc_class::CircleDocClassChecker>(context, semantic_model, cancel_token);
     run_check::<incomplete_signature_doc::IncompleteSignatureDocChecker>(
         context,
@@ -224,6 +257,22 @@ pub struct SharedDiagnosticData {
     pub gm_method_realms: HashMap<WorkspaceId, Arc<GmMethodRealmMap>>,
     /// Maps workspace_id -> immutable, precomputed callee-declaration realm data.
     pub callee_realms_by_workspace: HashMap<WorkspaceId, Arc<PrecomputedCalleeRealmMap>>,
+    /// Required non-method fields for each type declaration, including inherited fields.
+    pub missing_required_fields: Arc<PrecomputedMissingRequiredFields>,
+    /// Named members declared on subclasses, keyed by every base type they can satisfy.
+    pub subclass_fields: Arc<PrecomputedSubclassFields>,
+    /// Whether any indexed signature/type cache can produce an async callable.
+    pub await_candidates: Arc<PrecomputedAwaitCandidates>,
+    /// Static callee names whose callable metadata has parameter types worth checking.
+    pub param_type_candidates: Arc<PrecomputedParamTypeCandidates>,
+    /// Static callee names whose signatures are marked @nodiscard.
+    pub nodiscard_candidates: Arc<PrecomputedNoDiscardCandidates>,
+    /// Precomputed declaration annotation realms for all workspace files.
+    /// Avoids re-scanning syntax trees for @realm annotations per file.
+    pub decl_annotation_realms: Arc<FxHashMap<FileId, Vec<AnnotatedRealmRange>>>,
+    /// Precomputed sorted send flows by message name. Built once per batch
+    /// run instead of per-file, avoiding repeated VFS path lookups and sorts.
+    pub sorted_send_flows: Arc<SortedSendFlowCache>,
 }
 
 pub struct DiagnosticContext<'a> {
@@ -233,6 +282,7 @@ pub struct DiagnosticContext<'a> {
     pub config: Arc<LuaDiagnosticConfig>,
     cancel_token: CancellationToken,
     shared_data: Option<Arc<SharedDiagnosticData>>,
+    assignment_prefix_events: Option<Arc<AssignmentPrefixEvents>>,
 }
 
 impl<'a> DiagnosticContext<'a> {
@@ -249,6 +299,7 @@ impl<'a> DiagnosticContext<'a> {
             config,
             cancel_token,
             shared_data: None,
+            assignment_prefix_events: None,
         }
     }
 
@@ -266,6 +317,7 @@ impl<'a> DiagnosticContext<'a> {
             config,
             cancel_token,
             shared_data: Some(shared_data),
+            assignment_prefix_events: None,
         }
     }
 
@@ -279,6 +331,16 @@ impl<'a> DiagnosticContext<'a> {
 
     pub fn get_file_id(&self) -> FileId {
         self.file_id
+    }
+
+    pub fn get_assignment_prefix_events(&mut self, root: &LuaChunk) -> Arc<AssignmentPrefixEvents> {
+        if let Some(events) = &self.assignment_prefix_events {
+            return events.clone();
+        }
+
+        let events = Arc::new(collect_assignment_prefix_events(root));
+        self.assignment_prefix_events = Some(events.clone());
+        events
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -416,6 +478,83 @@ impl<'a> DiagnosticContext<'a> {
         // default setting
         is_code_default_enable(code, self.config.level)
     }
+}
+
+fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
+    let mut events: AssignmentPrefixEvents = HashMap::new();
+    for node in root.descendants::<LuaAst>() {
+        let LuaAst::LuaAssignStat(assign_stat) = node else {
+            continue;
+        };
+
+        let Some((block_start, block_end)) = assignment_block_range(assign_stat.syntax()) else {
+            continue;
+        };
+
+        let offset = assign_stat.syntax().text_range().start();
+        let (vars, exprs) = assign_stat.get_var_and_expr_list();
+        for (idx, var) in vars.into_iter().enumerate() {
+            let prefix_text = normalized_syntax_text(var.syntax());
+            if prefix_text.is_empty() {
+                continue;
+            }
+
+            let is_table_literal = exprs
+                .get(idx)
+                .is_some_and(|expr| matches!(expr, LuaExpr::TableExpr(_)));
+            events
+                .entry((block_start, block_end, prefix_text))
+                .or_default()
+                .push(AssignmentPrefixEvent {
+                    offset,
+                    is_table_literal,
+                });
+        }
+    }
+
+    events
+}
+
+pub fn is_initialized_assignment_prefix(
+    index_expr: &LuaIndexExpr,
+    assign_stat: &LuaAssignStat,
+    assignment_prefixes: &AssignmentPrefixEvents,
+) -> bool {
+    let Some(prefix) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    let Some((block_start, block_end)) = assignment_block_range(assign_stat.syntax()) else {
+        return false;
+    };
+
+    let prefix_text = normalized_syntax_text(prefix.syntax());
+    if prefix_text.is_empty() {
+        return false;
+    }
+
+    let key = (block_start, block_end, prefix_text);
+    let Some(events) = assignment_prefixes.get(&key) else {
+        return false;
+    };
+
+    let current_offset = assign_stat.syntax().text_range().start();
+    let last_event_idx = events.partition_point(|event| event.offset < current_offset);
+    last_event_idx > 0 && events[last_event_idx - 1].is_table_literal
+}
+
+fn assignment_block_range(node: &LuaSyntaxNode) -> Option<(TextSize, TextSize)> {
+    let range = node.parent()?.text_range();
+    Some((range.start(), range.end()))
+}
+
+fn normalized_syntax_text(syntax: &LuaSyntaxNode) -> String {
+    syntax
+        .text()
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
 }
 
 fn get_closure_expr_comment(closure_expr: &LuaClosureExpr) -> Option<LuaComment> {

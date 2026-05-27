@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::Path;
 
 use schemars::JsonSchema;
@@ -32,6 +33,7 @@ const FILE_PARAM_DEFAULTS: &[(&str, &str)] = &[
     ("inflictor", "Entity"),
     ("victim", "Entity"),
     ("cmd", "CUserCmd"),
+    ("func", "function"),
     ("mat", "IMaterial"),
 ];
 
@@ -110,7 +112,7 @@ pub enum EmmyrcGmodScriptedClassScopeEntry {
     Definition(Box<EmmyrcGmodScriptedClassDefinition>),
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[derive(Serialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedClassDefinition {
     pub id: String,
@@ -148,14 +150,14 @@ pub struct EmmyrcGmodScriptedClassScaffold {
     pub files: Vec<EmmyrcGmodScriptedClassScaffoldFile>,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedClassScaffoldFile {
     pub path: String,
     pub template: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedGmodScriptedClassDefinition {
     pub id: String,
@@ -179,6 +181,273 @@ pub struct ResolvedGmodScriptedClassDefinition {
 pub struct ResolvedGmodScriptedClassMatch {
     pub definition: ResolvedGmodScriptedClassDefinition,
     pub class_name: String,
+}
+
+impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "id",
+            "label",
+            "path",
+            "include",
+            "exclude",
+            "classGlobal",
+            "parentId",
+            "icon",
+            "rootDir",
+            "scaffold",
+            "classNamePrefix",
+            "disabled",
+        ];
+
+        struct DefinitionVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DefinitionVisitor {
+            type Value = EmmyrcGmodScriptedClassDefinition;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct EmmyrcGmodScriptedClassDefinition")
+            }
+
+            fn visit_map<MapType>(self, mut map: MapType) -> Result<Self::Value, MapType::Error>
+            where
+                MapType: serde::de::MapAccess<'de>,
+            {
+                let mut id = None;
+                let mut label = None;
+                let mut path = None;
+                let mut include = None;
+                let mut exclude = None;
+                let mut class_global = None;
+                let mut parent_id = None;
+                let mut icon = None;
+                let mut root_dir = None;
+                let mut scaffold = None;
+                let mut class_name_prefix = None;
+                let mut disabled = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => read_unique_field(&mut id, &mut map, "id")?,
+                        "label" => read_unique_field(&mut label, &mut map, "label")?,
+                        "path" => read_unique_field(&mut path, &mut map, "path")?,
+                        "include" => read_unique_field(&mut include, &mut map, "include")?,
+                        "exclude" => read_unique_field(&mut exclude, &mut map, "exclude")?,
+                        "classGlobal" => {
+                            read_unique_field(&mut class_global, &mut map, "classGlobal")?
+                        }
+                        "parentId" => read_unique_field(&mut parent_id, &mut map, "parentId")?,
+                        "icon" => read_unique_field(&mut icon, &mut map, "icon")?,
+                        "rootDir" => read_unique_field(&mut root_dir, &mut map, "rootDir")?,
+                        "scaffold" => read_unique_field(&mut scaffold, &mut map, "scaffold")?,
+                        "classNamePrefix" => {
+                            read_unique_field(&mut class_name_prefix, &mut map, "classNamePrefix")?
+                        }
+                        "disabled" => read_unique_field(&mut disabled, &mut map, "disabled")?,
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(EmmyrcGmodScriptedClassDefinition {
+                    id: required_field::<_, MapType::Error>(id, "id")?,
+                    label: label.unwrap_or_default(),
+                    path: path.unwrap_or_default(),
+                    include: include.unwrap_or_default(),
+                    exclude: exclude.unwrap_or_default(),
+                    class_global: class_global.unwrap_or_default(),
+                    parent_id: parent_id.unwrap_or_default(),
+                    icon: icon.unwrap_or_default(),
+                    root_dir: root_dir.unwrap_or_default(),
+                    scaffold: scaffold.unwrap_or_default(),
+                    class_name_prefix: class_name_prefix.unwrap_or_default(),
+                    disabled: disabled.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "EmmyrcGmodScriptedClassDefinition",
+            FIELDS,
+            DefinitionVisitor,
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassScaffoldFile {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &["path", "template"];
+
+        struct ScaffoldFileVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ScaffoldFileVisitor {
+            type Value = EmmyrcGmodScriptedClassScaffoldFile;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct EmmyrcGmodScriptedClassScaffoldFile")
+            }
+
+            fn visit_map<MapType>(self, mut map: MapType) -> Result<Self::Value, MapType::Error>
+            where
+                MapType: serde::de::MapAccess<'de>,
+            {
+                let mut path = None;
+                let mut template = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "path" => read_unique_field(&mut path, &mut map, "path")?,
+                        "template" => read_unique_field(&mut template, &mut map, "template")?,
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(EmmyrcGmodScriptedClassScaffoldFile {
+                    path: required_field::<_, MapType::Error>(path, "path")?,
+                    template: required_field::<_, MapType::Error>(template, "template")?,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "EmmyrcGmodScriptedClassScaffoldFile",
+            FIELDS,
+            ScaffoldFileVisitor,
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "id",
+            "label",
+            "path",
+            "include",
+            "exclude",
+            "classGlobal",
+            "parentId",
+            "icon",
+            "rootDir",
+            "scaffold",
+            "classNamePrefix",
+        ];
+
+        struct ResolvedDefinitionVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ResolvedDefinitionVisitor {
+            type Value = ResolvedGmodScriptedClassDefinition;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct ResolvedGmodScriptedClassDefinition")
+            }
+
+            fn visit_map<MapType>(self, mut map: MapType) -> Result<Self::Value, MapType::Error>
+            where
+                MapType: serde::de::MapAccess<'de>,
+            {
+                let mut id = None;
+                let mut label = None;
+                let mut path = None;
+                let mut include = None;
+                let mut exclude = None;
+                let mut class_global = None;
+                let mut parent_id = None;
+                let mut icon = None;
+                let mut root_dir = None;
+                let mut scaffold = None;
+                let mut class_name_prefix = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => read_unique_field(&mut id, &mut map, "id")?,
+                        "label" => read_unique_field(&mut label, &mut map, "label")?,
+                        "path" => read_unique_field(&mut path, &mut map, "path")?,
+                        "include" => read_unique_field(&mut include, &mut map, "include")?,
+                        "exclude" => read_unique_field(&mut exclude, &mut map, "exclude")?,
+                        "classGlobal" => {
+                            read_unique_field(&mut class_global, &mut map, "classGlobal")?
+                        }
+                        "parentId" => read_unique_field(&mut parent_id, &mut map, "parentId")?,
+                        "icon" => read_unique_field(&mut icon, &mut map, "icon")?,
+                        "rootDir" => read_unique_field(&mut root_dir, &mut map, "rootDir")?,
+                        "scaffold" => read_unique_field(&mut scaffold, &mut map, "scaffold")?,
+                        "classNamePrefix" => {
+                            read_unique_field(&mut class_name_prefix, &mut map, "classNamePrefix")?
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(ResolvedGmodScriptedClassDefinition {
+                    id: required_field::<_, MapType::Error>(id, "id")?,
+                    label: required_field::<_, MapType::Error>(label, "label")?,
+                    path: required_field::<_, MapType::Error>(path, "path")?,
+                    include: required_field::<_, MapType::Error>(include, "include")?,
+                    exclude: required_field::<_, MapType::Error>(exclude, "exclude")?,
+                    class_global: required_field::<_, MapType::Error>(class_global, "classGlobal")?,
+                    parent_id: parent_id.unwrap_or_default(),
+                    icon: icon.unwrap_or_default(),
+                    root_dir: required_field::<_, MapType::Error>(root_dir, "rootDir")?,
+                    scaffold: scaffold.unwrap_or_default(),
+                    class_name_prefix: class_name_prefix.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "ResolvedGmodScriptedClassDefinition",
+            FIELDS,
+            ResolvedDefinitionVisitor,
+        )
+    }
+}
+
+fn read_unique_field<'de, MapType, FieldType>(
+    field: &mut Option<FieldType>,
+    map: &mut MapType,
+    name: &'static str,
+) -> Result<(), MapType::Error>
+where
+    MapType: serde::de::MapAccess<'de>,
+    FieldType: Deserialize<'de>,
+{
+    if field.is_some() {
+        return Err(<MapType::Error as serde::de::Error>::duplicate_field(name));
+    }
+
+    *field = Some(map.next_value()?);
+    Ok(())
+}
+
+fn required_field<FieldType, ErrorType>(
+    field: Option<FieldType>,
+    name: &'static str,
+) -> Result<FieldType, ErrorType>
+where
+    ErrorType: serde::de::Error,
+{
+    field.ok_or_else(|| ErrorType::missing_field(name))
 }
 
 fn enabled_default() -> bool {
@@ -321,7 +590,7 @@ fn scripted_scope_include_default() -> Vec<EmmyrcGmodScriptedClassScopeEntry> {
             "SWEPs",
             &["weapons"],
             &["weapons/**"],
-            &["weapons/gmod_tool/**"],
+            &["weapons/gmod_tool/stools/**"],
             "SWEP",
             None,
             Some("folder-library"),
@@ -979,18 +1248,27 @@ impl EmmyrcGmodScriptedClassScopes {
             .collect()
     }
 
+    /// Returns true if the file matches at least one definition's include
+    /// patterns without being excluded by that *same* definition's exclude
+    /// patterns.  Unlike the old global exclude check, this prevents a
+    /// sibling definition's exclude (e.g. SWEP's `weapons/gmod_tool/stools/**`)
+    /// from blocking a file that legitimately belongs to another definition
+    /// (e.g. STOOL's `weapons/gmod_tool/stools/**`).
+    pub fn is_file_in_scope(&self, file_path: &Path) -> bool {
+        let definitions = self.resolved_definitions();
+        if definitions.is_empty() {
+            return true;
+        }
+
+        definitions.iter().any(|definition| {
+            matches_scope_patterns(file_path, &definition.include, &definition.exclude)
+        })
+    }
+
     pub fn detect_class_for_path(
         &self,
         file_path: &Path,
     ) -> Option<ResolvedGmodScriptedClassMatch> {
-        if !matches_scope_patterns(
-            file_path,
-            &self.include_patterns(),
-            &self.exclude_patterns(),
-        ) {
-            return None;
-        }
-
         let normalized_path = file_path.to_string_lossy().replace('\\', "/");
         let original_segments = normalized_path
             .split('/')
@@ -1010,6 +1288,14 @@ impl EmmyrcGmodScriptedClassScopes {
         let definitions = self.resolved_definitions();
         let mut best_match: Option<(ResolvedGmodScriptedClassDefinition, usize, usize)> = None;
         for definition in definitions {
+            // Check THIS definition's include/exclude patterns — do not merge
+            // excludes from other definitions, as they are definition-scoped.
+            // E.g. SWEP's "weapons/gmod_tool/stools/**" exclude must not prevent
+            // STOOL files from matching the STOOL definition.
+            if !matches_scope_patterns(file_path, &definition.include, &definition.exclude) {
+                continue;
+            }
+
             let rule_len = definition.path.len();
             if rule_len == 0 || lower_segments.len() < rule_len {
                 continue;
@@ -1072,6 +1358,212 @@ impl EmmyrcGmodScriptedClassScopes {
             class_name,
         })
     }
+
+    pub fn scan_scripted_class_scope_files<'a, T>(
+        &self,
+        files: impl IntoIterator<Item = (T, &'a Path)>,
+    ) -> (HashSet<T>, HashMap<T, ResolvedGmodScriptedClassMatch>)
+    where
+        T: Copy + Eq + Hash,
+    {
+        let definitions = self.resolved_definitions();
+        if definitions.is_empty() {
+            return (HashSet::new(), HashMap::new());
+        }
+
+        let compiled_definitions = compile_scope_definitions(&definitions);
+        let mut scope_files = HashSet::new();
+        let mut matches = HashMap::new();
+        for (file_id, file_path) in files {
+            let candidate_paths = build_scope_candidate_paths(file_path);
+            if !compiled_definitions.iter().any(|definition| {
+                matches_compiled_scope_patterns(
+                    &candidate_paths,
+                    &definition.include,
+                    &definition.exclude,
+                )
+            }) {
+                continue;
+            }
+
+            scope_files.insert(file_id);
+            if let Some(scope_match) = detect_class_for_path_with_compiled_definitions(
+                file_path,
+                &candidate_paths,
+                &compiled_definitions,
+            ) {
+                matches.insert(file_id, scope_match);
+            }
+        }
+
+        (scope_files, matches)
+    }
+}
+
+struct CompiledScopeDefinition<'a> {
+    definition: &'a ResolvedGmodScriptedClassDefinition,
+    include: ScopePatternSet<'a>,
+    exclude: ScopePatternSet<'a>,
+}
+
+enum ScopePatternSet<'a> {
+    Empty,
+    Valid(wax::Any<'a>),
+    Invalid,
+}
+
+fn compile_scope_definitions(
+    definitions: &[ResolvedGmodScriptedClassDefinition],
+) -> Vec<CompiledScopeDefinition<'_>> {
+    definitions
+        .iter()
+        .map(|definition| CompiledScopeDefinition {
+            definition,
+            include: compile_scope_patterns(&definition.include, "include"),
+            exclude: compile_scope_patterns(&definition.exclude, "exclude"),
+        })
+        .collect()
+}
+
+fn compile_scope_patterns<'a>(patterns: &'a [String], kind: &str) -> ScopePatternSet<'a> {
+    if patterns.is_empty() {
+        return ScopePatternSet::Empty;
+    }
+
+    match wax::any(patterns.iter().map(String::as_str)) {
+        Ok(glob) => ScopePatternSet::Valid(glob),
+        Err(err) => {
+            log::warn!("Invalid gmod.scriptedClassScopes.{kind} pattern: {err}");
+            ScopePatternSet::Invalid
+        }
+    }
+}
+
+fn detect_class_for_path_with_compiled_definitions(
+    file_path: &Path,
+    candidate_paths: &[String],
+    definitions: &[CompiledScopeDefinition],
+) -> Option<ResolvedGmodScriptedClassMatch> {
+    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
+    let original_segments = normalized_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let lower_segments = normalized_path
+        .to_ascii_lowercase()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lower_segments.is_empty() {
+        return None;
+    }
+
+    let mut best_match: Option<(&ResolvedGmodScriptedClassDefinition, usize, usize)> = None;
+    for definition in definitions {
+        if !matches_compiled_scope_patterns(
+            candidate_paths,
+            &definition.include,
+            &definition.exclude,
+        ) {
+            continue;
+        }
+
+        let rule_len = definition.definition.path.len();
+        if rule_len == 0 || lower_segments.len() < rule_len {
+            continue;
+        }
+
+        for start_idx in (0..=lower_segments.len() - rule_len).rev() {
+            let mut matched = true;
+            for (offset, rule_segment) in definition.definition.path.iter().enumerate() {
+                if lower_segments[start_idx + offset] != rule_segment.to_ascii_lowercase() {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if !matched {
+                continue;
+            }
+
+            let end_idx = start_idx + rule_len - 1;
+            let replace_best = match best_match {
+                None => true,
+                Some((_, best_end_idx, best_rule_len)) => {
+                    end_idx > best_end_idx || (end_idx == best_end_idx && rule_len > best_rule_len)
+                }
+            };
+            if replace_best {
+                best_match = Some((definition.definition, end_idx, rule_len));
+            }
+
+            break;
+        }
+    }
+
+    let (definition, best_end_idx, _) = best_match?;
+    let class_idx = best_end_idx + 1;
+    if class_idx >= lower_segments.len() {
+        return None;
+    }
+
+    let class_name = if class_idx == original_segments.len() - 1 {
+        original_segments[class_idx]
+            .strip_suffix(".lua")
+            .unwrap_or(original_segments[class_idx].as_str())
+            .to_string()
+    } else {
+        original_segments[class_idx].clone()
+    };
+    if class_name.is_empty() {
+        return None;
+    }
+
+    let class_name = match definition.class_name_prefix.as_deref() {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}{class_name}"),
+        _ => class_name,
+    };
+
+    Some(ResolvedGmodScriptedClassMatch {
+        definition: definition.clone(),
+        class_name,
+    })
+}
+
+fn matches_compiled_scope_patterns(
+    candidate_paths: &[String],
+    include_patterns: &ScopePatternSet<'_>,
+    exclude_patterns: &ScopePatternSet<'_>,
+) -> bool {
+    match include_patterns {
+        ScopePatternSet::Empty => {}
+        ScopePatternSet::Valid(include_set) => {
+            if !candidate_paths
+                .iter()
+                .any(|path| include_set.is_match(Path::new(path)))
+            {
+                return false;
+            }
+        }
+        ScopePatternSet::Invalid => return true,
+    }
+
+    match exclude_patterns {
+        ScopePatternSet::Empty => {}
+        ScopePatternSet::Valid(exclude_set) => {
+            if candidate_paths
+                .iter()
+                .any(|path| exclude_set.is_match(Path::new(path)))
+            {
+                return false;
+            }
+        }
+        ScopePatternSet::Invalid => return false,
+    }
+
+    true
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
@@ -1189,7 +1681,7 @@ mod tests {
         verify_that!(definitions[0].class_global.as_str(), eq("ENT"))?;
         verify_that!(
             definitions[1].exclude.as_slice(),
-            eq(&["weapons/gmod_tool/**".to_string()])
+            eq(&["weapons/gmod_tool/stools/**".to_string()])
         )?;
         verify_that!(definitions[3].parent_id.as_deref(), eq(Some("weapons")))?;
         verify_that!(definitions[4].scaffold.is_none(), eq(true))?;
@@ -1224,6 +1716,135 @@ mod tests {
         verify_that!(gmod.detect_realm_from_calls, eq(None))?;
         verify_that!(gmod.infer_dynamic_fields, eq(true))?;
         verify_that!(gmod.dynamic_fields_global, eq(true))
+    }
+
+    #[gtest]
+    fn test_scripted_class_definition_deserialize_required_field_edges() -> Result<()> {
+        let definition: EmmyrcGmodScriptedClassDefinition = serde_json::from_str(
+            r#"{
+                "id": "custom",
+                "label": null,
+                "path": null,
+                "classNamePrefix": null,
+                "unknown": true
+            }"#,
+        )
+        .or_fail()?;
+
+        verify_that!(definition.id.as_str(), eq("custom"))?;
+        verify_that!(definition.label.is_none(), eq(true))?;
+        verify_that!(definition.path.is_none(), eq(true))?;
+        verify_that!(definition.class_name_prefix.is_none(), eq(true))?;
+
+        let missing_id =
+            serde_json::from_str::<EmmyrcGmodScriptedClassDefinition>(r#"{ "label": "Custom" }"#)
+                .unwrap_err();
+        verify_that!(
+            missing_id.to_string(),
+            contains_substring("missing field `id`")
+        )?;
+
+        let duplicate_id = serde_json::from_str::<EmmyrcGmodScriptedClassDefinition>(
+            r#"{ "id": "first", "id": "second" }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            duplicate_id.to_string(),
+            contains_substring("duplicate field `id`")
+        )
+    }
+
+    #[gtest]
+    fn test_scripted_class_scaffold_file_deserialize_required_field_edges() -> Result<()> {
+        let file: EmmyrcGmodScriptedClassScaffoldFile = serde_json::from_str(
+            r#"{
+                "path": "{{name}}/shared.lua",
+                "template": "ent_shared.lua",
+                "unknown": true
+            }"#,
+        )
+        .or_fail()?;
+
+        verify_that!(file.path.as_str(), eq("{{name}}/shared.lua"))?;
+        verify_that!(file.template.as_str(), eq("ent_shared.lua"))?;
+
+        let missing_template = serde_json::from_str::<EmmyrcGmodScriptedClassScaffoldFile>(
+            r#"{ "path": "{{name}}/shared.lua" }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            missing_template.to_string(),
+            contains_substring("missing field `template`")
+        )?;
+
+        let duplicate_path = serde_json::from_str::<EmmyrcGmodScriptedClassScaffoldFile>(
+            r#"{ "path": "one.lua", "path": "two.lua", "template": "base.lua" }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            duplicate_path.to_string(),
+            contains_substring("duplicate field `path`")
+        )
+    }
+
+    #[gtest]
+    fn test_resolved_scripted_class_definition_deserialize_required_field_edges() -> Result<()> {
+        let definition: ResolvedGmodScriptedClassDefinition = serde_json::from_str(
+            r#"{
+                "id": "custom",
+                "label": "Custom",
+                "path": ["custom"],
+                "include": ["custom/**"],
+                "exclude": [],
+                "classGlobal": "CUSTOM",
+                "parentId": null,
+                "icon": null,
+                "rootDir": "lua/custom",
+                "scaffold": null,
+                "classNamePrefix": null,
+                "unknown": true
+            }"#,
+        )
+        .or_fail()?;
+
+        verify_that!(definition.id.as_str(), eq("custom"))?;
+        verify_that!(definition.path.as_slice(), eq(&["custom".to_string()]))?;
+        verify_that!(definition.parent_id.is_none(), eq(true))?;
+        verify_that!(definition.scaffold.is_none(), eq(true))?;
+
+        let missing_root_dir = serde_json::from_str::<ResolvedGmodScriptedClassDefinition>(
+            r#"{
+                "id": "custom",
+                "label": "Custom",
+                "path": ["custom"],
+                "include": [],
+                "exclude": [],
+                "classGlobal": "CUSTOM"
+            }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            missing_root_dir.to_string(),
+            contains_substring("missing field `rootDir`")
+        )?;
+
+        let duplicate_class_global = serde_json::from_str::<ResolvedGmodScriptedClassDefinition>(
+            r#"{
+                "id": "custom",
+                "label": "Custom",
+                "path": ["custom"],
+                "include": [],
+                "exclude": [],
+                "classGlobal": "CUSTOM",
+                "classGlobal": "OTHER",
+                "rootDir": "lua/custom"
+            }"#,
+        )
+        .unwrap_err();
+        verify_that!(
+            duplicate_class_global.to_string(),
+            contains_substring("duplicate field `classGlobal`")
+        )
     }
 
     #[gtest]
@@ -1355,6 +1976,114 @@ mod tests {
     }
 
     #[gtest]
+    fn test_detect_class_for_path_stool_default_scopes() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+
+        // Standard lua-root path
+        let result =
+            scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/stools/hoverball.lua"));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
+        verify_that!(match_.class_name.as_str(), eq("hoverball"))?;
+
+        // Gamemode-nested path (e.g. gamemodes/sandbox/entities/weapons/...)
+        let result = scopes.detect_class_for_path(Path::new(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/stools/hoverball.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
+        verify_that!(match_.class_name.as_str(), eq("hoverball"))
+    }
+
+    #[gtest]
+    fn test_stool_not_matched_as_swep() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+
+        // STOOL files must be classified as TOOL, not SWEP
+        let result =
+            scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/stools/rope.lua"));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
+        verify_that!(match_.definition.id.as_str(), eq("stools"))?;
+
+        // Regular SWEP files must still be classified as SWEP
+        let result =
+            scopes.detect_class_for_path(Path::new("lua/weapons/weapon_pistol/shared.lua"));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
+        verify_that!(match_.definition.id.as_str(), eq("weapons"))
+    }
+
+    #[gtest]
+    fn test_is_file_in_scope_stool() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+
+        // STOOL files should be considered in scope
+        verify_that!(
+            scopes.is_file_in_scope(Path::new("lua/weapons/gmod_tool/stools/hoverball.lua")),
+            eq(true)
+        )?;
+
+        // SWEP files should also be in scope
+        verify_that!(
+            scopes.is_file_in_scope(Path::new("lua/weapons/weapon_pistol/shared.lua")),
+            eq(true)
+        )?;
+
+        // gmod_tool weapon itself should be in scope as SWEP
+        verify_that!(
+            scopes.is_file_in_scope(Path::new("lua/weapons/gmod_tool/init.lua")),
+            eq(true)
+        )?;
+
+        // Random files should not be in scope
+        verify_that!(
+            scopes.is_file_in_scope(Path::new("lua/random/file.lua")),
+            eq(false)
+        )
+    }
+
+    #[gtest]
+    fn test_gmod_tool_weapon_detected_as_swep() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+
+        // lua/weapons/gmod_tool/init.lua — the Sword Tool Gun weapon itself
+        let result = scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/init.lua"));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
+        verify_that!(match_.class_name.as_str(), eq("gmod_tool"))?;
+
+        // lua/weapons/gmod_tool/shared.lua — shared SWEP file
+        let result = scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/shared.lua"));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
+        verify_that!(match_.class_name.as_str(), eq("gmod_tool"))?;
+
+        // gamemodes/sandbox/entities/weapons/gmod_tool/init.lua — gamemode-nested SWEP
+        let result = scopes.detect_class_for_path(Path::new(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/init.lua",
+        ));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("SWEP"))?;
+        verify_that!(match_.class_name.as_str(), eq("gmod_tool"))?;
+
+        // STOOL files must still be classified as TOOL
+        let result =
+            scopes.detect_class_for_path(Path::new("lua/weapons/gmod_tool/stools/hoverball.lua"));
+        verify_that!(result.is_some(), eq(true))?;
+        let match_ = result.unwrap();
+        verify_that!(match_.definition.class_global.as_str(), eq("TOOL"))?;
+        verify_that!(match_.class_name.as_str(), eq("hoverball"))
+    }
+
+    #[gtest]
     fn test_file_param_defaults_merge_workspace_overrides_and_removals() -> Result<()> {
         let gmod: EmmyrcGmod = serde_json::from_str(
             r#"{
@@ -1374,6 +2103,10 @@ mod tests {
         verify_that!(
             gmod.file_param_defaults.get("ent"),
             eq(Some(&"Entity".to_string()))
+        )?;
+        verify_that!(
+            gmod.file_param_defaults.get("func"),
+            eq(Some(&"function".to_string()))
         )
     }
 }

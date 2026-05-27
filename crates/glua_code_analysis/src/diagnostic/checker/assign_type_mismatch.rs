@@ -1,9 +1,10 @@
 use std::ops::Deref;
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr,
-    LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr,
-    LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCommentOwner, LuaDocTag,
+    LuaExpr, LuaIndexExpr, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaSyntaxNode,
+    LuaSyntaxToken, LuaTableExpr, LuaTableField, LuaVarExpr, NumberResult, PathTrait,
+    UnaryOperator,
 };
 use rowan::{NodeOrToken, TextRange};
 
@@ -128,7 +129,10 @@ fn check_name_expr(
     );
     let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
-        if !source_is_inferred || strict_inferred_mismatch {
+        if !source_is_inferred
+            || strict_inferred_mismatch
+            || inferred_target_requires_explicit_table_field_checks(&expr)
+        {
             check_table_expr(
                 context,
                 semantic_model,
@@ -178,7 +182,10 @@ fn check_index_expr(
     );
     let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
-        if !source_is_inferred || strict_inferred_mismatch {
+        if !source_is_inferred
+            || strict_inferred_mismatch
+            || inferred_target_requires_explicit_table_field_checks(&expr)
+        {
             check_table_expr(
                 context,
                 semantic_model,
@@ -189,6 +196,32 @@ fn check_index_expr(
         }
     }
     Some(())
+}
+
+fn inferred_target_requires_explicit_table_field_checks(expr: &LuaExpr) -> bool {
+    let Some(table_expr) = LuaTableExpr::cast(expr.syntax().clone()) else {
+        return false;
+    };
+
+    table_expr_has_explicit_field_type_annotations(&table_expr)
+}
+
+fn table_expr_has_explicit_field_type_annotations(table_expr: &LuaTableExpr) -> bool {
+    table_expr.get_fields().any(|field| {
+        field_has_explicit_type_annotation(&field)
+            || field
+                .get_value_expr()
+                .and_then(|value_expr| LuaTableExpr::cast(value_expr.syntax().clone()))
+                .is_some_and(|nested| table_expr_has_explicit_field_type_annotations(&nested))
+    })
+}
+
+fn field_has_explicit_type_annotation(field: &LuaTableField) -> bool {
+    field.get_comments().into_iter().any(|comment| {
+        comment
+            .get_doc_tags()
+            .any(|tag| matches!(tag, LuaDocTag::Type(_)))
+    })
 }
 
 fn is_inferred_member_collection_append_target(
@@ -358,25 +391,30 @@ fn member_flags_before_position(
     position: rowan::TextSize,
     include_current_position: bool,
 ) -> Option<(bool, bool)> {
-    member_flags_for_member_ids(
-        semantic_model,
-        semantic_model
-            .get_db()
-            .get_member_index()
-            .get_members_for_owner_key(owner, member_key)
-            .into_iter()
-            .filter(|member| {
-                if member.get_id().file_id != semantic_model.get_file_id() {
-                    return true;
-                }
-                if include_current_position {
-                    member.get_id().get_position() <= position
-                } else {
-                    member.get_id().get_position() < position
-                }
-            })
-            .map(|member| member.get_id()),
-    )
+    let member_ids = semantic_model
+        .get_db()
+        .get_member_index()
+        .get_members_for_owner_key(owner, member_key)
+        .into_iter()
+        .filter(|member| {
+            if member.get_id().file_id != semantic_model.get_file_id() {
+                return true;
+            }
+            if include_current_position {
+                member.get_id().get_position() <= position
+            } else {
+                member.get_id().get_position() < position
+            }
+        })
+        .map(|member| member.get_id())
+        .collect();
+    let visible_member_ids = crate::LuaMemberIndexItem::Many(member_ids)
+        .visible_member_ids_with_realm_at_offset(
+            semantic_model.get_db(),
+            &semantic_model.get_file_id(),
+            position,
+        );
+    member_flags_for_member_ids(semantic_model, visible_member_ids)
 }
 
 fn member_flags_for_member_ids<I>(
@@ -455,6 +493,12 @@ fn check_local_stat(
             .get_type_index()
             .get_type_cache(&decl_id.into())
             .map(|cache| cache.as_type().clone())?;
+        let source_is_inferred = semantic_model
+            .get_db()
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .map(|cache| cache.is_infer())
+            .unwrap_or(false);
         let value_type = value_types.get(idx)?.0.clone();
         check_assign_type_mismatch(
             context,
@@ -463,9 +507,14 @@ fn check_local_stat(
             Some(&var_type),
             &value_type,
             false,
-            false,
+            source_is_inferred,
         );
-        if let Some(expr) = value_exprs.get(idx) {
+        let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
+        if let Some(expr) = value_exprs.get(idx)
+            && (!source_is_inferred
+                || strict_inferred_mismatch
+                || inferred_target_requires_explicit_table_field_checks(expr))
+        {
             check_table_expr(
                 context,
                 semantic_model,

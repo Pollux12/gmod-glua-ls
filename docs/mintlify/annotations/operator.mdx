@@ -7,7 +7,7 @@ description: Declare operator behavior for a class.
 
 `@operator` tells GLuaLS what a class supports for operators like `+`, `==`, `#`, indexing, or calling.
 
-Use it in annotation files or class definitions when GLuaLS cannot infer the operator behavior by itself.
+Use it in annotation files or class definitions when GLuaLS cannot infer the operator behavior.
 
 ---
 
@@ -48,4 +48,4 @@ local v3 = v1 + v2
 - Relational: `eq`, `lt`, `le`
 - Other: `len` (length operator `#`), `concat` (concatenation `..`), `call`, `index`
 
-`pairs` is parsed internally but is not currently implemented for type inference, so it is not documented as supported here.
+GLuaLS parses `pairs`, but it does not use `pairs` for type inference yet, so this page does not list it as supported.

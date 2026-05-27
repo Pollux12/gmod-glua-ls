@@ -364,6 +364,89 @@ impl LuaTypeIndex {
     pub fn get_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
         self.types.get(owner)
     }
+
+    pub fn iter_type_caches(&self) -> impl Iterator<Item = (&LuaTypeOwner, &LuaTypeCache)> {
+        self.types.iter()
+    }
+
+    pub fn files_with_type_caches_referencing_files(
+        &self,
+        file_ids: &HashSet<FileId>,
+    ) -> HashSet<FileId> {
+        let mut dependent_files = HashSet::new();
+        for (owner, cache) in &self.types {
+            let owner_file_id = owner.get_file_id();
+            if file_ids.contains(&owner_file_id) {
+                continue;
+            }
+
+            if type_references_any_file(cache.as_type(), file_ids) {
+                dependent_files.insert(owner_file_id);
+            }
+        }
+
+        dependent_files
+    }
+
+    pub fn files_with_cross_file_type_caches_referencing_files(
+        &self,
+        file_ids: &HashSet<FileId>,
+    ) -> HashSet<FileId> {
+        let mut dependent_files = HashSet::new();
+        for (owner, cache) in &self.types {
+            let owner_file_id = owner.get_file_id();
+            if type_references_other_file(cache.as_type(), file_ids, owner_file_id) {
+                dependent_files.insert(owner_file_id);
+            }
+        }
+
+        dependent_files
+    }
+}
+
+fn type_references_any_file(typ: &LuaType, file_ids: &HashSet<FileId>) -> bool {
+    let mut references_file = false;
+    typ.visit_type(&mut |inner| {
+        if references_file {
+            return;
+        }
+
+        references_file = match inner {
+            LuaType::TableConst(range) => file_ids.contains(&range.file_id),
+            LuaType::Instance(instance) => file_ids.contains(&instance.get_range().file_id),
+            LuaType::Signature(signature_id) => file_ids.contains(&signature_id.get_file_id()),
+            LuaType::ModuleRef(file_id) => file_ids.contains(file_id),
+            _ => false,
+        };
+    });
+
+    references_file
+}
+
+fn type_references_other_file(
+    typ: &LuaType,
+    file_ids: &HashSet<FileId>,
+    owner_file_id: FileId,
+) -> bool {
+    let mut references_file = false;
+    typ.visit_type(&mut |inner| {
+        if references_file {
+            return;
+        }
+
+        let referenced_file_id = match inner {
+            LuaType::TableConst(range) => Some(range.file_id),
+            LuaType::Instance(instance) => Some(instance.get_range().file_id),
+            LuaType::Signature(signature_id) => Some(signature_id.get_file_id()),
+            LuaType::ModuleRef(file_id) => Some(*file_id),
+            _ => None,
+        };
+
+        references_file = referenced_file_id
+            .is_some_and(|file_id| file_id != owner_file_id && file_ids.contains(&file_id));
+    });
+
+    references_file
 }
 
 impl LuaIndex for LuaTypeIndex {

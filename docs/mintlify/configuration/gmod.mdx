@@ -5,7 +5,7 @@ description: GMod-specific language server settings for realm analysis, scripted
 
 ## Overview
 
-All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These control realm detection, network message analysis, scripted class behaviour, VGUI support, and more.
+All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These settings control realm detection, network message analysis, scripted class behavior, VGUI support, and more.
 
 ---
 
@@ -15,8 +15,8 @@ All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These co
 |---|---|---|---|
 | `gmod.enabled` | `boolean` | `true` | Enable all GMod-specific analysis. Set `false` to use as a generic Lua LS |
 | `gmod.defaultRealm` | `string` | `"shared"` | Realm assumed for files with no realm signal. Use `"client"`, `"server"`, or `"shared"` |
-| `gmod.detectRealmFromFilename` | `boolean` | `true` | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
-| `gmod.detectRealmFromCalls` | `boolean` | `true` | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, and `require` |
+| `gmod.detectRealmFromFilename` | `boolean \| null` | `null` (resolves to `true`) | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
+| `gmod.detectRealmFromCalls` | `boolean \| null` | `null` (resolves to `true`) | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, and `require` |
 | `gmod.inferDynamicFields` | `boolean` | `true` | Track fields dynamically assigned to GMod objects |
 | `gmod.dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files. Set `false` to scope them per-file |
 | `gmod.fileParamDefaults` | `object` | built-in map | Parameter-name → type fallback, applied to params without explicit `@param`. Editable in the Settings UI. Set a value to `""` to remove a built-in default |
@@ -42,11 +42,9 @@ All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These co
 
 ## Gamemode inheritance
 
-GLua LS supports gamemode inheritance in two ways.
+GLuaLS supports gamemode inheritance. `DeriveGamemode("...")` keeps inherited `GM` members working. The `gmod.autoDetectGamemodeBase` setting loads parent gamemode folders from your gamemode's `<name>.txt` `base` value so parent files are available for completions, definitions, and diagnostics.
 
-`DeriveGamemode("...")` keeps inherited `GM` members working inside gamemode code, while `gmod.autoDetectGamemodeBase` loads parent gamemode folders from your gamemode's `<name>.txt` `base` value so parent files are available for completions, definitions, and diagnostics.
-
-This setting only controls the `.txt` file lookup. It does not disable support for `DeriveGamemode("...")`.
+This setting controls the `.txt` file lookup. `DeriveGamemode("...")` support remains active.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -77,9 +75,9 @@ Each definition supports:
 | `classNamePrefix` | `string` | Optional prefix prepended to the folder-derived class name. Used by the `gamemodes` scope to produce runtime-accurate names like `gamemode_sandbox` |
 | `disabled` | `boolean` | Disable this definition (useful for turning off built-in groups) |
 
-The `gamemodes` group detects files under `gamemodes/<name>/gamemode/**` and types the `GM` global as the class `gamemode_<name>`. This makes `DEFINE_BASECLASS("gamemode_sandbox")` and cross-gamemode field access (for example, `self.Sandbox.SetupMove`) resolve correctly in derived gamemodes.
+The `gamemodes` group detects files under `gamemodes/<name>/gamemode/**` and types the `GM` global as the class `gamemode_<name>`. This lets `DEFINE_BASECLASS("gamemode_sandbox")` and cross-gamemode field access, such as `self.Sandbox.SetupMove`, resolve in derived gamemodes.
 
-To **override** a built-in definition, add an entry with its `id` and only the fields to change. To **disable** a built-in group, set `{ "id": "effects", "disabled": true }`.
+To **override** a built-in definition, add an entry with its `id` and only the fields you want to change. To **disable** a built-in group, set `{ "id": "effects", "disabled": true }`.
 
 ### Example
 
@@ -133,6 +131,7 @@ To **override** a built-in definition, add an entry with its `id` and only the f
 |---|---|---|---|
 | `gmod.network.enabled` | `boolean` | `true` | Enable all network flow analysis |
 | `gmod.network.completion.smartReadSuggestions` | `boolean` | `true` | Suggest net.Read* calls in expected order inside receive callbacks |
+| `gmod.network.codeLensEnabled` | `boolean` | `true` | Show code lens actions on net message receivers |
 | `gmod.network.completion.mismatchHints` | `boolean` | `true` | Annotate suggestions with hints when expected read doesn't match current |
 
 <Note>
@@ -173,18 +172,21 @@ To disable individual network diagnostics, use the primary `diagnostics.disable`
 |---|---|
 | `"minimal"` | Functions, classes, hooks, net receivers, timers, concommands only |
 | `"normal"` (default) | Same as minimal, plus typed non-primitive tables and variables |
-| `"verbose"` | Full legacy view — all locals, assignments, and control-flow blocks |
+| `"verbose"` | Full legacy view with all locals, assignments, and control-flow blocks |
 
 ---
 
 ## VSCode extension settings
 
-These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
 | VSCode Setting | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|---|
 | `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `boolean` (`boolean \| null` in workspace) | `true` (`null` in workspace) | Auto-download GMod annotations |
+| `gluals.gmod.annotationsRepository` | VS Code only | `string` | `Pollux12/annotations-gmod-glua-ls` | GitHub repository for automatic annotation downloads |
+| `gluals.gmod.annotationsBranch` | VS Code only | `string` | `gluals-annotations` | Git branch for automatic annotation downloads |
 | `gluals.gmod.autoDetectGamemodeBase` | `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Auto-detect base gamemodes from the gamemode `.txt` file |
 | `gluals.gmod.templatePath` | `gmod.templatePath` | `string` | `null` | Custom scaffolding template path |
+| `gluals.gmod.network.codeLensEnabled` | `gmod.network.codeLensEnabled` | `boolean` | `true` | Network code lens |
 | `gluals.gmod.vgui.codeLensEnabled` | `gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI code lens |
 | `gluals.gmod.vgui.inlayHintEnabled` | `gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI inlay hints |

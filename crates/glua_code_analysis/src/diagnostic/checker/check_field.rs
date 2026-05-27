@@ -1,4 +1,8 @@
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr,
@@ -9,16 +13,61 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, DiagnosticCode, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaMemberKey,
-    LuaMemberOwner, LuaType, LuaUnionType, SemanticModel, check_type_compact,
+    LuaMemberOwner, LuaType, LuaTypeDeclId, LuaUnionType, SemanticModel, check_type_compact,
     enum_variable_is_param, get_keyof_members,
     semantic::{
         infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
     },
 };
 
-use super::{Checker, DiagnosticContext, humanize_lint_type};
+use super::{Checker, DiagnosticContext, humanize_lint_type, is_initialized_assignment_prefix};
 
 pub struct CheckFieldChecker;
+
+pub fn precompute_subclass_fields(db: &DbIndex) -> HashMap<LuaTypeDeclId, Arc<HashSet<SmolStr>>> {
+    if !db.get_emmyrc().gmod.enabled {
+        return HashMap::new();
+    }
+
+    let mut subclass_fields: HashMap<LuaTypeDeclId, HashSet<SmolStr>> = HashMap::new();
+    let type_index = db.get_type_index();
+    let member_index = db.get_member_index();
+
+    for type_decl in type_index.get_all_types() {
+        let type_id = type_decl.get_id();
+        let owner = LuaMemberOwner::Type(type_id.clone());
+        let Some(members) = member_index.get_members(&owner) else {
+            continue;
+        };
+
+        let member_names = members
+            .iter()
+            .filter_map(|member| match member.get_key() {
+                LuaMemberKey::Name(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if member_names.is_empty() {
+            continue;
+        }
+
+        let mut super_types = Vec::new();
+        type_id.collect_super_types(db, &mut super_types);
+        for super_type in super_types {
+            if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
+                subclass_fields
+                    .entry(super_id)
+                    .or_default()
+                    .extend(member_names.iter().cloned());
+            }
+        }
+    }
+
+    subclass_fields
+        .into_iter()
+        .map(|(type_id, fields)| (type_id, Arc::new(fields)))
+        .collect()
+}
 
 impl Checker for CheckFieldChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::InjectField, DiagnosticCode::UndefinedField];
@@ -26,26 +75,48 @@ impl Checker for CheckFieldChecker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
         let mut checked_index_expr = HashSet::new();
+        let assignment_prefixes = context.get_assignment_prefix_events(&root);
+        let mut state = CheckFieldState::default();
+        let profile_enabled = log::log_enabled!(log::Level::Info);
+        let mut profile = profile_enabled.then(CheckFieldProfile::default);
         for node in root.descendants::<LuaAst>() {
             if context.is_cancelled() {
                 return;
             }
+            if let Some(profile) = profile.as_mut() {
+                profile.nodes_scanned += 1;
+            }
             match node {
                 LuaAst::LuaAssignStat(assign) => {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.assignment_nodes += 1;
+                    }
                     let (vars, _) = assign.get_var_and_expr_list();
                     for var in vars.iter() {
                         if let LuaVarExpr::IndexExpr(index_expr) = var {
                             checked_index_expr.insert(index_expr.syntax().clone());
+                            if is_initialized_assignment_prefix(
+                                index_expr,
+                                &assign,
+                                &assignment_prefixes,
+                            ) {
+                                continue;
+                            }
                             check_index_expr(
                                 context,
                                 semantic_model,
                                 index_expr,
                                 DiagnosticCode::InjectField,
+                                &mut state,
+                                profile.as_mut(),
                             );
                         }
                     }
                 }
                 LuaAst::LuaFuncStat(func_stat) => {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.func_name_nodes += 1;
+                    }
                     if let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() {
                         checked_index_expr.insert(index_expr.syntax().clone());
                         check_index_expr(
@@ -53,11 +124,19 @@ impl Checker for CheckFieldChecker {
                             semantic_model,
                             &index_expr,
                             DiagnosticCode::InjectField,
+                            &mut state,
+                            profile.as_mut(),
                         );
                     }
                 }
                 LuaAst::LuaIndexExpr(index_expr) => {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.index_expr_nodes += 1;
+                    }
                     if checked_index_expr.contains(index_expr.syntax()) {
+                        if let Some(profile) = profile.as_mut() {
+                            profile.prechecked_index_skips += 1;
+                        }
                         continue;
                     }
                     check_index_expr(
@@ -65,11 +144,61 @@ impl Checker for CheckFieldChecker {
                         semantic_model,
                         &index_expr,
                         DiagnosticCode::UndefinedField,
+                        &mut state,
+                        profile.as_mut(),
                     );
                 }
                 _ => {}
             }
         }
+        if let Some(profile) = profile {
+            profile.log(semantic_model.get_file_id(), state.member_infer_cache.len());
+        }
+    }
+}
+
+#[derive(Default)]
+struct CheckFieldState {
+    member_infer_cache: HashMap<(LuaType, LuaMemberKey, bool), bool>,
+}
+
+#[derive(Default)]
+struct CheckFieldProfile {
+    nodes_scanned: usize,
+    assignment_nodes: usize,
+    func_name_nodes: usize,
+    index_expr_nodes: usize,
+    prechecked_index_skips: usize,
+    index_expr_checked: usize,
+    invalid_prefix_skips: usize,
+    valid_member_hits: usize,
+    dynamic_field_skips: usize,
+    subclass_field_skips: usize,
+    diagnostics_emitted: usize,
+    prefix_infer_time: Duration,
+    valid_member_time: Duration,
+}
+
+impl CheckFieldProfile {
+    fn log(&self, file_id: crate::FileId, member_cache_entries: usize) {
+        log::info!(
+            "check field profile: file={:?} nodes={} assignments={} func_names={} index_nodes={} prechecked_skips={} checked={} invalid_prefix_skips={} valid_member_hits={} dynamic_skips={} subclass_skips={} diagnostics={} prefix_infer_time={:?} valid_member_time={:?} member_cache_entries={}",
+            file_id,
+            self.nodes_scanned,
+            self.assignment_nodes,
+            self.func_name_nodes,
+            self.index_expr_nodes,
+            self.prechecked_index_skips,
+            self.index_expr_checked,
+            self.invalid_prefix_skips,
+            self.valid_member_hits,
+            self.dynamic_field_skips,
+            self.subclass_field_skips,
+            self.diagnostics_emitted,
+            self.prefix_infer_time,
+            self.valid_member_time,
+            member_cache_entries,
+        );
     }
 }
 
@@ -78,32 +207,52 @@ fn check_index_expr(
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
     code: DiagnosticCode,
+    state: &mut CheckFieldState,
+    mut profile: Option<&mut CheckFieldProfile>,
 ) -> Option<()> {
     if context.is_cancelled() {
         return Some(());
     }
 
     let db = context.db;
+    if let Some(profile) = profile.as_mut() {
+        profile.index_expr_checked += 1;
+    }
+    let prefix_infer_start = profile.is_some().then(std::time::Instant::now);
     let prefix_typ = semantic_model
         .infer_expr(index_expr.get_prefix_expr()?)
         .unwrap_or(LuaType::Unknown);
+    if let (Some(profile), Some(prefix_infer_start)) = (profile.as_mut(), prefix_infer_start) {
+        profile.prefix_infer_time += prefix_infer_start.elapsed();
+    }
 
-    if is_invalid_prefix_type(&prefix_typ, code) {
+    if is_invalid_prefix_type(&prefix_typ) {
+        if let Some(profile) = profile.as_mut() {
+            profile.invalid_prefix_skips += 1;
+        }
         return Some(());
     }
 
     let index_key = index_expr.get_index_key()?;
 
-    if is_valid_member(
+    let valid_member_start = profile.is_some().then(std::time::Instant::now);
+    let valid_member = is_valid_member_with_state(
         context,
         semantic_model,
         &prefix_typ,
         index_expr,
         &index_key,
         code,
+        state,
     )
-    .is_some()
-    {
+    .is_some();
+    if let (Some(profile), Some(valid_member_start)) = (profile.as_mut(), valid_member_start) {
+        profile.valid_member_time += valid_member_start.elapsed();
+    }
+    if valid_member {
+        if let Some(profile) = profile.as_mut() {
+            profile.valid_member_hits += 1;
+        }
         // TableOf types allow dot-access to all members but flag colon method calls.
         // GetTable() returns a plain table with fields; colon calls pass the wrong self.
         if is_tableof_colon_access(&prefix_typ, index_expr) {
@@ -121,7 +270,12 @@ fn check_index_expr(
         return Some(());
     }
 
-    if is_dynamic_field(db, &prefix_typ, &index_key) {
+    let field_name = SmolStr::new(index_key.get_path_part());
+
+    if is_dynamic_field(db, &prefix_typ, &field_name) {
+        if let Some(profile) = profile.as_mut() {
+            profile.dynamic_field_skips += 1;
+        }
         return Some(());
     }
 
@@ -133,8 +287,11 @@ fn check_index_expr(
     }
 
     if matches!(code, DiagnosticCode::UndefinedField)
-        && field_exists_on_subclass(db, &prefix_typ, &index_key.get_path_part())
+        && field_exists_on_subclass(context, db, &prefix_typ, &field_name)
     {
+        if let Some(profile) = profile.as_mut() {
+            profile.subclass_field_skips += 1;
+        }
         return Some(());
     }
 
@@ -163,26 +320,31 @@ fn check_index_expr(
         }
     }
 
-    let index_name = index_key.get_path_part();
     match code {
         DiagnosticCode::InjectField => {
+            if let Some(profile) = profile.as_mut() {
+                profile.diagnostics_emitted += 1;
+            }
             context.add_diagnostic(
                 DiagnosticCode::InjectField,
                 index_key.get_range()?,
                 t!(
                     "Fields cannot be injected into the reference of `%{class}` for `%{field}`. ",
                     class = humanize_lint_type(db, &prefix_typ),
-                    field = index_name,
+                    field = field_name,
                 )
                 .to_string(),
                 None,
             );
         }
         DiagnosticCode::UndefinedField => {
+            if let Some(profile) = profile.as_mut() {
+                profile.diagnostics_emitted += 1;
+            }
             context.add_diagnostic(
                 DiagnosticCode::UndefinedField,
                 index_key.get_range()?,
-                t!("Undefined field `%{field}`. ", field = index_name,).to_string(),
+                t!("Undefined field `%{field}`. ", field = field_name,).to_string(),
                 None,
             );
         }
@@ -192,7 +354,7 @@ fn check_index_expr(
     Some(())
 }
 
-fn is_invalid_prefix_type(typ: &LuaType, code: DiagnosticCode) -> bool {
+fn is_invalid_prefix_type(typ: &LuaType) -> bool {
     let mut current_typ = typ;
     loop {
         match current_typ {
@@ -203,15 +365,15 @@ fn is_invalid_prefix_type(typ: &LuaType, code: DiagnosticCode) -> bool {
             | LuaType::SelfInfer
             | LuaType::TplRef(_)
             | LuaType::StrTplRef(_) => return true,
-            LuaType::TableConst(_) => return code == DiagnosticCode::InjectField,
+            // TableConst needs normal member validation for InjectField checks.
+            // Treating it as invalid suppresses diagnostics like typed-object key mismatches.
+            LuaType::TableConst(_) => return false,
             LuaType::Union(union) => {
                 return match union.as_ref() {
-                    LuaUnionType::Nullable(typ) => {
-                        typ.is_nil() || is_invalid_prefix_type(typ, code)
-                    }
+                    LuaUnionType::Nullable(typ) => typ.is_nil() || is_invalid_prefix_type(typ),
                     LuaUnionType::Multi(types) => types
                         .iter()
-                        .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ, code)),
+                        .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ)),
                 };
             }
             LuaType::Instance(instance_typ) => {
@@ -250,6 +412,87 @@ pub(super) fn is_valid_member(
     index_expr: &LuaIndexExpr,
     index_key: &LuaIndexKey,
     code: DiagnosticCode,
+) -> Option<()> {
+    is_valid_member_inner(
+        context,
+        semantic_model,
+        prefix_typ,
+        index_expr,
+        index_key,
+        code,
+        None,
+    )
+}
+
+fn is_valid_member_with_state(
+    context: &DiagnosticContext,
+    semantic_model: &SemanticModel,
+    prefix_typ: &LuaType,
+    index_expr: &LuaIndexExpr,
+    index_key: &LuaIndexKey,
+    code: DiagnosticCode,
+    state: &mut CheckFieldState,
+) -> Option<()> {
+    is_valid_member_inner(
+        context,
+        semantic_model,
+        prefix_typ,
+        index_expr,
+        index_key,
+        code,
+        Some(state),
+    )
+}
+
+fn valid_member_cache_key(
+    semantic_model: &SemanticModel,
+    prefix_typ: &LuaType,
+    index_key: &LuaIndexKey,
+    code: DiagnosticCode,
+) -> Option<(LuaType, LuaMemberKey, bool)> {
+    if !is_cacheable_valid_member_prefix(semantic_model.get_db(), prefix_typ) {
+        return None;
+    }
+
+    let member_key = LuaMemberKey::from_index_key(
+        semantic_model.get_db(),
+        &mut semantic_model.get_cache().borrow_mut(),
+        index_key,
+    )
+    .ok()?;
+    Some((
+        prefix_typ.clone(),
+        member_key,
+        matches!(code, DiagnosticCode::InjectField),
+    ))
+}
+
+fn is_cacheable_valid_member_prefix(db: &DbIndex, prefix_typ: &LuaType) -> bool {
+    match prefix_typ {
+        LuaType::Ref(id) | LuaType::Def(id) => db
+            .get_type_index()
+            .get_type_decl(id)
+            .is_some_and(|decl| !decl.is_enum()),
+        LuaType::String
+        | LuaType::Io
+        | LuaType::StringConst(_)
+        | LuaType::DocStringConst(_)
+        | LuaType::Language(_)
+        | LuaType::Array(_)
+        | LuaType::Tuple(_) => true,
+        LuaType::TableOf(inner) => is_cacheable_valid_member_prefix(db, inner),
+        _ => false,
+    }
+}
+
+fn is_valid_member_inner(
+    context: &DiagnosticContext,
+    semantic_model: &SemanticModel,
+    prefix_typ: &LuaType,
+    index_expr: &LuaIndexExpr,
+    index_key: &LuaIndexKey,
+    code: DiagnosticCode,
+    mut state: Option<&mut CheckFieldState>,
 ) -> Option<()> {
     match prefix_typ {
         LuaType::Global | LuaType::Userdata => return Some(()),
@@ -294,6 +537,13 @@ pub(super) fn is_valid_member(
             }
         }
         LuaType::TableConst(id) => {
+            if code == DiagnosticCode::UndefinedField
+                && matches!(index_key, LuaIndexKey::Expr(_))
+                && !is_table_const_from_doc_tag(semantic_model, id)
+            {
+                return Some(());
+            }
+
             let key = LuaMemberKey::from_index_key(
                 semantic_model.get_db(),
                 &mut semantic_model.get_cache().borrow_mut(),
@@ -391,9 +641,40 @@ pub(super) fn is_valid_member(
         _ => {}
     }
 
-    // Check flow-based semantic info FIRST (cheap cached lookup) before
-    // expensive AST walks like is_nil_safe_expr_context.
-    let need_add_diagnostic =
+    let direct_member_cache_key = state
+        .as_ref()
+        .and_then(|_| valid_member_cache_key(semantic_model, prefix_typ, index_key, code));
+    if let Some(cache_key) = &direct_member_cache_key
+        && let Some(valid) = state
+            .as_deref_mut()
+            .and_then(|state| state.member_infer_cache.get(cache_key).copied())
+    {
+        if valid {
+            return Some(());
+        }
+    } else {
+        let valid = semantic_model
+            .infer_index_member_type(prefix_typ, index_expr)
+            .is_ok();
+        if let Some(state) = state.as_mut() {
+            if let Some(cache_key) = direct_member_cache_key {
+                state.member_infer_cache.insert(cache_key, valid);
+            }
+        }
+        if valid {
+            return Some(());
+        }
+    }
+
+    // Check flow-based semantic info before expensive AST walks like
+    // is_nil_safe_expr_context. Many ordinary member hits return above without
+    // needing full declaration resolution.
+    let need_add_diagnostic = if matches!(code, DiagnosticCode::InjectField) {
+        // InjectField diagnostics run on assignment sites. At those locations,
+        // declaration inference can resolve a non-unknown type from the assignment
+        // value and incorrectly suppress legitimate InjectField reports.
+        true
+    } else {
         match semantic_model.get_semantic_info(index_expr.syntax().clone().into()) {
             Some(info) => {
                 let mut need = info.semantic_decl.is_none();
@@ -418,7 +699,8 @@ pub(super) fn is_valid_member(
                 need
             }
             None => true,
-        };
+        }
+    };
 
     if !need_add_diagnostic {
         return Some(());
@@ -448,7 +730,9 @@ pub(super) fn is_valid_member(
                             }
                         }
                     }
-                    _ => return Some(()),
+                    _ => {
+                        return Some(());
+                    }
                 }
             }
         }
@@ -479,11 +763,11 @@ pub(super) fn is_valid_member(
     };
 
     // 一些类型组合需要特殊处理
-    if let (LuaType::Def(id), _) = (prefix_typ, &key_type)
+    if let (LuaType::Ref(id) | LuaType::Def(id), _) = (prefix_typ, &key_type)
         && let Some(decl) = semantic_model.get_db().get_type_index().get_type_decl(id)
         && decl.is_class()
     {
-        if code == DiagnosticCode::InjectField {
+        if matches!(prefix_typ, LuaType::Def(_)) && code == DiagnosticCode::InjectField {
             return Some(());
         }
         if index_key.is_string() || matches!(key_type, LuaType::String) {
@@ -966,8 +1250,34 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                             }
                         }
                     }
+
+                    for elseif_clause in if_stat.get_else_if_clause_list() {
+                        if !elseif_clause.get_range().contains_range(node_range) {
+                            continue;
+                        }
+
+                        if let Some(condition_expr) = elseif_clause.get_condition_expr() {
+                            let cond_range = condition_expr.get_range();
+                            if cond_range.contains_range(node_range) {
+                                if is_truthy_check_in_condition(&condition_expr, &normalized_target)
+                                {
+                                    return true;
+                                }
+                            } else if condition_nil_guards_field(
+                                &condition_expr,
+                                &normalized_target,
+                            ) {
+                                if let Some(root_name) = target_root_name
+                                    && has_root_reassignment_before_usage(index_expr, root_name)
+                                {
+                                    break;
+                                }
+                                return true;
+                            }
+                        }
+                    }
                 }
-                break;
+                continue;
             }
             LuaSyntaxKind::ElseIfClauseStat => {
                 if let Some(elseif_clause) = LuaElseIfClauseStat::cast(ancestor) {
@@ -1475,16 +1785,15 @@ fn if_body_has_return(if_stat: &LuaIfStat) -> bool {
     false
 }
 
-fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, index_key: &LuaIndexKey) -> bool {
+fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, field_name: &SmolStr) -> bool {
     let emmyrc = db.get_emmyrc();
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
     }
 
-    let field_name = index_key.get_path_part();
     let index = db.get_dynamic_field_index();
 
-    has_dynamic_field_for_type(db, index, prefix_typ, &field_name)
+    has_dynamic_field_for_type(db, index, prefix_typ, field_name)
 }
 
 /// Check if a type is an enum type. Enum members are finite and known,
@@ -1503,11 +1812,15 @@ fn has_dynamic_field_for_type(
     db: &DbIndex,
     index: &crate::DynamicFieldIndex,
     typ: &LuaType,
-    field_name: &str,
+    field_name: &SmolStr,
 ) -> bool {
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
-            if index.has_field(id, field_name) {
+            let owner = crate::DynamicFieldOwner::Type(id.clone());
+            if index.has_field(&owner, field_name)
+                || owner_has_named_dynamic_fields(index, &owner)
+                    && !index.get_wildcard_definitions(&owner).is_empty()
+            {
                 return true;
             }
             // Walk parent types: dynamic fields registered on a parent class
@@ -1515,14 +1828,22 @@ fn has_dynamic_field_for_type(
             // (e.g. base_glide_motorcycle).
             let mut super_types = Vec::new();
             id.collect_super_types(db, &mut super_types);
-            for super_type in &super_types {
+            super_types.iter().any(|super_type| {
                 if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
-                    if index.has_field(super_id, field_name) {
-                        return true;
-                    }
+                    let owner = crate::DynamicFieldOwner::Type(super_id.clone());
+                    index.has_field(&owner, field_name)
+                        || owner_has_named_dynamic_fields(index, &owner)
+                            && !index.get_wildcard_definitions(&owner).is_empty()
+                } else {
+                    false
                 }
-            }
-            false
+            })
+        }
+        LuaType::TableConst(table_range) => {
+            let owner = crate::DynamicFieldOwner::Table(table_range.clone());
+            index.has_field(&owner, field_name)
+                || owner_has_named_dynamic_fields(index, &owner)
+                    && !index.get_wildcard_definitions(&owner).is_empty()
         }
         LuaType::Instance(instance) => {
             has_dynamic_field_for_type(db, index, instance.get_base(), field_name)
@@ -1536,30 +1857,51 @@ fn has_dynamic_field_for_type(
     }
 }
 
+fn owner_has_named_dynamic_fields(
+    index: &crate::DynamicFieldIndex,
+    owner: &crate::DynamicFieldOwner,
+) -> bool {
+    index
+        .get_fields(owner)
+        .is_some_and(|fields| !fields.is_empty())
+}
+
 /// Check if a field exists on any subclass of the given prefix type.
 /// In GMod, entities are commonly passed around as their base type (e.g. Entity)
 /// even though they are actually a specific subclass (e.g. Vehicle, Player).
-fn field_exists_on_subclass(db: &DbIndex, prefix_typ: &LuaType, field_name: &str) -> bool {
+fn field_exists_on_subclass(
+    context: &DiagnosticContext,
+    db: &DbIndex,
+    prefix_typ: &LuaType,
+    field_name: &SmolStr,
+) -> bool {
     if !db.get_emmyrc().gmod.enabled {
         return false;
     }
 
     let type_id = match prefix_typ {
         LuaType::Ref(id) | LuaType::Def(id) => id,
-        LuaType::TableOf(inner) => return field_exists_on_subclass(db, inner, field_name),
+        LuaType::TableOf(inner) => return field_exists_on_subclass(context, db, inner, field_name),
         LuaType::Union(union) => {
             return union
                 .into_vec()
                 .iter()
-                .any(|t| field_exists_on_subclass(db, t, field_name));
+                .any(|t| field_exists_on_subclass(context, db, t, field_name));
         }
         _ => return false,
     };
 
+    if let Some(shared_data) = context.get_shared_data_arc() {
+        return shared_data
+            .subclass_fields
+            .get(type_id)
+            .is_some_and(|fields| fields.contains(field_name));
+    }
+
     let sub_types = db.get_type_index().get_all_sub_types(type_id);
+    let key = LuaMemberKey::Name(field_name.clone());
     for sub_decl in sub_types {
         let owner = LuaMemberOwner::Type(sub_decl.get_id());
-        let key = LuaMemberKey::Name(field_name.into());
         if db
             .get_member_index()
             .get_member_item(&owner, &key)

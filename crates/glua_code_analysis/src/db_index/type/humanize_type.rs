@@ -217,6 +217,7 @@ fn humanize_simple_type(
     let mut count = 0;
     for (member_key, typ) in member_vec {
         let member_string = build_table_member_string(
+            db,
             member_key,
             typ,
             humanize_type(db, typ, level.next_level()),
@@ -232,6 +233,7 @@ fn humanize_simple_type(
     if count < all_count {
         for function_key in function_vec {
             let member_string = build_table_member_string(
+                db,
                 function_key,
                 &LuaType::Function,
                 "function".to_string(),
@@ -400,6 +402,7 @@ fn humanize_call_type(db: &DbIndex, inner: &LuaAliasCallType, level: RenderLevel
         LuaAliasCallKind::Index => "index",
         LuaAliasCallKind::RawGet => "rawget",
         LuaAliasCallKind::Merge => "Merge",
+        LuaAliasCallKind::Split => "split",
     };
     let operands = inner
         .get_operands()
@@ -589,6 +592,7 @@ fn humanize_table_const_type_detail_and_simple(
             None => &super::LuaTypeCache::InferType(LuaType::Any),
         };
         let member_string = build_table_member_string(
+            db,
             key,
             type_cache.as_type(),
             humanize_type(db, type_cache.as_type(), level.next_level()),
@@ -808,6 +812,7 @@ fn humanize_signature_type(
 }
 
 fn build_table_member_string(
+    db: &DbIndex,
     member_key: &LuaMemberKey,
     ty: &LuaType,
     member_value_string: String,
@@ -834,7 +839,11 @@ fn build_table_member_string(
         LuaMemberKey::Name(name) => format!("{name}{separator}{member_value}"),
         LuaMemberKey::Integer(i) => format!("[{i}]{separator}{member_value}"),
         LuaMemberKey::None => member_value,
-        LuaMemberKey::ExprType(_) => member_value,
+        LuaMemberKey::ExprType(LuaType::Integer) => member_value,
+        LuaMemberKey::ExprType(typ) => {
+            let key_type = humanize_type(db, typ, level.next_level());
+            format!("[{key_type}]{separator}{member_value}")
+        }
     }
 }
 

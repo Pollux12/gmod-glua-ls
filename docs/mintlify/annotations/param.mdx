@@ -30,7 +30,7 @@ function createUser(name, age) end
 
 ## Optional parameters
 
-Add `?` after the name to mark the parameter as potentially `nil`:
+Add `?` after the name to mark the parameter as `nil` in some calls:
 
 ```lua
 ---@param damage number Base damage to deal
@@ -102,7 +102,7 @@ Use backticks when the parameter is a class-name string:
 function ents.Create(class) end
 ```
 
-If your function accepts either a class object or a class-name string:
+For functions accepting either a class object or class-name string:
 
 ```lua
 ---@generic T
@@ -110,7 +110,7 @@ If your function accepts either a class object or a class-name string:
 function useClass(name) end
 ```
 
-Quick rule:
+Rule:
 - `T` treats `"some_text"` as `string`
 - `` `T` `` treats `"some_text"` as a class/type name
 
@@ -118,7 +118,7 @@ Quick rule:
 
 ## `self` parameter
 
-For methods, `self` is automatically typed as the owning class — you don't need to annotate it. However, you can if you want to be explicit:
+GLuaLS types `self` as the owning class for methods. Annotate only when you want to be explicit:
 
 ```lua
 ---@param self Player
@@ -130,4 +130,4 @@ function Player:GiveMoney(amount) end
 
 ## Interplay with @fileparam
 
-If you don't add `@param` for every parameter, GLuaLS falls back to file-level defaults set with `@fileparam`, then workspace defaults from `gmod.fileParamDefaults`. Explicit `@param` always takes highest priority.
+GLuaLS applies file-level defaults from `@fileparam`, then workspace defaults from `gmod.fileParamDefaults`. Explicit `@param` takes highest priority.

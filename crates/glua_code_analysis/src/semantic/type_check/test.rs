@@ -142,6 +142,60 @@ mod test {
         assert!(ws.check_type(&tuple_ty2, &tuple_ty));
     }
 
+    /// Entity should be accepted where a child type (base_glide) is expected in GMod.
+    #[test]
+    fn test_entity_to_child_subtype() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class base_glide : Entity
+            "#,
+        );
+
+        let entity_ty = ws.ty("Entity");
+        let base_glide_ty = ws.ty("base_glide");
+
+        // base_glide can be used where Entity is expected (Liskov).
+        // check_type(source=Entity, compact=base_glide) → YES
+        assert!(ws.check_type(&entity_ty, &base_glide_ty));
+
+        // Entity can be used where base_glide is expected in GMod mode.
+        // check_type(source=base_glide, compact=Entity) → YES (GMod pragmatic)
+        assert!(ws.check_type(&base_glide_ty, &entity_ty));
+    }
+
+    /// Without GMod mode, supertype → subtype should still be rejected.
+    #[test]
+    fn test_supertype_to_subtype_rejected_without_gmod() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = false;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class A
+            ---@class B : A
+            "#,
+        );
+
+        let a_ty = ws.ty("A");
+        let b_ty = ws.ty("B");
+
+        // B can be used where A is expected (Liskov: B is subtype of A).
+        // check_type(source=A, compact=B) = "can B be used where A is expected?" → YES
+        assert!(ws.check_type(&a_ty, &b_ty));
+
+        // A cannot be used where B is expected without GMod (strict OOP).
+        // check_type(source=B, compact=A) = "can A be used where B is expected?" → NO
+        assert!(!ws.check_type(&b_ty, &a_ty));
+    }
+
     #[test]
     fn test_issue_86() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -207,5 +261,39 @@ mod test {
             test(a, b)
         "#
         ));
+    }
+
+    #[test]
+    fn test_defaulted_class_field_is_not_required_for_table_compatibility() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class TraceLike
+            ---@field Hit boolean=false
+            ---@field HitPos number
+            "#,
+        );
+
+        let target_ty = ws.ty("TraceLike");
+        let table_ty = ws.expr_ty("{ HitPos = 1 }");
+
+        assert!(ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn test_defaulted_generic_field_is_not_required_for_table_compatibility() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class TraceBox<T>
+            ---@field Value T
+            ---@field Hit boolean=false
+            "#,
+        );
+
+        let target_ty = ws.ty("TraceBox<number>");
+        let table_ty = ws.expr_ty("{ Value = 1 }");
+
+        assert!(ws.check_type(&target_ty, &table_ty));
     }
 }

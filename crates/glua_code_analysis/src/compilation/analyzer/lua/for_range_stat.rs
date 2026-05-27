@@ -1,9 +1,10 @@
 use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
+use std::collections::{HashMap, HashSet};
 
 use crate::{
-    DbIndex, InferFailReason, LuaDeclId, LuaInferCache, LuaMemberKey, LuaOperatorMetaMethod,
-    LuaType, LuaTypeCache, TplContext, TypeOps, TypeSubstitutor, VariadicType,
-    compilation::analyzer::unresolve::UnResolveIterVar, get_member_map, infer_expr,
+    DbIndex, InferFailReason, LuaDeclId, LuaInferCache, LuaMemberKey, LuaObjectType,
+    LuaOperatorMetaMethod, LuaType, LuaTypeCache, TplContext, TypeOps, TypeSubstitutor,
+    VariadicType, compilation::analyzer::unresolve::UnResolveIterVar, get_member_map, infer_expr,
     instantiate_doc_function, tpl_pattern_match_args,
 };
 
@@ -214,7 +215,10 @@ fn try_infer_pairs_iter_types_from_table_members(
 
     let mut keys = Vec::new();
     let mut values = Vec::new();
-    let mut member_entries = members.into_iter().collect::<Vec<_>>();
+    let mut member_entries = members
+        .iter()
+        .map(|(key, member_infos)| (key.clone(), member_infos.clone()))
+        .collect::<Vec<_>>();
     member_entries.sort_by_key(|(key, _)| member_key_stable_key(key));
     for (key, member_infos) in member_entries {
         let key_type = match key {
@@ -242,10 +246,91 @@ fn try_infer_pairs_iter_types_from_table_members(
         return Ok(None);
     }
 
-    Ok(Some(VariadicType::Multi(vec![
-        LuaType::from_vec(keys),
-        LuaType::from_vec(values),
-    ])))
+    let iter_types = VariadicType::Multi(vec![
+        compact_pairs_key_type(&keys),
+        compact_pairs_value_type(db, values),
+    ]);
+
+    Ok(Some(iter_types))
+}
+
+const LARGE_EXACT_PAIRS_KEY_UNION_THRESHOLD: usize = 128;
+
+fn compact_pairs_key_type(keys: &[LuaType]) -> LuaType {
+    if keys.len() > LARGE_EXACT_PAIRS_KEY_UNION_THRESHOLD
+        && keys
+            .iter()
+            .all(|key| matches!(key, LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)))
+    {
+        LuaType::Integer
+    } else {
+        LuaType::from_vec(keys.to_vec())
+    }
+}
+
+fn compact_pairs_value_type(db: &DbIndex, values: Vec<LuaType>) -> LuaType {
+    try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_vec(values))
+}
+
+fn try_compact_record_values(db: &DbIndex, values: &[LuaType]) -> Option<LuaType> {
+    if values.len() < 2 || !values.iter().all(is_record_like_value_type) {
+        return None;
+    }
+
+    let mut fields: HashMap<LuaMemberKey, (LuaType, usize)> = HashMap::new();
+    for value in values {
+        let member_map = get_member_map(db, value)?;
+        let mut present_keys = HashSet::new();
+        for (key, member_infos) in member_map.iter() {
+            if matches!(key, LuaMemberKey::None) || member_infos.is_empty() {
+                continue;
+            }
+
+            present_keys.insert(key.clone());
+            for member in member_infos {
+                fields
+                    .entry(key.clone())
+                    .and_modify(|(existing, _)| {
+                        *existing = TypeOps::Union.apply(db, existing, &member.typ);
+                    })
+                    .or_insert((member.typ.clone(), 0));
+            }
+        }
+
+        for key in present_keys {
+            if let Some((_, present_count)) = fields.get_mut(&key) {
+                *present_count += 1;
+            }
+        }
+    }
+
+    if fields.is_empty() {
+        return None;
+    }
+
+    let total_values = values.len();
+    let object_fields = fields
+        .into_iter()
+        .map(|(key, (typ, present_count))| {
+            let typ = if present_count < total_values {
+                TypeOps::Union.apply(db, &typ, &LuaType::Nil)
+            } else {
+                typ
+            };
+            (key, typ)
+        })
+        .collect();
+
+    Some(LuaType::Object(
+        LuaObjectType::new_with_fields(object_fields, Vec::new()).into(),
+    ))
+}
+
+fn is_record_like_value_type(value: &LuaType) -> bool {
+    matches!(
+        value,
+        LuaType::TableConst(_) | LuaType::Instance(_) | LuaType::Object(_)
+    )
 }
 
 fn is_pairs_metamethod_key(key: &LuaMemberKey) -> bool {

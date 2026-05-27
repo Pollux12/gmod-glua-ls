@@ -44,6 +44,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_initialized_assignment_chain_does_not_report_assign_type_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                WepHolster = {}
+                WepHolster.defData = {}
+                WepHolster.defData["weapon_pistol"] = {}
+                WepHolster.defData["weapon_pistol"].Model = "models/weapons/w_pistol.mdl"
+                WepHolster.defData["weapon_pistol"].BoneOffset = {
+                    Vector(1, 2, 3),
+                    Angle(4, 5, 6),
+                }
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_inferred_table_literal_fields_can_widen_after_later_assignments() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@class Vector
+
+                ---@return Vector
+                local function Vector()
+                end
+
+                local cfg = {
+                    color = "white",
+                    enabled = false,
+                }
+
+                cfg.color = Vector()
+                cfg.enabled = { reason = "starting up" }
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_default_initialized_assignment_chain_skips_inferred_member_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local t = {}
+                t.x = {}
+                t.x.y = 1
+                t.x.y = "x"
+            "#
+        ));
+    }
+
     // #[test]
     // fn test_3() {
     //     let mut ws = VirtualWorkspace::new();
@@ -606,6 +662,8 @@ local b = a
             "#
         ));
 
+        // With GMod enabled (default), assigning a supertype value to a subtype
+        // variable is allowed to reduce false positives (Entity as generic stand-in).
         assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
@@ -732,6 +790,8 @@ return t
         config.strict.array_index = true;
         ws.analysis.update_config(config.into());
 
+        // With GMod enabled (default), assigning a supertype value to a subtype
+        // variable is allowed to reduce false positives (Entity as generic stand-in).
         assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
@@ -743,8 +803,6 @@ return t
                 "#
         ));
 
-        // 允许接受父类.
-        // TODO: 接受父类时应该检查是否具有子类的所有非可空成员.
         assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
@@ -1194,6 +1252,59 @@ return t
     }
 
     #[test]
+    fn test_realm_split_dynamic_command_table_keeps_realm_local_callback_signature() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::AssignTypeMismatch);
+
+        ws.def_file(
+            "lua/glide/server/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+
+            commands[1] = function(ply) end
+
+            ---@param commandId number
+            ---@param handler fun(ply: Player)
+            function Glide.AddCommandHandler(commandId, handler)
+                commands[commandId] = handler
+            end
+            "#,
+        );
+
+        let client_file_id = ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+
+            ---@param commandId number
+            ---@param handler fun(len: number)
+            function Glide.AddCommandHandler(commandId, handler)
+                commands[commandId] = handler
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(client_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
+        ));
+        assert!(
+            !diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "unexpected assign-type-mismatch diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn test_ref_index_access_assign_class_to_object_mismatch() {
         let mut ws = crate::VirtualWorkspace::new();
 
@@ -1417,6 +1528,35 @@ return t
         ));
     }
 
+    #[test]
+    fn test_find_meta_table_member_alias_does_not_report_assign_type_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@return string
+            function Entity:GetClass()
+            end
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return T
+            function FindMetaTable(metaName)
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local ENTITY = FindMetaTable("Entity")
+            ENTITY.Test1Alias = ENTITY.GetClass
+            "#
+        ));
+    }
+
     // Pattern 2: local var without initializer - assigning then accessing fields should not error
     #[test]
     fn test_rc2_local_no_init_then_assign_table() {
@@ -1560,6 +1700,55 @@ return t
                 local result = fn()
                 result.field = 0
             end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_unknown_union_member_does_not_poison_assignable_known_members() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local target = false
+
+            ---@type false|unknown
+            local value
+
+            target = value
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .expect("diagnostics should be available");
+        let code_string = Some(NumberOrString::String(
+            DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
+        ));
+        let assign_diags = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == code_string)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            assign_diags.is_empty(),
+            "unexpected assign-type-mismatch diagnostics: {:?}",
+            assign_diags
+        );
+    }
+
+    #[test]
+    fn test_unknown_union_member_does_not_hide_incompatible_known_members() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local target = false
+
+            ---@type string|unknown
+            local value
+
+            target = value
             "#
         ));
     }
@@ -1925,6 +2114,428 @@ return t
                 .all(|diagnostic| diagnostic.code != code_string)
         );
     }
+
+    /// When an unannotated main-workspace override shadows an annotated library
+    /// function, the annotated return type should still take priority and the
+    /// override's parameter overloads should be respected.
+    #[test]
+    fn test_annotated_library_override_suppresses_assign_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        // Main workspace: unannotated override + test call
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, ...)
+                -- unannotated override, analyzer infers nil return
+                return nil
+            end
+
+            ---@type Entity
+            local ent = ents.Create("letter")
+            -- ent should resolve to Entity (from annotation), not nil
+            "#
+        ));
+    }
+
+    /// The main-workspace override of an annotated library function should not
+    /// trigger "expected N parameters but found M" when the override accepts
+    /// more parameters.
+    #[test]
+    fn test_annotated_library_override_suppresses_redundant_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library2");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        // Main workspace: override with extra parameters + test call
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, ...)
+                return nil
+            end
+
+            local x = ents.Create("foo", "extra_arg")
+            -- Should NOT produce "expected 1 parameters but found 2"
+            "#
+        ));
+    }
+
+    /// Repro for non-variadic declaration-style override: extra parameters
+    /// accepted by the override must suppress redundant-parameter diagnostics.
+    #[test]
+    fn test_annotated_library_non_variadic_override_suppresses_redundant_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_non_variadic");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        // Main workspace: declaration-style non-variadic override with extra parameter.
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, safety)
+                return nil
+            end
+
+            local x = ents.Create("foo", "extra_arg")
+            -- Should NOT produce "expected 1 parameters but found 2"
+            "#
+        ));
+    }
+
+    /// Assignment-style override should still inherit annotated return type when
+    /// called with extra parameters accepted by the override.
+    #[test]
+    fn test_annotated_library_file_define_override_return_type_with_extra_params() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_file_define_ret");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+            local originalCreate = ents.Create
+
+            ents.Create = function(name, safety)
+                if originalCreate then
+                    return originalCreate(name)
+                end
+                return nil
+            end
+
+            ---@type Entity
+            local ent = ents.Create("foo", "extra")
+            -- Should use annotated return type (Entity), not override's nil inference
+            "#
+        ));
+    }
+
+    /// Isolates call-site checking by assigning a predeclared function into the
+    /// override slot (instead of inline closure assignment typing).
+    #[test]
+    fn test_annotated_library_file_define_named_override_suppresses_redundant_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_file_define_named");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+            local originalCreate = ents.Create
+
+            local function create_override(name, safety)
+                if originalCreate then
+                    return originalCreate(name)
+                end
+                return nil
+            end
+
+            ents.Create = create_override
+            local x = ents.Create("foo", "extra_arg")
+            "#
+        ));
+    }
+
+    /// The annotated return type should take priority even when the override's
+    /// extra parameters are used (2-param call still returns Entity, not nil).
+    #[test]
+    fn test_annotated_library_override_return_type_with_extra_params() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library workspace with annotated ents.Create
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library3");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        // Main workspace: 2-param call with typed local should NOT produce
+        // assign-type-mismatch because the meta return type (Entity) wins.
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, ...)
+                return nil
+            end
+
+            ---@type Entity
+            local ent = ents.Create("foo", "extra")
+            -- Should NOT be nil — meta return type (Entity) takes priority
+            "#
+        ));
+    }
+
+    /// Guard against hiding the annotated return entirely (e.g. degrading to
+    /// unknown): with library annotation present, assigning override call result
+    /// to an incompatible concrete target type should still report mismatch.
+    #[test]
+    fn test_annotated_library_override_extra_params_mismatch_incompatible_target() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_incompatible_target");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, safety)
+                return nil
+            end
+
+            ---@type string
+            local ent = ents.Create("foo", "extra")
+            "#
+        ));
+    }
+
+    /// Without the library annotation, the override's nil return SHOULD trigger
+    /// assign-type-mismatch. This proves the library annotation is the fix.
+    #[test]
+    fn test_unannotated_override_alone_does_produce_assign_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // No library workspace — only the unannotated override exists.
+        // The override returns number, so assigning to a string-typed local
+        // SHOULD produce assign-type-mismatch.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, ...)
+                return 123
+            end
+
+            ---@type string
+            local ent = ents.Create("foo")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_server_only_override_does_not_suppress_client_redundant_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_ents_create_library_realm_split");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@realm shared
+                ---@param class string
+                ---@return Entity
+                function ents.Create(class) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        ws.def_file(
+            "gamemode/modules/workarounds/sv_workarounds.lua",
+            r#"
+            ents = ents or {}
+
+            function ents.Create(name, safety)
+                return nil
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+            if SERVER then
+                local ok = ents.Create("foo", "extra")
+            end
+            "#
+        ));
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+            if CLIENT then
+                local ok = ents.Create("foo")
+            end
+            "#
+        ));
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ents = ents or {}
+            if CLIENT then
+                local should_error = ents.Create("foo", "extra")
+            end
+            "#
+        ));
+    }
 }
 
 #[test]
@@ -2007,6 +2618,130 @@ fn test_doc_string_union_with_legacy_wrapped_literals_stays_strict() {
         register_privilege({
             MinAccess = "root"
         })
+        "#
+    ));
+}
+
+// In GMod, NULL is the "zero value" of Entity. Assigning an Entity subtype
+// to a NULL-typed slot is valid — the pattern `filter = { NULL, NULL };
+// filter[1] = self` is common and correct.
+#[test]
+fn test_entity_subtype_assignable_to_null_typed_slot() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@class glide_missile : Entity
+        local glide_missile = {}
+
+        ---@type glide_missile
+        local self
+
+        local traceData = {
+            filter = { NULL, NULL },
+        }
+
+        traceData.filter[1] = self
+        traceData.filter[2] = self
+        "#
+    ));
+}
+
+// NULL should be assignable to Entity-typed slots (NULL is a valid Entity value).
+#[test]
+fn test_null_assignable_to_entity_typed_slot() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@type Entity
+        local ent
+
+        ent = NULL
+        "#
+    ));
+}
+
+// NULL should NOT be assignable to unrelated types (e.g., string).
+#[test]
+fn test_null_not_assignable_to_unrelated_type() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(!ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@type string
+        local s
+
+        s = NULL
+        "#
+    ));
+}
+
+// Non-Entity types should NOT be assignable to NULL-typed slots.
+#[test]
+fn test_non_entity_not_assignable_to_null_slot() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(!ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@type NULL
+        local slot
+
+        ---@type string
+        local s
+
+        slot = s
+        "#
+    ));
+}
+
+// Direct Entity subtype → NULL local variable assignment should be valid.
+#[test]
+fn test_entity_subtype_assignable_to_null_local() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+    assert!(ws.check_code_for_namespace(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Entity
+        local Entity = {}
+
+        ---@class NULL : Entity
+        local NULL = nil
+
+        ---@class glide_missile : Entity
+        local glide_missile = {}
+
+        ---@type NULL
+        local slot
+
+        ---@type glide_missile
+        local self
+
+        slot = self
         "#
     ));
 }

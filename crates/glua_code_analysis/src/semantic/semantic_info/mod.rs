@@ -16,6 +16,7 @@ pub use resolve_global_decl::resolve_global_decl_id;
 pub use semantic_decl_level::SemanticDeclLevel;
 pub use semantic_guard::SemanticDeclGuard;
 
+use super::infer::try_local_decl_initializer_fallback_type;
 use super::{InferFailReason, LuaInferCache, infer_bind_value_type, infer_expr};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,8 +39,17 @@ pub fn infer_token_semantic_info(
                 .get_type_index()
                 .get_type_cache(&decl_id.into())
                 .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown));
+            let typ = type_cache.as_type().clone();
+            let typ = try_local_decl_initializer_fallback_type(
+                db,
+                cache,
+                decl_id,
+                &typ,
+                token.text_range().start(),
+            )
+            .unwrap_or(typ);
             Some(SemanticInfo {
-                typ: type_cache.as_type().clone(),
+                typ,
                 semantic_decl: Some(LuaSemanticDeclId::LuaDecl(decl_id)),
             })
         }
@@ -95,7 +105,7 @@ pub fn infer_node_semantic_info(
                 cache,
                 expr,
                 SemanticDeclGuard::default(),
-                SemanticDeclLevel::default(),
+                SemanticDeclLevel::NoTrace,
             );
             Some(SemanticInfo {
                 typ,

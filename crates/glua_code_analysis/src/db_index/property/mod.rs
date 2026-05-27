@@ -9,6 +9,7 @@ use glua_parser::{LuaAstNode, LuaDocTagField, LuaDocType, LuaVersionCondition, V
 pub use property::LuaCommonProperty;
 pub use property::{LuaDeprecated, LuaExport, LuaExportScope, LuaPropertyId};
 
+use crate::LuaDocDefaultValue;
 pub use crate::db_index::property::property::LuaAttributeUse;
 use crate::{DbIndex, FileId, LuaMember, LuaSignatureId};
 
@@ -18,6 +19,7 @@ use super::{LuaSemanticDeclId, traits::LuaIndex};
 pub struct LuaPropertyIndex {
     properties: HashMap<LuaPropertyId, LuaCommonProperty>,
     property_owners_map: HashMap<LuaSemanticDeclId, LuaPropertyId>,
+    signature_owner_by_property: HashMap<LuaPropertyId, LuaSignatureId>,
 
     id_count: u32,
     in_filed_owner: HashMap<FileId, HashSet<LuaSemanticDeclId>>,
@@ -36,6 +38,7 @@ impl LuaPropertyIndex {
             in_filed_owner: HashMap::new(),
             properties: HashMap::new(),
             property_owners_map: HashMap::new(),
+            signature_owner_by_property: HashMap::new(),
         }
     }
 
@@ -51,6 +54,9 @@ impl LuaPropertyIndex {
             let id = LuaPropertyId::new(self.id_count);
             self.id_count += 1;
             self.property_owners_map.insert(owner_id.clone(), id);
+            if let LuaSemanticDeclId::Signature(signature_id) = owner_id {
+                self.signature_owner_by_property.insert(id, signature_id);
+            }
             self.properties.insert(id, LuaCommonProperty::new());
             self.properties.get_mut(&id).map(|prop| (prop, id))
         }
@@ -65,6 +71,14 @@ impl LuaPropertyIndex {
         let (_, property_id) = self.get_or_create_property(source_owner_id.clone())?;
         self.property_owners_map
             .insert(same_property_owner_id.clone(), property_id);
+        if let LuaSemanticDeclId::Signature(signature_id) = &source_owner_id {
+            self.signature_owner_by_property
+                .insert(property_id, *signature_id);
+        }
+        if let LuaSemanticDeclId::Signature(signature_id) = &same_property_owner_id {
+            self.signature_owner_by_property
+                .insert(property_id, *signature_id);
+        }
 
         let file_owners = self.in_filed_owner.entry(file_id).or_default();
         file_owners.insert(source_owner_id);
@@ -118,6 +132,23 @@ impl LuaPropertyIndex {
     ) -> Option<()> {
         let (property, _) = self.get_or_create_property(owner_id.clone())?;
         property.add_extra_source(source);
+
+        self.in_filed_owner
+            .entry(file_id)
+            .or_default()
+            .insert(owner_id);
+
+        Some(())
+    }
+
+    pub fn add_default_value(
+        &mut self,
+        file_id: FileId,
+        owner_id: LuaSemanticDeclId,
+        default_value: LuaDocDefaultValue,
+    ) -> Option<()> {
+        let (property, _) = self.get_or_create_property(owner_id.clone())?;
+        property.add_extra_default_value(default_value);
 
         self.in_filed_owner
             .entry(file_id)
@@ -258,6 +289,26 @@ impl LuaPropertyIndex {
             .get(owner_id)
             .and_then(|id| self.properties.get(id))
     }
+
+    pub fn get_signature_owner(
+        &self,
+        owner_id: &LuaSemanticDeclId,
+    ) -> Option<crate::LuaSignatureId> {
+        let property_id = self.property_owners_map.get(owner_id)?;
+        self.signature_owner_by_property.get(property_id).copied()
+    }
+
+    pub fn iter_owner_properties(
+        &self,
+    ) -> impl Iterator<Item = (&LuaSemanticDeclId, &LuaCommonProperty)> {
+        self.property_owners_map
+            .iter()
+            .filter_map(|(owner_id, property_id)| {
+                self.properties
+                    .get(property_id)
+                    .map(|property| (owner_id, property))
+            })
+    }
 }
 
 impl LuaIndex for LuaPropertyIndex {
@@ -266,6 +317,7 @@ impl LuaIndex for LuaPropertyIndex {
             for property_owner_id in property_owner_ids {
                 if let Some(property_id) = self.property_owners_map.remove(&property_owner_id) {
                     self.properties.remove(&property_id);
+                    self.signature_owner_by_property.remove(&property_id);
                 }
             }
         }
@@ -274,6 +326,7 @@ impl LuaIndex for LuaPropertyIndex {
     fn clear(&mut self) {
         self.properties.clear();
         self.property_owners_map.clear();
+        self.signature_owner_by_property.clear();
         self.in_filed_owner.clear();
         self.id_count = 0;
     }

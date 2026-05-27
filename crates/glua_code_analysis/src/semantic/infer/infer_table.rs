@@ -2,7 +2,7 @@ use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaExpr, LuaIndexMemberExpr,
-    LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaTableExpr, LuaTableField,
+    LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaTableExpr, LuaTableField, LuaVarExpr,
 };
 
 use crate::{
@@ -398,6 +398,16 @@ fn infer_table_type_by_assign_stat(
             None => Err(InferFailReason::UnResolveDeclType(decl_id)),
         }
     } else {
+        if let LuaVarExpr::IndexExpr(index_expr) = name {
+            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), cache.get_file_id());
+            if let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into()) {
+                return match type_cache.as_type() {
+                    LuaType::TableConst(_) => Err(InferFailReason::None),
+                    typ => Ok(typ.clone()),
+                };
+            }
+        }
+
         infer_expr(
             db,
             cache,

@@ -8,8 +8,8 @@ use glua_parser::{
     LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
-    LuaLocalFuncStat, LuaLocalStat, LuaRepeatStat, LuaStat, LuaSyntaxNode, LuaVarExpr,
-    LuaWhileStat, NumberResult, PathTrait,
+    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaRepeatStat, LuaStat, LuaSyntaxNode,
+    LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
 };
 
 use crate::{
@@ -65,12 +65,10 @@ impl GmodKeywords {
     }
 }
 
-fn scan_gmod_keywords(content: &str, hook_method_prefixes: &[String]) -> GmodKeywords {
+fn scan_gmod_keywords(content: &str, formatted_hook_prefixes: &[String]) -> GmodKeywords {
     let has_gm_func = content.contains("GM:")
         || content.contains("GAMEMODE:")
-        || hook_method_prefixes
-            .iter()
-            .any(|p| content.contains(&format!("{p}:")));
+        || formatted_hook_prefixes.iter().any(|p| content.contains(p));
     GmodKeywords {
         has_hook: content.contains("hook"),
         has_net: content.contains("net."),
@@ -101,18 +99,19 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let _p = Profile::cond_new("gmod pre-analyze", context.tree_list.len() > 1);
         let tree_list = context.tree_list.clone();
         let file_ids: Vec<FileId> = tree_list.iter().map(|x| x.file_id).collect();
-        let do_profile = tree_list.len() > 100;
+        let do_profile = tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
 
         // Pre-compute scripted class scope for all files (compile globs once)
         let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
 
-        let t0 = std::time::Instant::now();
+        let t0 = do_profile.then(std::time::Instant::now);
         let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::new();
         let mut annotation_realms: HashMap<FileId, GmodRealm> = HashMap::new();
         let mut t_hook = std::time::Duration::ZERO;
         let mut t_netflow = std::time::Duration::ZERO;
         let mut t_scoped = std::time::Duration::ZERO;
         let mut t_realm = std::time::Duration::ZERO;
+        let mut profile = do_profile.then(GmodPreProfile::default);
 
         // Build a workspace-global registry of helper functions so that
         // net.Read/Write expansion can follow helpers defined in *other* files
@@ -125,31 +124,55 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         // file in `tree_list`, but helpers can live in any file.
         let helper_registry = build_helper_registry(db);
 
+        // Pre-format hook method prefixes once to avoid per-file `format!("{p}:")` allocations
+        let formatted_hook_prefixes: Vec<String> = db
+            .get_emmyrc()
+            .gmod
+            .hook_mappings
+            .method_prefixes
+            .iter()
+            .map(|p| format!("{p}:"))
+            .collect();
+
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
 
             // Pre-scan file source for gmod-relevant keywords to skip unnecessary AST walks
-            let method_prefixes = &db.get_emmyrc().gmod.hook_mappings.method_prefixes;
             let keywords = db
                 .get_vfs()
                 .get_file_content(&in_filed_tree.file_id)
-                .map(|c| scan_gmod_keywords(c, method_prefixes))
+                .map(|c| scan_gmod_keywords(c, &formatted_hook_prefixes))
                 .unwrap_or_default();
+            if let Some(profile) = profile.as_mut() {
+                profile.files_scanned += 1;
+                profile.record_keywords(&keywords, is_in_scope);
+            }
 
-            let s = std::time::Instant::now();
+            let s = do_profile.then(std::time::Instant::now);
+            let mut local_fns = LocalFnCache::default();
             let (gm_method_realms, receive_flows) = if keywords.needs_hook_metadata() {
                 collect_hook_metadata(
                     db,
                     in_filed_tree.file_id,
                     in_filed_tree.value.clone(),
                     &helper_registry,
+                    &mut local_fns,
                 )
             } else {
+                if let Some(profile) = profile.as_mut() {
+                    profile.hook_metadata_skips += 1;
+                }
                 (Vec::new(), Vec::new())
             };
-            t_hook += s.elapsed();
+            if let Some(profile) = profile.as_mut() {
+                profile.gm_method_realms += gm_method_realms.len();
+                profile.receive_flows += receive_flows.len();
+            }
+            if let Some(s) = s {
+                t_hook += s.elapsed();
+            }
 
-            let s = std::time::Instant::now();
+            let s = do_profile.then(std::time::Instant::now);
             if keywords.has_net || !receive_flows.is_empty() {
                 collect_network_flow_metadata(
                     db,
@@ -157,16 +180,21 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     in_filed_tree.value.clone(),
                     receive_flows,
                     &helper_registry,
+                    &mut local_fns,
                 );
+            } else if let Some(profile) = profile.as_mut() {
+                profile.netflow_skips += 1;
             }
-            t_netflow += s.elapsed();
+            if let Some(s) = s {
+                t_netflow += s.elapsed();
+            }
 
             if !gm_method_realms.is_empty() {
                 db.get_gmod_infer_index_mut()
                     .set_gm_method_realm_annotations(in_filed_tree.file_id, gm_method_realms);
             }
             if is_in_scope {
-                let s = std::time::Instant::now();
+                let s = do_profile.then(std::time::Instant::now);
                 // Use cached scoped class info from decl phase, or detect if not cached
                 let scope_match = db
                     .get_gmod_infer_index()
@@ -189,6 +217,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                         Some(m)
                     });
                 if let Some(scope_match) = scope_match {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.scoped_class_matches += 1;
+                    }
                     ensure_scoped_class_type_decl(
                         db,
                         in_filed_tree.file_id,
@@ -209,11 +240,16 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                         &scope_match,
                     );
                 }
-                t_scoped += s.elapsed();
+                if let Some(s) = s {
+                    t_scoped += s.elapsed();
+                }
             }
-            let s = std::time::Instant::now();
+            let s = do_profile.then(std::time::Instant::now);
             if keywords.has_realm_branch {
                 let ranges = collect_branch_realm_ranges(&in_filed_tree.value);
+                if let Some(profile) = profile.as_mut() {
+                    profile.branch_realm_ranges += ranges.len();
+                }
                 if !ranges.is_empty() {
                     branch_realm_ranges.insert(in_filed_tree.file_id, ranges);
                 }
@@ -221,12 +257,20 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             if keywords.has_realm_anno {
                 if let Some(realm) = collect_realm_annotation(&in_filed_tree.value) {
                     annotation_realms.insert(in_filed_tree.file_id, realm);
+                    if let Some(profile) = profile.as_mut() {
+                        profile.annotation_realms += 1;
+                    }
                 }
                 let member_ranges = collect_member_realm_ranges(&in_filed_tree.value);
+                if let Some(profile) = profile.as_mut() {
+                    profile.member_realm_ranges += member_ranges.len();
+                }
                 db.get_gmod_infer_index_mut()
                     .set_member_realm_ranges(in_filed_tree.file_id, member_ranges);
             }
-            t_realm += s.elapsed();
+            if let Some(s) = s {
+                t_realm += s.elapsed();
+            }
 
             // Pre-index @fileparam annotations (O(1) lookup during resolve vs O(file_size) AST walk)
             // @fileparam is extremely rare; only scan if file content contains it
@@ -243,9 +287,12 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             }
         }
         if do_profile {
+            if let Some(profile) = profile.as_ref() {
+                profile.log();
+            }
             log::info!(
                 "gmod pre: per-file metadata cost {:?} (hook={:?}, netflow={:?}, scoped={:?}, realm={:?})",
-                t0.elapsed(),
+                t0.map(|t0| t0.elapsed()).unwrap_or_default(),
                 t_hook,
                 t_netflow,
                 t_scoped,
@@ -254,21 +301,75 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         }
 
         // Network var wrappers are purely syntactic (AST pattern matching)
-        let t1 = std::time::Instant::now();
+        let t1 = do_profile.then(std::time::Instant::now);
         let tree_map: HashMap<FileId, LuaChunk> = tree_list
             .iter()
             .map(|x| (x.file_id, x.value.clone()))
             .collect();
         synthesize_network_var_wrappers(db, &scripted_scope_files, &tree_map);
-        if do_profile {
+        if let Some(t1) = t1 {
             log::info!("gmod pre: network_var_wrappers cost {:?}", t1.elapsed());
         }
 
-        let t2 = std::time::Instant::now();
+        let t2 = do_profile.then(std::time::Instant::now);
         rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms, &file_ids);
-        if do_profile {
+        if let Some(t2) = t2 {
             log::info!("gmod pre: rebuild_realm_metadata cost {:?}", t2.elapsed());
         }
+    }
+}
+
+#[derive(Default)]
+struct GmodPreProfile {
+    files_scanned: usize,
+    hook_keyword_files: usize,
+    net_keyword_files: usize,
+    system_call_keyword_files: usize,
+    gm_func_keyword_files: usize,
+    realm_branch_keyword_files: usize,
+    realm_annotation_keyword_files: usize,
+    scoped_files: usize,
+    hook_metadata_skips: usize,
+    netflow_skips: usize,
+    gm_method_realms: usize,
+    receive_flows: usize,
+    scoped_class_matches: usize,
+    branch_realm_ranges: usize,
+    annotation_realms: usize,
+    member_realm_ranges: usize,
+}
+
+impl GmodPreProfile {
+    fn record_keywords(&mut self, keywords: &GmodKeywords, is_scoped: bool) {
+        self.hook_keyword_files += usize::from(keywords.has_hook);
+        self.net_keyword_files += usize::from(keywords.has_net);
+        self.system_call_keyword_files += usize::from(keywords.has_system_call);
+        self.gm_func_keyword_files += usize::from(keywords.has_gm_func);
+        self.realm_branch_keyword_files += usize::from(keywords.has_realm_branch);
+        self.realm_annotation_keyword_files += usize::from(keywords.has_realm_anno);
+        self.scoped_files += usize::from(is_scoped);
+    }
+
+    fn log(&self) {
+        log::info!(
+            "gmod pre profile: files={} keyword_files hook={} net={} system={} gm_func={} realm_branch={} realm_anno={} scoped={} hook_skips={} netflow_skips={} gm_method_realms={} receive_flows={} scoped_matches={} branch_ranges={} annotation_realms={} member_ranges={}",
+            self.files_scanned,
+            self.hook_keyword_files,
+            self.net_keyword_files,
+            self.system_call_keyword_files,
+            self.gm_func_keyword_files,
+            self.realm_branch_keyword_files,
+            self.realm_annotation_keyword_files,
+            self.scoped_files,
+            self.hook_metadata_skips,
+            self.netflow_skips,
+            self.gm_method_realms,
+            self.receive_flows,
+            self.scoped_class_matches,
+            self.branch_realm_ranges,
+            self.annotation_realms,
+            self.member_realm_ranges,
+        );
     }
 }
 
@@ -285,49 +386,57 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
 
         let _p = Profile::cond_new("gmod post-analyze", context.tree_list.len() > 1);
         let file_ids: Vec<FileId> = context.tree_list.iter().map(|x| x.file_id).collect();
-        let do_profile = context.tree_list.len() > 100;
+        let do_profile = context.tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
 
         let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
 
-        let t0 = std::time::Instant::now();
+        // Resolve scripted_ents.GetMember delegations BEFORE synthesizing
+        // members so that NetworkVar calls copied from target entities are
+        // picked up by synthesize_scripted_class_members.
+        let t_deleg = do_profile.then(std::time::Instant::now);
+        resolve_getmember_network_var_delegations(db, &scripted_scope_files, context);
+        if let Some(t_deleg) = t_deleg {
+            log::info!(
+                "gmod post: getmember_delegations cost {:?}",
+                t_deleg.elapsed()
+            );
+        }
+
+        let t0 = do_profile.then(std::time::Instant::now);
         synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
-        if do_profile {
+        if let Some(t0) = t0 {
             log::info!("gmod post: scripted_class_members cost {:?}", t0.elapsed());
         }
 
-        let t1 = std::time::Instant::now();
+        let t1 = do_profile.then(std::time::Instant::now);
         synthesize_vgui_registrations(db, &file_ids);
-        if do_profile {
+        if let Some(t1) = t1 {
             log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed());
         }
     }
 }
 
-/// Workspace-global registry of helper function definitions, used as a
-/// fallback when same-file helper resolution doesn't find a definition.
-///
-/// Keyed by:
-/// - bare-name globals: `"helperFn"` for `function helperFn() end` or
-///   `helperFn = function() end` at module top-level
-/// - dotted globals: `"Module.fn"` for `function Module.fn() end` or
-///   `Module.fn = function() end`
-///
-/// Locals are intentionally excluded — they can only be referenced from
-/// within their defining file, so the same-file lookup already covers them.
-///
-/// The chunk that owns each helper body is stored alongside the block so
-/// that further nested helper calls inside the body can be resolved against
-/// the owning file's tree (preserving local-shadows-global semantics in
-/// each step of the walk).
 struct HelperRegistry {
     map: HashMap<String, (LuaChunk, LuaBlock)>,
+    methods: HashMap<String, (LuaChunk, LuaBlock)>,
 }
 
 fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
     let mut map: HashMap<String, (LuaChunk, LuaBlock)> = HashMap::new();
+    let mut methods: HashMap<String, (LuaChunk, LuaBlock)> = HashMap::new();
+    let mut duplicate_methods = HashSet::new();
 
     let vfs = db.get_vfs();
-    let mut candidate_file_ids = vfs.get_all_file_ids();
+    // Filter to files containing "net." BEFORE sorting, to avoid allocating
+    // path strings for the vast majority of files that don't contain net helpers.
+    let mut candidate_file_ids: Vec<FileId> = vfs
+        .get_all_file_ids()
+        .into_iter()
+        .filter(|file_id| {
+            vfs.get_file_content(file_id)
+                .is_some_and(|c| c.contains("net."))
+        })
+        .collect();
     candidate_file_ids.sort_by_cached_key(|file_id| {
         let raw_path = vfs
             .get_file_path(file_id)
@@ -341,15 +450,6 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
     });
 
     for file_id in candidate_file_ids {
-        // Skip files that obviously can't contain net helper bodies. Any
-        // helper that wraps a net write/read must contain `net.` literally,
-        // so this prunes the vast majority of files cheaply.
-        let Some(content) = vfs.get_file_content(&file_id) else {
-            continue;
-        };
-        if !content.contains("net.") {
-            continue;
-        }
         let Some(tree) = vfs.get_syntax_tree(&file_id) else {
             continue;
         };
@@ -369,15 +469,28 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
                     continue;
                 };
 
-                let key = match func_name {
+                let key = match &func_name {
                     LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
-                    LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(&index_expr),
+                    LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(index_expr),
+                };
+                let method_name = match &func_name {
+                    LuaVarExpr::IndexExpr(index_expr) => index_field_name(index_expr),
+                    _ => None,
                 };
 
                 if let Some(key) = key {
                     // Deterministic duplicate winner rule:
                     // the first helper discovered in sorted path order wins.
-                    map.entry(key).or_insert_with(|| (chunk.clone(), block));
+                    map.entry(key)
+                        .or_insert_with(|| (chunk.clone(), block.clone()));
+                }
+                if let Some(method_name) = method_name {
+                    if methods
+                        .insert(method_name.clone(), (chunk.clone(), block.clone()))
+                        .is_some()
+                    {
+                        duplicate_methods.insert(method_name);
+                    }
                 }
                 continue;
             }
@@ -396,26 +509,35 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
                         LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
                         LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(index_expr),
                     };
+                    let method_name = match var {
+                        LuaVarExpr::IndexExpr(index_expr) => index_field_name(index_expr),
+                        _ => None,
+                    };
 
                     if let Some(key) = key {
                         // Deterministic duplicate winner rule:
                         // the first helper discovered in sorted path order wins.
-                        map.entry(key).or_insert_with(|| (chunk.clone(), block));
+                        map.entry(key)
+                            .or_insert_with(|| (chunk.clone(), block.clone()));
+                    }
+                    if let Some(method_name) = method_name {
+                        if methods
+                            .insert(method_name.clone(), (chunk.clone(), block.clone()))
+                            .is_some()
+                        {
+                            duplicate_methods.insert(method_name);
+                        }
                     }
                 }
             }
         }
     }
 
-    HelperRegistry { map }
-}
-
-#[allow(dead_code)]
-fn _debug_helper_registry(reg: &HelperRegistry) {
-    eprintln!("HelperRegistry has {} entries:", reg.map.len());
-    for k in reg.map.keys() {
-        eprintln!("  - {k}");
+    for duplicate_method in duplicate_methods {
+        methods.remove(&duplicate_method);
     }
+
+    HelperRegistry { map, methods }
 }
 
 /// Per-file function definition lookup. Built once and reused for all
@@ -427,6 +549,11 @@ struct FileFunctionMap {
     /// Method bodies, keyed `"Prefix.Field"`:
     /// `function M.f() end`, `M.f = function() end`.
     dotted: HashMap<String, LuaBlock>,
+    /// Colon-callable method bodies keyed by field name:
+    /// `function M:f() end`, `function ENT:f() end`, `M.f = function() end`.
+    /// Used only as a conservative same-file/cross-file fallback for net flow
+    /// expansion through `obj:f()` calls.
+    methods: HashMap<String, LuaBlock>,
     /// All top-level function-defining blocks in source order, including
     /// duplicates and unnamed closures. Lets callers that need to scan every
     /// function body in the file skip running 4 separate `descendants` walks.
@@ -437,6 +564,7 @@ impl FileFunctionMap {
     fn build(root: &LuaChunk) -> Self {
         let mut bare: HashMap<String, LuaBlock> = HashMap::new();
         let mut dotted: HashMap<String, LuaBlock> = HashMap::new();
+        let mut methods: HashMap<String, LuaBlock> = HashMap::new();
         let mut all_blocks: Vec<LuaBlock> = Vec::new();
         for node in root.syntax().descendants() {
             if let Some(local_func_stat) = LuaLocalFuncStat::cast(node.clone()) {
@@ -484,6 +612,9 @@ impl FileFunctionMap {
                         if let Some(key) = dotted_global_key(&index_expr) {
                             dotted.entry(key).or_insert_with(|| block.clone());
                         }
+                        if let Some(method_name) = index_field_name(&index_expr) {
+                            methods.entry(method_name).or_insert_with(|| block.clone());
+                        }
                     }
                     None => {}
                 }
@@ -510,6 +641,9 @@ impl FileFunctionMap {
                                 if let Some(key) = dotted_global_key(index_expr) {
                                     dotted.entry(key).or_insert_with(|| block.clone());
                                 }
+                                if let Some(method_name) = index_field_name(index_expr) {
+                                    methods.entry(method_name).or_insert_with(|| block.clone());
+                                }
                             }
                         }
                     }
@@ -520,6 +654,7 @@ impl FileFunctionMap {
         FileFunctionMap {
             bare,
             dotted,
+            methods,
             all_blocks,
         }
     }
@@ -553,15 +688,22 @@ fn dotted_global_key(index_expr: &glua_parser::LuaIndexExpr) -> Option<String> {
     Some(format!("{prefix_text}.{field_text}"))
 }
 
+fn index_field_name(index_expr: &glua_parser::LuaIndexExpr) -> Option<String> {
+    let LuaIndexKey::Name(field_token) = index_expr.get_index_key()? else {
+        return None;
+    };
+    Some(field_token.get_name_text().to_string())
+}
+
 fn collect_hook_metadata(
     db: &mut DbIndex,
     file_id: FileId,
     root: LuaChunk,
     helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) -> (Vec<(String, GmodRealm)>, Vec<NetReceiveFlow>) {
     let mut gm_method_realms = Vec::new();
     let mut receive_flows = Vec::new();
-    let mut local_fns = LocalFnCache::default();
 
     // Single descendants walk dispatching by node kind. Avoids two separate
     // O(N) walks for the LuaCallExpr and LuaFuncStat passes.
@@ -572,7 +714,7 @@ fn collect_hook_metadata(
             }
 
             if let Some(receive_flow) =
-                collect_net_receive_flow(&root, &call_expr, helper_registry, &mut local_fns)
+                collect_net_receive_flow(&root, &call_expr, helper_registry, local_fns)
             {
                 receive_flows.push(receive_flow);
             }
@@ -608,13 +750,13 @@ fn collect_network_flow_metadata(
     root: LuaChunk,
     receive_flows: Vec<NetReceiveFlow>,
     helper_registry: &HelperRegistry,
+    local_fns: &mut LocalFnCache,
 ) {
-    let mut local_fns = LocalFnCache::default();
-    let mut send_flows = collect_net_send_flows(&root, helper_registry, &mut local_fns);
+    let mut send_flows = collect_net_send_flows(&root, helper_registry, local_fns);
     send_flows.extend(collect_wrapped_net_send_flows(
         &root,
         helper_registry,
-        &mut local_fns,
+        local_fns,
     ));
     send_flows.sort_by_key(|flow| flow.start_range.start());
 
@@ -948,6 +1090,16 @@ fn resolve_call_to_function_block<'a>(
                 .map(|(chunk, block)| (name.clone(), block.clone(), chunk))
         }
         LuaExpr::IndexExpr(index_expr) => {
+            if call_expr.is_colon_call()
+                && let Some(method_name) = index_field_name(&index_expr)
+            {
+                if let Some(block) = local_fns.get(root).methods.get(&method_name).cloned() {
+                    return Some((format!(":{method_name}"), block, root));
+                }
+                if let Some((chunk, block)) = helper_registry.methods.get(&method_name) {
+                    return Some((format!(":{method_name}"), block.clone(), chunk));
+                }
+            }
             let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
                 return None;
             };
@@ -1473,7 +1625,9 @@ fn collect_scripted_scope_type_bindings_with(
                 continue;
             }
 
-            if decl.is_local() || decl.is_global() {
+            let is_scoped_local = decl.is_local()
+                && (decl.is_seeded_class_local() || scope_match.global_name == "PLUGIN");
+            if is_scoped_local || decl.is_global() {
                 decls.push((decl.get_id(), decl.get_range()));
             }
         }
@@ -1529,7 +1683,7 @@ fn ensure_scoped_class_type_decl(
     global_name: &str,
     range: rowan::TextRange,
 ) -> LuaTypeDeclId {
-    let class_decl_id = LuaTypeDeclId::global(class_name);
+    let class_decl_id = get_scripted_class_type_decl_id(global_name, class_name);
     if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
         db.get_type_index_mut().add_type_decl(
             file_id,
@@ -1573,6 +1727,21 @@ fn ensure_scoped_class_type_decl(
     class_decl_id
 }
 
+pub(crate) fn get_scripted_class_type_decl_id(
+    global_name: &str,
+    class_name: &str,
+) -> LuaTypeDeclId {
+    if scoped_class_uses_global_namespace(global_name) {
+        LuaTypeDeclId::global(&format!("{global_name}.{class_name}"))
+    } else {
+        LuaTypeDeclId::global(class_name)
+    }
+}
+
+fn scoped_class_uses_global_namespace(global_name: &str) -> bool {
+    matches!(global_name, "TOOL" | "EFFECT")
+}
+
 fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
     let mut super_types = vec![LuaType::Ref(LuaTypeDeclId::global(global_name))];
     match global_name {
@@ -1608,6 +1777,328 @@ pub(crate) fn ensure_scoped_class_type_decl_for_file(
     ))
 }
 
+/// Resolve scripted_ents.GetMember("class", "method") delegation patterns.
+///
+/// Detects patterns like:
+/// ```lua
+/// function ENT:SetupDataTables()
+///     local f = scripted_ents.GetMember("target_class", "SetupDataTables")
+///     f(self)
+/// end
+/// ```
+///
+/// When such a delegation is found, NetworkVar calls from the target entity's
+/// metadata are copied into the current entity's metadata so that
+/// `synthesize_scripted_class_members` will produce Get/Set members for them.
+fn resolve_getmember_network_var_delegations(
+    db: &mut DbIndex,
+    scripted_scope_files: &HashSet<FileId>,
+    context: &AnalyzeContext,
+) {
+    // Collect files to process: only scripted scope files whose source
+    // contains "scripted_ents.GetMember".  Collect into owned structures
+    // so we can drop the immutable VFS borrow before mutable db access.
+    let candidate_files: Vec<(FileId, LuaChunk, LuaTypeDeclId)> = {
+        let vfs = db.get_vfs();
+        context
+            .tree_list
+            .iter()
+            .filter(|t| scripted_scope_files.contains(&t.file_id))
+            .filter(|t| {
+                vfs.get_file_content(&t.file_id)
+                    .is_some_and(|c| c.contains("scripted_ents.GetMember"))
+            })
+            .filter_map(|t| {
+                let scope_match = db
+                    .get_gmod_infer_index()
+                    .get_scoped_class_info(&t.file_id)
+                    .cloned()?;
+                let class_decl_id = get_scripted_class_type_decl_id(
+                    &scope_match.global_name,
+                    &scope_match.class_name,
+                );
+                Some((t.file_id, t.value.clone(), class_decl_id))
+            })
+            .collect()
+    };
+
+    if candidate_files.is_empty() {
+        return;
+    }
+
+    // Build class_name -> file_ids reverse mapping only when there are
+    // delegating files to resolve; this avoids a full VFS scan on ordinary edits.
+    let class_file_map = build_class_file_map(db);
+
+    for (file_id, chunk, class_decl_id) in &candidate_files {
+        find_and_resolve_getmember_delegations(db, *file_id, class_decl_id, chunk, &class_file_map);
+    }
+}
+
+/// Build a mapping from class_name to all file ids for known scripted entity classes.
+fn build_class_file_map(db: &DbIndex) -> HashMap<String, Vec<FileId>> {
+    let mut map = HashMap::new();
+    let gmod_infer = db.get_gmod_infer_index();
+    let vfs = db.get_vfs();
+    let all_file_ids = vfs.get_all_file_ids();
+
+    for file_id in all_file_ids {
+        if let Some(info) = gmod_infer.get_scoped_class_info(&file_id) {
+            let is_init = vfs
+                .get_file_path(&file_id)
+                .and_then(|p| p.file_name().and_then(|name| name.to_str()))
+                .is_some_and(|name| name == "init.lua");
+            let file_ids = map.entry(info.class_name.clone()).or_insert_with(Vec::new);
+            if is_init {
+                file_ids.insert(0, file_id);
+            } else {
+                file_ids.push(file_id);
+            }
+        }
+    }
+
+    map
+}
+
+/// Walk a scripted class file's AST looking for `scripted_ents.GetMember` delegation
+/// patterns. When found, copy NetworkVar calls from the target class into this file's
+/// metadata.
+fn find_and_resolve_getmember_delegations(
+    db: &mut DbIndex,
+    current_file_id: FileId,
+    current_class_decl_id: &LuaTypeDeclId,
+    chunk: &LuaChunk,
+    class_file_map: &HashMap<String, Vec<FileId>>,
+) {
+    // Collect local variable names assigned from scripted_ents.GetMember calls.
+    // Map: local_name -> (target_class_name, target_method_name)
+    let mut getmember_locals: HashMap<String, (String, String)> = HashMap::new();
+
+    for node in chunk.syntax().descendants() {
+        // Match: local Name = scripted_ents.GetMember("class", "method")
+        if let Some(local_stat) = LuaLocalStat::cast(node.clone()) {
+            let local_names: Vec<LuaLocalName> = local_stat.get_local_name_list().collect();
+            let value_exprs: Vec<LuaExpr> = local_stat.get_value_exprs().collect();
+            for (i, local_name) in local_names.iter().enumerate() {
+                let Some(local_name_text) = local_name
+                    .get_name_token()
+                    .map(|t| t.get_name_text().to_string())
+                else {
+                    continue;
+                };
+
+                let Some(value_expr) = value_exprs.get(i) else {
+                    continue;
+                };
+
+                let LuaExpr::CallExpr(call_expr) = value_expr else {
+                    continue;
+                };
+
+                if let Some((target_class, target_method)) =
+                    extract_getmember_call(&call_expr, false)
+                {
+                    getmember_locals.insert(local_name_text, (target_class, target_method));
+                }
+            }
+        }
+
+        // Match: f(self) or f(self, ...) where f is a tracked local
+        if let Some(call_expr) = LuaCallExpr::cast(node) {
+            let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr() else {
+                continue;
+            };
+            let Some(caller_name) = name_expr.get_name_text() else {
+                continue;
+            };
+
+            let Some((target_class, target_method)) = getmember_locals.get(&caller_name) else {
+                continue;
+            };
+            if target_method != "SetupDataTables" {
+                continue;
+            }
+
+            // Verify the first argument is "self"
+            let Some(args_list) = call_expr.get_args_list() else {
+                continue;
+            };
+            let first_arg = args_list.get_args().next();
+            if !matches!(
+                first_arg.as_ref().map(|a| a.syntax().text()),
+                Some(t) if t == "self"
+            ) {
+                continue;
+            };
+
+            // Also check as a statement: f(self) as a statement
+            // Actually the descendant walk will hit both LuaCallExpr and
+            // LuaCallExprStat, and the LuaCallExpr inside a LuaCallExprStat
+            // will match either way.
+
+            // Look up the target class
+            if let Some(target_file_ids) = class_file_map.get(target_class) {
+                copy_network_var_calls_from(
+                    db,
+                    current_file_id,
+                    current_class_decl_id,
+                    target_file_ids,
+                );
+            }
+        }
+    }
+
+    // Also check direct calls: scripted_ents.GetMember("class", "method")(self)
+    for node in chunk.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        let Some(LuaExpr::CallExpr(inner_call)) = node.get_prefix_expr() else {
+            continue;
+        };
+        if let Some((target_class, target_method)) = extract_getmember_call(&inner_call, true) {
+            if target_method != "SetupDataTables" {
+                continue;
+            }
+
+            let Some(args_list) = node.get_args_list() else {
+                continue;
+            };
+            let first_arg = args_list.get_args().next();
+            if !matches!(
+                first_arg.as_ref().map(|a| a.syntax().text()),
+                Some(t) if t == "self"
+            ) {
+                continue;
+            };
+
+            if let Some(target_file_ids) = class_file_map.get(&target_class) {
+                copy_network_var_calls_from(
+                    db,
+                    current_file_id,
+                    current_class_decl_id,
+                    target_file_ids,
+                );
+            }
+        }
+    }
+}
+
+/// Extract (class_name, method_name) from a `scripted_ents.GetMember` call expression.
+/// `reject_parenthesized` controls whether parenthesized calls are rejected.
+fn extract_getmember_call(
+    call_expr: &LuaCallExpr,
+    reject_parenthesized: bool,
+) -> Option<(String, String)> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+
+    // Check for parenthesized: (scripted_ents.GetMember)(...)
+    if let LuaExpr::ParenExpr(paren_expr) = &prefix_expr {
+        let inner = paren_expr.get_expr()?;
+        if !matches!(inner, LuaExpr::IndexExpr(_)) {
+            return None;
+        }
+        if reject_parenthesized {
+            return None;
+        }
+    }
+
+    let index_expr = match &prefix_expr {
+        LuaExpr::IndexExpr(idx) => idx.clone(),
+        LuaExpr::ParenExpr(paren) => {
+            let inner = paren.get_expr()?;
+            if let LuaExpr::IndexExpr(idx) = inner {
+                idx.clone()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // Check the index key is "GetMember"
+    let key_match = match index_expr.get_index_key() {
+        Some(LuaIndexKey::Name(name_token)) => name_token.get_name_text() == "GetMember",
+        Some(LuaIndexKey::String(string_token)) => string_token.get_value() == "GetMember",
+        _ => false,
+    };
+    if !key_match {
+        return None;
+    }
+
+    // Check the prefix is "scripted_ents"
+    let prefix_match = match index_expr.get_prefix_expr() {
+        Some(LuaExpr::NameExpr(name_expr)) => {
+            name_expr.get_name_text().as_deref() == Some("scripted_ents")
+        }
+        _ => false,
+    };
+    if !prefix_match {
+        return None;
+    }
+
+    // Extract string literal arguments
+    let args_list = call_expr.get_args_list()?;
+    let args: Vec<LuaExpr> = args_list.get_args().collect();
+    let class_name = extract_string_literal(args.first()?)?;
+    let method_name = extract_string_literal(args.get(1)?)?;
+
+    Some((class_name, method_name))
+}
+
+/// Extract a string literal value from an expression, supporting parenthesized literals.
+fn extract_string_literal(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(literal) => match literal.get_literal() {
+            Some(LuaLiteralToken::String(s)) => Some(s.get_value().to_string()),
+            _ => None,
+        },
+        LuaExpr::ParenExpr(paren) => {
+            let inner = paren.get_expr()?;
+            extract_string_literal(&inner)
+        }
+        _ => None,
+    }
+}
+
+/// Copy NetworkVar and NetworkVarElement calls from the target entity's metadata
+/// into the current entity's metadata so they get synthesized as Get/Set members.
+fn copy_network_var_calls_from(
+    db: &mut DbIndex,
+    current_file_id: FileId,
+    _current_class_decl_id: &LuaTypeDeclId,
+    target_file_ids: &[FileId],
+) {
+    let target_metadata: Vec<_> = target_file_ids
+        .iter()
+        .filter_map(|target_file_id| {
+            db.get_gmod_class_metadata_index()
+                .get_file_metadata(target_file_id)
+                .cloned()
+        })
+        .collect();
+    if target_metadata.is_empty() {
+        return;
+    }
+
+    let metadata_index = db.get_gmod_class_metadata_index_mut();
+
+    for target_metadata in &target_metadata {
+        for nv_call in &target_metadata.network_var_calls {
+            metadata_index.add_call(
+                current_file_id,
+                GmodScriptedClassCallKind::NetworkVar,
+                nv_call.clone(),
+            );
+        }
+
+        for nve_call in &target_metadata.network_var_element_calls {
+            metadata_index.add_call(
+                current_file_id,
+                GmodScriptedClassCallKind::NetworkVarElement,
+                nve_call.clone(),
+            );
+        }
+    }
+}
+
 /// Synthesize typed members from AccessorFunc, NetworkVar, and DEFINE_BASECLASS
 /// calls for all files that have scripted class metadata.
 fn synthesize_scripted_class_members(
@@ -1634,7 +2125,8 @@ fn synthesize_scripted_class_members(
         };
 
         if let Some(ref scope_match) = scope_match {
-            let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+            let class_decl_id =
+                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             if let Some((effective_base_name, is_derive)) = resolve_effective_inheritance_base(
                 &metadata,
                 scope_match.class_name_prefix.as_deref(),
@@ -1668,7 +2160,8 @@ fn synthesize_scripted_class_members(
 
         // AccessorFunc: synthesize Get/Set/field members
         if let Some(ref scope_match) = scope_match {
-            let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+            let class_decl_id =
+                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.accessor_func_calls {
                 synthesize_accessor_func(db, file_id, &class_decl_id, call);
             }
@@ -1676,7 +2169,8 @@ fn synthesize_scripted_class_members(
 
         // NetworkVar: synthesize Get/Set members
         if let Some(ref scope_match) = scope_match {
-            let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+            let class_decl_id =
+                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.network_var_calls {
                 synthesize_network_var(db, file_id, &class_decl_id, call);
             }
@@ -1684,7 +2178,8 @@ fn synthesize_scripted_class_members(
 
         // NetworkVarElement: synthesize Get/Set members (always number type)
         if let Some(ref scope_match) = scope_match {
-            let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+            let class_decl_id =
+                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.network_var_element_calls {
                 synthesize_network_var_element(db, file_id, &class_decl_id, call);
             }
@@ -1898,7 +2393,8 @@ fn synthesize_network_var_wrappers(
             continue;
         };
 
-        let class_decl_id = LuaTypeDeclId::global(&scope_match.class_name);
+        let class_decl_id =
+            get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
 
         // Step 1: Collect wrapper definitions from method definitions
         let wrappers = collect_network_var_wrappers(root, &scope_match.global_name);
@@ -2900,6 +3396,7 @@ fn synthesize_panel_class(
             db.get_type_index_mut()
                 .add_super_type(class_decl_id.clone(), file_id, super_type);
         }
+        synthesize_panel_baseclass_member(db, file_id, &class_decl_id, base_name, call);
     }
 
     // Bind the table variable to the panel class
@@ -2973,6 +3470,37 @@ fn synthesize_panel_class(
     }
 }
 
+fn synthesize_panel_baseclass_member(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    base_name: &str,
+    call: &GmodScriptedClassCallMetadata,
+) {
+    let owner = LuaMemberOwner::Type(class_decl_id.clone());
+    let member_key = LuaMemberKey::Name("BaseClass".into());
+    if db
+        .get_member_index()
+        .get_member_item(&owner, &member_key)
+        .is_some()
+    {
+        return;
+    }
+
+    let syntax_id = call
+        .args
+        .get(2)
+        .map(|arg| arg.syntax_id)
+        .unwrap_or(call.syntax_id);
+    let member_id = LuaMemberId::new(syntax_id, file_id);
+    let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
+    db.get_member_index_mut().add_member(owner, member);
+    db.get_type_index_mut().bind_type(
+        member_id.into(),
+        LuaTypeCache::DocType(LuaType::Ref(LuaTypeDeclId::global(base_name))),
+    );
+}
+
 /// Resolve AccessorFunc force type argument to a LuaType.
 fn resolve_accessor_force_type(force_arg: Option<&GmodClassCallLiteral>) -> LuaType {
     match force_arg {
@@ -3041,18 +3569,6 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
             class_name: scope_match.class_name,
             class_name_prefix: scope_match.definition.class_name_prefix,
         })
-}
-
-/// Returns the gmod scripted-class name that the given file belongs to, if any.
-/// For example, a file at `lua/entities/base_glide_car/sv_braking.lua` returns
-/// `Some("base_glide_car")`.
-/// Uses cached scoped class info when available (populated during gmod_pre phase),
-/// falling back to path detection.
-pub fn get_gmod_class_name_for_file(db: &DbIndex, file_id: FileId) -> Option<String> {
-    if let Some(info) = db.get_gmod_infer_index().get_scoped_class_info(&file_id) {
-        return Some(info.class_name.clone());
-    }
-    detect_scoped_class_from_path(db, file_id).map(|m| m.class_name)
 }
 
 /// Returns the scripted class info `(class_name, global_name)` for a file, if it belongs to a

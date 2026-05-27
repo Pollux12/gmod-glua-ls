@@ -7,15 +7,6 @@ mod test {
 
     use crate::{DiagnosticCode, LuaSignatureId, LuaType, LuaTypeDeclId, VirtualWorkspace};
 
-    fn assert_union_contains_unknown_and(typ: LuaType, expected: LuaType) {
-        let LuaType::Union(union) = typ else {
-            panic!("expected union return type");
-        };
-        let types = union.into_vec();
-        assert!(types.contains(&LuaType::Unknown), "{types:?}");
-        assert!(types.contains(&expected), "{types:?}");
-    }
-
     fn nth_name_expr_type_from_end(
         ws: &mut VirtualWorkspace,
         file_id: crate::FileId,
@@ -164,7 +155,39 @@ mod test {
     }
 
     #[gtest]
-    fn test_str_tpl_generic_function_body_return_is_not_erased_by_any_branch() {
+    fn test_str_tpl_generic_override_with_extra_param_preserves_instantiated_return() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Entity
+                ---@class letter: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                local originalCreate = ents.Create
+                function ents.Create(name, safety)
+                    if originalCreate then
+                        return originalCreate(name)
+                    end
+                    return nil
+                end
+            "#,
+        );
+
+        let spawned_ty = ws.expr_ty("ents.Create(\"letter\", \"meow\")");
+        let expected = ws.ty("letter");
+        assert_eq!(spawned_ty, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_function_body_return_is_not_poisoned_by_any_branch() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -200,7 +223,7 @@ mod test {
 
         let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
         let expected = ws.ty("glide_wheel");
-        assert_union_contains_unknown_and(wheel_ty, expected);
+        assert_eq!(wheel_ty, expected);
     }
 
     #[gtest]
@@ -223,7 +246,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_unknown_return_branch_is_preserved_before_precise_branch() {
+    fn test_unknown_return_branch_does_not_poison_precise_later_branch() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -259,11 +282,11 @@ mod test {
 
         let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
         let expected = ws.ty("glide_wheel");
-        assert_union_contains_unknown_and(wheel_ty, expected);
+        assert_eq!(wheel_ty, expected);
     }
 
     #[gtest]
-    fn test_unknown_return_branch_is_preserved_after_precise_branch() {
+    fn test_unknown_return_branch_does_not_poison_precise_earlier_branch() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -298,7 +321,7 @@ mod test {
 
         let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
         let expected = ws.ty("glide_wheel");
-        assert_union_contains_unknown_and(wheel_ty, expected);
+        assert_eq!(wheel_ty, expected);
     }
 
     #[gtest]
@@ -431,7 +454,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_unresolved_return_branch_is_not_dropped_for_precise_later_return() {
+    fn test_unresolved_return_branch_does_not_poison_precise_later_return() {
         let mut ws = VirtualWorkspace::new();
 
         let file_id = ws.def_file(
@@ -463,7 +486,7 @@ mod test {
 
         let expected = LuaType::Ref(LuaTypeDeclId::global("glide_wheel"));
         let signature_return = signature_return_type_for_function(&mut ws, file_id, "CreateWheel");
-        assert_union_contains_unknown_and(signature_return, expected);
+        assert_eq!(signature_return, expected);
     }
 
     #[gtest]

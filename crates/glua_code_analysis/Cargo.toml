@@ -14,6 +14,10 @@ include = [
     "src/**",
     "resources/**",
 ]
+
+[lib]
+doctest = false
+
 [dev-dependencies]
 googletest.workspace = true
 
@@ -53,6 +57,7 @@ itertools.workspace = true
 luars.workspace = true
 reqwest.workspace = true
 schema_to_glua.workspace = true
+rustc-hash.workspace = true
 
 [package.metadata.i18n]
 available-locales = ["en", "zh_CN", "zh_HK"]

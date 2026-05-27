@@ -1,17 +1,15 @@
-use std::path::Path;
-
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaNameExpr,
-    LuaVarExpr,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr,
+    LuaNameExpr, LuaVarExpr,
 };
 use rowan::TextSize;
-use wax::Pattern;
 
 use super::{InferFailReason, InferResult, infer_expr};
 use crate::{
-    FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, TypeOps,
-    compilation::analyzer::infer_for_range_iter_expr_func,
+    CacheEntry, FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel,
+    TypeOps,
+    compilation::{analyzer::infer_for_range_iter_expr_func, get_scripted_class_type_decl_id},
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
     semantic::{
@@ -28,7 +26,10 @@ pub fn infer_name_expr(
     let name_token = name_expr.get_name_token().ok_or(InferFailReason::None)?;
     let name = name_token.get_name_text();
     match name {
-        "self" => return infer_self(db, cache, name_expr),
+        "self" => {
+            cache.prof_name_self_calls += 1;
+            return infer_self(db, cache, name_expr);
+        }
         "_G" => return Ok(LuaType::Global),
         _ => {}
     }
@@ -40,12 +41,8 @@ pub fn infer_name_expr(
         .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&range));
     let result = if let Some(decl_id) = decl_id {
-        infer_expr_narrow_type(
-            db,
-            cache,
-            LuaExpr::NameExpr(name_expr.clone()),
-            VarRefId::VarRef(decl_id),
-        )
+        cache.prof_name_local_calls += 1;
+        infer_local_decl_name_type(db, cache, &name_expr, decl_id)
     } else {
         if let Some(implicit_module_type) =
             infer_legacy_module_implicit_type(db, file_id, name_expr.get_position(), name)
@@ -62,19 +59,27 @@ pub fn infer_name_expr(
         }
 
         match get_name_expr_var_ref_id(db, cache, &name_expr) {
-            Some(VarRefId::GlobalName(_, _)) => infer_expr_narrow_type(
-                db,
-                cache,
-                LuaExpr::NameExpr(name_expr.clone()),
-                VarRefId::GlobalName(
-                    internment::ArcIntern::new(smol_str::SmolStr::new(name)),
-                    name_expr.get_position(),
-                ),
-            )
-            .or_else(|_| {
-                infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-            }),
-            Some(_) | None => {
+            Some(var_ref_id) => {
+                cache.prof_name_narrow_calls += 1;
+                let narrow_start =
+                    log::log_enabled!(log::Level::Info).then(std::time::Instant::now);
+                let result = infer_expr_narrow_type(
+                    db,
+                    cache,
+                    LuaExpr::NameExpr(name_expr.clone()),
+                    var_ref_id,
+                )
+                .or_else(|_| {
+                    cache.prof_name_global_calls += 1;
+                    infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+                });
+                if let Some(start) = narrow_start {
+                    cache.prof_name_narrow_time_ns += start.elapsed().as_nanos() as u64;
+                }
+                result
+            }
+            None => {
+                cache.prof_name_global_calls += 1;
                 infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
             }
         }
@@ -103,12 +108,43 @@ pub fn infer_name_expr(
     result
 }
 
+fn infer_local_decl_name_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+    decl_id: LuaDeclId,
+) -> InferResult {
+    let var_ref_id = VarRefId::VarRef(decl_id);
+    let result =
+        infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id);
+    if let Ok(typ) = &result
+        && let Some(initializer_type) = try_local_decl_initializer_fallback_type(
+            db,
+            cache,
+            decl_id,
+            typ,
+            name_expr.get_position(),
+        )
+    {
+        return Ok(initializer_type);
+    }
+
+    result
+}
+
 fn try_infer_enclosing_for_range_iter_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
     decl_id: LuaDeclId,
 ) -> Option<LuaType> {
+    if let Some(cached) = cache.for_range_iter_var_type_cache.get(&decl_id).cloned() {
+        return match cached {
+            CacheEntry::Cache(typ) => Some(typ),
+            CacheEntry::Ready | CacheEntry::Error(_) => None,
+        };
+    }
+
     let for_range = name_expr
         .syntax()
         .ancestors()
@@ -118,13 +154,268 @@ fn try_infer_enclosing_for_range_iter_type(
         .enumerate()
         .find_map(|(idx, var_name)| (var_name.get_position() == decl_id.position).then_some(idx))?;
     let iter_exprs = for_range.get_expr_list().collect::<Vec<_>>();
-    let iter_var_types = infer_for_range_iter_expr_func(db, cache, &iter_exprs).ok()?;
+    cache
+        .for_range_iter_var_type_cache
+        .insert(decl_id, CacheEntry::Ready);
+    let iter_var_types = match infer_for_range_iter_expr_func(db, cache, &iter_exprs) {
+        Ok(iter_var_types) => iter_var_types,
+        Err(reason) => {
+            cache
+                .for_range_iter_var_type_cache
+                .insert(decl_id, CacheEntry::Error(reason));
+            return None;
+        }
+    };
     let ret_type = iter_var_types
         .get_type(var_idx)
         .cloned()
         .unwrap_or(LuaType::Unknown);
+    let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
+    cache
+        .for_range_iter_var_type_cache
+        .insert(decl_id, CacheEntry::Cache(ret_type.clone()));
 
-    Some(TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil))
+    Some(ret_type)
+}
+
+pub(crate) fn try_local_decl_initializer_fallback_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+    current_type: &LuaType,
+    query_position: TextSize,
+) -> Option<LuaType> {
+    if current_type.is_never() {
+        if has_local_reassignment_between(db, cache, decl_id, query_position) {
+            return None;
+        }
+
+        return try_infer_local_initializer_type(db, cache, decl_id);
+    }
+
+    if let Some(alias_type) = try_infer_flow_sensitive_alias_initializer_type(
+        db,
+        cache,
+        decl_id,
+        current_type,
+        query_position,
+    ) {
+        return Some(alias_type);
+    }
+
+    if !((current_type.is_unknown() || current_type.is_nil())
+        && local_decl_type_cache_is_inferred(db, decl_id)
+        && is_gmod_dynamic_initializer(db, decl_id))
+    {
+        return None;
+    }
+
+    if has_local_reassignment_between(db, cache, decl_id, query_position) {
+        return None;
+    }
+
+    let initializer_type = try_infer_local_initializer_type(db, cache, decl_id)?;
+    (!initializer_type.is_never() && !initializer_type.is_nil() && !initializer_type.is_unknown())
+        .then_some(initializer_type)
+}
+
+fn try_infer_flow_sensitive_alias_initializer_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+    current_type: &LuaType,
+    query_position: TextSize,
+) -> Option<LuaType> {
+    if !(current_type.is_unknown() || current_type.is_nil() || current_type.is_table()) {
+        return None;
+    }
+
+    if has_local_reassignment_between(db, cache, decl_id, query_position) {
+        return None;
+    }
+
+    let (_, initializer_expr) = local_initializer_expr(db, decl_id)?;
+    if !matches!(
+        initializer_expr,
+        LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)
+    ) {
+        return None;
+    }
+
+    let initializer_ref =
+        super::narrow::get_var_expr_var_ref_id(db, cache, initializer_expr.clone())?;
+    if !db.get_flow_index().has_special_call_effect_before(
+        &decl_id.file_id,
+        decl_id.position,
+        &initializer_ref,
+    ) {
+        return None;
+    }
+
+    let initializer_type = infer_expr(db, cache, initializer_expr).ok()?;
+    (!initializer_type.is_never()
+        && !initializer_type.is_nil()
+        && !initializer_type.is_unknown()
+        && !initializer_type.is_table())
+    .then_some(initializer_type)
+}
+
+fn has_local_reassignment_between(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+    query_position: TextSize,
+) -> bool {
+    let profile_start = if log::log_enabled!(log::Level::Info) {
+        cache.prof_local_reassign_calls += 1;
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
+    if query_position <= decl_id.position {
+        finish_local_reassignment_profile(cache, profile_start, false);
+        return false;
+    }
+
+    if !cache.local_reassignments_indexed {
+        collect_local_reassignment_positions(db, cache, profile_start.is_some());
+    }
+
+    let result = cache
+        .local_reassignment_positions_cache
+        .get(&decl_id)
+        .and_then(|positions| positions.first())
+        .is_some_and(|position| *position < query_position);
+
+    finish_local_reassignment_profile(cache, profile_start, result);
+    result
+}
+
+fn collect_local_reassignment_positions(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    profile_enabled: bool,
+) {
+    cache.local_reassignments_indexed = true;
+    let file_id = cache.get_file_id();
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return;
+    };
+
+    let references = db.get_reference_index().get_local_reference(&file_id);
+    let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
+    for assign_stat in root.descendants().filter_map(LuaAssignStat::cast) {
+        if profile_enabled {
+            cache.prof_local_reassign_assign_scans += 1;
+        }
+        let position = assign_stat.get_position();
+
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        for var in vars {
+            if profile_enabled {
+                cache.prof_local_reassign_var_checks += 1;
+            }
+            let LuaVarExpr::NameExpr(name_expr) = var else {
+                continue;
+            };
+
+            let assigned_decl_id = references
+                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
+                .or_else(|| assignment_name_decl_id(decl_tree, &name_expr));
+            let Some(assigned_decl_id) = assigned_decl_id else {
+                continue;
+            };
+            if assigned_decl_id.file_id != file_id || position <= assigned_decl_id.position {
+                continue;
+            }
+
+            cache
+                .local_reassignment_positions_cache
+                .entry(assigned_decl_id)
+                .or_default()
+                .push(position);
+        }
+    }
+
+    for positions in cache.local_reassignment_positions_cache.values_mut() {
+        positions.sort_unstable();
+        positions.dedup();
+    }
+}
+
+fn finish_local_reassignment_profile(
+    cache: &mut LuaInferCache,
+    profile_start: Option<std::time::Instant>,
+    hit: bool,
+) {
+    if let Some(start) = profile_start {
+        cache.prof_local_reassign_time_ns += start.elapsed().as_nanos() as u64;
+        if hit {
+            cache.prof_local_reassign_hits += 1;
+        }
+    }
+}
+
+fn assignment_name_decl_id(
+    decl_tree: Option<&crate::LuaDeclarationTree>,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaDeclId> {
+    let name = name_expr.get_name_text()?;
+
+    decl_tree
+        .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
+        .map(|decl| decl.get_id())
+}
+
+fn try_infer_local_initializer_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+) -> Option<LuaType> {
+    let (initializer_ret_idx, expr) = local_initializer_expr(db, decl_id)?;
+    let init_type = match infer_expr(db, cache, expr).ok()? {
+        LuaType::Variadic(variadic) => variadic
+            .get_type(initializer_ret_idx)
+            .cloned()
+            .unwrap_or(LuaType::Nil),
+        ty if initializer_ret_idx == 0 => ty,
+        _ => LuaType::Nil,
+    };
+
+    (!init_type.is_never() && !init_type.is_nil()).then_some(init_type)
+}
+
+fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)?
+        .get_red_root();
+    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
+}
+
+fn local_decl_type_cache_is_inferred(db: &DbIndex, decl_id: LuaDeclId) -> bool {
+    db.get_type_index()
+        .get_type_cache(&decl_id.into())
+        .is_some_and(|type_cache| type_cache.is_infer())
+}
+
+fn is_gmod_dynamic_initializer(db: &DbIndex, decl_id: LuaDeclId) -> bool {
+    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+        return false;
+    }
+
+    matches!(
+        local_initializer_expr(db, decl_id),
+        Some((_, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_)))
+    )
 }
 
 fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Option<LuaType> {
@@ -152,14 +443,25 @@ pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
     cache: &mut LuaInferCache,
     name: &str,
 ) -> Option<LuaTypeDeclId> {
-    if !db.get_emmyrc().gmod.enabled
-        || !db
-            .get_emmyrc()
-            .gmod
-            .scripted_class_scopes
-            .resolved_definitions()
-            .iter()
-            .any(|definition| definition.class_global == name)
+    if !db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    if let Some(info) = db
+        .get_gmod_infer_index()
+        .get_scoped_class_info(&cache.get_file_id())
+    {
+        return (info.global_name == name)
+            .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name));
+    }
+
+    if !db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions()
+        .iter()
+        .any(|definition| definition.class_global == name)
     {
         return None;
     }
@@ -169,7 +471,7 @@ pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
         return None;
     }
 
-    Some(LuaTypeDeclId::global(&class_name))
+    Some(get_scripted_class_type_decl_id(&global_name, &class_name))
 }
 
 fn detect_scoped_global_from_path_cached(
@@ -202,98 +504,10 @@ fn detect_scoped_global_from_path(db: &DbIndex, file_id: FileId) -> Option<(Stri
 
 fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-    let include_patterns = scopes.include_patterns();
-    let exclude_patterns = scopes.exclude_patterns();
-    if include_patterns.is_empty() && exclude_patterns.is_empty() {
-        return true;
-    }
-
     let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
-        return include_patterns.is_empty();
+        return scopes.resolved_definitions().is_empty();
     };
-
-    let normalized_path = file_path.to_string_lossy().replace('\\', "/");
-    let mut candidate_paths = Vec::new();
-    push_path_candidates(&mut candidate_paths, &normalized_path);
-    let normalized_lower = normalized_path.to_ascii_lowercase();
-    if let Some(lua_idx) = normalized_lower.find("/lua/") {
-        let lua_relative_path = normalized_path[lua_idx + 1..].to_string();
-        push_path_candidates(&mut candidate_paths, &lua_relative_path);
-        if let Some(stripped) = lua_relative_path.strip_prefix("lua/") {
-            push_path_candidates(&mut candidate_paths, stripped);
-        }
-    }
-    if let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) {
-        push_candidate_path(&mut candidate_paths, file_name);
-    }
-
-    if !include_patterns.is_empty() {
-        let include_set = match wax::any(
-            include_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(glob) => glob,
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.include pattern: {err}");
-                return true;
-            }
-        };
-        if !candidate_paths
-            .iter()
-            .any(|path| include_set.is_match(Path::new(path)))
-        {
-            return false;
-        }
-    }
-
-    if !exclude_patterns.is_empty() {
-        let exclude_set = match wax::any(
-            exclude_patterns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        ) {
-            Ok(glob) => glob,
-            Err(err) => {
-                log::warn!("Invalid gmod.scriptedClassScopes.exclude pattern: {err}");
-                return false;
-            }
-        };
-        if candidate_paths
-            .iter()
-            .any(|path| exclude_set.is_match(Path::new(path)))
-        {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn push_path_candidates(candidate_paths: &mut Vec<String>, path: &str) {
-    push_candidate_path(candidate_paths, path);
-
-    let segments = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    for idx in 0..segments.len() {
-        push_candidate_path(candidate_paths, &segments[idx..].join("/"));
-    }
-}
-
-fn push_candidate_path(candidate_paths: &mut Vec<String>, candidate: &str) {
-    if candidate.is_empty() {
-        return;
-    }
-
-    if candidate_paths.iter().any(|existing| existing == candidate) {
-        return;
-    }
-
-    candidate_paths.push(candidate.to_string());
+    scopes.is_file_in_scope(file_path)
 }
 
 fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -> InferResult {
@@ -356,6 +570,16 @@ fn infer_scoped_implicit_self_type_inner(
         return None;
     };
     let prefix_name = prefix_name_expr.get_name_text()?;
+    let file_id = cache.get_file_id();
+    let prefix_decl = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&prefix_name_expr.get_range()))
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))?;
+    if !prefix_decl.is_seeded_class_local() {
+        return None;
+    }
+
     let class_decl_id = resolve_scoped_scripted_global_type_decl_id(db, cache, &prefix_name)?;
     Some(LuaType::Def(class_decl_id))
 }
@@ -740,6 +964,13 @@ pub fn infer_global_type(
     call_offset: Option<TextSize>,
     name: &str,
 ) -> InferResult {
+    if db.get_emmyrc().gmod.enabled && name == "NULL" {
+        let null_decl_id = LuaTypeDeclId::global("NULL");
+        if db.get_type_index().get_type_decl(&null_decl_id).is_some() {
+            return Ok(LuaType::Ref(null_decl_id));
+        }
+    }
+
     if let Some(module_decl_type) =
         infer_legacy_module_local_type(db, current_file_id, call_offset, name)
     {

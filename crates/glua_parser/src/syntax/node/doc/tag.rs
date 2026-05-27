@@ -48,6 +48,7 @@ pub enum LuaDocTag {
     Language(LuaDocTagLanguage),
     Realm(LuaDocTagRealm),
     Fileparam(LuaDocTagFileparam),
+    Outparam(LuaDocTagOutparam),
 }
 
 impl LuaAstNode for LuaDocTag {
@@ -87,6 +88,7 @@ impl LuaAstNode for LuaDocTag {
             LuaDocTag::AttributeUse(it) => it.syntax(),
             LuaDocTag::Realm(it) => it.syntax(),
             LuaDocTag::Fileparam(it) => it.syntax(),
+            LuaDocTag::Outparam(it) => it.syntax(),
         }
     }
 
@@ -128,6 +130,7 @@ impl LuaAstNode for LuaDocTag {
             || kind == LuaSyntaxKind::DocTagSchema
             || kind == LuaSyntaxKind::DocTagRealm
             || kind == LuaSyntaxKind::DocTagFileparam
+            || kind == LuaSyntaxKind::DocTagOutparam
     }
 
     fn cast(syntax: LuaSyntaxNode) -> Option<Self>
@@ -232,6 +235,9 @@ impl LuaAstNode for LuaDocTag {
             }
             LuaSyntaxKind::DocTagFileparam => Some(LuaDocTag::Fileparam(
                 LuaDocTagFileparam::cast(syntax).unwrap(),
+            )),
+            LuaSyntaxKind::DocTagOutparam => Some(LuaDocTag::Outparam(
+                LuaDocTagOutparam::cast(syntax).unwrap(),
             )),
             _ => None,
         }
@@ -522,6 +528,72 @@ impl LuaAstNode for LuaDocTagParam {
 
 impl LuaDocDescriptionOwner for LuaDocTagParam {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LuaDocTagDefaultValue {
+    Nil,
+    Boolean(bool),
+    Number(String),
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaDocDefaultValue {
+    syntax: LuaSyntaxNode,
+}
+
+impl LuaAstNode for LuaDocDefaultValue {
+    fn syntax(&self) -> &LuaSyntaxNode {
+        &self.syntax
+    }
+
+    fn can_cast(kind: LuaSyntaxKind) -> bool
+    where
+        Self: Sized,
+    {
+        kind == LuaSyntaxKind::DocDefaultValue
+    }
+
+    fn cast(syntax: LuaSyntaxNode) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        if Self::can_cast(syntax.kind().into()) {
+            Some(Self { syntax })
+        } else {
+            None
+        }
+    }
+}
+
+impl LuaDocDefaultValue {
+    pub fn get_value(&self) -> Option<LuaDocTagDefaultValue> {
+        let mut sign = "";
+        for token in self.tokens::<LuaGeneralToken>() {
+            let token_kind = token.get_token_kind();
+            match token_kind {
+                LuaTokenKind::TkPlus => sign = "+",
+                LuaTokenKind::TkMinus => sign = "-",
+                LuaTokenKind::TkNil => return Some(LuaDocTagDefaultValue::Nil),
+                LuaTokenKind::TkTrue => return Some(LuaDocTagDefaultValue::Boolean(true)),
+                LuaTokenKind::TkFalse => return Some(LuaDocTagDefaultValue::Boolean(false)),
+                LuaTokenKind::TkInt | LuaTokenKind::TkFloat => {
+                    return Some(LuaDocTagDefaultValue::Number(format!(
+                        "{sign}{}",
+                        token.get_text()
+                    )));
+                }
+                LuaTokenKind::TkString => {
+                    let string_token = LuaStringToken::cast(token.syntax().clone())?;
+                    return Some(LuaDocTagDefaultValue::String(string_token.get_value()));
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+}
+
 impl LuaDocTagParam {
     pub fn get_name_token(&self) -> Option<LuaNameToken> {
         self.token()
@@ -536,7 +608,23 @@ impl LuaDocTagParam {
     }
 
     pub fn get_type(&self) -> Option<LuaDocType> {
-        self.child()
+        self.children::<LuaDocType>().last()
+    }
+
+    pub fn get_default_value(&self) -> Option<LuaDocTagDefaultValue> {
+        let type_range = self.get_type()?.syntax().text_range();
+        let mut left_default = None;
+        let mut right_default = None;
+        for default in self.children::<LuaDocDefaultValue>() {
+            let range = default.syntax().text_range();
+            if range.end() <= type_range.start() {
+                left_default = default.get_value();
+            } else if range.start() >= type_range.end() {
+                right_default = default.get_value();
+            }
+        }
+
+        left_default.or(right_default)
     }
 }
 
@@ -585,20 +673,39 @@ impl LuaDocTagReturn {
     }
 
     pub fn get_info_list(&self) -> Vec<(LuaDocType, Option<LuaNameToken>)> {
+        self.get_info_list_with_default()
+            .into_iter()
+            .map(|(doc_type, name, _)| (doc_type, name))
+            .collect()
+    }
+
+    pub fn get_info_list_with_default(
+        &self,
+    ) -> Vec<(
+        LuaDocType,
+        Option<LuaNameToken>,
+        Option<LuaDocTagDefaultValue>,
+    )> {
         let mut result = Vec::new();
         let mut current_type = None;
         let mut current_name = None;
+        let mut current_default = None;
         for child in self.syntax.children_with_tokens() {
             match child.kind() {
                 LuaKind::Token(LuaTokenKind::TkComma) => {
                     if let Some(type_) = current_type {
-                        result.push((type_, current_name));
+                        result.push((type_, current_name, current_default));
                     }
                     current_type = None;
                     current_name = None;
+                    current_default = None;
                 }
                 LuaKind::Token(LuaTokenKind::TkName) => {
                     current_name = Some(LuaNameToken::cast(child.into_token().unwrap()).unwrap());
+                }
+                k if LuaDocDefaultValue::can_cast(k.into()) => {
+                    current_default = LuaDocDefaultValue::cast(child.into_node().unwrap())
+                        .and_then(|default| default.get_value());
                 }
                 k if LuaDocType::can_cast(k.into()) => {
                     current_type = Some(LuaDocType::cast(child.into_node().unwrap()).unwrap());
@@ -608,7 +715,7 @@ impl LuaDocTagReturn {
         }
 
         if let Some(type_) = current_type {
-            result.push((type_, current_name));
+            result.push((type_, current_name, current_default));
         }
 
         result
@@ -733,7 +840,7 @@ impl LuaDocTagField {
     }
 
     pub fn get_type(&self) -> Option<LuaDocType> {
-        self.children().last()
+        self.children::<LuaDocType>().last()
     }
 
     pub fn is_nullable(&self) -> bool {
@@ -746,6 +853,22 @@ impl LuaDocTagField {
 
     pub fn get_type_flag(&self) -> Option<LuaDocTypeFlag> {
         self.child()
+    }
+
+    pub fn get_default_value(&self) -> Option<LuaDocTagDefaultValue> {
+        let type_range = self.get_type()?.syntax().text_range();
+        let mut left_default = None;
+        let mut right_default = None;
+        for default in self.children::<LuaDocDefaultValue>() {
+            let range = default.syntax().text_range();
+            if range.end() <= type_range.start() {
+                left_default = default.get_value();
+            } else if range.start() >= type_range.end() {
+                right_default = default.get_value();
+            }
+        }
+
+        left_default.or(right_default)
     }
 }
 
@@ -1383,6 +1506,60 @@ impl LuaDocDescriptionOwner for LuaDocTagFileparam {}
 impl LuaDocTagFileparam {
     pub fn get_name_token(&self) -> Option<LuaNameToken> {
         self.token()
+    }
+
+    pub fn get_type(&self) -> Option<LuaDocType> {
+        self.child()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaDocTagOutparam {
+    syntax: LuaSyntaxNode,
+}
+
+impl LuaAstNode for LuaDocTagOutparam {
+    fn syntax(&self) -> &LuaSyntaxNode {
+        &self.syntax
+    }
+
+    fn can_cast(kind: LuaSyntaxKind) -> bool
+    where
+        Self: Sized,
+    {
+        kind == LuaSyntaxKind::DocTagOutparam
+    }
+
+    fn cast(syntax: LuaSyntaxNode) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        if Self::can_cast(syntax.kind().into()) {
+            Some(Self { syntax })
+        } else {
+            None
+        }
+    }
+}
+
+impl LuaDocDescriptionOwner for LuaDocTagOutparam {}
+
+impl LuaDocTagOutparam {
+    pub fn get_path(&self) -> Option<String> {
+        let mut path = String::new();
+        for child in self.syntax.children_with_tokens() {
+            let Some(token) = child.as_token() else {
+                break;
+            };
+            let kind: LuaTokenKind = token.kind().into();
+            match kind {
+                LuaTokenKind::TkTagOutparam | LuaTokenKind::TkWhitespace => continue,
+                LuaTokenKind::TkName | LuaTokenKind::TkDot => path.push_str(token.text()),
+                _ => break,
+            }
+        }
+
+        (!path.is_empty()).then_some(path)
     }
 
     pub fn get_type(&self) -> Option<LuaDocType> {

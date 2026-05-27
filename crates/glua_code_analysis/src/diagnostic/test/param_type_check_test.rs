@@ -5,7 +5,7 @@ mod test {
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
 
     #[test]
     fn test_issue_216() {
@@ -60,6 +60,169 @@ mod test {
             r#"
             local a, b = pcall(string.rep, "a", 10000)
         "#
+        ));
+    }
+
+    #[test]
+    fn test_numeric_alias_union_is_compatible_with_number_param() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@alias BUTTON_CODE number
+
+            ---@param code number
+            local function isDown(code) end
+
+            ---@type BUTTON_CODE|number
+            local key
+
+            isDown(key)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_pcall_variadic_generic_accepts_class_arg_from_unresolved_callable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+
+            ---@type table[]
+            local indicators = {}
+
+            ---@param vehicle Entity
+            local function ResetHUDForVehicle(vehicle)
+                for _, indicator in ipairs(indicators) do
+                    if indicator.getValue then
+                        pcall(indicator.getValue, vehicle)
+                    end
+                end
+            end
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_required_table_field_assigned_from_reused_unresolved_local_is_not_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@class HullTrace
+            ---@field start Vector
+            ---@field endpos Vector
+
+            ---@param trace HullTrace
+            function TraceHull(trace) end
+
+            local pos
+            local traceData = {}
+
+            local function Fire(params)
+                pos = params.pos
+                traceData.start = pos
+                traceData.endpos = pos
+                TraceHull(traceData)
+            end
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_required_table_field_assigned_explicit_nil_still_mismatches() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@class HullTrace
+            ---@field start Vector
+            ---@field endpos Vector
+
+            ---@param trace HullTrace
+            function TraceHull(trace) end
+
+            local traceData = {}
+            traceData.start = nil
+            traceData.endpos = nil
+            TraceHull(traceData)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_required_table_field_assigned_known_wrong_type_still_mismatches() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@class HullTrace
+            ---@field start Vector
+            ---@field endpos Vector
+
+            ---@param trace HullTrace
+            function TraceHull(trace) end
+
+            local traceData = {}
+            traceData.start = "wrong"
+            traceData.endpos = "wrong"
+            TraceHull(traceData)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_inferred_dynamic_table_field_before_assignment_is_lenient_by_default() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r##"
+            util = {}
+
+            ---@return table?
+            function util.JSONToTable(s) end
+
+            ---@return table
+            local function read_table()
+                return util.JSONToTable("") or {}
+            end
+
+            ---@param value string
+            ---@return string
+            local function first_char(value)
+                return value
+            end
+
+            ---@param value string
+            ---@return string
+            local function translate(value)
+                return value
+            end
+
+            local data = read_table()
+
+            if first_char(data.text) == "#" then
+                data.text = translate(data.text)
+            end
+        "##,
         ));
     }
 
@@ -1474,7 +1637,7 @@ mod test {
         function pairs(t) end
         "#,
         );
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
             ---@type {[string]: number}
@@ -1484,7 +1647,7 @@ mod test {
             end
         "#
         ));
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
             ---@alias MatchersObject {[string]: number}
@@ -1652,6 +1815,227 @@ mod test {
             end
             "#,
         ));
+    }
+
+    #[test]
+    fn test_vgui_instance_close_override_does_not_poison_sibling_dframe_close() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+
+        ws.def(
+            r#"
+            ---@class DFrame
+            local DFrame = {}
+
+            function DFrame:Close()
+            end
+
+            vgui = {}
+
+            ---@generic T: DFrame
+            ---@param className `T`
+            ---@return T
+            function vgui.Create(className)
+            end
+
+            function vgui.Register(name, tbl, base)
+            end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/vgui/editor.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.Close = function(s)
+                end
+            end
+
+            vgui.Register("EditorFrame", PANEL, "DFrame")
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/browser.lua",
+            r#"
+            local PANEL = {}
+
+            vgui.Register("BrowserFrame", PANEL, "DFrame")
+
+            local frame = vgui.Create("BrowserFrame")
+            frame:Close()
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics.iter().all(|diag| diag.code != param_type_code),
+            "unexpected param-type-mismatch diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_array_slots_reassigned_from_struct_literals_use_reassigned_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@field Remove fun(self: Panel)
+
+            ---@class DPanel: Panel
+
+            ---@class DLabel: Panel
+
+            vgui = {}
+
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@param parent Panel?
+            ---@return T
+            function vgui.Create(classname, parent)
+            end
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        let file_id = ws.def(
+            r#"
+                ---@type Panel
+                local parent = {}
+                parent.Tabs = {
+                    { Title = "Tab 1", Tip = "Tip 1" },
+                    { Title = "Tab 2", Tip = "Tip 2" },
+                }
+
+                for i = 1, #parent.Tabs do
+                    parent.Tabs[i] = vgui.Create("DPanel", parent)
+                end
+
+                parent.Tabs[1].Label = vgui.Create("DLabel", parent.Tabs[1])
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics.iter().all(|diag| diag.code != param_type_code),
+            "unexpected param-type-mismatch diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_array_slot_overwrite_after_reassignment_still_errors() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Panel
+
+            ---@class DPanel: Panel
+
+            ---@class DLabel: Panel
+
+            vgui = {}
+
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@param parent Panel?
+            ---@return T
+            function vgui.Create(classname, parent)
+            end
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+                ---@type Panel
+                local parent = {}
+                parent.Tabs = {
+                    { Title = "Tab 1", Tip = "Tip 1" },
+                    { Title = "Tab 2", Tip = "Tip 2" },
+                }
+
+                for i = 1, #parent.Tabs do
+                    parent.Tabs[i] = vgui.Create("DPanel", parent)
+                end
+
+                parent.Tabs[1] = "not a panel"
+                parent.Tabs[1].Label = vgui.Create("DLabel", parent.Tabs[1])
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_other_array_slot_assignment_does_not_hide_reassigned_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Panel
+
+            ---@class DPanel: Panel
+
+            ---@class DLabel: Panel
+
+            vgui = {}
+
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@param parent Panel?
+            ---@return T
+            function vgui.Create(classname, parent)
+            end
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        let file_id = ws.def(
+            r#"
+                ---@type Panel
+                local parent = {}
+                parent.Tabs = {
+                    { Title = "Tab 1", Tip = "Tip 1" },
+                    { Title = "Tab 2", Tip = "Tip 2" },
+                }
+
+                for i = 1, #parent.Tabs do
+                    parent.Tabs[i] = vgui.Create("DPanel", parent)
+                end
+
+                parent.Tabs[2] = "not this slot"
+                parent.Tabs[1].Label = vgui.Create("DLabel", parent.Tabs[1])
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics.iter().all(|diag| diag.code != param_type_code),
+            "unexpected param-type-mismatch diagnostics: {diagnostics:?}"
+        );
     }
 
     /// Complementary test: passing a completely unrelated type should still raise the
@@ -1936,9 +2320,9 @@ mod test {
     #[test]
     fn test_and_or_chain_false_suppression_annotated_not_stripped() {
         let mut ws = VirtualWorkspace::new();
-        // When the expression involves annotated types, the false stripping should NOT apply
-        // because expr_has_inferred_type returns false for annotated operands.
-        assert!(!ws.check_code_for(
+        // `cond and "valid"` has type `boolean | "valid"`. Both are tostring-coercible primitives,
+        // so the param-type-mismatch diagnostic is suppressed for the `string` param.
+        assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
                 ---@type boolean
@@ -2185,6 +2569,109 @@ mod test {
     }
 
     #[test]
+    fn test_vector_arithmetic_from_normalizing_helper_preserves_vector_result() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Vector
+            ---@operator add(Vector): Vector
+            ---@operator sub(Vector): Vector
+            ---@operator mul(number|Vector): Vector
+            ---@operator unm: Vector
+            local Vector = {}
+
+            ---@return number
+            function Vector:Length() end
+
+            ---@return Vector
+            function Vector:Cross(other) end
+
+            function Vector:Normalize() end
+
+            ---@return Vector
+            function Vector(x, y, z) end
+
+            render = {}
+
+            ---@param a Vector
+            ---@param b Vector
+            ---@param c Vector
+            ---@param d Vector
+            function render.DrawQuad(a, b, c, d) end
+
+            ---@return string
+            function type(value) end
+            "#,
+        );
+
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        let file_id = ws.def(
+            r#"
+            local function toVector(v)
+                if not v then return Vector(0, 0, 0) end
+                if type(v) == "Vector" then return v end
+                return Vector(0, 0, 0)
+            end
+
+            local function drawTraceBox(contactPos, contactNormal, fw, rt, radius)
+                radius = radius or 8
+
+                local halfWidth = radius * 1.1
+                local halfLen = radius * 1.75
+
+                local c1 = contactPos + -fw * (-halfLen) + rt * (-halfWidth)
+                local c2 = contactPos + -fw * (-halfLen) + rt * (halfWidth)
+                local c3 = contactPos + -fw * (halfLen) + rt * (halfWidth)
+                local c4 = contactPos + -fw * (halfLen) + rt * (-halfWidth)
+
+                local cn = toVector(contactNormal)
+                if cn:Length() < 1e-4 then cn = Vector(0, 0, 1) end
+                if cn.z < 0 then cn = -cn end
+                cn:Normalize()
+
+                local offset = cn * (radius * 0.2)
+
+                local o1 = c1 + offset
+                local o2 = c2 + offset
+                local o3 = c3 + offset
+                local o4 = c4 + offset
+                render.DrawQuad(o1, o2, o3, o4)
+            end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == code)
+            .map(|diag| diag.message.clone())
+            .collect();
+
+        assert!(messages.is_empty(), "{}", messages.join(" || "));
+    }
+
+    #[test]
+    fn test_unary_minus_definite_nil_still_mismatches_string_param() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value table
+            local function takes_table(value) end
+
+            local value = nil
+            takes_table(-value)
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_type_guard_alias_assignment_or_chain_narrows_to_number() {
         let mut ws = VirtualWorkspace::new();
 
@@ -2313,5 +2800,511 @@ mod test {
             local name = debug.setlocal(1, "x", 1)
         "#
         ));
+    }
+
+    // --- GLua primitive coercion suppression tests ---
+
+    /// `string` params should accept integer/float literals (tostring() is implicit in GLua).
+    #[test]
+    fn test_string_param_accepts_integer_literal() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param label string
+            local function show(label) end
+            show(42)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_string_param_accepts_float_literal() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param label string
+            local function show(label) end
+            show(3.14)
+        "#
+        ));
+    }
+
+    /// `string` params should accept a bare `number` typed variable.
+    #[test]
+    fn test_string_param_accepts_number_type() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param label string
+            local function show(label) end
+            ---@type number
+            local n
+            show(n)
+        "#
+        ));
+    }
+
+    /// `string` params should accept a `boolean`.
+    #[test]
+    fn test_string_param_accepts_boolean() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param label string
+            local function show(label) end
+            show(true)
+            show(false)
+        "#
+        ));
+    }
+
+    /// `string` params should accept a union of all-primitive types.
+    #[test]
+    fn test_string_param_accepts_primitive_union() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param label string
+            local function show(label) end
+            ---@type string|number|boolean
+            local v
+            show(v)
+        "#
+        ));
+    }
+
+    /// Mirrors the real-world false-positive from cl_test10.lua: a union of string
+    /// literals, integer literals, and a boolean literal passed to a `string` param.
+    #[test]
+    fn test_string_param_accepts_mixed_literal_union() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param label string
+            local function show(label) end
+            ---@type ""| "some_string"| 1| 45| 750| false
+            local entry
+            show(entry)
+        "#
+        ));
+    }
+
+    /// `string` params must still reject tables.
+    #[test]
+    fn test_string_param_rejects_table() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param label string
+            local function show(label) end
+            show({})
+        "#
+        ));
+    }
+
+    /// `string` params must still reject named class instances.
+    #[test]
+    fn test_string_param_rejects_class_instance() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class MyObj
+            ---@field value number
+
+            ---@param label string
+            local function show(label) end
+
+            ---@type MyObj
+            local obj
+            show(obj)
+        "#
+        ));
+    }
+
+    /// A union that contains a non-primitive (class) must still produce a diagnostic.
+    #[test]
+    fn test_string_param_rejects_union_with_class() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class DateData
+            ---@param label string
+            local function show(label) end
+            ---@type DateData|string
+            local v
+            show(v)
+        "#
+        ));
+    }
+
+    /// `number` params must reject string literals (even numeric-looking ones) in strict mode.
+    /// In lenient mode (default), numeric string literals are accepted.
+    #[test]
+    fn test_number_param_rejects_string_literal() {
+        let mut ws = VirtualWorkspace::new();
+        // Non-numeric strings are always rejected.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function calc(n) end
+            calc("abc")
+        "#
+        ));
+        // Numeric string literals are rejected only in strict mode.
+        let mut strict_emmyrc = Emmyrc::default();
+        strict_emmyrc.strict.strict_type_coercion = true;
+        ws.update_emmyrc(strict_emmyrc);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function calc(n) end
+            calc("2")
+        "#
+        ));
+    }
+
+    /// A bare `string` type must be rejected for `number` params.
+    #[test]
+    fn test_number_param_rejects_bare_string_type() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function calc(n) end
+            ---@type string
+            local s
+            calc(s)
+        "#
+        ));
+    }
+
+    /// `integer` params must reject string literals in strict mode;
+    /// in lenient mode (default), numeric string literals are accepted.
+    #[test]
+    fn test_integer_param_rejects_string_literal() {
+        let mut ws = VirtualWorkspace::new();
+        // Non-numeric strings are always rejected.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n integer
+            local function calc(n) end
+            calc("hello")
+        "#
+        ));
+        // Numeric string literals are rejected only in strict mode.
+        let mut strict_emmyrc = Emmyrc::default();
+        strict_emmyrc.strict.strict_type_coercion = true;
+        ws.update_emmyrc(strict_emmyrc);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n integer
+            local function calc(n) end
+            calc("2")
+        "#
+        ));
+    }
+
+    /// `string` params with optional (`?`) annotation should still accept primitives.
+    #[test]
+    fn test_optional_string_param_accepts_number() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param label string?
+            local function show(label) end
+            show(10)
+        "#
+        ));
+    }
+
+    // --- GMod NULL compatibility tests ---
+
+    #[test]
+    fn test_core_null_type_is_assignable_to_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            "#,
+        );
+
+        let null_ty = ws.ty("NULL");
+        let entity_ty = ws.ty("Entity");
+        // In GMod, NULL is the "zero value" of Entity — an invalid/empty Entity.
+        // NULL is assignable to Entity (and vice versa) because they are the same type family.
+        assert!(ws.check_type(&null_ty, &entity_ty));
+    }
+
+    #[test]
+    fn test_null_expr_type_is_assignable_to_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            ---@type NULL
+            NULL = nil
+            "#,
+        );
+
+        let null_expr_ty = ws.expr_ty("NULL");
+        let entity_ty = ws.ty("Entity");
+        // In GMod, NULL is the "zero value" of Entity — assignable to Entity.
+        assert!(ws.check_type(&null_expr_ty, &entity_ty));
+    }
+
+    #[test]
+    fn test_null_param_accepts_entity_gmod() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            ---@type NULL
+            NULL = nil
+            "#,
+        );
+
+        let null_ty = ws.ty("NULL");
+        let entity_ty = ws.ty("Entity");
+        // In GMod, Entity is assignable to NULL (replacing a NULL placeholder with a real Entity).
+        assert!(ws.check_type(&entity_ty, &null_ty));
+    }
+
+    /// NULL should be compatible with Entity subclasses like Player in GMod,
+    /// since NULL is the "zero value" of the Entity type hierarchy.
+    #[test]
+    fn test_null_compatible_with_player() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class NULL : Entity
+            "#,
+        );
+
+        let null_ty = ws.ty("NULL");
+        let player_ty = ws.ty("Player");
+        // In GMod, NULL and Player are both in the Entity family, so they are compatible.
+        assert!(ws.check_type(&null_ty, &player_ty));
+    }
+
+    // --- Union coercion suppression tests ---
+
+    /// `(any|string)` passed to `string` param should not produce a mismatch.
+    /// Both union arms are accepted by GLua string coercion checking.
+    #[test]
+    fn test_any_string_union_to_string_param() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param s string
+            local function f(s) end
+
+            ---@type any|string
+            local val
+            f(val)
+        "#
+        ));
+    }
+
+    /// `(0|any|number)` passed to `number` param should not produce a mismatch.
+    /// Each union arm is accepted by number checking.
+    #[test]
+    fn test_any_number_union_to_number_param() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function f(n) end
+
+            ---@type 0|any|number
+            local val
+            f(val)
+        "#
+        ));
+    }
+
+    /// `(any|string)` passed to `number` param SHOULD still mismatch.
+    /// The `string` arm remains incompatible with `number`.
+    #[test]
+    fn test_any_string_union_to_number_param_still_mismatches() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function f(n) end
+
+            ---@type any|string
+            local val
+            f(val)
+        "#
+        ));
+    }
+
+    /// `any|string|nil` should satisfy `string?` through nullable string coercion.
+    #[test]
+    fn test_any_string_nil_to_string_nullable_passes() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param s string?
+            local function f(s) end
+
+            ---@type any|string|nil
+            local val
+            f(val)
+        "#
+        ));
+    }
+
+    /// `any|string|nil` should still mismatch `number?` because `string` is incompatible.
+    #[test]
+    fn test_any_string_nil_to_number_nullable_mismatches() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number?
+            local function f(n) end
+
+            ---@type any|string|nil
+            local val
+            f(val)
+        "#
+        ));
+    }
+
+    /// In GMod, Entity is used as a generic stand-in for many things (network vars,
+    /// etc.), so passing Entity where a more specific subtype is expected should not
+    /// produce false-positive param-type-mismatch diagnostics.
+    #[test]
+    fn test_entity_accepted_for_child_type_param() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            ---@class base_glide : Entity
+
+            ---@param e base_glide?
+            local function takes_base_glide(e)
+            end
+
+            ---@type Entity
+            local ent = nil
+
+            takes_base_glide(ent)
+        "#
+        ));
+    }
+
+    /// Entity should also be accepted for non-nullable child type params in GMod.
+    #[test]
+    fn test_entity_accepted_for_nonnullable_child_type_param() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            ---@class base_glide : Entity
+
+            ---@param e base_glide
+            local function takes_base_glide(e)
+            end
+
+            ---@type Entity
+            local ent = nil
+
+            takes_base_glide(ent)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_inferred_dynamic_string_key_field_does_not_report_param_mismatch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+
+        let file_id = ws.def(
+            r#"
+                local function readValue()
+                    if flag then
+                        return Vector(1, 2, 3)
+                    end
+
+                    return "not a number"
+                end
+
+                local rec = { data = {} }
+                local data = rec.data
+                local key = net.ReadString()
+                data[key] = readValue()
+
+                local d = rec.data
+                math.abs(d.forwardSlip or 0)
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics.iter().all(|diag| diag.code != param_type_code),
+            "inferred dynamic key field values should respect inferred mismatch diagnostics policy: {diagnostics:?}"
+        );
     }
 }

@@ -16,8 +16,8 @@
   <a href="https://github.com/Pollux12/gmod-glua-ls/releases">
     <img src="https://img.shields.io/github/v/release/Pollux12/gmod-glua-ls?style=flat-square&label=gLuaLS" alt="Language server version">
   </a>
-  <a href="https://github.com/Pollux12/gmod-luals-addon/tree/gluals-annotations">
-    <img src="https://img.shields.io/github/last-commit/Pollux12/gmod-luals-addon/gluals-annotations?style=flat-square&label=Annotations%20Updated" alt="Annotations updated">
+  <a href="https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations">
+    <img src="https://img.shields.io/github/last-commit/Pollux12/annotations-gmod-glua-ls/gluals-annotations?style=flat-square&label=Annotations%20Updated" alt="Annotations updated">
   </a>
 </p>
 

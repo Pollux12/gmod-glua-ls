@@ -36,4 +36,5 @@ pub const DOC_TAGS: &[&str] = &[
     "hook",
     "realm",
     "fileparam",
+    "outparam",
 ];

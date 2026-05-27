@@ -3,11 +3,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use log::info;
+use rustc_hash::FxHashMap;
 
 pub use super::checker::DiagnosticContext;
 use super::checker::SharedDiagnosticData;
+use super::checker::precompute_await_candidates;
 use super::checker::precompute_callee_realms_for_workspace;
 use super::checker::precompute_gm_method_realms;
+use super::checker::precompute_missing_required_fields;
+use super::checker::precompute_nodiscard_candidates;
+use super::checker::precompute_param_type_candidates;
+use super::checker::precompute_sorted_send_flows;
+use super::checker::precompute_subclass_fields;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::semantic::LuaAnalysisPhase;
 use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
@@ -111,20 +118,38 @@ impl LuaDiagnostic {
         let mut callee_realms_by_workspace = HashMap::new();
         for workspace_id in module_index.get_main_workspace_ids() {
             let realms = Arc::new(precompute_gm_method_realms(db, workspace_id));
-            let callee_realms = precompute_callee_realms_for_workspace(
-                db,
-                workspace_id,
-                &workspace_file_ids,
-                realms.as_ref(),
-            );
+            let callee_realms =
+                precompute_callee_realms_for_workspace(db, workspace_id, &workspace_file_ids);
             gm_method_realms.insert(workspace_id, realms);
             callee_realms_by_workspace.insert(workspace_id, Arc::new(callee_realms));
         }
+
+        let missing_required_fields = precompute_missing_required_fields(db);
+        let subclass_fields = precompute_subclass_fields(db);
+        let await_candidates = precompute_await_candidates(db);
+        let param_type_candidates = precompute_param_type_candidates(db);
+        let nodiscard_candidates = precompute_nodiscard_candidates(db);
+
+        // Precompute decl annotation realms for all workspace files
+        let decl_annotation_realms = precompute_decl_annotation_realms(db, &workspace_file_ids);
+
+        // Precompute sorted send flows so each file doesn't re-sort them.
+        let sorted_send_flows = Arc::new(precompute_sorted_send_flows(
+            db.get_gmod_network_index(),
+            db.get_vfs(),
+        ));
 
         Arc::new(SharedDiagnosticData {
             workspace_file_ids: Arc::new(workspace_file_ids),
             gm_method_realms,
             callee_realms_by_workspace,
+            missing_required_fields: Arc::new(missing_required_fields),
+            subclass_fields: Arc::new(subclass_fields),
+            await_candidates: Arc::new(await_candidates),
+            param_type_candidates: Arc::new(param_type_candidates),
+            nodiscard_candidates: Arc::new(nodiscard_candidates),
+            decl_annotation_realms: Arc::new(decl_annotation_realms),
+            sorted_send_flows,
         })
     }
 
@@ -152,25 +177,21 @@ impl LuaDiagnostic {
 
         let config = self.get_config_for_file(compilation, file_id);
 
-        // Use a flow analysis budget for diagnostics. This prevents
-        // pathologically large files from dominating diagnostic time.
-        // 10K nodes is sufficient — normal files use a few hundred at most,
-        // but monster files (3000+ lines) can trigger millions of visits.
-        const DIAGNOSTIC_FLOW_BUDGET: u32 = u32::MAX;
-
-        let sem_start = Instant::now();
-        let semantic_model =
-            compilation.get_semantic_model_with_flow_budget(file_id, DIAGNOSTIC_FLOW_BUDGET)?;
+        let slow_log_enabled = log::log_enabled!(log::Level::Info);
+        let sem_start = slow_log_enabled.then(Instant::now);
+        let semantic_model = compilation.get_semantic_model(file_id)?;
         // Set diagnostics phase so error results are cached (types are final,
         // no subsequent unresolve pass will change them). This prevents expensive
         // recomputation across diagnostic checkers.
         semantic_model.set_analysis_phase(LuaAnalysisPhase::Diagnostics);
-        let sem_elapsed = sem_start.elapsed();
-        if sem_elapsed.as_millis() > 10 {
-            info!(
-                "diagnose_file: get_semantic_model cost {:?} for {:?}",
-                sem_elapsed, file_id
-            );
+        if let Some(sem_start) = sem_start {
+            let sem_elapsed = sem_start.elapsed();
+            if sem_elapsed.as_millis() > 10 {
+                info!(
+                    "diagnose_file: get_semantic_model cost {:?} for {:?}",
+                    sem_elapsed, file_id
+                );
+            }
         }
 
         let mut context = if let Some(shared) = shared_data {
@@ -179,40 +200,43 @@ impl LuaDiagnostic {
             DiagnosticContext::new(file_id, db, config, cancel_token.clone())
         };
 
-        let check_start = Instant::now();
+        let check_start = slow_log_enabled.then(Instant::now);
         check_file(&mut context, &semantic_model, &cancel_token);
-        let check_elapsed = check_start.elapsed();
-        if check_elapsed.as_millis() > 100 {
-            let cache = semantic_model.get_cache().borrow_mut();
-            info!(
-                "diagnose_file: check_file cost {:?} for {:?} | infer_expr: {} calls ({} hits, {:.1}% hit rate) | flow: {} calls ({} hits, {:.1}% hit rate) | flow_nodes_walked: {} | expr_cache_size: {} | flow_cache_size: {} | merges: {} (total_antecedents: {}) | cond_errors: {} (none={}, recursive={}, unresolved={}) | multi_ante_from_cond: {}",
-                check_elapsed,
-                file_id,
-                cache.prof_infer_expr_calls,
-                cache.prof_infer_expr_hits,
-                if cache.prof_infer_expr_calls > 0 {
-                    cache.prof_infer_expr_hits as f64 / cache.prof_infer_expr_calls as f64 * 100.0
-                } else {
-                    0.0
-                },
-                cache.prof_flow_calls,
-                cache.prof_flow_hits,
-                if cache.prof_flow_calls > 0 {
-                    cache.prof_flow_hits as f64 / cache.prof_flow_calls as f64 * 100.0
-                } else {
-                    0.0
-                },
-                cache.prof_flow_nodes_walked,
-                cache.expr_cache.len(),
-                cache.flow_node_cache.len(),
-                cache.prof_merge_calls,
-                cache.prof_merge_total_antecedents,
-                cache.prof_condition_errors_caught,
-                cache.prof_condition_errors_none,
-                cache.prof_condition_errors_recursive,
-                cache.prof_condition_errors_unresolved,
-                cache.prof_multi_ante_from_condition,
-            );
+        if let Some(check_start) = check_start {
+            let check_elapsed = check_start.elapsed();
+            if check_elapsed.as_millis() > 100 {
+                let cache = semantic_model.get_cache().borrow_mut();
+                info!(
+                    "diagnose_file: check_file cost {:?} for {:?} | infer_expr: {} calls ({} hits, {:.1}% hit rate) | flow: {} calls ({} hits, {:.1}% hit rate) | flow_nodes_walked: {} | expr_cache_size: {} | flow_cache_size: {} | merges: {} (total_antecedents: {}) | cond_errors: {} (none={}, recursive={}, unresolved={}) | multi_ante_from_cond: {}",
+                    check_elapsed,
+                    file_id,
+                    cache.prof_infer_expr_calls,
+                    cache.prof_infer_expr_hits,
+                    if cache.prof_infer_expr_calls > 0 {
+                        cache.prof_infer_expr_hits as f64 / cache.prof_infer_expr_calls as f64
+                            * 100.0
+                    } else {
+                        0.0
+                    },
+                    cache.prof_flow_calls,
+                    cache.prof_flow_hits,
+                    if cache.prof_flow_calls > 0 {
+                        cache.prof_flow_hits as f64 / cache.prof_flow_calls as f64 * 100.0
+                    } else {
+                        0.0
+                    },
+                    cache.prof_flow_nodes_walked,
+                    cache.expr_cache.len(),
+                    cache.flow_cache_entry_count(),
+                    cache.prof_merge_calls,
+                    cache.prof_merge_total_antecedents,
+                    cache.prof_condition_errors_caught,
+                    cache.prof_condition_errors_none,
+                    cache.prof_condition_errors_recursive,
+                    cache.prof_condition_errors_unresolved,
+                    cache.prof_multi_ante_from_condition,
+                );
+            }
         }
 
         if cancel_token.is_cancelled() {
@@ -221,4 +245,19 @@ impl LuaDiagnostic {
 
         Some(context.get_diagnostics())
     }
+}
+
+fn precompute_decl_annotation_realms(
+    db: &crate::DbIndex,
+    workspace_file_ids: &[FileId],
+) -> FxHashMap<FileId, Vec<super::checker::AnnotatedRealmRange>> {
+    use super::checker::collect_decl_annotation_realms_for_file_precompute;
+    let mut cache = FxHashMap::default();
+    for &file_id in workspace_file_ids {
+        let realms = collect_decl_annotation_realms_for_file_precompute(db, &file_id);
+        if !realms.is_empty() {
+            cache.insert(file_id, realms);
+        }
+    }
+    cache
 }

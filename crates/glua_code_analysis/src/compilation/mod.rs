@@ -2,6 +2,7 @@ pub(crate) mod analyzer;
 mod test;
 
 pub use analyzer::gmod::get_scripted_class_info_for_file;
+pub(crate) use analyzer::gmod::get_scripted_class_type_decl_id;
 pub use analyzer::unresolve::extract_hook_name;
 pub use analyzer::unresolve::resolve_gmod_hook_add_callback_doc_function;
 
@@ -40,27 +41,7 @@ impl LuaCompilation {
         ))
     }
 
-    /// Creates a semantic model with a flow analysis budget. When the budget
-    /// (total flow nodes visited) is exceeded, flow narrowing is skipped and
-    /// base types are returned. Use 0 for unlimited.
-    pub fn get_semantic_model_with_flow_budget(
-        &'_ self,
-        file_id: FileId,
-        flow_budget: u32,
-    ) -> Option<SemanticModel<'_>> {
-        let mut cache = LuaInferCache::new(file_id, Default::default());
-        cache.flow_node_budget = flow_budget;
-        let tree = self.db.get_vfs().get_syntax_tree(&file_id)?;
-        Some(SemanticModel::new(
-            file_id,
-            &self.db,
-            cache,
-            self.emmyrc.clone(),
-            tree.get_chunk_node(),
-        ))
-    }
-
-    pub fn update_index(&mut self, file_ids: Vec<FileId>) {
+    pub fn update_index(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
         let mut need_analyzed_files = vec![];
         for file_id in file_ids {
             let tree = match self.db.get_vfs().get_syntax_tree(&file_id) {
@@ -76,7 +57,12 @@ impl LuaCompilation {
             });
         }
 
-        analyzer::analyze(&mut self.db, need_analyzed_files, self.emmyrc.clone());
+        let mut stabilization_candidates =
+            analyzer::analyze(&mut self.db, need_analyzed_files, self.emmyrc.clone())
+                .into_iter()
+                .collect::<Vec<_>>();
+        stabilization_candidates.sort_unstable();
+        stabilization_candidates
     }
 
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {

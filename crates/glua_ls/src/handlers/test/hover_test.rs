@@ -145,6 +145,76 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_reassigned_field_initialized_local_stays_local_after_isvalid_guard() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Weapon
+                ---@field activeVehicle nil
+
+                ---@type Weapon
+                local wep
+                local veh = wep.activeVehicle
+                if not IsValid(veh) then
+                    veh = select(1, wep:GetTargetVehicle())
+                end
+                if not IsValid(veh) then return end
+                local narrowed = ve<??>h
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            hover.contains("local veh: unknown"),
+            "expected later local hover to stay on veh instead of source field, got: {}",
+            hover
+        );
+        assert!(
+            !hover.contains("(field) activeVehicle"),
+            "later local hover must not bind back to the source field, got: {}",
+            hover
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_outparam_updates_trace_output_field() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class TraceResult
+                ---@field Hit boolean
+                local TraceResult = {}
+
+                util = {}
+
+                ---@outparam traceConfig.output TraceResult
+                ---@param traceConfig table
+                function util.TraceLine(traceConfig) end
+
+                local ray = {}
+                local traceData = {
+                    output = ray,
+                }
+
+                util.TraceLine(traceData)
+
+                local hit = traceData.<??>output.Hit
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) output: TraceResult\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_decl_shows_inheritance_chain() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(
@@ -1440,9 +1510,939 @@ mod tests {
                 local x = ent.te<??>stVar
             "#,
             VirtualHoverResult {
-                value: "```lua\n(infer) testVar: true\n```".to_string(),
+                value: "```lua\n(field) testVar: true\n```\n\n&nbsp;&nbsp;in class `HoverDyn.Entity`"
+                    .to_string(),
             },
         ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_field_for_metatable_instance() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        check!(ws.check_hover(
+            r#"
+                local LOCATION = {}
+                LOCATION.__index = LOCATION
+
+                function LOCATION:Init()
+                    local instance = {}
+                    setmetatable(instance, self)
+                    instance._OriginalName = true
+                    return instance
+                end
+
+                function LOCATION:GetOriginalName()
+                    return self._Origi<??>nalName
+                end
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(infer) _OriginalName: true\n```".to_string(),
+            },
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_field_respects_file_scope() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = false;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "assign.lua",
+            "---@class HoverDynScoped.Entity\n---@type HoverDynScoped.Entity\nlocal ent\nent.testVar = true\n",
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@type HoverDynScoped.Entity
+                local ent2
+                local x = ent2.te<??>stVar
+            "#,
+        )?;
+        let file_id = ws.def_file("use.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+        assert!(
+            !markup.value.contains("(infer) testVar"),
+            "dynamic field hover should not leak across files when dynamic_fields_global=false, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_field_for_tableof() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class HoverTbl.Entity
+                local HoverTbl = {}
+
+                ---@return tableof<self>
+                function HoverTbl:GetTable() end
+
+                function HoverTbl:Init()
+                    local tbl = self:GetTable()
+                    tbl.customData = true
+                    return tbl.cus<??>tomData
+                end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+        assert!(
+            markup.value.contains("customData"),
+            "expected tableof dynamic field hover to resolve field name, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("HoverTbl.Entity"),
+            "expected tableof dynamic field hover to stay on class context, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_table_field_assignment_prefers_concrete_string_over_any() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@return table|nil
+                local function FromJSON()
+                end
+
+                ---@return table
+                local function ReadTable()
+                    return FromJSON() or {}
+                end
+
+                ---@param value string
+                ---@return string
+                local function FirstChar(value)
+                    return value
+                end
+
+                ---@param phrase string
+                ---@return string
+                local function GetPhrase(phrase)
+                    return phrase
+                end
+
+                local data = ReadTable()
+
+                if FirstChar(data.text) == "#" then
+                    data.te<??>xt = GetPhrase(data.text)
+                end
+            "##,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("text: string"),
+            "expected concrete string hover for dynamic table field assignment, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("any"),
+            "expected hover to avoid retaining open-table any in the field type, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_table_field_read_before_assignment_stays_open_table_any() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@return table|nil
+                local function FromJSON()
+                end
+
+                ---@return table
+                local function ReadTable()
+                    return FromJSON() or {}
+                end
+
+                ---@param value string
+                ---@return string
+                local function FirstChar(value)
+                    return value
+                end
+
+                ---@param phrase string
+                ---@return string
+                local function GetPhrase(phrase)
+                    return phrase
+                end
+
+                local data = ReadTable()
+
+                if FirstChar(data.text) == "#" then
+                    data.text = GetPhrase(data.te<??>xt)
+                end
+            "##,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("any?"),
+            "expected pre-assignment open-table field read to stay broad, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("string"),
+            "expected future assignment not to type a prior field read, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_table_field_call_arg_before_assignment_stays_open_table_any() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                util = {}
+
+                ---@return table?
+                function util.JSONToTable(s)
+                end
+
+                ---@return table
+                local function ReadTable()
+                    return util.JSONToTable("") or {}
+                end
+
+                ---@param value string
+                ---@return string
+                local function FirstChar(value)
+                    return value
+                end
+
+                ---@param phrase string
+                ---@return string
+                local function GetPhrase(phrase)
+                    return phrase
+                end
+
+                local data = ReadTable()
+
+                if FirstChar(data.te<??>xt) == "#" then
+                    data.text = GetPhrase(data.text)
+                end
+            "##,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("any?"),
+            "expected call-site pre-assignment field read to stay broad, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("string"),
+            "expected future assignment not to type the earlier call argument, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_glide_readtable_field_call_arg_stays_open_table_any_after_reindex() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (network_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                Glide.NetCommands = Glide.NetCommands or {}
+                local commands = Glide.NetCommands
+
+                commands[Glide.CMD_NOTIFY] = function()
+                    local data = Glide.ReadTable()
+
+                    if string.sub(data.te<??>xt, 1, 1) == "#" then
+                        data.text = language.GetPhrase(data.text)
+                    end
+                end
+            "##,
+        )?;
+
+        ws.def_files(vec![
+            (
+                "lua/autorun/sh_glide.lua",
+                r#"
+                ---@class Glide
+                Glide = Glide or {}
+                Glide.CMD_NOTIFY = 1
+
+                function Glide.FromJSON(s)
+                    if type(s) ~= "string" or s == "" then
+                        return {}
+                    end
+
+                    return util.JSONToTable(s) or {}
+                end
+                "#,
+            ),
+            (
+                "lua/glide/sh_network.lua",
+                r#"
+                function Glide.ReadTable()
+                    local data = net.ReadData(1)
+                    return Glide.FromJSON(data)
+                end
+                "#,
+            ),
+            (
+                "lua/includes/util.lua",
+                r#"
+                util = {}
+
+                ---@return table?
+                function util.JSONToTable(json)
+                end
+                "#,
+            ),
+            (
+                "lua/includes/net.lua",
+                r#"
+                net = {}
+
+                ---@return string
+                function net.ReadData(length)
+                end
+                "#,
+            ),
+            (
+                "lua/includes/language.lua",
+                r#"
+                language = {}
+
+                ---@param phrase string
+                ---@return string
+                function language.GetPhrase(phrase)
+                end
+                "#,
+            ),
+            (
+                "lua/includes/string.lua",
+                r#"
+                string = {}
+
+                ---@param s string
+                ---@param i integer
+                ---@param j integer?
+                ---@return string
+                function string.sub(s, i, j)
+                end
+                "#,
+            ),
+            ("lua/glide/client/network.lua", &network_content),
+        ]);
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/glide/client/network.lua");
+        let file_id = ws
+            .analysis
+            .get_file_id(&uri)
+            .expect("expected network.lua file id");
+
+        let initial = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            initial.contains("any?"),
+            "expected initial hover to stay broad, got: {}",
+            initial
+        );
+
+        ws.analysis
+            .update_file_text_only(&uri, format!("{network_content}\n"));
+
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let after_reindex = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            after_reindex.contains("any?"),
+            "expected post-reindex hover to stay broad, got: {}",
+            after_reindex
+        );
+        assert!(
+            !after_reindex.contains("string"),
+            "expected future assignment not to type the earlier call argument after reindex, got: {}",
+            after_reindex
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_table_field_rhs_does_not_use_lhs_assignment_member() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@param phrase string
+                ---@return string
+                local function GetPhrase(phrase)
+                    return phrase
+                end
+
+                ---@return table<any, any>
+                local function ReadTable()
+                    return {}
+                end
+
+                local data = ReadTable()
+                data.text = GetPhrase(data.te<??>xt)
+            "##,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/network.lua", &content);
+
+        let hover = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            hover.contains("any"),
+            "expected RHS read not to use the LHS assignment member, got: {}",
+            hover
+        );
+        assert!(
+            !hover.contains("string"),
+            "expected RHS read to remain broad before assignment value is applied, got: {}",
+            hover
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_class_field_read_does_not_use_later_same_file_assignment() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@class ReindexData
+
+                ---@type ReindexData
+                local data = {}
+
+                local before = data.te<??>xt
+                data.text = "later"
+            "##,
+        )?;
+        let file_name = "lua/glide/client/network.lua";
+        let file_id = ws.def_file(file_name, &content);
+
+        let initial = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            !initial.contains("(field)") && !initial.contains("string"),
+            "expected initial hover not to use the later assignment, got: {}",
+            initial
+        );
+
+        let uri = ws.virtual_url_generator.new_uri(file_name);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{content}\n"));
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let after_reindex = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            !after_reindex.contains("(field)") && !after_reindex.contains("string"),
+            "expected post-reindex hover not to use the later assignment, got: {}",
+            after_reindex
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_table_field_read_after_assignment_uses_assigned_string() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                ---@return table|nil
+                local function FromJSON()
+                end
+
+                ---@return table
+                local function ReadTable()
+                    return FromJSON() or {}
+                end
+
+                ---@param value string
+                ---@return string
+                local function GetPhrase(value)
+                    return value
+                end
+
+                local data = ReadTable()
+                data.text = GetPhrase(data.text)
+                local text = data.te<??>xt
+            "##,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("string"),
+            "expected post-assignment field read to use assigned string type, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("any"),
+            "expected post-assignment field read not to retain open-table any, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_branch_initialized_indexed_record_assignment() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/sh_glide.lua",
+            r#"
+            ---@class Glide
+            Glide = Glide or {}
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            Glide.DebugNetwork = Glide.DebugNetwork or {}
+
+            if CLIENT then
+                local DebugNet = Glide.DebugNetwork
+
+                function DebugNet.ReadSnapshot()
+                    local entId = net.ReadUInt(16)
+                    local vehicleId = nil
+                    local fields = {}
+                    return entId, vehicleId, fields
+                end
+            end
+        "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            local DebugNet = Glide.DebugNetwork
+
+            local function receive()
+                local entId, vehicleId, fields = DebugNet.ReadSnapshot()
+                if not entId then return end
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+                local rec = Glide.DebugSnapshots[entId]
+                if not rec then
+                    re<??>c = { data = {}, t = SysTime() }
+                    Glide.DebugSnapshots[entId] = rec
+                end
+
+                local data = rec.data
+                print(data, rec)
+            end
+        "#,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/network.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+        assert!(
+            value.contains("data"),
+            "expected assignment hover to include record table shape, got: {}",
+            value
+        );
+        assert!(
+            !value.contains("any"),
+            "expected assignment hover not to collapse record table to any, got: {}",
+            value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_key_table_shape_omits_unnamed_wildcard_value_row() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@return Vector
+                function _G.Vector() end
+
+                net = {}
+                ---@return string
+                function net.ReadString() end
+
+                local function readValue()
+                    if flag == 1 then
+                        return Vector()
+                    end
+
+                    if flag == 2 then
+                        return "text"
+                    end
+
+                    return 1
+                end
+
+                local rec = { data = {}, t = 0 }
+                local data = rec.data
+                data.vehicle = 1
+
+                local key = net.ReadString()
+                data[key] = readValue()
+
+                local d = rec.da<??>ta
+                print(d)
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/network.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("vehicle"),
+            "expected hover to retain concrete named fields, got: {value}"
+        );
+        assert!(
+            !value.contains("\n    ("),
+            "dynamic-key value type should not render as an unnamed table field, got: {value}"
+        );
+        assert!(
+            value.contains("[string]"),
+            "expected dynamic string-key values to render as an indexed table entry, got: {value}"
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_string_key_field_uses_index_value_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@return Vector
+                function _G.Vector() end
+
+                net = {}
+                ---@return string
+                function net.ReadString() end
+
+                Glide = {}
+
+                local function readValue()
+                    if flag == 1 then
+                        return Vector()
+                    end
+
+                    if flag == 2 then
+                        return true
+                    end
+
+                    if flag == 3 then
+                        return {}
+                    end
+
+                    if flag == 4 then
+                        return "text"
+                    end
+
+                    return 1
+                end
+
+                local fields = {}
+                fields[net.ReadString()] = readValue()
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+                local rec = Glide.DebugSnapshots[1]
+                if not rec then
+                    rec = { data = {}, t = 0 }
+                    Glide.DebugSnapshots[1] = rec
+                end
+
+                local data = rec.data
+                data.vehicle = 1
+
+                for key, value in pairs(fields) do
+                    data[key] = value
+                end
+
+                local d = rec.data
+                print(d.for<??>wardForce)
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/debugging.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            !value.contains(": nil"),
+            "dynamic string-key field hover must not collapse to nil, got: {value}"
+        );
+        assert!(
+            value.contains("Vector")
+                && value.contains("true")
+                && value.contains("1")
+                && value.contains("\"text\"")
+                && value.contains("table"),
+            "expected field hover to use the dynamic string index value union, got: {value}"
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_local_gettable_call_uses_scoped_receiver_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(&dedent(
+            r#"
+                    ---@class Entity
+                    local Entity = {}
+
+                    ---@return tableof<self>
+                    function Entity:GetTable() end
+
+                    ---@generic T : table
+                    ---@param metaName `T`
+                    ---@return T
+                    function FindMetaTable(metaName) end
+
+                    local getTable = FindMetaTable("Entity").GetTable
+
+                    function ENT:Think(selfTbl)
+                        selfTbl = selfTbl or getTa<??>ble(self)
+                    end
+                "#,
+        ))?;
+        let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("glide_wheel:GetTable"),
+            "expected aliased GetTable hover to use scripted class receiver, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("tableof<glide_wheel>"),
+            "expected aliased GetTable hover to specialize return type, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("tableof<Entity>"),
+            "expected aliased GetTable hover to avoid base Entity return type, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_local_gettable_nested_state_field_keeps_declared_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(&dedent(
+            r#"
+                    ---@class Entity
+                    local Entity = {}
+
+                    ---@return tableof<self>
+                    function Entity:GetTable() end
+
+                    ---@generic T : table
+                    ---@param metaName `T`
+                    ---@return T
+                    function FindMetaTable(metaName) end
+
+                    ---@class GlideTraceData
+                    ---@field start number
+
+                    ---@class GlideWheelState
+                    ---@field traceData GlideTraceData
+
+                    local getTable = FindMetaTable("Entity").GetTable
+
+                    function ENT:Initialize()
+                        ---@type GlideWheelState
+                        self.state = {
+                            traceData = {
+                                start = 1,
+                            },
+                        }
+                    end
+
+                    function ENT:Think(selfTbl)
+                        selfTbl = selfTbl or getTable(self)
+                        local traceData = selfTbl.state.traceData
+                        return tra<??>ceData
+                    end
+                "#,
+        ))?;
+        let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("GlideTraceData"),
+            "expected nested traceData hover to keep declared type, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains("never"),
+            "expected nested traceData hover to avoid never, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains(": nil"),
+            "expected nested traceData hover to avoid nil, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_local_gettable_state_field_keeps_typed_state() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(&dedent(
+            r#"
+                    ---@class Entity
+                    local Entity = {}
+
+                    ---@return tableof<self>
+                    function Entity:GetTable() end
+
+                    ---@generic T : table
+                    ---@param metaName `T`
+                    ---@return T
+                    function FindMetaTable(metaName) end
+
+                    ---@class GlideTraceData
+                    ---@field start number
+
+                    ---@class GlideWheelState
+                    ---@field traceData GlideTraceData
+
+                    local getTable = FindMetaTable("Entity").GetTable
+
+                    function ENT:Initialize()
+                        ---@type GlideWheelState
+                        self.state = {
+                            traceData = {
+                                start = 1,
+                            },
+                        }
+                    end
+
+                    function ENT:Think(selfTbl)
+                        selfTbl = selfTbl or getTable(self)
+                        return selfTbl.sta<??>te
+                    end
+                "#,
+        ))?;
+        let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("GlideWheelState"),
+            "expected state hover to keep GlideWheelState, got: {}",
+            markup.value
+        );
+        assert!(
+            !markup.value.contains(": any"),
+            "expected state hover to avoid any, got: {}",
+            markup.value
+        );
 
         Ok(())
     }
@@ -2144,6 +3144,234 @@ mod tests {
                 markup.value
             );
         }
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_branched_dynamic_field_unions_vector_real_shape() -> Result<()> {
+        // Repro of cityrp-vehicle-base/init.lua bug:
+        //   if exitPos then
+        //       seat.GlideExitPos = Vector(...)
+        //   else
+        //       seat.GlideExitPos = nil
+        //   end
+        // Reading `seat.GlideExitPos` later must hover as `Vector?` (i.e. Vector|nil),
+        // NOT bare `nil`. Pre-fix, `retain_only_member_for_owner_key` dropped the
+        // Vector-branch member because the `= nil` branch ran later.
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@param x? number
+                ---@param y? number
+                ---@param z? number
+                ---@return Vector
+                function _G.Vector(x, y, z) end
+
+                ---@param ent any
+                ---@return boolean
+                function _G.IsValid(ent) end
+
+                ---@class NULL
+                NULL = {}
+
+                _G.ents = {}
+                ---@generic T : Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function _G.ents.Create(class) end
+
+                ---@class Entity
+                local Entity = {}
+
+                function ENT:CreateSeat(exitPos)
+                    local seat = ents.Create("prop_vehicle_prisoner_pod")
+                    if not IsValid(seat) then return end
+                    if exitPos then
+                        seat.GlideExitPos = Vector(exitPos[1], exitPos[2], exitPos[3])
+                    else
+                        seat.GlideExitPos = nil
+                    end
+                end
+
+                function ENT:ReadSeat()
+                    local seat = ents.Create("prop_vehicle_prisoner_pod")
+                    if not IsValid(seat) then return end
+                    local v = seat.Glide<??>ExitPos
+                    return v
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        let has_vector = value.contains("Vector");
+        let has_nil_marker = value.contains("nil") || value.contains('?');
+        assert!(
+            has_vector && has_nil_marker,
+            "expected hover on read site to include Vector + nil marker, got: {value}"
+        );
+        Ok(())
+    }
+
+    /// Hover at the LHS of `seat.GlideExitPos = nil` (the offending line the
+    /// user is hovering on). Pre-fix this displayed `(field) GlideExitPos: nil`
+    /// because `get_hover_type` rewrote the displayed type to the RHS being
+    /// assigned. Post-fix, `lhs_indexed_member_union_type` recovers the
+    /// field's full union from the branched assignments so the hover correctly
+    /// shows `Vector?` (i.e. `Vector | nil`).
+    #[gtest]
+    fn test_hover_branched_dynamic_field_lhs_assign_does_not_collapse_field_type() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        // Hover directly on the `GlideExitPos` token in the `= nil` branch.
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@param x? number
+                ---@param y? number
+                ---@param z? number
+                ---@return Vector
+                function _G.Vector(x, y, z) end
+
+                ---@param ent any
+                ---@return boolean
+                function _G.IsValid(ent) end
+
+                ---@class NULL
+                NULL = {}
+
+                _G.ents = {}
+                ---@generic T : Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function _G.ents.Create(class) end
+
+                ---@class Entity
+                local Entity = {}
+
+                function ENT:CreateSeat(exitPos)
+                    local seat = ents.Create("prop_vehicle_prisoner_pod")
+                    if not IsValid(seat) then return end
+                    if exitPos then
+                        seat.GlideExitPos = Vector(exitPos[1], exitPos[2], exitPos[3])
+                    else
+                        seat.Glide<??>ExitPos = nil
+                    end
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        // Post-fix the LHS hover must show the field's full union, not bare
+        // `nil` or `never`. Accept either `Vector?` rendering or explicit
+        // `Vector | nil` / `Vector|nil`.
+        assert!(
+            value.contains("GlideExitPos"),
+            "hover should include field name, got: {value}"
+        );
+        assert!(
+            value.contains("Vector"),
+            "LHS hover must include `Vector` from the other branch, got: {value}"
+        );
+        let has_nil_marker = value.contains("Vector?")
+            || value.contains("Vector | nil")
+            || value.contains("Vector|nil")
+            || value.contains("nil");
+        assert!(
+            has_nil_marker,
+            "LHS hover must include a nil marker (`?` or `| nil`), got: {value}"
+        );
+        assert!(
+            !value.contains("GlideExitPos: nil") && !value.contains("GlideExitPos: never"),
+            "LHS hover must not collapse to bare `nil` or `never`, got: {value}"
+        );
+        Ok(())
+    }
+
+    /// Read-site hover where the entity local comes from `self.seats[index]`
+    /// in a different method than the branched assignment. Mirrors
+    /// `cityrp-vehicle-base/init.lua:559` (`local seat = self.seats[index]`
+    /// then `seat.GlideExitPos[1]`). Failing red test pre-fix produced bare
+    /// `nil` or `never` because the branched dynamic-field assignment
+    /// collapsed to the last `= nil` branch.
+    #[gtest]
+    fn test_hover_branched_dynamic_field_read_via_self_seats_array() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Vector
+                local Vector = {}
+                ---@param x? number
+                ---@param y? number
+                ---@param z? number
+                ---@return Vector
+                function _G.Vector(x, y, z) end
+
+                ---@param ent any
+                ---@return boolean
+                function _G.IsValid(ent) end
+
+                ---@class NULL
+                NULL = {}
+
+                _G.ents = {}
+                ---@generic T : Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function _G.ents.Create(class) end
+
+                ---@class Entity
+                local Entity = {}
+
+                ---@class base_glide
+                ---@field seats prop_vehicle_prisoner_pod[]
+                local ENTCLASS = {}
+
+                function ENT:CreateSeat(exitPos, index)
+                    local seat = ents.Create("prop_vehicle_prisoner_pod")
+                    if not IsValid(seat) then return end
+                    if exitPos then
+                        seat.GlideExitPos = Vector(exitPos[1], exitPos[2], exitPos[3])
+                    else
+                        seat.GlideExitPos = nil
+                    end
+                    self.seats[index] = seat
+                end
+
+                function ENT:GetSeatExitPos(index)
+                    local seat = self.seats[index]
+                    if not IsValid(seat) then return end
+                    return seat.Glide<??>ExitPos
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        let has_vector = value.contains("Vector");
+        let has_nil_marker = value.contains("nil") || value.contains('?');
+        assert!(
+            has_vector && has_nil_marker,
+            "real-shape read via self.seats[i] must hover Vector|nil, got: {value}"
+        );
         Ok(())
     }
 }

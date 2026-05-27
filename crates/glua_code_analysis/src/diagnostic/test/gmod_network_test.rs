@@ -1574,6 +1574,44 @@ mod tests {
     }
 
     #[gtest]
+    fn test_receiver_expands_colon_method_reads_on_same_scripted_class() {
+        let mut ws = new_gmod_workspace();
+
+        ws.def_file(
+            "lua/entities/base_glide/sv_weapons.lua",
+            r#"
+            util.AddNetworkString("glide.sync_weapon_data")
+            function ENT:SendWeaponData()
+                net.Start("glide.sync_weapon_data")
+                net.WriteUInt(1, 5)
+                net.WriteString("weapon")
+                net.Send(Entity(1))
+            end
+            "#,
+        );
+
+        let client_file_id = ws.def_file(
+            "lua/entities/base_glide/cl_hud.lua",
+            r#"
+            function ENT:OnSyncWeaponData()
+                local slotIndex = net.ReadUInt(5)
+                local className = net.ReadString()
+            end
+
+            net.Receive("glide.sync_weapon_data", function()
+                local vehicle = Glide.currentVehicle
+                if IsValid(vehicle) then
+                    vehicle:OnSyncWeaponData()
+                end
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
     fn test_helper_function_expansion_cross_file_genuine_mismatch_reported() {
         // Cross-file helpers resolve, so a genuine mismatch via shared helpers
         // (sender writes UInt, receiver reads String) should surface.

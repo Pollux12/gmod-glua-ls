@@ -1,6 +1,6 @@
 use std::{collections::HashSet, ops::Deref, sync::Arc};
 
-use glua_parser::{LuaAstNode, LuaDocTypeList};
+use glua_parser::{LuaAstNode, LuaDocTypeList, LuaFuncStat, LuaNameExpr, LuaVarExpr};
 use glua_parser::{LuaCallExpr, LuaExpr};
 use internment::ArcIntern;
 
@@ -248,6 +248,13 @@ pub fn infer_self_type(
                 SemanticDeclLevel::default(),
             )?;
             if let LuaSemanticDeclId::Member(member_id) = semantic_decl_id {
+                if let Some(first_arg) = call_expr.get_args_list()?.get_args().next()
+                    && let Some(arg_type) = infer_alias_self_arg_type(db, cache, first_arg)
+                {
+                    let self_type = build_self_type(db, &arg_type);
+                    return Some(self_type);
+                }
+
                 let owner = db.get_member_index().get_current_owner(&member_id)?;
                 if let LuaMemberOwner::Type(id) = owner {
                     let typ = LuaType::Ref(id.clone());
@@ -258,6 +265,47 @@ pub fn infer_self_type(
             }
         }
         _ => {}
+    }
+
+    None
+}
+
+fn infer_alias_self_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg_expr: LuaExpr,
+) -> Option<LuaType> {
+    if let LuaExpr::NameExpr(name_expr) = &arg_expr
+        && name_expr.get_name_text()? == "self"
+        && is_implicit_self_name(db, cache, name_expr)
+        && let Some(self_type) = infer_enclosing_self_type(db, cache, name_expr)
+    {
+        return Some(self_type);
+    }
+
+    infer_expr(db, cache, arg_expr).ok()
+}
+
+fn is_implicit_self_name(db: &DbIndex, cache: &LuaInferCache, name_expr: &LuaNameExpr) -> bool {
+    db.get_decl_index()
+        .get_decl_tree(&cache.get_file_id())
+        .and_then(|tree| tree.find_local_decl("self", name_expr.get_position()))
+        .is_some_and(|decl| decl.is_implicit_self())
+}
+
+fn infer_enclosing_self_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaType> {
+    for func_stat in name_expr.ancestors::<LuaFuncStat>() {
+        let func_name = func_stat.get_func_name()?;
+        if let LuaVarExpr::IndexExpr(index_expr) = func_name
+            && index_expr.get_index_token()?.is_colon()
+        {
+            let prefix_expr = index_expr.get_prefix_expr()?;
+            return infer_expr(db, cache, prefix_expr).ok();
+        }
     }
 
     None

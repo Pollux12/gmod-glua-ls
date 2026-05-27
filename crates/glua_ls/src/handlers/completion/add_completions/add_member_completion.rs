@@ -110,10 +110,19 @@ pub fn add_member_completion(
 
     let call_display = get_call_show(builder.semantic_model.get_db(), &remove_nil_type, status)
         .unwrap_or(CallDisplay::None);
+    let is_inferred_dynamic_member = property_owner.is_none();
     // 紧靠着 label 显示的描述
-    let detail = get_detail(builder, &remove_nil_type, call_display);
+    let detail = if is_inferred_dynamic_member {
+        None
+    } else {
+        get_detail(builder, &remove_nil_type, call_display)
+    };
     // 在`detail`更右侧, 且不紧靠着`detail`显示
-    let description = get_description(builder, &remove_nil_type);
+    let description = if is_inferred_dynamic_member {
+        None
+    } else {
+        get_description(builder, &remove_nil_type)
+    };
 
     let deprecated = property_owner
         .as_ref()
@@ -121,7 +130,11 @@ pub fn add_member_completion(
 
     let mut completion_item = CompletionItem {
         label: label.clone(),
-        kind: Some(get_completion_kind(&remove_nil_type)),
+        kind: Some(if is_inferred_dynamic_member {
+            lsp_types::CompletionItemKind::VARIABLE
+        } else {
+            get_completion_kind(&remove_nil_type)
+        }),
         data: completion_data,
         label_details: Some(lsp_types::CompletionItemLabelDetails {
             detail,

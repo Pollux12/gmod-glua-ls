@@ -5,11 +5,12 @@ dhat-heap.json
 .claude/
 .opencode/
 .serena/
-.agents/skills/
 .pommel/
 .pommelignore
 .grepai/
 .context-engine/
+.slim/deepwork/
 
 benchmark_*.log
+.bench-*.log
 100

@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod test {
-    use crate::{LuaAstNode, LuaComment, LuaParser, ParserConfig};
+    use crate::{
+        LuaAstNode, LuaComment, LuaDocTagDefaultValue, LuaDocTagField, LuaDocTagParam,
+        LuaDocTagReturn, LuaParser, ParserConfig,
+    };
 
     #[allow(unused)]
     fn print_ast(lua_code: &str) {
@@ -81,5 +84,49 @@ mod test {
         "#;
 
         print_ast(code);
+    }
+
+    #[test]
+    fn test_inline_default_accessors() {
+        let code = r#"
+        ---@field ContentsLeft=0 CONTENTS
+        ---@field ContentsRight CONTENTS=0
+        ---@param retries_left=3 number
+        ---@param retries_right number=3
+        ---@return boolean=false
+        function f() end
+        "#;
+
+        let tree = LuaParser::parse(code, ParserConfig::default());
+        let root = tree.get_chunk_node();
+
+        let mut field_tags = root.descendants::<LuaDocTagField>();
+        let field_left = field_tags.next().unwrap();
+        let field_right = field_tags.next().unwrap();
+        assert_eq!(
+            field_left.get_default_value(),
+            Some(LuaDocTagDefaultValue::Number("0".to_string()))
+        );
+        assert_eq!(
+            field_right.get_default_value(),
+            Some(LuaDocTagDefaultValue::Number("0".to_string()))
+        );
+
+        let mut param_tags = root.descendants::<LuaDocTagParam>();
+        let param_left = param_tags.next().unwrap();
+        let param_right = param_tags.next().unwrap();
+        assert_eq!(
+            param_left.get_default_value(),
+            Some(LuaDocTagDefaultValue::Number("3".to_string()))
+        );
+        assert_eq!(
+            param_right.get_default_value(),
+            Some(LuaDocTagDefaultValue::Number("3".to_string()))
+        );
+
+        let return_tag = root.descendants::<LuaDocTagReturn>().next().unwrap();
+        let infos = return_tag.get_info_list_with_default();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].2, Some(LuaDocTagDefaultValue::Boolean(false)));
     }
 }

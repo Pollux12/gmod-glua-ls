@@ -18,11 +18,19 @@ use crate::handlers::gmod_string_context::{
     extract_string_call_context, is_vgui_panel_string_context, net_message_call_kind,
     normalize_string_name,
 };
+use crate::handlers::hover::find_member_origin_owner;
 
 #[derive(Default)]
 struct ReferenceSearchContext {
     visited_module_exports: HashSet<FileId>,
     visited_semantic_ids: HashSet<LuaSemanticDeclId>,
+    include_declaration: bool,
+    /// Tracks whether we are still processing the starting symbol (vs secondary
+    /// symbols enqueued from the worklist).  Used to honour LSP
+    /// `includeDeclaration` semantics: only the starting symbol's own
+    /// declaration is subject to the flag; secondary symbol declarations are
+    /// always included because they represent references to the original.
+    is_starting_symbol: bool,
 }
 
 pub fn search_references(
@@ -30,6 +38,7 @@ pub fn search_references(
     compilation: &LuaCompilation,
     token: LuaSyntaxToken,
     cancel_token: &CancellationToken,
+    include_declaration: bool,
 ) -> Option<Vec<Location>> {
     let mut result = Vec::new();
     if let Some(semantic_decl) =
@@ -44,6 +53,7 @@ pub fn search_references(
                     token,
                     &mut result,
                     cancel_token,
+                    include_declaration,
                 );
             }
             LuaSemanticDeclId::Member(member_id) => {
@@ -53,6 +63,7 @@ pub fn search_references(
                     member_id,
                     &mut result,
                     cancel_token,
+                    include_declaration,
                 );
             }
             LuaSemanticDeclId::TypeDecl(type_decl_id) => {
@@ -96,8 +107,13 @@ pub fn search_decl_references_with_token(
     token: LuaSyntaxToken,
     result: &mut Vec<Location>,
     cancel_token: &CancellationToken,
+    include_declaration: bool,
 ) -> Option<()> {
-    let mut ctx = ReferenceSearchContext::default();
+    let mut ctx = ReferenceSearchContext {
+        include_declaration,
+        is_starting_symbol: true,
+        ..Default::default()
+    };
     let mut semantic_cache = HashMap::new();
     let previous_result = result.len();
     let ret = search_semantic_references_with_ctx(
@@ -137,8 +153,13 @@ pub fn search_decl_references(
     decl_id: LuaDeclId,
     result: &mut Vec<Location>,
     cancel_token: &CancellationToken,
+    include_declaration: bool,
 ) -> Option<()> {
-    let mut ctx = ReferenceSearchContext::default();
+    let mut ctx = ReferenceSearchContext {
+        include_declaration,
+        is_starting_symbol: true,
+        ..Default::default()
+    };
     let mut semantic_cache = HashMap::new();
     search_semantic_references_with_ctx(
         &mut ctx,
@@ -169,9 +190,12 @@ fn search_decl_references_with_ctx<'a>(
             .get_reference_index()
             .get_decl_references(&decl_id.file_id, &decl_id)?;
         let document = semantic_model.get_document();
-        // 加入自己
-        if let Some(location) = document.to_lsp_location(decl.get_range()) {
-            result.push(location);
+        // 加入自己 (only for the starting symbol when include_declaration is true,
+        // or always for secondary symbols from the worklist)
+        if ctx.include_declaration || !ctx.is_starting_symbol {
+            if let Some(location) = document.to_lsp_location(decl.get_range()) {
+                result.push(location);
+            }
         }
         let typ = semantic_model.get_type(decl.get_id().into());
         let should_follow_value_alias = matches!(
@@ -208,9 +232,30 @@ fn search_decl_references_with_ctx<'a>(
             .get_db()
             .get_reference_index()
             .get_global_references(name)?;
+
+        // Resolve the declaration location so we can honour include_declaration
+        // for the starting symbol.  Global references include the declaration
+        // site itself, so we must filter it out when the flag is false.
+        let decl_location = if !ctx.include_declaration && ctx.is_starting_symbol {
+            semantic_model
+                .get_document_by_file_id(decl_id.file_id)
+                .and_then(|doc| doc.to_lsp_location(decl.get_range()))
+        } else {
+            None
+        };
+
         for in_filed_syntax_id in global_references {
             let document = semantic_model.get_document_by_file_id(in_filed_syntax_id.file_id)?;
             let location = document.to_lsp_location(in_filed_syntax_id.value.get_range())?;
+
+            // Skip the declaration when include_declaration is false for the
+            // starting symbol.
+            if let Some(ref decl_loc) = decl_location {
+                if location.uri == decl_loc.uri && location.range == decl_loc.range {
+                    continue;
+                }
+            }
+
             result.push(location);
         }
     }
@@ -224,8 +269,13 @@ pub fn search_member_references(
     member_id: LuaMemberId,
     result: &mut Vec<Location>,
     cancel_token: &CancellationToken,
+    include_declaration: bool,
 ) -> Option<()> {
-    let mut ctx = ReferenceSearchContext::default();
+    let mut ctx = ReferenceSearchContext {
+        include_declaration,
+        is_starting_symbol: true,
+        ..Default::default()
+    };
     let mut semantic_cache = HashMap::new();
     search_semantic_references_with_ctx(
         &mut ctx,
@@ -258,6 +308,24 @@ fn search_member_references_with_ctx<'a>(
         .get_index_references(key)?;
 
     let semantic_id = LuaSemanticDeclId::Member(member_id);
+
+    // Resolve the origin member so we can identify the declaration location
+    // for include_declaration semantics.
+    let origin_member_id = find_member_origin_owner(compilation, semantic_model, member_id)
+        .and_then(|id| match id {
+            LuaSemanticDeclId::Member(mid) => Some(mid),
+            _ => None,
+        })
+        .unwrap_or(member_id);
+
+    let decl_location = semantic_model
+        .get_document_by_file_id(origin_member_id.file_id)
+        .and_then(|doc| doc.to_lsp_location(origin_member_id.get_syntax_id().get_range()));
+
+    // Track whether the declaration was naturally produced by the reference
+    // loop so we don't add it twice.
+    let mut decl_found_in_loop = false;
+
     for in_filed_syntax_id in index_references {
         if cancel_token.is_cancelled() {
             return None;
@@ -274,6 +342,23 @@ fn search_member_references_with_ctx<'a>(
             let document = reference_semantic_model.get_document();
             let range = in_filed_syntax_id.value.get_range();
             let location = document.to_lsp_location(range)?;
+
+            // Check if this reference is the declaration location.
+            // Use full range equality to avoid false positives when a usage
+            // happens to be on the same line as the declaration.
+            let is_decl = decl_location.as_ref().is_some_and(|decl_loc| {
+                location.uri == decl_loc.uri && location.range == decl_loc.range
+            });
+
+            if is_decl {
+                decl_found_in_loop = true;
+                // When include_declaration is false for the starting symbol,
+                // skip the declaration.
+                if !ctx.include_declaration && ctx.is_starting_symbol {
+                    continue;
+                }
+            }
+
             result.push(location);
             let _ = search_member_secondary_references(
                 ctx,
@@ -282,6 +367,14 @@ fn search_member_references_with_ctx<'a>(
                 result,
                 worklist,
             );
+        }
+    }
+
+    // If include_declaration is true (or secondary symbol) and the declaration
+    // was not found in the reference loop, add it now.
+    if !decl_found_in_loop && (ctx.include_declaration || !ctx.is_starting_symbol) {
+        if let Some(loc) = decl_location {
+            result.push(loc);
         }
     }
 
@@ -772,52 +865,6 @@ fn find_require_call_binding_semantic(
     None
 }
 
-#[allow(unused)]
-fn filter_duplicate_and_covered_locations(locations: Vec<Location>) -> Vec<Location> {
-    if locations.is_empty() {
-        return locations;
-    }
-    let mut sorted_locations = locations;
-    sorted_locations.sort_by(|a, b| {
-        a.uri
-            .to_string()
-            .cmp(&b.uri.to_string())
-            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
-            .then_with(|| b.range.end.line.cmp(&a.range.end.line))
-    });
-
-    let mut result = Vec::new();
-    let mut seen_lines_by_uri: HashMap<String, HashSet<u32>> = HashMap::new();
-
-    for location in sorted_locations {
-        let uri_str = location.uri.to_string();
-        let seen_lines = seen_lines_by_uri.entry(uri_str).or_default();
-
-        let start_line = location.range.start.line;
-        let end_line = location.range.end.line;
-
-        let is_covered = (start_line..=end_line).any(|line| seen_lines.contains(&line));
-
-        if !is_covered {
-            for line in start_line..=end_line {
-                seen_lines.insert(line);
-            }
-            result.push(location);
-        }
-    }
-
-    // 最终按位置排序
-    result.sort_by(|a, b| {
-        a.uri
-            .to_string()
-            .cmp(&b.uri.to_string())
-            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
-            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
-    });
-
-    result
-}
-
 fn enqueue_semantic_id(
     ctx: &mut ReferenceSearchContext,
     worklist: &mut Vec<LuaSemanticDeclId>,
@@ -857,7 +904,7 @@ fn search_semantic_references_with_ctx<'a>(
         return Some(());
     }
 
-    let mut first = true;
+    ctx.is_starting_symbol = true;
     let mut start_ret = Some(());
 
     while let Some(semantic_id) = worklist.pop() {
@@ -897,9 +944,12 @@ fn search_semantic_references_with_ctx<'a>(
             _ => Some(()),
         };
 
-        if first {
+        // After the first iteration, we are no longer processing the
+        // starting symbol, so secondary symbol declarations are always
+        // included regardless of include_declaration.
+        if ctx.is_starting_symbol {
+            ctx.is_starting_symbol = false;
             start_ret = ret;
-            first = false;
         }
     }
 

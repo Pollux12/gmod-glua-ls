@@ -861,6 +861,7 @@ dependencies = [
  "reqwest",
  "rowan",
  "rust-i18n",
+ "rustc-hash 2.1.1",
  "schema_to_glua",
  "schemars 1.0.4",
  "serde",

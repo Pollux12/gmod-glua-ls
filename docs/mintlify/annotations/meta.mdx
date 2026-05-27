@@ -7,9 +7,9 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-`@meta` marks a file as a **type-only declaration file**. GLuaLS reads it for type information, but runtime code does not use it.
+`@meta` marks a file as a **type-only declaration file**. GLuaLS reads it for type information. Your addon does not run it.
 
-Use this for meta libraries, including the wiki-generated Garry's Mod annotations ([view here](https://github.com/Pollux12/gmod-luals-addon/tree/gluals-annotations)).
+Use this for meta libraries, including the wiki-generated Garry's Mod annotations ([view them here](https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations)).
 
 ---
 
@@ -24,7 +24,10 @@ Use this for meta libraries, including the wiki-generated Garry's Mod annotation
 
 ## Usage
 
-Meta files are used to define types for external libraries, built-in APIs, or any code you want to type without having the actual implementation available:
+Use meta files to define types for:
+- External libraries
+- Built-in APIs
+- Code without implementation source
 
 ```lua
 ---@meta
@@ -47,7 +50,7 @@ return json
 
 ## Named meta files
 
-Providing a name after `@meta` associates the file with a specific library name, used for documentation and tooling:
+Add a name after `@meta` to connect the file to a library name for documentation and tooling:
 
 ```lua
 ---@meta mylib
@@ -57,15 +60,15 @@ Providing a name after `@meta` associates the file with a specific library name,
 
 ## Common uses
 
-- **Bundled GMod annotations** — the auto-downloaded annotations for GMod's API are all meta files
-- **Third-party library stubs** — declare types for libraries loaded at runtime
-- **Custom type files** — define extra types used across your workspace
+- **Bundled GMod annotations**: GLuaLS ships GMod API annotations as meta files
+- **Third-party library stubs**: declare types for libraries loaded at runtime
+- **Custom type files**: define extra types used across your workspace
 
 ---
 
 ## Meta files in workspace configuration
 
-Add meta files or directories to `workspace.library` to include them in analysis without treating them as project code:
+Add meta files or directories to `workspace.library` so GLuaLS analyzes them without treating them as project code:
 
 <ConfigTip />
 ```json .gluarc.json
@@ -80,4 +83,4 @@ Add meta files or directories to `workspace.library` to include them in analysis
 
 ## See also
 
-- [Annotations management](/configuration/annotations-management) — how the VS Code extension downloads and loads GMod annotations
+- [Annotations management](/configuration/annotations-management): how the VS Code extension downloads and loads GMod annotations

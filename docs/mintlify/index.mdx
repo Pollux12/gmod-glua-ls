@@ -8,7 +8,7 @@ mode: wide
 
 GLua Language Server (GLuaLS) is a language server and toolkit for **Garry's Mod**, built on top of [EmmyLua Rust](https://github.com/EmmyLuaLs/emmylua-analyzer-rust).
 
-It is built to work out of the box. Install the extension, open your GMod Lua project, and start coding. If you need custom settings, use the built-in settings panel.
+GLuaLS works out of the box. Install the extension, open your GMod Lua project, and start coding. If you need custom settings, use the built-in settings panel.
 
 <CardGroup cols={3}>
   <Card title="Install" icon="download" href="/getting-started/installation">
@@ -34,10 +34,10 @@ It is built to work out of the box. Install the extension, open your GMod Lua pr
     Validates `net.Start`/`net.Receive` payloads, catches mismatched write/read types, and delivers smart completion.
   </Card>
   <Card title="Scripted class support" icon="cube" href="/language/scripted-classes">
-    Automatic detection of ENT, SWEP, TOOL, and custom classes. Synthesizes NetworkVar getters/setters and AccessorFuncs automatically.
+    Detects ENT, SWEP, TOOL, and custom classes. Synthesizes NetworkVar getters/setters and AccessorFuncs.
   </Card>
   <Card title="Hook intelligence" icon="link" href="/language/hook-intelligence">
-    Intelligent autocomplete for `hook.Add`, `hook.Run`, and `GM:` overrides. Registers custom hooks automatically.
+    Autocomplete for `hook.Add`, `hook.Run`, and `GM:` overrides. Registers custom hooks.
   </Card>
   <Card title="Integrated debugger" icon="bug" href="/debugger/overview">
     Full SRCDS debugger with breakpoints, variable inspection, live entity explorer, and Lua execution straight from the editor.
@@ -51,7 +51,7 @@ It is built to work out of the box. Install the extension, open your GMod Lua pr
 
 ## Example: what GLuaLS catches
 
-GLuaLS catches GMod-specific mistakes that generic Lua tools miss entirely:
+GLuaLS catches GMod-specific mistakes that generic Lua tools miss:
 
 <CodeGroup>
 ```lua Realm mismatch

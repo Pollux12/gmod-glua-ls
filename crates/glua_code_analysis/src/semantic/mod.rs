@@ -16,11 +16,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaChunk, LuaDocType, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaNameExpr,
-    LuaParseError, LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr,
+    LuaAstNode, LuaCallExpr, LuaChunk, LuaDocType, LuaExpr, LuaIndexExpr, LuaIndexKey,
+    LuaIndexMemberExpr, LuaNameExpr, LuaParseError, LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken,
+    LuaTableExpr,
 };
+pub(crate) use infer::check_iter_var_range;
 pub use infer::infer_index_expr;
-use infer::{infer_bind_value_type, infer_expr_list_types};
+use infer::{infer_bind_value_type, infer_call_arg_expr_list_types, infer_expr_list_types};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
 use lsp_types::Uri;
 pub use member::LuaMemberInfo;
@@ -58,9 +60,11 @@ use crate::{LuaFunctionType, LuaMemberId, LuaMemberKey, LuaTypeOwner};
 pub use generic::*;
 pub use guard::{InferGuard, InferGuardRef};
 pub use infer::InferFailReason;
+pub use infer::VarRefId;
 pub use infer::infer_call_expr_func;
 pub(crate) use infer::infer_expr;
 pub use infer::infer_param;
+pub(crate) use infer::{contains_gmod_null_type, get_var_expr_var_ref_id};
 use overload_resolve::resolve_signature;
 pub use semantic_info::SemanticDeclLevel;
 pub use type_check::{TypeCheckFailReason, TypeCheckResult};
@@ -321,11 +325,11 @@ impl<'a> SemanticModel<'a> {
         arg_count: Option<usize>,
     ) -> Option<Arc<LuaFunctionType>> {
         let prefix_expr = call_expr.get_prefix_expr()?;
-        let call_expr_type =
-            infer_expr(self.db, &mut self.infer_cache.borrow_mut(), prefix_expr).ok()?;
+        let mut cache = self.infer_cache.borrow_mut();
+        let call_expr_type = infer_expr(self.db, &mut cache, prefix_expr).ok()?;
         infer_call_expr_func(
             self.db,
-            &mut self.infer_cache.borrow_mut(),
+            &mut cache,
             call_expr,
             call_expr_type,
             &InferGuard::new(),
@@ -345,6 +349,19 @@ impl<'a> SemanticModel<'a> {
             Ok(infer_expr(db, cache, expr).unwrap_or(LuaType::Unknown))
         })
         .unwrap_or_default()
+    }
+
+    pub fn infer_call_arg_expr_list_types(
+        &self,
+        call_expr: LuaCallExpr,
+        var_count: Option<usize>,
+    ) -> Vec<(LuaType, TextRange)> {
+        infer_call_arg_expr_list_types(
+            self.db,
+            &mut self.infer_cache.borrow_mut(),
+            call_expr,
+            var_count,
+        )
     }
 
     /// 推断值已经绑定的类型(不是推断值的类型). 例如从右值推断左值类型, 从调用参数推断函数参数类型
@@ -464,6 +481,20 @@ impl<'a> SemanticModel<'a> {
         member_key: &LuaMemberKey,
     ) -> Result<LuaType, InferFailReason> {
         member::infer_raw_member_type(self.db, prefix_type, member_key)
+    }
+
+    pub(crate) fn infer_index_member_type(
+        &self,
+        prefix_type: &LuaType,
+        index_expr: &LuaIndexExpr,
+    ) -> Result<LuaType, InferFailReason> {
+        infer::infer_member_by_member_key(
+            self.db,
+            &mut self.infer_cache.borrow_mut(),
+            prefix_type,
+            LuaIndexMemberExpr::IndexExpr(index_expr.clone()),
+            &InferGuard::new(),
+        )
     }
 
     pub fn get_member_origin_owner(&self, member_id: LuaMemberId) -> Option<LuaSemanticDeclId> {

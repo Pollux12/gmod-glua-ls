@@ -8,10 +8,10 @@ use glua_code_analysis::{
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaSyntaxKind,
-    LuaSyntaxToken, LuaTableExpr, LuaTableField, PathTrait,
+    LuaSyntaxToken, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use lsp_types::{Hover, HoverContents, MarkedString, MarkupContent};
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 use crate::handlers::hover::function::{build_function_hover, is_function};
 use crate::handlers::hover::humanize_type_decl::build_type_decl_hover;
@@ -50,6 +50,31 @@ pub fn build_semantic_info_hover(
     } else {
         None
     }
+}
+
+pub fn build_assignment_target_hover(
+    compilation: &LuaCompilation,
+    semantic_model: &SemanticModel,
+    db: &DbIndex,
+    document: &LuaDocument,
+    token: LuaSyntaxToken,
+) -> Option<Hover> {
+    let typ = get_assignment_target_type(&token, semantic_model)?;
+    let range = token.text_range();
+    if let Some(semantic_decl) = get_assignment_target_semantic_decl(db, semantic_model, &token) {
+        let hover_builder = build_hover_content(
+            compilation,
+            semantic_model,
+            db,
+            Some(typ),
+            semantic_decl,
+            false,
+            Some(token.clone()),
+        )?;
+        return hover_builder.build_hover_result(document.to_lsp_range(range));
+    }
+
+    build_hover_without_property(db, semantic_model, document, token, typ)
 }
 
 fn build_hover_without_property(
@@ -110,14 +135,30 @@ fn build_dynamic_field_hover_without_property(
     let prefix_type = semantic_model
         .infer_expr(index_expr.get_prefix_expr()?)
         .ok()?;
-    if !is_dynamic_field_for_type(db, &prefix_type, &field_name) {
+    if !is_dynamic_field_for_type(
+        db,
+        semantic_model,
+        &prefix_type,
+        &field_name,
+        index_expr.get_position(),
+    ) {
         return None;
     }
 
-    let type_humanize_text = if typ.is_const() {
-        hover_const_type(db, typ)
+    let hover_type = if let Some(assignment_type) =
+        prefer_concrete_assignment_type_for_token(token, semantic_model, typ)
+    {
+        assignment_type
+    } else if matches!(typ, LuaType::Nil | LuaType::Unknown) {
+        LuaType::Any
     } else {
-        humanize_type(db, typ, RenderLevel::Simple)
+        typ.clone()
+    };
+
+    let type_humanize_text = if hover_type.is_const() {
+        hover_const_type(db, &hover_type)
+    } else {
+        humanize_type(db, &hover_type, RenderLevel::Simple)
     };
 
     Some(format!(
@@ -126,32 +167,26 @@ fn build_dynamic_field_hover_without_property(
     ))
 }
 
-fn is_dynamic_field_for_type(db: &DbIndex, typ: &LuaType, field_name: &str) -> bool {
+fn is_dynamic_field_for_type(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    typ: &LuaType,
+    field_name: &str,
+    position_offset: TextSize,
+) -> bool {
     let emmyrc = db.get_emmyrc();
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
     }
 
-    let index = db.get_dynamic_field_index();
-    has_dynamic_field_for_type(index, typ, field_name)
-}
-
-fn has_dynamic_field_for_type(
-    index: &glua_code_analysis::DynamicFieldIndex,
-    typ: &LuaType,
-    field_name: &str,
-) -> bool {
-    match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => index.has_field(id, field_name),
-        LuaType::Instance(instance) => {
-            has_dynamic_field_for_type(index, instance.get_base(), field_name)
-        }
-        LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
-            .any(|member_type| has_dynamic_field_for_type(index, member_type, field_name)),
-        _ => false,
-    }
+    let key = LuaMemberKey::Name(field_name.into());
+    semantic_model
+        .get_member_info_with_key_at_offset(typ, key, true, position_offset)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| member.property_owner_id.is_none())
+        })
 }
 
 pub fn build_hover_content_for_completion<'a>(
@@ -369,8 +404,46 @@ fn build_member_hover(
             builder.set_type_description(format!("(field) {}: {}", member_name, const_value));
             builder.set_location_path(Some(member));
         } else {
-            let member_hover_type =
-                get_hover_type(builder, builder.semantic_model).unwrap_or(typ.clone());
+            // For fields with multiple definitions (e.g. dynamic-field
+            // assignments in mutually-exclusive branches), `get_hover_type`
+            // would override the displayed type to the *local* RHS at the
+            // assignment site — producing misleading hovers like
+            // `(field) GlideExitPos: nil` on the `= nil` branch even though
+            // the field's actual type is the union `Vector | nil`.
+            //
+            // Resolution order:
+            //   1. If `find_member_origin_owners` returned >1 distinct types
+            //      (read sites usually walk all definitions), union them.
+            //   2. If `typ` is already a union (richer info), prefer it.
+            //   3. If we're at the LHS of an assignment, re-derive the field's
+            //      full union type from the IndexExpr's prefix-type via
+            //      `get_member_info_with_key_at_offset` and union that.
+            //   4. Otherwise, fall back to `get_hover_type` (preserves generic-
+            //      instantiation behavior).
+            let unique_origin_types: Vec<LuaType> = {
+                let mut seen: Vec<LuaType> = Vec::new();
+                for (_, t) in &semantic_decls {
+                    if !seen.iter().any(|s| s == t) {
+                        seen.push(t.clone());
+                    }
+                }
+                seen
+            };
+            let member_hover_type = if unique_origin_types.len() > 1 {
+                let mut acc = unique_origin_types[0].clone();
+                for t in &unique_origin_types[1..] {
+                    acc = glua_code_analysis::TypeOps::Union.apply(db, &acc, t);
+                }
+                prefer_concrete_assignment_type_for_builder(builder, builder.semantic_model, &acc)
+                    .unwrap_or(acc)
+            } else if typ.is_union() {
+                prefer_concrete_assignment_type_for_builder(builder, builder.semantic_model, &typ)
+                    .unwrap_or(typ.clone())
+            } else {
+                prefer_concrete_assignment_type_for_builder(builder, builder.semantic_model, &typ)
+                    .or_else(|| get_hover_type(builder, builder.semantic_model))
+                    .unwrap_or(typ.clone())
+            };
             let level = if member_hover_type.is_module_ref() {
                 builder.detail_render_level
             } else {
@@ -750,14 +823,25 @@ pub fn add_signature_ret_description(
 }
 
 pub fn get_hover_type(builder: &HoverBuilder, semantic_model: &SemanticModel) -> Option<LuaType> {
-    let assign_stat = LuaAssignStat::cast(builder.get_trigger_token()?.parent()?.parent()?)?;
+    let trigger_token = builder.get_trigger_token()?;
+    get_assignment_target_type(&trigger_token, semantic_model)
+}
+
+fn get_assignment_target_type(
+    trigger_token: &LuaSyntaxToken,
+    semantic_model: &SemanticModel,
+) -> Option<LuaType> {
+    let mut ancestor = trigger_token.parent();
+    let assign_stat = loop {
+        let node = ancestor?;
+        if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
+            break assign_stat;
+        }
+        ancestor = node.parent();
+    };
     let (vars, exprs) = assign_stat.get_var_and_expr_list();
     for (i, var) in vars.iter().enumerate() {
-        if var
-            .syntax()
-            .text_range()
-            .contains(builder.get_trigger_token()?.text_range().start())
-        {
+        if token_is_assignment_target(var, trigger_token) {
             let mut expr: Option<&LuaExpr> = exprs.get(i);
             let multi_return_index = if expr.is_none() {
                 expr = Some(exprs.last()?);
@@ -782,6 +866,100 @@ pub fn get_hover_type(builder: &HoverBuilder, semantic_model: &SemanticModel) ->
     None
 }
 
+fn get_assignment_target_semantic_decl(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    trigger_token: &LuaSyntaxToken,
+) -> Option<LuaSemanticDeclId> {
+    let file_id = semantic_model.get_file_id();
+    let mut ancestor = trigger_token.parent();
+    let assign_stat = loop {
+        let node = ancestor?;
+        if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
+            break assign_stat;
+        }
+        ancestor = node.parent();
+    };
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    for var in vars {
+        if !token_is_assignment_target(&var, trigger_token) {
+            continue;
+        }
+
+        return match var {
+            LuaVarExpr::NameExpr(name_expr) => {
+                let decl_id = db
+                    .get_reference_index()
+                    .get_var_reference_decl(&file_id, name_expr.get_range())?;
+                Some(LuaSemanticDeclId::LuaDecl(decl_id))
+            }
+            LuaVarExpr::IndexExpr(index_expr) => Some(LuaSemanticDeclId::Member(LuaMemberId::new(
+                index_expr.get_syntax_id(),
+                file_id,
+            ))),
+        };
+    }
+
+    None
+}
+
+fn token_is_assignment_target(var: &LuaVarExpr, trigger_token: &LuaSyntaxToken) -> bool {
+    match var {
+        LuaVarExpr::NameExpr(name_expr) => name_expr
+            .syntax()
+            .text_range()
+            .contains(trigger_token.text_range().start()),
+        LuaVarExpr::IndexExpr(index_expr) => index_expr
+            .get_index_key()
+            .and_then(|key| key.get_range())
+            .is_some_and(|range| range.contains_range(trigger_token.text_range())),
+    }
+}
+
+fn prefer_concrete_assignment_type_for_builder(
+    builder: &HoverBuilder,
+    semantic_model: &SemanticModel,
+    current_type: &LuaType,
+) -> Option<LuaType> {
+    let trigger_token = builder.get_trigger_token()?;
+    prefer_concrete_assignment_type_for_token(&trigger_token, semantic_model, current_type)
+}
+
+fn prefer_concrete_assignment_type_for_token(
+    trigger_token: &LuaSyntaxToken,
+    semantic_model: &SemanticModel,
+    current_type: &LuaType,
+) -> Option<LuaType> {
+    if !contains_open_table_any(current_type) {
+        return None;
+    }
+
+    let assignment_type = get_assignment_target_type(trigger_token, semantic_model)?;
+    if is_specific_assignment_type(&assignment_type) {
+        Some(assignment_type)
+    } else {
+        None
+    }
+}
+
+fn contains_open_table_any(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any => true,
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .any(|typ| matches!(typ, LuaType::Any)),
+        _ => false,
+    }
+}
+
+fn is_specific_assignment_type(typ: &LuaType) -> bool {
+    !matches!(
+        typ,
+        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never
+    )
+}
+
 #[allow(unused)]
 fn adjust_semantic_decls(
     builder: &mut HoverBuilder,
@@ -791,12 +969,43 @@ fn adjust_semantic_decls(
 ) -> Option<()> {
     if let Some(pos) = semantic_decls
         .iter()
-        .position(|(_, typ)| current_type == typ)
+        .position(|(decl, typ)| decl == current_semantic_decl_id && current_type == typ)
     {
         let item = semantic_decls.remove(pos);
         semantic_decls.push(item);
         return Some(());
     }
+
+    if let Some(pos) = semantic_decls
+        .iter()
+        .position(|(_, typ)| current_type == typ)
+    {
+        let should_preserve_current_member = matches!(
+            current_semantic_decl_id,
+            LuaSemanticDeclId::Member(member_id)
+                if builder
+                    .semantic_model
+                    .get_db()
+                    .get_member_index()
+                    .get_member(member_id)
+                    .is_some_and(|member| {
+                        member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
+                    })
+        ) && semantic_decls
+            .get(pos)
+            .is_some_and(|(decl, _)| decl != current_semantic_decl_id);
+
+        if should_preserve_current_member
+            && has_add_to_semantic_decls(builder, current_semantic_decl_id).unwrap_or(true)
+        {
+            semantic_decls.push((current_semantic_decl_id.clone(), current_type.clone()));
+        } else {
+            let item = semantic_decls.remove(pos);
+            semantic_decls.push(item);
+        }
+        return Some(());
+    }
+
     // semantic_decls 是追溯最初定义的结果, 不包含当前内容
     let current_len = semantic_decls.len();
     if current_len == 0 {

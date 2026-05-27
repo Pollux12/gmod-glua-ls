@@ -36,6 +36,14 @@ pub struct EmmyrcStrict {
     /// Report type mismatch diagnostics for inferred values when strict mode is enabled.
     #[serde(default = "default_false")]
     pub inferred_type_mismatch: bool,
+    /// When enabled, `param-type-mismatch` requires exact types and disables GLua-aware
+    /// primitive coercions. By default (disabled), the following are accepted:
+    /// - `number`, `integer`, and `boolean` values where `string` is expected
+    ///   (Lua's `tostring()` handles these cleanly).
+    /// - String literals that are valid numbers (e.g. `"2"`) where `number` or `integer`
+    ///   is expected (Lua's `tonumber()` handles these cleanly).
+    #[serde(default = "default_false")]
+    pub strict_type_coercion: bool,
 }
 
 impl Default for EmmyrcStrict {
@@ -48,6 +56,7 @@ impl Default for EmmyrcStrict {
             require_export_global: false,
             allow_nullable_as_non_nullable: true,
             inferred_type_mismatch: false,
+            strict_type_coercion: false,
         }
     }
 }
@@ -67,5 +76,6 @@ mod tests {
         assert!(!strict.require_export_global);
         assert!(strict.allow_nullable_as_non_nullable);
         assert!(!strict.inferred_type_mismatch);
+        assert!(!strict.strict_type_coercion);
     }
 }

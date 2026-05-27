@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use glua_parser::LuaAstNode;
 
@@ -57,7 +57,7 @@ pub fn check_reach_reason(
 
 pub fn resolve_all_reason(
     db: &mut DbIndex,
-    reason_unresolves: &mut HashMap<InferFailReason, Vec<UnResolve>>,
+    reason_unresolves: &mut FxHashMap<InferFailReason, Vec<UnResolve>>,
     loop_count: usize,
 ) {
     let mut reasons: Vec<InferFailReason> = reason_unresolves.keys().cloned().collect();
@@ -113,6 +113,7 @@ pub fn resolve_as_unknown(
                 signature.return_docs = vec![LuaDocReturnInfo {
                     name: None,
                     type_ref: LuaType::Unknown,
+                    default_value: None,
                     description: None,
                     attributes: None,
                     return_kind: ReturnTypeKind::default(),

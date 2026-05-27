@@ -1,15 +1,68 @@
 #[cfg(test)]
 mod test {
     use crate::{
-        Emmyrc, EmmyrcGmodRealm, GmodConVarKind, GmodHookKind, GmodHookNameIssue, GmodRealm,
-        GmodTimerKind, VirtualWorkspace,
+        DiagnosticCode, Emmyrc, EmmyrcGmodRealm, GmodConVarKind, GmodHookKind, GmodHookNameIssue,
+        GmodRealm, GmodTimerKind, VirtualWorkspace,
     };
     use googletest::prelude::*;
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
 
     fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+    }
+
+    #[gtest]
+    fn test_realm_split_dynamic_command_table_call_uses_compatible_realm_member() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
+
+        ws.def_file(
+            "lua/glide/server/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+
+            commands[1] = function(ply) end
+            "#,
+        );
+
+        let client_file_id = ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            Glide.NetCommands = Glide.NetCommands or {}
+            local commands = Glide.NetCommands
+
+            net.Receive("glide.command", function()
+                local cmd = net.ReadUInt(8)
+                if commands[cmd] then
+                    commands[cmd]()
+                end
+            end)
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(client_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
+        ));
+        assert_that!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == code)
+                .count(),
+            eq(0usize)
+        );
     }
 
     #[gtest]

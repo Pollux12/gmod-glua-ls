@@ -16,8 +16,9 @@ use std::{
 };
 
 use crate::{
-    AsyncState, Emmyrc, FileId, InFiled, InferFailReason, LuaFunctionType, LuaMember,
-    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, WorkspaceId,
+    AsyncState, Emmyrc, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId,
+    LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache,
+    WorkspaceId,
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
 };
@@ -25,12 +26,17 @@ use glua_parser::LuaChunk;
 use infer_cache_manager::InferCacheManager;
 use unresolve::UnResolve;
 
-pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, config: Arc<Emmyrc>) {
+pub fn analyze(
+    db: &mut DbIndex,
+    need_analyzed_files: Vec<InFiled<LuaChunk>>,
+    config: Arc<Emmyrc>,
+) -> HashSet<FileId> {
     if need_analyzed_files.is_empty() {
-        return;
+        return HashSet::new();
     }
 
     let contexts = module_analyze(db, need_analyzed_files, config);
+    let mut stabilization_candidates = HashSet::new();
 
     for (workspace_id, mut context) in contexts {
         context.workspace_id = Some(workspace_id);
@@ -53,10 +59,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
         // fully recomputed in the unresolve phase.
         run_analysis::<gmod::GmodPreAnalysisPipeline>(db, &mut context);
 
-        // Apply flow analysis budget during lua analyze to cap runaway cost
-        // on very large files (e.g. 3000+ line files with deep flow chains).
-        // Budget of 10K nodes prevents any single file from dominating.
-        context.infer_manager.set_default_flow_budget(u32::MAX);
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
 
         // Gmod post-analysis: synthesize members that depend on metadata collected
@@ -64,12 +66,24 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>, co
         run_analysis::<gmod::GmodPostAnalysisPipeline>(db, &mut context);
 
         synthesize_accessorfunc_members(db, &workspace_file_ids);
+        if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
+            // Special-call resolution needs dynamic fields that point at outparam
+            // tables, while some dynamic fields need unresolve-refined aliases.
+            // Seed only declared-member table fields before unresolve; the full
+            // dynamic pass still runs afterward.
+            run_analysis::<dynamic_field::EarlyDynamicFieldAnalysisPipeline>(db, &mut context);
+        }
+
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
 
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
         }
+
+        stabilization_candidates.extend(context.stabilization_candidates.iter().copied());
     }
+
+    stabilization_candidates
 }
 
 fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
@@ -172,7 +186,6 @@ fn module_analyze(
         return vec![];
     }
 
-    let _p = Profile::new("module analyze");
     let mut file_tree_map: HashMap<WorkspaceId, Vec<InFiled<LuaChunk>>> = HashMap::new();
     for in_filed_tree in need_analyzed_files {
         let file_id = in_filed_tree.file_id;
@@ -234,8 +247,11 @@ pub struct AnalyzeContext {
     #[allow(unused)]
     config: Arc<Emmyrc>,
     metas: HashSet<FileId>,
-    scripted_scope_files: Option<HashSet<FileId>>,
+    scripted_scope_files: Option<Arc<HashSet<FileId>>>,
+    scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
+    pending_unresolve_decl_ids: HashSet<LuaDeclId>,
+    stabilization_candidates: HashSet<FileId>,
     infer_manager: InferCacheManager,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -247,7 +263,10 @@ impl AnalyzeContext {
             config: emmyrc,
             metas: HashSet::new(),
             scripted_scope_files: None,
+            scripted_scope_infos: None,
             unresolves: Vec::new(),
+            pending_unresolve_decl_ids: HashSet::new(),
+            stabilization_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
             workspace_id: None,
         }
@@ -262,20 +281,84 @@ impl AnalyzeContext {
     }
 
     pub fn add_unresolve(&mut self, un_resolve: UnResolve, reason: InferFailReason) {
+        if let UnResolve::Decl(decl) = &un_resolve {
+            self.pending_unresolve_decl_ids.insert(decl.decl_id);
+        }
         self.unresolves.push((un_resolve, reason));
     }
 
-    pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> &HashSet<FileId> {
-        if self.scripted_scope_files.is_none() {
+    pub fn has_pending_decl_unresolve(&self, decl_id: LuaDeclId) -> bool {
+        self.pending_unresolve_decl_ids.contains(&decl_id)
+    }
+
+    pub fn request_stabilization(&mut self, file_id: FileId) {
+        self.stabilization_candidates.insert(file_id);
+    }
+
+    pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> Arc<HashSet<FileId>> {
+        self.ensure_scripted_scope_cache(db);
+
+        self.scripted_scope_files
+            .as_ref()
+            .expect("set above")
+            .clone()
+    }
+
+    pub fn get_or_compute_scripted_scope_infos(
+        &mut self,
+        db: &DbIndex,
+    ) -> Arc<HashMap<FileId, GmodScopedClassInfo>> {
+        self.ensure_scripted_scope_cache(db);
+
+        self.scripted_scope_infos
+            .as_ref()
+            .expect("set above")
+            .clone()
+    }
+
+    fn ensure_scripted_scope_cache(&mut self, db: &DbIndex) {
+        if self.scripted_scope_files.is_some() && self.scripted_scope_infos.is_some() {
+            return;
+        }
+
+        let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+        if scopes.resolved_definitions().is_empty() {
             let file_ids = self
                 .tree_list
                 .iter()
                 .map(|in_filed_tree| in_filed_tree.file_id)
-                .collect::<Vec<_>>();
-            self.scripted_scope_files =
-                Some(lua::call::compute_scripted_class_files(db, &file_ids));
+                .collect::<HashSet<_>>();
+            self.scripted_scope_files = Some(Arc::new(file_ids));
+            self.scripted_scope_infos = Some(Arc::new(HashMap::new()));
+            return;
         }
 
-        self.scripted_scope_files.as_ref().expect("set above")
+        let file_paths = self
+            .tree_list
+            .iter()
+            .filter_map(|in_filed_tree| {
+                db.get_vfs()
+                    .get_file_path(&in_filed_tree.file_id)
+                    .map(|path| (in_filed_tree.file_id, path.as_path()))
+            })
+            .collect::<Vec<_>>();
+        let (scripted_scope_files, scoped_matches) =
+            scopes.scan_scripted_class_scope_files(file_paths);
+        let scripted_scope_infos = scoped_matches
+            .into_iter()
+            .map(|(file_id, scope_match)| {
+                (
+                    file_id,
+                    GmodScopedClassInfo {
+                        class_name: scope_match.class_name,
+                        global_name: scope_match.definition.class_global,
+                        class_name_prefix: scope_match.definition.class_name_prefix,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        self.scripted_scope_files = Some(Arc::new(scripted_scope_files));
+        self.scripted_scope_infos = Some(Arc::new(scripted_scope_infos));
     }
 }

@@ -1,12 +1,13 @@
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBlock, LuaBreakStat, LuaCallArgList,
     LuaCallExprStat, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat, LuaFuncStat, LuaGotoStat,
-    LuaIfStat, LuaLabelStat, LuaLocalStat, LuaRepeatStat, LuaReturnStat, LuaVarExpr, LuaWhileStat,
+    LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLabelStat, LuaLiteralToken, LuaLocalStat,
+    LuaRepeatStat, LuaReturnStat, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait, UnaryOperator,
 };
 
 use crate::{
-    AnalyzeError, AssignVarHint, BranchLabelInfo, DiagnosticCode, FlowId, FlowNodeKind,
-    LuaClosureId, LuaDeclId,
+    AnalyzeError, AssignVarHint, AssignmentFlowInfo, BranchLabelInfo, DiagnosticCode, FlowId,
+    FlowNodeKind, LuaClosureId, LuaDeclId,
     compilation::analyzer::flow::{
         bind_analyze::{
             bind_block, bind_each_child, bind_node,
@@ -20,7 +21,7 @@ use crate::{
 pub fn bind_local_stat(
     binder: &mut FlowBinder,
     local_stat: LuaLocalStat,
-    current: FlowId,
+    mut current: FlowId,
 ) -> FlowId {
     let local_names = local_stat.get_local_name_list().collect::<Vec<_>>();
     let values = local_stat.get_value_exprs().collect::<Vec<_>>();
@@ -36,7 +37,7 @@ pub fn bind_local_stat(
 
     for value in values {
         // If there are more values than names, we still need to bind the values
-        bind_expr(binder, value.clone(), current);
+        current = bind_top_level_expr(binder, value.clone(), current);
     }
 
     let local_flow_id = binder.create_decl(local_stat.get_position());
@@ -73,14 +74,12 @@ fn check_value_expr_is_check_expr(value_expr: LuaExpr) -> bool {
 pub fn bind_assign_stat(
     binder: &mut FlowBinder,
     assign_stat: LuaAssignStat,
-    current: FlowId,
+    mut current: FlowId,
 ) -> FlowId {
     let (vars, values) = assign_stat.get_var_and_expr_list();
     // First bind the right-hand side expressions
     for expr in &values {
-        if let Some(ast) = LuaAst::cast(expr.syntax().clone()) {
-            bind_node(binder, ast, current);
-        }
+        current = bind_top_level_expr(binder, expr.clone(), current);
     }
 
     let mut has_name = false;
@@ -100,11 +99,109 @@ pub fn bind_assign_stat(
         (false, true) => AssignVarHint::IndexOnly,
         _ => AssignVarHint::Mixed,
     };
+    let assignment_flow_info = collect_assignment_flow_info(&vars);
     let assignment_kind = FlowNodeKind::Assignment(assign_stat.to_ptr(), hint);
     let flow_id = binder.create_node(assignment_kind);
+    binder.set_assignment_flow_info(flow_id, assignment_flow_info);
     binder.add_antecedent(flow_id, current);
 
     flow_id
+}
+
+fn collect_assignment_flow_info(vars: &[LuaVarExpr]) -> AssignmentFlowInfo {
+    let mut info = AssignmentFlowInfo::default();
+    for var in vars {
+        let LuaVarExpr::IndexExpr(index_expr) = var else {
+            continue;
+        };
+
+        match index_expr.get_access_path() {
+            Some(path) => push_assignment_index_path(&mut info, path),
+            None => info.has_unknown_index_target = true,
+        }
+
+        if is_collection_append_write(index_expr) {
+            let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+                info.has_unknown_index_target = true;
+                continue;
+            };
+            match expr_access_path(&prefix_expr) {
+                Some(path) => push_assignment_index_path(&mut info, path),
+                None => info.has_unknown_index_target = true,
+            }
+        }
+    }
+    info
+}
+
+fn push_assignment_index_path(info: &mut AssignmentFlowInfo, path: String) {
+    let path = internment::ArcIntern::from(smol_str::SmolStr::new(&path));
+    if !info.index_paths.contains(&path) {
+        info.index_paths.push(path);
+    }
+}
+
+fn is_collection_append_write(index_expr: &LuaIndexExpr) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(prefix_path) = expr_access_path(&prefix_expr) else {
+        return false;
+    };
+    let Some(LuaIndexKey::Expr(index_key_expr)) = index_expr.get_index_key() else {
+        return false;
+    };
+    let LuaExpr::BinaryExpr(binary_expr) = index_key_expr else {
+        return false;
+    };
+    if binary_expr
+        .get_op_token()
+        .is_none_or(|token| token.get_op() != BinaryOperator::OpAdd)
+    {
+        return false;
+    }
+
+    let Some((left, right)) = binary_expr.get_exprs() else {
+        return false;
+    };
+    if !is_literal_integer_one(&right) {
+        return false;
+    }
+
+    let LuaExpr::UnaryExpr(unary_expr) = left else {
+        return false;
+    };
+    if unary_expr
+        .get_op_token()
+        .is_none_or(|token| token.get_op() != UnaryOperator::OpLen)
+    {
+        return false;
+    }
+
+    let Some(len_expr) = unary_expr.get_expr() else {
+        return false;
+    };
+    expr_access_path(&len_expr).is_some_and(|len_path| len_path == prefix_path)
+}
+
+fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn is_literal_integer_one(expr: &LuaExpr) -> bool {
+    let LuaExpr::LiteralExpr(literal_expr) = expr else {
+        return false;
+    };
+
+    matches!(
+        literal_expr.get_literal(),
+        Some(LuaLiteralToken::Number(number))
+            if matches!(number.get_number_value(), NumberResult::Int(1))
+    )
 }
 
 pub fn bind_call_expr_stat(
@@ -134,7 +231,9 @@ pub fn bind_call_expr_stat(
         if let Some(ast) = LuaAst::cast(call_expr.syntax().clone()) {
             bind_each_child(binder, ast, current);
         }
-        current
+        let flow_id = binder.create_node(FlowNodeKind::Call(call_expr.to_ptr()));
+        binder.add_antecedent(flow_id, current);
+        flow_id
     }
 }
 
@@ -209,11 +308,11 @@ pub fn bind_goto_stat(binder: &mut FlowBinder, goto_stat: LuaGotoStat, current: 
 pub fn bind_return_stat(
     binder: &mut FlowBinder,
     return_stat: LuaReturnStat,
-    current: FlowId,
+    mut current: FlowId,
 ) -> FlowId {
     // If there are expressions in the return statement, bind them
     for expr in return_stat.get_expr_list() {
-        bind_expr(binder, expr.clone(), current);
+        current = bind_top_level_expr(binder, expr.clone(), current);
     }
 
     // Return statements are typically used to exit a function
@@ -222,6 +321,26 @@ pub fn bind_return_stat(
     binder.add_antecedent(return_flow_id, current);
 
     return_flow_id
+}
+
+fn bind_top_level_expr(binder: &mut FlowBinder, expr: LuaExpr, current: FlowId) -> FlowId {
+    bind_expr(binder, expr.clone(), current);
+
+    let Some(call_expr) = unwrap_top_level_call_expr(&expr) else {
+        return current;
+    };
+
+    let flow_id = binder.create_node(FlowNodeKind::Call(call_expr.to_ptr()));
+    binder.add_antecedent(flow_id, current);
+    flow_id
+}
+
+fn unwrap_top_level_call_expr(expr: &LuaExpr) -> Option<glua_parser::LuaCallExpr> {
+    match expr {
+        LuaExpr::CallExpr(call_expr) => Some(call_expr.clone()),
+        LuaExpr::ParenExpr(paren_expr) => unwrap_top_level_call_expr(&paren_expr.get_expr()?),
+        _ => None,
+    }
 }
 
 pub fn bind_do_stat(binder: &mut FlowBinder, do_stat: LuaDoStat, mut current: FlowId) -> FlowId {
@@ -486,4 +605,39 @@ pub fn bind_for_stat(binder: &mut FlowBinder, for_stat: LuaForStat, current: Flo
     }
 
     current
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Deref;
+
+    use glua_parser::{LuaAstNode, LuaParser, ParserConfig};
+
+    use super::*;
+
+    #[test]
+    fn assignment_flow_info_tracks_collection_append_prefix_path() {
+        let tree = LuaParser::parse(
+            "holder.items[#holder.items + 1] = value",
+            ParserConfig::default(),
+        );
+        let root = tree.get_chunk_node();
+        let assign_stat = root
+            .descendants::<LuaAssignStat>()
+            .next()
+            .expect("expected assignment");
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+
+        let info = collect_assignment_flow_info(&vars);
+        let paths = info
+            .index_paths
+            .iter()
+            .map(|path| path.deref().as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            paths.contains(&"holder.items"),
+            "collection append should mark prefix path as affected: {paths:?}"
+        );
+    }
 }

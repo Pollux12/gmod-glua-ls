@@ -38,7 +38,7 @@ pub fn bind_type(
     } else {
         let decl_type_cache = decl_type_cache?;
         let decl_type = decl_type_cache.as_type();
-        if should_inferred_signature_replace_uninformative_cache(decl_type_cache, &type_cache) {
+        if should_replace_uninformative_inferred_cache(&type_owner, decl_type_cache, &type_cache) {
             db.get_type_index_mut()
                 .force_bind_type(type_owner.clone(), type_cache);
             migrate_global_members_when_type_resolve(db, type_owner);
@@ -50,20 +50,95 @@ pub fn bind_type(
     Some(())
 }
 
+pub fn bind_resolved_type(
+    db: &mut DbIndex,
+    type_owner: LuaTypeOwner,
+    type_cache: LuaTypeCache,
+) -> Option<()> {
+    if let Some(current_cache) = db.get_type_index().get_type_cache(&type_owner)
+        && should_replace_uninformative_resolved_cache(current_cache, &type_cache)
+    {
+        db.get_type_index_mut()
+            .force_bind_type(type_owner.clone(), type_cache);
+        migrate_global_members_when_type_resolve(db, type_owner);
+        return Some(());
+    }
+
+    bind_type(db, type_owner, type_cache)
+}
+
+fn should_replace_uninformative_resolved_cache(
+    current_cache: &LuaTypeCache,
+    new_cache: &LuaTypeCache,
+) -> bool {
+    let LuaTypeCache::InferType(current_type) = current_cache else {
+        return false;
+    };
+    let LuaTypeCache::InferType(new_type) = new_cache else {
+        return false;
+    };
+
+    is_uninformative_inferred_type(current_type) && is_informative_inferred_type(new_type)
+}
+
+fn should_replace_uninformative_inferred_cache(
+    type_owner: &LuaTypeOwner,
+    current_cache: &LuaTypeCache,
+    new_cache: &LuaTypeCache,
+) -> bool {
+    if should_inferred_signature_replace_uninformative_cache(current_cache, new_cache) {
+        return true;
+    }
+
+    if !matches!(type_owner, LuaTypeOwner::Member(_)) {
+        return false;
+    }
+
+    let LuaTypeCache::InferType(current_type) = current_cache else {
+        return false;
+    };
+    let LuaTypeCache::InferType(new_type) = new_cache else {
+        return false;
+    };
+
+    is_uninformative_inferred_type(current_type) && is_informative_inferred_type(new_type)
+}
+
 fn should_inferred_signature_replace_uninformative_cache(
     current_cache: &LuaTypeCache,
     new_cache: &LuaTypeCache,
 ) -> bool {
-    let LuaTypeCache::InferType(LuaType::Signature(_)) = new_cache else {
-        return false;
-    };
-
-    match current_cache {
-        LuaTypeCache::DocType(LuaType::DocFunction(func)) => {
-            matches!(func.get_ret(), LuaType::Any | LuaType::Unknown)
+    matches!(new_cache, LuaTypeCache::InferType(LuaType::Signature(_)))
+        && match current_cache {
+            LuaTypeCache::DocType(LuaType::DocFunction(func)) => {
+                matches!(func.get_ret(), LuaType::Any | LuaType::Unknown)
+            }
+            LuaTypeCache::InferType(typ) => typ.is_any() || typ.is_unknown(),
+            _ => false,
         }
-        LuaTypeCache::InferType(typ) => typ.is_any() || typ.is_unknown(),
+}
+
+fn is_uninformative_inferred_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
+        LuaType::Union(union) => union.into_vec().iter().all(is_uninformative_inferred_type),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(typ, _)| is_uninformative_inferred_type(typ)),
         _ => false,
+    }
+}
+
+fn is_informative_inferred_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => false,
+        LuaType::Union(union) => union.into_vec().iter().any(is_informative_inferred_type),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .any(|(typ, _)| is_informative_inferred_type(typ)),
+        _ => true,
     }
 }
 

@@ -1,8 +1,11 @@
 use std::{collections::HashMap, ops::Deref, vec};
 
+use smol_str::SmolStr;
+
 use crate::{
-    DbIndex, LuaAliasCallKind, LuaAliasCallType, LuaMemberInfo, LuaMemberKey, LuaObjectType,
-    LuaTupleStatus, LuaTupleType, LuaType, TypeOps, VariadicType, get_member_map,
+    DbIndex, LuaAliasCallKind, LuaAliasCallType, LuaArrayLen, LuaArrayType, LuaMemberInfo,
+    LuaMemberKey, LuaObjectType, LuaTupleStatus, LuaTupleType, LuaType, TypeOps, VariadicType,
+    get_member_map,
     semantic::{
         generic::key_type_to_member_key,
         member::{find_members, infer_raw_member_type},
@@ -92,6 +95,7 @@ pub fn instantiate_alias_call(
             instantiate_index_call(db, &operands[0], &key)
         }
         LuaAliasCallKind::Merge => instantiate_merge_call(db, &operands),
+        LuaAliasCallKind::Split => instantiate_split_call(&operands),
     }
 }
 
@@ -352,4 +356,36 @@ pub fn get_keyof_members(db: &DbIndex, prefix_type: &LuaType) -> Option<Vec<LuaM
         },
         _ => find_members(db, prefix_type),
     }
+}
+
+/// When both `Sep` and `Str` are string constants, splits `Str` by `Sep` and returns a tuple of
+/// `StringConst` elements. Falls back to `string[]` when either operand is not a known constant.
+fn instantiate_split_call(operands: &[LuaType]) -> LuaType {
+    let string_array =
+        || LuaType::Array(LuaArrayType::new(LuaType::String, LuaArrayLen::None).into());
+
+    if operands.len() < 2 {
+        return LuaType::Unknown;
+    }
+
+    let sep = match &operands[0] {
+        LuaType::DocStringConst(s) | LuaType::StringConst(s) => s.as_str().to_owned(),
+        _ => return string_array(),
+    };
+
+    if sep.is_empty() {
+        return string_array();
+    }
+
+    let str_val = match &operands[1] {
+        LuaType::DocStringConst(s) | LuaType::StringConst(s) => s.as_str().to_owned(),
+        _ => return string_array(),
+    };
+
+    let parts: Vec<LuaType> = str_val
+        .split(sep.as_str())
+        .map(|part| LuaType::StringConst(SmolStr::new(part).into()))
+        .collect();
+
+    LuaType::Tuple(LuaTupleType::new(parts, LuaTupleStatus::InferResolve).into())
 }

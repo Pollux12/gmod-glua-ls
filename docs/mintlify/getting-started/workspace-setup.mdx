@@ -37,7 +37,7 @@ Open the addon or gamemode folder directly in VS Code. The extension detects the
 
 If you work on a gamemode and multiple addons, use a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces) and add each as its own folder.
 
-By default, multi-root workspace isolation is disabled. The language server merges workspace configs into one global baseline (first workspace config wins scalar conflicts, arrays are unioned), while still allowing per-workspace file-scoped overrides where needed.
+By default, GLuaLS disables multi-root workspace isolation. The language server merges workspace configs into one global baseline. The first workspace config wins scalar conflicts, arrays are unioned, and per-workspace file overrides still apply where needed.
 
 You can enable isolation with `workspace.enableIsolation` when you want each folder analyzed separately. See [Configuration](/configuration/workspace) for details.
 
@@ -67,7 +67,7 @@ If your project uses shared utility files outside the workspace root, add them a
 }
 ```
 
-Library files are analyzed, and their types are available in your workspace. Diagnostics are not reported for library files.
+GLuaLS analyzes library files and makes their types available in your workspace. It does not report diagnostics for library files.
 
 ---
 
@@ -106,7 +106,7 @@ If your project uses a custom module loader, map it to `require` behavior:
 
 ## Annotations path <a id="annotations-path" />
 
-By default, the VS Code extension downloads and updates GMod wiki annotations. If you need a custom annotations build or want auto-download off:
+By default, the VS Code extension downloads and updates GMod wiki annotations. If you need a custom annotations build or want to turn off downloads:
 
 <ConfigTip />
 
@@ -119,7 +119,7 @@ By default, the VS Code extension downloads and updates GMod wiki annotations. I
 }
 ```
 
-See [Annotations management](/configuration/annotations-management) for details on how auto-download works.
+See [Annotations management](/configuration/annotations-management) for details on annotation downloads.
 
 ---
 

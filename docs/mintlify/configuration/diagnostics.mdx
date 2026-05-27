@@ -5,7 +5,7 @@ description: Enable, disable, and tune the severity of every diagnostic code.
 
 ## Overview
 
-The `diagnostics` section controls which checks are active and how severe they appear. Every diagnostic code can be individually enabled, disabled, or re-levelled.
+The `diagnostics` section controls which checks run and how severe they appear. You can enable, disable, or re-level each diagnostic code.
 
 ---
 
@@ -36,7 +36,7 @@ The `diagnostics` section controls which checks are active and how severe they a
 
 ## Full diagnostic reference
 
-Codes marked **Off** are disabled by default and require `enables` to activate.
+Codes marked **Off** start disabled. Add them to `enables` to turn them on.
 
 ### Syntax & annotations
 
@@ -159,12 +159,13 @@ Codes marked **Off** are disabled by default and require `enables` to activate.
 
 ## VSCode extension settings
 
-These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
 | VSCode Setting | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|---|
 | `gluals.diagnostics.diagnosticInterval` | `diagnostics.diagnosticInterval` | `integer` | `500` | Scan delay in milliseconds |
 | `gluals.strict.inferredTypeMismatch` | `strict.inferredTypeMismatch` | `boolean` | `false` | Stricter type checking for inferred values |
+| `gluals.strict.strictTypeCoercion` | `strict.strictTypeCoercion` | `boolean` | `false` | Requires exact types in param-type-mismatch and disables GLua-aware coercions (e.g. number/boolean → string, numeric string literal → number/integer) |
 | `gluals.codeAction.insertSpace` | `codeAction.insertSpace` | `boolean` | `false` | Space after --- in diagnostic comments |
 
 ---

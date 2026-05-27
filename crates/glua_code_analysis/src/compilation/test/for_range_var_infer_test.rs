@@ -214,4 +214,46 @@ mod test {
             ]))),
         );
     }
+
+    #[test]
+    fn test_pairs_array_records_use_compact_object_value_shape() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            local records = {
+                { pos = 1, name = "a" },
+                { pos = 2, name = "b", optional = true },
+            }
+
+            for key, value in pairs(records) do
+                key_out = key
+                value_out = value
+                pos_out = value.pos
+                optional_out = value.optional
+            end
+        "#,
+        );
+
+        let LuaType::Union(key_union) = ws.expr_ty("key_out") else {
+            panic!("expected exact small-table key union");
+        };
+        let key_set = key_union.into_set();
+        assert!(key_set.contains(&LuaType::IntegerConst(1)));
+        assert!(key_set.contains(&LuaType::IntegerConst(2)));
+        assert!(matches!(ws.expr_ty("value_out"), LuaType::Object(_)));
+        let LuaType::Union(pos_union) = ws.expr_ty("pos_out") else {
+            panic!("expected exact small-table field union");
+        };
+        let pos_set = pos_union.into_set();
+        assert!(pos_set.contains(&LuaType::IntegerConst(1)));
+        assert!(pos_set.contains(&LuaType::IntegerConst(2)));
+        assert_eq!(
+            ws.expr_ty("optional_out"),
+            LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
+                LuaType::BooleanConst(true),
+                LuaType::Nil,
+            ]))),
+        );
+    }
 }

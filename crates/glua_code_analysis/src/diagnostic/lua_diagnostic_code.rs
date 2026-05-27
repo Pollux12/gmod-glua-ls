@@ -148,6 +148,8 @@ pub enum DiagnosticCode {
     GmodNetReadWriteBitsMismatch,
     /// gmod-duplicate-system-registration
     GmodDuplicateSystemRegistration,
+    /// gmod-null-check
+    GmodNullCheck,
     #[serde(other)]
     None,
 }
@@ -191,6 +193,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::GmodNetMissingNetworkCounterpart => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodNetReadWriteBitsMismatch => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodDuplicateSystemRegistration => DiagnosticSeverity::HINT,
+        DiagnosticCode::GmodNullCheck => DiagnosticSeverity::WARNING,
         _ => DiagnosticSeverity::WARNING,
     }
 }
@@ -226,6 +229,7 @@ pub fn is_code_default_enable(code: &DiagnosticCode, level: LuaLanguageLevel) ->
         DiagnosticCode::GmodNetMissingNetworkCounterpart => true,
         DiagnosticCode::GmodNetReadWriteBitsMismatch => true,
         DiagnosticCode::GmodInvalidHookName => true,
+        DiagnosticCode::GmodNullCheck => true,
 
         // neovim-code-style
         DiagnosticCode::NonLiteralExpressionsInAssert => false,
@@ -313,6 +317,10 @@ mod tests {
             is_code_default_enable(&DiagnosticCode::GmodInvalidHookName, level),
             eq(true)
         );
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::GmodNullCheck, level),
+            eq(true)
+        );
     }
 
     #[gtest]
@@ -324,6 +332,10 @@ mod tests {
         assert_that!(
             get_default_severity(DiagnosticCode::GmodRealmMismatchHeuristic),
             eq(DiagnosticSeverity::ERROR)
+        );
+        assert_that!(
+            get_default_severity(DiagnosticCode::GmodNullCheck),
+            eq(DiagnosticSeverity::WARNING)
         );
         assert_that!(
             get_default_severity(DiagnosticCode::GmodUnknownRealm),

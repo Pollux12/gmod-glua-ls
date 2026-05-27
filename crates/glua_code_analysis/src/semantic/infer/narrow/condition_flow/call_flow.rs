@@ -11,8 +11,9 @@ use crate::{
         infer_index::infer_member_by_member_key,
         narrow::{
             ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
-            get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow, narrow_down_type,
-            narrow_false_or_nil, remove_false_or_nil, var_ref_id::get_var_expr_var_ref_id,
+            get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow, gmod_null_type,
+            gmod_null_type_is_defined, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
+            remove_gmod_null_type, var_ref_id::get_var_expr_var_ref_id,
         },
     },
 };
@@ -286,10 +287,22 @@ fn name_expr_has_local_binding(
     cache: &mut LuaInferCache,
     name_expr: &glua_parser::LuaNameExpr,
 ) -> bool {
-    db.get_reference_index()
-        .get_local_reference(&cache.get_file_id())
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+
+    let file_id = cache.get_file_id();
+    let by_reference = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-        .is_some()
+        .is_some();
+    let by_scope = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)
+        .and_then(|decl_tree| decl_tree.find_local_decl(&name, name_expr.get_position()))
+        .is_some();
+    by_reference || by_scope
 }
 
 fn is_builtin_or_unresolved_global_name(
@@ -812,11 +825,21 @@ fn try_narrow_isvalid(
     let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
 
     let result_type = match condition_flow {
-        InferConditionFlow::TrueCondition => remove_false_or_nil(antecedent_type),
+        InferConditionFlow::TrueCondition => promote_unknown_isvalid_success_to_any(
+            remove_gmod_null_type(db, remove_false_or_nil(antecedent_type)),
+        ),
         InferConditionFlow::FalseCondition => antecedent_type,
     };
 
     Ok(Some(result_type))
+}
+
+fn promote_unknown_isvalid_success_to_any(narrowed_type: LuaType) -> LuaType {
+    if narrowed_type.is_unknown() {
+        LuaType::Any
+    } else {
+        narrowed_type
+    }
 }
 
 /// Known GMod type-checking function names handled by name-based narrowing fallback.
@@ -854,7 +877,7 @@ fn resolve_istype_guard_target_type(
     }
 
     let type_name = match helper_name {
-        "isentity" | "IsEntity" => "Entity",
+        "isentity" | "IsEntity" => return resolve_entity_guard_target_type(db, cache),
         "isvector" => "Vector",
         "isangle" => "Angle",
         "ismatrix" => "VMatrix",
@@ -866,6 +889,19 @@ fn resolve_istype_guard_target_type(
     db.get_type_index()
         .find_type_decl(cache.get_file_id(), type_name)
         .map(|decl| LuaType::Ref(decl.get_id()))
+}
+
+fn resolve_entity_guard_target_type(db: &DbIndex, cache: &LuaInferCache) -> Option<LuaType> {
+    let entity_type = db
+        .get_type_index()
+        .find_type_decl(cache.get_file_id(), "Entity")
+        .map(|decl| LuaType::Ref(decl.get_id()))?;
+
+    if gmod_null_type_is_defined(db) {
+        return Some(TypeOps::Union.apply(db, &entity_type, &gmod_null_type()));
+    }
+
+    Some(entity_type)
 }
 
 fn narrow_istype_true_branch(

@@ -1,17 +1,20 @@
 mod infer_array;
+pub(crate) use infer_array::check_iter_var_range;
 
 use std::collections::HashSet;
 
 use glua_parser::{
-    LuaAstNode, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, NumberResult, PathTrait,
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaLocalStat,
+    LuaNameExpr, NumberResult, PathTrait,
 };
 use internment::ArcIntern;
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::{
-    CacheEntry, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclOrMemberId,
-    LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
+    CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
+    LuaDeclOrMemberId, LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
+    compilation::{get_scripted_class_info_for_file, get_scripted_class_type_decl_id},
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaObjectType,
         LuaOperatorMetaMethod, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType,
@@ -21,16 +24,15 @@ use crate::{
         InferGuard,
         generic::{TypeSubstitutor, instantiate_type_generic},
         infer::{
-            VarRefId,
-            infer_index::infer_array::{check_iter_var_range, infer_array_member},
-            infer_name::get_name_expr_var_ref_id,
-            narrow::infer_expr_narrow_type,
+            VarRefId, infer_index::infer_array::infer_array_member,
+            infer_name::get_name_expr_var_ref_id, narrow::infer_expr_narrow_type,
         },
         is_doc_tag_table_const,
         member::get_buildin_type_map_type_id,
         member::infer_owner_raw_member_type_with_realm,
         member::intersect_member_types,
         member::member_key_matches_type,
+        member::resolve_dynamic_field_member,
         type_check::{self, check_type_compact},
     },
 };
@@ -44,7 +46,17 @@ pub fn infer_index_expr(
     pass_flow: bool,
 ) -> InferResult {
     let prefix_expr = index_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
-    let prefix_type = infer_expr(db, cache, prefix_expr.clone())?;
+    let mut prefix_is_unresolved_param = false;
+    let prefix_type = match infer_expr(db, cache, prefix_expr.clone()) {
+        Ok(prefix_type) => prefix_type,
+        Err(InferFailReason::UnResolveDeclType(decl_id))
+            if is_unresolved_param_decl(db, decl_id) =>
+        {
+            prefix_is_unresolved_param = true;
+            LuaType::Unknown
+        }
+        Err(err) => return Err(err),
+    };
     let index_member_expr = LuaIndexMemberExpr::IndexExpr(index_expr.clone());
 
     let reason = match infer_member_by_member_key(
@@ -94,14 +106,29 @@ pub fn infer_index_expr(
     }
 
     if pass_flow {
-        match infer_member_type_fallback_pass_flow(db, cache, index_expr) {
+        match infer_member_type_fallback_pass_flow(
+            db,
+            cache,
+            index_expr,
+            prefix_is_unresolved_param,
+        ) {
             Ok(member_type) => return Ok(member_type),
             Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
             Err(err) => return Err(err),
         }
     }
 
+    if prefix_is_unresolved_param {
+        return Ok(LuaType::Unknown);
+    }
+
     Err(reason)
+}
+
+fn is_unresolved_param_decl(db: &DbIndex, decl_id: LuaDeclId) -> bool {
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_param())
 }
 
 fn infer_member_type_pass_flow(
@@ -111,6 +138,10 @@ fn infer_member_type_pass_flow(
     // prefix_type: &LuaType,
     member_type: LuaType,
 ) -> InferResult {
+    if !index_expr_has_flow_node(db, cache, &index_expr) {
+        return Ok(member_type);
+    }
+
     let Some(var_ref_id) = get_index_expr_var_ref_id(db, cache, &index_expr) else {
         return Ok(member_type.clone());
     };
@@ -129,7 +160,12 @@ fn infer_member_type_fallback_pass_flow(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: LuaIndexExpr,
+    unknown_truthy_as_any: bool,
 ) -> InferResult {
+    if !index_expr_has_flow_node(db, cache, &index_expr) {
+        return Err(InferFailReason::FieldNotFound);
+    }
+
     let Some(var_ref_id) = get_index_expr_var_ref_id(db, cache, &index_expr) else {
         return Err(InferFailReason::FieldNotFound);
     };
@@ -139,9 +175,20 @@ fn infer_member_type_fallback_pass_flow(
         .insert(var_ref_id.clone(), CacheEntry::Cache(LuaType::Nil));
     match infer_expr_narrow_type(db, cache, LuaExpr::IndexExpr(index_expr), var_ref_id) {
         Ok(member_type) if !member_type.is_nil() && !member_type.is_unknown() => Ok(member_type),
+        Ok(member_type) if member_type.is_unknown() && unknown_truthy_as_any => Ok(LuaType::Any),
         Ok(_) | Err(InferFailReason::None) => Err(InferFailReason::FieldNotFound),
         Err(err) => Err(err),
     }
+}
+
+fn index_expr_has_flow_node(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    db.get_flow_index()
+        .get_flow_tree(&cache.get_file_id())
+        .is_some_and(|flow_tree| flow_tree.get_flow_id(index_expr.get_syntax_id()).is_some())
 }
 
 pub fn get_index_expr_var_ref_id(
@@ -149,6 +196,11 @@ pub fn get_index_expr_var_ref_id(
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
 ) -> Option<VarRefId> {
+    let syntax_id = index_expr.get_syntax_id();
+    if let Some(var_ref_id) = cache.expr_var_ref_id_cache.get(&syntax_id) {
+        return Some(var_ref_id.clone());
+    }
+
     let access_path = match index_expr.get_access_path() {
         Some(path) => ArcIntern::new(SmolStr::new(&path)),
         None => return None,
@@ -167,6 +219,9 @@ pub fn get_index_expr_var_ref_id(
         };
 
         let var_ref_id = VarRefId::IndexRef(decl_or_member_id, access_path);
+        cache
+            .expr_var_ref_id_cache
+            .insert(syntax_id, var_ref_id.clone());
         return Some(var_ref_id);
     }
 
@@ -276,7 +331,15 @@ fn infer_table_member(
 ) -> InferResult {
     let owner = LuaMemberOwner::Element(inst.clone());
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
-    let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
+    let key = match LuaMemberKey::from_index_key_or_unknown(db, cache, &index_key) {
+        Ok(key) => key,
+        Err(err)
+            if is_unknown_dynamic_key_without_table_data(db, &owner, &inst, &index_key, &err) =>
+        {
+            return Ok(nullable_any_type());
+        }
+        Err(err) => return Err(err),
+    };
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
         return member_item.resolve_type_with_realm_at_offset(
             db,
@@ -285,19 +348,244 @@ fn infer_table_member(
         );
     }
 
+    if let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
+        db,
+        &owner,
+        &key,
+        cache.get_file_id(),
+        index_expr.get_position(),
+    ) {
+        return Ok(member_type);
+    }
+
+    if db.get_emmyrc().gmod.enabled
+        && db.get_emmyrc().gmod.infer_dynamic_fields
+        && is_literal_table_field_access(&index_key)
+    {
+        if let Some(dynamic_field) = resolve_dynamic_field_member(
+            db,
+            cache,
+            &LuaType::TableConst(inst.clone()),
+            &key,
+            Some(index_expr.get_position()),
+        ) && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
+        {
+            return Ok(dynamic_field.typ);
+        }
+
+        if table_has_cross_file_matching_expr_key_member(db, &owner, &key, cache.get_file_id()) {
+            return Ok(nullable_any_type());
+        }
+    }
+
     match infer_owner_raw_member_type_with_realm(
         db,
-        owner,
+        owner.clone(),
         &key,
         cache.get_file_id(),
         Some(index_expr.get_position()),
     ) {
         Ok(typ) => Ok(typ),
-        Err(InferFailReason::FieldNotFound) if is_table_const_from_doc_tag(db, &inst) => {
-            Ok(nullable_any_type())
+        Err(InferFailReason::FieldNotFound) => {
+            if let Some(dynamic_field) = resolve_dynamic_field_member(
+                db,
+                cache,
+                &LuaType::TableConst(inst.clone()),
+                &key,
+                Some(index_expr.get_position()),
+            ) && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
+            {
+                return Ok(dynamic_field.typ);
+            }
+            if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
+                return Ok(nullable_any_type());
+            }
+            if is_table_const_from_doc_tag(db, &inst) {
+                Ok(nullable_any_type())
+            } else {
+                Err(InferFailReason::FieldNotFound)
+            }
         }
         Err(err) => Err(err),
     }
+}
+
+fn is_literal_table_field_access(index_key: &LuaIndexKey) -> bool {
+    matches!(index_key, LuaIndexKey::Name(_) | LuaIndexKey::String(_))
+}
+
+fn infer_cross_file_matching_expr_key_member_type(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    access_file_id: FileId,
+    access_position: TextSize,
+) -> Option<LuaType> {
+    if !db.get_emmyrc().gmod.enabled
+        || !db.get_emmyrc().gmod.infer_dynamic_fields
+        || !db.get_emmyrc().gmod.dynamic_fields_global
+    {
+        return None;
+    }
+
+    let access_key_type = crate::semantic::member::member_key_as_type(key)?;
+    let access_realm = db
+        .get_gmod_infer_index()
+        .get_realm_file_metadata(&access_file_id)
+        .map(|metadata| metadata.inferred_realm)
+        .unwrap_or(crate::GmodRealm::Unknown);
+
+    let allow_wildcard_expr_literal_match =
+        is_literal_member_key(key) && owner_has_named_dynamic_fields_and_wildcards(db, owner);
+    let members = db.get_member_index().get_members(owner)?;
+    let mut result = LuaType::Unknown;
+
+    for member in members {
+        if !member.get_key().is_expr()
+            || member.get_file_id() == access_file_id
+            || !is_dynamic_field_fallback_realm_compatible(
+                db,
+                access_realm,
+                member.get_file_id(),
+                member.get_id().get_position(),
+            )
+        {
+            continue;
+        }
+
+        let member_item = crate::db_index::LuaMemberIndexItem::One(member.get_id());
+        let Ok(member_type) =
+            member_item.resolve_type_with_realm_at_offset(db, &access_file_id, access_position)
+        else {
+            continue;
+        };
+
+        let key_match = if is_literal_member_key(key)
+            && member_key_is_unknown_expr(member.get_key())
+        {
+            is_precise_unknown_wildcard_value_type(&member_type)
+        } else if is_literal_member_key(key) && member_key_is_broad_wildcard_expr(member.get_key())
+        {
+            allow_wildcard_expr_literal_match
+                && is_precise_unknown_wildcard_value_type(&member_type)
+        } else {
+            member_key_matches_type(db, &access_key_type, member.get_key())
+        };
+        if !key_match {
+            continue;
+        }
+
+        result = TypeOps::Union.apply(db, &result, &member_type);
+    }
+
+    if result.is_unknown() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+fn table_has_cross_file_matching_expr_key_member(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    access_file_id: FileId,
+) -> bool {
+    if !db.get_emmyrc().gmod.dynamic_fields_global {
+        return false;
+    }
+
+    let Some(access_key_type) = crate::semantic::member::member_key_as_type(key) else {
+        return false;
+    };
+    let access_realm = db
+        .get_gmod_infer_index()
+        .get_realm_file_metadata(&access_file_id)
+        .map(|metadata| metadata.inferred_realm)
+        .unwrap_or(crate::GmodRealm::Unknown);
+
+    db.get_member_index()
+        .get_members(owner)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                member.get_key().is_expr()
+                    && member.get_file_id() != access_file_id
+                    && is_dynamic_field_fallback_realm_compatible(
+                        db,
+                        access_realm,
+                        member.get_file_id(),
+                        member.get_id().get_position(),
+                    )
+                    && member_key_matches_type(db, &access_key_type, member.get_key())
+            })
+        })
+}
+
+fn is_literal_member_key(key: &LuaMemberKey) -> bool {
+    matches!(key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))
+}
+
+fn member_key_is_broad_wildcard_expr(key: &LuaMemberKey) -> bool {
+    matches!(key, LuaMemberKey::ExprType(typ) if is_broad_wildcard_key_type(typ))
+}
+
+fn member_key_is_unknown_expr(key: &LuaMemberKey) -> bool {
+    matches!(key, LuaMemberKey::ExprType(typ) if typ.is_unknown())
+}
+
+fn owner_has_named_dynamic_fields_and_wildcards(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
+    let dynamic_owner = match owner {
+        LuaMemberOwner::Type(type_id) => crate::DynamicFieldOwner::Type(type_id.clone()),
+        LuaMemberOwner::Element(range) => crate::DynamicFieldOwner::Table(range.clone()),
+        _ => return false,
+    };
+
+    let index = db.get_dynamic_field_index();
+    index
+        .get_fields(&dynamic_owner)
+        .is_some_and(|fields| !fields.is_empty())
+        && !index.get_wildcard_definitions(&dynamic_owner).is_empty()
+}
+
+fn is_precise_unknown_wildcard_value_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Instance(_) => true,
+        LuaType::TypeGuard(inner) => is_precise_unknown_wildcard_value_type(inner),
+        LuaType::TableOf(inner) => is_precise_unknown_wildcard_value_type(inner),
+        LuaType::Union(union) => {
+            let members = union.into_vec();
+            !members.is_empty() && members.iter().all(is_precise_unknown_wildcard_value_type)
+        }
+        _ => false,
+    }
+}
+
+fn is_broad_wildcard_key_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any | LuaType::String | LuaType::Number | LuaType::Integer => true,
+        LuaType::TypeGuard(inner) => is_broad_wildcard_key_type(inner),
+        LuaType::Union(union) => {
+            let members = union.into_vec();
+            !members.is_empty() && members.iter().all(is_broad_wildcard_key_type)
+        }
+        _ => false,
+    }
+}
+
+fn is_dynamic_field_fallback_realm_compatible(
+    db: &DbIndex,
+    access_realm: crate::GmodRealm,
+    definition_file_id: FileId,
+    definition_position: TextSize,
+) -> bool {
+    let definition_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&definition_file_id, definition_position);
+    !matches!(
+        (access_realm, definition_realm),
+        (crate::GmodRealm::Client, crate::GmodRealm::Server)
+            | (crate::GmodRealm::Server, crate::GmodRealm::Client)
+    )
 }
 
 fn is_table_const_from_doc_tag(db: &DbIndex, inst: &InFiled<TextRange>) -> bool {
@@ -312,11 +600,52 @@ fn nullable_any_type() -> LuaType {
     LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into())
 }
 
+fn is_unknown_dynamic_key_without_table_data(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    inst: &InFiled<TextRange>,
+    index_key: &LuaIndexKey,
+    err: &InferFailReason,
+) -> bool {
+    matches!(index_key, LuaIndexKey::Expr(_))
+        && table_const_has_no_specific_data(db, owner, inst)
+        && matches!(
+            err,
+            InferFailReason::None
+                | InferFailReason::UnResolveDeclType(_)
+                | InferFailReason::UnResolveExpr(_)
+        )
+}
+
+fn is_dynamic_expr_key_without_table_data(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    inst: &InFiled<TextRange>,
+    key: &LuaMemberKey,
+) -> bool {
+    matches!(key, LuaMemberKey::ExprType(_)) && table_const_has_no_specific_data(db, owner, inst)
+}
+
+fn table_const_has_no_specific_data(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    inst: &InFiled<TextRange>,
+) -> bool {
+    db.get_member_index()
+        .get_members(owner)
+        .is_none_or(|members| members.is_empty())
+        && db.get_metatable_index().get(inst).is_none()
+}
+
 fn infer_plain_table_member(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: LuaIndexMemberExpr,
 ) -> InferResult {
+    if let Some(member_type) = infer_gmod_plain_table_dynamic_field(db, cache, &index_expr) {
+        return Ok(member_type);
+    }
+
     let nullable_any = nullable_any_type();
 
     let index_prefix_expr = match index_expr.clone() {
@@ -335,6 +664,208 @@ fn infer_plain_table_member(
     }
 
     Ok(nullable_any)
+}
+
+fn infer_gmod_plain_table_dynamic_field(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexMemberExpr,
+) -> Option<LuaType> {
+    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+        return None;
+    }
+
+    if !is_gmod_gettable_alias_member_access(db, cache, index_expr) {
+        return None;
+    }
+
+    let (class_name, global_name) = get_scripted_class_info_for_file(db, cache.get_file_id())?;
+
+    let index_key = index_expr.get_index_key()?;
+    let member_key = LuaMemberKey::from_index_key(db, cache, &index_key).ok()?;
+    let class_type = LuaType::Ref(get_scripted_class_type_decl_id(&global_name, &class_name));
+    if let Ok(member_type) = infer_member_by_member_key(
+        db,
+        cache,
+        &class_type,
+        index_expr.clone(),
+        &InferGuard::new(),
+    ) {
+        return Some(member_type);
+    }
+
+    resolve_dynamic_field_member(
+        db,
+        cache,
+        &class_type,
+        &member_key,
+        Some(index_expr.get_position()),
+    )
+    .map(|resolution| resolution.typ)
+}
+
+fn is_gmod_gettable_alias_member_access(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexMemberExpr,
+) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    match prefix_expr {
+        LuaExpr::NameExpr(name_expr) => local_name_initializer_expr(db, cache, &name_expr)
+            .is_some_and(|initializer| is_self_gettable_call(db, cache, &initializer)),
+        LuaExpr::CallExpr(call_expr) => is_self_gettable_call_expr(db, cache, &call_expr),
+        _ => false,
+    }
+}
+
+fn local_name_initializer_expr(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaExpr> {
+    let Some(VarRefId::VarRef(decl_id)) = get_name_expr_var_ref_id(db, cache, name_expr) else {
+        return None;
+    };
+    if decl_id.file_id != cache.get_file_id()
+        || has_local_write_before_use(db, &cache.get_file_id(), &decl_id, name_expr.get_position())
+    {
+        return None;
+    }
+    db.get_decl_index().get_decl(&decl_id)?;
+    let token = match name_expr.get_root().token_at_offset(decl_id.position) {
+        rowan::TokenAtOffset::Single(token) => token,
+        rowan::TokenAtOffset::Between(_, right) => right,
+        rowan::TokenAtOffset::None => return None,
+    };
+
+    for ancestor in token.parent_ancestors() {
+        let Some(local_stat) = LuaLocalStat::cast(ancestor) else {
+            continue;
+        };
+
+        let name_index = local_stat
+            .get_local_name_list()
+            .position(|local_name| local_name.get_position() == decl_id.position)?;
+        return local_stat.get_value_exprs().nth(name_index);
+    }
+
+    None
+}
+
+fn has_local_write_before_use(
+    db: &DbIndex,
+    file_id: &FileId,
+    decl_id: &LuaDeclId,
+    use_position: rowan::TextSize,
+) -> bool {
+    db.get_reference_index()
+        .get_decl_references(file_id, decl_id)
+        .is_some_and(|decl_ref| {
+            decl_ref.cells.iter().any(|cell| {
+                cell.is_write
+                    && cell.range.start() > decl_id.position
+                    && cell.range.start() < use_position
+            })
+        })
+}
+
+fn is_self_gettable_call(db: &DbIndex, cache: &mut LuaInferCache, expr: &LuaExpr) -> bool {
+    let LuaExpr::CallExpr(call_expr) = expr else {
+        return false;
+    };
+
+    is_self_gettable_call_expr(db, cache, call_expr)
+}
+
+fn is_self_gettable_call_expr(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    if call_expr.is_colon_call() {
+        let LuaExpr::IndexExpr(index_expr) = &prefix_expr else {
+            return false;
+        };
+        return is_entity_gettable_index_expr(db, cache, &prefix_expr)
+            && index_expr
+                .get_prefix_expr()
+                .is_some_and(|self_expr| is_self_expr(&self_expr));
+    }
+
+    if !call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().next())
+        .is_some_and(|arg| is_self_expr(&arg))
+    {
+        return false;
+    }
+
+    match prefix_expr {
+        LuaExpr::IndexExpr(_) => is_entity_gettable_index_expr(db, cache, &prefix_expr),
+        LuaExpr::NameExpr(name_expr) => local_name_initializer_expr(db, cache, &name_expr)
+            .is_some_and(|initializer| is_entity_gettable_index_expr(db, cache, &initializer)),
+        _ => false,
+    }
+}
+
+fn is_entity_gettable_index_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: &LuaExpr) -> bool {
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return false;
+    };
+
+    if !matches!(
+        index_expr.get_index_key(),
+        Some(LuaIndexKey::Name(name)) if name.get_name_text() == "GetTable"
+    ) {
+        return false;
+    }
+
+    let Some(receiver_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Ok(receiver_type) = infer_expr(db, cache, receiver_expr) else {
+        return false;
+    };
+
+    is_entity_or_derived_type(db, &receiver_type)
+}
+
+fn is_entity_or_derived_type(db: &DbIndex, typ: &LuaType) -> bool {
+    let entity_id = LuaTypeDeclId::global("Entity");
+    match typ {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            type_id == &entity_id || type_check::is_sub_type_of(db, type_id, &entity_id)
+        }
+        LuaType::Generic(generic) => {
+            let type_id = generic.get_base_type_id_ref();
+            type_id == &entity_id || type_check::is_sub_type_of(db, type_id, &entity_id)
+        }
+        LuaType::Instance(instance) => is_entity_or_derived_type(db, instance.get_base()),
+        LuaType::TableOf(base) => is_entity_or_derived_type(db, base),
+        LuaType::Union(union) => {
+            let types = union.into_vec();
+            let mut saw_non_nil = false;
+            for typ in types.iter().filter(|typ| !matches!(typ, LuaType::Nil)) {
+                saw_non_nil = true;
+                if !is_entity_or_derived_type(db, typ) {
+                    return false;
+                }
+            }
+            saw_non_nil
+        }
+        _ => false,
+    }
+}
+
+fn is_self_expr(expr: &LuaExpr) -> bool {
+    matches!(expr, LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self"))
 }
 
 fn infer_custom_type_member(
@@ -372,18 +903,28 @@ fn infer_custom_type_member(
     let owner = LuaMemberOwner::Type(prefix_type_id.clone());
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
+    let access_position = index_expr.get_position();
 
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
-        return member_item.resolve_type_with_realm(db, &cache.get_file_id());
+        return member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            access_position,
+        );
     }
     let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
     if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, &key) {
-        let resolved = member_item.resolve_type_with_realm(db, &cache.get_file_id());
+        let resolved = member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            access_position,
+        );
         let decl_backed_type = resolve_decl_backed_global_path_member_type(
             db,
             member_item,
             &cache.get_file_id(),
             key.clone(),
+            Some(access_position),
         );
         if let Some(module_decl_type) = decl_backed_type.clone()
             && resolved
@@ -403,6 +944,16 @@ fn infer_custom_type_member(
         return resolved;
     }
 
+    if let Some(dynamic_field) = resolve_dynamic_field_member(
+        db,
+        cache,
+        &LuaType::Ref(prefix_type_id.clone()),
+        &key,
+        Some(index_expr.get_position()),
+    ) {
+        return Ok(dynamic_field.typ);
+    }
+
     // 解决`key`为表达式的情况
     if let LuaIndexKey::Expr(expr) = index_key
         && let Some(keys) = get_expr_member_key(db, cache, &expr)
@@ -416,8 +967,11 @@ fn infer_custom_type_member(
             }
 
             if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key)
-                && let Ok(member_type) =
-                    member_item.resolve_type_with_realm(db, &cache.get_file_id())
+                && let Ok(member_type) = member_item.resolve_type_with_realm_at_offset(
+                    db,
+                    &cache.get_file_id(),
+                    access_position,
+                )
             {
                 result_types.push(member_type);
             }
@@ -454,8 +1008,14 @@ fn resolve_decl_backed_global_path_member_type(
     member_item: &crate::db_index::LuaMemberIndexItem,
     caller_file_id: &crate::FileId,
     key: LuaMemberKey,
+    caller_position: Option<TextSize>,
 ) -> Option<LuaType> {
-    let visible_member_ids = member_item.visible_member_ids_with_realm(db, caller_file_id);
+    let visible_member_ids = match caller_position {
+        Some(position) => {
+            member_item.visible_member_ids_with_realm_at_offset(db, caller_file_id, position)
+        }
+        None => member_item.visible_member_ids_with_realm(db, caller_file_id),
+    };
     let mut result = LuaType::Unknown;
 
     for member_id in visible_member_ids {
@@ -682,25 +1242,35 @@ fn infer_index_metamethod(
     key_type: &LuaType,
     value_type: &LuaType,
 ) -> InferResult {
-    let access_key_type = match &index_key {
-        LuaIndexKey::Name(name) => LuaType::StringConst(SmolStr::new(name.get_name_text()).into()),
-        LuaIndexKey::String(s) => LuaType::StringConst(SmolStr::new(s.get_value()).into()),
-        LuaIndexKey::Integer(i) => {
-            if let NumberResult::Int(index_value) = i.get_number_value() {
-                LuaType::IntegerConst(index_value)
-            } else {
-                return Err(InferFailReason::FieldNotFound);
-            }
-        }
-        LuaIndexKey::Idx(i) => LuaType::IntegerConst(*i as i64),
-        LuaIndexKey::Expr(expr) => infer_expr(db, cache, expr.clone())?,
-    };
+    let access_key_type = index_key_access_type(db, cache, index_key)?;
 
     if check_type_compact(db, key_type, &access_key_type).is_ok() {
         return Ok(value_type.clone());
     }
 
     Err(InferFailReason::FieldNotFound)
+}
+
+fn index_key_access_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_key: &LuaIndexKey,
+) -> InferResult {
+    match index_key {
+        LuaIndexKey::Name(name) => Ok(LuaType::StringConst(
+            SmolStr::new(name.get_name_text()).into(),
+        )),
+        LuaIndexKey::String(s) => Ok(LuaType::StringConst(SmolStr::new(s.get_value()).into())),
+        LuaIndexKey::Integer(i) => {
+            if let NumberResult::Int(index_value) = i.get_number_value() {
+                Ok(LuaType::IntegerConst(index_value))
+            } else {
+                Err(InferFailReason::FieldNotFound)
+            }
+        }
+        LuaIndexKey::Idx(i) => Ok(LuaType::IntegerConst(*i as i64)),
+        LuaIndexKey::Expr(expr) => infer_expr(db, cache, expr.clone()),
+    }
 }
 
 fn infer_union_member(
@@ -973,42 +1543,64 @@ fn infer_member_by_index_table(
         }
         None => {
             let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
-            if let LuaIndexKey::Expr(expr) = index_key {
-                let key_type = infer_expr(db, cache, expr.clone())?;
-                let members = db
-                    .get_member_index()
-                    .get_members(&LuaMemberOwner::Element(table_range.clone()));
-                if let Some(mut members) = members {
-                    members.sort_by(|a, b| a.get_key().cmp(b.get_key()));
-                    let mut result_type = LuaType::Unknown;
-                    for member in members {
-                        if member_key_matches_type(db, &key_type, member.get_key()) {
-                            let member_type = db
-                                .get_type_index()
-                                .get_type_cache(&member.get_id().into())
-                                .map(|it| it.as_type())
-                                .unwrap_or(&LuaType::Unknown);
+            let key_type = index_key_access_type(db, cache, &index_key)?;
+            let members = db
+                .get_member_index()
+                .get_members(&LuaMemberOwner::Element(table_range.clone()));
+            if let Some(mut members) = members {
+                members.sort_by(|a, b| a.get_key().cmp(b.get_key()));
+                let mut result_type = LuaType::Unknown;
+                let mut matched_inferred_index_key = false;
+                for member in members {
+                    if member_key_matches_type(db, &key_type, member.get_key()) {
+                        matched_inferred_index_key |=
+                            is_inferred_index_member_key(member.get_key());
+                        let member_type = db
+                            .get_type_index()
+                            .get_type_cache(&member.get_id().into())
+                            .map(|it| it.as_type())
+                            .unwrap_or(&LuaType::Unknown);
 
-                            result_type = TypeOps::Union.apply(db, &result_type, member_type);
-                        }
+                        result_type = TypeOps::Union.apply(db, &result_type, member_type);
+                    }
+                }
+
+                if !result_type.is_unknown() {
+                    if table_index_result_may_be_nil(db, &key_type, matched_inferred_index_key) {
+                        result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
                     }
 
-                    if !result_type.is_unknown() {
-                        if matches!(
-                            key_type,
-                            LuaType::String | LuaType::Number | LuaType::Integer
-                        ) {
-                            result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
-                        }
-
-                        return Ok(result_type);
-                    }
+                    return Ok(result_type);
                 }
             }
         }
     }
 
     Err(InferFailReason::FieldNotFound)
+}
+
+fn table_index_result_may_be_nil(
+    db: &DbIndex,
+    key_type: &LuaType,
+    matched_inferred_index_key: bool,
+) -> bool {
+    matches!(
+        key_type,
+        LuaType::String | LuaType::Number | LuaType::Integer
+    ) || (db.get_emmyrc().strict.array_index
+        && matched_inferred_index_key
+        && is_numeric_access_key_type(key_type))
+}
+
+fn is_numeric_access_key_type(key_type: &LuaType) -> bool {
+    matches!(
+        key_type,
+        LuaType::Integer | LuaType::Number | LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
+    )
+}
+
+fn is_inferred_index_member_key(key: &LuaMemberKey) -> bool {
+    matches!(key, LuaMemberKey::ExprType(_))
 }
 
 fn infer_member_by_index_custom_type(
@@ -1313,6 +1905,7 @@ fn infer_namespace_member(
             member_item,
             &cache.get_file_id(),
             member_key.clone(),
+            None,
         ) {
             return Ok(module_decl_type);
         }

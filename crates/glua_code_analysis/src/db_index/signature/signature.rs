@@ -18,6 +18,7 @@ pub struct LuaSignature {
     pub generic_params: Vec<Arc<LuaGenericParamInfo>>,
     pub overloads: Vec<Arc<LuaFunctionType>>,
     pub param_docs: HashMap<usize, LuaDocParamInfo>,
+    pub out_params: Vec<LuaOutParamInfo>,
     pub params: Vec<String>,
     pub return_docs: Vec<LuaDocReturnInfo>,
     pub resolve_return: SignatureReturnStatus,
@@ -45,6 +46,7 @@ impl LuaSignature {
             generic_params: Vec::new(),
             overloads: Vec::new(),
             param_docs: HashMap::new(),
+            out_params: Vec::new(),
             params: Vec::new(),
             return_docs: Vec::new(),
             resolve_return: SignatureReturnStatus::UnResolve,
@@ -67,10 +69,11 @@ impl LuaSignature {
         self.param_docs.values().any(|param_info| {
             type_contains_str_tpl_ref(&param_info.type_ref)
                 || param_info.get_attribute_by_name("constructor").is_some()
-        }) || self
-            .overloads
-            .iter()
-            .any(|overload| overload_has_special_call_params(overload.as_ref()))
+        }) || !self.out_params.is_empty()
+            || self
+                .overloads
+                .iter()
+                .any(|overload| overload_has_special_call_params(overload.as_ref()))
     }
 
     pub fn get_type_params(&self) -> Vec<(String, Option<LuaType>)> {
@@ -84,6 +87,16 @@ impl LuaSignature {
         }
 
         type_params
+    }
+
+    pub fn get_param_optional_flags(&self) -> Vec<bool> {
+        (0..self.params.len())
+            .map(|idx| {
+                self.param_docs
+                    .get(&idx)
+                    .is_some_and(|param_info| param_info.default_value.is_some())
+            })
+            .collect()
     }
 
     pub fn find_param_idx(&self, param_name: &str) -> Option<usize> {
@@ -176,7 +189,8 @@ impl LuaSignature {
             is_vararg,
             params,
             return_type,
-        );
+        )
+        .with_optional_params(self.get_param_optional_flags());
         Arc::new(func_type)
     }
 
@@ -187,8 +201,13 @@ impl LuaSignature {
         }
 
         let return_type = self.get_return_type();
+        let mut optional_params = self.get_param_optional_flags();
+        if !optional_params.is_empty() && !self.is_colon_define {
+            optional_params.remove(0);
+        }
         let func_type =
-            LuaFunctionType::new(self.async_state, false, self.is_vararg, params, return_type);
+            LuaFunctionType::new(self.async_state, false, self.is_vararg, params, return_type)
+                .with_optional_params(optional_params);
         Arc::new(func_type)
     }
 }
@@ -223,6 +242,7 @@ fn overload_has_special_call_params(func: &LuaFunctionType) -> bool {
 pub struct LuaDocParamInfo {
     pub name: String,
     pub type_ref: LuaType,
+    pub default_value: Option<LuaDocDefaultValue>,
     pub nullable: bool,
     pub description: Option<String>,
     pub attributes: Option<Vec<LuaAttributeUse>>,
@@ -237,6 +257,13 @@ impl LuaDocParamInfo {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaOutParamInfo {
+    pub param_idx: usize,
+    pub field_path: Vec<String>,
+    pub type_ref: LuaType,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReturnTypeKind {
     #[default]
@@ -245,10 +272,19 @@ pub enum ReturnTypeKind {
     Definition,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LuaDocDefaultValue {
+    Nil,
+    Boolean(bool),
+    Number(String),
+    String(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct LuaDocReturnInfo {
     pub name: Option<String>,
     pub type_ref: LuaType,
+    pub default_value: Option<LuaDocDefaultValue>,
     pub description: Option<String>,
     pub attributes: Option<Vec<LuaAttributeUse>>,
     pub return_kind: ReturnTypeKind,

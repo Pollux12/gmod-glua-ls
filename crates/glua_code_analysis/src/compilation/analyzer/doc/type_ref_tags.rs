@@ -1,30 +1,30 @@
 use glua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaDocDescriptionOwner, LuaDocTagAs, LuaDocTagCast,
-    LuaDocTagModule, LuaDocTagOther, LuaDocTagOverload, LuaDocTagParam, LuaDocTagReturn,
-    LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaDocTypeFlag, LuaExpr,
-    LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
+    LuaDocTagModule, LuaDocTagOther, LuaDocTagOutparam, LuaDocTagOverload, LuaDocTagParam,
+    LuaDocTagReturn, LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType,
+    LuaDocTypeFlag, LuaExpr, LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
 };
 
 use super::{
-    DocAnalyzer,
+    DocAnalyzer, apply_nullable_doc_default, convert_doc_default_value,
     infer_type::infer_type,
     preprocess_description,
     tags::{find_owner_closure, get_owner_id_or_report},
 };
 use crate::{
-    InFiled, JsonSchemaFile, LuaOperatorMetaMethod, LuaTypeCache, LuaTypeOwner, OperatorFunction,
-    ReturnTypeKind, SignatureReturnStatus, TypeOps,
-    compilation::analyzer::common::bind_type,
-    db_index::{
-        AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType,
-        LuaMemberId, LuaOperator, LuaSemanticDeclId, LuaSignatureId, LuaType,
-    },
-};
-use crate::{
-    LuaAttributeUse,
+    AnalyzeError, DiagnosticCode, LuaAttributeUse,
     compilation::analyzer::doc::{
         attribute_tags::{find_attach_attribute, infer_attribute_uses},
         tags::{find_owner_closure_or_report, get_owner_id, report_orphan_tag},
+    },
+};
+use crate::{
+    InFiled, JsonSchemaFile, LuaOperatorMetaMethod, LuaTypeCache, LuaTypeOwner, OperatorFunction,
+    ReturnTypeKind, SignatureReturnStatus,
+    compilation::analyzer::common::bind_type,
+    db_index::{
+        AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType,
+        LuaMemberId, LuaOperator, LuaOutParamInfo, LuaSemanticDeclId, LuaSignatureId, LuaType,
     },
 };
 
@@ -197,15 +197,13 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
     };
 
     let nullable = tag.is_nullable();
-    let mut type_ref = if let Some(lua_doc_type) = tag.get_type() {
+    let type_ref = if let Some(lua_doc_type) = tag.get_type() {
         infer_type(analyzer, lua_doc_type)
     } else {
         return None;
     };
-
-    if nullable && !type_ref.is_nullable() {
-        type_ref = TypeOps::Union.apply(analyzer.db, &type_ref, &LuaType::Nil);
-    }
+    let default_value = tag.get_default_value().map(convert_doc_default_value);
+    let type_ref = apply_nullable_doc_default(analyzer, type_ref, nullable, default_value.as_ref());
 
     let description = tag
         .get_description()
@@ -229,6 +227,7 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
         let param_info = LuaDocParamInfo {
             name: name.clone(),
             type_ref: type_ref.clone(),
+            default_value,
             nullable,
             description,
             attributes,
@@ -258,6 +257,79 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
     Some(())
 }
 
+pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> Option<()> {
+    let path = tag.get_path()?;
+    let mut path_segments = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .map(ToString::to_string);
+    let Some(param_name) = path_segments.next() else {
+        report_invalid_outparam(
+            analyzer,
+            &tag,
+            "outparam path must start with a parameter name",
+        );
+        return None;
+    };
+    let field_path = path_segments.collect::<Vec<_>>();
+    if field_path.is_empty() {
+        report_invalid_outparam(
+            analyzer,
+            &tag,
+            format!("outparam `{path}` must target at least one field"),
+        );
+        return None;
+    }
+
+    let type_ref = tag
+        .get_type()
+        .map(|lua_doc_type| infer_type(analyzer, lua_doc_type))?;
+    let closure = find_owner_closure_or_report(analyzer, &tag)?;
+    let signature_id = LuaSignatureId::from_closure(analyzer.file_id, &closure);
+    let signature = analyzer
+        .db
+        .get_signature_index_mut()
+        .get_or_create(signature_id);
+    let Some(param_idx) = signature.find_param_idx(&param_name) else {
+        report_invalid_outparam(
+            analyzer,
+            &tag,
+            format!("outparam root `{param_name}` does not match any parameter"),
+        );
+        return None;
+    };
+
+    if let Some(existing) = signature
+        .out_params
+        .iter_mut()
+        .find(|p| p.param_idx == param_idx && p.field_path == field_path)
+    {
+        existing.type_ref = type_ref;
+    } else {
+        signature.out_params.push(LuaOutParamInfo {
+            param_idx,
+            field_path,
+            type_ref,
+        });
+    }
+    Some(())
+}
+
+fn report_invalid_outparam(
+    analyzer: &mut DocAnalyzer,
+    tag: &LuaDocTagOutparam,
+    message: impl Into<String>,
+) {
+    analyzer.db.get_diagnostic_index_mut().add_diagnostic(
+        analyzer.file_id,
+        AnalyzeError {
+            kind: DiagnosticCode::AnnotationUsageError,
+            message: message.into(),
+            range: tag.get_range(),
+        },
+    );
+}
+
 fn get_return_type_kind(flag: Option<LuaDocTypeFlag>) -> ReturnTypeKind {
     if let Some(flag) = flag {
         for token in flag.get_attrib_tokens() {
@@ -280,11 +352,14 @@ pub fn analyze_return(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturn) -> Optio
 
     if let Some(closure) = find_owner_closure_or_report(analyzer, &tag) {
         let signature_id = LuaSignatureId::from_closure(analyzer.file_id, &closure);
-        let returns = tag.get_info_list();
-        for (doc_type, name_token) in returns {
+        let returns = tag.get_info_list_with_default();
+        for (doc_type, name_token, default) in returns {
             let name = name_token.map(|name| name.get_name_text().to_string());
 
-            let mut type_ref = infer_type(analyzer, doc_type);
+            let default_value = default.map(convert_doc_default_value);
+            let inferred_type = infer_type(analyzer, doc_type);
+            let mut type_ref =
+                apply_nullable_doc_default(analyzer, inferred_type, false, default_value.as_ref());
             match return_kind {
                 ReturnTypeKind::Instance => {
                     let range = InFiled::new(analyzer.file_id, tag.syntax().text_range());
@@ -300,6 +375,7 @@ pub fn analyze_return(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturn) -> Optio
             let return_info = LuaDocReturnInfo {
                 name,
                 type_ref,
+                default_value,
                 description: description.clone(),
                 attributes: None,
                 return_kind,

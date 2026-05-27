@@ -34,4 +34,29 @@ mod test {
             "#
         ));
     }
+
+    #[test]
+    fn deprecated_prefilter_keeps_name_and_member_diagnostics() {
+        let mut ws = crate::VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@deprecated use new_api
+        old_api = {}
+
+        api = {}
+
+        ---@deprecated use api.new_method
+        function api.old_method() end
+        "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::Deprecated,
+            r#"
+            old_api
+            api.old_method()
+            "#
+        ));
+    }
 }

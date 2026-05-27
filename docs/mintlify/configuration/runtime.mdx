@@ -5,7 +5,7 @@ description: Configure non-standard Lua symbols, strict type checking, special f
 
 ## Overview
 
-The `runtime`, `strict`, `doc`, and `references` sections control how the language server interprets Lua syntax and enforces type checking strictness.
+The `runtime`, `strict`, `doc`, and `references` sections control how the language server interprets Lua syntax and checks types.
 
 ---
 
@@ -23,7 +23,7 @@ The `runtime`, `strict`, `doc`, and `references` sections control how the langua
 
 ### Default non-standard symbols
 
-The following non-standard symbols are enabled by default to match GLua syntax:
+GLuaLS enables these non-standard symbols by default to match GLua syntax:
 
 ```
 ["//", "/**/", "continue", "!=", "||", "&&", "!"]
@@ -43,7 +43,7 @@ All available non-standard symbols:
 
 ### Special functions
 
-Map custom function names to built-in semantic behaviours:
+Map custom function names to built-in semantic behavior:
 
 ```json .gluarc.json
 {
@@ -57,7 +57,7 @@ Map custom function names to built-in semantic behaviours:
 }
 ```
 
-Available behaviours: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"`, `"setmetatable"`
+Available behavior values: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"`, `"setmetatable"`
 
 ---
 
@@ -136,7 +136,7 @@ Available behaviours: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"`, `"
 
 ## VSCode extension settings
 
-These settings can also be configured via VS Code's settings (`gluals.*` prefix):
+You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
 | VSCode Setting | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|---|

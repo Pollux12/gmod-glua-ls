@@ -129,6 +129,12 @@
 ---@alias std.RawGet<T, K> unknown
 
 ---
+--- built-in type for splitting a string by a separator.
+--- When `Sep` and `Str` are both string constants, returns a tuple of the split parts.
+--- Otherwise falls back to `string[]`.
+---@alias std.Split<Sep, Str> unknown
+
+---
 --- built-in type for generic template, for match integer const and true/false
 ---@alias std.ConstTpl<T> unknown
 

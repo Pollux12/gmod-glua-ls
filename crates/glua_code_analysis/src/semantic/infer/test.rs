@@ -4,7 +4,7 @@ mod test {
         DiagnosticCode, FileId, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaType,
         LuaUnionType, VirtualWorkspace, semantic::infer_owner_raw_member_type_with_realm,
     };
-    use glua_parser::{LuaAstNode, LuaExpr, LuaNameExpr};
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaNameExpr};
 
     fn infer_last_name_expr_type(
         ws: &mut VirtualWorkspace,
@@ -35,6 +35,32 @@ mod test {
 
         semantic_model
             .infer_expr(LuaExpr::NameExpr(target))
+            .unwrap_or(crate::LuaType::Unknown)
+    }
+
+    fn infer_last_index_expr_type_in_file(
+        ws: &VirtualWorkspace,
+        file_id: FileId,
+        field_name: &str,
+    ) -> crate::LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let target = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .filter(|expr| {
+                expr.get_index_key()
+                    .is_some_and(|key| key.get_path_part() == field_name)
+            })
+            .collect::<Vec<_>>()
+            .pop()
+            .expect("Target index expr must exist");
+
+        semantic_model
+            .infer_expr(LuaExpr::IndexExpr(target))
             .unwrap_or(crate::LuaType::Unknown)
     }
 
@@ -401,6 +427,110 @@ mod test {
     }
 
     #[test]
+    fn test_branch_initialized_indexed_record_alias_preserves_shape() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/sh_glide.lua",
+            r#"
+            ---@class Glide
+            Glide = Glide or {}
+        "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_network.lua",
+            r#"
+            Glide.DebugNetwork = Glide.DebugNetwork or {}
+
+            if CLIENT then
+                local DebugNet = Glide.DebugNetwork
+
+                function DebugNet.ReadSnapshot()
+                    local entId = net.ReadUInt(16)
+                    local vehicleId = nil
+                    local fields = {}
+                    return entId, vehicleId, fields
+                end
+            end
+        "#,
+        );
+        let file_id = ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            local DebugNet = Glide.DebugNetwork
+
+            local function receive()
+                local entId, vehicleId, fields = DebugNet.ReadSnapshot()
+                if not entId then return end
+
+                Glide.DebugSnapshots = Glide.DebugSnapshots or {}
+                local rec = Glide.DebugSnapshots[entId]
+                if not rec then
+                    rec = { data = {}, t = SysTime() }
+                    Glide.DebugSnapshots[entId] = rec
+                end
+
+                local data = rec.data
+                print(data, rec)
+            end
+        "#,
+        );
+        let ty = infer_last_name_expr_type_in_file(&ws, file_id, "rec");
+
+        assert!(
+            matches!(ty, LuaType::TableConst(_)),
+            "Branch-initialized record alias should preserve its table shape, got: {:?}",
+            ty
+        );
+    }
+
+    #[test]
+    fn test_flow_merge_preserves_explicit_any_over_table_shape() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@type any
+            local value
+            if condition then
+                value = {}
+            end
+
+            print(value)
+            "#,
+            "value",
+        );
+
+        assert_eq!(ty, ws.ty("any"));
+    }
+
+    #[test]
+    fn test_flow_merge_keeps_inferred_any_over_specific_non_table_assignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return any
+            local function read()
+            end
+
+            local value = read()
+            if condition then
+                value = "translated"
+            end
+
+            print(value)
+            "#,
+            "value",
+        );
+
+        assert_eq!(ty, ws.ty("any"));
+    }
+
+    #[test]
     fn test_pairs_value_preserves_cross_file_indexed_assignment_table_field() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
@@ -514,6 +644,56 @@ mod test {
             matches!(ty, LuaType::TableConst(_)),
             "Cross-file guarded field from pairs value should preserve the assigned data table, got: {:?}",
             ty
+        );
+    }
+
+    #[test]
+    fn test_dynamic_string_key_field_read_uses_index_value_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/glide/client/network.lua",
+            r#"
+            ---@class Vector
+            local Vector = {}
+            ---@return Vector
+            function _G.Vector() end
+
+            net = {}
+            ---@return string
+            function net.ReadString() end
+
+            local function readValue()
+                if flag then
+                    return Vector()
+                end
+
+                return "not a number"
+            end
+
+            local rec = { data = {}, t = 0 }
+            local data = rec.data
+            local key = net.ReadString()
+            data[key] = readValue()
+
+            local d = rec.data
+            print(d.forwardSlip)
+        "#,
+        );
+
+        let ty = infer_last_index_expr_type_in_file(&ws, file_id, "forwardSlip");
+        let display = ws.humanize_type(ty.clone());
+        assert!(
+            !ty.is_unknown() && !ty.is_nil(),
+            "A dynamic string-key field read should use the index value type, got: {display}"
+        );
+        assert!(
+            display.contains("Vector") && display.contains("\"not a number\""),
+            "A dynamic string-key field read should include the indexed value union, got: {display}"
         );
     }
 

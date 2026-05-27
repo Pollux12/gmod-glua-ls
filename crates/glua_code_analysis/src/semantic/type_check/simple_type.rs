@@ -444,7 +444,7 @@ fn check_variadic_type_compact(
                 }
                 VariadicType::Multi(compact_multi) => {
                     for compact_type in compact_multi {
-                        check_simple_type_compact(
+                        check_general_type_compact(
                             context,
                             source_base,
                             compact_type,
@@ -454,7 +454,7 @@ fn check_variadic_type_compact(
                 }
             },
             _ => {
-                check_simple_type_compact(
+                check_general_type_compact(
                     context,
                     source_base,
                     compact_type,

@@ -1,10 +1,13 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use glua_code_analysis::{EmmyLuaAnalysis, FileId, Profile};
+use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use log::{debug, info, warn};
 use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -24,6 +27,7 @@ pub struct FileDiagnostic {
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     client: Arc<ClientProxy>,
     status_bar: Arc<StatusBar>,
+    startup_complete_notified: Arc<AtomicBool>,
     diagnostic_tokens: Arc<Mutex<HashMap<FileId, CancellationToken>>>,
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
     cached_file_diagnostics: Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>,
@@ -39,6 +43,7 @@ impl FileDiagnostic {
         Self {
             analysis,
             client,
+            startup_complete_notified: Arc::new(AtomicBool::new(false)),
             diagnostic_tokens: Arc::new(Mutex::new(HashMap::new())),
             workspace_diagnostic_token: Arc::new(Mutex::new(None)),
             cached_file_diagnostics: Arc::new(Mutex::new(HashMap::new())),
@@ -74,6 +79,19 @@ impl FileDiagnostic {
 
     pub async fn clear_recent_edit(&self, uri: &Uri) {
         self.recently_edited_lines.lock().await.remove(uri);
+    }
+
+    fn notify_startup_complete(&self) {
+        if self.startup_complete_notified.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        self.client.send_notification(
+            "gluals/serverStatus",
+            serde_json::json!({
+                "state": "startupComplete",
+            }),
+        );
     }
 
     pub async fn cache_fresh_file_diagnostics(&self, uri: &Uri, diagnostics: &[Diagnostic]) {
@@ -251,10 +269,18 @@ impl FileDiagnostic {
         let analysis = self.analysis.clone();
         let client_proxy = self.client.clone();
         let status_bar = self.status_bar.clone();
+        let file_diagnostic = self.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {
-                    push_workspace_diagnostic(analysis, client_proxy, status_bar, silent, cancel_token).await
+                    push_workspace_diagnostic(
+                        file_diagnostic,
+                        analysis,
+                        client_proxy,
+                        status_bar,
+                        silent,
+                        cancel_token,
+                    ).await
                 }
                 _ = cancel_token.cancelled() => {
                     log::info!("cancel workspace diagnostic");
@@ -347,16 +373,6 @@ impl FileDiagnostic {
             let shared_data = analysis.precompute_diagnostic_shared_data();
             (file_ids, shared_data)
         };
-        let profile_text = format!(
-            "workspace diagnostic pull slow: {} files",
-            main_workspace_file_ids.len()
-        );
-        let _p = Profile::new(profile_text.as_str());
-        info!(
-            "workspace diagnostic pull slow started: files={}",
-            main_workspace_file_ids.len()
-        );
-
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
         let valid_file_count = main_workspace_file_ids.len();
         let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
@@ -440,12 +456,6 @@ impl FileDiagnostic {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
         let valid_file_count = main_workspace_file_ids.len();
-        let profile_text = format!("workspace diagnostic pull fast: {} files", valid_file_count);
-        let _p = Profile::new(profile_text.as_str());
-        info!(
-            "workspace diagnostic pull fast started: files={}",
-            valid_file_count
-        );
 
         let analysis = self.analysis.clone();
         let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
@@ -471,8 +481,6 @@ impl FileDiagnostic {
 
         let mut count = 0;
         if valid_file_count != 0 {
-            let text = format!("diagnose {} files", valid_file_count);
-            let _p = Profile::new(text.as_str());
             let mut last_percentage = 0;
 
             while count < valid_file_count {
@@ -515,6 +523,9 @@ impl FileDiagnostic {
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnosis complete".to_string()),
         );
+        if count == valid_file_count && !cancel_token.is_cancelled() {
+            self.notify_startup_complete();
+        }
 
         result
     }
@@ -590,6 +601,7 @@ async fn diagnose_workspace_file_off_thread(
 }
 
 async fn push_workspace_diagnostic(
+    file_diagnostic: FileDiagnostic,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     client_proxy: Arc<ClientProxy>,
     status_bar: Arc<StatusBar>,
@@ -609,15 +621,6 @@ async fn push_workspace_diagnostic(
     // diagnostic files
     let (tx, mut rx) = tokio::sync::mpsc::channel::<FileId>(100);
     let valid_file_count = main_workspace_file_ids.len();
-    let profile_text = format!(
-        "workspace diagnostic push (silent={}): {} files",
-        silent, valid_file_count
-    );
-    let _p = Profile::new(profile_text.as_str());
-    info!(
-        "workspace diagnostic push started: files={}, silent={}",
-        valid_file_count, silent
-    );
     if !silent {
         status_bar
             .create_progress_task(ProgressTask::DiagnoseWorkspace)
@@ -695,6 +698,9 @@ async fn push_workspace_diagnostic(
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnosis complete".to_string()),
         );
+        if count == valid_file_count && !cancel_token.is_cancelled() {
+            file_diagnostic.notify_startup_complete();
+        }
     }
 }
 
