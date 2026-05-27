@@ -110,8 +110,8 @@ pub fn get_type_at_binary_expr(
 
     // Fallback: any binary expression that successfully evaluates implies its
     // index-typed operands have non-nil prefixes. For an undefined-global
-    // prefix (Unknown base), keep the uncertainty as Unknown instead of
-    // widening to Any after a pattern like `if tmysql.Version < 4.1 then`.
+    // prefix (Unknown base), widen to Any so guarded/indexed global patterns
+    // keep existing flow behavior (e.g. `if tmysql.Version < 4.1 then`).
     // Comparison/equality ops that already matched a more-specific narrowing
     // return above; we only run this when dispatch produced Continue.
     //
@@ -142,7 +142,7 @@ pub fn get_type_at_binary_expr(
 }
 
 /// If `index_expr`'s leftmost-name prefix matches `var_ref_id` and that var's
-/// antecedent type is `Unknown`, return `Unknown`. Used as a fallback for binary
+/// antecedent type is `Unknown`, return `Any`. Used as a fallback for binary
 /// expressions where evaluating the index implies the prefix is non-nil.
 #[allow(clippy::too_many_arguments)]
 fn try_unknown_prefix_widen(

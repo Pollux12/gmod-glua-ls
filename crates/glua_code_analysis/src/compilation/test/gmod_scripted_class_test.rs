@@ -4894,6 +4894,200 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_gmod_vehicle_sound_guarded_starttail_call_has_no_unchecked_nil_and_non_any_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+            function CSoundPatch:SetSoundLevel(level) end
+            function CSoundPatch:PlayEx(volume, pitch) end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+
+            ---@return string
+            function GetDynamicSoundId() end
+        "#;
+
+        let base_shared_code = r#"
+            ENT.Type = "anim"
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:OnEngineStateChange()
+                local snd = self:CreateLoopingSound("start", "start.wav", 70, self)
+                snd:PlayEx(1, 100)
+
+                local dynamicId = GetDynamicSoundId()
+                local dynamicSound = self:CreateLoopingSound(dynamicId, "dynamic.wav", 70, self)
+                dynamicSound:PlayEx(1, 100)
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    snd:SetSoundLevel(level)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+
+            function ENT:InternalDeactivateSounds()
+                local sounds = self.sounds
+
+                for k, snd in pairs(sounds) do
+                    snd:Stop()
+                    sounds[k] = nil
+                end
+            end
+        "#;
+
+        let car_shared_code = r#"
+            ENT.Type = "anim"
+            ENT.Base = "base_glide"
+            ENT.StopStartTailOnInput = false
+            ENT.HornSound = "horn.wav"
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:OnUpdateSounds()
+                local sounds = self.sounds
+                local dt = 0
+                local isHonking = false
+                local startTailPreview = sounds.startTail
+
+                if self.StopStartTailOnInput and sounds.startTail then
+                    local guardedStartTail = sounds.startTail
+                    guardedStartTail:Stop()
+                    sounds.startTail:Stop()
+                    sounds["startTail"] = nil
+                end
+
+                if isHonking and self.HornSound and self.HornSound ~= "" then
+                    if sounds.horn then
+                        sounds.horn:ChangeVolume(1)
+                    else
+                        local snd = self:CreateLoopingSound("horn", self.HornSound, 85, self)
+                        snd:PlayEx(1, 100)
+                    end
+                elseif sounds.horn then
+                    if sounds.horn:GetVolume() > 0 then
+                        sounds.horn:ChangeVolume(sounds.horn:GetVolume() - dt * 8)
+                    else
+                        sounds.horn:Stop()
+                        sounds.horn = nil
+                    end
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", base_shared_code),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            ("lua/entities/base_glide_car/shared.lua", car_shared_code),
+            (car_path, car_code),
+        ]);
+
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let start_tail_type = index_expr_type(&mut ws, file_id, "sounds.startTail");
+        let start_tail_display = ws.humanize_type_detailed(start_tail_type);
+        assert_that!(
+            start_tail_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "sounds.startTail should keep inferred sound patch type from dynamic map indexing"
+        );
+        assert_that!(
+            start_tail_display.contains("any"),
+            eq(false),
+            "sounds.startTail should not widen to any"
+        );
+        let sounds_type = local_name_type(&mut ws, file_id, "sounds");
+        let sounds_display = ws.humanize_type_detailed(sounds_type);
+        assert_that!(
+            sounds_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "sounds alias should keep inferred CSoundPatch map value type"
+        );
+        let preview_start_tail_type = local_name_type(&mut ws, file_id, "startTailPreview");
+        let preview_start_tail_display = ws.humanize_type_detailed(preview_start_tail_type);
+        assert_that!(
+            preview_start_tail_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "unguarded sounds.startTail access should use map value type"
+        );
+        assert_that!(
+            preview_start_tail_display.contains("any"),
+            eq(false),
+            "unguarded sounds.startTail access should not widen to any"
+        );
+
+        let guarded_start_tail_type = local_name_type(&mut ws, file_id, "guardedStartTail");
+        let guarded_start_tail_display = ws.humanize_type_detailed(guarded_start_tail_type);
+        assert_that!(
+            guarded_start_tail_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "guarded local alias should preserve concrete sound patch type"
+        );
+        assert_that!(
+            guarded_start_tail_display.contains("any"),
+            eq(false),
+            "guarded local alias should not widen to any"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_diagnostics = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_diagnostics,
+            is_empty(),
+            "guarded sounds.startTail call should not report unchecked-nil-access"
+        );
+    }
+
     #[test]
     fn test_guarded_dynamic_field_local_alias_matches_rhs_type() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

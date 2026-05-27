@@ -348,6 +348,16 @@ fn infer_table_member(
         );
     }
 
+    if let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
+        db,
+        &owner,
+        &key,
+        cache.get_file_id(),
+        index_expr.get_position(),
+    ) {
+        return Ok(member_type);
+    }
+
     if db.get_emmyrc().gmod.enabled
         && db.get_emmyrc().gmod.infer_dynamic_fields
         && is_literal_table_field_access(&index_key)
@@ -358,7 +368,8 @@ fn infer_table_member(
             &LuaType::TableConst(inst.clone()),
             &key,
             Some(index_expr.get_position()),
-        ) {
+        ) && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
+        {
             return Ok(dynamic_field.typ);
         }
 
@@ -382,7 +393,8 @@ fn infer_table_member(
                 &LuaType::TableConst(inst.clone()),
                 &key,
                 Some(index_expr.get_position()),
-            ) {
+            ) && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
+            {
                 return Ok(dynamic_field.typ);
             }
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
@@ -400,6 +412,79 @@ fn infer_table_member(
 
 fn is_literal_table_field_access(index_key: &LuaIndexKey) -> bool {
     matches!(index_key, LuaIndexKey::Name(_) | LuaIndexKey::String(_))
+}
+
+fn infer_cross_file_matching_expr_key_member_type(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    access_file_id: FileId,
+    access_position: TextSize,
+) -> Option<LuaType> {
+    if !db.get_emmyrc().gmod.enabled
+        || !db.get_emmyrc().gmod.infer_dynamic_fields
+        || !db.get_emmyrc().gmod.dynamic_fields_global
+    {
+        return None;
+    }
+
+    let Some(access_key_type) = crate::semantic::member::member_key_as_type(key) else {
+        return None;
+    };
+    let access_realm = db
+        .get_gmod_infer_index()
+        .get_realm_file_metadata(&access_file_id)
+        .map(|metadata| metadata.inferred_realm)
+        .unwrap_or(crate::GmodRealm::Unknown);
+
+    let allow_wildcard_expr_literal_match =
+        is_literal_member_key(key) && owner_has_named_dynamic_fields_and_wildcards(db, owner);
+    let members = db.get_member_index().get_members(owner)?;
+    let mut result = LuaType::Unknown;
+
+    for member in members {
+        if !member.get_key().is_expr()
+            || member.get_file_id() == access_file_id
+            || !is_dynamic_field_fallback_realm_compatible(
+                db,
+                access_realm,
+                member.get_file_id(),
+                member.get_id().get_position(),
+            )
+        {
+            continue;
+        }
+
+        let member_item = crate::db_index::LuaMemberIndexItem::One(member.get_id());
+        let Ok(member_type) =
+            member_item.resolve_type_with_realm_at_offset(db, &access_file_id, access_position)
+        else {
+            continue;
+        };
+
+        let key_match = if is_literal_member_key(key)
+            && member_key_is_unknown_expr(member.get_key())
+        {
+            is_precise_unknown_wildcard_value_type(&member_type)
+        } else if is_literal_member_key(key) && member_key_is_broad_wildcard_expr(member.get_key())
+        {
+            allow_wildcard_expr_literal_match
+                && is_precise_unknown_wildcard_value_type(&member_type)
+        } else {
+            member_key_matches_type(db, &access_key_type, member.get_key())
+        };
+        if !key_match {
+            continue;
+        }
+
+        result = TypeOps::Union.apply(db, &result, &member_type);
+    }
+
+    if result.is_unknown() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 fn table_has_cross_file_matching_expr_key_member(
@@ -436,6 +521,57 @@ fn table_has_cross_file_matching_expr_key_member(
                     && member_key_matches_type(db, &access_key_type, member.get_key())
             })
         })
+}
+
+fn is_literal_member_key(key: &LuaMemberKey) -> bool {
+    matches!(key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))
+}
+
+fn member_key_is_broad_wildcard_expr(key: &LuaMemberKey) -> bool {
+    matches!(key, LuaMemberKey::ExprType(typ) if is_broad_wildcard_key_type(typ))
+}
+
+fn member_key_is_unknown_expr(key: &LuaMemberKey) -> bool {
+    matches!(key, LuaMemberKey::ExprType(typ) if typ.is_unknown())
+}
+
+fn owner_has_named_dynamic_fields_and_wildcards(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
+    let dynamic_owner = match owner {
+        LuaMemberOwner::Type(type_id) => crate::DynamicFieldOwner::Type(type_id.clone()),
+        LuaMemberOwner::Element(range) => crate::DynamicFieldOwner::Table(range.clone()),
+        _ => return false,
+    };
+
+    let index = db.get_dynamic_field_index();
+    index
+        .get_fields(&dynamic_owner)
+        .is_some_and(|fields| !fields.is_empty())
+        && !index.get_wildcard_definitions(&dynamic_owner).is_empty()
+}
+
+fn is_precise_unknown_wildcard_value_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Instance(_) => true,
+        LuaType::TypeGuard(inner) => is_precise_unknown_wildcard_value_type(inner),
+        LuaType::TableOf(inner) => is_precise_unknown_wildcard_value_type(inner),
+        LuaType::Union(union) => {
+            let members = union.into_vec();
+            !members.is_empty() && members.iter().all(is_precise_unknown_wildcard_value_type)
+        }
+        _ => false,
+    }
+}
+
+fn is_broad_wildcard_key_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any | LuaType::String | LuaType::Number | LuaType::Integer => true,
+        LuaType::TypeGuard(inner) => is_broad_wildcard_key_type(inner),
+        LuaType::Union(union) => {
+            let members = union.into_vec();
+            !members.is_empty() && members.iter().all(is_broad_wildcard_key_type)
+        }
+        _ => false,
+    }
 }
 
 fn is_dynamic_field_fallback_realm_compatible(
