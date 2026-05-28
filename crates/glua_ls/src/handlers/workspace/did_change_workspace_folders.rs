@@ -34,7 +34,7 @@ pub async fn on_did_change_workspace_folders(
         removed_roots.len()
     );
 
-    let (client_id, supports_config_request) = {
+    let (client_id, supports_config_request, previous_client_config) = {
         let mut workspace_manager = context.workspace_manager().write().await;
 
         if !removed_roots.is_empty() {
@@ -56,10 +56,13 @@ pub async fn on_did_change_workspace_folders(
         (
             workspace_manager.client_config.client_id,
             context.lsp_features().supports_config_request(),
+            workspace_manager.client_config.clone(),
         )
     };
 
-    let client_config = get_client_config(&context, client_id, supports_config_request).await;
+    let client_config = get_client_config(&context, client_id, supports_config_request)
+        .await
+        .preserve_initialization_options_from(&previous_client_config);
 
     let mut workspace_manager = context.workspace_manager().write().await;
     workspace_manager.client_config = client_config;

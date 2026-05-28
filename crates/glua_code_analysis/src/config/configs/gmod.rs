@@ -48,6 +48,11 @@ pub struct EmmyrcGmod {
     pub scripted_class_scopes: EmmyrcGmodScriptedClassScopes,
     #[serde(default)]
     pub hook_mappings: EmmyrcGmodHookMappings,
+    /// Ordered plugin ids persisted by editor integrations.
+    /// The language server remains plugin-agnostic and consumes resolved config only.
+    #[serde(default)]
+    #[schemars(extend("x-gluals-editor" = "pluginList"))]
+    pub plugins: Vec<String>,
     #[serde(default)]
     pub network: EmmyrcGmodNetwork,
     #[serde(default)]
@@ -73,7 +78,7 @@ pub struct EmmyrcGmod {
     pub infer_dynamic_fields: bool,
     #[serde(default = "dynamic_fields_global_default")]
     pub dynamic_fields_global: bool,
-    /// Path to GMod annotations to load as core library.
+    /// Override path to GMod annotations directory. Set to empty to use VSCode downloaded annotations.
     /// When set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).
     /// Set to explicit path to override, or use `autoLoadAnnotations: false` in .gluarc to disable entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,12 +87,12 @@ pub struct EmmyrcGmod {
     /// This takes precedence over extension settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_load_annotations: Option<bool>,
-    /// Path to a folder containing custom GLua scaffolding templates (`.lua` files).
+    /// Path to custom GLua scaffolding templates folder.
     /// Built-in templates are used as fallback when a custom one is not found.
     /// Accepts an absolute path or a path relative to the workspace root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_path: Option<String>,
-    /// Automatically detect and add the base gamemode as a library when a gamemode
+    /// Automatically add base gamemodes as libraries when a gamemode
     /// derives from another (via the `"base"` field in the gamemode `.txt` file).
     /// Set to `false` to disable this detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -504,6 +509,7 @@ impl Default for EmmyrcGmod {
             default_realm: EmmyrcGmodRealm::default(),
             scripted_class_scopes: EmmyrcGmodScriptedClassScopes::default(),
             hook_mappings: EmmyrcGmodHookMappings::default(),
+            plugins: Vec::new(),
             network: EmmyrcGmodNetwork::default(),
             vgui: EmmyrcGmodVgui::default(),
             outline: EmmyrcGmodOutline::default(),

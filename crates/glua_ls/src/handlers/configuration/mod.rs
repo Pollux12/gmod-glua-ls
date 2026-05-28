@@ -12,17 +12,20 @@ pub async fn on_did_change_configuration(
     log::info!("on_did_change_configuration: {}", pretty_json);
 
     // Check initialization status and get client config
-    let (client_id, supports_config_request) = {
+    let (client_id, supports_config_request, previous_client_config) = {
         let workspace_manager = context.workspace_manager().read().await;
         let client_id = workspace_manager.client_config.client_id;
         let supports_config_request = context.lsp_features().supports_config_request();
-        (client_id, supports_config_request)
+        let previous_client_config = workspace_manager.client_config.clone();
+        (client_id, supports_config_request, previous_client_config)
     };
 
     log::info!("change config client_id: {:?}", client_id);
 
     // Get new config without holding any locks
-    let new_client_config = get_client_config(&context, client_id, supports_config_request).await;
+    let new_client_config = get_client_config(&context, client_id, supports_config_request)
+        .await
+        .preserve_initialization_options_from(&previous_client_config);
 
     // Update config and reload - acquire write lock only when necessary
     {

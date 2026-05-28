@@ -1452,14 +1452,14 @@
     "EmmyrcGmod": {
       "properties": {
         "annotationsPath": {
-          "description": "Path to GMod annotations to load as core library.\nWhen set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).\nSet to explicit path to override, or use `autoLoadAnnotations: false` in .gluarc to disable entirely.",
+          "description": "Override path to GMod annotations directory. Set to empty to use VSCode downloaded annotations.\nWhen set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).\nSet to explicit path to override, or use `autoLoadAnnotations: false` in .gluarc to disable entirely.",
           "type": [
             "string",
             "null"
           ]
         },
         "autoDetectGamemodeBase": {
-          "description": "Automatically detect and add the base gamemode as a library when a gamemode\nderives from another (via the `\"base\"` field in the gamemode `.txt` file).\nSet to `false` to disable this detection.",
+          "description": "Automatically add base gamemodes as libraries when a gamemode\nderives from another (via the `\"base\"` field in the gamemode `.txt` file).\nSet to `false` to disable this detection.",
           "type": [
             "boolean",
             "null"
@@ -1563,6 +1563,15 @@
           "default": {
             "verbosity": "normal"
           }
+        },
+        "plugins": {
+          "default": [],
+          "description": "Ordered plugin ids persisted by editor integrations.\nThe language server remains plugin-agnostic and consumes resolved config only.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-gluals-editor": "pluginList"
         },
         "scriptedClassScopes": {
           "$ref": "#/$defs/EmmyrcGmodScriptedClassScopes",
@@ -1698,7 +1707,7 @@
           }
         },
         "templatePath": {
-          "description": "Path to a folder containing custom GLua scaffolding templates (`.lua` files).\nBuilt-in templates are used as fallback when a custom one is not found.\nAccepts an absolute path or a path relative to the workspace root.",
+          "description": "Path to custom GLua scaffolding templates folder.\nBuilt-in templates are used as fallback when a custom one is not found.\nAccepts an absolute path or a path relative to the workspace root.",
           "type": [
             "string",
             "null"
@@ -2759,6 +2768,7 @@
         "outline": {
           "verbosity": "normal"
         },
+        "plugins": [],
         "scriptedClassScopes": {
           "include": [
             {

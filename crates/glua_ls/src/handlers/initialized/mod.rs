@@ -102,6 +102,26 @@ pub async fn initialized_handler(
                 }
             }
         }
+
+        if let Some(plugin_libraries) = init_options.get("gmodPluginLibraryPaths") {
+            if let Some(arr) = plugin_libraries.as_array() {
+                for lib in arr {
+                    if let Some(lib_str) = lib.as_str() {
+                        if !lib_str.is_empty() {
+                            client_config
+                                .gmod_plugin_library_paths
+                                .push(lib_str.to_string());
+                        }
+                    }
+                }
+                if !client_config.gmod_plugin_library_paths.is_empty() {
+                    log::info!(
+                        "Received plugin annotation libraries from VSCode: {:?}",
+                        client_config.gmod_plugin_library_paths
+                    );
+                }
+            }
+        }
     }
 
     // Apply CLI-provided annotations path (highest precedence after .gluarc.json)
