@@ -299,6 +299,7 @@ pub async fn init_analysis(
         Vec::new()
     };
 
+    file_diagnostic.invalidate_shared_diagnostic_data();
     drop(mut_analysis);
 
     status_bar.update_progress_task(
@@ -315,6 +316,7 @@ pub async fn init_analysis(
         let url_contents = fetch_schema_urls(schema_urls).await;
         let mut mut_analysis = analysis.write().await;
         mut_analysis.apply_fetched_schemas(url_contents);
+        file_diagnostic.invalidate_shared_diagnostic_data();
     }
 
     if !lsp_features.supports_workspace_diagnostic() {

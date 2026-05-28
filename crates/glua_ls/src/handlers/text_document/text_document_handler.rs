@@ -79,6 +79,11 @@ async fn apply_document_update_without_queuing(
             } else {
                 (analysis.update_file_text_only(uri, text), None)
             };
+            if file_id.is_some() {
+                context
+                    .file_diagnostic()
+                    .invalidate_shared_diagnostic_data();
+            }
             drop(analysis);
 
             if let Some(deferred_drop) = deferred_drop {
@@ -115,6 +120,9 @@ async fn check_schema_update(context: &ServerContextSnapshot) {
 
     let mut write_analysis = context.analysis().write().await;
     write_analysis.apply_fetched_schemas(url_contents);
+    context
+        .file_diagnostic()
+        .invalidate_shared_diagnostic_data();
 }
 
 async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<PreparsedDocument> {
@@ -484,7 +492,13 @@ pub async fn on_did_close_document(
                     if !context.is_document_closed(uri).await {
                         return Some(());
                     }
-                    analysis.update_file_by_uri(uri, Some(text))
+                    let file_id = analysis.update_file_by_uri(uri, Some(text));
+                    if file_id.is_some() {
+                        context
+                            .file_diagnostic()
+                            .invalidate_shared_diagnostic_data();
+                    }
+                    file_id
                 };
 
                 if !lsp_features.supports_pull_diagnostic()
@@ -512,6 +526,9 @@ pub async fn on_did_close_document(
                 return Some(());
             }
             mut_analysis.remove_file_by_uri(uri);
+            context
+                .file_diagnostic()
+                .invalidate_shared_diagnostic_data();
             drop(mut_analysis);
 
             if !lsp_features.supports_pull_diagnostic() {

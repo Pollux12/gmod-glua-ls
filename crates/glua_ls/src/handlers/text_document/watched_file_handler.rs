@@ -88,7 +88,13 @@ pub async fn on_did_change_watched_files(
             analysis.remove_file_by_uri(uri);
         }
 
-        analysis.update_files_by_uri(watched_lua_files)
+        let file_ids = analysis.update_files_by_uri(watched_lua_files);
+        if !file_ids.is_empty() || !deleted_lua_uris.is_empty() {
+            context
+                .file_diagnostic()
+                .invalidate_shared_diagnostic_data();
+        }
+        file_ids
     };
 
     // Schedule diagnostics and config reloads (no locks needed)
