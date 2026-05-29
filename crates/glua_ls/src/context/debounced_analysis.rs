@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use super::ClientProxy;
+use super::{ClientProxy, file_diagnostic::SharedDiagnosticDataCache};
 
 /// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
 pub struct DebouncedAnalysis {
@@ -21,17 +21,19 @@ pub struct DebouncedAnalysis {
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
+    shared_diagnostic_data_cache: SharedDiagnosticDataCache,
     debounce_duration: Duration,
     shutdown: CancellationToken,
     client: Arc<ClientProxy>,
 }
 
 impl DebouncedAnalysis {
-    pub fn new(
+    pub(crate) fn new(
         analysis: Arc<RwLock<EmmyLuaAnalysis>>,
         debounce_ms: u64,
         shutdown: CancellationToken,
         client: Arc<ClientProxy>,
+        shared_diagnostic_data_cache: SharedDiagnosticDataCache,
     ) -> Self {
         Self {
             pending_files: Mutex::new(HashSet::new()),
@@ -41,6 +43,7 @@ impl DebouncedAnalysis {
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
+            shared_diagnostic_data_cache,
             debounce_duration: Duration::from_millis(debounce_ms),
             shutdown,
             client,
@@ -142,6 +145,7 @@ impl DebouncedAnalysis {
         loop {
             if let Ok(mut analysis) = self.analysis.try_write() {
                 analysis.reindex_files(file_ids);
+                self.shared_diagnostic_data_cache.invalidate();
                 return true;
             }
 
@@ -251,5 +255,106 @@ impl DebouncedAnalysis {
             has_pending_file_work || has_in_flight_changes,
             Ordering::Release,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, file_path_to_uri};
+    use googletest::prelude::*;
+    use lsp_server::Connection;
+    use lsp_types::{Diagnostic, NumberOrString};
+    use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::context::{ClientProxy, FileDiagnostic, StatusBar};
+
+    use super::DebouncedAnalysis;
+
+    fn has_diagnostic_code(diagnostics: &[Diagnostic], code: DiagnosticCode) -> bool {
+        let code = Some(NumberOrString::String(code.get_name().to_string()));
+        diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+    }
+
+    #[gtest]
+    fn reindex_invalidates_cached_shared_diagnostic_data() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace =
+                std::env::temp_dir().join("gmod_glua_ls_debounced_shared_diagnostic_cache");
+            analysis.add_main_workspace(workspace.clone());
+            analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::DiscardReturns);
+
+            let api_uri = file_path_to_uri(&workspace.join("lua/autorun/shared/api.lua"))
+                .expect("API URI should parse");
+            analysis.update_file_by_uri(
+                &api_uri,
+                Some("function NeedsUse() return true end".to_string()),
+            );
+
+            let user_uri = file_path_to_uri(&workspace.join("lua/autorun/shared/user.lua"))
+                .expect("user URI should parse");
+            analysis.update_file_by_uri(&user_uri, Some("NeedsUse()".to_string()));
+
+            let (connection, _peer) = Connection::memory();
+            let client = Arc::new(ClientProxy::new(connection));
+            let status_bar = Arc::new(StatusBar::new(client.clone()));
+            let analysis = Arc::new(RwLock::new(analysis));
+            let file_diagnostic =
+                FileDiagnostic::new(analysis.clone(), status_bar.clone(), client.clone());
+
+            let initial_diagnostics = file_diagnostic
+                .pull_file_diagnostics(user_uri.clone(), CancellationToken::new())
+                .await
+                .unwrap_or_default();
+            verify_that!(
+                has_diagnostic_code(&initial_diagnostics, DiagnosticCode::DiscardReturns),
+                eq(false)
+            )?;
+
+            let api_file_id = {
+                let mut analysis = analysis.write().await;
+                analysis
+                    .update_file_text_only(
+                        &api_uri,
+                        r#"
+                            ---@nodiscard
+                            function NeedsUse() return true end
+                        "#
+                        .to_string(),
+                    )
+                    .expect("API file should still exist")
+            };
+
+            let debounced_analysis = DebouncedAnalysis::new(
+                analysis.clone(),
+                0,
+                CancellationToken::new(),
+                client,
+                file_diagnostic.shared_diagnostic_data_cache(),
+            );
+            verify_that!(
+                debounced_analysis
+                    .reindex_files_without_queuing(vec![api_file_id])
+                    .await,
+                eq(true)
+            )?;
+
+            let updated_diagnostics = file_diagnostic
+                .pull_file_diagnostics(user_uri, CancellationToken::new())
+                .await
+                .unwrap_or_default();
+            verify_that!(
+                has_diagnostic_code(&updated_diagnostics, DiagnosticCode::DiscardReturns),
+                eq(true)
+            )?;
+
+            Ok(())
+        })
     }
 }

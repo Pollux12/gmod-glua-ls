@@ -22,6 +22,58 @@ struct SuppressedDiagnosticLines {
     expires_at: Instant,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct SharedDiagnosticDataCache {
+    cached: Arc<StdMutex<Option<Arc<SharedDiagnosticData>>>>,
+}
+
+impl SharedDiagnosticDataCache {
+    fn get_or_precompute(&self, analysis: &EmmyLuaAnalysis) -> Arc<SharedDiagnosticData> {
+        if let Ok(mut cache) = self.cached.lock() {
+            if let Some(cached) = cache.as_ref() {
+                return cached.clone();
+            }
+
+            let shared_data = analysis.precompute_diagnostic_shared_data();
+            *cache = Some(shared_data.clone());
+            return shared_data;
+        }
+
+        analysis.precompute_diagnostic_shared_data()
+    }
+
+    fn force_precompute(&self, analysis: &EmmyLuaAnalysis) -> Arc<SharedDiagnosticData> {
+        let shared_data = analysis.precompute_diagnostic_shared_data();
+        if let Ok(mut cache) = self.cached.lock() {
+            *cache = Some(shared_data.clone());
+        }
+        shared_data
+    }
+
+    pub(crate) fn invalidate(&self) {
+        if let Ok(mut cache) = self.cached.lock() {
+            *cache = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_ptr(&self) -> Option<*const SharedDiagnosticData> {
+        self.cached
+            .lock()
+            .expect("shared diagnostic cache mutex should not be poisoned")
+            .as_ref()
+            .map(Arc::as_ptr)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.cached
+            .lock()
+            .expect("shared diagnostic cache mutex should not be poisoned")
+            .is_none()
+    }
+}
+
 #[derive(Clone)]
 pub struct FileDiagnostic {
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -32,7 +84,7 @@ pub struct FileDiagnostic {
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
     cached_file_diagnostics: Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>,
     recently_edited_lines: Arc<Mutex<HashMap<Uri, SuppressedDiagnosticLines>>>,
-    cached_shared_diagnostic_data: Arc<StdMutex<Option<Arc<SharedDiagnosticData>>>>,
+    shared_diagnostic_data_cache: SharedDiagnosticDataCache,
 }
 
 impl FileDiagnostic {
@@ -49,37 +101,28 @@ impl FileDiagnostic {
             workspace_diagnostic_token: Arc::new(Mutex::new(None)),
             cached_file_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             recently_edited_lines: Arc::new(Mutex::new(HashMap::new())),
-            cached_shared_diagnostic_data: Arc::new(StdMutex::new(None)),
+            shared_diagnostic_data_cache: SharedDiagnosticDataCache::default(),
             status_bar,
         }
+    }
+
+    pub(crate) fn shared_diagnostic_data_cache(&self) -> SharedDiagnosticDataCache {
+        self.shared_diagnostic_data_cache.clone()
     }
 
     fn get_or_precompute_shared_diagnostic_data(
         &self,
         analysis: &EmmyLuaAnalysis,
     ) -> Arc<SharedDiagnosticData> {
-        if let Ok(mut cache) = self.cached_shared_diagnostic_data.lock() {
-            if let Some(cached) = cache.as_ref() {
-                return cached.clone();
-            }
-
-            let shared_data = analysis.precompute_diagnostic_shared_data();
-            *cache = Some(shared_data.clone());
-            return shared_data;
-        }
-
-        analysis.precompute_diagnostic_shared_data()
+        self.shared_diagnostic_data_cache
+            .get_or_precompute(analysis)
     }
 
     fn force_precompute_shared_diagnostic_data(
         &self,
         analysis: &EmmyLuaAnalysis,
     ) -> Arc<SharedDiagnosticData> {
-        let shared_data = analysis.precompute_diagnostic_shared_data();
-        if let Ok(mut cache) = self.cached_shared_diagnostic_data.lock() {
-            *cache = Some(shared_data.clone());
-        }
-        shared_data
+        self.shared_diagnostic_data_cache.force_precompute(analysis)
     }
 
     fn diagnose_file_with_shared_data(
@@ -101,9 +144,7 @@ impl FileDiagnostic {
     }
 
     pub fn invalidate_shared_diagnostic_data(&self) {
-        if let Ok(mut cache) = self.cached_shared_diagnostic_data.lock() {
-            *cache = None;
-        }
+        self.shared_diagnostic_data_cache.invalidate();
     }
 
     pub async fn note_recent_edit(
@@ -942,12 +983,7 @@ mod tests {
             eq(true)
         )?;
 
-        let first_cached = file_diagnostic
-            .cached_shared_diagnostic_data
-            .lock()
-            .expect("shared diagnostic cache mutex should not be poisoned")
-            .as_ref()
-            .map(Arc::as_ptr);
+        let first_cached = file_diagnostic.shared_diagnostic_data_cache.cached_ptr();
         {
             let guard = analysis.blocking_read();
             let _ = file_diagnostic.diagnose_file_with_shared_data(
@@ -956,21 +992,12 @@ mod tests {
                 CancellationToken::new(),
             );
         }
-        let second_cached = file_diagnostic
-            .cached_shared_diagnostic_data
-            .lock()
-            .expect("shared diagnostic cache mutex should not be poisoned")
-            .as_ref()
-            .map(Arc::as_ptr);
+        let second_cached = file_diagnostic.shared_diagnostic_data_cache.cached_ptr();
         verify_that!(second_cached, eq(first_cached))?;
 
         file_diagnostic.invalidate_shared_diagnostic_data();
         verify_that!(
-            file_diagnostic
-                .cached_shared_diagnostic_data
-                .lock()
-                .expect("shared diagnostic cache mutex should not be poisoned")
-                .is_none(),
+            file_diagnostic.shared_diagnostic_data_cache.is_empty(),
             eq(true)
         )?;
 
