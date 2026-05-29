@@ -1003,7 +1003,7 @@ fn infer_custom_type_member(
     Err(InferFailReason::FieldNotFound)
 }
 
-fn resolve_decl_backed_global_path_member_type(
+pub(crate) fn resolve_decl_backed_global_path_member_type(
     db: &DbIndex,
     member_item: &crate::db_index::LuaMemberIndexItem,
     caller_file_id: &crate::FileId,

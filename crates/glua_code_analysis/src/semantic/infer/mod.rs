@@ -23,6 +23,7 @@ pub use infer_fail_reason::InferFailReason;
 pub(crate) use infer_index::check_iter_var_range;
 pub use infer_index::infer_index_expr;
 pub(crate) use infer_index::infer_member_by_member_key;
+pub(crate) use infer_index::resolve_decl_backed_global_path_member_type;
 use infer_name::infer_name_expr;
 pub(crate) use infer_name::resolve_scoped_scripted_global_type_decl_id;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;

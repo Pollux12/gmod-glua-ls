@@ -238,6 +238,110 @@ mod test {
     }
 
     #[test]
+    fn test_gamemode_bootstrap_global_table_members_merge_across_files() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let sh_util = r#"
+                --- Various useful helper functions.
+                -- @module ix.util
+
+                ix.type = ix.type or {
+                    [2] = "string",
+                    string = 2,
+                }
+
+                ix.blurRenderQueue = {}
+
+                function ix.util.Include(fileName, realm)
+                end
+
+                ix.util.Include("core/meta/sh_entity.lua")
+            "#;
+        let init = r#"
+                ix = ix or { util = {}, meta = {} }
+                include("core/sh_util.lua")
+                include("shared.lua")
+            "#;
+        let cl_init = r#"
+                ix = ix or { util = {}, gui = {}, meta = {} }
+                include("core/sh_util.lua")
+                include("shared.lua")
+            "#;
+        let shared_source = r#"
+                ix.util.Include("core/cl_skin.lua")
+            "#;
+
+        ws.def_files(vec![
+            ("gamemodes/helix/gamemode/core/sh_util.lua", sh_util),
+            ("gamemodes/helix/gamemode/init.lua", init),
+            ("gamemodes/helix/gamemode/cl_init.lua", cl_init),
+            ("gamemodes/helix/gamemode/shared.lua", shared_source),
+        ]);
+        let shared = ws.def_file("gamemodes/helix/gamemode/shared.lua", shared_source);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(shared, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field),
+            "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_global_path_table_member_fallback_respects_local_shadow() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "global_util.lua",
+            r#"
+                ix = ix or { util = {} }
+                function ix.util.Include(fileName)
+                end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "shadow.lua",
+            r#"
+                local ix = { util = {} }
+                ix.util.Include("missing.lua")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_field
+                    && diagnostic.message == "Undefined field `Include`. "),
+            "expected UndefinedField for local shadow, got {diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn test() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
