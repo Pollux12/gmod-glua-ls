@@ -1242,8 +1242,9 @@ mod test {
 
     #[gtest]
     fn test_isfunction_narrows_nil_from_nullable_type() {
-        // Bug repro: isfunction(func) should narrow away nil in the true branch
+        // Bug repro: annotated isfunction(func) should narrow away nil in the true branch
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -1315,6 +1316,7 @@ mod test {
         // Regression: `local isfunction = isfunction` is common in GMod addons for performance.
         // The cached local must still narrow away nil.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -1330,8 +1332,9 @@ mod test {
 
     #[gtest]
     fn test_isstring_narrows_nil_from_nullable_type() {
-        // Regression: `isstring(x)` should narrow nil from `string?` via try_narrow_istype_function.
+        // Regression: `isstring(x)` should narrow nil from `string?` via TypeGuard annotations.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -2044,6 +2047,109 @@ mod test {
                 "lua/glide/client/engine_stream_need_check.lua",
                 engine_stream_source,
             ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_istable_short_circuit_guards_indexed_table_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<table>
+            function istable(value) end
+            "#,
+        );
+        let code = r#"
+            local MODES = {
+                {
+                    function(client)
+                        return false
+                    end,
+                    "Off."
+                }
+            }
+
+            ---@return integer
+            local function getMode() end
+
+            local mode = getMode() or 1
+            local client
+
+            return istable(MODES[mode]) and MODES[mode][1](client)
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "MODES[mode] may be nil"),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_shadowed_istable_short_circuit_does_not_guard_indexed_table_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<table>
+            function istable(value) end
+            "#,
+        );
+        let code = r#"
+            local MODES
+            ---@return integer
+            local function getMode() end
+
+            local mode = getMode() or 1
+            local client
+            local istable = function()
+                return true
+            end
+
+            return istable(MODES[mode]) and MODES[mode][1](client)
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "MODES may be nil"),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_nullable_type_guard_does_not_suppress_receiver_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Widget
+            ---@field Run fun(self: Widget)
+
+            ---@param value any
+            ---@return TypeGuard<Widget?>
+            function maybe_widget(value) end
+            "#,
+        );
+        let code = r#"
+            ---@type any
+            local widget
+
+            return maybe_widget(widget) and widget:Run()
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "widget may be nil"),
             eq(true)
         );
     }

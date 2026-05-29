@@ -2287,6 +2287,7 @@ _2 = a[1]
     #[test]
     fn test_isfunction_simple_var_narrows_nil() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
 
         ws.def(
             r#"
@@ -2385,6 +2386,7 @@ _2 = a[1]
     #[test]
     fn test_local_cached_isfunction_narrows_nil() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
 
         ws.def(
             r#"
@@ -2405,6 +2407,7 @@ _2 = a[1]
     #[test]
     fn test_isstring_simple_var_narrows_nil() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
 
         ws.def(
             r#"
@@ -2958,6 +2961,7 @@ _2 = a[1]
     fn test_istable_narrows_uninitialized_local() {
         // After istable(testTbl), testTbl should be non-nil (indexable without need-check-nil)
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
         let result = ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -3419,6 +3423,7 @@ _2 = a[1]
     fn test_isstring_guard_narrows() {
         // isstring(x) should narrow to remove nil
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -3435,6 +3440,7 @@ _2 = a[1]
     fn test_isnumber_guard_narrows() {
         // isnumber(x) should narrow to remove nil
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -3454,6 +3460,7 @@ _2 = a[1]
     fn test_isbool_guard_narrows() {
         // isbool(x) should narrow to remove nil
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -3567,6 +3574,7 @@ _2 = a[1]
     fn test_isfunction_then_call_no_diagnostic() {
         // Common GMod pattern: guard with isfunction before calling
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -3587,6 +3595,7 @@ _2 = a[1]
     fn test_istable_then_access_no_diagnostic() {
         // Common pattern: guard with istable before accessing
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -3671,6 +3680,7 @@ _2 = a[1]
     #[gtest]
     fn test_renamed_isfunction_alias_still_narrows() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -4606,6 +4616,7 @@ _2 = a[1]
     #[test]
     fn test_unknown_local_istable_guard_is_scoped() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         set_gmod_enabled(&mut ws);
 
         let file_id = ws.def_file(

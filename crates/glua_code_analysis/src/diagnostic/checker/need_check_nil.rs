@@ -76,6 +76,15 @@ fn check_call_expr(
 ) -> Option<()> {
     let prefix = call_expr.get_prefix_expr()?;
 
+    let is_receiver_guarded_by_type_guard = if let LuaExpr::IndexExpr(index_expr) = &prefix
+        && let Some(receiver) = index_expr.get_prefix_expr()
+        && is_short_circuit_type_guard_for_receiver(semantic_model, &call_expr, &receiver)
+    {
+        true
+    } else {
+        false
+    };
+
     if let LuaExpr::IndexExpr(index_expr) = &prefix
         && let Some(receiver) = index_expr.get_prefix_expr()
         && is_short_circuit_isvalid_guard_for_receiver(&call_expr, &receiver)
@@ -85,7 +94,9 @@ fn check_call_expr(
 
     if let LuaExpr::IndexExpr(index_expr) = &prefix {
         let receiver = index_expr.get_prefix_expr()?;
-        if report_unsafe_receiver(context, semantic_model, &receiver) {
+        if !is_receiver_guarded_by_type_guard
+            && report_unsafe_receiver(context, semantic_model, &receiver)
+        {
             return Some(());
         }
     }
@@ -541,26 +552,75 @@ fn is_short_circuit_isvalid_guard_for_receiver(
     call_expr: &LuaCallExpr,
     receiver: &LuaExpr,
 ) -> bool {
-    let Some(binary_expr) = call_expr.get_parent::<LuaBinaryExpr>() else {
+    let Some(guard_call) = short_circuit_left_call_for_right_call(call_expr) else {
         return false;
+    };
+
+    is_isvalid_call_guarding_expr(&guard_call, receiver)
+}
+
+fn is_short_circuit_type_guard_for_receiver(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    receiver: &LuaExpr,
+) -> bool {
+    let Some(guard_call) = short_circuit_left_call_for_right_call(call_expr) else {
+        return false;
+    };
+
+    is_type_guard_call_guarding_expr(semantic_model, &guard_call, receiver)
+}
+
+fn short_circuit_left_call_for_right_call(call_expr: &LuaCallExpr) -> Option<LuaCallExpr> {
+    let Some(binary_expr) = call_expr.get_parent::<LuaBinaryExpr>() else {
+        return None;
     };
 
     let Some(op) = binary_expr.get_op_token().map(|token| token.get_op()) else {
-        return false;
+        return None;
     };
     if op != BinaryOperator::OpAnd {
-        return false;
+        return None;
     }
 
     let Some((left, right)) = binary_expr.get_exprs() else {
-        return false;
+        return None;
     };
     if right.syntax() != call_expr.syntax() {
-        return false;
+        return None;
     }
 
     match left {
-        LuaExpr::CallExpr(guard_call) => is_isvalid_call_guarding_expr(&guard_call, receiver),
+        LuaExpr::CallExpr(guard_call) => Some(guard_call),
+        _ => None,
+    }
+}
+
+fn is_type_guard_call_guarding_expr(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+    receiver: &LuaExpr,
+) -> bool {
+    if !call_returns_non_nullable_type_guard(semantic_model, guard_call) {
+        return false;
+    };
+
+    let Some(first_arg) = guard_call
+        .get_args_list()
+        .and_then(|args| args.get_args().next())
+    else {
+        return false;
+    };
+
+    exprs_reference_same_var(semantic_model, &first_arg, receiver)
+}
+
+fn call_returns_non_nullable_type_guard(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+) -> bool {
+    match semantic_model.infer_expr(LuaExpr::CallExpr(guard_call.clone())) {
+        Ok(LuaType::TypeGuard(inner)) => !inner.is_nullable(),
         _ => false,
     }
 }

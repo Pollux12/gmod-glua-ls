@@ -258,6 +258,7 @@ mod test {
     #[test]
     fn test_isstring_guard_narrows_undefined_global_expr_to_string() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         let ty = infer_last_name_expr_type(
             &mut ws,
             r#"
@@ -274,6 +275,7 @@ mod test {
     #[test]
     fn test_istable_guard_preserves_annotated_specific_table_type() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         ws.def(
             r#"
             ---@class MyData
@@ -300,6 +302,7 @@ mod test {
     #[test]
     fn test_isstring_guard_preserves_annotated_string_subtype() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         ws.def(
             r#"
             ---@class UserId: string
@@ -325,6 +328,7 @@ mod test {
     #[test]
     fn test_istable_guard_does_not_broaden_incompatible_known_type() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
 
         let ty = infer_last_name_expr_type(
             &mut ws,
