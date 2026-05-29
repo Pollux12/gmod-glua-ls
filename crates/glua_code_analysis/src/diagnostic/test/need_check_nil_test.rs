@@ -441,6 +441,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_type_predicates();
         ws.def(
             r#"
             ---@class Entity
@@ -571,6 +572,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_type_predicates();
         ws.def(
             r#"
             ---@class Entity

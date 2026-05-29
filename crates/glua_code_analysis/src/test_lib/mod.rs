@@ -156,6 +156,42 @@ impl VirtualWorkspace {
             ---@param value any
             ---@return TypeGuard<table>
             function istable(value) end
+
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            function isentity(value) end
+
+            ---@class Vector
+
+            ---@param value any
+            ---@return TypeGuard<Vector>
+            function isvector(value) end
+
+            ---@class Angle
+
+            ---@param value any
+            ---@return TypeGuard<Angle>
+            function isangle(value) end
+
+            ---@class VMatrix
+
+            ---@param value any
+            ---@return TypeGuard<VMatrix>
+            function ismatrix(value) end
+
+            ---@class Panel
+
+            ---@param value any
+            ---@return TypeGuard<Panel>
+            function ispanel(value) end
+
+            ---@class Color
+
+            ---@param value any
+            ---@return TypeGuard<Color>
+            function IsColor(value) end
             "#,
         )
     }
