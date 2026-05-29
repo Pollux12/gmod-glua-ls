@@ -556,23 +556,36 @@ fn apply_index_expr_member_owner(
             LuaMemberFeature::FileDefine
         };
         let member = LuaMember::new(member_id, member_key, decl_feature, None);
-        analyzer
+        let function_scope = analyzer
             .db
-            .get_member_index_mut()
-            .add_member(member_owner, member);
+            .get_member_index()
+            .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
+        let member_index = analyzer.db.get_member_index_mut();
+        member_index.add_member(member_owner, member);
+        member_index.set_member_function_scope_range(member_id, function_scope);
         return Some(());
     }
 
     if set_owner_only {
-        analyzer.db.get_member_index_mut().set_member_owner(
-            member_owner,
-            member_id.file_id,
-            member_id,
-        );
+        let function_scope = analyzer
+            .db
+            .get_member_index()
+            .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
+        let member_index = analyzer.db.get_member_index_mut();
+        member_index.set_member_owner(member_owner, member_id.file_id, member_id);
+        member_index.set_member_function_scope_range(member_id, function_scope);
         return Some(());
     }
 
+    let function_scope = analyzer
+        .db
+        .get_member_index()
+        .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
     add_member(analyzer.db, member_owner, member_id);
+    analyzer
+        .db
+        .get_member_index_mut()
+        .set_member_function_scope_range(member_id, function_scope);
 
     Some(())
 }
@@ -1070,7 +1083,11 @@ fn assign_merge_type_owner_and_expr_type(
     if let LuaTypeOwner::Member(member_id) = type_owner
         && is_assignment_file_define_member(analyzer.db, member_id)
         && !is_member_assignment_in_conditional_branch(analyzer, member_id)
-        && !is_member_assignment_in_function_scope(analyzer, member_id)
+        && analyzer
+            .db
+            .get_member_index()
+            .member_function_scope_range(member_id)
+            .is_none()
     {
         analyzer
             .db
@@ -1079,29 +1096,6 @@ fn assign_merge_type_owner_and_expr_type(
     }
 
     Some(())
-}
-
-fn is_member_assignment_in_function_scope(analyzer: &LuaAnalyzer, member_id: LuaMemberId) -> bool {
-    let Some(tree) = analyzer.db.get_vfs().get_syntax_tree(&member_id.file_id) else {
-        return false;
-    };
-    let root = tree.get_red_root();
-    let Some(member) = analyzer.db.get_member_index().get_member(&member_id) else {
-        return false;
-    };
-    let Some(token) = root
-        .token_at_offset(member.get_range().start())
-        .right_biased()
-    else {
-        return false;
-    };
-
-    token.parent_ancestors().any(|ancestor| {
-        matches!(
-            ancestor.kind().into(),
-            LuaSyntaxKind::FuncStat | LuaSyntaxKind::LocalFuncStat | LuaSyntaxKind::ClosureExpr
-        )
-    })
 }
 
 /// Returns true when the assignment that introduced this member sits inside a

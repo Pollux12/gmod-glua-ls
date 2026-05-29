@@ -108,10 +108,20 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
             } else {
                 analyzer.create_scope(stat.get_range(), LuaScopeKind::FuncStat);
             }
+            let file_id = analyzer.get_file_id();
+            analyzer
+                .db
+                .get_member_index_mut()
+                .add_function_scope_range(file_id, stat.get_range());
             stats::analyze_func_stat(analyzer, stat);
         }
         LuaAst::LuaLocalFuncStat(stat) => {
             analyzer.create_scope(stat.get_range(), LuaScopeKind::FuncStat);
+            let file_id = analyzer.get_file_id();
+            analyzer
+                .db
+                .get_member_index_mut()
+                .add_function_scope_range(file_id, stat.get_range());
             stats::analyze_local_func_stat(analyzer, stat);
         }
         LuaAst::LuaRepeatStat(stat) => {
@@ -125,6 +135,11 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
         }
         LuaAst::LuaClosureExpr(expr) => {
             analyzer.create_scope(expr.get_range(), LuaScopeKind::Normal);
+            let file_id = analyzer.get_file_id();
+            analyzer
+                .db
+                .get_member_index_mut()
+                .add_function_scope_range(file_id, expr.get_range());
             exprs::analyze_closure_expr(analyzer, expr);
         }
         LuaAst::LuaTableExpr(expr) => {
