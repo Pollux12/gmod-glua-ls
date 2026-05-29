@@ -3212,6 +3212,123 @@ mod test {
         ));
     }
 
+    #[test]
+    fn test_any_unknown_union_to_table_param_does_not_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param t table
+            local function takes_table(t) end
+
+            ---@type any|unknown
+            local value
+            takes_table(value)
+        "#,
+        ));
+    }
+
+    #[test]
+    fn test_nullable_any_unknown_union_to_table_param_does_not_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param t table
+            local function takes_table(t) end
+
+            ---@type any|unknown|nil
+            local value
+            takes_table(value)
+        "#,
+        ));
+    }
+
+    #[test]
+    fn test_inferred_any_unknown_union_to_table_param_does_not_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param t table
+            local function takes_table(t) end
+
+            local stored = {}
+
+            local function get_value(key, default)
+                local config = stored[key]
+
+                if config then
+                    if config.value ~= nil then
+                        return config.value
+                    elseif config.default ~= nil then
+                        return config.default
+                    end
+                end
+
+                return default
+            end
+
+            takes_table(get_value("color"))
+        "#,
+        ));
+    }
+
+    #[test]
+    fn test_method_table_param_accepts_inferred_any_unknown_union() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Panel
+            ---@field DrawTextEntryText fun(self: Panel, text_color: table, highlight_color: table, cursor_color: table)
+
+            ---@type Panel
+            local panel
+
+            local color_white = {}
+            local stored = {}
+
+            local ix = { config = {} }
+            function ix.config.Get(key, default)
+                local config = stored[key]
+
+                if config and config.type then
+                    if config.value ~= nil then
+                        return config.value
+                    elseif config.default ~= nil then
+                        return config.default
+                    end
+                end
+
+                return default
+            end
+
+            panel:DrawTextEntryText(color_white, ix.config.Get("color"), color_white)
+        "#,
+        ));
+    }
+
+    #[test]
+    fn test_nullable_any_to_table_param_does_not_report_type_mismatch_in_strict_nil_mode() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.strict.allow_nullable_as_non_nullable = false;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param t table
+            local function takes_table(t) end
+
+            ---@type any|nil
+            local value
+            takes_table(value)
+        "#,
+        ));
+    }
+
     /// In GMod, Entity is used as a generic stand-in for many things (network vars,
     /// etc.), so passing Entity where a more specific subtype is expected should not
     /// produce false-positive param-type-mismatch diagnostics.
