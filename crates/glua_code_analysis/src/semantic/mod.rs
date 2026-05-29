@@ -65,6 +65,7 @@ pub use infer::VarRefId;
 pub use infer::infer_call_expr_func;
 pub(crate) use infer::infer_expr;
 pub use infer::infer_param;
+pub(crate) use infer::remove_false_or_nil;
 pub(crate) use infer::{contains_gmod_null_type, get_var_expr_var_ref_id};
 use overload_resolve::resolve_signature;
 pub use semantic_info::SemanticDeclLevel;
