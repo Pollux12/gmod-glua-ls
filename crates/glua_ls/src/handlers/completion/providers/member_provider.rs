@@ -89,11 +89,12 @@ fn extend_gmod_hook_fallback_members(
         return;
     };
 
-    let owner_candidates = gmod_hook_owner_candidates(owner_name.as_str());
-    if owner_candidates.is_empty() {
+    if !gmod_has_hook_owner_candidates(builder.semantic_model.get_db(), owner_name.as_str()) {
         return;
     }
 
+    let owner_candidates =
+        gmod_hook_owner_candidates(builder.semantic_model.get_db(), owner_name.as_str());
     let mut existing: HashMap<LuaMemberKey, HashSet<Option<LuaSemanticDeclId>>> = HashMap::new();
     for (key, infos) in members.iter() {
         let entry = existing.entry(key.clone()).or_default();
@@ -103,7 +104,7 @@ fn extend_gmod_hook_fallback_members(
     }
 
     for owner_candidate in owner_candidates {
-        let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_candidate));
+        let owner_type = LuaType::Ref(LuaTypeDeclId::global(&owner_candidate));
         let Some(fallback_map) = builder
             .semantic_model
             .get_member_info_map_at_offset(&owner_type, builder.position_offset)
@@ -123,16 +124,76 @@ fn extend_gmod_hook_fallback_members(
     }
 }
 
-fn gmod_hook_owner_candidates(owner_name: &str) -> &'static [&'static str] {
-    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
-        &["GM", "GAMEMODE", "SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
-        &["PLUGIN", "GM", "GAMEMODE", "SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
-        &["SANDBOX", "GM", "GAMEMODE"]
-    } else {
-        &[]
+fn gmod_hook_owner_candidates(db: &DbIndex, owner_name: &str) -> Vec<String> {
+    if let Some(configured) = db
+        .get_emmyrc()
+        .gmod
+        .scripted_owners
+        .hook_owner_candidates_configured(owner_name)
+    {
+        return configured;
     }
+
+    for definition in db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions()
+    {
+        if definition.hook_owner
+            && (definition.class_global.eq_ignore_ascii_case(owner_name)
+                || definition
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(owner_name)))
+        {
+            let mut candidates = vec![definition.class_global];
+            candidates.extend(definition.aliases);
+            candidates.extend(definition.super_types);
+            return candidates;
+        }
+    }
+
+    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
+        vec![
+            "GM".to_string(),
+            "GAMEMODE".to_string(),
+            "SANDBOX".to_string(),
+        ]
+    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
+        vec![
+            "SANDBOX".to_string(),
+            "GM".to_string(),
+            "GAMEMODE".to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn gmod_has_hook_owner_candidates(db: &DbIndex, owner_name: &str) -> bool {
+    db.get_emmyrc()
+        .gmod
+        .scripted_owners
+        .hook_owner_candidates_configured(owner_name)
+        .is_some()
+        || db
+            .get_emmyrc()
+            .gmod
+            .scripted_class_scopes
+            .resolved_definitions()
+            .into_iter()
+            .any(|definition| {
+                definition.hook_owner
+                    && (definition.class_global.eq_ignore_ascii_case(owner_name)
+                        || definition
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(owner_name)))
+            })
+        || owner_name.eq_ignore_ascii_case("GM")
+        || owner_name.eq_ignore_ascii_case("GAMEMODE")
+        || owner_name.eq_ignore_ascii_case("SANDBOX")
 }
 
 pub fn add_completions_for_members(
@@ -383,10 +444,7 @@ fn is_gmod_hook_member_info(db: &DbIndex, info: &LuaMemberInfo) -> bool {
     };
 
     let owner_name = owner_type_id.get_simple_name();
-    owner_name.eq_ignore_ascii_case("GM")
-        || owner_name.eq_ignore_ascii_case("GAMEMODE")
-        || owner_name.eq_ignore_ascii_case("SANDBOX")
-        || owner_name.eq_ignore_ascii_case("PLUGIN")
+    gmod_has_hook_owner_candidates(db, owner_name)
 }
 
 fn is_member_realm_compatible(builder: &CompletionBuilder, info: &LuaMemberInfo) -> bool {

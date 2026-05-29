@@ -347,12 +347,42 @@ impl AnalyzeContext {
         let scripted_scope_infos = scoped_matches
             .into_iter()
             .map(|(file_id, scope_match)| {
+                let aliases = scopes.aliases_for_global(&scope_match.definition.class_global);
+                let extra_scope_matches = db
+                    .get_vfs()
+                    .get_file_path(&file_id)
+                    .map(|path| {
+                        scopes
+                            .detect_all_scoped_class_matches_for_path(path)
+                            .into_iter()
+                            .filter(|extra_match| {
+                                !extra_match
+                                    .definition
+                                    .class_global
+                                    .eq_ignore_ascii_case(&scope_match.definition.class_global)
+                            })
+                            .map(|extra_match| {
+                                (
+                                    extra_match.class_name,
+                                    extra_match.definition.class_global,
+                                    extra_match.definition.class_name_prefix,
+                                    extra_match.definition.is_global_singleton,
+                                    extra_match.definition.hook_owner,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 (
                     file_id,
                     GmodScopedClassInfo {
                         class_name: scope_match.class_name,
                         global_name: scope_match.definition.class_global,
                         class_name_prefix: scope_match.definition.class_name_prefix,
+                        aliases,
+                        is_global_singleton: scope_match.definition.is_global_singleton,
+                        hook_owner: scope_match.definition.hook_owner,
+                        extra_scope_matches,
                     },
                 )
             })

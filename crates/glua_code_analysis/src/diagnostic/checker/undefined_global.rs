@@ -698,13 +698,37 @@ fn check_name_expr(
         return Some(());
     }
 
-    if db.get_emmyrc().gmod.enabled
-        && db
+    if db.get_emmyrc().gmod.enabled {
+        if let Some(info) = db
             .get_gmod_infer_index()
             .get_scoped_class_info(&semantic_model.get_file_id())
-            .is_some_and(|info| info.global_name == name_text.as_str())
-    {
-        return Some(());
+            && (info.global_name == name_text.as_str()
+                || info.aliases.iter().any(|alias| alias == name_text.as_str())
+                || info
+                    .extra_scope_matches
+                    .iter()
+                    .any(|(_, global_name, _, _, _)| global_name == name_text.as_str()))
+        {
+            return Some(());
+        }
+
+        if db
+            .get_emmyrc()
+            .gmod
+            .scripted_class_scopes
+            .resolved_definitions()
+            .into_iter()
+            .any(|definition| {
+                definition.is_global_singleton
+                    && (definition.class_global == name_text.as_str()
+                        || definition
+                            .aliases
+                            .iter()
+                            .any(|alias| alias == name_text.as_str()))
+            })
+        {
+            return Some(());
+        }
     }
 
     if name_text == "BaseClass"

@@ -1057,6 +1057,56 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_plugin_hook_method_uses_sandbox_docs_from_configured_super_types() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "library/lua/includes/extensions/sandbox_hooks.lua",
+            r#"
+                ---@class SANDBOX
+                ---@type SANDBOX
+                SANDBOX = SANDBOX or {}
+
+                ---Sandbox-only plugin fallback docs.
+                ---@param ply Player
+                function SANDBOX:PluginSandboxFallback(ply)
+                end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                function PLUGIN:PluginSandboxFall<??>back(ply)
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("plugins/weather/sh_plugin.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("Sandbox-only plugin fallback docs"),
+            "expected PLUGIN hover to include SANDBOX fallback docs, got: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("PluginSandboxFallback"),
+            "expected PLUGIN hover to include fallback signature, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_hook_add_string_uses_registered_hook_docs() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

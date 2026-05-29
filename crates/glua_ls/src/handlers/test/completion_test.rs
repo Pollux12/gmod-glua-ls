@@ -3607,6 +3607,12 @@ mod tests {
 
             function GM:ZzzPluginHook(player, entity) end
 
+            ---@class SANDBOX
+            ---@type SANDBOX
+            SANDBOX = SANDBOX or {}
+
+            function SANDBOX:ZzzSandboxHook(ply, class) end
+
             local PLUGIN = {}
             function PLUGIN:<??>()
             end
@@ -3629,7 +3635,7 @@ mod tests {
         };
 
         let item = items
-            .into_iter()
+            .iter()
             .find(|it| it.label == "ZzzPluginHook")
             .ok_or("missing ZzzPluginHook completion")
             .or_fail()?;
@@ -3640,6 +3646,18 @@ mod tests {
             .as_ref()
             .and_then(|details| details.detail.clone());
         verify_eq!(item_detail, Some("(player, entity)".to_string()))?;
+
+        let sandbox_item = items
+            .iter()
+            .find(|it| it.label == "ZzzSandboxHook")
+            .ok_or("missing ZzzSandboxHook completion")
+            .or_fail()?;
+        verify_eq!(sandbox_item.kind, Some(CompletionItemKind::FUNCTION))?;
+        let sandbox_detail = sandbox_item
+            .label_details
+            .as_ref()
+            .and_then(|details| details.detail.clone());
+        verify_eq!(sandbox_detail, Some("(ply, class)".to_string()))?;
 
         Ok(())
     }

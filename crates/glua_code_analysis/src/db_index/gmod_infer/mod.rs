@@ -184,6 +184,12 @@ pub struct GmodScopedClassInfo {
     /// (e.g. parent-name alias for gamemodes) can strip it back off without a
     /// second path scan.
     pub class_name_prefix: Option<String>,
+    pub aliases: Vec<String>,
+    pub is_global_singleton: bool,
+    pub hook_owner: bool,
+    /// Additional matching scripted scopes for the same file, stored as
+    /// `(class_name, global_name, class_name_prefix, is_global_singleton, hook_owner)`.
+    pub extra_scope_matches: Vec<(String, String, Option<String>, bool, bool)>,
 }
 
 /// Workspace-global registry of helper function definitions, used as a
