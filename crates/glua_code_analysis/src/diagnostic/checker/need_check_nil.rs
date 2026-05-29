@@ -572,20 +572,14 @@ fn is_short_circuit_type_guard_for_receiver(
 }
 
 fn short_circuit_left_call_for_right_call(call_expr: &LuaCallExpr) -> Option<LuaCallExpr> {
-    let Some(binary_expr) = call_expr.get_parent::<LuaBinaryExpr>() else {
-        return None;
-    };
+    let binary_expr = call_expr.get_parent::<LuaBinaryExpr>()?;
 
-    let Some(op) = binary_expr.get_op_token().map(|token| token.get_op()) else {
-        return None;
-    };
+    let op = binary_expr.get_op_token().map(|token| token.get_op())?;
     if op != BinaryOperator::OpAnd {
         return None;
     }
 
-    let Some((left, right)) = binary_expr.get_exprs() else {
-        return None;
-    };
+    let (left, right) = binary_expr.get_exprs()?;
     if right.syntax() != call_expr.syntax() {
         return None;
     }
