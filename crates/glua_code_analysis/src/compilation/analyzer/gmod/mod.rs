@@ -3447,8 +3447,8 @@ fn synthesize_panel_class(
             let class_member_owner = LuaMemberOwner::Type(class_decl_id.clone());
             let mut table_member_ids = HashSet::new();
 
-            for table_range in table_ranges {
-                let table_member_owner = LuaMemberOwner::Element(table_range);
+            for table_range in &table_ranges {
+                let table_member_owner = LuaMemberOwner::Element(table_range.clone());
                 if let Some(members) = db.get_member_index().get_members(&table_member_owner) {
                     for member in members {
                         let member_position = member.get_id().get_position();
@@ -3465,6 +3465,13 @@ fn synthesize_panel_class(
 
             for member_id in table_member_ids {
                 add_member(db, class_member_owner.clone(), member_id);
+            }
+
+            // Replace stale table-const types with the synthesized class type so cross-file accesses resolve correctly.
+            let class_type = LuaType::Def(class_decl_id.clone());
+            for table_range in &table_ranges {
+                db.get_type_index_mut()
+                    .replace_table_const_type(table_range, &class_type);
             }
         }
     }

@@ -3,8 +3,72 @@ mod test {
     use std::{ops::Deref, sync::Arc};
 
     use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaAstToken, LuaLocalName};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
+
+    fn assign_value_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        lhs_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let assign_stat = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaAssignStat>()
+            .find(|assign_stat| {
+                assign_stat
+                    .get_var_and_expr_list()
+                    .0
+                    .into_iter()
+                    .any(|var| var.syntax().text() == lhs_text)
+            })
+            .expect("expected assignment stat");
+        let (vars, exprs) = assign_stat.get_var_and_expr_list();
+        let index = vars
+            .iter()
+            .position(|var| var.syntax().text() == lhs_text)
+            .expect("expected matching LHS variable");
+        let expr = exprs
+            .get(index)
+            .cloned()
+            .expect("expected corresponding assignment value");
+
+        semantic_model
+            .infer_expr(expr)
+            .expect("expected inferred assignment value type")
+    }
+
+    fn local_name_type(ws: &mut VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("expected local name");
+        let token = local_name
+            .get_name_token()
+            .expect("expected local name token");
+
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .map(|info| info.typ)
+            .expect("expected semantic info for local name")
+    }
 
     #[test]
     fn test_dynamic_table_param_return_or_empty_branch_keeps_fields_allowed() {
@@ -3339,6 +3403,149 @@ mod test {
                 .any(|diagnostic| diagnostic.code == contact_pos_code
                     && diagnostic.message == contact_pos_message),
             "expected no post-reindex undefined-field for contactPos, got {after_reindex_diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_panel_self_assignment_to_table_field_preserves_panel_type_cross_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/cl_init.lua",
+            r#"
+                ix = ix or { gui = {} }
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix-hl2rp/schema/derma/cl_combinedisplay.lua",
+            r#"
+            ---@class DPanel
+            ---@field Remove fun(self: DPanel)
+
+            local PANEL = {}
+
+            function PANEL:Init()
+                ix.gui.combine = self
+            end
+
+            function PANEL:Paint(w, h)
+            end
+
+            vgui.Register("ixCombineDisplay", PANEL, "DPanel")
+            "#,
+        );
+        let hooks_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/cl_hooks.lua",
+            r#"
+                if (IsValid(ix.gui.combine)) then
+                    ix.gui.combine:Remove()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(hooks_file, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected UndefinedField diagnostics for panel self-assignment: {undefined_fields:#?}"
+        );
+    }
+
+    #[test]
+    fn test_panel_self_assignment_to_table_field_type_is_panel_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/cl_init.lua",
+            r#"
+                ix = ix or { gui = {} }
+            "#,
+        );
+        let panel_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/derma/cl_combinedisplay.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                ix.gui.combine = self
+            end
+
+            function PANEL:Paint(w, h)
+            end
+
+            vgui.Register("ixCombineDisplay", PANEL, "DPanel")
+            "#,
+        );
+
+        let combine_type = assign_value_type(&mut ws, panel_file, "ix.gui.combine");
+        let display = ws.humanize_type(combine_type);
+        assert!(
+            display.contains("ixCombineDisplay"),
+            "expected ix.gui.combine to be typed as ixCombineDisplay, got: {display}"
+        );
+    }
+
+    #[test]
+    fn test_panel_self_assignment_to_table_field_type_visible_cross_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/cl_init.lua",
+            r#"
+                ix = ix or { gui = {} }
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix-hl2rp/schema/derma/cl_combinedisplay.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                ix.gui.combine = self
+            end
+
+            function PANEL:Paint(w, h)
+            end
+
+            vgui.Register("ixCombineDisplay", PANEL, "DPanel")
+            "#,
+        );
+        let hooks_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/cl_hooks.lua",
+            r#"
+                local c = ix.gui.combine
+            "#,
+        );
+
+        let combine_type = local_name_type(&mut ws, hooks_file, "c");
+        let display = ws.humanize_type(combine_type);
+        assert!(
+            display.contains("ixCombineDisplay"),
+            "expected cross-file ix.gui.combine to be typed as ixCombineDisplay, got: {display}"
         );
     }
 }

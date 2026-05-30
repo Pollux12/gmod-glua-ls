@@ -11,12 +11,52 @@ use super::traits::LuaIndex;
 use crate::{DbIndex, FileId, InFiled, db_index::r#type::type_decl::LuaTypeIdentifier};
 pub use generic_param::GenericParam;
 pub use humanize_type::{RenderLevel, format_union_type, humanize_type};
+use rowan::TextRange;
 use std::collections::{HashMap, HashSet};
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};
 pub use type_ops::TypeOps;
 pub use type_owner::{LuaTypeCache, LuaTypeOwner};
 pub use type_visit_trait::TypeVisitTrait;
 pub use types::*;
+
+fn replace_table_const_in_type(
+    typ: &LuaType,
+    table_range: &InFiled<TextRange>,
+    replacement: &LuaType,
+) -> Option<LuaType> {
+    match typ {
+        LuaType::TableConst(existing_range) if existing_range == table_range => {
+            Some(replacement.clone())
+        }
+        LuaType::Union(union) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = union
+                .into_vec()
+                .into_iter()
+                .map(|sub_type| {
+                    replace_table_const_in_type(&sub_type, table_range, replacement)
+                        .inspect(|_| changed = true)
+                        .unwrap_or(sub_type)
+                })
+                .collect();
+            changed.then(|| LuaType::from_vec(new_types))
+        }
+        LuaType::Intersection(intersection) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = intersection
+                .get_types()
+                .iter()
+                .map(|sub_type| {
+                    replace_table_const_in_type(sub_type, table_range, replacement)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| sub_type.clone())
+                })
+                .collect();
+            changed.then(|| LuaType::from_vec(new_types))
+        }
+        _ => None,
+    }
+}
 
 pub(crate) fn widen_literal_type_for_assignment(typ: &LuaType) -> LuaType {
     match typ {
@@ -367,6 +407,32 @@ impl LuaTypeIndex {
 
     pub fn iter_type_caches(&self) -> impl Iterator<Item = (&LuaTypeOwner, &LuaTypeCache)> {
         self.types.iter()
+    }
+
+    pub fn replace_table_const_type(
+        &mut self,
+        table_range: &InFiled<TextRange>,
+        replacement: &LuaType,
+    ) {
+        let updates: Vec<(LuaTypeOwner, LuaTypeCache)> = self
+            .types
+            .iter()
+            .filter_map(|(owner, cache)| {
+                replace_table_const_in_type(cache.as_type(), table_range, replacement).map(
+                    |new_type| {
+                        let new_cache = match cache {
+                            LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
+                            LuaTypeCache::InferType(_) => LuaTypeCache::InferType(new_type),
+                        };
+                        (owner.clone(), new_cache)
+                    },
+                )
+            })
+            .collect();
+
+        for (owner, new_cache) in updates {
+            self.types.insert(owner, new_cache);
+        }
     }
 
     pub fn files_with_type_caches_referencing_files(
