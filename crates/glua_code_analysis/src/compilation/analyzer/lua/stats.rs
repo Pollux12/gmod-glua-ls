@@ -535,6 +535,8 @@ fn apply_index_expr_member_owner(
 ) -> Option<()> {
     let index_key = index_expr.get_index_key()?;
     let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+    let guarded_table_assignment = is_guarded_table_assignment_index_expr(&index_expr);
+
     if analyzer
         .db
         .get_member_index()
@@ -560,9 +562,18 @@ fn apply_index_expr_member_owner(
             .db
             .get_member_index()
             .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
-        let member_index = analyzer.db.get_member_index_mut();
-        member_index.add_member(member_owner, member);
-        member_index.set_member_function_scope_range(member_id, function_scope);
+        {
+            let member_index = analyzer.db.get_member_index_mut();
+            member_index.add_member(member_owner, member);
+            member_index.set_member_function_scope_range(member_id, function_scope);
+        }
+        if guarded_table_assignment {
+            analyzer
+                .db
+                .get_member_index_mut()
+                .mark_non_overwriting_assignment_member(member_id);
+            preserve_guarded_table_assignment_members(analyzer, member_id);
+        }
         return Some(());
     }
 
@@ -571,9 +582,18 @@ fn apply_index_expr_member_owner(
             .db
             .get_member_index()
             .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
-        let member_index = analyzer.db.get_member_index_mut();
-        member_index.set_member_owner(member_owner, member_id.file_id, member_id);
-        member_index.set_member_function_scope_range(member_id, function_scope);
+        {
+            let member_index = analyzer.db.get_member_index_mut();
+            member_index.set_member_owner(member_owner, member_id.file_id, member_id);
+            member_index.set_member_function_scope_range(member_id, function_scope);
+        }
+        if guarded_table_assignment {
+            analyzer
+                .db
+                .get_member_index_mut()
+                .mark_non_overwriting_assignment_member(member_id);
+            preserve_guarded_table_assignment_members(analyzer, member_id);
+        }
         return Some(());
     }
 
@@ -586,6 +606,13 @@ fn apply_index_expr_member_owner(
         .db
         .get_member_index_mut()
         .set_member_function_scope_range(member_id, function_scope);
+    if guarded_table_assignment {
+        analyzer
+            .db
+            .get_member_index_mut()
+            .mark_non_overwriting_assignment_member(member_id);
+        preserve_guarded_table_assignment_members(analyzer, member_id);
+    }
 
     Some(())
 }
@@ -1088,20 +1115,42 @@ fn assign_merge_type_owner_and_expr_type(
 
     if let LuaTypeOwner::Member(member_id) = type_owner
         && is_assignment_file_define_member(analyzer.db, member_id)
-        && !is_member_assignment_in_conditional_branch(analyzer, member_id)
-        && analyzer
-            .db
-            .get_member_index()
-            .member_function_scope_range(member_id)
-            .is_none()
     {
-        analyzer
-            .db
-            .get_member_index_mut()
-            .retain_only_member_for_owner_key(member_id);
+        let guarded_table_assignment =
+            preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, member_id);
+        if guarded_table_assignment {
+            analyzer
+                .db
+                .get_member_index_mut()
+                .mark_non_overwriting_assignment_member(member_id);
+            preserve_guarded_table_assignment_members(analyzer, member_id);
+        } else if !is_member_assignment_in_conditional_branch(analyzer, member_id)
+            && analyzer
+                .db
+                .get_member_index()
+                .member_function_scope_range(member_id)
+                .is_none()
+        {
+            analyzer
+                .db
+                .get_member_index_mut()
+                .retain_only_member_for_owner_key(member_id);
+        }
     }
 
     Some(())
+}
+
+fn preserve_guarded_table_assignment_members(analyzer: &mut LuaAnalyzer, member_id: LuaMemberId) {
+    let Some(member_ids) = guarded_table_assignment_member_ids_for_owner_key(analyzer, member_id)
+    else {
+        return;
+    };
+
+    analyzer
+        .db
+        .get_member_index_mut()
+        .preserve_members_for_owner_key(member_id, member_ids);
 }
 
 /// Returns true when the assignment that introduced this member sits inside a
@@ -1202,6 +1251,27 @@ fn get_widened_member_assignment_collection_type(
     ))
 }
 
+fn guarded_table_assignment_member_ids_for_owner_key(
+    analyzer: &LuaAnalyzer,
+    member_id: LuaMemberId,
+) -> Option<Vec<LuaMemberId>> {
+    let member_index = analyzer.db.get_member_index();
+    let owner = member_index.get_member_owner(&member_id)?.clone();
+    let key = member_index.get_member(&member_id)?.get_key().clone();
+    let mut member_ids = Vec::new();
+
+    for related_member in member_index.get_current_owner_members_for_key(&owner, &key) {
+        let related_member_id = related_member.get_id();
+        if !is_guarded_table_assignment_member(analyzer.db, related_member_id) {
+            return None;
+        }
+
+        member_ids.push(related_member_id);
+    }
+
+    (member_ids.len() >= 2).then_some(member_ids)
+}
+
 fn get_widened_member_assignment_type(
     analyzer: &mut LuaAnalyzer,
     type_owner: &LuaTypeOwner,
@@ -1219,13 +1289,11 @@ fn get_widened_member_assignment_type(
     let owner = member_index.get_member_owner(member_id)?.clone();
     let key = member_index.get_member(member_id)?.get_key().clone();
     let related_members = if preserve_table_literals {
-        member_index
-            .get_current_owner_members_for_key(&owner, &key)
+        let related_member_ids =
+            guarded_table_assignment_member_ids_for_owner_key(analyzer, *member_id)?;
+        related_member_ids
             .into_iter()
-            .filter(|related_member| {
-                related_member.get_id() == *member_id
-                    || is_guarded_table_assignment_member(analyzer.db, related_member.get_id())
-            })
+            .filter_map(|related_member_id| member_index.get_member(&related_member_id))
             .collect()
     } else {
         member_index.get_members_for_owner_key(&owner, &key)
@@ -1729,6 +1797,11 @@ fn is_guarded_table_assignment_member(db: &crate::DbIndex, member_id: LuaMemberI
     let Some(index_expr) = LuaIndexExpr::cast(node) else {
         return false;
     };
+
+    is_guarded_table_assignment_index_expr(&index_expr)
+}
+
+fn is_guarded_table_assignment_index_expr(index_expr: &LuaIndexExpr) -> bool {
     let Some(var) = LuaVarExpr::cast(index_expr.syntax().clone()) else {
         return false;
     };
@@ -1738,13 +1811,14 @@ fn is_guarded_table_assignment_member(db: &crate::DbIndex, member_id: LuaMemberI
     let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() else {
         return false;
     };
+    let syntax_id = index_expr.get_syntax_id();
     let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
 
     var_list
         .iter()
         .zip(expr_list.iter())
         .any(|(candidate_var, expr)| {
-            candidate_var.get_syntax_id() == *member_id.get_syntax_id()
+            candidate_var.get_syntax_id() == syntax_id
                 && guarded_assignment_expr_matches_path(expr, &access_path)
         })
 }

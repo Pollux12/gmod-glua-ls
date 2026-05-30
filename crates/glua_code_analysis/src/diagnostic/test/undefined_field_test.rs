@@ -524,6 +524,146 @@ mod test {
     }
 
     #[test]
+    fn test_guarded_nested_table_redefinition_preserves_existing_fields_on_cold_batch_load() {
+        let mut analysis = crate::EmmyLuaAnalysis::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        analysis.update_config(Arc::new(emmyrc));
+        analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let root = std::env::temp_dir().join("gmod_glua_ls_ix_type_batch");
+        let helix_root = root.join("garrysmod/gamemodes/helix");
+        let schema_root = root.join("garrysmod/gamemodes/helix-hl2rp");
+        analysis.add_library_workspace(helix_root.clone());
+        analysis.add_main_workspace(schema_root.clone());
+
+        let sh_util = r#"
+                --- Various useful helper functions.
+                -- @module ix.util
+
+                ix.type = ix.type or {
+                    [4] = "text",
+                    [8] = "number",
+                    text = 4,
+                    number = 8,
+                }
+            "#;
+        let init = r#"
+                ix = ix or { util = {}, meta = {} }
+                include("core/sh_util.lua")
+                include("shared.lua")
+            "#;
+        let cl_init = r#"
+                ix = ix or { gui = {}, util = {}, meta = {} }
+                include("core/sh_util.lua")
+                include("shared.lua")
+            "#;
+        let shared = r#"
+                --- Top-level library containing all Helix libraries.
+                -- @module ix
+
+                --- A table of variable types that are used throughout the framework.
+                -- @table ix.type
+                -- @realm shared
+                -- @field text A regular string.
+                ix.type = ix.type or {}
+            "#;
+        let command = r#"
+                local argumentType = ix.type.text
+                local numberType = ix.type.number
+            "#;
+
+        let command_path = schema_root.join("schema/sh_commands.lua");
+        analysis.update_files_by_path(vec![
+            (
+                helix_root.join("gamemode/shared.lua"),
+                Some(shared.to_string()),
+            ),
+            (
+                helix_root.join("gamemode/core/sh_util.lua"),
+                Some(sh_util.to_string()),
+            ),
+            (helix_root.join("gamemode/init.lua"), Some(init.to_string())),
+            (
+                helix_root.join("gamemode/cl_init.lua"),
+                Some(cl_init.to_string()),
+            ),
+            (command_path.clone(), Some(command.to_string())),
+        ]);
+
+        let shared_path = helix_root.join("gamemode/shared.lua");
+        let shared_uri = lsp_types::Uri::parse_from_file_path(&shared_path)
+            .expect("expected shared path to convert to uri");
+        let shared_file = analysis
+            .get_file_id(&shared_uri)
+            .expect("expected shared file id");
+        let tree = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&shared_file)
+            .expect("expected shared syntax tree");
+        let root = tree.get_red_root();
+        let mut lookup_member_count = None;
+        for assign_stat in root
+            .descendants()
+            .filter_map(glua_parser::LuaAssignStat::cast)
+        {
+            let (vars, _) = assign_stat.get_var_and_expr_list();
+            for var in vars {
+                if var.syntax().text() != "ix.type" {
+                    continue;
+                }
+                let glua_parser::LuaVarExpr::IndexExpr(index_expr) = var else {
+                    continue;
+                };
+                let member_id = crate::LuaMemberId::new(index_expr.get_syntax_id(), shared_file);
+                let member_index = analysis.compilation.get_db().get_member_index();
+                let owner = member_index
+                    .get_member_owner(&member_id)
+                    .expect("expected ix.type owner");
+                let key = member_index
+                    .get_member(&member_id)
+                    .expect("expected ix.type member")
+                    .get_key();
+                lookup_member_count = member_index
+                    .get_member_item(owner, key)
+                    .map(|member_item| member_item.get_member_ids().len());
+            }
+        }
+
+        assert!(
+            lookup_member_count.is_some_and(|count| count >= 2),
+            "guarded ix.type definitions should stay in the lookup item after cold batch load, found {lookup_member_count:?}"
+        );
+
+        let command_uri = lsp_types::Uri::parse_from_file_path(&command_path)
+            .expect("expected command path to convert to uri");
+        let command_file = analysis
+            .get_file_id(&command_uri)
+            .expect("expected command file id");
+        let diagnostics = analysis
+            .diagnose_file(command_file, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected UndefinedField diagnostics on cold batch load: {undefined_fields:#?}"
+        );
+    }
+
+    #[test]
     fn test_guarded_nested_table_redefinition_appends_rhs_fields_across_files() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
