@@ -6,7 +6,7 @@ use lsp_types::{
 
 use super::actions::{
     build_add_doc_tag, build_disable_file_changes, build_disable_next_line_changes,
-    build_need_check_nil, build_preferred_local_alias_fix,
+    build_gmod_null_check, build_need_check_nil, build_preferred_local_alias_fix,
 };
 use crate::handlers::command::{DisableAction, make_disable_code_command};
 
@@ -71,6 +71,9 @@ fn add_fix_code_action(
         DiagnosticCode::UnknownDocTag => build_add_doc_tag(semantic_model, actions, range, data),
         DiagnosticCode::PreferredLocalAlias => {
             build_preferred_local_alias_fix(semantic_model, actions, range, data)
+        }
+        DiagnosticCode::GmodNullCheck => {
+            build_gmod_null_check(semantic_model, actions, range, data)
         }
         _ => Some(()),
     }

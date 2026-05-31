@@ -68,6 +68,14 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         } else if is_hook_name_string_context(builder, &call_expr, literal_expr) {
             if staged_call_snippets_enabled(builder) && matches_call_path(&call_path, "hook.Add") {
                 add_staged_hook_add_completion_items(builder, &call_expr)
+            } else if staged_call_snippets_enabled(builder)
+                && matches_call_path(&call_path, "hook.Run")
+            {
+                add_staged_hook_emit_completion_items(builder, &call_expr, false)
+            } else if staged_call_snippets_enabled(builder)
+                && matches_call_path(&call_path, "hook.Call")
+            {
+                add_staged_hook_emit_completion_items(builder, &call_expr, true)
             } else {
                 add_hook_completion_items(builder, Some(text_edit_range))
             }
@@ -100,12 +108,21 @@ pub fn apply_staged_call_snippet(
         .find_map(LuaIndexExpr::cast)?;
     let prefix_path = expr_access_path(&index_expr.get_prefix_expr()?)?;
     let call_path = format!("{prefix_path}.{label}");
-    if !matches_call_path(&call_path, "hook.Add") && !matches_call_path(&call_path, "net.Receive") {
+    if !matches_call_path(&call_path, "hook.Add")
+        && !matches_call_path(&call_path, "hook.Run")
+        && !matches_call_path(&call_path, "hook.Call")
+        && !matches_call_path(&call_path, "net.Receive")
+    {
         return None;
     }
 
-    completion_item.insert_text = Some(format!(r#"{}("${{1}}")"#, label));
+    completion_item.insert_text = Some(if matches_call_path(&call_path, "hook.Call") {
+        format!(r#"{}("${{1}}", ${{2:GAMEMODE}})"#, label)
+    } else {
+        format!(r#"{}("${{1}}")"#, label)
+    });
     completion_item.insert_text_format = Some(InsertTextFormat::SNIPPET);
+    completion_item.sort_text = Some(format!("000_gmod_staged_call_{}", label.to_lowercase()));
     completion_item.command = Some(trigger_suggest_command());
     Some(())
 }
@@ -377,6 +394,8 @@ fn add_net_message_completion_items(
 ) -> bool {
     let before_count = builder.get_completion_items_mut().len();
     for (name, (registration_count, receiver_count)) in collect_net_message_stats(builder) {
+        let filter_text = name.clone();
+        let sort_text = format!("010_gmod_net_message_{}", completion_sort_key(&name));
         let text_edit = text_edit_range.map(|range| {
             CompletionTextEdit::Edit(TextEdit {
                 range,
@@ -391,6 +410,8 @@ fn add_net_message_completion_items(
                 description: Some("GMod net message".to_string()),
             }),
             detail: Some("GMod net message".to_string()),
+            filter_text: Some(filter_text),
+            sort_text: Some(sort_text),
             text_edit,
             ..Default::default()
         });
@@ -422,6 +443,7 @@ fn add_staged_net_receive_completion_items(
 
     for (name, (registration_count, receiver_count)) in collect_net_message_stats(builder) {
         let snippet = build_net_receive_snippet(&name, call_realm);
+        let sort_text = format!("000_gmod_net_receive_{}", completion_sort_key(&name));
         let _ = builder.add_completion_item(CompletionItem {
             label: name.clone(),
             kind: Some(lsp_types::CompletionItemKind::EVENT),
@@ -430,6 +452,8 @@ fn add_staged_net_receive_completion_items(
                 description: Some("GMod net message".to_string()),
             }),
             detail: Some("GMod net message".to_string()),
+            filter_text: Some(name.clone()),
+            sort_text: Some(sort_text),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
             insert_text_mode: Some(InsertTextMode::ADJUST_INDENTATION),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
@@ -449,6 +473,8 @@ fn add_hook_completion_items(
 ) -> bool {
     let before_count = builder.get_completion_items_mut().len();
     for (name, stats, data) in collect_hook_completion_entries(builder) {
+        let filter_text = name.clone();
+        let sort_text = format!("010_gmod_hook_name_{}", completion_sort_key(&name));
         let text_edit = text_edit_range.map(|range| {
             CompletionTextEdit::Edit(TextEdit {
                 range,
@@ -464,6 +490,8 @@ fn add_hook_completion_items(
             }),
             detail: Some("GMod hook".to_string()),
             data,
+            filter_text: Some(filter_text),
+            sort_text: Some(sort_text),
             text_edit,
             ..Default::default()
         });
@@ -489,6 +517,7 @@ fn add_staged_hook_add_completion_items(
             .callback_params
             .as_ref()
             .map_or(&[][..], |(_, params)| params.as_slice());
+        let sort_text = format!("000_gmod_hook_add_{}", completion_sort_key(&name));
         let _ = builder.add_completion_item(CompletionItem {
             label: name.clone(),
             kind: Some(lsp_types::CompletionItemKind::EVENT),
@@ -498,11 +527,56 @@ fn add_staged_hook_add_completion_items(
             }),
             detail: Some("GMod hook".to_string()),
             data,
+            filter_text: Some(name.clone()),
+            sort_text: Some(sort_text),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
             insert_text_mode: Some(InsertTextMode::ADJUST_INDENTATION),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                 range: replace_range.clone(),
                 new_text: build_hook_add_snippet(&name, callback_params),
+            })),
+            ..Default::default()
+        });
+    }
+
+    builder.get_completion_items_mut().len() > before_count
+}
+
+fn add_staged_hook_emit_completion_items(
+    builder: &mut CompletionBuilder,
+    call_expr: &LuaCallExpr,
+    include_gamemode_arg: bool,
+) -> bool {
+    let before_count = builder.get_completion_items_mut().len();
+    let Some(string_token) = completion_string_token(builder) else {
+        return false;
+    };
+    let Some(replace_range) = staged_call_edit_range(builder, &string_token, call_expr) else {
+        return false;
+    };
+
+    for (name, stats, data) in collect_hook_completion_entries(builder) {
+        let callback_params = stats
+            .callback_params
+            .as_ref()
+            .map_or(&[][..], |(_, params)| params.as_slice());
+        let sort_text = format!("000_gmod_hook_emit_{}", completion_sort_key(&name));
+        let _ = builder.add_completion_item(CompletionItem {
+            label: name.clone(),
+            kind: Some(lsp_types::CompletionItemKind::EVENT),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some(hook_label_detail(&stats)),
+                description: Some("GMod hook".to_string()),
+            }),
+            detail: Some("GMod hook".to_string()),
+            data,
+            filter_text: Some(name.clone()),
+            sort_text: Some(sort_text),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_mode: Some(InsertTextMode::ADJUST_INDENTATION),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: replace_range.clone(),
+                new_text: build_hook_emit_snippet(&name, callback_params, include_gamemode_arg),
             })),
             ..Default::default()
         });
@@ -805,6 +879,34 @@ fn build_hook_add_snippet(hook_name: &str, callback_params: &[String]) -> String
     )
 }
 
+fn build_hook_emit_snippet(
+    hook_name: &str,
+    callback_params: &[String],
+    include_gamemode_arg: bool,
+) -> String {
+    let mut args = Vec::with_capacity(callback_params.len() + usize::from(include_gamemode_arg));
+    let mut placeholder_index = 1;
+    if include_gamemode_arg {
+        args.push(format!("${{{placeholder_index}:GAMEMODE}}"));
+        placeholder_index += 1;
+    }
+
+    for param in callback_params {
+        args.push(format!(
+            "${{{}:{}}}",
+            placeholder_index,
+            escape_snippet_text(param)
+        ));
+        placeholder_index += 1;
+    }
+
+    if args.is_empty() {
+        format!("{}\")", escape_snippet_text(hook_name))
+    } else {
+        format!("{}\", {})", escape_snippet_text(hook_name), args.join(", "))
+    }
+}
+
 fn build_net_receive_snippet(message_name: &str, call_realm: GmodRealm) -> String {
     let callback_signature = if call_realm == GmodRealm::Client {
         "function(len)"
@@ -817,6 +919,10 @@ fn build_net_receive_snippet(message_name: &str, call_realm: GmodRealm) -> Strin
         escape_snippet_text(message_name),
         callback_signature
     )
+}
+
+fn completion_sort_key(name: &str) -> String {
+    name.to_lowercase()
 }
 
 fn escape_snippet_text(text: &str) -> String {

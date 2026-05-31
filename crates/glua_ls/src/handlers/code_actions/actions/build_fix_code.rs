@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::handlers::command::make_auto_doc_tag_command;
-use glua_code_analysis::SemanticModel;
-use glua_parser::{LuaAstNode, LuaExpr};
+use glua_code_analysis::{LuaDocument, SemanticModel};
+use glua_parser::{BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaExpr};
 use lsp_types::{CodeAction, CodeActionKind, CodeActionOrCommand, Range, TextEdit, WorkspaceEdit};
 use rowan::{NodeOrToken, TokenAtOffset};
 
@@ -74,6 +74,113 @@ pub fn build_add_doc_tag(
     }));
 
     Some(())
+}
+
+pub fn build_gmod_null_check(
+    semantic_model: &SemanticModel,
+    actions: &mut Vec<CodeActionOrCommand>,
+    range: Range,
+    _data: &Option<serde_json::Value>,
+) -> Option<()> {
+    let document = semantic_model.get_document();
+    let target_range = document.to_rowan_range(range)?;
+    let root = semantic_model.get_root();
+    let token = match root.syntax().token_at_offset(target_range.start()) {
+        TokenAtOffset::Single(token) => token,
+        TokenAtOffset::Between(_, token) => token,
+        _ => return None,
+    };
+
+    let mut current_node = token.parent();
+    while let Some(node) = current_node {
+        if node.text_range() == target_range {
+            if let Some(binary_expr) = LuaBinaryExpr::cast(node.clone()) {
+                if let Some(replacement) =
+                    build_gmod_null_binary_replacement(semantic_model, &document, &binary_expr)
+                {
+                    push_gmod_null_check_action(actions, &document, range, replacement);
+                }
+                return Some(());
+            }
+
+            if LuaExpr::can_cast(node.kind().into()) {
+                let expr_text = document.get_text_slice(target_range).trim();
+                if !expr_text.is_empty() {
+                    push_gmod_null_check_action(
+                        actions,
+                        &document,
+                        range,
+                        format!("IsValid({expr_text})"),
+                    );
+                }
+                return Some(());
+            }
+        }
+
+        current_node = node.parent();
+    }
+
+    Some(())
+}
+
+fn build_gmod_null_binary_replacement(
+    semantic_model: &SemanticModel,
+    document: &LuaDocument,
+    binary_expr: &LuaBinaryExpr,
+) -> Option<String> {
+    let op = binary_expr.get_op_token()?.get_op();
+    if !matches!(op, BinaryOperator::OpEq | BinaryOperator::OpNe) {
+        return None;
+    }
+
+    let (left, right) = binary_expr.get_exprs()?;
+    let checked_expr = match (
+        is_nil_expr(semantic_model, &left),
+        is_nil_expr(semantic_model, &right),
+    ) {
+        (false, true) => left,
+        (true, false) => right,
+        _ => return None,
+    };
+
+    let expr_text = document
+        .get_text_slice(checked_expr.syntax().text_range())
+        .trim();
+    if expr_text.is_empty() {
+        return None;
+    }
+
+    let is_valid_call = format!("IsValid({expr_text})");
+    match op {
+        BinaryOperator::OpEq => Some(format!("not {is_valid_call}")),
+        BinaryOperator::OpNe => Some(is_valid_call),
+        _ => None,
+    }
+}
+
+fn is_nil_expr(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    semantic_model
+        .infer_expr(expr.clone())
+        .is_ok_and(|expr_type| expr_type.is_nil())
+}
+
+fn push_gmod_null_check_action(
+    actions: &mut Vec<CodeActionOrCommand>,
+    document: &LuaDocument,
+    range: Range,
+    new_text: String,
+) {
+    let text_edit = TextEdit { range, new_text };
+
+    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+        title: t!("Use IsValid(...) for GMod NULL check").to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(HashMap::from([(document.get_uri(), vec![text_edit])])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }));
 }
 
 pub fn build_preferred_local_alias_fix(

@@ -495,6 +495,11 @@ fn try_add_alias_completion_item_new(
     let mut alias_completion_item = completion_item.clone();
     alias_completion_item.label = alias_label;
     alias_completion_item.insert_text = Some(label.clone());
+    alias_completion_item.filter_text = Some(format!(
+        "{} {}",
+        alias_completion_item.label.as_str(),
+        label.as_str()
+    ));
 
     // 更新 label_details 添加别名提示
     let index_hint = t!("completion.index %{label}", label = label).to_string();

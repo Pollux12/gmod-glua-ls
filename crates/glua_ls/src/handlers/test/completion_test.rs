@@ -1,10 +1,17 @@
 #[cfg(test)]
 mod tests {
-    use glua_code_analysis::{DocSyntax, Emmyrc, EmmyrcFilenameConvention};
+    use glua_code_analysis::{
+        DocSyntax, Emmyrc, EmmyrcFilenameConvention, FileId, file_path_to_uri,
+    };
     use googletest::prelude::*;
     use lsp_types::{
         CompletionItemKind, CompletionResponse, CompletionTriggerKind, Documentation,
         InsertTextFormat, MarkupContent,
+    };
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
     };
     use tokio_util::sync::CancellationToken;
 
@@ -3292,6 +3299,141 @@ mod tests {
         )?;
         verify_that!(text_edit.range.start.line, eq(1))?;
         verify_that!(text_edit.range.start.character, eq(22))?;
+        verify_that!(item.filter_text.as_deref(), eq(Some("PlayerSpawn")))?;
+        verify_that!(
+            item.sort_text
+                .as_deref()
+                .is_some_and(|sort_text| sort_text.starts_with("000_gmod_hook_add_")),
+            eq(true)
+        )?;
+        verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_hook_run_string_completion_expands_emit_snippet() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            hook.Run("<??>")
+            "#,
+        )?;
+        let file_id = ws.def(content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .iter()
+            .find(|item| item.label == "PlayerSpawn")
+            .ok_or("missing PlayerSpawn completion")
+            .or_fail()?;
+        let text_edit = item
+            .text_edit
+            .as_ref()
+            .ok_or("missing staged hook.Run text edit")
+            .or_fail()?;
+        let lsp_types::CompletionTextEdit::Edit(text_edit) = text_edit else {
+            return fail!("expected text edit for staged hook.Run completion");
+        };
+
+        verify_eq!(item.kind, Some(CompletionItemKind::EVENT))?;
+        verify_that!(
+            text_edit.new_text.as_str(),
+            eq("PlayerSpawn\", ${1:ply}, ${2:transition})")
+        )?;
+        verify_that!(text_edit.range.start.line, eq(1))?;
+        verify_that!(text_edit.range.start.character, eq(22))?;
+        verify_that!(item.filter_text.as_deref(), eq(Some("PlayerSpawn")))?;
+        verify_that!(
+            item.sort_text
+                .as_deref()
+                .is_some_and(|sort_text| sort_text.starts_with("000_gmod_hook_emit_")),
+            eq(true)
+        )?;
+        verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_hook_call_string_completion_expands_emit_snippet_with_gamemode() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            hook.Call("<??>")
+            "#,
+        )?;
+        let file_id = ws.def(content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .iter()
+            .find(|item| item.label == "PlayerSpawn")
+            .ok_or("missing PlayerSpawn completion")
+            .or_fail()?;
+        let text_edit = item
+            .text_edit
+            .as_ref()
+            .ok_or("missing staged hook.Call text edit")
+            .or_fail()?;
+        let lsp_types::CompletionTextEdit::Edit(text_edit) = text_edit else {
+            return fail!("expected text edit for staged hook.Call completion");
+        };
+
+        verify_eq!(item.kind, Some(CompletionItemKind::EVENT))?;
+        verify_that!(
+            text_edit.new_text.as_str(),
+            eq("PlayerSpawn\", ${1:GAMEMODE}, ${2:ply}, ${3:transition})")
+        )?;
+        verify_that!(item.filter_text.as_deref(), eq(Some("PlayerSpawn")))?;
+        verify_that!(
+            item.sort_text
+                .as_deref()
+                .is_some_and(|sort_text| sort_text.starts_with("000_gmod_hook_emit_")),
+            eq(true)
+        )?;
         verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
 
         Ok(())
@@ -4255,5 +4397,111 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_include_path_completion_filters_to_lua_files() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        let root = create_path_completion_root("gmod_include_path")?;
+        fs::create_dir_all(root.join("lua/includes")).or_fail()?;
+        fs::write(root.join("lua/includes/init.lua"), "").or_fail()?;
+        fs::write(root.join("lua/includes/icon.png"), "").or_fail()?;
+        ws.analysis.add_main_workspace(root.clone());
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            include("lua/includes/<??>")
+            "#,
+        )?;
+        let file_id = define_disk_file(&mut ws, root.join("lua/autorun/test.lua"), &content)?;
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(items.iter().any(|item| item.label == "init.lua"), eq(true))?;
+        verify_that!(items.iter().any(|item| item.label == "icon.png"), eq(false))
+    }
+
+    #[gtest]
+    fn test_member_named_include_uses_annotation_path_kind() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let root = create_path_completion_root("member_include_path")?;
+        fs::create_dir_all(root.join("materials/icons")).or_fail()?;
+        fs::write(root.join("materials/icons/icon.png"), "").or_fail()?;
+        fs::write(root.join("materials/icons/cl_init.lua"), "").or_fail()?;
+        ws.analysis.add_main_workspace(root.clone());
+        ws.def(
+            r#"
+            ---@class Loader
+            ---@field include fun(self: Loader, path: Path)
+            ---@type Loader
+            local loader
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            loader:include("materials/icons/<??>")
+            "#,
+        )?;
+        let file_id = define_disk_file(&mut ws, root.join("lua/autorun/test.lua"), &content)?;
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(items.iter().any(|item| item.label == "icon.png"), eq(true))?;
+        verify_that!(
+            items.iter().any(|item| item.label == "cl_init.lua"),
+            eq(true)
+        )
+    }
+
+    fn create_path_completion_root(name: &str) -> Result<PathBuf> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .or_fail()?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("glua_ls_{name}_{nonce}"));
+        fs::create_dir_all(&root).or_fail()?;
+        Ok(root)
+    }
+
+    fn define_disk_file(
+        ws: &mut ProviderVirtualWorkspace,
+        path: PathBuf,
+        content: &str,
+    ) -> Result<FileId> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).or_fail()?;
+        }
+        let uri = file_path_to_uri(&path)
+            .ok_or("failed to create file URI")
+            .or_fail()?;
+        ws.analysis
+            .update_file_by_uri(&uri, Some(content.to_string()))
+            .or_fail()
     }
 }
