@@ -2,9 +2,130 @@
 mod test {
     use std::{ops::Deref, sync::Arc};
 
-    use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, Emmyrc, LuaMemberOwner, LuaType, RenderLevel, VirtualWorkspace,
+        humanize_type,
+    };
+    use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaLocalName};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
+
+    fn assign_value_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        lhs_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let assign_stat = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaAssignStat>()
+            .find(|assign_stat| {
+                assign_stat
+                    .get_var_and_expr_list()
+                    .0
+                    .into_iter()
+                    .any(|var| var.syntax().text() == lhs_text)
+            })
+            .expect("expected assignment stat");
+        let (vars, exprs) = assign_stat.get_var_and_expr_list();
+        let index = vars
+            .iter()
+            .position(|var| var.syntax().text() == lhs_text)
+            .expect("expected matching LHS variable");
+        let expr = exprs
+            .get(index)
+            .cloned()
+            .expect("expected corresponding assignment value");
+
+        semantic_model
+            .infer_expr(expr)
+            .expect("expected inferred assignment value type")
+    }
+
+    fn local_name_type(ws: &mut VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("expected local name");
+        let token = local_name
+            .get_name_token()
+            .expect("expected local name token");
+
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .map(|info| info.typ)
+            .expect("expected semantic info for local name")
+    }
+
+    fn index_expr_type(
+        analysis: &crate::EmmyLuaAnalysis,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|index_expr| index_expr.syntax().text() == expr_text)
+            .expect("expected index expression");
+
+        semantic_model
+            .infer_expr(LuaExpr::IndexExpr(index_expr))
+            .expect("expected inferred index expression type")
+    }
+
+    fn contains_empty_table_bootstrap(db: &crate::DbIndex, typ: &LuaType) -> bool {
+        match typ {
+            LuaType::Table => true,
+            LuaType::TableConst(table_id) => {
+                db.get_member_index()
+                    .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
+                    == 0
+            }
+            LuaType::Union(union) => union
+                .into_vec()
+                .iter()
+                .any(|sub_type| contains_empty_table_bootstrap(db, sub_type)),
+            _ => false,
+        }
+    }
+
+    fn empty_table_bootstrap_branch_count(db: &crate::DbIndex, typ: &LuaType) -> usize {
+        match typ {
+            LuaType::Table => 1,
+            LuaType::TableConst(table_id) => usize::from(
+                db.get_member_index()
+                    .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
+                    == 0,
+            ),
+            LuaType::Union(union) => union
+                .into_vec()
+                .iter()
+                .map(|sub_type| empty_table_bootstrap_branch_count(db, sub_type))
+                .sum(),
+            _ => 0,
+        }
+    }
 
     #[test]
     fn test_dynamic_table_param_return_or_empty_branch_keeps_fields_allowed() {
@@ -234,6 +355,574 @@ mod test {
                 .iter()
                 .all(|diagnostic| diagnostic.code != undefined_field),
             "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_gamemode_bootstrap_global_table_members_merge_across_files() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let sh_util = r#"
+                --- Various useful helper functions.
+                -- @module ix.util
+
+                ix.type = ix.type or {
+                    [2] = "string",
+                    string = 2,
+                }
+
+                ix.blurRenderQueue = {}
+
+                function ix.util.Include(fileName, realm)
+                end
+
+                ix.util.Include("core/meta/sh_entity.lua")
+            "#;
+        let init = r#"
+                ix = ix or { util = {}, meta = {} }
+                include("core/sh_util.lua")
+                include("shared.lua")
+            "#;
+        let cl_init = r#"
+                ix = ix or { util = {}, gui = {}, meta = {} }
+                include("core/sh_util.lua")
+                include("shared.lua")
+            "#;
+        let shared_source = r#"
+                ix.util.Include("core/cl_skin.lua")
+            "#;
+
+        ws.def_files(vec![
+            ("gamemodes/helix/gamemode/core/sh_util.lua", sh_util),
+            ("gamemodes/helix/gamemode/init.lua", init),
+            ("gamemodes/helix/gamemode/cl_init.lua", cl_init),
+            ("gamemodes/helix/gamemode/shared.lua", shared_source),
+        ]);
+        let shared = ws.def_file("gamemodes/helix/gamemode/shared.lua", shared_source);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(shared, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field),
+            "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_child_gamemode_sees_parent_guarded_global_table_fields() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/init.lua",
+            r#"
+                ix = ix or { util = {}, meta = {} }
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix/gamemode/cl_init.lua",
+            r#"
+                ix = ix or { util = {}, gui = {}, meta = {} }
+            "#,
+        );
+        let child_hooks = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/cl_hooks.lua",
+            r#"
+                function Schema:CharacterLoaded(character)
+                    if (IsValid(ix.gui.combine)) then
+                        ix.gui.combine:Remove()
+                    end
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(child_hooks, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field),
+            "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_guarded_global_table_bootstraps_merge_fields_across_files() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/init.lua",
+            r#"
+                ix = ix or { util = {} }
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix/gamemode/cl_init.lua",
+            r#"
+                ix = ix or { gui = {} }
+            "#,
+        );
+        let child_hooks = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/cl_hooks.lua",
+            r#"
+                ix.util.Include("core/meta/sh_entity.lua")
+
+                if (IsValid(ix.gui.combine)) then
+                    ix.gui.combine:Remove()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(child_hooks, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected UndefinedField diagnostics: {undefined_fields:#?}"
+        );
+    }
+
+    #[test]
+    fn test_guarded_nested_table_redefinition_preserves_existing_fields() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/core/sh_util.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {
+                    [2] = "string",
+                    [4] = "text",
+                    string = 2,
+                    text = 4,
+                }
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix/gamemode/shared.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {}
+            "#,
+        );
+        let command_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/sh_commands.lua",
+            r#"
+                local argumentType = ix.type.text
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(command_file, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected UndefinedField diagnostics: {undefined_fields:#?}"
+        );
+    }
+
+    #[test]
+    fn test_guarded_nested_table_redefinition_preserves_existing_fields_on_cold_batch_load() {
+        let mut analysis = crate::EmmyLuaAnalysis::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        analysis.update_config(Arc::new(emmyrc));
+        analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let root = std::env::temp_dir().join("gmod_glua_ls_ix_type_batch");
+        let helix_root = root.join("garrysmod/gamemodes/helix");
+        let schema_root = root.join("garrysmod/gamemodes/helix-hl2rp");
+        analysis.add_library_workspace(helix_root.clone());
+        analysis.add_main_workspace(schema_root.clone());
+
+        let sh_util = r#"
+                --- Various useful helper functions.
+                -- @module ix.util
+
+                ix.type = ix.type or {
+                    [4] = "text",
+                    [8] = "number",
+                    text = 4,
+                    number = 8,
+                }
+            "#;
+        let init = r#"
+                ix = ix or { util = {}, meta = {} }
+                include("core/sh_util.lua")
+                include("shared.lua")
+            "#;
+        let cl_init = r#"
+                ix = ix or { gui = {}, util = {}, meta = {} }
+                include("core/sh_util.lua")
+                include("shared.lua")
+            "#;
+        let shared = r#"
+                --- Top-level library containing all Helix libraries.
+                -- @module ix
+
+                --- A table of variable types that are used throughout the framework.
+                -- @table ix.type
+                -- @realm shared
+                -- @field text A regular string.
+                ix.type = ix.type or {}
+            "#;
+        let command = r#"
+                local argumentType = ix.type.text
+                local numberType = ix.type.number
+            "#;
+
+        let command_path = schema_root.join("schema/sh_commands.lua");
+        analysis.update_files_by_path(vec![
+            (
+                helix_root.join("gamemode/shared.lua"),
+                Some(shared.to_string()),
+            ),
+            (
+                helix_root.join("gamemode/core/sh_util.lua"),
+                Some(sh_util.to_string()),
+            ),
+            (helix_root.join("gamemode/init.lua"), Some(init.to_string())),
+            (
+                helix_root.join("gamemode/cl_init.lua"),
+                Some(cl_init.to_string()),
+            ),
+            (command_path.clone(), Some(command.to_string())),
+        ]);
+
+        let shared_path = helix_root.join("gamemode/shared.lua");
+        let shared_uri = lsp_types::Uri::parse_from_file_path(&shared_path)
+            .expect("expected shared path to convert to uri");
+        let shared_file = analysis
+            .get_file_id(&shared_uri)
+            .expect("expected shared file id");
+        let tree = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&shared_file)
+            .expect("expected shared syntax tree");
+        let root = tree.get_red_root();
+        let mut lookup_member_count = None;
+        for assign_stat in root
+            .descendants()
+            .filter_map(glua_parser::LuaAssignStat::cast)
+        {
+            let (vars, _) = assign_stat.get_var_and_expr_list();
+            for var in vars {
+                if var.syntax().text() != "ix.type" {
+                    continue;
+                }
+                let glua_parser::LuaVarExpr::IndexExpr(index_expr) = var else {
+                    continue;
+                };
+                let member_id = crate::LuaMemberId::new(index_expr.get_syntax_id(), shared_file);
+                let member_index = analysis.compilation.get_db().get_member_index();
+                let owner = member_index
+                    .get_member_owner(&member_id)
+                    .expect("expected ix.type owner");
+                let key = member_index
+                    .get_member(&member_id)
+                    .expect("expected ix.type member")
+                    .get_key();
+                lookup_member_count = member_index
+                    .get_member_item(owner, key)
+                    .map(|member_item| member_item.get_member_ids().len());
+            }
+        }
+
+        assert!(
+            lookup_member_count.is_some_and(|count| count >= 2),
+            "guarded ix.type definitions should stay in the lookup item after cold batch load, found {lookup_member_count:?}"
+        );
+
+        let command_uri = lsp_types::Uri::parse_from_file_path(&command_path)
+            .expect("expected command path to convert to uri");
+        let command_file = analysis
+            .get_file_id(&command_uri)
+            .expect("expected command file id");
+        let diagnostics = analysis
+            .diagnose_file(command_file, CancellationToken::new())
+            .unwrap_or_default();
+        let ix_type = index_expr_type(&analysis, command_file, "ix.type");
+        let ix_type_display = humanize_type(
+            analysis.compilation.get_db(),
+            &ix_type,
+            RenderLevel::Detailed,
+        );
+
+        assert!(
+            ix_type_display.contains("text") && ix_type_display.contains("number"),
+            "expected ix.type to retain detailed fields, got {ix_type_display}"
+        );
+        assert!(
+            !contains_empty_table_bootstrap(analysis.compilation.get_db(), &ix_type),
+            "expected ix.type to omit redundant empty/bootstrap table branch, got {ix_type_display}"
+        );
+
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected UndefinedField diagnostics on cold batch load: {undefined_fields:#?}"
+        );
+    }
+
+    #[test]
+    fn test_guarded_empty_table_bootstrap_remains_table_when_only_definition() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "gamemodes/helix/gamemode/shared.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {}
+
+                local typeTable = ix.type
+            "#,
+        );
+
+        let ty = local_name_type(&mut ws, file_id, "typeTable");
+        let display = ws.humanize_type(ty.clone());
+
+        assert!(
+            display == "table" || matches!(ty, LuaType::Table | LuaType::TableConst(_)),
+            "expected lone guarded bootstrap to remain table-like, got {display}"
+        );
+    }
+
+    #[test]
+    fn test_repeated_guarded_empty_table_bootstraps_collapse_to_single_table() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/shared.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {}
+            "#,
+        );
+        let command_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/sh_commands.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {}
+
+                local typeTable = ix.type
+            "#,
+        );
+
+        let ty = local_name_type(&mut ws, command_file, "typeTable");
+        let display = ws.humanize_type(ty.clone());
+
+        assert_eq!(display, "table");
+        assert_eq!(
+            empty_table_bootstrap_branch_count(ws.analysis.compilation.get_db(), &ty),
+            1,
+            "expected repeated empty guarded bootstraps to collapse to one table branch, got {display}"
+        );
+    }
+
+    #[test]
+    fn test_guarded_nested_table_redefinition_appends_rhs_fields_across_files() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/core/sh_util.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {
+                    text = 4,
+                }
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix/gamemode/shared.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {
+                    number = 8,
+                }
+            "#,
+        );
+        let command_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/sh_commands.lua",
+            r#"
+                local textType = ix.type.text
+                local numberType = ix.type.number
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(command_file, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected UndefinedField diagnostics: {undefined_fields:#?}"
+        );
+    }
+
+    #[test]
+    fn test_guarded_table_redefinition_keeps_known_non_table_or_semantics() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "gamemodes/helix/gamemode/shared.lua",
+            r#"
+                ix = "already initialized"
+                ix = ix or { gui = {} }
+                local panel = ix.gui
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+                    && diagnostic.message == "Undefined field `gui`. "
+            }),
+            "expected UndefinedField for gui on known non-table guard, got {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_global_path_table_member_fallback_respects_local_shadow() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "global_util.lua",
+            r#"
+                ix = ix or { util = {} }
+                function ix.util.Include(fileName)
+                end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "shadow.lua",
+            r#"
+                local ix = { util = {} }
+                ix.util.Include("missing.lua")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_field
+                    && diagnostic.message == "Undefined field `Include`. "),
+            "expected UndefinedField for local shadow, got {diagnostics:#?}"
         );
     }
 
@@ -2988,6 +3677,149 @@ mod test {
                 .any(|diagnostic| diagnostic.code == contact_pos_code
                     && diagnostic.message == contact_pos_message),
             "expected no post-reindex undefined-field for contactPos, got {after_reindex_diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_panel_self_assignment_to_table_field_preserves_panel_type_cross_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/cl_init.lua",
+            r#"
+                ix = ix or { gui = {} }
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix-hl2rp/schema/derma/cl_combinedisplay.lua",
+            r#"
+            ---@class DPanel
+            ---@field Remove fun(self: DPanel)
+
+            local PANEL = {}
+
+            function PANEL:Init()
+                ix.gui.combine = self
+            end
+
+            function PANEL:Paint(w, h)
+            end
+
+            vgui.Register("ixCombineDisplay", PANEL, "DPanel")
+            "#,
+        );
+        let hooks_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/cl_hooks.lua",
+            r#"
+                if (IsValid(ix.gui.combine)) then
+                    ix.gui.combine:Remove()
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(hooks_file, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected UndefinedField diagnostics for panel self-assignment: {undefined_fields:#?}"
+        );
+    }
+
+    #[test]
+    fn test_panel_self_assignment_to_table_field_type_is_panel_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/cl_init.lua",
+            r#"
+                ix = ix or { gui = {} }
+            "#,
+        );
+        let panel_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/derma/cl_combinedisplay.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                ix.gui.combine = self
+            end
+
+            function PANEL:Paint(w, h)
+            end
+
+            vgui.Register("ixCombineDisplay", PANEL, "DPanel")
+            "#,
+        );
+
+        let combine_type = assign_value_type(&mut ws, panel_file, "ix.gui.combine");
+        let display = ws.humanize_type(combine_type);
+        assert!(
+            display.contains("ixCombineDisplay"),
+            "expected ix.gui.combine to be typed as ixCombineDisplay, got: {display}"
+        );
+    }
+
+    #[test]
+    fn test_panel_self_assignment_to_table_field_type_visible_cross_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/cl_init.lua",
+            r#"
+                ix = ix or { gui = {} }
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix-hl2rp/schema/derma/cl_combinedisplay.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                ix.gui.combine = self
+            end
+
+            function PANEL:Paint(w, h)
+            end
+
+            vgui.Register("ixCombineDisplay", PANEL, "DPanel")
+            "#,
+        );
+        let hooks_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/cl_hooks.lua",
+            r#"
+                local c = ix.gui.combine
+            "#,
+        );
+
+        let combine_type = local_name_type(&mut ws, hooks_file, "c");
+        let display = ws.humanize_type(combine_type);
+        assert!(
+            display.contains("ixCombineDisplay"),
+            "expected cross-file ix.gui.combine to be typed as ixCombineDisplay, got: {display}"
         );
     }
 }

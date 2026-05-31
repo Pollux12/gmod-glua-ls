@@ -11,9 +11,9 @@ use crate::{
         infer_index::infer_member_by_member_key,
         narrow::{
             ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
-            get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow, gmod_null_type,
-            gmod_null_type_is_defined, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
-            remove_gmod_null_type, var_ref_id::get_var_expr_var_ref_id,
+            get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow, narrow_down_type,
+            narrow_false_or_nil, remove_false_or_nil, remove_gmod_null_type,
+            var_ref_id::get_var_expr_var_ref_id,
         },
     },
 };
@@ -172,20 +172,6 @@ pub fn get_type_at_call_expr(
             return Ok(ResultTypeOrContinue::Result(isvalid_type));
         }
 
-        if let Some(istype_type) = try_narrow_istype_function(
-            db,
-            tree,
-            cache,
-            root,
-            var_ref_id,
-            flow_node,
-            &call_expr_ref,
-            &prefix_expr_ref,
-            condition_flow,
-        )? {
-            return Ok(ResultTypeOrContinue::Result(istype_type));
-        }
-
         if let Some(fallback_target_expr) =
             resolve_builtin_name_fallback_target(db, cache, root, &prefix_expr_ref)
         {
@@ -215,20 +201,6 @@ pub fn get_type_at_call_expr(
                 condition_flow,
             )? {
                 return Ok(ResultTypeOrContinue::Result(isvalid_type));
-            }
-
-            if let Some(istype_type) = try_narrow_istype_function(
-                db,
-                tree,
-                cache,
-                root,
-                var_ref_id,
-                flow_node,
-                &call_expr_ref,
-                &fallback_target_expr,
-                condition_flow,
-            )? {
-                return Ok(ResultTypeOrContinue::Result(istype_type));
             }
         }
     }
@@ -315,7 +287,7 @@ fn is_builtin_or_unresolved_global_name(
     };
 
     let helper_name = helper_name.as_str();
-    if helper_name != "IsValid" && !ISTYPE_FUNCTION_NAMES.contains(&helper_name) {
+    if helper_name != "IsValid" && helper_name != "isfunction" {
         return false;
     }
 
@@ -517,19 +489,39 @@ fn get_type_at_call_expr_by_type_guard(
         _ => return Ok(ResultTypeOrContinue::Continue),
     };
 
+    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+
     match condition_flow {
-        InferConditionFlow::TrueCondition => Ok(ResultTypeOrContinue::Result(guard_type)),
-        InferConditionFlow::FalseCondition => {
-            let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-            let antecedent_type =
-                get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
-            Ok(ResultTypeOrContinue::Result(TypeOps::Remove.apply(
-                db,
-                &antecedent_type,
-                &guard_type,
-            )))
-        }
+        InferConditionFlow::TrueCondition => Ok(ResultTypeOrContinue::Result(
+            narrow_type_guard_true_branch(db, antecedent_type, guard_type),
+        )),
+        InferConditionFlow::FalseCondition => Ok(ResultTypeOrContinue::Result(
+            TypeOps::Remove.apply(db, &antecedent_type, &guard_type),
+        )),
     }
+}
+
+fn narrow_type_guard_true_branch(
+    db: &DbIndex,
+    antecedent_type: LuaType,
+    guard_type: LuaType,
+) -> LuaType {
+    if guard_type.is_nullable() {
+        return guard_type;
+    }
+
+    if let Some(narrowed_type) =
+        narrow_down_type(db, antecedent_type.clone(), guard_type.clone(), None)
+    {
+        return narrowed_type;
+    }
+
+    if antecedent_type.is_unknown() || antecedent_type.is_any() {
+        return guard_type;
+    }
+
+    remove_false_or_nil(antecedent_type)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -840,150 +832,4 @@ fn promote_unknown_isvalid_success_to_any(narrowed_type: LuaType) -> LuaType {
     } else {
         narrowed_type
     }
-}
-
-/// Known GMod type-checking function names handled by name-based narrowing fallback.
-const ISTYPE_FUNCTION_NAMES: &[&str] = &[
-    "isfunction",
-    "isstring",
-    "isnumber",
-    "isbool",
-    "istable",
-    "isentity",
-    "isvector",
-    "isangle",
-    "ismatrix",
-    "ispanel",
-    "IsColor",
-    "IsEntity",
-];
-
-fn resolve_istype_guard_target_type(
-    db: &DbIndex,
-    cache: &LuaInferCache,
-    helper_name: &str,
-) -> Option<LuaType> {
-    let primitive_type = match helper_name {
-        "isfunction" => Some(LuaType::Function),
-        "isstring" => Some(LuaType::String),
-        "isnumber" => Some(LuaType::Number),
-        "isbool" => Some(LuaType::Boolean),
-        "istable" => Some(LuaType::Table),
-        _ => None,
-    };
-
-    if let Some(primitive_type) = primitive_type {
-        return Some(primitive_type);
-    }
-
-    let type_name = match helper_name {
-        "isentity" | "IsEntity" => return resolve_entity_guard_target_type(db, cache),
-        "isvector" => "Vector",
-        "isangle" => "Angle",
-        "ismatrix" => "VMatrix",
-        "ispanel" => "Panel",
-        "IsColor" => "Color",
-        _ => return None,
-    };
-
-    db.get_type_index()
-        .find_type_decl(cache.get_file_id(), type_name)
-        .map(|decl| LuaType::Ref(decl.get_id()))
-}
-
-fn resolve_entity_guard_target_type(db: &DbIndex, cache: &LuaInferCache) -> Option<LuaType> {
-    let entity_type = db
-        .get_type_index()
-        .find_type_decl(cache.get_file_id(), "Entity")
-        .map(|decl| LuaType::Ref(decl.get_id()))?;
-
-    if gmod_null_type_is_defined(db) {
-        return Some(TypeOps::Union.apply(db, &entity_type, &gmod_null_type()));
-    }
-
-    Some(entity_type)
-}
-
-fn narrow_istype_true_branch(
-    db: &DbIndex,
-    antecedent_type: LuaType,
-    narrow_target: &LuaType,
-) -> LuaType {
-    if let Some(narrowed_type) =
-        narrow_down_type(db, antecedent_type.clone(), narrow_target.clone(), None)
-    {
-        return narrowed_type;
-    }
-
-    if antecedent_type.is_unknown() || antecedent_type.is_any() {
-        return narrow_target.clone();
-    }
-
-    remove_false_or_nil(antecedent_type)
-}
-
-/// Detect `isfunction(x)`, `isstring(x)`, etc. calls and narrow the argument type.
-/// This handles the simple variable argument case that `try_narrow_isfunction_member`
-/// doesn't cover (it only handles `isfunction(obj.member)`).
-#[allow(clippy::too_many_arguments)]
-fn try_narrow_istype_function(
-    db: &DbIndex,
-    tree: &FlowTree,
-    cache: &mut LuaInferCache,
-    root: &LuaChunk,
-    var_ref_id: &VarRefId,
-    flow_node: &FlowNode,
-    call_expr: &LuaCallExpr,
-    prefix_expr: &LuaExpr,
-    condition_flow: InferConditionFlow,
-) -> Result<Option<LuaType>, InferFailReason> {
-    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
-        return Ok(None);
-    };
-
-    let Some(name) = name_expr.get_name_text() else {
-        return Ok(None);
-    };
-
-    if !ISTYPE_FUNCTION_NAMES.contains(&name.as_str()) {
-        return Ok(None);
-    }
-
-    if !is_builtin_or_unresolved_global_name(db, cache, name_expr) {
-        return Ok(None);
-    }
-
-    let Some(first_arg) = call_expr
-        .get_args_list()
-        .and_then(|args| args.get_args().next())
-    else {
-        return Ok(None);
-    };
-
-    // Check if the first argument matches the variable we're narrowing
-    let Some(arg_ref_id) = get_var_expr_var_ref_id(db, cache, first_arg) else {
-        return Ok(None);
-    };
-    if arg_ref_id != *var_ref_id {
-        return Ok(None);
-    }
-
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
-    let narrow_target = resolve_istype_guard_target_type(db, cache, &name);
-
-    let result_type = match condition_flow {
-        InferConditionFlow::TrueCondition => match narrow_target {
-            Some(ref narrow_target) => {
-                narrow_istype_true_branch(db, antecedent_type, narrow_target)
-            }
-            None => remove_false_or_nil(antecedent_type),
-        },
-        InferConditionFlow::FalseCondition => match narrow_target {
-            Some(ref narrow_target) => TypeOps::Remove.apply(db, &antecedent_type, narrow_target),
-            None => antecedent_type,
-        },
-    };
-
-    Ok(Some(result_type))
 }

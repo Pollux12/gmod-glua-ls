@@ -60,6 +60,9 @@ pub async fn on_did_rename_files_handler(
                 analysis.update_file_by_uri(&rename.new_uri, Some(text));
             }
         }
+        context
+            .file_diagnostic()
+            .invalidate_shared_diagnostic_data();
         drop(analysis);
 
         let analysis = context.analysis().read().await;

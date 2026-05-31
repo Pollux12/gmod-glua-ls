@@ -91,6 +91,17 @@ impl LuaMemberIndexItem {
         caller_file_id: &FileId,
         caller_position: TextSize,
     ) -> Vec<LuaMemberId> {
+        if let LuaMemberIndexItem::One(member_id) = self {
+            if let Some(visible_member_id) = visible_single_member_id_with_realm_at_offset(
+                db,
+                *member_id,
+                caller_file_id,
+                caller_position,
+            ) {
+                return vec![visible_member_id];
+            }
+        }
+
         let member_ids = self.get_member_ids();
         let mut visible_member_ids =
             visible_member_ids_at_offset(db, &member_ids, caller_file_id, caller_position);
@@ -123,11 +134,72 @@ impl LuaMemberIndexItem {
         )
     }
 
+    pub fn visible_member_ids_with_realm_at_offset_from_history(
+        &self,
+        db: &DbIndex,
+        caller_file_id: &FileId,
+        caller_position: TextSize,
+    ) -> Vec<LuaMemberId> {
+        let member_ids = self.get_member_ids();
+        let visible_member_ids =
+            visible_member_ids_at_offset(db, &member_ids, caller_file_id, caller_position);
+        let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &visible_member_ids);
+        select_member_ids_by_workspace_and_realm(
+            db,
+            caller_file_id,
+            priority_tiers,
+            db.get_gmod_infer_index()
+                .get_realm_at_offset(caller_file_id, caller_position),
+        )
+    }
+
     pub fn get_member_ids(&self) -> Vec<LuaMemberId> {
         match self {
             LuaMemberIndexItem::One(member_id) => vec![*member_id],
             LuaMemberIndexItem::Many(member_ids) => member_ids.clone(),
         }
+    }
+}
+
+fn visible_single_member_id_with_realm_at_offset(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    caller_file_id: &FileId,
+    caller_position: TextSize,
+) -> Option<LuaMemberId> {
+    if !member_visible_at_offset(db, member_id, caller_file_id, caller_position)
+        || should_expand_function_assignment_history(
+            db,
+            &[member_id],
+            caller_file_id,
+            caller_position,
+        )
+    {
+        return None;
+    }
+
+    let module_index = db.get_module_index();
+    if let Some(caller_workspace_id) = module_index.get_workspace_id(*caller_file_id) {
+        let candidate_workspace_id = module_index
+            .get_workspace_id(member_id.file_id)
+            .unwrap_or(crate::WorkspaceId::MAIN);
+        module_index.workspace_resolution_priority(caller_workspace_id, candidate_workspace_id)?;
+    }
+
+    if !db.get_emmyrc().gmod.enabled {
+        return Some(member_id);
+    }
+
+    let caller_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(caller_file_id, caller_position);
+    let member_realm = member_effective_realm(db.get_gmod_infer_index(), &member_id);
+    if is_realm_compatible(caller_realm, member_realm)
+        || !matches!(caller_realm, GmodRealm::Client | GmodRealm::Server)
+    {
+        Some(member_id)
+    } else {
+        None
     }
 }
 
@@ -152,31 +224,12 @@ fn is_function_scoped_assignment_file_define(db: &DbIndex, member_id: LuaMemberI
     let Some(member) = db.get_member_index().get_member(&member_id) else {
         return false;
     };
-    if !member.get_feature().is_file_define()
-        || member.get_syntax_id().get_kind() != glua_parser::LuaSyntaxKind::IndexExpr
-    {
-        return false;
-    }
-
-    let Some(root) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
-        return false;
-    };
-    let root = root.get_red_root();
-    let Some(token) = root
-        .token_at_offset(member.get_range().start())
-        .right_biased()
-    else {
-        return false;
-    };
-
-    token.parent_ancestors().any(|ancestor| {
-        matches!(
-            ancestor.kind().into(),
-            glua_parser::LuaSyntaxKind::FuncStat
-                | glua_parser::LuaSyntaxKind::LocalFuncStat
-                | glua_parser::LuaSyntaxKind::ClosureExpr
-        )
-    })
+    member.get_feature().is_file_define()
+        && member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
+        && db
+            .get_member_index()
+            .member_function_scope_range(member_id)
+            .is_some()
 }
 
 fn member_assignment_shares_enclosing_function(
@@ -189,33 +242,12 @@ fn member_assignment_shares_enclosing_function(
         return false;
     }
 
-    let Some(member) = db.get_member_index().get_member(&member_id) else {
-        return false;
-    };
-    let member_function =
-        enclosing_function_range_at_position(db, member_id.file_id, member.get_range().start());
-    let caller_function =
-        enclosing_function_range_at_position(db, *caller_file_id, caller_position);
+    let member_function = db.get_member_index().member_function_scope_range(member_id);
+    let caller_function = db
+        .get_member_index()
+        .enclosing_function_scope_range(*caller_file_id, caller_position);
 
     member_function.is_some() && member_function == caller_function
-}
-
-fn enclosing_function_range_at_position(
-    db: &DbIndex,
-    file_id: FileId,
-    position: TextSize,
-) -> Option<rowan::TextRange> {
-    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
-    let token = root.token_at_offset(position).right_biased()?;
-    token.parent_ancestors().find_map(|ancestor| {
-        matches!(
-            ancestor.kind().into(),
-            glua_parser::LuaSyntaxKind::FuncStat
-                | glua_parser::LuaSyntaxKind::LocalFuncStat
-                | glua_parser::LuaSyntaxKind::ClosureExpr
-        )
-        .then(|| ancestor.text_range())
-    })
 }
 
 fn visible_member_ids_at_offset(
@@ -407,7 +439,13 @@ fn resolve_member_type(
                 });
             let should_widen_file_defines =
                 !should_prefer_doc_file_defines && members.len() > 1 && all_file_defines;
+            let all_non_overwriting_assignment_file_defines = all_file_defines
+                && members.iter().all(|member| {
+                    db.get_member_index()
+                        .is_non_overwriting_assignment_member(member.get_id())
+                });
             let should_widen_table_literals = should_widen_file_defines
+                && !all_non_overwriting_assignment_file_defines
                 && members.iter().all(|member| {
                     db.get_type_index()
                         .get_type_cache(&member.get_id().into())
@@ -452,6 +490,11 @@ fn resolve_member_type(
                     {
                         let base_typ = prune_non_generic_callables_for_adapter_merge(db, &typ);
                         typ = TypeOps::Union.apply(db, &base_typ, &adapters);
+                    }
+                    if all_non_overwriting_assignment_file_defines
+                        && !should_prefer_doc_file_defines
+                    {
+                        typ = crate::prune_redundant_guarded_table_bootstrap_type(db, typ);
                     }
                     Ok(typ)
                 }
@@ -917,10 +960,11 @@ fn supplement_function_assignment_shape_members(
         return;
     }
 
+    let existing = result.iter().copied().collect::<HashSet<_>>();
     let supplements = fallback_member_ids
         .iter()
         .copied()
-        .filter(|member_id| !result.contains(member_id))
+        .filter(|member_id| !existing.contains(member_id))
         .filter(|member_id| is_function_scoped_assignment_file_define(db, *member_id))
         .filter(|member_id| !member_type_is_uninformative(db, *member_id))
         .collect::<Vec<_>>();
@@ -1606,6 +1650,92 @@ mod tests {
     }
 
     #[test]
+    fn single_member_visibility_matches_many_member_realm_filtering() {
+        let mut db = make_db();
+        let caller_file = FileId::new(10);
+        let server_file = FileId::new(11);
+        let server_member = make_member_id(server_file, 1);
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        db.get_module_index_mut().update_config(Arc::new(emmyrc));
+        set_file_realms(
+            &mut db,
+            &[
+                (caller_file, GmodRealm::Client),
+                (server_file, GmodRealm::Server),
+            ],
+        );
+
+        let single = LuaMemberIndexItem::One(server_member)
+            .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
+        let many = LuaMemberIndexItem::Many(vec![server_member])
+            .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
+
+        assert_eq!(single, many);
+        assert!(single.is_empty());
+    }
+
+    #[test]
+    fn single_member_visibility_matches_many_member_compatible_realm() {
+        let mut db = make_db();
+        let caller_file = FileId::new(10);
+        let shared_file = FileId::new(11);
+        let shared_member = make_member_id(shared_file, 1);
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        db.get_module_index_mut().update_config(Arc::new(emmyrc));
+        set_file_realms(
+            &mut db,
+            &[
+                (caller_file, GmodRealm::Client),
+                (shared_file, GmodRealm::Shared),
+            ],
+        );
+
+        let single = LuaMemberIndexItem::One(shared_member)
+            .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
+        let many = LuaMemberIndexItem::Many(vec![shared_member])
+            .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
+
+        assert_eq!(single, many);
+    }
+
+    #[test]
+    fn single_member_visibility_matches_many_member_workspace_isolation() {
+        let mut db = make_db();
+        let module_index = db.get_module_index_mut();
+
+        let workspace_a = WorkspaceId::MAIN;
+        let workspace_b = WorkspaceId { id: 3 };
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectA").into(),
+            workspace_a,
+            WorkspaceKind::Main,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Users/username/ProjectB").into(),
+            workspace_b,
+            WorkspaceKind::Main,
+        );
+
+        let caller_file = FileId::new(10);
+        module_index.add_module_by_path(caller_file, "C:/Users/username/ProjectA/init.lua");
+        let isolated_file = FileId::new(11);
+        module_index.add_module_by_path(isolated_file, "C:/Users/username/ProjectB/init.lua");
+        let isolated_member = make_member_id(isolated_file, 1);
+
+        let single = LuaMemberIndexItem::One(isolated_member)
+            .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
+        let many = LuaMemberIndexItem::Many(vec![isolated_member])
+            .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
+
+        assert_eq!(single, many);
+        assert!(single.is_empty());
+    }
+
+    #[test]
     fn visible_member_ids_at_offset_excludes_later_same_file_file_defines() {
         let mut db = make_db();
         let caller_file = FileId::new(10);
@@ -1713,6 +1843,56 @@ mod tests {
             item.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
 
         assert_eq!(visible, vec![earlier_member]);
+    }
+
+    #[test]
+    fn visible_member_ids_from_history_matches_expanded_assignment_history() {
+        let mut db = make_db();
+        let caller_file = FileId::new(10);
+        let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
+        let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("PreExpandedHistoryOwner"));
+        let key = LuaMemberKey::Name("field".into());
+
+        db.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                earlier_member,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+        db.get_member_index_mut().add_member(
+            owner.clone(),
+            LuaMember::new(
+                later_member,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        let latest_item = db
+            .get_member_index()
+            .get_member_item(&owner, &key)
+            .expect("runtime assignments collapse to the latest member");
+        let pre_expanded_history = LuaMemberIndexItem::Many(vec![earlier_member, later_member]);
+
+        let expanded_visible = latest_item.visible_member_ids_with_realm_at_offset(
+            &db,
+            &caller_file,
+            TextSize::new(20),
+        );
+        let history_visible = pre_expanded_history
+            .visible_member_ids_with_realm_at_offset_from_history(
+                &db,
+                &caller_file,
+                TextSize::new(20),
+            );
+
+        assert_eq!(expanded_visible, vec![earlier_member]);
+        assert_eq!(history_visible, expanded_visible);
     }
 
     #[test]

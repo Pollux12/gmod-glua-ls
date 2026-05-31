@@ -22,6 +22,7 @@ use glua_parser::{
 };
 pub(crate) use infer::check_iter_var_range;
 pub use infer::infer_index_expr;
+pub(crate) use infer::resolve_decl_backed_global_path_member_type;
 use infer::{infer_bind_value_type, infer_call_arg_expr_list_types, infer_expr_list_types};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
 use lsp_types::Uri;
@@ -64,6 +65,7 @@ pub use infer::VarRefId;
 pub use infer::infer_call_expr_func;
 pub(crate) use infer::infer_expr;
 pub use infer::infer_param;
+pub(crate) use infer::remove_false_or_nil;
 pub(crate) use infer::{contains_gmod_null_type, get_var_expr_var_ref_id};
 use overload_resolve::resolve_signature;
 pub use semantic_info::SemanticDeclLevel;

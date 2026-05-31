@@ -7,16 +7,17 @@ use std::{
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaRepeatStat,
-    LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat,
+    LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat, PathTrait,
 };
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, DiagnosticCode, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaMemberKey,
-    LuaMemberOwner, LuaType, LuaTypeDeclId, LuaUnionType, SemanticModel, check_type_compact,
-    enum_variable_is_param, get_keyof_members,
+    DbIndex, DiagnosticCode, FileId, GlobalId, InferFailReason, LuaAliasCallKind, LuaAliasCallType,
+    LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, LuaUnionType, SemanticModel,
+    check_type_compact, enum_variable_is_param, get_keyof_members,
     semantic::{
         infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
+        resolve_decl_backed_global_path_member_type,
     },
 };
 
@@ -566,6 +567,10 @@ fn is_valid_member_inner(
                     return Some(());
                 }
                 Err(_) => {}
+            }
+
+            if is_valid_global_path_table_member(semantic_model, index_expr, &key) {
+                return Some(());
             }
         }
         // In GMod mode, strings support numeric byte indexing (e.g. `str[2]`, `str[i]`).
@@ -1181,6 +1186,89 @@ fn table_generic_supports_index_key(
     };
 
     check_type_compact(semantic_model.get_db(), key_type, &access_key_type).is_ok()
+}
+
+fn is_valid_global_path_table_member(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+    key: &LuaMemberKey,
+) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(prefix_path) = global_expr_access_path(
+        semantic_model.get_db(),
+        semantic_model.get_file_id(),
+        &prefix_expr,
+    ) else {
+        return false;
+    };
+
+    let db = semantic_model.get_db();
+    let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&prefix_path));
+    let Some(member_item) = db.get_member_index().get_member_item(&owner, key) else {
+        return false;
+    };
+
+    if member_item
+        .resolve_type_with_realm_at_offset(
+            db,
+            &semantic_model.get_file_id(),
+            index_expr.get_position(),
+        )
+        .is_ok()
+    {
+        return true;
+    }
+
+    resolve_decl_backed_global_path_member_type(
+        db,
+        member_item,
+        &semantic_model.get_file_id(),
+        key.clone(),
+        Some(index_expr.get_position()),
+    )
+    .is_some()
+}
+
+fn global_expr_access_path(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Option<String> {
+    if !expr_root_is_global(db, file_id, expr) {
+        return None;
+    }
+
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn expr_root_is_global(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {
+    let Some(root_name) = expr_root_name(expr) else {
+        return false;
+    };
+
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, root_name.get_range())
+    else {
+        return true;
+    };
+
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_global() || decl.is_module_scoped())
+}
+
+fn expr_root_name(expr: &LuaExpr) -> Option<glua_parser::LuaNameExpr> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => Some(name_expr.clone()),
+        LuaExpr::IndexExpr(index_expr) => {
+            let prefix_expr = index_expr.get_prefix_expr()?;
+            expr_root_name(&prefix_expr)
+        }
+        _ => None,
+    }
 }
 
 fn check_enum_is_param(

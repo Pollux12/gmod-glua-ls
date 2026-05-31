@@ -134,6 +134,68 @@ impl VirtualWorkspace {
             .expect("File ID must be present")
     }
 
+    pub fn def_gmod_type_predicates(&mut self) -> FileId {
+        self.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<function>
+            function isfunction(value) end
+
+            ---@param value any
+            ---@return TypeGuard<string>
+            function isstring(value) end
+
+            ---@param value any
+            ---@return TypeGuard<number>
+            function isnumber(value) end
+
+            ---@param value any
+            ---@return TypeGuard<boolean>
+            function isbool(value) end
+
+            ---@param value any
+            ---@return TypeGuard<table>
+            function istable(value) end
+
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            function isentity(value) end
+
+            ---@class Vector
+
+            ---@param value any
+            ---@return TypeGuard<Vector>
+            function isvector(value) end
+
+            ---@class Angle
+
+            ---@param value any
+            ---@return TypeGuard<Angle>
+            function isangle(value) end
+
+            ---@class VMatrix
+
+            ---@param value any
+            ---@return TypeGuard<VMatrix>
+            function ismatrix(value) end
+
+            ---@class Panel
+
+            ---@param value any
+            ---@return TypeGuard<Panel>
+            function ispanel(value) end
+
+            ---@class Color
+
+            ---@param value any
+            ---@return TypeGuard<Color>
+            function IsColor(value) end
+            "#,
+        )
+    }
+
     pub fn def_file(&mut self, file_name: &str, content: &str) -> FileId {
         let uri = self.virtual_url_generator.new_uri(file_name);
 

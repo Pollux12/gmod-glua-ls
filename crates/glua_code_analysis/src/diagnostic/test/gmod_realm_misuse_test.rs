@@ -5,6 +5,28 @@ mod tests {
     use lsp_types::{DiagnosticSeverity, NumberOrString};
     use tokio_util::sync::CancellationToken;
 
+    fn enable_only_realm_mismatch_diagnostics(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .diagnostics
+            .enables
+            .push(DiagnosticCode::GmodRealmMismatch);
+        emmyrc
+            .diagnostics
+            .enables
+            .push(DiagnosticCode::GmodRealmMismatchHeuristic);
+        for diagnostic_code in DiagnosticCode::all().iter() {
+            if !matches!(
+                diagnostic_code,
+                DiagnosticCode::GmodRealmMismatch | DiagnosticCode::GmodRealmMismatchHeuristic
+            ) {
+                emmyrc.diagnostics.disable.push(*diagnostic_code);
+            }
+        }
+        ws.update_emmyrc(emmyrc);
+    }
+
     #[gtest]
     fn test_disabled_when_gmod_off() {
         let mut ws = VirtualWorkspace::new();
@@ -1120,6 +1142,147 @@ mod tests {
                 .iter()
                 .filter(|d| d.code == mismatch_code || d.code == heuristic_code)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[gtest]
+    fn test_no_mismatch_for_entity_owner_call_to_player_method_defined_on_server_and_client() {
+        let mut ws = VirtualWorkspace::new();
+        enable_only_realm_mismatch_diagnostics(&mut ws);
+
+        ws.def_file(
+            "lua/autorun/sh_meta_defs.lua",
+            r#"
+                ---@class Entity
+                ---@class Player : Entity
+                ---@class SWEP
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return (definition) T
+                function _G.FindMetaTable(metaName) end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/server/sv_networking.lua",
+            r#"
+                local playerMeta = FindMetaTable("Player")
+
+                function playerMeta:GetLocalVar(key, default)
+                    return default
+                end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/client/cl_networking.lua",
+            r#"
+                local entityMeta = FindMetaTable("Entity")
+                local playerMeta = FindMetaTable("Player")
+
+                function entityMeta:GetNetVar(key, default)
+                    return default
+                end
+
+                playerMeta.GetLocalVar = entityMeta.GetNetVar
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/weapons/ix_hands.lua",
+            r#"
+                ---@return Entity
+                function SWEP:GetOwner() end
+
+                function SWEP:Think()
+                    if SERVER then
+                        self:GetOwner():GetLocalVar("bIsHoldingObject", true)
+                    end
+                end
+            "#,
+        );
+
+        let snapshots = ws.run_diagnostics_with_shared_snapshots(&[file_id]);
+        let heuristic_code = Some(
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
+        );
+        let strict_code = Some(DiagnosticCode::GmodRealmMismatch.get_name().to_string());
+        assert!(
+            !snapshots.iter().any(|diagnostic| {
+                diagnostic.code == heuristic_code || diagnostic.code == strict_code
+            }),
+            "Expected no realm mismatch for an Entity-typed owner call to a Player method available on client and server, got: {:?}",
+            snapshots
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == heuristic_code || diagnostic.code == strict_code
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[gtest]
+    fn test_mismatch_for_entity_owner_call_to_client_only_player_method() {
+        let mut ws = VirtualWorkspace::new();
+        enable_only_realm_mismatch_diagnostics(&mut ws);
+
+        ws.def_file(
+            "lua/autorun/sh_meta_defs.lua",
+            r#"
+                ---@class Entity
+                ---@class Player : Entity
+                ---@class SWEP
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return (definition) T
+                function _G.FindMetaTable(metaName) end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/client/cl_networking.lua",
+            r#"
+                local entityMeta = FindMetaTable("Entity")
+                local playerMeta = FindMetaTable("Player")
+
+                function entityMeta:GetNetVar(key, default)
+                    return default
+                end
+
+                playerMeta.GetLocalVar = entityMeta.GetNetVar
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/weapons/ix_hands.lua",
+            r#"
+                ---@return Entity
+                function SWEP:GetOwner() end
+
+                function SWEP:Think()
+                    if SERVER then
+                        self:GetOwner():GetLocalVar("bIsHoldingObject", true)
+                    end
+                end
+            "#,
+        );
+
+        let snapshots = ws.run_diagnostics_with_shared_snapshots(&[file_id]);
+        let heuristic_code = Some(
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
+        );
+        assert!(
+            snapshots
+                .iter()
+                .any(|diagnostic| diagnostic.code == heuristic_code),
+            "Expected a realm mismatch when the Player GetLocalVar candidate is client-only, got: {:?}",
+            snapshots
         );
     }
 

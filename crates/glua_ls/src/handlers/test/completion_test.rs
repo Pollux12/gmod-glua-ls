@@ -205,6 +205,17 @@ mod tests {
     #[gtest]
     fn test_completion_undefined_global_isstring_guard_offers_string_methods() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+                ---Returns whether the given value is a string.
+                ---@realm shared
+                ---@realm menu
+                ---@source https://wiki.facepunch.com/gmod/Global.isstring
+                ---@param var any
+                ---@return TypeGuard<string> isString # Whether the value is a string.
+                function _G.isstring(var) end
+            "#,
+        );
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 if isstring(testVar2) then ---@diagnostic disable-line: undefined-global

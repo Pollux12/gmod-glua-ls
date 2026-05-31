@@ -258,6 +258,7 @@ mod test {
     #[test]
     fn test_isstring_guard_narrows_undefined_global_expr_to_string() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         let ty = infer_last_name_expr_type(
             &mut ws,
             r#"
@@ -274,6 +275,7 @@ mod test {
     #[test]
     fn test_istable_guard_preserves_annotated_specific_table_type() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         ws.def(
             r#"
             ---@class MyData
@@ -300,6 +302,7 @@ mod test {
     #[test]
     fn test_isstring_guard_preserves_annotated_string_subtype() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         ws.def(
             r#"
             ---@class UserId: string
@@ -325,6 +328,7 @@ mod test {
     #[test]
     fn test_istable_guard_does_not_broaden_incompatible_known_type() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
 
         let ty = infer_last_name_expr_type(
             &mut ws,
@@ -364,6 +368,97 @@ mod test {
             "Type should be Any after truthy guard, got: {:?}",
             ty
         );
+    }
+
+    #[test]
+    fn test_gmod_isplayer_method_narrows_entity_to_player() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+        "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@param entity Entity
+            local function test(entity)
+                if entity:IsPlayer() then
+                    print(entity)
+                end
+            end
+        "#,
+            "entity",
+        );
+
+        assert_eq!(ty, ws.ty("Player"));
+    }
+
+    #[test]
+    fn test_gmod_isplayer_method_narrows_nullable_entity_to_player() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+        "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@param entity Entity?
+            local function test(entity)
+                if entity:IsPlayer() then
+                    print(entity)
+                end
+            end
+        "#,
+            "entity",
+        );
+
+        assert_eq!(ty, ws.ty("Player"));
+    }
+
+    #[test]
+    fn test_gmod_isplayer_method_narrows_entity_union_to_player() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class CSEnt : Entity
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+        "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@param entity Entity|CSEnt
+            local function test(entity)
+                if entity:IsPlayer() then
+                    print(entity)
+                end
+            end
+        "#,
+            "entity",
+        );
+
+        assert_eq!(ty, ws.ty("Player"));
     }
 
     #[test]

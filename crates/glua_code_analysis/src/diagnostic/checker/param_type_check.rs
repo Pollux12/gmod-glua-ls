@@ -716,6 +716,10 @@ fn try_add_diagnostic(
         return;
     }
 
+    if is_any_only_uninformative_or_nil(expr_type) {
+        return;
+    }
+
     let strict_coercion = semantic_model.get_emmyrc().strict.strict_type_coercion;
     if !strict_coercion && should_suppress_lua_primitive_coercion(param_type, expr_type) {
         return;
@@ -1012,6 +1016,31 @@ fn strip_nullable_param(ty: &LuaType) -> &LuaType {
         }
     }
     ty
+}
+
+fn is_any_only_uninformative_or_nil(ty: &LuaType) -> bool {
+    contains_any(ty) && is_only_any_unknown_or_nil(ty)
+}
+
+fn contains_any(ty: &LuaType) -> bool {
+    match ty {
+        LuaType::Any => true,
+        LuaType::Union(union) => union.into_vec().iter().any(contains_any),
+        LuaType::MultiLineUnion(union) => union.get_unions().iter().any(|(ty, _)| contains_any(ty)),
+        _ => false,
+    }
+}
+
+fn is_only_any_unknown_or_nil(ty: &LuaType) -> bool {
+    match ty {
+        LuaType::Any | LuaType::Unknown | LuaType::Nil => true,
+        LuaType::Union(union) => union.into_vec().iter().all(is_only_any_unknown_or_nil),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(ty, _)| is_only_any_unknown_or_nil(ty)),
+        _ => false,
+    }
 }
 
 /// Returns `true` if `expr_type` can be safely passed where `param_type` is expected,

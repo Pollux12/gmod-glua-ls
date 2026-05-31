@@ -409,7 +409,7 @@ fn member_flags_before_position(
         .map(|member| member.get_id())
         .collect();
     let visible_member_ids = crate::LuaMemberIndexItem::Many(member_ids)
-        .visible_member_ids_with_realm_at_offset(
+        .visible_member_ids_with_realm_at_offset_from_history(
             semantic_model.get_db(),
             &semantic_model.get_file_id(),
             position,

@@ -192,6 +192,7 @@ impl ServerContext {
             200,
             debounced_shutdown.clone(),
             client.clone(),
+            file_diagnostic.shared_diagnostic_data_cache(),
         ));
 
         // Spawn the debounced analysis background loop

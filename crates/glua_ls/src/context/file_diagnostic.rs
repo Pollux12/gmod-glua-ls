@@ -1,13 +1,13 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use glua_code_analysis::{EmmyLuaAnalysis, FileId};
+use glua_code_analysis::{EmmyLuaAnalysis, FileId, SharedDiagnosticData};
 use log::{debug, info, warn};
 use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -22,6 +22,58 @@ struct SuppressedDiagnosticLines {
     expires_at: Instant,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct SharedDiagnosticDataCache {
+    cached: Arc<StdMutex<Option<Arc<SharedDiagnosticData>>>>,
+}
+
+impl SharedDiagnosticDataCache {
+    fn get_or_precompute(&self, analysis: &EmmyLuaAnalysis) -> Arc<SharedDiagnosticData> {
+        if let Ok(mut cache) = self.cached.lock() {
+            if let Some(cached) = cache.as_ref() {
+                return cached.clone();
+            }
+
+            let shared_data = analysis.precompute_diagnostic_shared_data();
+            *cache = Some(shared_data.clone());
+            return shared_data;
+        }
+
+        analysis.precompute_diagnostic_shared_data()
+    }
+
+    fn force_precompute(&self, analysis: &EmmyLuaAnalysis) -> Arc<SharedDiagnosticData> {
+        let shared_data = analysis.precompute_diagnostic_shared_data();
+        if let Ok(mut cache) = self.cached.lock() {
+            *cache = Some(shared_data.clone());
+        }
+        shared_data
+    }
+
+    pub(crate) fn invalidate(&self) {
+        if let Ok(mut cache) = self.cached.lock() {
+            *cache = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_ptr(&self) -> Option<*const SharedDiagnosticData> {
+        self.cached
+            .lock()
+            .expect("shared diagnostic cache mutex should not be poisoned")
+            .as_ref()
+            .map(Arc::as_ptr)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.cached
+            .lock()
+            .expect("shared diagnostic cache mutex should not be poisoned")
+            .is_none()
+    }
+}
+
 #[derive(Clone)]
 pub struct FileDiagnostic {
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -32,6 +84,7 @@ pub struct FileDiagnostic {
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
     cached_file_diagnostics: Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>,
     recently_edited_lines: Arc<Mutex<HashMap<Uri, SuppressedDiagnosticLines>>>,
+    shared_diagnostic_data_cache: SharedDiagnosticDataCache,
 }
 
 impl FileDiagnostic {
@@ -48,8 +101,50 @@ impl FileDiagnostic {
             workspace_diagnostic_token: Arc::new(Mutex::new(None)),
             cached_file_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             recently_edited_lines: Arc::new(Mutex::new(HashMap::new())),
+            shared_diagnostic_data_cache: SharedDiagnosticDataCache::default(),
             status_bar,
         }
+    }
+
+    pub(crate) fn shared_diagnostic_data_cache(&self) -> SharedDiagnosticDataCache {
+        self.shared_diagnostic_data_cache.clone()
+    }
+
+    fn get_or_precompute_shared_diagnostic_data(
+        &self,
+        analysis: &EmmyLuaAnalysis,
+    ) -> Arc<SharedDiagnosticData> {
+        self.shared_diagnostic_data_cache
+            .get_or_precompute(analysis)
+    }
+
+    fn force_precompute_shared_diagnostic_data(
+        &self,
+        analysis: &EmmyLuaAnalysis,
+    ) -> Arc<SharedDiagnosticData> {
+        self.shared_diagnostic_data_cache.force_precompute(analysis)
+    }
+
+    fn diagnose_file_with_shared_data(
+        &self,
+        analysis: &EmmyLuaAnalysis,
+        file_id: FileId,
+        cancel_token: CancellationToken,
+    ) -> Option<Vec<Diagnostic>> {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
+
+        let shared_data = self.get_or_precompute_shared_diagnostic_data(analysis);
+        if cancel_token.is_cancelled() {
+            return None;
+        }
+
+        analysis.diagnose_file_with_shared(file_id, cancel_token, shared_data)
+    }
+
+    pub fn invalidate_shared_diagnostic_data(&self) {
+        self.shared_diagnostic_data_cache.invalidate();
     }
 
     pub async fn note_recent_edit(
@@ -185,6 +280,7 @@ impl FileDiagnostic {
                     }
                     let blocking_analysis = analysis.clone();
                     let blocking_token = cancel_token.clone();
+                    let diagnostic_runner = file_diagnostic.clone();
                     match tokio::task::spawn_blocking(move || {
                         if blocking_token.is_cancelled() {
                             return None;
@@ -193,7 +289,11 @@ impl FileDiagnostic {
                         // Diagnose under a blocking read lock so CPU work does not run on Tokio workers.
                         let guard = blocking_analysis.blocking_read();
                         let uri = guard.get_uri(file_id_clone)?;
-                        let diagnostics = guard.diagnose_file(file_id_clone, blocking_token.clone())?;
+                        let diagnostics = diagnostic_runner.diagnose_file_with_shared_data(
+                            &guard,
+                            file_id_clone,
+                            blocking_token.clone(),
+                        )?;
                         Some((uri, diagnostics))
                     })
                     .await
@@ -325,6 +425,7 @@ impl FileDiagnostic {
         }
 
         let analysis = self.analysis.clone();
+        let file_diagnostic = self.clone();
         match tokio::task::spawn_blocking(move || {
             if cancel_token.is_cancelled() {
                 return None;
@@ -338,7 +439,7 @@ impl FileDiagnostic {
                 return None;
             }
 
-            guard.diagnose_file(file_id, cancel_token)
+            file_diagnostic.diagnose_file_with_shared_data(&guard, file_id, cancel_token)
         })
         .await
         {
@@ -370,7 +471,7 @@ impl FileDiagnostic {
                 .get_db()
                 .get_module_index()
                 .get_main_workspace_file_ids();
-            let shared_data = analysis.precompute_diagnostic_shared_data();
+            let shared_data = self.force_precompute_shared_diagnostic_data(&analysis);
             (file_ids, shared_data)
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
@@ -445,7 +546,7 @@ impl FileDiagnostic {
                 .get_db()
                 .get_module_index()
                 .get_main_workspace_file_ids();
-            let shared_data = analysis.precompute_diagnostic_shared_data();
+            let shared_data = self.force_precompute_shared_diagnostic_data(&analysis);
             (file_ids, shared_data)
         };
 
@@ -615,7 +716,7 @@ async fn push_workspace_diagnostic(
             .get_db()
             .get_module_index()
             .get_main_workspace_file_ids();
-        let shared_data = read_analysis.precompute_diagnostic_shared_data();
+        let shared_data = file_diagnostic.force_precompute_shared_diagnostic_data(&read_analysis);
         (file_ids, shared_data)
     };
     // diagnostic files
@@ -756,10 +857,17 @@ fn filter_diagnostics_by_line_span(
 
 #[cfg(test)]
 mod tests {
+    use crate::context::{ClientProxy, StatusBar};
+    use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, Emmyrc, file_path_to_uri};
     use googletest::prelude::*;
+    use lsp_server::Connection;
+    use lsp_types::NumberOrString;
     use lsp_types::{Position, Range};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
 
-    use super::{changed_line_span, filter_diagnostics_by_line_span};
+    use super::{FileDiagnostic, changed_line_span, filter_diagnostics_by_line_span};
 
     fn diagnostic(start_line: u32, end_line: u32) -> lsp_types::Diagnostic {
         lsp_types::Diagnostic {
@@ -821,6 +929,78 @@ mod tests {
         .collect::<Vec<_>>();
 
         verify_that!(filtered.as_slice(), eq(&[(0, 0), (3, 3)]))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn single_file_diagnostics_use_shared_workspace_data() -> Result<()> {
+        let mut analysis = EmmyLuaAnalysis::new();
+        let workspace = std::env::temp_dir().join("gmod_glua_ls_shared_single_file_diagnostics");
+        analysis.add_main_workspace(workspace.clone());
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        analysis.update_config(Arc::new(emmyrc));
+        analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
+
+        let server_uri = file_path_to_uri(&workspace.join("lua/autorun/server/sv_api.lua"))
+            .expect("server URI should parse");
+        analysis.update_file_by_uri(
+            &server_uri,
+            Some("function ServerOnlyApi() return true end".to_string()),
+        );
+
+        let client_uri = file_path_to_uri(&workspace.join("lua/autorun/client/cl_user.lua"))
+            .expect("client URI should parse");
+        let client_file = analysis
+            .update_file_by_uri(&client_uri, Some("ServerOnlyApi()".to_string()))
+            .expect("client file should be indexed");
+
+        let (connection, _peer) = Connection::memory();
+        let client = Arc::new(ClientProxy::new(connection));
+        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let analysis = Arc::new(RwLock::new(analysis));
+        let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client);
+
+        let diagnostics = {
+            let guard = analysis.blocking_read();
+            file_diagnostic
+                .diagnose_file_with_shared_data(&guard, client_file, CancellationToken::new())
+                .unwrap_or_default()
+        };
+
+        let target_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
+        ));
+        verify_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == target_code),
+            eq(true)
+        )?;
+
+        let first_cached = file_diagnostic.shared_diagnostic_data_cache.cached_ptr();
+        {
+            let guard = analysis.blocking_read();
+            let _ = file_diagnostic.diagnose_file_with_shared_data(
+                &guard,
+                client_file,
+                CancellationToken::new(),
+            );
+        }
+        let second_cached = file_diagnostic.shared_diagnostic_data_cache.cached_ptr();
+        verify_that!(second_cached, eq(first_cached))?;
+
+        file_diagnostic.invalidate_shared_diagnostic_data();
+        verify_that!(
+            file_diagnostic.shared_diagnostic_data_cache.is_empty(),
+            eq(true)
+        )?;
+
         Ok(())
     }
 }

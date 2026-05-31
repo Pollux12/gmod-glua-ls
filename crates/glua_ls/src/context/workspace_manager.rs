@@ -245,6 +245,7 @@ impl WorkspaceManager {
                 let mut analysis = analysis.write().await;
                 // 在重新索引之前清理不存在的文件
                 analysis.cleanup_nonexistent_files();
+                file_diagnostic.invalidate_shared_diagnostic_data();
                 // Release lock immediately after cleanup
             }
 
