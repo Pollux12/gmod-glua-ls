@@ -13,8 +13,8 @@ use table_generic_check::check_table_generic_type_compact;
 use tuple_type_check::check_tuple_type_compact;
 
 use crate::{
-    LuaType, LuaUnionType, TypeSubstitutor,
-    semantic::type_check::type_check_context::TypeCheckContext,
+    LuaObjectType, LuaType, LuaUnionType, TypeSubstitutor,
+    semantic::{member::find_members, type_check::type_check_context::TypeCheckContext},
 };
 
 use super::{
@@ -71,6 +71,12 @@ pub fn check_complex_type_compact(
         }
         LuaType::Object(source_object) => {
             match check_object_type_compact(context, source_object, compact_type, check_guard) {
+                Err(TypeCheckFailReason::DonotCheck) => {}
+                result => return result,
+            }
+        }
+        LuaType::MergedTable(_) => {
+            match check_merged_table_type_compact(context, source, compact_type, check_guard) {
                 Err(TypeCheckFailReason::DonotCheck) => {}
                 result => return result,
             }
@@ -156,6 +162,28 @@ pub fn check_complex_type_compact(
     }
 
     Err(TypeCheckFailReason::TypeNotMatch)
+}
+
+fn check_merged_table_type_compact(
+    context: &mut TypeCheckContext,
+    source: &LuaType,
+    compact_type: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    if matches!(compact_type, LuaType::Any | LuaType::Table) {
+        return Ok(());
+    }
+
+    let Some(members) = find_members(context.db, source) else {
+        return Err(TypeCheckFailReason::DonotCheck);
+    };
+
+    let fields = members
+        .into_iter()
+        .map(|member| (member.key, member.typ))
+        .collect();
+    let object = LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into());
+    check_general_type_compact(context, &object, compact_type, check_guard.next_level()?)
 }
 
 // too complex
