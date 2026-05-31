@@ -2,8 +2,11 @@
 mod test {
     use std::{ops::Deref, sync::Arc};
 
-    use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
-    use glua_parser::{LuaAstNode, LuaAstToken, LuaLocalName};
+    use crate::{
+        DiagnosticCode, Emmyrc, LuaMemberOwner, LuaType, RenderLevel, VirtualWorkspace,
+        humanize_type,
+    };
+    use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaLocalName};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
@@ -68,6 +71,60 @@ mod test {
             .get_semantic_info(token.syntax().clone().into())
             .map(|info| info.typ)
             .expect("expected semantic info for local name")
+    }
+
+    fn index_expr_type(
+        analysis: &crate::EmmyLuaAnalysis,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|index_expr| index_expr.syntax().text() == expr_text)
+            .expect("expected index expression");
+
+        semantic_model
+            .infer_expr(LuaExpr::IndexExpr(index_expr))
+            .expect("expected inferred index expression type")
+    }
+
+    fn contains_empty_table_bootstrap(db: &crate::DbIndex, typ: &LuaType) -> bool {
+        match typ {
+            LuaType::Table => true,
+            LuaType::TableConst(table_id) => {
+                db.get_member_index()
+                    .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
+                    == 0
+            }
+            LuaType::Union(union) => union
+                .into_vec()
+                .iter()
+                .any(|sub_type| contains_empty_table_bootstrap(db, sub_type)),
+            _ => false,
+        }
+    }
+
+    fn empty_table_bootstrap_branch_count(db: &crate::DbIndex, typ: &LuaType) -> usize {
+        match typ {
+            LuaType::Table => 1,
+            LuaType::TableConst(table_id) => usize::from(
+                db.get_member_index()
+                    .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
+                    == 0,
+            ),
+            LuaType::Union(union) => union
+                .into_vec()
+                .iter()
+                .map(|sub_type| empty_table_bootstrap_branch_count(db, sub_type))
+                .sum(),
+            _ => 0,
+        }
     }
 
     #[test]
@@ -647,6 +704,22 @@ mod test {
         let diagnostics = analysis
             .diagnose_file(command_file, CancellationToken::new())
             .unwrap_or_default();
+        let ix_type = index_expr_type(&analysis, command_file, "ix.type");
+        let ix_type_display = humanize_type(
+            analysis.compilation.get_db(),
+            &ix_type,
+            RenderLevel::Detailed,
+        );
+
+        assert!(
+            ix_type_display.contains("text") && ix_type_display.contains("number"),
+            "expected ix.type to retain detailed fields, got {ix_type_display}"
+        );
+        assert!(
+            !contains_empty_table_bootstrap(analysis.compilation.get_db(), &ix_type),
+            "expected ix.type to omit redundant empty/bootstrap table branch, got {ix_type_display}"
+        );
+
         let undefined_fields: Vec<_> = diagnostics
             .iter()
             .filter(|diagnostic| {
@@ -660,6 +733,67 @@ mod test {
         assert!(
             undefined_fields.is_empty(),
             "unexpected UndefinedField diagnostics on cold batch load: {undefined_fields:#?}"
+        );
+    }
+
+    #[test]
+    fn test_guarded_empty_table_bootstrap_remains_table_when_only_definition() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "gamemodes/helix/gamemode/shared.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {}
+
+                local typeTable = ix.type
+            "#,
+        );
+
+        let ty = local_name_type(&mut ws, file_id, "typeTable");
+        let display = ws.humanize_type(ty.clone());
+
+        assert!(
+            display == "table" || matches!(ty, LuaType::Table | LuaType::TableConst(_)),
+            "expected lone guarded bootstrap to remain table-like, got {display}"
+        );
+    }
+
+    #[test]
+    fn test_repeated_guarded_empty_table_bootstraps_collapse_to_single_table() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "gamemodes/helix/gamemode/shared.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {}
+            "#,
+        );
+        let command_file = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/sh_commands.lua",
+            r#"
+                ix = ix or {}
+                ix.type = ix.type or {}
+
+                local typeTable = ix.type
+            "#,
+        );
+
+        let ty = local_name_type(&mut ws, command_file, "typeTable");
+        let display = ws.humanize_type(ty.clone());
+
+        assert_eq!(display, "table");
+        assert_eq!(
+            empty_table_bootstrap_branch_count(ws.analysis.compilation.get_db(), &ty),
+            1,
+            "expected repeated empty guarded bootstraps to collapse to one table branch, got {display}"
         );
     }
 

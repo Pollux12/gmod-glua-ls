@@ -439,7 +439,13 @@ fn resolve_member_type(
                 });
             let should_widen_file_defines =
                 !should_prefer_doc_file_defines && members.len() > 1 && all_file_defines;
+            let all_non_overwriting_assignment_file_defines = all_file_defines
+                && members.iter().all(|member| {
+                    db.get_member_index()
+                        .is_non_overwriting_assignment_member(member.get_id())
+                });
             let should_widen_table_literals = should_widen_file_defines
+                && !all_non_overwriting_assignment_file_defines
                 && members.iter().all(|member| {
                     db.get_type_index()
                         .get_type_cache(&member.get_id().into())
@@ -484,6 +490,11 @@ fn resolve_member_type(
                     {
                         let base_typ = prune_non_generic_callables_for_adapter_merge(db, &typ);
                         typ = TypeOps::Union.apply(db, &base_typ, &adapters);
+                    }
+                    if all_non_overwriting_assignment_file_defines
+                        && !should_prefer_doc_file_defines
+                    {
+                        typ = crate::prune_redundant_guarded_table_bootstrap_type(db, typ);
                     }
                     Ok(typ)
                 }

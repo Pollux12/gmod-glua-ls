@@ -8,7 +8,9 @@ mod type_visit_trait;
 mod types;
 
 use super::traits::LuaIndex;
-use crate::{DbIndex, FileId, InFiled, db_index::r#type::type_decl::LuaTypeIdentifier};
+use crate::{
+    DbIndex, FileId, InFiled, LuaMemberOwner, db_index::r#type::type_decl::LuaTypeIdentifier,
+};
 pub use generic_param::GenericParam;
 pub use humanize_type::{RenderLevel, format_union_type, humanize_type};
 use rowan::TextRange;
@@ -79,6 +81,72 @@ pub(crate) fn widen_literal_type_for_assignment(typ: &LuaType) -> LuaType {
                 .collect(),
         ),
         _ => typ.clone(),
+    }
+}
+
+pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: LuaType) -> LuaType {
+    let LuaType::Union(union) = typ else {
+        return typ;
+    };
+
+    let types = union.into_vec();
+    if !types
+        .iter()
+        .any(|typ| is_informative_guarded_table_branch(db, typ))
+    {
+        return collapse_guarded_table_bootstrap_branches(db, types);
+    }
+
+    LuaType::from_vec(
+        types
+            .into_iter()
+            .filter(|typ| !is_guarded_table_bootstrap_branch(db, typ))
+            .collect(),
+    )
+}
+
+fn collapse_guarded_table_bootstrap_branches(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
+    let mut saw_bootstrap = false;
+    let mut retained = Vec::with_capacity(types.len());
+
+    for typ in types {
+        if is_guarded_table_bootstrap_branch(db, &typ) {
+            saw_bootstrap = true;
+        } else {
+            retained.push(typ);
+        }
+    }
+
+    if saw_bootstrap {
+        retained.push(LuaType::Table);
+    }
+
+    LuaType::from_vec(retained)
+}
+
+fn is_informative_guarded_table_branch(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::TableConst(table_id) => {
+            db.get_member_index()
+                .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
+                > 0
+        }
+        LuaType::Object(object) => {
+            !object.get_fields().is_empty() || !object.get_index_access().is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn is_guarded_table_bootstrap_branch(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Table => true,
+        LuaType::TableConst(table_id) => {
+            db.get_member_index()
+                .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
+                == 0
+        }
+        _ => false,
     }
 }
 

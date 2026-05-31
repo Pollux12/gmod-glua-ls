@@ -1406,7 +1406,15 @@ fn get_widened_member_assignment_type(
         return None;
     }
 
-    Some(doc_type.unwrap_or(widened_type))
+    if let Some(doc_type) = doc_type {
+        return Some(doc_type);
+    }
+
+    Some(if preserve_table_literals {
+        crate::prune_redundant_guarded_table_bootstrap_type(analyzer.db, widened_type)
+    } else {
+        widened_type
+    })
 }
 
 fn widen_related_assignment_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {

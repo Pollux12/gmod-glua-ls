@@ -523,6 +523,10 @@ impl LuaMemberIndex {
         self.non_overwriting_assignment_members.insert(member_id);
     }
 
+    pub fn is_non_overwriting_assignment_member(&self, member_id: LuaMemberId) -> bool {
+        self.non_overwriting_assignment_members.contains(&member_id)
+    }
+
     pub fn get_current_owner_members_for_key(
         &self,
         owner: &LuaMemberOwner,
