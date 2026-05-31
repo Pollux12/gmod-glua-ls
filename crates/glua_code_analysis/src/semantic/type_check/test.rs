@@ -1,6 +1,12 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use std::collections::HashMap;
+
+    use crate::{
+        DiagnosticCode, LuaMemberKey, LuaMergedTableType, LuaObjectType, LuaType, VirtualWorkspace,
+    };
+
+    use super::super::check_type_compact;
 
     #[test]
     fn test_string() {
@@ -108,6 +114,144 @@ mod test {
 
             assert!(ws.check_type(&object_ty, &object_ty));
         }
+    }
+
+    #[test]
+    fn test_merged_table_types_check_structurally() {
+        let db = crate::DbIndex::new();
+        let source = merged_table_with_field("name", LuaType::String);
+        let compact = merged_table_with_field("name", LuaType::String);
+
+        assert!(check_type_compact(&db, &source, &compact).is_ok());
+    }
+
+    #[test]
+    fn test_merged_table_type_check_preserves_index_access() {
+        let db = crate::DbIndex::new();
+        let source = merged_table_with_field_and_index_access(
+            "name",
+            LuaType::String,
+            LuaType::String,
+            LuaType::Number,
+        );
+        let compact = merged_table_with_field_and_index_access(
+            "name",
+            LuaType::String,
+            LuaType::String,
+            LuaType::String,
+        );
+
+        assert!(check_type_compact(&db, &source, &compact).is_err());
+    }
+
+    #[test]
+    fn test_object_type_index_access_accepts_matching_explicit_fields() {
+        let db = crate::DbIndex::new();
+        let source = object_with_index_access(LuaType::String, LuaType::String);
+        let compact = object_with_field("name", LuaType::String);
+
+        assert!(check_type_compact(&db, &source, &compact).is_ok());
+    }
+
+    #[test]
+    fn test_object_type_index_access_rejects_mismatched_explicit_fields() {
+        let db = crate::DbIndex::new();
+        let source = object_with_index_access(LuaType::String, LuaType::String);
+        let compact = object_with_field_and_index_access(
+            "count",
+            LuaType::Number,
+            LuaType::String,
+            LuaType::String,
+        );
+
+        assert!(check_type_compact(&db, &source, &compact).is_err());
+    }
+
+    #[test]
+    fn test_object_type_literal_index_access_ignores_non_matching_explicit_fields() {
+        let db = crate::DbIndex::new();
+        let source = object_with_index_access(
+            LuaType::StringConst(smol_str::SmolStr::new("name").into()),
+            LuaType::String,
+        );
+        let compact = object_with_field("count", LuaType::Number);
+
+        assert!(check_type_compact(&db, &source, &compact).is_ok());
+    }
+
+    #[test]
+    fn test_object_type_index_access_checks_all_matching_index_signatures() {
+        let db = crate::DbIndex::new();
+        let source = object_with_index_access(LuaType::String, LuaType::String);
+        let compact = object_with_index_accesses(vec![
+            (LuaType::String, LuaType::String),
+            (LuaType::String, LuaType::Number),
+        ]);
+
+        assert!(check_type_compact(&db, &source, &compact).is_err());
+    }
+
+    #[test]
+    fn test_pure_index_access_merged_tables_check_structurally() {
+        let db = crate::DbIndex::new();
+        let source = merged_table_with_index_access(LuaType::String, LuaType::String);
+        let compact = merged_table_with_index_access(LuaType::String, LuaType::String);
+
+        assert!(check_type_compact(&db, &source, &compact).is_ok());
+    }
+
+    fn merged_table_with_field(name: &str, typ: LuaType) -> LuaType {
+        merged_table_from_object(object_with_field(name, typ))
+    }
+
+    fn merged_table_with_index_access(
+        index_key_type: LuaType,
+        index_value_type: LuaType,
+    ) -> LuaType {
+        merged_table_from_object(object_with_index_access(index_key_type, index_value_type))
+    }
+
+    fn merged_table_from_object(object: LuaType) -> LuaType {
+        LuaMergedTableType::new(vec![object]).into()
+    }
+
+    fn object_with_field(name: &str, typ: LuaType) -> LuaType {
+        let mut fields = HashMap::new();
+        fields.insert(LuaMemberKey::Name(name.into()), typ);
+        LuaObjectType::new_with_fields(fields, Vec::new()).into()
+    }
+
+    fn object_with_index_access(index_key_type: LuaType, index_value_type: LuaType) -> LuaType {
+        object_with_index_accesses(vec![(index_key_type, index_value_type)])
+    }
+
+    fn object_with_index_accesses(index_access: Vec<(LuaType, LuaType)>) -> LuaType {
+        LuaObjectType::new_with_fields(HashMap::new(), index_access).into()
+    }
+
+    fn merged_table_with_field_and_index_access(
+        name: &str,
+        field_type: LuaType,
+        index_key_type: LuaType,
+        index_value_type: LuaType,
+    ) -> LuaType {
+        merged_table_from_object(object_with_field_and_index_access(
+            name,
+            field_type,
+            index_key_type,
+            index_value_type,
+        ))
+    }
+
+    fn object_with_field_and_index_access(
+        name: &str,
+        field_type: LuaType,
+        index_key_type: LuaType,
+        index_value_type: LuaType,
+    ) -> LuaType {
+        let mut fields = HashMap::new();
+        fields.insert(LuaMemberKey::Name(name.into()), field_type);
+        LuaObjectType::new_with_fields(fields, vec![(index_key_type, index_value_type)]).into()
     }
 
     #[test]

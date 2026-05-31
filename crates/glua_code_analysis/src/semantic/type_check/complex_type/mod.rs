@@ -5,6 +5,8 @@ mod object_type_check;
 mod table_generic_check;
 mod tuple_type_check;
 
+use std::collections::HashMap;
+
 use array_type_check::check_array_type_compact;
 use call_type_check::check_call_type_compact;
 use intersection_type_check::check_intersection_type_compact;
@@ -174,16 +176,54 @@ fn check_merged_table_type_compact(
         return Ok(());
     }
 
-    let Some(members) = find_members(context.db, source) else {
+    let Some(object) = structural_object_from_members(context, source) else {
         return Err(TypeCheckFailReason::DonotCheck);
     };
 
-    let fields = members
+    if matches!(compact_type, LuaType::MergedTable(_))
+        && let Some(compact_object) = structural_object_from_members(context, compact_type)
+    {
+        return check_general_type_compact(
+            context,
+            &object,
+            &compact_object,
+            check_guard.next_level()?,
+        );
+    }
+
+    check_general_type_compact(context, &object, compact_type, check_guard.next_level()?)
+}
+
+fn structural_object_from_members(context: &TypeCheckContext, typ: &LuaType) -> Option<LuaType> {
+    let members = find_members(context.db, typ).unwrap_or_default();
+    let fields: HashMap<_, _> = members
         .into_iter()
         .map(|member| (member.key, member.typ))
         .collect();
-    let object = LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into());
-    check_general_type_compact(context, &object, compact_type, check_guard.next_level()?)
+    let mut index_access = Vec::new();
+    collect_index_access_from_type(typ, &mut index_access);
+    if fields.is_empty() && index_access.is_empty() {
+        return None;
+    }
+
+    Some(LuaType::Object(
+        LuaObjectType::new_with_fields(fields, index_access).into(),
+    ))
+}
+
+fn collect_index_access_from_type(typ: &LuaType, index_access: &mut Vec<(LuaType, LuaType)>) {
+    match typ {
+        LuaType::Object(object) => {
+            index_access.extend(object.get_index_access().iter().cloned());
+        }
+        LuaType::MergedTable(merged_table) => {
+            for component in merged_table.get_types() {
+                collect_index_access_from_type(component, index_access);
+            }
+        }
+        LuaType::TableOf(inner) => collect_index_access_from_type(inner, index_access),
+        _ => {}
+    }
 }
 
 // too complex
