@@ -63,35 +63,31 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         .get_member_info_map_at_offset(&prefix_type, builder.position_offset)
         .unwrap_or_default();
     let gmod_owner_name = gmod_hook_owner_name(&prefix_expr, &prefix_type);
-    extend_gmod_hook_fallback_members(builder, &prefix_expr, &prefix_type, &mut member_info_map);
+    let gmod_fallback_owner = if builder.semantic_model.get_emmyrc().gmod.enabled {
+        gmod_owner_name
+            .as_deref()
+            .and_then(gmod_hook_fallback_owner)
+    } else {
+        None
+    };
+    extend_gmod_hook_fallback_members(builder, gmod_fallback_owner, &mut member_info_map);
 
     add_completions_for_members_with_gmod_owner(
         builder,
         &member_info_map,
         completion_status,
-        gmod_owner_name.as_deref(),
+        gmod_fallback_owner,
     )
 }
 
 fn extend_gmod_hook_fallback_members(
     builder: &CompletionBuilder,
-    prefix_expr: &LuaExpr,
-    prefix_type: &LuaType,
+    fallback_owner: Option<GmodFallbackOwner<'_>>,
     members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) {
-    if !builder.semantic_model.get_emmyrc().gmod.enabled {
-        return;
-    }
-
-    let owner_name = gmod_hook_owner_name(prefix_expr, prefix_type);
-    let Some(owner_name) = owner_name else {
+    let Some(fallback_owner) = fallback_owner else {
         return;
     };
-
-    let owner_candidates = gmod_hook_owner_candidates(owner_name.as_str());
-    if owner_candidates.is_empty() {
-        return;
-    }
 
     let mut existing: HashMap<LuaMemberKey, HashSet<Option<LuaSemanticDeclId>>> = HashMap::new();
     for (key, infos) in members.iter() {
@@ -101,7 +97,7 @@ fn extend_gmod_hook_fallback_members(
         }
     }
 
-    for owner_candidate in owner_candidates {
+    for owner_candidate in fallback_owner.candidates {
         let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_candidate));
         let Some(fallback_map) = builder
             .semantic_model
@@ -132,6 +128,24 @@ fn gmod_hook_owner_name(prefix_expr: &LuaExpr, prefix_type: &LuaType) -> Option<
     }
 }
 
+#[derive(Clone, Copy)]
+struct GmodFallbackOwner<'a> {
+    owner_name: &'a str,
+    candidates: &'static [&'static str],
+}
+
+fn gmod_hook_fallback_owner(owner_name: &str) -> Option<GmodFallbackOwner<'_>> {
+    let candidates = gmod_hook_owner_candidates(owner_name);
+    if candidates.is_empty() {
+        None
+    } else {
+        Some(GmodFallbackOwner {
+            owner_name,
+            candidates,
+        })
+    }
+}
+
 fn gmod_hook_owner_candidates(owner_name: &str) -> &'static [&'static str] {
     if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
         &["GM", "GAMEMODE", "SANDBOX"]
@@ -156,14 +170,19 @@ fn add_completions_for_members_with_gmod_owner(
     builder: &mut CompletionBuilder,
     members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
     completion_status: CompletionTriggerStatus,
-    gmod_owner_name: Option<&str>,
+    gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
 ) -> Option<()> {
     // 排序
     let mut sorted_entries: Vec<_> = members.iter().collect();
     sorted_entries.sort_unstable_by_key(|(name, _)| *name);
 
     for (_, member_infos) in sorted_entries {
-        add_resolve_member_infos(builder, member_infos, completion_status, gmod_owner_name);
+        add_resolve_member_infos(
+            builder,
+            member_infos,
+            completion_status,
+            gmod_fallback_owner,
+        );
     }
 
     Some(())
@@ -173,7 +192,7 @@ fn add_resolve_member_infos(
     builder: &mut CompletionBuilder,
     member_infos: &Vec<LuaMemberInfo>,
     completion_status: CompletionTriggerStatus,
-    gmod_owner_name: Option<&str>,
+    gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
 ) -> Option<()> {
     if member_infos.len() == 1 {
         let member_info = &member_infos[0];
@@ -198,7 +217,7 @@ fn add_resolve_member_infos(
             _ => None,
         };
         let description_hint =
-            gmod_fallback_description_hint(builder, gmod_owner_name, member_info);
+            gmod_fallback_description_hint(builder, gmod_fallback_owner, member_info);
         add_member_completion_with_description_hint(
             builder,
             member_info.clone(),
@@ -222,7 +241,7 @@ fn add_resolve_member_infos(
         match resolve_state {
             MemberResolveState::All => {
                 let description_hint =
-                    gmod_fallback_description_hint(builder, gmod_owner_name, member_info);
+                    gmod_fallback_description_hint(builder, gmod_fallback_owner, member_info);
                 add_member_completion_with_description_hint(
                     builder,
                     member_info.clone(),
@@ -236,7 +255,7 @@ fn add_resolve_member_infos(
                     && feature.is_meta_decl()
                 {
                     let description_hint =
-                        gmod_fallback_description_hint(builder, gmod_owner_name, member_info);
+                        gmod_fallback_description_hint(builder, gmod_fallback_owner, member_info);
                     add_member_completion_with_description_hint(
                         builder,
                         member_info.clone(),
@@ -251,7 +270,7 @@ fn add_resolve_member_infos(
                     && feature.is_file_decl()
                 {
                     let description_hint =
-                        gmod_fallback_description_hint(builder, gmod_owner_name, member_info);
+                        gmod_fallback_description_hint(builder, gmod_fallback_owner, member_info);
                     add_member_completion_with_description_hint(
                         builder,
                         member_info.clone(),
@@ -269,31 +288,22 @@ fn add_resolve_member_infos(
 
 fn gmod_fallback_description_hint(
     builder: &CompletionBuilder,
-    gmod_owner_name: Option<&str>,
+    fallback_owner: Option<GmodFallbackOwner<'_>>,
     member_info: &LuaMemberInfo,
 ) -> Option<String> {
-    if !builder.semantic_model.get_emmyrc().gmod.enabled {
-        return None;
-    }
-
-    let owner_name = gmod_owner_name?;
-    let owner_candidates = gmod_hook_owner_candidates(owner_name);
-    if owner_candidates.is_empty() {
-        return None;
-    }
-
-    let source_owner = get_owner_type_id(builder.semantic_model.get_db(), member_info)?
-        .get_simple_name()
-        .to_string();
-    if source_owner.eq_ignore_ascii_case(owner_name)
-        || !owner_candidates
+    let fallback_owner = fallback_owner?;
+    let source_owner = get_owner_type_id(builder.semantic_model.get_db(), member_info)?;
+    let source_owner_name = source_owner.get_simple_name();
+    if source_owner_name.eq_ignore_ascii_case(fallback_owner.owner_name)
+        || !fallback_owner
+            .candidates
             .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(source_owner.as_str()))
+            .any(|candidate| candidate.eq_ignore_ascii_case(source_owner_name))
     {
         return None;
     }
 
-    Some(format!("from {source_owner}"))
+    Some(format!("from {source_owner_name}"))
 }
 
 /// 过滤成员信息，返回需要的成员列表和重载数量
