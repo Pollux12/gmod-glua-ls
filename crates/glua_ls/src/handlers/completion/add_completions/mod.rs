@@ -5,7 +5,9 @@ mod completion_item_info;
 
 pub use add_decl_completion::add_decl_completion;
 pub use add_member_completion::get_index_alias_name;
-pub use add_member_completion::{CompletionTriggerStatus, add_member_completion};
+pub use add_member_completion::{
+    CompletionTriggerStatus, add_member_completion_with_description_hint,
+};
 pub use check_match_word::check_match_word;
 use glua_code_analysis::{LuaSemanticDeclId, LuaType, RenderLevel};
 use lsp_types::CompletionItemKind;

@@ -1,5 +1,5 @@
 use glua_code_analysis::{LuaType, LuaUnionType};
-use glua_parser::{LuaExpr, LuaLiteralToken};
+use glua_parser::{LuaExpr, LuaLiteralToken, UnaryOperator};
 
 use crate::handlers::{
     completion::completion_data::CompletionColorInfo,
@@ -70,6 +70,56 @@ pub(super) fn scalar_literal_description(typ: &LuaType) -> Option<String> {
     }
 }
 
+pub(super) fn gmod_constructor_literal_detail(expr: &LuaExpr) -> Option<String> {
+    let LuaExpr::CallExpr(call_expr) = expr else {
+        return None;
+    };
+
+    let prefix = call_expr.get_prefix_expr()?;
+    let LuaExpr::NameExpr(name_expr) = &prefix else {
+        return None;
+    };
+    let name_token = name_expr.get_name_token()?;
+    let constructor_name = name_token.get_name_text();
+    if !is_gmod_literal_constructor_name(&constructor_name) {
+        return None;
+    }
+
+    let args = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
+    if args.len() != 3 {
+        return None;
+    }
+
+    let components = args
+        .iter()
+        .map(numeric_literal_text)
+        .collect::<Option<Vec<_>>>()?;
+
+    Some(format!(
+        " = {}({})",
+        constructor_name,
+        components.join(", ")
+    ))
+}
+
+pub(super) fn is_gmod_literal_constructor_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => {
+            is_gmod_literal_constructor_name(&id.get_simple_name())
+        }
+        LuaType::Instance(instance) => is_gmod_literal_constructor_type(instance.get_base()),
+        LuaType::Union(union) => match union.as_ref() {
+            LuaUnionType::Nullable(typ) => is_gmod_literal_constructor_type(typ),
+            LuaUnionType::Multi(types) => types.iter().any(is_gmod_literal_constructor_type),
+        },
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .any(is_gmod_literal_constructor_type),
+        _ => false,
+    }
+}
+
 pub(super) fn is_color_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => id.get_simple_name() == "Color",
@@ -80,6 +130,28 @@ pub(super) fn is_color_type(typ: &LuaType) -> bool {
         },
         LuaType::Intersection(intersection) => intersection.get_types().iter().any(is_color_type),
         _ => false,
+    }
+}
+
+fn is_gmod_literal_constructor_name(name: &str) -> bool {
+    matches!(name, "Vector" | "Angle")
+}
+
+fn numeric_literal_text(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => {
+            let LuaLiteralToken::Number(number) = literal_expr.get_literal()? else {
+                return None;
+            };
+            Some(number.get_number_value().to_string())
+        }
+        LuaExpr::UnaryExpr(unary_expr)
+            if unary_expr.get_op_token()?.get_op() == UnaryOperator::OpUnm =>
+        {
+            let inner = unary_expr.get_expr()?;
+            Some(format!("-{}", numeric_literal_text(&inner)?))
+        }
+        _ => None,
     }
 }
 

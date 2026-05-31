@@ -3,15 +3,16 @@ use glua_parser::{LuaAstNode, LuaExpr, LuaSyntaxKind};
 use lsp_types::CompletionItem;
 
 use crate::handlers::completion::{
-    add_completions::get_function_snippet, completion_builder::CompletionBuilder,
-    completion_data::CompletionData,
+    add_completions::get_function_snippet,
+    completion_builder::CompletionBuilder,
+    completion_data::{CompletionColorInfo, CompletionData},
 };
 
 use super::{
     CallDisplay, check_visibility,
     completion_item_info::{
-        color_info_from_expr, color_info_from_type, is_color_type, scalar_literal_description,
-        scalar_literal_detail,
+        color_info_from_expr, color_info_from_type, gmod_constructor_literal_detail, is_color_type,
+        is_gmod_literal_constructor_type, scalar_literal_description, scalar_literal_detail,
     },
     get_completion_kind, get_description, get_detail, is_deprecated,
 };
@@ -26,7 +27,8 @@ pub fn add_decl_completion(
     check_visibility(builder, property_owner.clone())?;
 
     let overload_count = count_function_overloads(builder.semantic_model.get_db(), typ);
-    let color = get_decl_completion_color(builder, decl_id, typ);
+    let (color, constructor_literal_detail) =
+        get_decl_completion_literal_info(builder, decl_id, typ);
     let literal_detail = scalar_literal_detail(typ);
 
     let mut completion_item = CompletionItem {
@@ -50,6 +52,7 @@ pub fn add_decl_completion(
                 .as_ref()
                 .map(|color| format!(" {}", color.hex))
                 .or_else(|| get_detail(builder, typ, CallDisplay::None))
+                .or(constructor_literal_detail)
                 .or(literal_detail),
             description: if color.is_some() {
                 Some("Color".to_string())
@@ -95,21 +98,34 @@ fn count_function_overloads(db: &DbIndex, typ: &LuaType) -> Option<usize> {
     if count == 0 { None } else { Some(count) }
 }
 
-fn get_decl_completion_color(
+fn get_decl_completion_literal_info(
     builder: &CompletionBuilder,
     decl_id: LuaDeclId,
     typ: &LuaType,
-) -> Option<crate::handlers::completion::completion_data::CompletionColorInfo> {
-    if let Some(color) = color_info_from_type(typ) {
-        return Some(color);
+) -> (Option<CompletionColorInfo>, Option<String>) {
+    let mut color = color_info_from_type(typ);
+    let should_inspect_color =
+        color.is_none() && (is_color_type(typ) || matches!(typ, LuaType::Unknown));
+    let should_inspect_constructor =
+        is_gmod_literal_constructor_type(typ) || matches!(typ, LuaType::Unknown);
+    if !should_inspect_color && !should_inspect_constructor {
+        return (color, None);
     }
 
-    if !is_color_type(typ) && !matches!(typ, LuaType::Unknown) {
-        return None;
+    let value_expr = get_decl_value_expr(builder, decl_id);
+    if should_inspect_color {
+        color = value_expr.as_ref().and_then(color_info_from_expr);
     }
 
-    let value_expr = get_decl_value_expr(builder, decl_id)?;
-    color_info_from_expr(&value_expr)
+    let constructor_literal_detail = if color.is_none() && should_inspect_constructor {
+        value_expr
+            .as_ref()
+            .and_then(gmod_constructor_literal_detail)
+    } else {
+        None
+    };
+
+    (color, constructor_literal_detail)
 }
 
 fn get_decl_value_expr(builder: &CompletionBuilder, decl_id: LuaDeclId) -> Option<LuaExpr> {
@@ -119,7 +135,7 @@ fn get_decl_value_expr(builder: &CompletionBuilder, decl_id: LuaDeclId) -> Optio
         .get_decl_index()
         .get_decl(&decl_id)?;
     let value_syntax_id = decl.get_value_syntax_id()?;
-    if !can_expr_syntax_be_color(value_syntax_id.get_kind()) {
+    if !can_expr_syntax_have_completion_literal(value_syntax_id.get_kind()) {
         return None;
     }
     let tree = builder
@@ -131,7 +147,7 @@ fn get_decl_value_expr(builder: &CompletionBuilder, decl_id: LuaDeclId) -> Optio
     LuaExpr::cast(value_node)
 }
 
-fn can_expr_syntax_be_color(kind: LuaSyntaxKind) -> bool {
+fn can_expr_syntax_have_completion_literal(kind: LuaSyntaxKind) -> bool {
     matches!(
         kind,
         LuaSyntaxKind::CallExpr

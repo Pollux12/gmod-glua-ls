@@ -199,9 +199,19 @@ fn apply_color_completion_documentation(
     let mut color_documentation = String::new();
     color_documentation.push_str("\n\n---\n\n");
     color_documentation.push_str("**Color preview**\n\n");
+    let color_title = format!(
+        "{} | {} | {} | {}",
+        color.hex, color.rgb, color.rgba, color.gmod
+    );
     color_documentation.push_str(&format!(
-        "<!-- gluals-color-preview --><span style=\"color:{};\">■</span> {}\n\n",
-        color.hex, color.hex
+        concat!(
+            "<!-- gluals-color-preview -->",
+            "<span title=\"{}\" ",
+            "style=\"display:inline-block;width:0.85em;height:0.85em;",
+            "border:1px solid var(--vscode-editorWidget-border);",
+            "background-color:{};vertical-align:-0.1em;\"></span> {}\n\n"
+        ),
+        color_title, color.hex, color.hex
     ));
     color_documentation.push_str(&format!(
         "`{}`  \n`{}`  \n`{}`",

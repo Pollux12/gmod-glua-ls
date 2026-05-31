@@ -10,7 +10,7 @@ use rowan::TextSize;
 use std::collections::{HashMap, HashSet};
 
 use crate::handlers::completion::{
-    add_completions::{CompletionTriggerStatus, add_member_completion},
+    add_completions::{CompletionTriggerStatus, add_member_completion_with_description_hint},
     completion_builder::CompletionBuilder,
 };
 
@@ -62,9 +62,15 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         .semantic_model
         .get_member_info_map_at_offset(&prefix_type, builder.position_offset)
         .unwrap_or_default();
+    let gmod_owner_name = gmod_hook_owner_name(&prefix_expr, &prefix_type);
     extend_gmod_hook_fallback_members(builder, &prefix_expr, &prefix_type, &mut member_info_map);
 
-    add_completions_for_members(builder, &member_info_map, completion_status)
+    add_completions_for_members_with_gmod_owner(
+        builder,
+        &member_info_map,
+        completion_status,
+        gmod_owner_name.as_deref(),
+    )
 }
 
 fn extend_gmod_hook_fallback_members(
@@ -77,14 +83,7 @@ fn extend_gmod_hook_fallback_members(
         return;
     }
 
-    let owner_name = match prefix_type {
-        LuaType::Ref(owner_type_decl_id) => Some(owner_type_decl_id.get_simple_name().to_string()),
-        _ => match prefix_expr {
-            LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
-            _ => None,
-        },
-    };
-
+    let owner_name = gmod_hook_owner_name(prefix_expr, prefix_type);
     let Some(owner_name) = owner_name else {
         return;
     };
@@ -123,6 +122,16 @@ fn extend_gmod_hook_fallback_members(
     }
 }
 
+fn gmod_hook_owner_name(prefix_expr: &LuaExpr, prefix_type: &LuaType) -> Option<String> {
+    match prefix_type {
+        LuaType::Ref(owner_type_decl_id) => Some(owner_type_decl_id.get_simple_name().to_string()),
+        _ => match prefix_expr {
+            LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+            _ => None,
+        },
+    }
+}
+
 fn gmod_hook_owner_candidates(owner_name: &str) -> &'static [&'static str] {
     if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
         &["GM", "GAMEMODE", "SANDBOX"]
@@ -140,12 +149,21 @@ pub fn add_completions_for_members(
     members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
     completion_status: CompletionTriggerStatus,
 ) -> Option<()> {
+    add_completions_for_members_with_gmod_owner(builder, members, completion_status, None)
+}
+
+fn add_completions_for_members_with_gmod_owner(
+    builder: &mut CompletionBuilder,
+    members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+    completion_status: CompletionTriggerStatus,
+    gmod_owner_name: Option<&str>,
+) -> Option<()> {
     // 排序
     let mut sorted_entries: Vec<_> = members.iter().collect();
     sorted_entries.sort_unstable_by_key(|(name, _)| *name);
 
     for (_, member_infos) in sorted_entries {
-        add_resolve_member_infos(builder, member_infos, completion_status);
+        add_resolve_member_infos(builder, member_infos, completion_status, gmod_owner_name);
     }
 
     Some(())
@@ -155,6 +173,7 @@ fn add_resolve_member_infos(
     builder: &mut CompletionBuilder,
     member_infos: &Vec<LuaMemberInfo>,
     completion_status: CompletionTriggerStatus,
+    gmod_owner_name: Option<&str>,
 ) -> Option<()> {
     if member_infos.len() == 1 {
         let member_info = &member_infos[0];
@@ -178,11 +197,14 @@ fn add_resolve_member_infos(
             }
             _ => None,
         };
-        add_member_completion(
+        let description_hint =
+            gmod_fallback_description_hint(builder, gmod_owner_name, member_info);
+        add_member_completion_with_description_hint(
             builder,
             member_info.clone(),
             completion_status,
             overload_count,
+            description_hint.as_deref(),
         );
         return Some(());
     }
@@ -199,22 +221,28 @@ fn add_resolve_member_infos(
 
         match resolve_state {
             MemberResolveState::All => {
-                add_member_completion(
+                let description_hint =
+                    gmod_fallback_description_hint(builder, gmod_owner_name, member_info);
+                add_member_completion_with_description_hint(
                     builder,
                     member_info.clone(),
                     completion_status,
                     overload_count,
+                    description_hint.as_deref(),
                 );
             }
             MemberResolveState::Meta => {
                 if let Some(feature) = member_info.feature
                     && feature.is_meta_decl()
                 {
-                    add_member_completion(
+                    let description_hint =
+                        gmod_fallback_description_hint(builder, gmod_owner_name, member_info);
+                    add_member_completion_with_description_hint(
                         builder,
                         member_info.clone(),
                         completion_status,
                         overload_count,
+                        description_hint.as_deref(),
                     );
                 }
             }
@@ -222,11 +250,14 @@ fn add_resolve_member_infos(
                 if let Some(feature) = member_info.feature
                     && feature.is_file_decl()
                 {
-                    add_member_completion(
+                    let description_hint =
+                        gmod_fallback_description_hint(builder, gmod_owner_name, member_info);
+                    add_member_completion_with_description_hint(
                         builder,
                         member_info.clone(),
                         completion_status,
                         overload_count,
+                        description_hint.as_deref(),
                     );
                 }
             }
@@ -234,6 +265,35 @@ fn add_resolve_member_infos(
     }
 
     Some(())
+}
+
+fn gmod_fallback_description_hint(
+    builder: &CompletionBuilder,
+    gmod_owner_name: Option<&str>,
+    member_info: &LuaMemberInfo,
+) -> Option<String> {
+    if !builder.semantic_model.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let owner_name = gmod_owner_name?;
+    let owner_candidates = gmod_hook_owner_candidates(owner_name);
+    if owner_candidates.is_empty() {
+        return None;
+    }
+
+    let source_owner = get_owner_type_id(builder.semantic_model.get_db(), member_info)?
+        .get_simple_name()
+        .to_string();
+    if source_owner.eq_ignore_ascii_case(owner_name)
+        || !owner_candidates
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(source_owner.as_str()))
+    {
+        return None;
+    }
+
+    Some(format!("from {source_owner}"))
 }
 
 /// 过滤成员信息，返回需要的成员列表和重载数量

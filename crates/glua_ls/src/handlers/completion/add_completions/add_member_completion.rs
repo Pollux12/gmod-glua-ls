@@ -18,8 +18,8 @@ use crate::handlers::completion::{
 use super::{
     CallDisplay, check_visibility,
     completion_item_info::{
-        color_info_from_expr, color_info_from_type, is_color_type, scalar_literal_description,
-        scalar_literal_detail,
+        color_info_from_expr, color_info_from_type, gmod_constructor_literal_detail, is_color_type,
+        is_gmod_literal_constructor_type, scalar_literal_description, scalar_literal_detail,
     },
     get_completion_kind, get_description, get_detail, is_deprecated,
 };
@@ -37,6 +37,16 @@ pub fn add_member_completion(
     member_info: LuaMemberInfo,
     status: CompletionTriggerStatus,
     overload_count: Option<usize>,
+) -> Option<()> {
+    add_member_completion_with_description_hint(builder, member_info, status, overload_count, None)
+}
+
+pub fn add_member_completion_with_description_hint(
+    builder: &mut CompletionBuilder,
+    member_info: LuaMemberInfo,
+    status: CompletionTriggerStatus,
+    overload_count: Option<usize>,
+    description_hint: Option<&str>,
 ) -> Option<()> {
     if builder.is_cancelled() {
         return None;
@@ -101,7 +111,8 @@ pub fn add_member_completion(
     if status == CompletionTriggerStatus::Colon && !remove_nil_type.is_function() {
         return None;
     }
-    let color = get_member_completion_color(builder, property_owner, &remove_nil_type);
+    let (color, constructor_literal_detail) =
+        get_member_completion_literal_info(builder, property_owner, &remove_nil_type);
 
     // 附加数据, 用于在`resolve`时进一步处理
     let completion_data = if let Some(id) = &property_owner {
@@ -131,7 +142,9 @@ pub fn add_member_completion(
     } else if is_inferred_dynamic_member {
         None
     } else {
-        get_detail(builder, &remove_nil_type, call_display).or(literal_detail)
+        get_detail(builder, &remove_nil_type, call_display)
+            .or(constructor_literal_detail)
+            .or(literal_detail)
     };
     // 在`detail`更右侧, 且不紧靠着`detail`显示
     let description = if color.is_some() {
@@ -142,6 +155,7 @@ pub fn add_member_completion(
         scalar_literal_description(&remove_nil_type)
             .or_else(|| get_description(builder, &remove_nil_type))
     };
+    let description = apply_description_hint(description, description_hint);
 
     let deprecated = property_owner
         .as_ref()
@@ -218,29 +232,57 @@ pub fn add_member_completion(
         deprecated,
         label,
         overload_count,
+        description_hint,
     );
 
     Some(())
 }
 
-fn get_member_completion_color(
+fn apply_description_hint(
+    description: Option<String>,
+    description_hint: Option<&str>,
+) -> Option<String> {
+    let Some(hint) = description_hint else {
+        return description;
+    };
+
+    Some(match description {
+        Some(description) => format!("{hint} - {description}"),
+        None => hint.to_string(),
+    })
+}
+
+fn get_member_completion_literal_info(
     builder: &CompletionBuilder,
     property_owner: &Option<LuaSemanticDeclId>,
     typ: &LuaType,
-) -> Option<CompletionColorInfo> {
-    if let Some(color) = color_info_from_type(typ) {
-        return Some(color);
+) -> (Option<CompletionColorInfo>, Option<String>) {
+    let mut color = color_info_from_type(typ);
+    let should_inspect_color =
+        color.is_none() && (is_color_type(typ) || matches!(typ, LuaType::Unknown));
+    let should_inspect_constructor =
+        is_gmod_literal_constructor_type(typ) || matches!(typ, LuaType::Unknown);
+    if !should_inspect_color && !should_inspect_constructor {
+        return (color, None);
     }
 
-    if !is_color_type(typ) && !matches!(typ, LuaType::Unknown) {
-        return None;
-    }
-
-    let LuaSemanticDeclId::Member(member_id) = property_owner.as_ref()? else {
-        return None;
+    let Some(LuaSemanticDeclId::Member(member_id)) = property_owner.as_ref() else {
+        return (color, None);
     };
-    let value_expr = get_member_value_expr(builder.semantic_model.get_db(), *member_id)?;
-    color_info_from_expr(&value_expr)
+    let value_expr = get_member_value_expr(builder.semantic_model.get_db(), *member_id);
+    if should_inspect_color {
+        color = value_expr.as_ref().and_then(color_info_from_expr);
+    }
+
+    let constructor_literal_detail = if color.is_none() && should_inspect_constructor {
+        value_expr
+            .as_ref()
+            .and_then(gmod_constructor_literal_detail)
+    } else {
+        None
+    };
+
+    (color, constructor_literal_detail)
 }
 
 fn get_member_value_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
@@ -279,6 +321,7 @@ fn add_signature_overloads(
     deprecated: Option<bool>,
     label: String,
     overload_count: Option<usize>,
+    description_hint: Option<&str>,
 ) -> Option<()> {
     let signature_id = match typ {
         LuaType::Signature(signature_id) => signature_id,
@@ -298,7 +341,8 @@ fn add_signature_overloads(
         .enumerate()
         .for_each(|(index, overload)| {
             let typ = LuaType::DocFunction(overload);
-            let description = get_description(builder, &typ);
+            let description =
+                apply_description_hint(get_description(builder, &typ), description_hint);
             let detail = get_detail(builder, &typ, call_display);
             let data = if let Some(id) = &property_owner {
                 CompletionData::from_overload(builder, id.clone(), index, overload_count)

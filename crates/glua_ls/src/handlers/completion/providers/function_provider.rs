@@ -166,6 +166,7 @@ fn add_type_ref_completion(
                 let completion_item = CompletionItem {
                     label,
                     kind: Some(lsp_types::CompletionItemKind::ENUM_MEMBER),
+                    label_details: enum_label_description(type_ref_id.get_name()),
                     ..Default::default()
                 };
 
@@ -195,9 +196,9 @@ fn add_union_member_completion(
     union_types.sort_by_key(|typ| matches!(typ, LuaType::StrTplRef(_)));
 
     for union_sub_typ in union_types {
-        let name = match union_sub_typ {
-            LuaType::DocStringConst(s) => to_enum_label(builder, s.as_str()),
-            LuaType::DocIntegerConst(i) => i.to_string(),
+        let (name, description) = match union_sub_typ {
+            LuaType::DocStringConst(s) => (to_enum_label(builder, s.as_str()), "string literal"),
+            LuaType::DocIntegerConst(i) => (i.to_string(), "integer literal"),
             _ => {
                 dispatch_type(builder, union_sub_typ.clone(), &infer_guard.fork());
                 continue;
@@ -207,6 +208,7 @@ fn add_union_member_completion(
         let completion_item = CompletionItem {
             label: name,
             kind: Some(lsp_types::CompletionItemKind::ENUM_MEMBER),
+            label_details: enum_label_description(description),
             ..Default::default()
         };
 
@@ -220,6 +222,7 @@ fn add_string_completion(builder: &mut CompletionBuilder, str: &str) -> Option<(
     let completion_item = CompletionItem {
         label: to_enum_label(builder, str),
         kind: Some(lsp_types::CompletionItemKind::ENUM_MEMBER),
+        label_details: enum_label_description("string literal"),
         ..Default::default()
     };
 
@@ -549,9 +552,9 @@ fn add_multi_line_union_member_completion(
     infer_guard: &InferGuardRef,
 ) -> Option<()> {
     for (union_sub_typ, description) in union_typ.get_unions() {
-        let name = match union_sub_typ {
-            LuaType::DocStringConst(s) => to_enum_label(builder, s),
-            LuaType::DocIntegerConst(i) => i.to_string(),
+        let (name, literal_description) = match union_sub_typ {
+            LuaType::DocStringConst(s) => (to_enum_label(builder, s), "string literal"),
+            LuaType::DocIntegerConst(i) => (i.to_string(), "integer literal"),
             _ => {
                 dispatch_type(builder, union_sub_typ.clone(), &infer_guard.fork());
                 continue;
@@ -563,12 +566,7 @@ fn add_multi_line_union_member_completion(
             .map(|description| Documentation::String(description.clone()));
 
         let label_details =
-            description
-                .as_ref()
-                .map(|description| lsp_types::CompletionItemLabelDetails {
-                    detail: None,
-                    description: Some(description.clone()),
-                });
+            enum_label_description(description.as_deref().unwrap_or(literal_description));
 
         let completion_item = CompletionItem {
             label: name,
@@ -593,6 +591,13 @@ fn to_enum_label(builder: &CompletionBuilder, str: &str) -> String {
     } else {
         format!("\"{}\"", str)
     }
+}
+
+fn enum_label_description(description: &str) -> Option<lsp_types::CompletionItemLabelDetails> {
+    Some(lsp_types::CompletionItemLabelDetails {
+        detail: None,
+        description: Some(description.to_string()),
+    })
 }
 
 fn add_lambda_completion(builder: &mut CompletionBuilder, func: &LuaFunctionType) -> Option<()> {
