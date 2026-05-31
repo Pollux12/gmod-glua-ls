@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     context::ClientId,
-    handlers::references::{search_decl_references, search_member_references},
+    handlers::references::{search_decl_usages, search_member_references},
 };
 
 use super::{CodeLensData, CodeLensResolveData};
@@ -50,14 +50,7 @@ pub fn resolve_code_lens(
             let file_id = decl_id.file_id;
             let semantic_model = compilation.get_semantic_model(file_id)?;
             let mut results = Vec::new();
-            search_decl_references(
-                &semantic_model,
-                compilation,
-                decl_id,
-                &mut results,
-                cancel_token,
-                true,
-            );
+            search_decl_usages(compilation, decl_id, &mut results, cancel_token);
             let ref_count = results.len();
             let uri = semantic_model.get_document().get_uri();
             let command = make_usage_command(uri, code_lens.range, ref_count, client_id, results);

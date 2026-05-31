@@ -32,11 +32,11 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             rust:
@@ -51,6 +51,7 @@ jobs:
               - '.github/workflows/build.yml'
 
   # Lightweight dev builds for every push/PR — Linux x64, Windows x64, and experimental macOS.
+  # glua_check is shipped only for Linux and Windows.
   build-dev:
     name: Dev Build (${{ matrix.platform }})
     needs: changes
@@ -66,7 +67,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ startsWith(matrix.platform, 'darwin-') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Install Rust toolchain
@@ -76,25 +77,33 @@ jobs:
         with:
           key: dev-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build
+      - name: Build language server
         run: |
           rustup target add ${{ matrix.target }}
-          cargo build --release --target ${{ matrix.target }} -p glua_ls -p glua_check
-      - name: Copy binary (Linux)
+          cargo build --release --target ${{ matrix.target }} -p glua_ls
+      - name: Build glua_check
+        if: ${{ !startsWith(matrix.platform, 'darwin-') }}
+        run: cargo build --release --target ${{ matrix.target }} -p glua_check
+      - name: Copy language server (Unix)
         if: ${{ matrix.os != 'windows-latest' }}
         run: |
           mkdir -p ${{ github.workspace }}/artifact/
           cp ${{ github.workspace }}/target/${{ matrix.target }}/release/glua_ls ${{ github.workspace }}/artifact/glua_ls
-          cp ${{ github.workspace }}/target/${{ matrix.target }}/release/glua_check ${{ github.workspace }}/artifact/glua_check
-      - name: Copy binary (Windows)
+      - name: Copy glua_check (Linux)
+        if: ${{ matrix.os != 'windows-latest' && !startsWith(matrix.platform, 'darwin-') }}
+        run: cp ${{ github.workspace }}/target/${{ matrix.target }}/release/glua_check ${{ github.workspace }}/artifact/glua_check
+      - name: Copy binaries (Windows)
         if: ${{ matrix.os == 'windows-latest' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/artifact/"
           Copy-Item "${{ github.workspace }}/target/${{ matrix.target }}/release/glua_ls.exe" "${{ github.workspace }}/artifact/glua_ls.exe"
-          Copy-Item "${{ github.workspace }}/target/${{ matrix.target }}/release/glua_check.exe" "${{ github.workspace }}/artifact/glua_check.exe"
+      - name: Copy glua_check (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: Copy-Item "${{ github.workspace }}/target/${{ matrix.target }}/release/glua_check.exe" "${{ github.workspace }}/artifact/glua_check.exe"
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: glua_ls-${{ matrix.platform }}-dev
           path: ${{ github.workspace }}/artifact/
@@ -116,8 +125,6 @@ jobs:
           - { os: macos-15,       target: aarch64-apple-darwin,      platform: darwin-arm64-experimental, cross: general, crate: glua_ls, output: glua_ls }
           - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux-x64, cross: general,  crate: glua_check, output: glua_check }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   platform: win32-x64, cross: general,  crate: glua_check, output: glua_check }
-          - { os: macos-15-intel, target: x86_64-apple-darwin,       platform: darwin-x64-experimental, cross: general, crate: glua_check, output: glua_check }
-          - { os: macos-15,       target: aarch64-apple-darwin,      platform: darwin-arm64-experimental, cross: general, crate: glua_check, output: glua_check }
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ contains(matrix.platform, 'darwin') }}
     steps:
@@ -156,7 +163,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Install Rust toolchain
@@ -194,13 +201,13 @@ jobs:
           Copy-Item "${{ github.workspace }}/target/${{ matrix.target }}/release/${{ matrix.crate }}.exe" "${{ github.workspace }}/artifact/${{ matrix.output }}.exe"
       - name: Upload
         if: ${{ matrix.cross != 'zigbuild' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.output }}-${{ matrix.platform }}
           path: ${{ github.workspace }}/artifact/
       - name: Upload zigbuild
         if: ${{ matrix.cross == 'zigbuild' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.output }}-${{ matrix.platform }}-glibc.${{ matrix.glibc }}
           path: ${{ github.workspace }}/artifact/
@@ -222,7 +229,7 @@ jobs:
             echo "::error::CARGO_TOKEN is required for this publish-crates run."
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Install Rust toolchain
@@ -286,7 +293,7 @@ jobs:
       contents: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
       - name: Add execute permission and compress (Linux)
         run: |
           chmod +x glua_ls-linux-x64/glua_ls
@@ -315,8 +322,6 @@ jobs:
 
           package_macos_artifact glua_ls-darwin-x64-experimental glua_ls glua_ls-darwin-x64-experimental.tar.gz
           package_macos_artifact glua_ls-darwin-arm64-experimental glua_ls glua_ls-darwin-arm64-experimental.tar.gz
-          package_macos_artifact glua_check-darwin-x64-experimental glua_check glua_check-darwin-x64-experimental.tar.gz
-          package_macos_artifact glua_check-darwin-arm64-experimental glua_check glua_check-darwin-arm64-experimental.tar.gz
       - name: Compress (Windows)
         run: |
           cd glua_ls-win32-x64
@@ -378,8 +383,6 @@ jobs:
             "glua_check-linux-x64.tar.gz"
             "glua_ls-darwin-x64-experimental.tar.gz"
             "glua_ls-darwin-arm64-experimental.tar.gz"
-            "glua_check-darwin-x64-experimental.tar.gz"
-            "glua_check-darwin-arm64-experimental.tar.gz"
           )
 
           upload_assets=()

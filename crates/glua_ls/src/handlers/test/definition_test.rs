@@ -389,6 +389,27 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_forward_declared_function_call_prefers_function_definition() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_definition(
+            r#"
+                local create_initial_simplex4
+
+                function create_initial_simplex4(points, thread_yield)
+                    return { points, thread_yield }
+                end
+
+                local faces = create_initial_simplex4<??>({}, nil)
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 3,
+            }]
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_export_function_2() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         ws.def_file(

@@ -454,6 +454,17 @@ pub fn infer_bind_value_type(
             }
             typ
         }
+        LuaAst::LuaFuncStat(func_stat) => {
+            let func_name = func_stat.get_func_name()?;
+            let func_expr: LuaExpr = func_name.into();
+            if expr != func_expr {
+                return None;
+            }
+
+            let signature_id =
+                LuaSignatureId::from_closure(cache.get_file_id(), &func_stat.get_closure()?);
+            Some(LuaType::Signature(signature_id))
+        }
         LuaAst::LuaTableField(table_field) => {
             let field_key = table_field.get_field_key()?;
             let table_expr = table_field.get_parent::<LuaTableExpr>()?;

@@ -7,7 +7,9 @@ use lsp_types::{
     ClientCapabilities, Location, OneOf, Position, ReferenceParams, ServerCapabilities,
 };
 use reference_searcher::search_references;
-pub use reference_searcher::{search_decl_references, search_member_references};
+pub use reference_searcher::{
+    search_decl_references, search_decl_usages, search_member_references,
+};
 use rowan::TokenAtOffset;
 use tokio_util::sync::CancellationToken;
 
