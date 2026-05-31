@@ -2,11 +2,14 @@
 mod test {
     use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaIndexKey, LuaLocalName, LuaVarExpr};
     use googletest::prelude::*;
-    use lsp_types::NumberOrString;
+    use lsp_types::{NumberOrString, Uri};
     use smol_str::SmolStr;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, Emmyrc, LuaType, LuaUnionType, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, Emmyrc, LuaMemberId, LuaMemberOwner, LuaType, LuaUnionType,
+        VirtualWorkspace,
+    };
 
     fn file_has_diagnostic(
         ws: &mut VirtualWorkspace,
@@ -73,6 +76,36 @@ mod test {
                 _ => None,
             })
             .expect("expected semantic info for index expr")
+    }
+
+    fn first_index_expr_member_owner(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaMemberOwner {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<LuaAst>()
+            .find_map(|node| match node {
+                LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
+                    Some(index_expr)
+                }
+                _ => None,
+            })
+            .expect("expected index expr");
+        let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_member_owner(&member_id)
+            .cloned()
+            .expect("expected member owner")
     }
 
     #[test]
@@ -1338,6 +1371,535 @@ Editor:MissingMethod()
             &editor_type,
             eq(&editor_type_a),
             "Editor in file_b should have the same concrete type as Editor in file_a"
+        );
+    }
+
+    #[gtest]
+    fn test_global_self_assignment_preserves_existing_table_shape() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "marauth/gamemode/src/boot/boot.lua",
+            r#"
+marauth = {}
+marauth.util = {}
+"#,
+        );
+        let file_id = ws.def_file(
+            "marauth-hl2rp/gamemode/sh_init.lua",
+            r#"
+marauth = marauth
+
+local observed = marauth
+local util = marauth.util
+"#,
+        );
+
+        let observed_type = local_name_type(&mut ws, file_id, "observed");
+        assert_that!(
+            observed_type.is_unknown(),
+            eq(false),
+            "self-assignment should not make marauth unknown"
+        );
+
+        let util_type = local_name_type(&mut ws, file_id, "util");
+        assert_that!(
+            util_type.is_unknown() || util_type.is_nil(),
+            eq(false),
+            "self-assignment should not erase the known marauth.util table"
+        );
+    }
+
+    #[gtest]
+    fn test_global_self_assignment_does_not_shadow_lower_priority_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        let library_root = ws.virtual_url_generator.new_path("__test_library_marauth");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri = Uri::parse_from_file_path(&library_root.join("marauth.lua"))
+            .expect("valid library uri");
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+marauth = {}
+marauth.util = {}
+"#
+                .to_string(),
+            ),
+        );
+
+        let file_id = ws.def(
+            r#"
+marauth = marauth
+
+local observed = marauth
+local util = marauth.util
+"#,
+        );
+
+        let observed_type = local_name_type(&mut ws, file_id, "observed");
+        assert_that!(
+            observed_type.is_table(),
+            eq(true),
+            "self-assignment should not shadow a visible lower-priority table with unknown"
+        );
+
+        let util_type = local_name_type(&mut ws, file_id, "util");
+        assert_that!(
+            util_type.is_table(),
+            eq(true),
+            "self-assignment should preserve fields from the visible lower-priority table"
+        );
+    }
+
+    #[gtest]
+    fn test_plain_global_table_prefers_global_path_member_over_nullable_any() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+---@type table
+marauth = {}
+
+marauth.util = {}
+
+function marauth.util:TestFunction()
+end
+
+local util = marauth.util
+local testFunction = marauth.util.TestFunction
+"#,
+        );
+
+        let util_type = local_name_type(&mut ws, file_id, "util");
+        assert_that!(
+            matches!(util_type, LuaType::TableConst(_) | LuaType::MergedTable(_)),
+            eq(true),
+            "plain global table should resolve the concrete global-path util member, got {util_type:?}"
+        );
+
+        let test_function_type = local_name_type(&mut ws, file_id, "testFunction");
+        assert_that!(
+            test_function_type.is_function(),
+            eq(true),
+            "plain global table should not turn nested global-path methods into nullable any, got {test_function_type:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_bare_table_fragment_does_not_pollute_merged_global_member() {
+        let mut ws = VirtualWorkspace::new();
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_marauth_bare_table");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            Uri::parse_from_file_path(&library_root.join("marauth.lua")).expect("valid uri");
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+marauth = {}
+marauth.util = {}
+
+function marauth.util:TestFunction()
+end
+"#
+                .to_string(),
+            ),
+        );
+
+        let file_id = ws.def(
+            r#"
+---@type table
+marauth = marauth or {}
+
+local testFunction = marauth.util.TestFunction
+"#,
+        );
+
+        let test_function_type = local_name_type(&mut ws, file_id, "testFunction");
+        assert_that!(
+            test_function_type.is_function(),
+            eq(true),
+            "bare table fragments in a merged global should not pollute known members with nullable any, got {test_function_type:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_resolved_current_workspace_globals_do_not_fall_back_to_lower_priority_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_shadowed_global");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri = Uri::parse_from_file_path(&library_root.join("shadowed.lua"))
+            .expect("valid library uri");
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+shadowed = {}
+shadowed.util = {}
+"#
+                .to_string(),
+            ),
+        );
+
+        let file_id = ws.def(
+            r#"
+shadowed = 1
+shadowed = 2
+
+local value = shadowed
+"#,
+        );
+
+        let value_type = local_name_type(&mut ws, file_id, "value");
+        assert_that!(
+            matches!(value_type, LuaType::Integer | LuaType::IntegerConst(_)),
+            eq(true),
+            "a resolved current-workspace primitive global must remain a primitive, got {:?}",
+            value_type
+        );
+    }
+
+    #[gtest]
+    fn test_guarded_global_assignment_keeps_lower_priority_fields_without_field_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_marauth_guard");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri = Uri::parse_from_file_path(&library_root.join("marauth.lua"))
+            .expect("valid library uri");
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+marauth = {}
+marauth.util = {}
+
+function marauth.util:TestFunction()
+end
+"#
+                .to_string(),
+            ),
+        );
+
+        let file_id = ws.def(
+            r#"
+marauth = marauth or {}
+
+local util = marauth.util
+local testFunction = marauth.util.TestFunction
+"#,
+        );
+
+        let util_type = local_name_type(&mut ws, file_id, "util");
+        assert_that!(
+            util_type.is_table(),
+            eq(true),
+            "root guard should not require repeating `marauth.util = marauth.util or {{}}` in the child file"
+        );
+
+        let function_type = local_name_type(&mut ws, file_id, "testFunction");
+        assert_that!(
+            function_type.is_function(),
+            eq(true),
+            "fields from the lower-priority table should remain visible through the guarded root"
+        );
+    }
+
+    #[gtest]
+    fn test_same_priority_guarded_global_tables_merge_fields_independent_of_index_order() {
+        let mut ws = VirtualWorkspace::new();
+
+        let child_file = ws.def_file(
+            "gamemodes/test/gamemode/sh_test1.lua",
+            r#"
+marauth = marauth or {}
+
+marauth.util:TestFunction()
+local util = marauth.util
+local testFunction = marauth.util.TestFunction
+"#,
+        );
+        ws.def_file(
+            "gamemodes/test_base/gamemode/sh_test1.lua",
+            r#"
+marauth = marauth or {}
+marauth.util = marauth.util or {}
+
+function marauth.util:TestFunction()
+end
+"#,
+        );
+
+        let util_type = local_name_type(&mut ws, child_file, "util");
+        assert_that!(
+            util_type.is_table(),
+            eq(true),
+            "same-priority guarded table pieces should merge instead of depending on file order"
+        );
+
+        let function_type = local_name_type(&mut ws, child_file, "testFunction");
+        assert_that!(
+            function_type.is_function(),
+            eq(true),
+            "same-priority guarded table merge should preserve method fields"
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, child_file, DiagnosticCode::NeedCheckNil),
+            eq(false),
+            "same-priority guarded table merge should not make known fields nullable"
+        );
+    }
+
+    #[gtest]
+    fn test_cross_workspace_guarded_global_tables_merge_fields_with_isolation_disabled() {
+        let mut ws = VirtualWorkspace::new();
+
+        let base_root = ws
+            .virtual_url_generator
+            .new_path("__test_base_gamemode_root");
+        ws.analysis.add_main_workspace(base_root.clone());
+        let base_uri = Uri::parse_from_file_path(&base_root.join("gamemode/sh_test1.lua"))
+            .expect("valid base uri");
+        ws.analysis.update_file_by_uri(
+            &base_uri,
+            Some(
+                r#"
+marauth = marauth or {}
+marauth.util = marauth.util or {}
+
+function marauth.util:TestFunction()
+end
+"#
+                .to_string(),
+            ),
+        );
+
+        let child_file = ws.def_file(
+            "gamemode/sh_test1.lua",
+            r#"
+marauth = marauth or {}
+
+marauth.util:TestFunction()
+local util = marauth.util
+local testFunction = marauth.util.TestFunction
+"#,
+        );
+
+        let util_type = local_name_type(&mut ws, child_file, "util");
+        assert_that!(
+            util_type.is_table(),
+            eq(true),
+            "guarded table fields from another visible main workspace should stay non-nil, got {:?}",
+            util_type
+        );
+
+        let function_type = local_name_type(&mut ws, child_file, "testFunction");
+        assert_that!(
+            function_type.is_function(),
+            eq(true),
+            "guarded table methods from another visible main workspace should stay visible, got {:?}",
+            function_type
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, child_file, DiagnosticCode::NeedCheckNil),
+            eq(false),
+            "visible guarded table fields should not require nil checks"
+        );
+    }
+
+    #[gtest]
+    fn test_cross_workspace_guarded_global_tables_merge_disjoint_and_nested_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        let base_root = ws
+            .virtual_url_generator
+            .new_path("__test_base_gamemode_merge_root");
+        ws.analysis.add_main_workspace(base_root.clone());
+        let base_uri = Uri::parse_from_file_path(&base_root.join("gamemode/sh_test1.lua"))
+            .expect("valid base uri");
+        ws.analysis.update_file_by_uri(
+            &base_uri,
+            Some(
+                r#"
+marauth = marauth or {}
+marauth.util = marauth.util or {}
+
+function marauth.util:BaseFunction()
+end
+"#
+                .to_string(),
+            ),
+        );
+
+        let child_file = ws.def_file(
+            "gamemode/sh_test1.lua",
+            r#"
+marauth = marauth or {}
+marauth.character = marauth.character or {}
+marauth.util = marauth.util or {}
+
+function marauth.character:Create()
+end
+
+function marauth.util:ChildFunction()
+end
+
+local util = marauth.util
+local baseFunction = marauth.util.BaseFunction
+local childFunction = marauth.util.ChildFunction
+local character = marauth.character
+local create = marauth.character.Create
+"#,
+        );
+
+        let util_type = local_name_type(&mut ws, child_file, "util");
+        assert_that!(
+            util_type.is_table(),
+            eq(true),
+            "same global table field contributions should merge into a definite table"
+        );
+
+        let base_function_type = local_name_type(&mut ws, child_file, "baseFunction");
+        assert_that!(
+            base_function_type.is_function(),
+            eq(true),
+            "nested table merge should preserve base workspace methods"
+        );
+
+        let child_function_type = local_name_type(&mut ws, child_file, "childFunction");
+        assert_that!(
+            child_function_type.is_function(),
+            eq(true),
+            "nested table merge should preserve child workspace methods"
+        );
+
+        let character_type = local_name_type(&mut ws, child_file, "character");
+        assert_that!(
+            character_type.is_table(),
+            eq(true),
+            "disjoint root fields should remain visible through the merged global table"
+        );
+
+        let create_type = local_name_type(&mut ws, child_file, "create");
+        assert_that!(
+            create_type.is_function(),
+            eq(true),
+            "disjoint nested methods should remain visible through the merged global table"
+        );
+    }
+
+    #[gtest]
+    fn test_three_file_nested_guarded_global_table_chain_keeps_all_methods() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def_file(
+            "gamemodes/test_base/gamemode/sh_test1.lua",
+            r#"
+marauth = marauth or {}
+marauth.util = marauth.util or {}
+
+function marauth.util:BaseFunction()
+end
+"#,
+        );
+        ws.def_file(
+            "gamemodes/test/gamemode/sh_test1.lua",
+            r#"
+marauth = marauth or {}
+marauth.util = marauth.util or {}
+
+function marauth.util:FirstChildFunction()
+end
+"#,
+        );
+        let consumer_file = ws.def_file(
+            "gamemodes/test/gamemode/sh_test2.lua",
+            r#"
+marauth = marauth or {}
+marauth.util = marauth.util or {}
+
+function marauth.util:SecondChildFunction()
+end
+
+local util = marauth.util
+local baseFunction = marauth.util.BaseFunction
+local firstChildFunction = marauth.util.FirstChildFunction
+local secondChildFunction = marauth.util.SecondChildFunction
+"#,
+        );
+
+        let util_type = local_name_type(&mut ws, consumer_file, "util");
+        assert_that!(
+            util_type.is_table(),
+            eq(true),
+            "nested guarded table chain should remain a definite table, got {:?}",
+            util_type
+        );
+
+        for name in ["baseFunction", "firstChildFunction", "secondChildFunction"] {
+            let function_type = local_name_type(&mut ws, consumer_file, name);
+            assert_that!(
+                function_type.is_function(),
+                eq(true),
+                "nested guarded table chain should preserve {name}, got {:?}",
+                function_type
+            );
+        }
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::NeedCheckNil),
+            eq(false),
+            "nested guarded table chain should not make known methods nullable"
+        );
+    }
+
+    #[gtest]
+    fn test_guarded_global_child_field_owner_prefers_current_file_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        let base_root = ws
+            .virtual_url_generator
+            .new_path("__test_base_gamemode_owner_root");
+        ws.analysis.add_main_workspace(base_root.clone());
+        let base_uri = Uri::parse_from_file_path(&base_root.join("gamemode/sh_test1.lua"))
+            .expect("valid base uri");
+        ws.analysis.update_file_by_uri(
+            &base_uri,
+            Some(
+                r#"
+marauth = marauth or {}
+marauth.util = marauth.util or {}
+"#
+                .to_string(),
+            ),
+        );
+
+        let child_file = ws.def_file(
+            "gamemode/sh_test1.lua",
+            r#"
+marauth = marauth or {}
+marauth.character = marauth.character or {}
+"#,
+        );
+
+        let owner = first_index_expr_member_owner(&ws, child_file, "marauth.character");
+        let LuaMemberOwner::Element(owner_range) = owner else {
+            panic!("expected marauth.character to be owned by a table element, got {owner:?}");
+        };
+        assert_that!(
+            owner_range.file_id,
+            eq(child_file),
+            "child guarded field assignment should attach to the current file's table owner"
         );
     }
 }

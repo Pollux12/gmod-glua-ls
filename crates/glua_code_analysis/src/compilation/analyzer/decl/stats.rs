@@ -97,24 +97,30 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 }
 
                 if let Some(decl) = analyzer.find_decl(name, position) {
-                    let decl_id = decl.get_id();
-                    analyzer
-                        .db
-                        .get_reference_index_mut()
-                        .add_decl_reference(decl_id, file_id, range, true);
-                } else {
-                    let decl = LuaDecl::new(
-                        name,
-                        file_id,
-                        range,
-                        LuaDeclExtra::Global {
-                            kind: LuaSyntaxKind::NameExpr.into(),
-                        },
-                        value_expr_id,
-                    );
-
-                    analyzer.add_decl(decl);
+                    let is_local_decl = !decl.is_global() && !decl.is_module_scoped();
+                    let is_same_file_global_like = (decl.is_global() || decl.is_module_scoped())
+                        && decl.get_file_id() == file_id;
+                    if is_local_decl || is_same_file_global_like {
+                        let decl_id = decl.get_id();
+                        analyzer
+                            .db
+                            .get_reference_index_mut()
+                            .add_decl_reference(decl_id, file_id, range, true);
+                        continue;
+                    }
                 }
+
+                let decl = LuaDecl::new(
+                    name,
+                    file_id,
+                    range,
+                    LuaDeclExtra::Global {
+                        kind: LuaSyntaxKind::NameExpr.into(),
+                    },
+                    value_expr_id,
+                );
+
+                analyzer.add_decl(decl);
             }
             LuaVarExpr::IndexExpr(index_expr) => {
                 let index_key = index_expr.get_index_key()?;

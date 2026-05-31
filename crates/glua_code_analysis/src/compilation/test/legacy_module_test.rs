@@ -4,7 +4,8 @@ mod test {
 
     use crate::humanize_type;
     use crate::{
-        Emmyrc, EmmyrcLuaVersion, LuaSemanticDeclId, LuaType, RenderLevel, VirtualWorkspace,
+        Emmyrc, EmmyrcLuaVersion, GlobalId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId,
+        LuaType, RenderLevel, VirtualWorkspace,
     };
 
     fn local_type_by_name(
@@ -106,6 +107,44 @@ mod test {
         );
 
         assert!(local_type_by_name(&mut ws, class_file, "c").is_function());
+    }
+
+    #[test]
+    fn legacy_module_same_file_reassignment_reuses_module_decl() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.runtime.version = EmmyrcLuaVersion::Lua51;
+        ws.update_emmyrc(emmyrc);
+        let class_file = ws.def_file(
+            "class.lua",
+            r#"
+            module("class", package.seeall)
+
+            Value = "hello"
+            Value = 123
+            local value = Value
+            "#,
+        );
+
+        let value_type = local_type_by_name(&mut ws, class_file, "value");
+        assert!(
+            matches!(value_type, LuaType::Integer | LuaType::IntegerConst(_)),
+            "same-file module reassignment should update the original module-scoped decl, got {value_type:?}"
+        );
+
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new("class"));
+        let key = LuaMemberKey::Name("Value".into());
+        let member_count = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_members_for_owner_key(&owner, &key)
+            .len();
+        assert_eq!(
+            member_count, 1,
+            "same-file module reassignment should not create duplicate module members"
+        );
     }
 
     #[test]

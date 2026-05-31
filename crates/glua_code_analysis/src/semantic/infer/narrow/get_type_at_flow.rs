@@ -9,7 +9,8 @@ use rowan::TextSize;
 use crate::{
     AssignVarHint, CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
     GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaUnionType, TypeOps, infer_expr,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeOwner, LuaUnionType,
+    TypeOps, infer_expr,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
         infer_name::infer_param,
@@ -979,7 +980,7 @@ fn get_type_at_assign_stat(
         }
 
         // Check if there's an explicit type annotation (not just inferred type)
-        let var_id = match &var {
+        let type_owner = match &var {
             LuaVarExpr::NameExpr(name_expr) => {
                 Some(LuaDeclId::new(cache.get_file_id(), name_expr.get_position()).into())
             }
@@ -988,12 +989,20 @@ fn get_type_at_assign_stat(
             }
         };
 
-        let explicit_var_type = var_id
-            .and_then(|id| db.get_type_index().get_type_cache(&id))
+        let explicit_var_type = type_owner
+            .as_ref()
+            .and_then(|id| db.get_type_index().get_type_cache(id))
             .filter(|tc| tc.is_doc())
             .map(|tc| tc.as_type().clone());
 
-        let expr_type = infer_expr_list_value_type_at(db, cache, &exprs, i)?;
+        let guarded_global_type = exprs.get(i).and_then(|expr| {
+            guarded_global_self_assignment_type(db, cache, type_owner.as_ref(), &maybe_ref_id, expr)
+        });
+
+        let expr_type = match guarded_global_type {
+            Some(typ) => Some(typ),
+            None => infer_expr_list_value_type_at(db, cache, &exprs, i)?,
+        };
         let Some(expr_type) = expr_type else {
             return Ok(ResultTypeOrContinue::Continue);
         };
@@ -1042,6 +1051,36 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+fn guarded_global_self_assignment_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    type_owner: Option<&LuaTypeOwner>,
+    var_ref_id: &VarRefId,
+    expr: &LuaExpr,
+) -> Option<LuaType> {
+    if !is_self_coalescing_or_expr(db, cache, var_ref_id, expr) {
+        return None;
+    }
+
+    let Some(LuaTypeOwner::Decl(decl_id)) = type_owner else {
+        return None;
+    };
+
+    let decl = db.get_decl_index().get_decl(decl_id)?;
+    if !decl.is_global() {
+        return None;
+    }
+
+    let type_cache = db
+        .get_type_index()
+        .get_type_cache(&LuaTypeOwner::Decl(*decl_id))?;
+    if !type_cache.is_infer() || !type_cache.as_type().is_table() {
+        return None;
+    }
+
+    Some(type_cache.as_type().clone())
 }
 
 fn assignment_flow_info_cannot_match(
