@@ -100,7 +100,12 @@ fn add_func_stat_code_lens(
         }
         LuaVarExpr::NameExpr(name_expr) => {
             let name_token = name_expr.get_name_token()?;
-            let decl_id = LuaDeclId::new(file_id, name_token.get_position());
+            let decl_id = semantic_model
+                .get_db()
+                .get_reference_index()
+                .get_local_reference(&file_id)
+                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
+                .unwrap_or_else(|| LuaDeclId::new(file_id, name_token.get_position()));
             let data = CodeLensResolveData {
                 uri: Some(document.get_uri().clone()),
                 payload: CodeLensData::DeclId(decl_id),
@@ -370,6 +375,50 @@ fn add_net_call_code_lens(
     });
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_code_analysis::VirtualWorkspace;
+    use glua_parser::{LuaAstNode, LuaLocalName};
+    use googletest::prelude::*;
+
+    use super::build_code_lens;
+    use crate::handlers::code_lens::{CodeLensData, CodeLensResolveData};
+
+    #[gtest]
+    fn function_code_lens_uses_forward_local_decl_id() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+                local create_initial_simplex4
+
+                function create_initial_simplex4(points, thread_yield)
+                    return { points, thread_yield }
+                end
+
+                local faces = create_initial_simplex4({}, nil)
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let lenses = build_code_lens(&semantic_model).expect("expected code lenses");
+        let data = lenses
+            .iter()
+            .filter_map(|lens| lens.data.as_ref())
+            .find_map(|value| serde_json::from_value::<CodeLensResolveData>(value.clone()).ok())
+            .expect("expected function code lens data");
+        let local_name = ws.get_node::<LuaLocalName>(file_id);
+        let expected_decl = glua_code_analysis::LuaDeclId::new(file_id, local_name.get_position());
+
+        let CodeLensData::DeclId(actual_decl) = data.payload else {
+            panic!("expected declaration code lens");
+        };
+        assert_that!(actual_decl, eq(expected_decl));
+    }
 }
 
 /// Picks the label for a `net.Start` lens. Looks up the indexed send flow
