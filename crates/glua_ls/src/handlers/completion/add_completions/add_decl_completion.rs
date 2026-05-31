@@ -1,4 +1,5 @@
 use glua_code_analysis::{DbIndex, LuaDeclId, LuaSemanticDeclId, LuaType};
+use glua_parser::{LuaAstNode, LuaExpr, LuaSyntaxKind};
 use lsp_types::CompletionItem;
 
 use crate::handlers::completion::{
@@ -7,7 +8,12 @@ use crate::handlers::completion::{
 };
 
 use super::{
-    CallDisplay, check_visibility, get_completion_kind, get_description, get_detail, is_deprecated,
+    CallDisplay, check_visibility,
+    completion_item_info::{
+        color_info_from_expr, color_info_from_type, is_color_type, scalar_literal_description,
+        scalar_literal_detail,
+    },
+    get_completion_kind, get_description, get_detail, is_deprecated,
 };
 
 pub fn add_decl_completion(
@@ -20,14 +26,36 @@ pub fn add_decl_completion(
     check_visibility(builder, property_owner.clone())?;
 
     let overload_count = count_function_overloads(builder.semantic_model.get_db(), typ);
+    let color = get_decl_completion_color(builder, decl_id, typ);
+    let literal_detail = scalar_literal_detail(typ);
 
     let mut completion_item = CompletionItem {
         label: name.to_string(),
-        kind: Some(get_completion_kind(typ)),
-        data: CompletionData::from_property_owner_id(builder, decl_id.into(), overload_count),
+        kind: Some(if color.is_some() {
+            lsp_types::CompletionItemKind::COLOR
+        } else {
+            get_completion_kind(typ)
+        }),
+        data: match color.clone() {
+            Some(color) => CompletionData::from_property_owner_id_with_color(
+                builder,
+                decl_id.into(),
+                overload_count,
+                color,
+            ),
+            None => CompletionData::from_property_owner_id(builder, decl_id.into(), overload_count),
+        },
         label_details: Some(lsp_types::CompletionItemLabelDetails {
-            detail: get_detail(builder, typ, CallDisplay::None),
-            description: get_description(builder, typ),
+            detail: color
+                .as_ref()
+                .map(|color| format!(" {}", color.hex))
+                .or_else(|| get_detail(builder, typ, CallDisplay::None))
+                .or(literal_detail),
+            description: if color.is_some() {
+                Some("Color".to_string())
+            } else {
+                scalar_literal_description(typ).or_else(|| get_description(builder, typ))
+            },
         }),
         ..Default::default()
     };
@@ -65,4 +93,53 @@ fn count_function_overloads(db: &DbIndex, typ: &LuaType) -> Option<usize> {
         count -= 1;
     }
     if count == 0 { None } else { Some(count) }
+}
+
+fn get_decl_completion_color(
+    builder: &CompletionBuilder,
+    decl_id: LuaDeclId,
+    typ: &LuaType,
+) -> Option<crate::handlers::completion::completion_data::CompletionColorInfo> {
+    if let Some(color) = color_info_from_type(typ) {
+        return Some(color);
+    }
+
+    if !is_color_type(typ) && !matches!(typ, LuaType::Unknown) {
+        return None;
+    }
+
+    let value_expr = get_decl_value_expr(builder, decl_id)?;
+    color_info_from_expr(&value_expr)
+}
+
+fn get_decl_value_expr(builder: &CompletionBuilder, decl_id: LuaDeclId) -> Option<LuaExpr> {
+    let decl = builder
+        .semantic_model
+        .get_db()
+        .get_decl_index()
+        .get_decl(&decl_id)?;
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    if !can_expr_syntax_be_color(value_syntax_id.get_kind()) {
+        return None;
+    }
+    let tree = builder
+        .semantic_model
+        .get_db()
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)?;
+    let value_node = value_syntax_id.to_node_from_root(&tree.get_red_root())?;
+    LuaExpr::cast(value_node)
+}
+
+fn can_expr_syntax_be_color(kind: LuaSyntaxKind) -> bool {
+    matches!(
+        kind,
+        LuaSyntaxKind::CallExpr
+            | LuaSyntaxKind::LiteralExpr
+            | LuaSyntaxKind::RequireCallExpr
+            | LuaSyntaxKind::AssertCallExpr
+            | LuaSyntaxKind::ErrorCallExpr
+            | LuaSyntaxKind::TypeCallExpr
+            | LuaSyntaxKind::SetmetatableCallExpr
+    )
 }

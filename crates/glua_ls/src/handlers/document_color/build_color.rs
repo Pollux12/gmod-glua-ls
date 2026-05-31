@@ -6,6 +6,30 @@ use glua_parser::{
 use lsp_types::{Color, ColorInformation};
 use rowan::{TextRange, TextSize};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GmodColor {
+    pub(crate) red: f32,
+    pub(crate) green: f32,
+    pub(crate) blue: f32,
+    pub(crate) alpha: f32,
+}
+
+pub(crate) struct GmodHexColor {
+    pub(crate) color: GmodColor,
+    pub(crate) has_alpha: bool,
+}
+
+impl GmodColor {
+    pub(crate) fn to_lsp_color(self) -> Color {
+        Color {
+            red: self.red,
+            green: self.green,
+            blue: self.blue,
+            alpha: self.alpha,
+        }
+    }
+}
+
 pub fn build_colors(
     root: LuaSyntaxNode,
     document: &LuaDocument,
@@ -165,6 +189,30 @@ fn try_build_gmod_color_call(
     document: &LuaDocument,
     result: &mut Vec<ColorInformation>,
 ) -> Option<()> {
+    let (color, args) = gmod_color_call_info(&call_expr)?;
+
+    // Use the range of the arguments only (not the whole call expr) so the swatch
+    // appears inside the brackets, consistent with other color-tuple detections.
+    let first_arg = args.first()?;
+    let last_arg = args.last()?;
+    let args_range = TextRange::new(
+        first_arg.syntax().text_range().start(),
+        last_arg.syntax().text_range().end(),
+    );
+    let range = document.to_lsp_range(args_range)?;
+    result.push(ColorInformation {
+        range,
+        color: color.to_lsp_color(),
+    });
+
+    Some(())
+}
+
+pub(crate) fn gmod_color_from_call_expr(call_expr: &LuaCallExpr) -> Option<GmodColor> {
+    gmod_color_call_info(call_expr).map(|(color, _)| color)
+}
+
+fn gmod_color_call_info(call_expr: &LuaCallExpr) -> Option<(GmodColor, Vec<LuaExpr>)> {
     // Prefix must be a bare name expression "Color".
     let prefix = call_expr.get_prefix_expr()?;
     let LuaExpr::NameExpr(name_expr) = &prefix else {
@@ -173,7 +221,7 @@ fn try_build_gmod_color_call(
     let name_token = name_expr.get_name_token()?;
     if name_token.get_name_text() != "Color" {
         return None;
-    }
+    };
 
     let args_list = call_expr.get_args_list()?;
     let args: Vec<_> = args_list.get_args().collect();
@@ -203,26 +251,15 @@ fn try_build_gmod_color_call(
         components[i] = (value / 255.0) as f32;
     }
 
-    // Use the range of the arguments only (not the whole call expr) so the swatch
-    // appears inside the brackets, consistent with other color-tuple detections.
-    let first_arg = args.first()?;
-    let last_arg = args.last()?;
-    let args_range = TextRange::new(
-        first_arg.syntax().text_range().start(),
-        last_arg.syntax().text_range().end(),
-    );
-    let range = document.to_lsp_range(args_range)?;
-    result.push(ColorInformation {
-        range,
-        color: Color {
+    Some((
+        GmodColor {
             red: components[0],
             green: components[1],
             blue: components[2],
             alpha: components[3],
         },
-    });
-
-    Some(())
+        args,
+    ))
 }
 
 fn try_build_color_information(
@@ -293,35 +330,38 @@ fn try_build_color_information(
     Some(())
 }
 
-fn parse_hex_color(hex: &str) -> Option<Color> {
-    match hex.len() {
-        6 => {
-            // RGB格式
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
-            Some(Color {
-                red: r,
-                green: g,
-                blue: b,
-                alpha: 1.0,
-            })
-        }
-        8 => {
-            // RGBA格式
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
-            let a = u8::from_str_radix(&hex[6..8], 16).ok()? as f32 / 255.0;
-            Some(Color {
-                red: r,
-                green: g,
-                blue: b,
-                alpha: a,
-            })
-        }
-        _ => None, // 不匹配的长度
+pub(crate) fn gmod_color_from_hex_text(text: &str) -> Option<GmodColor> {
+    gmod_hex_color_from_hex_text(text).map(|hex_color| hex_color.color)
+}
+
+pub(crate) fn gmod_hex_color_from_hex_text(text: &str) -> Option<GmodHexColor> {
+    let hex = text.strip_prefix('#').unwrap_or(text);
+    if !matches!(hex.len(), 6 | 8) || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return None;
     }
+
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
+    let alpha = if hex.len() == 8 {
+        u8::from_str_radix(&hex[6..8], 16).ok()? as f32 / 255.0
+    } else {
+        1.0
+    };
+
+    Some(GmodHexColor {
+        color: GmodColor {
+            red,
+            green,
+            blue,
+            alpha,
+        },
+        has_alpha: hex.len() == 8,
+    })
+}
+
+fn parse_hex_color(hex: &str) -> Option<Color> {
+    gmod_color_from_hex_text(hex).map(GmodColor::to_lsp_color)
 }
 
 pub fn convert_color_to_hex(color: Color, len: usize) -> String {

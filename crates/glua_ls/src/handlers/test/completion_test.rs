@@ -3,7 +3,8 @@ mod tests {
     use glua_code_analysis::{DocSyntax, Emmyrc, EmmyrcFilenameConvention};
     use googletest::prelude::*;
     use lsp_types::{
-        CompletionItemKind, CompletionResponse, CompletionTriggerKind, InsertTextFormat,
+        CompletionItemKind, CompletionResponse, CompletionTriggerKind, Documentation,
+        InsertTextFormat, MarkupContent,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -1318,7 +1319,7 @@ mod tests {
             vec![VirtualCompletionItem {
                 label: "nameX".to_string(),
                 kind: CompletionItemKind::CONSTANT,
-                ..Default::default()
+                label_detail: Some(" = 1".to_string()),
             }],
         ));
         Ok(())
@@ -1561,7 +1562,7 @@ mod tests {
                 VirtualCompletionItem {
                     label: "GLOBAL".to_string(),
                     kind: CompletionItemKind::CONSTANT,
-                    label_detail: None,
+                    label_detail: Some(" = 0".to_string()),
                 },
                 VirtualCompletionItem {
                     label: "mod_with_class_and_def".to_string(),
@@ -1576,7 +1577,7 @@ mod tests {
                 VirtualCompletionItem {
                     label: "foo".to_string(),
                     kind: CompletionItemKind::CONSTANT,
-                    label_detail: None,
+                    label_detail: Some(" = 0".to_string()),
                 },
                 VirtualCompletionItem {
                     label: "mod_with_class".to_string(),
@@ -1664,7 +1665,7 @@ mod tests {
                 VirtualCompletionItem {
                     label: "x".to_string(),
                     kind: CompletionItemKind::CONSTANT,
-                    label_detail: None,
+                    label_detail: Some(" = 1".to_string()),
                 },
             ],
         ));
@@ -1680,7 +1681,7 @@ mod tests {
                 VirtualCompletionItem {
                     label: "foo".to_string(),
                     kind: CompletionItemKind::CONSTANT,
-                    label_detail: None,
+                    label_detail: Some(" = 1".to_string()),
                 },
             ],
         ));
@@ -1744,7 +1745,7 @@ mod tests {
                 VirtualCompletionItem {
                     label: "y".to_string(),
                     kind: CompletionItemKind::CONSTANT,
-                    label_detail: None,
+                    label_detail: Some(" = 0".to_string()),
                 },
             ],
         ));
@@ -1880,7 +1881,7 @@ mod tests {
                 VirtualCompletionItem {
                     label: "y".to_string(),
                     kind: CompletionItemKind::CONSTANT,
-                    label_detail: None,
+                    label_detail: Some(" = 0".to_string()),
                 },
             ],
         ));
@@ -1950,7 +1951,7 @@ mod tests {
                 VirtualCompletionItem {
                     label: "y".to_string(),
                     kind: CompletionItemKind::CONSTANT,
-                    label_detail: None,
+                    label_detail: Some(" = 0".to_string()),
                 },
                 VirtualCompletionItem {
                     label: "init".to_string(),
@@ -2486,12 +2487,12 @@ mod tests {
                 VirtualCompletionItem {
                     label: "\"bar\"".to_string(),
                     kind: CompletionItemKind::CONSTANT,
-                    ..Default::default()
+                    label_detail: Some(" = 2".to_string()),
                 },
                 VirtualCompletionItem {
                     label: "\"foo\"".to_string(),
                     kind: CompletionItemKind::CONSTANT,
-                    ..Default::default()
+                    label_detail: Some(" = 1".to_string()),
                 },
             ],
             CompletionTriggerKind::TRIGGER_CHARACTER
@@ -3652,6 +3653,261 @@ mod tests {
             .and_then(|details| details.detail.clone());
         verify_eq!(item_detail, Some("(player, entity)".to_string()))?;
 
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_color_global_completion_includes_preview_metadata() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Color
+
+                ---@return Color
+                function Color(r, g, b, a) end
+
+                color_white = Color(255, 255, 255, 255)
+                color_black = Color(0, 0, 0, 255)
+
+                color_w<??>
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .into_iter()
+            .find(|item| item.label == "color_white")
+            .ok_or("missing color_white completion")
+            .or_fail()?;
+
+        verify_eq!(item.kind, Some(CompletionItemKind::COLOR))?;
+        let label_details = item
+            .label_details
+            .as_ref()
+            .ok_or("missing label details")
+            .or_fail()?;
+        verify_that!(label_details.detail.as_ref(), some(eq(" #FFFFFF")))?;
+        verify_that!(label_details.description.as_ref(), some(eq("Color")))?;
+        verify_that!(
+            item.data
+                .as_ref()
+                .and_then(|data| data.get("color"))
+                .and_then(|color| color.get("hex"))
+                .and_then(|hex| hex.as_str()),
+            some(eq("#FFFFFF"))
+        )?;
+
+        let resolved = crate::handlers::completion::completion_resolve(
+            &ws.analysis,
+            item,
+            crate::context::ClientId::VSCode,
+        );
+        let documentation = resolved
+            .documentation
+            .as_ref()
+            .ok_or("missing resolved documentation")
+            .or_fail()?;
+        let Documentation::MarkupContent(MarkupContent { value, .. }) = documentation else {
+            return fail!("expected markdown documentation");
+        };
+        verify_that!(value, contains_substring("#FFFFFF"))?;
+        verify_that!(value, contains_substring("rgba(255, 255, 255, 255)"))?;
+        verify_that!(value, contains_substring("Color(255, 255, 255, 255)"))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_scalar_constant_completion_includes_literal_detail() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        check!(ws.check_completion(
+            r#"
+                local MAX_PLAYERS = 128
+                MAX_PLAY<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "MAX_PLAYERS".to_string(),
+                kind: CompletionItemKind::CONSTANT,
+                label_detail: Some(" = 128".to_string()),
+            }],
+        ));
+
+        check!(ws.check_completion(
+            r#"
+                local GAMEMODE_NAME = "sandbox"
+                GAMEMODE<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "GAMEMODE_NAME".to_string(),
+                kind: CompletionItemKind::CONSTANT,
+                label_detail: Some(" = \"sandbox\"".to_string()),
+            }],
+        ));
+
+        check!(ws.check_completion(
+            r#"
+                local IS_CLIENTSIDE = true
+                IS_CLIENT<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "IS_CLIENTSIDE".to_string(),
+                kind: CompletionItemKind::CONSTANT,
+                label_detail: Some(" = true".to_string()),
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_doc_boolean_constant_completion_is_constant() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        check!(ws.check_completion(
+            r#"
+                ---@type true
+                local IS_CLIENTSIDE
+                IS_CLIENT<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "IS_CLIENTSIDE".to_string(),
+                kind: CompletionItemKind::CONSTANT,
+                label_detail: Some(" = true".to_string()),
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hex_color_string_completion_includes_preview_metadata() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r##"
+                local ACCENT_COLOR = "#112233FF"
+
+                ACCENT<??>
+            "##,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .into_iter()
+            .find(|item| item.label == "ACCENT_COLOR")
+            .ok_or("missing ACCENT_COLOR completion")
+            .or_fail()?;
+
+        verify_eq!(item.kind, Some(CompletionItemKind::COLOR))?;
+        let label_details = item
+            .label_details
+            .as_ref()
+            .ok_or("missing label details")
+            .or_fail()?;
+        verify_that!(label_details.detail.as_ref(), some(eq(" #112233FF")))?;
+        verify_that!(label_details.description.as_ref(), some(eq("Color")))?;
+        verify_that!(
+            item.data
+                .as_ref()
+                .and_then(|data| data.get("color"))
+                .and_then(|color| color.get("hex"))
+                .and_then(|hex| hex.as_str()),
+            some(eq("#112233FF"))
+        )?;
+        verify_that!(
+            item.data
+                .as_ref()
+                .and_then(|data| data.get("color"))
+                .and_then(|color| color.get("rgb"))
+                .and_then(|rgb| rgb.as_str()),
+            some(eq("rgb(17, 34, 51)"))
+        )?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_color_member_completion_includes_preview_metadata() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Color
+
+                ---@return Color
+                function Color(r, g, b, a) end
+
+                local SKIN = {}
+                SKIN.HeaderColor = Color(20, 40, 60, 128)
+
+                SKIN.<??>
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .into_iter()
+            .find(|item| item.label == "HeaderColor")
+            .ok_or("missing HeaderColor completion")
+            .or_fail()?;
+
+        verify_eq!(item.kind, Some(CompletionItemKind::COLOR))?;
+        let label_details = item
+            .label_details
+            .as_ref()
+            .ok_or("missing label details")
+            .or_fail()?;
+        verify_that!(label_details.detail.as_ref(), some(eq(" #14283C80")))?;
+        verify_that!(label_details.description.as_ref(), some(eq("Color")))?;
+        verify_that!(
+            item.data
+                .as_ref()
+                .and_then(|data| data.get("color"))
+                .and_then(|color| color.get("rgba"))
+                .and_then(|rgba| rgba.as_str()),
+            some(eq("rgba(20, 40, 60, 128)"))
+        )?;
+        verify_that!(
+            item.data
+                .as_ref()
+                .and_then(|data| data.get("color"))
+                .and_then(|color| color.get("gmod"))
+                .and_then(|gmod| gmod.as_str()),
+            some(eq("Color(20, 40, 60, 128)"))
+        )?;
         Ok(())
     }
 }

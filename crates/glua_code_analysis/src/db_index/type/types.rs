@@ -420,6 +420,7 @@ impl LuaType {
                 | LuaType::TableConst(_)
                 | LuaType::DocStringConst(_)
                 | LuaType::DocIntegerConst(_)
+                | LuaType::DocBooleanConst(_)
         )
     }
 

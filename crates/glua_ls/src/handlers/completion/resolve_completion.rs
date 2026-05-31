@@ -6,7 +6,7 @@ use crate::{
     handlers::hover::{HoverBuilder, build_hover_content_for_completion},
 };
 
-use super::completion_data::{CompletionData, CompletionDataType};
+use super::completion_data::{CompletionColorInfo, CompletionData, CompletionDataType};
 
 pub fn resolve_completion(
     compilation: &LuaCompilation,
@@ -17,6 +17,7 @@ pub fn resolve_completion(
     client_id: ClientId,
 ) -> Option<()> {
     // todo: resolve completion
+    let color = completion_data.color.clone();
     match completion_data.typ {
         CompletionDataType::PropertyOwnerId(property_id) => {
             let hover_builder =
@@ -43,6 +44,9 @@ pub fn resolve_completion(
             }
         }
         _ => {}
+    }
+    if let Some(color) = color {
+        apply_color_completion_documentation(completion_item, &color);
     }
     Some(())
 }
@@ -186,4 +190,41 @@ fn build_other_completion_item(
         value: result,
     }));
     Some(())
+}
+
+fn apply_color_completion_documentation(
+    completion_item: &mut CompletionItem,
+    color: &CompletionColorInfo,
+) {
+    let mut color_documentation = String::new();
+    color_documentation.push_str("\n\n---\n\n");
+    color_documentation.push_str("**Color preview**\n\n");
+    color_documentation.push_str(&format!(
+        "<!-- gluals-color-preview --><span style=\"color:{};\">■</span> {}\n\n",
+        color.hex, color.hex
+    ));
+    color_documentation.push_str(&format!(
+        "`{}`  \n`{}`  \n`{}`",
+        color.rgb, color.rgba, color.gmod
+    ));
+
+    match completion_item.documentation.take() {
+        Some(Documentation::MarkupContent(mut markup)) => {
+            markup.value.push_str(&color_documentation);
+            completion_item.documentation = Some(Documentation::MarkupContent(markup));
+        }
+        Some(Documentation::String(mut text)) => {
+            text.push_str(&color_documentation);
+            completion_item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: lsp_types::MarkupKind::Markdown,
+                value: text,
+            }));
+        }
+        None => {
+            completion_item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: lsp_types::MarkupKind::Markdown,
+                value: color_documentation.trim_start().to_string(),
+            }));
+        }
+    }
 }

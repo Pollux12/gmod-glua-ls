@@ -1,4 +1,4 @@
-mod build_color;
+pub(crate) mod build_color;
 
 use build_color::{build_colors, convert_color_to_hex};
 use glua_code_analysis::SemanticModel;

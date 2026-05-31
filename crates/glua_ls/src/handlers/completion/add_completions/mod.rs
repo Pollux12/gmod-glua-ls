@@ -1,6 +1,7 @@
 mod add_decl_completion;
 mod add_member_completion;
 mod check_match_word;
+mod completion_item_info;
 
 pub use add_decl_completion::add_decl_completion;
 pub use add_member_completion::get_index_alias_name;

@@ -1,22 +1,27 @@
 use glua_code_analysis::{
-    DbIndex, LuaAliasCallKind, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId, LuaType,
-    SemanticModel, get_keyof_members, try_extract_signature_id_from_field,
+    DbIndex, LuaAliasCallKind, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId,
+    LuaType, SemanticModel, get_keyof_members, try_extract_signature_id_from_field,
 };
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaFuncStat, LuaGeneralToken, LuaIndexExpr,
-    LuaParenExpr, LuaTokenKind,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaFuncStat, LuaGeneralToken, LuaIndexExpr,
+    LuaParenExpr, LuaTableField, LuaTokenKind,
 };
 use lsp_types::CompletionItem;
 
 use crate::handlers::completion::{
     add_completions::get_function_snippet,
     completion_builder::CompletionBuilder,
-    completion_data::CompletionData,
+    completion_data::{CompletionColorInfo, CompletionData},
     providers::{apply_staged_call_snippet, get_function_remove_nil},
 };
 
 use super::{
-    CallDisplay, check_visibility, get_completion_kind, get_description, get_detail, is_deprecated,
+    CallDisplay, check_visibility,
+    completion_item_info::{
+        color_info_from_expr, color_info_from_type, is_color_type, scalar_literal_description,
+        scalar_literal_detail,
+    },
+    get_completion_kind, get_description, get_detail, is_deprecated,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,11 +101,19 @@ pub fn add_member_completion(
     if status == CompletionTriggerStatus::Colon && !remove_nil_type.is_function() {
         return None;
     }
+    let color = get_member_completion_color(builder, property_owner, &remove_nil_type);
 
     // 附加数据, 用于在`resolve`时进一步处理
     let completion_data = if let Some(id) = &property_owner {
         if let Some(index) = member_info.overload_index {
             CompletionData::from_overload(builder, id.clone(), index, overload_count)
+        } else if let Some(color) = color.clone() {
+            CompletionData::from_property_owner_id_with_color(
+                builder,
+                id.clone(),
+                overload_count,
+                color,
+            )
         } else {
             CompletionData::from_property_owner_id(builder, id.clone(), overload_count)
         }
@@ -112,16 +125,22 @@ pub fn add_member_completion(
         .unwrap_or(CallDisplay::None);
     let is_inferred_dynamic_member = property_owner.is_none();
     // 紧靠着 label 显示的描述
-    let detail = if is_inferred_dynamic_member {
+    let literal_detail = scalar_literal_detail(&remove_nil_type);
+    let detail = if let Some(color) = &color {
+        Some(format!(" {}", color.hex))
+    } else if is_inferred_dynamic_member {
         None
     } else {
-        get_detail(builder, &remove_nil_type, call_display)
+        get_detail(builder, &remove_nil_type, call_display).or(literal_detail)
     };
     // 在`detail`更右侧, 且不紧靠着`detail`显示
-    let description = if is_inferred_dynamic_member {
+    let description = if color.is_some() {
+        Some("Color".to_string())
+    } else if is_inferred_dynamic_member {
         None
     } else {
-        get_description(builder, &remove_nil_type)
+        scalar_literal_description(&remove_nil_type)
+            .or_else(|| get_description(builder, &remove_nil_type))
     };
 
     let deprecated = property_owner
@@ -130,7 +149,9 @@ pub fn add_member_completion(
 
     let mut completion_item = CompletionItem {
         label: label.clone(),
-        kind: Some(if is_inferred_dynamic_member {
+        kind: Some(if color.is_some() {
+            lsp_types::CompletionItemKind::COLOR
+        } else if is_inferred_dynamic_member {
             lsp_types::CompletionItemKind::VARIABLE
         } else {
             get_completion_kind(&remove_nil_type)
@@ -200,6 +221,54 @@ pub fn add_member_completion(
     );
 
     Some(())
+}
+
+fn get_member_completion_color(
+    builder: &CompletionBuilder,
+    property_owner: &Option<LuaSemanticDeclId>,
+    typ: &LuaType,
+) -> Option<CompletionColorInfo> {
+    if let Some(color) = color_info_from_type(typ) {
+        return Some(color);
+    }
+
+    if !is_color_type(typ) && !matches!(typ, LuaType::Unknown) {
+        return None;
+    }
+
+    let LuaSemanticDeclId::Member(member_id) = property_owner.as_ref()? else {
+        return None;
+    };
+    let value_expr = get_member_value_expr(builder.semantic_model.get_db(), *member_id)?;
+    color_info_from_expr(&value_expr)
+}
+
+fn get_member_value_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+
+    if let Some(field) = LuaTableField::cast(node.clone()) {
+        return field.get_value_expr();
+    }
+
+    if let Some(index_expr) = LuaIndexExpr::cast(node) {
+        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
+            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+            let value_idx = vars
+                .iter()
+                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
+            return value_exprs.get(value_idx).cloned();
+        }
+
+        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
+            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
+        }
+    }
+
+    None
 }
 
 fn add_signature_overloads(

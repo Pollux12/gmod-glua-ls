@@ -264,6 +264,7 @@ mod tests {
                 uri: Some(uri.clone()),
                 typ: CompletionDataType::Module("foo".to_string()),
                 overload_count: None,
+                color: None,
             })
             .expect("completion data should serialize"),
         });
