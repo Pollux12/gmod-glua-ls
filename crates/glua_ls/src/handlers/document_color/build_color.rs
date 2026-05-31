@@ -387,11 +387,10 @@ pub fn convert_color_to_hex(color: Color, len: usize) -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use super::build_colors;
     use glua_code_analysis::{FileId, VirtualWorkspace};
     use glua_parser::{LineIndex, LuaAstNode, LuaParser, ParserConfig};
     use googletest::prelude::*;
-
-    use super::build_colors;
 
     fn collect_colors(text: &str) -> Vec<lsp_types::ColorInformation> {
         let tree = LuaParser::parse(text, ParserConfig::default());
@@ -461,6 +460,45 @@ mod tests {
             function Color(r, g, b, a) end
             
             local c = Color(255, 0, 0)
+            "#,
+        );
+
+        verify_that!(colors.len(), eq(1))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn document_colors_do_not_include_color_variable_references() -> Result<()> {
+        let colors = collect_colors_semantic(
+            r#"
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a? number
+            function Color(r, g, b, a) end
+
+            local c = Color(0, 0, 255)
+            print(c)
+            "#,
+        );
+
+        verify_that!(colors.len(), eq(1))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn document_colors_do_not_include_color_member_references() -> Result<()> {
+        let colors = collect_colors_semantic(
+            r#"
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a? number
+            function Color(r, g, b, a) end
+
+            T = {}
+            T.Blue = Color(0, 0, 255)
+            print(T.Blue)
             "#,
         );
 

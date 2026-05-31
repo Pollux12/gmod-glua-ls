@@ -9,6 +9,10 @@ pub use add_member_completion::{
     CompletionTriggerStatus, add_member_completion_with_description_hint,
 };
 pub use check_match_word::check_match_word;
+pub(crate) use completion_item_info::{
+    color_info_from_expr, color_info_from_type, color_label_detail, color_preview_documentation,
+    is_color_type,
+};
 use glua_code_analysis::{LuaSemanticDeclId, LuaType, RenderLevel};
 use lsp_types::CompletionItemKind;
 

@@ -6,7 +6,10 @@ use crate::{
     handlers::hover::{HoverBuilder, build_hover_content_for_completion},
 };
 
-use super::completion_data::{CompletionColorInfo, CompletionData, CompletionDataType};
+use super::{
+    add_completions::color_preview_documentation,
+    completion_data::{CompletionColorInfo, CompletionData, CompletionDataType},
+};
 
 pub fn resolve_completion(
     compilation: &LuaCompilation,
@@ -196,35 +199,25 @@ fn apply_color_completion_documentation(
     completion_item: &mut CompletionItem,
     color: &CompletionColorInfo,
 ) {
-    let mut color_documentation = String::new();
-    color_documentation.push_str("\n\n---\n\n");
-    color_documentation.push_str("**Color preview**\n\n");
-    let color_title = format!(
-        "{} | {} | {} | {}",
-        color.hex, color.rgb, color.rgba, color.gmod
-    );
-    color_documentation.push_str(&format!(
-        concat!(
-            "<!-- gluals-color-preview -->",
-            "<span title=\"{}\" ",
-            "style=\"display:inline-block;width:0.85em;height:0.85em;",
-            "border:1px solid var(--vscode-editorWidget-border);",
-            "background-color:{};vertical-align:-0.1em;\"></span> {}\n\n"
-        ),
-        color_title, color.hex, color.hex
-    ));
-    color_documentation.push_str(&format!(
-        "`{}`  \n`{}`  \n`{}`",
-        color.rgb, color.rgba, color.gmod
-    ));
+    let preview_documentation = color_preview_documentation(color);
 
     match completion_item.documentation.take() {
         Some(Documentation::MarkupContent(mut markup)) => {
-            markup.value.push_str(&color_documentation);
+            if !markup.value.contains(&preview_documentation) {
+                if !markup.value.trim().is_empty() {
+                    markup.value.push_str("\n\n");
+                }
+                markup.value.push_str(&preview_documentation);
+            }
             completion_item.documentation = Some(Documentation::MarkupContent(markup));
         }
         Some(Documentation::String(mut text)) => {
-            text.push_str(&color_documentation);
+            if !text.contains(&preview_documentation) {
+                if !text.trim().is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&preview_documentation);
+            }
             completion_item.documentation = Some(Documentation::MarkupContent(MarkupContent {
                 kind: lsp_types::MarkupKind::Markdown,
                 value: text,
@@ -233,7 +226,7 @@ fn apply_color_completion_documentation(
         None => {
             completion_item.documentation = Some(Documentation::MarkupContent(MarkupContent {
                 kind: lsp_types::MarkupKind::Markdown,
-                value: color_documentation.trim_start().to_string(),
+                value: preview_documentation,
             }));
         }
     }

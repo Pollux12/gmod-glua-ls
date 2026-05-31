@@ -6,6 +6,7 @@ mod providers;
 mod resolve_completion;
 
 pub use add_completions::get_index_alias_name;
+pub(crate) use add_completions::{color_info_from_expr, color_info_from_type, is_color_type};
 use completion_builder::CompletionBuilder;
 pub(crate) use completion_data::CompletionData;
 #[cfg(test)]

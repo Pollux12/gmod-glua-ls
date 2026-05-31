@@ -27,6 +27,7 @@ pub struct CompletionColorInfo {
     pub rgb: String,
     pub rgba: String,
     pub gmod: String,
+    pub gmod_display: String,
 }
 
 #[allow(unused)]

@@ -14,7 +14,7 @@ pub async fn on_emmy_annotator_handler(
     context: ServerContextSnapshot,
     params: EmmyAnnotatorParams,
     cancel_token: CancellationToken,
-) -> Option<Vec<EmmyAnnotator>> {
+) -> Option<EmmyAnnotatorResult> {
     if cancel_token.is_cancelled() {
         return None;
     }
@@ -43,7 +43,8 @@ pub async fn on_emmy_annotator_handler(
 
         let file_id = analysis.get_file_id(&uri)?;
         let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
-        build_annotators(&semantic_model)
+        let annotators = build_annotators(&semantic_model);
+        EmmyAnnotatorResult { annotators }
     };
 
     Some(result)

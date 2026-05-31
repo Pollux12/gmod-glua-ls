@@ -8,7 +8,7 @@ use crate::handlers::{
     },
 };
 
-pub(super) fn color_info_from_type(typ: &LuaType) -> Option<CompletionColorInfo> {
+pub(crate) fn color_info_from_type(typ: &LuaType) -> Option<CompletionColorInfo> {
     let text = match typ {
         LuaType::StringConst(text) | LuaType::DocStringConst(text) => text.as_str(),
         _ => return None,
@@ -24,12 +24,18 @@ pub(super) fn color_info_from_type(typ: &LuaType) -> Option<CompletionColorInfo>
     Some(completion_color_info(hex_color.color, hex_color.has_alpha))
 }
 
-pub(super) fn color_info_from_expr(expr: &LuaExpr) -> Option<CompletionColorInfo> {
+pub(crate) fn color_info_from_expr(expr: &LuaExpr) -> Option<CompletionColorInfo> {
     match expr {
         LuaExpr::CallExpr(call_expr) => {
             let color = gmod_color_from_call_expr(call_expr)?;
             let alpha = (color.alpha * 255.0).round() as u8;
-            Some(completion_color_info(color, alpha != u8::MAX))
+            let has_explicit_alpha = call_expr
+                .get_args_list()
+                .is_some_and(|args| args.get_args().count() >= 4);
+            Some(completion_color_info(
+                color,
+                has_explicit_alpha || alpha != u8::MAX,
+            ))
         }
         LuaExpr::LiteralExpr(literal_expr) => {
             let LuaLiteralToken::String(token) = literal_expr.get_literal()? else {
@@ -120,7 +126,7 @@ pub(super) fn is_gmod_literal_constructor_type(typ: &LuaType) -> bool {
     }
 }
 
-pub(super) fn is_color_type(typ: &LuaType) -> bool {
+pub(crate) fn is_color_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => id.get_simple_name() == "Color",
         LuaType::Instance(instance) => is_color_type(instance.get_base()),
@@ -131,6 +137,14 @@ pub(super) fn is_color_type(typ: &LuaType) -> bool {
         LuaType::Intersection(intersection) => intersection.get_types().iter().any(is_color_type),
         _ => false,
     }
+}
+
+pub(crate) fn color_label_detail(color: &CompletionColorInfo) -> String {
+    format!(" {}", color.gmod_display)
+}
+
+pub(crate) fn color_preview_documentation(color: &CompletionColorInfo) -> String {
+    format!("`{}`", color.gmod_display)
 }
 
 fn is_gmod_literal_constructor_name(name: &str) -> bool {
@@ -155,15 +169,20 @@ fn numeric_literal_text(expr: &LuaExpr) -> Option<String> {
     }
 }
 
-fn completion_color_info(color: GmodColor, include_alpha_in_hex: bool) -> CompletionColorInfo {
+fn completion_color_info(color: GmodColor, include_alpha: bool) -> CompletionColorInfo {
     let red = (color.red * 255.0).round() as u8;
     let green = (color.green * 255.0).round() as u8;
     let blue = (color.blue * 255.0).round() as u8;
     let alpha = (color.alpha * 255.0).round() as u8;
-    let hex = if include_alpha_in_hex {
+    let hex = if include_alpha {
         format!("#{:02X}{:02X}{:02X}{:02X}", red, green, blue, alpha)
     } else {
         format!("#{:02X}{:02X}{:02X}", red, green, blue)
+    };
+    let gmod_display = if include_alpha {
+        format!("Color({}, {}, {}, {})", red, green, blue, alpha)
+    } else {
+        format!("Color({}, {}, {})", red, green, blue)
     };
 
     CompletionColorInfo {
@@ -174,6 +193,7 @@ fn completion_color_info(color: GmodColor, include_alpha_in_hex: bool) -> Comple
         rgb: format!("rgb({}, {}, {})", red, green, blue),
         rgba: format!("rgba({}, {}, {}, {})", red, green, blue, alpha),
         gmod: format!("Color({}, {}, {}, {})", red, green, blue, alpha),
+        gmod_display,
         hex,
     }
 }

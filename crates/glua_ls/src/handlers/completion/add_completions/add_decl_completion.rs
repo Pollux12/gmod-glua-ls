@@ -9,7 +9,7 @@ use crate::handlers::completion::{
 };
 
 use super::{
-    CallDisplay, check_visibility,
+    CallDisplay, check_visibility, color_label_detail,
     completion_item_info::{
         color_info_from_expr, color_info_from_type, gmod_constructor_literal_detail, is_color_type,
         is_gmod_literal_constructor_type, scalar_literal_description, scalar_literal_detail,
@@ -50,7 +50,7 @@ pub fn add_decl_completion(
         label_details: Some(lsp_types::CompletionItemLabelDetails {
             detail: color
                 .as_ref()
-                .map(|color| format!(" {}", color.hex))
+                .map(color_label_detail)
                 .or_else(|| get_detail(builder, typ, CallDisplay::None))
                 .or(constructor_literal_detail)
                 .or(literal_detail),
@@ -62,7 +62,6 @@ pub fn add_decl_completion(
         }),
         ..Default::default()
     };
-
     if is_deprecated(builder, property_owner.clone()) {
         completion_item.deprecated = Some(true);
     }

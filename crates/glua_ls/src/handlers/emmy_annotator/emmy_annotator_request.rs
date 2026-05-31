@@ -6,13 +6,20 @@ pub enum EmmyAnnotatorRequest {}
 
 impl Request for EmmyAnnotatorRequest {
     type Params = EmmyAnnotatorParams;
-    type Result = Option<Vec<EmmyAnnotator>>;
+    type Result = Option<EmmyAnnotatorResult>;
     const METHOD: &'static str = "gluals/annotator";
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
 pub struct EmmyAnnotatorParams {
     pub uri: String,
+}
+
+/// Annotator response: style annotators (read-only/mutable underlines, doc
+/// emphasis).
+#[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
+pub struct EmmyAnnotatorResult {
+    pub annotators: Vec<EmmyAnnotator>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]

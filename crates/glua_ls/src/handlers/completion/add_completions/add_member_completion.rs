@@ -16,7 +16,7 @@ use crate::handlers::completion::{
 };
 
 use super::{
-    CallDisplay, check_visibility,
+    CallDisplay, check_visibility, color_label_detail,
     completion_item_info::{
         color_info_from_expr, color_info_from_type, gmod_constructor_literal_detail, is_color_type,
         is_gmod_literal_constructor_type, scalar_literal_description, scalar_literal_detail,
@@ -138,7 +138,7 @@ pub fn add_member_completion_with_description_hint(
     // 紧靠着 label 显示的描述
     let literal_detail = scalar_literal_detail(&remove_nil_type);
     let detail = if let Some(color) = &color {
-        Some(format!(" {}", color.hex))
+        Some(color_label_detail(color))
     } else if is_inferred_dynamic_member {
         None
     } else {
@@ -178,7 +178,6 @@ pub fn add_member_completion_with_description_hint(
         deprecated,
         ..Default::default()
     };
-
     if status == CompletionTriggerStatus::Dot
         && member_key.is_integer()
         && builder.trigger_token.kind() == LuaTokenKind::TkDot.into()

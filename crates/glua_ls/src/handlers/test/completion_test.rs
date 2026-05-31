@@ -4078,7 +4078,10 @@ mod tests {
             .as_ref()
             .ok_or("missing label details")
             .or_fail()?;
-        verify_that!(label_details.detail.as_ref(), some(eq(" #FFFFFF")))?;
+        verify_that!(
+            label_details.detail.as_ref(),
+            some(eq(" Color(255, 255, 255, 255)"))
+        )?;
         verify_that!(label_details.description.as_ref(), some(eq("Color")))?;
         verify_that!(
             item.data
@@ -4086,7 +4089,7 @@ mod tests {
                 .and_then(|data| data.get("color"))
                 .and_then(|color| color.get("hex"))
                 .and_then(|hex| hex.as_str()),
-            some(eq("#FFFFFF"))
+            some(eq("#FFFFFFFF"))
         )?;
 
         let resolved = crate::handlers::completion::completion_resolve(
@@ -4102,16 +4105,10 @@ mod tests {
         let Documentation::MarkupContent(MarkupContent { value, .. }) = documentation else {
             return fail!("expected markdown documentation");
         };
-        verify_that!(value, contains_substring("#FFFFFF"))?;
-        verify_that!(value, contains_substring("display:inline-block"))?;
-        verify_that!(value, contains_substring("background-color:#FFFFFF"))?;
-        verify_that!(
-            value,
-            contains_substring(
-                "title=\"#FFFFFF | rgb(255, 255, 255) | rgba(255, 255, 255, 255) | Color(255, 255, 255, 255)\""
-            )
-        )?;
-        verify_that!(value, contains_substring("rgba(255, 255, 255, 255)"))?;
+        verify_that!(value, not(contains_substring("data:image/svg+xml;utf8,")))?;
+        verify_that!(value, not(contains_substring("gluals-color-preview")))?;
+        verify_that!(value, not(contains_substring("rgba(255, 255, 255, 255)")))?;
+        verify_that!(value, not(contains_substring("---")))?;
         verify_that!(value, contains_substring("Color(255, 255, 255, 255)"))?;
         Ok(())
     }
@@ -4215,7 +4212,10 @@ mod tests {
             .as_ref()
             .ok_or("missing label details")
             .or_fail()?;
-        verify_that!(label_details.detail.as_ref(), some(eq(" #112233FF")))?;
+        verify_that!(
+            label_details.detail.as_ref(),
+            some(eq(" Color(17, 34, 51, 255)"))
+        )?;
         verify_that!(label_details.description.as_ref(), some(eq("Color")))?;
         verify_that!(
             item.data
@@ -4278,7 +4278,10 @@ mod tests {
             .as_ref()
             .ok_or("missing label details")
             .or_fail()?;
-        verify_that!(label_details.detail.as_ref(), some(eq(" #14283C80")))?;
+        verify_that!(
+            label_details.detail.as_ref(),
+            some(eq(" Color(20, 40, 60, 128)"))
+        )?;
         verify_that!(label_details.description.as_ref(), some(eq("Color")))?;
         verify_that!(
             item.data
