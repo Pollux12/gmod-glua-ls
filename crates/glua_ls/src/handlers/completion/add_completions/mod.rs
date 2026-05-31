@@ -36,7 +36,7 @@ pub fn check_visibility(builder: &mut CompletionBuilder, id: LuaSemanticDeclId) 
 pub fn get_completion_kind(typ: &LuaType) -> CompletionItemKind {
     if typ.is_function() {
         return CompletionItemKind::FUNCTION;
-    } else if typ.is_const() {
+    } else if is_completion_constant_type(typ) {
         return CompletionItemKind::CONSTANT;
     } else if typ.is_def() {
         return CompletionItemKind::CLASS;
@@ -45,6 +45,10 @@ pub fn get_completion_kind(typ: &LuaType) -> CompletionItemKind {
     }
 
     CompletionItemKind::VARIABLE
+}
+
+fn is_completion_constant_type(typ: &LuaType) -> bool {
+    typ.is_const() || matches!(typ, LuaType::DocBooleanConst(_))
 }
 
 pub fn is_deprecated(builder: &CompletionBuilder, id: LuaSemanticDeclId) -> bool {
