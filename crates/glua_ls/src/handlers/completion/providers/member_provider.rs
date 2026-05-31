@@ -4,9 +4,10 @@ use glua_code_analysis::{
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
-    LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaStringToken,
+    LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaNameExpr, LuaStringToken, PathTrait,
 };
 use rowan::TextSize;
+use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
 use crate::handlers::completion::{
@@ -62,9 +63,87 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         .semantic_model
         .get_member_info_map_at_offset(&prefix_type, builder.position_offset)
         .unwrap_or_default();
+    extend_global_path_members(builder, &prefix_expr, &mut member_info_map);
     extend_gmod_hook_fallback_members(builder, &prefix_expr, &prefix_type, &mut member_info_map);
 
     add_completions_for_members(builder, &member_info_map, completion_status)
+}
+
+fn extend_global_path_members(
+    builder: &CompletionBuilder,
+    prefix_expr: &LuaExpr,
+    members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+) {
+    let Some(prefix_path) = global_expr_access_path(&builder.semantic_model, prefix_expr) else {
+        return;
+    };
+
+    let namespace_type = LuaType::Namespace(SmolStr::new(prefix_path).into());
+    let Some(global_path_members) = builder
+        .semantic_model
+        .get_member_info_map_at_offset(&namespace_type, builder.position_offset)
+    else {
+        return;
+    };
+
+    let mut existing: HashMap<LuaMemberKey, HashSet<Option<LuaSemanticDeclId>>> = HashMap::new();
+    for (key, infos) in members.iter() {
+        let entry = existing.entry(key.clone()).or_default();
+        for info in infos {
+            entry.insert(info.property_owner_id.clone());
+        }
+    }
+
+    for (key, infos) in global_path_members {
+        let owners = existing.entry(key.clone()).or_default();
+        let target = members.entry(key).or_default();
+        for info in infos {
+            if owners.insert(info.property_owner_id.clone()) {
+                target.push(info);
+            }
+        }
+    }
+}
+
+fn global_expr_access_path(semantic_model: &SemanticModel, expr: &LuaExpr) -> Option<String> {
+    if !expr_root_is_global(semantic_model, expr) {
+        return None;
+    }
+
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn expr_root_is_global(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    let Some(root_name) = expr_root_name(expr) else {
+        return false;
+    };
+
+    let db = semantic_model.get_db();
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&semantic_model.get_file_id(), root_name.get_range())
+    else {
+        return true;
+    };
+
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_global() || decl.is_module_scoped())
+}
+
+fn expr_root_name(expr: &LuaExpr) -> Option<LuaNameExpr> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => Some(name_expr.clone()),
+        LuaExpr::IndexExpr(index_expr) => {
+            let prefix_expr = index_expr.get_prefix_expr()?;
+            expr_root_name(&prefix_expr)
+        }
+        _ => None,
+    }
 }
 
 fn extend_gmod_hook_fallback_members(

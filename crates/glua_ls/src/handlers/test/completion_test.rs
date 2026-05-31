@@ -252,6 +252,66 @@ mod tests {
     }
 
     #[gtest]
+    fn test_guarded_global_table_members_complete_when_child_indexes_first() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (child_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                marauth = marauth or {}
+                marauth.character = marauth.character or {}
+
+                function marauth.character:Create()
+                end
+
+                marauth.util:<??>
+            "#,
+        )?;
+
+        let file_ids = ws.def_files(vec![
+            (
+                "gamemodes/test/gamemode/sh_test1.lua",
+                child_content.as_str(),
+            ),
+            (
+                "gamemodes/test_base/gamemode/sh_test1.lua",
+                r#"
+                    marauth = marauth or {}
+                    marauth.util = marauth.util or {}
+
+                    function marauth.util:BaseFunction()
+                    end
+                "#,
+            ),
+        ]);
+        let child_file = file_ids[0];
+
+        let result = completion(
+            &ws.analysis,
+            child_file,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let labels = items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+
+        assert!(
+            labels.iter().any(|label| label == "BaseFunction"),
+            "expected guarded global table completion to include BaseFunction, got: {labels:?}"
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_5() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
         check!(ws.check_completion(
