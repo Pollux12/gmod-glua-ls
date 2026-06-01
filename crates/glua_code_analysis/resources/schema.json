@@ -1452,14 +1452,14 @@
     "EmmyrcGmod": {
       "properties": {
         "annotationsPath": {
-          "description": "Path to GMod annotations to load as core library.\nWhen set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).\nSet to explicit path to override, or use `autoLoadAnnotations: false` in .gluarc to disable entirely.",
+          "description": "Override path to GMod annotations directory. Set to empty to use VSCode downloaded annotations.\nWhen set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).\nSet to explicit path to override, or use `autoLoadAnnotations: false` in .gluarc to disable entirely.",
           "type": [
             "string",
             "null"
           ]
         },
         "autoDetectGamemodeBase": {
-          "description": "Automatically detect and add the base gamemode as a library when a gamemode\nderives from another (via the `\"base\"` field in the gamemode `.txt` file).\nSet to `false` to disable this detection.",
+          "description": "Automatically add base gamemodes as libraries when a gamemode\nderives from another (via the `\"base\"` field in the gamemode `.txt` file).\nSet to `false` to disable this detection.",
           "type": [
             "boolean",
             "null"
@@ -1563,6 +1563,15 @@
           "default": {
             "verbosity": "normal"
           }
+        },
+        "plugins": {
+          "default": [],
+          "description": "Ordered plugin ids persisted by editor integrations.\nThe language server remains plugin-agnostic and consumes resolved config only.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-gluals-editor": "pluginList"
         },
         "scriptedClassScopes": {
           "$ref": "#/$defs/EmmyrcGmodScriptedClassScopes",
@@ -1669,6 +1678,7 @@
               },
               {
                 "classGlobal": "PLUGIN",
+                "hookOwner": true,
                 "icon": "extensions",
                 "id": "plugins",
                 "include": [
@@ -1678,7 +1688,12 @@
                 "path": [
                   "plugins"
                 ],
-                "rootDir": "plugins"
+                "rootDir": "plugins",
+                "superTypes": [
+                  "GM",
+                  "GAMEMODE",
+                  "SANDBOX"
+                ]
               },
               {
                 "classGlobal": "GM",
@@ -1697,8 +1712,15 @@
             ]
           }
         },
+        "scriptedOwners": {
+          "$ref": "#/$defs/EmmyrcGmodScriptedOwners",
+          "default": {
+            "include": []
+          },
+          "description": "Configures additional hook-owner globals beyond the built-in\n`GM` / `GAMEMODE` / `SANDBOX` set."
+        },
         "templatePath": {
-          "description": "Path to a folder containing custom GLua scaffolding templates (`.lua` files).\nBuilt-in templates are used as fallback when a custom one is not found.\nAccepts an absolute path or a path relative to the workspace root.",
+          "description": "Path to custom GLua scaffolding templates folder.\nBuilt-in templates are used as fallback when a custom one is not found.\nAccepts an absolute path or a path relative to the workspace root.",
           "type": [
             "string",
             "null"
@@ -1813,6 +1835,16 @@
     },
     "EmmyrcGmodScriptedClassDefinition": {
       "properties": {
+        "aliases": {
+          "description": "Additional global names exposed for the same class global.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "classGlobal": {
           "type": [
             "string",
@@ -1841,6 +1873,27 @@
             "null"
           ]
         },
+        "fixedClassName": {
+          "description": "When set, every file matched by this scope resolves to this class name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hideFromOutline": {
+          "description": "When true, editor outline/class explorer views should hide this scope.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "hookOwner": {
+          "description": "Whether this class global should be treated as a hook owner.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "icon": {
           "type": [
             "string",
@@ -1856,6 +1909,13 @@
           },
           "type": [
             "array",
+            "null"
+          ]
+        },
+        "isGlobalSingleton": {
+          "description": "When true, the scope's class global is a workspace-global singleton.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -1894,6 +1954,23 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "stripFilePrefix": {
+          "description": "When true, strips sh_/sv_/cl_ from single-file class names.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "superTypes": {
+          "description": "Class globals this scope inherits from.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
           ]
         }
       },
@@ -2044,6 +2121,7 @@
             },
             {
               "classGlobal": "PLUGIN",
+              "hookOwner": true,
               "icon": "extensions",
               "id": "plugins",
               "include": [
@@ -2053,7 +2131,12 @@
               "path": [
                 "plugins"
               ],
-              "rootDir": "plugins"
+              "rootDir": "plugins",
+              "superTypes": [
+                "GM",
+                "GAMEMODE",
+                "SANDBOX"
+              ]
             },
             {
               "classGlobal": "GM",
@@ -2075,6 +2158,79 @@
           },
           "type": "array",
           "x-gluals-editor": "scriptedClassTable"
+        }
+      },
+      "type": "object"
+    },
+    "EmmyrcGmodScriptedOwnerEntry": {
+      "properties": {
+        "aliases": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "disabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "exclude": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "fallbackOwners": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "global": {
+          "type": "string"
+        },
+        "hookOwner": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "include": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "global",
+        "include"
+      ],
+      "type": "object"
+    },
+    "EmmyrcGmodScriptedOwners": {
+      "properties": {
+        "include": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EmmyrcGmodScriptedOwnerEntry"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -2759,6 +2915,7 @@
         "outline": {
           "verbosity": "normal"
         },
+        "plugins": [],
         "scriptedClassScopes": {
           "include": [
             {
@@ -2862,6 +3019,7 @@
             },
             {
               "classGlobal": "PLUGIN",
+              "hookOwner": true,
               "icon": "extensions",
               "id": "plugins",
               "include": [
@@ -2871,7 +3029,12 @@
               "path": [
                 "plugins"
               ],
-              "rootDir": "plugins"
+              "rootDir": "plugins",
+              "superTypes": [
+                "GM",
+                "GAMEMODE",
+                "SANDBOX"
+              ]
             },
             {
               "classGlobal": "GM",
@@ -2888,6 +3051,9 @@
               "rootDir": "gamemodes"
             }
           ]
+        },
+        "scriptedOwners": {
+          "include": []
         },
         "vgui": {
           "codeLensEnabled": true,

@@ -1,0 +1,89 @@
+---
+title: Framework plugins
+description: Use framework plugins, apply them safely, and build your own plugin packs.
+---
+
+## What this feature does
+
+Framework plugins help GLuaLS understand framework-specific code (for example DarkRP or Helix).
+
+When a plugin is applied, GLuaLS updates your workspace `.gluarc.json` with plugin settings.
+
+This gives you better completions/diagnostics for that framework without replacing your existing config.
+
+---
+
+## Using framework plugins
+
+If GLuaLS detects a framework, you will see a prompt with:
+
+- **Apply**
+- **Review Setup**
+- **Dismiss**
+
+You can also run these commands from the Command Palette:
+
+- **GLuaLS: Re-run Framework/Plugin Detection**
+- **GLuaLS: Framework/Plugin Setup Wizard**
+- **GLuaLS: Apply Framework Plugin** (manual override)
+
+Recommended path:
+
+- Use **Framework/Plugin Setup Wizard** first.
+
+Secondary options:
+
+- Use **Re-run Framework/Plugin Detection** to run detection again.
+- Use **Apply Framework Plugin** only when you want to manually force a specific plugin.
+
+---
+
+## If you do not get a popup
+
+This is usually expected when:
+
+- your workspace already has a `.gluarc.json` (to avoid unwanted changes), or
+- your project does not clearly match a supported framework.
+
+In that case, run **GLuaLS: Re-run Framework/Plugin Detection** first, then use the setup wizard if needed.
+
+---
+
+## Using more than one plugin
+
+Plugins are listed in `.gluarc.json` under `gmod.plugins`.
+
+Order matters: later plugins can override earlier plugin settings.
+
+If two plugins conflict, move the preferred one later in the list.
+
+---
+
+## Create your own plugin (local/private)
+
+If you want custom framework support for your own team/project:
+
+1. In `glua-api-snippets`, create `plugin/<your-id>/` with:
+   - `plugin.json` (plugin metadata + detection rules)
+   - `gluarc.json` (settings fragment to apply)
+   - optional `annotations/` folder
+2. Run:
+   - `npm run generate-all`
+3. In VS Code settings, point to your local generated outputs:
+   - `gluals.ls.annotationPath` → your `output` folder
+   - `gluals.ls.pluginBundlePath` → your `output-plugins` folder
+4. Run **GLuaLS: Re-run Framework/Plugin Detection**.
+
+---
+
+## Contribute a plugin upstream
+
+If you want everyone to use your plugin:
+
+1. Add your plugin folder under `glua-api-snippets/plugin/<id>/`.
+2. Run `npm run generate-all` and tests.
+3. Open a PR with:
+   - your plugin descriptor (`plugin.json`)
+   - `gluarc.json`
+   - optional annotations
+4. After merge, CI generates/publishes the plugin index and bundle.

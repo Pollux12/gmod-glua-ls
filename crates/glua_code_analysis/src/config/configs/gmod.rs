@@ -48,6 +48,11 @@ pub struct EmmyrcGmod {
     pub scripted_class_scopes: EmmyrcGmodScriptedClassScopes,
     #[serde(default)]
     pub hook_mappings: EmmyrcGmodHookMappings,
+    /// Ordered plugin ids persisted by editor integrations.
+    /// The language server remains plugin-agnostic and consumes resolved config only.
+    #[serde(default)]
+    #[schemars(extend("x-gluals-editor" = "pluginList"))]
+    pub plugins: Vec<String>,
     #[serde(default)]
     pub network: EmmyrcGmodNetwork,
     #[serde(default)]
@@ -73,7 +78,7 @@ pub struct EmmyrcGmod {
     pub infer_dynamic_fields: bool,
     #[serde(default = "dynamic_fields_global_default")]
     pub dynamic_fields_global: bool,
-    /// Path to GMod annotations to load as core library.
+    /// Override path to GMod annotations directory. Set to empty to use VSCode downloaded annotations.
     /// When set to empty string or not provided, uses VSCode extension's auto-downloaded annotations (if enabled).
     /// Set to explicit path to override, or use `autoLoadAnnotations: false` in .gluarc to disable entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,16 +87,20 @@ pub struct EmmyrcGmod {
     /// This takes precedence over extension settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_load_annotations: Option<bool>,
-    /// Path to a folder containing custom GLua scaffolding templates (`.lua` files).
+    /// Path to custom GLua scaffolding templates folder.
     /// Built-in templates are used as fallback when a custom one is not found.
     /// Accepts an absolute path or a path relative to the workspace root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_path: Option<String>,
-    /// Automatically detect and add the base gamemode as a library when a gamemode
+    /// Automatically add base gamemodes as libraries when a gamemode
     /// derives from another (via the `"base"` field in the gamemode `.txt` file).
     /// Set to `false` to disable this detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_detect_gamemode_base: Option<bool>,
+    /// Configures additional hook-owner globals beyond the built-in
+    /// `GM` / `GAMEMODE` / `SANDBOX` set.
+    #[serde(default)]
+    pub scripted_owners: EmmyrcGmodScriptedOwners,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
@@ -126,6 +135,27 @@ pub struct EmmyrcGmodScriptedClassDefinition {
     pub exclude: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_global: Option<String>,
+    /// When set, every file matched by this scope resolves to this class name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_class_name: Option<String>,
+    /// When true, the scope's class global is a workspace-global singleton.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_global_singleton: Option<bool>,
+    /// When true, strips sh_/sv_/cl_ from single-file class names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_file_prefix: Option<bool>,
+    /// When true, editor outline/class explorer views should hide this scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hide_from_outline: Option<bool>,
+    /// Additional global names exposed for the same class global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<String>>,
+    /// Class globals this scope inherits from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub super_types: Option<Vec<String>>,
+    /// Whether this class global should be treated as a hook owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_owner: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +197,20 @@ pub struct ResolvedGmodScriptedClassDefinition {
     pub exclude: Vec<String>,
     pub class_global: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_class_name: Option<String>,
+    #[serde(default)]
+    pub is_global_singleton: bool,
+    #[serde(default)]
+    pub strip_file_prefix: bool,
+    #[serde(default)]
+    pub hide_from_outline: bool,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub super_types: Vec<String>,
+    #[serde(default)]
+    pub hook_owner: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
@@ -197,6 +241,13 @@ impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
             "include",
             "exclude",
             "classGlobal",
+            "fixedClassName",
+            "isGlobalSingleton",
+            "stripFilePrefix",
+            "hideFromOutline",
+            "aliases",
+            "superTypes",
+            "hookOwner",
             "parentId",
             "icon",
             "rootDir",
@@ -224,6 +275,13 @@ impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
                 let mut include = None;
                 let mut exclude = None;
                 let mut class_global = None;
+                let mut fixed_class_name = None;
+                let mut is_global_singleton = None;
+                let mut strip_file_prefix = None;
+                let mut hide_from_outline = None;
+                let mut aliases = None;
+                let mut super_types = None;
+                let mut hook_owner = None;
                 let mut parent_id = None;
                 let mut icon = None;
                 let mut root_dir = None;
@@ -241,6 +299,25 @@ impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
                         "classGlobal" => {
                             read_unique_field(&mut class_global, &mut map, "classGlobal")?
                         }
+                        "fixedClassName" => {
+                            read_unique_field(&mut fixed_class_name, &mut map, "fixedClassName")?
+                        }
+                        "isGlobalSingleton" => read_unique_field(
+                            &mut is_global_singleton,
+                            &mut map,
+                            "isGlobalSingleton",
+                        )?,
+                        "stripFilePrefix" => {
+                            read_unique_field(&mut strip_file_prefix, &mut map, "stripFilePrefix")?
+                        }
+                        "hideFromOutline" => {
+                            read_unique_field(&mut hide_from_outline, &mut map, "hideFromOutline")?
+                        }
+                        "aliases" => read_unique_field(&mut aliases, &mut map, "aliases")?,
+                        "superTypes" => {
+                            read_unique_field(&mut super_types, &mut map, "superTypes")?
+                        }
+                        "hookOwner" => read_unique_field(&mut hook_owner, &mut map, "hookOwner")?,
                         "parentId" => read_unique_field(&mut parent_id, &mut map, "parentId")?,
                         "icon" => read_unique_field(&mut icon, &mut map, "icon")?,
                         "rootDir" => read_unique_field(&mut root_dir, &mut map, "rootDir")?,
@@ -262,6 +339,13 @@ impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
                     include: include.unwrap_or_default(),
                     exclude: exclude.unwrap_or_default(),
                     class_global: class_global.unwrap_or_default(),
+                    fixed_class_name: fixed_class_name.unwrap_or_default(),
+                    is_global_singleton: is_global_singleton.unwrap_or_default(),
+                    strip_file_prefix: strip_file_prefix.unwrap_or_default(),
+                    hide_from_outline: hide_from_outline.unwrap_or_default(),
+                    aliases: aliases.unwrap_or_default(),
+                    super_types: super_types.unwrap_or_default(),
+                    hook_owner: hook_owner.unwrap_or_default(),
                     parent_id: parent_id.unwrap_or_default(),
                     icon: icon.unwrap_or_default(),
                     root_dir: root_dir.unwrap_or_default(),
@@ -344,6 +428,13 @@ impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
             "include",
             "exclude",
             "classGlobal",
+            "fixedClassName",
+            "isGlobalSingleton",
+            "stripFilePrefix",
+            "hideFromOutline",
+            "aliases",
+            "superTypes",
+            "hookOwner",
             "parentId",
             "icon",
             "rootDir",
@@ -370,6 +461,13 @@ impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
                 let mut include = None;
                 let mut exclude = None;
                 let mut class_global = None;
+                let mut fixed_class_name = None;
+                let mut is_global_singleton = None;
+                let mut strip_file_prefix = None;
+                let mut hide_from_outline = None;
+                let mut aliases = None;
+                let mut super_types = None;
+                let mut hook_owner = None;
                 let mut parent_id = None;
                 let mut icon = None;
                 let mut root_dir = None;
@@ -386,6 +484,25 @@ impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
                         "classGlobal" => {
                             read_unique_field(&mut class_global, &mut map, "classGlobal")?
                         }
+                        "fixedClassName" => {
+                            read_unique_field(&mut fixed_class_name, &mut map, "fixedClassName")?
+                        }
+                        "isGlobalSingleton" => read_unique_field(
+                            &mut is_global_singleton,
+                            &mut map,
+                            "isGlobalSingleton",
+                        )?,
+                        "stripFilePrefix" => {
+                            read_unique_field(&mut strip_file_prefix, &mut map, "stripFilePrefix")?
+                        }
+                        "hideFromOutline" => {
+                            read_unique_field(&mut hide_from_outline, &mut map, "hideFromOutline")?
+                        }
+                        "aliases" => read_unique_field(&mut aliases, &mut map, "aliases")?,
+                        "superTypes" => {
+                            read_unique_field(&mut super_types, &mut map, "superTypes")?
+                        }
+                        "hookOwner" => read_unique_field(&mut hook_owner, &mut map, "hookOwner")?,
                         "parentId" => read_unique_field(&mut parent_id, &mut map, "parentId")?,
                         "icon" => read_unique_field(&mut icon, &mut map, "icon")?,
                         "rootDir" => read_unique_field(&mut root_dir, &mut map, "rootDir")?,
@@ -406,6 +523,13 @@ impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
                     include: required_field::<_, MapType::Error>(include, "include")?,
                     exclude: required_field::<_, MapType::Error>(exclude, "exclude")?,
                     class_global: required_field::<_, MapType::Error>(class_global, "classGlobal")?,
+                    fixed_class_name: fixed_class_name.unwrap_or_default(),
+                    is_global_singleton: is_global_singleton.unwrap_or(false),
+                    strip_file_prefix: strip_file_prefix.unwrap_or(false),
+                    hide_from_outline: hide_from_outline.unwrap_or(false),
+                    aliases: aliases.unwrap_or_default(),
+                    super_types: super_types.unwrap_or_default(),
+                    hook_owner: hook_owner.unwrap_or(false),
                     parent_id: parent_id.unwrap_or_default(),
                     icon: icon.unwrap_or_default(),
                     root_dir: required_field::<_, MapType::Error>(root_dir, "rootDir")?,
@@ -504,6 +628,7 @@ impl Default for EmmyrcGmod {
             default_realm: EmmyrcGmodRealm::default(),
             scripted_class_scopes: EmmyrcGmodScriptedClassScopes::default(),
             hook_mappings: EmmyrcGmodHookMappings::default(),
+            plugins: Vec::new(),
             network: EmmyrcGmodNetwork::default(),
             vgui: EmmyrcGmodVgui::default(),
             outline: EmmyrcGmodOutline::default(),
@@ -516,6 +641,7 @@ impl Default for EmmyrcGmod {
             auto_load_annotations: None,
             template_path: None,
             auto_detect_gamemode_base: None,
+            scripted_owners: EmmyrcGmodScriptedOwners::default(),
         }
     }
 }
@@ -636,18 +762,27 @@ fn scripted_scope_include_default() -> Vec<EmmyrcGmodScriptedClassScopeEntry> {
                 }],
             }),
         )),
-        EmmyrcGmodScriptedClassScopeEntry::Definition(default_scripted_class_definition(
-            "plugins",
-            "Plugins",
-            &["plugins"],
-            &["plugins/**"],
-            &[],
-            "PLUGIN",
-            None,
-            Some("extensions"),
-            Some("plugins"),
-            None,
-        )),
+        EmmyrcGmodScriptedClassScopeEntry::Definition({
+            let mut definition = default_scripted_class_definition(
+                "plugins",
+                "Plugins",
+                &["plugins"],
+                &["plugins/**"],
+                &[],
+                "PLUGIN",
+                None,
+                Some("extensions"),
+                Some("plugins"),
+                None,
+            );
+            definition.super_types = Some(vec![
+                "GM".to_string(),
+                "GAMEMODE".to_string(),
+                "SANDBOX".to_string(),
+            ]);
+            definition.hook_owner = Some(true);
+            definition
+        }),
         EmmyrcGmodScriptedClassScopeEntry::Definition({
             let mut definition = default_scripted_class_definition(
                 "gamemodes",
@@ -708,6 +843,13 @@ fn default_scripted_class_definition(
         root_dir: root_dir.map(str::to_string),
         scaffold,
         class_name_prefix: None,
+        fixed_class_name: None,
+        is_global_singleton: None,
+        strip_file_prefix: None,
+        hide_from_outline: None,
+        aliases: None,
+        super_types: None,
+        hook_owner: None,
         disabled: None,
     })
 }
@@ -780,6 +922,18 @@ fn resolve_scripted_class_definition(
             .collect(),
         exclude,
         class_global: class_global.to_string(),
+        fixed_class_name: definition
+            .fixed_class_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+        is_global_singleton: definition.is_global_singleton.unwrap_or(false),
+        strip_file_prefix: definition.strip_file_prefix.unwrap_or(false),
+        hide_from_outline: definition.hide_from_outline.unwrap_or(false),
+        aliases: normalize_name_list(definition.aliases.as_deref()),
+        super_types: normalize_name_list(definition.super_types.as_deref()),
+        hook_owner: definition.hook_owner.unwrap_or(false),
         parent_id: definition
             .parent_id
             .as_deref()
@@ -851,6 +1005,13 @@ fn merge_scripted_class_definitions(
                     include: Some(vec![trimmed.to_string()]),
                     exclude: None,
                     class_global: None,
+                    fixed_class_name: None,
+                    is_global_singleton: None,
+                    strip_file_prefix: None,
+                    hide_from_outline: None,
+                    aliases: None,
+                    super_types: None,
+                    hook_owner: None,
                     parent_id: None,
                     icon: None,
                     root_dir: None,
@@ -923,6 +1084,29 @@ fn legacy_include_patterns(entries: &[EmmyrcGmodScriptedClassScopeEntry]) -> Vec
         .filter(|pattern| !pattern.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn normalize_name_list(items: Option<&[String]>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    items
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|item| {
+            let trimmed = item.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .filter(|item| seen.insert(item.to_ascii_lowercase()))
+        .collect()
+}
+
+fn strip_realm_file_prefix(name: &str) -> &str {
+    if name.len() > 3 {
+        let prefix = &name[..3];
+        if matches!(prefix, "sh_" | "sv_" | "cl_") {
+            return &name[3..];
+        }
+    }
+    name
 }
 
 fn definition_matches_legacy_include(
@@ -1124,6 +1308,297 @@ fn matches_scope_patterns(
     true
 }
 
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EmmyrcGmodScriptedOwnerEntry {
+    pub id: String,
+    pub global: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<String>>,
+    pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_owner: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_owners: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGmodScriptedOwnerDefinition {
+    pub id: String,
+    pub global: String,
+    pub aliases: Vec<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub hook_owner: bool,
+    pub fallback_owners: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EmmyrcGmodScriptedOwners {
+    #[serde(default)]
+    pub include: Vec<EmmyrcGmodScriptedOwnerEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
+struct PatternSpecificity {
+    literal_segs: usize,
+    inverse_wildcard_segs: usize,
+    literal_chars: usize,
+    pattern_len: usize,
+}
+
+impl PatternSpecificity {
+    fn of(pattern: &str) -> Self {
+        let mut literal_segs = 0usize;
+        let mut wildcard_segs = 0usize;
+        let mut literal_chars = 0usize;
+        for segment in pattern.split('/').filter(|segment| !segment.is_empty()) {
+            if segment.contains('*') || segment.contains('?') {
+                wildcard_segs += 1;
+            } else {
+                literal_segs += 1;
+                literal_chars += segment.len();
+            }
+        }
+
+        Self {
+            literal_segs,
+            inverse_wildcard_segs: usize::MAX - wildcard_segs,
+            literal_chars,
+            pattern_len: pattern.len(),
+        }
+    }
+}
+
+fn resolve_scripted_owner_entry(
+    entry: &EmmyrcGmodScriptedOwnerEntry,
+) -> Option<ResolvedGmodScriptedOwnerDefinition> {
+    if entry.disabled.unwrap_or(false) {
+        return None;
+    }
+
+    let id = entry.id.trim();
+    let global = entry.global.trim();
+    if id.is_empty() || global.is_empty() {
+        return None;
+    }
+
+    let include = normalize_name_list(Some(&entry.include));
+    if include.is_empty() {
+        return None;
+    }
+
+    let exclude = normalize_name_list(entry.exclude.as_deref());
+    let aliases = normalize_name_list(entry.aliases.as_deref())
+        .into_iter()
+        .filter(|alias| alias != global)
+        .collect::<Vec<_>>();
+    let fallback_owners = normalize_name_list(entry.fallback_owners.as_deref())
+        .into_iter()
+        .filter(|owner| owner != global && !aliases.iter().any(|alias| alias == owner))
+        .collect::<Vec<_>>();
+
+    Some(ResolvedGmodScriptedOwnerDefinition {
+        id: id.to_string(),
+        global: global.to_string(),
+        aliases,
+        include,
+        exclude,
+        hook_owner: entry.hook_owner.unwrap_or(false),
+        fallback_owners,
+    })
+}
+
+fn builtin_hook_owner_fallbacks(owner_name: &str) -> Vec<String> {
+    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
+        vec!["SANDBOX".to_string()]
+    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
+        vec!["GM".to_string(), "GAMEMODE".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn builtin_hook_owner_candidates(owner_name: &str) -> Vec<String> {
+    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
+        vec![
+            "GM".to_string(),
+            "GAMEMODE".to_string(),
+            "SANDBOX".to_string(),
+        ]
+    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
+        vec![
+            "SANDBOX".to_string(),
+            "GM".to_string(),
+            "GAMEMODE".to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn merge_owner_names_dedup(primary: Vec<String>, secondary: Vec<String>) -> Vec<String> {
+    let mut merged = primary;
+    let mut seen = merged
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for name in secondary {
+        if seen.insert(name.to_ascii_lowercase()) {
+            merged.push(name);
+        }
+    }
+    merged
+}
+
+impl EmmyrcGmodScriptedOwners {
+    pub fn resolved_owners(&self) -> Vec<ResolvedGmodScriptedOwnerDefinition> {
+        let mut result = Vec::new();
+        let mut seen_ids = HashSet::new();
+        for entry in &self.include {
+            let id = entry.id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let id_lower = id.to_ascii_lowercase();
+            if seen_ids.contains(&id_lower) {
+                log::warn!("gmod.scriptedOwners: duplicate id '{id}' - first-valid entry wins");
+                continue;
+            }
+            if let Some(definition) = resolve_scripted_owner_entry(entry) {
+                seen_ids.insert(id_lower);
+                result.push(definition);
+            }
+        }
+        result
+    }
+
+    pub fn detect_owner_for_path(
+        &self,
+        file_path: &Path,
+    ) -> Option<ResolvedGmodScriptedOwnerDefinition> {
+        self.detect_owners_for_path_all(file_path)
+            .into_iter()
+            .next()
+    }
+
+    pub fn detect_owners_for_path_all(
+        &self,
+        file_path: &Path,
+    ) -> Vec<ResolvedGmodScriptedOwnerDefinition> {
+        let candidate_paths = build_scope_candidate_paths(file_path);
+        let mut matches = Vec::new();
+
+        for (idx, definition) in self.resolved_owners().into_iter().enumerate() {
+            if !definition.exclude.is_empty()
+                && definition.exclude.iter().any(|pattern| {
+                    wax::Glob::new(pattern)
+                        .map(|glob| {
+                            candidate_paths
+                                .iter()
+                                .any(|path| glob.is_match(Path::new(path)))
+                        })
+                        .unwrap_or(false)
+                })
+            {
+                continue;
+            }
+
+            let best_score = definition
+                .include
+                .iter()
+                .filter_map(|pattern| {
+                    let glob = wax::Glob::new(pattern).ok()?;
+                    candidate_paths
+                        .iter()
+                        .any(|path| glob.is_match(Path::new(path)))
+                        .then(|| PatternSpecificity::of(pattern))
+                })
+                .max();
+
+            if let Some(score) = best_score {
+                matches.push((score, idx, definition));
+            }
+        }
+
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        matches
+            .into_iter()
+            .map(|(_, _, definition)| definition)
+            .collect()
+    }
+
+    pub fn hook_owner_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        for definition in self.resolved_owners() {
+            if !definition.hook_owner {
+                continue;
+            }
+            if seen.insert(definition.global.clone()) {
+                names.push(definition.global);
+            }
+            for alias in definition.aliases {
+                if seen.insert(alias.clone()) {
+                    names.push(alias);
+                }
+            }
+        }
+        names
+    }
+
+    pub fn hook_owner_fallbacks_configured(&self, owner_name: &str) -> Option<Vec<String>> {
+        self.resolved_owners()
+            .into_iter()
+            .find(|definition| {
+                definition.global.eq_ignore_ascii_case(owner_name)
+                    || definition
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(owner_name))
+            })
+            .map(|definition| {
+                merge_owner_names_dedup(
+                    definition.fallback_owners,
+                    builtin_hook_owner_fallbacks(owner_name),
+                )
+            })
+    }
+
+    pub fn hook_owner_candidates_configured(&self, owner_name: &str) -> Option<Vec<String>> {
+        self.resolved_owners()
+            .into_iter()
+            .find(|definition| {
+                definition.global.eq_ignore_ascii_case(owner_name)
+                    || definition
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(owner_name))
+            })
+            .map(|definition| {
+                let mut names = vec![definition.global];
+                names.extend(definition.aliases);
+                names.extend(definition.fallback_owners);
+                merge_owner_names_dedup(names, builtin_hook_owner_candidates(owner_name))
+            })
+    }
+
+    pub fn is_configured_owner_name(&self, name: &str) -> bool {
+        self.resolved_owners().into_iter().any(|definition| {
+            definition.global.eq_ignore_ascii_case(name)
+                || definition
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(name))
+        })
+    }
+}
+
 fn merge_scripted_class_definition_override(
     base: &ResolvedGmodScriptedClassDefinition,
     override_definition: &EmmyrcGmodScriptedClassDefinition,
@@ -1162,6 +1637,36 @@ fn merge_scripted_class_definition_override(
             .class_global
             .clone()
             .unwrap_or_else(|| base.class_global.clone()),
+        fixed_class_name: if override_definition.fixed_class_name.is_some() {
+            override_definition
+                .fixed_class_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        } else {
+            base.fixed_class_name.clone()
+        },
+        is_global_singleton: override_definition
+            .is_global_singleton
+            .unwrap_or(base.is_global_singleton),
+        strip_file_prefix: override_definition
+            .strip_file_prefix
+            .unwrap_or(base.strip_file_prefix),
+        hide_from_outline: override_definition
+            .hide_from_outline
+            .unwrap_or(base.hide_from_outline),
+        aliases: if override_definition.aliases.is_some() {
+            normalize_name_list(override_definition.aliases.as_deref())
+        } else {
+            base.aliases.clone()
+        },
+        super_types: if override_definition.super_types.is_some() {
+            normalize_name_list(override_definition.super_types.as_deref())
+        } else {
+            base.super_types.clone()
+        },
+        hook_owner: override_definition.hook_owner.unwrap_or(base.hook_owner),
         parent_id: if override_definition.parent_id.is_some() {
             override_definition
                 .parent_id
@@ -1287,7 +1792,7 @@ impl EmmyrcGmodScriptedClassScopes {
 
         let definitions = self.resolved_definitions();
         let mut best_match: Option<(ResolvedGmodScriptedClassDefinition, usize, usize)> = None;
-        for definition in definitions {
+        for definition in &definitions {
             // Check THIS definition's include/exclude patterns — do not merge
             // excludes from other definitions, as they are definition-scoped.
             // E.g. SWEP's "weapons/gmod_tool/stools/**" exclude must not prevent
@@ -1330,33 +1835,133 @@ impl EmmyrcGmodScriptedClassScopes {
             }
         }
 
-        let (definition, best_end_idx, _) = best_match?;
-        let class_idx = best_end_idx + 1;
-        if class_idx >= lower_segments.len() {
-            return None;
+        if let Some((definition, best_end_idx, _)) = best_match {
+            if let Some(class_name) =
+                derive_scripted_class_name(&definition, &original_segments, best_end_idx + 1)
+            {
+                return Some(ResolvedGmodScriptedClassMatch {
+                    definition,
+                    class_name,
+                });
+            }
         }
 
-        let class_name = if class_idx == original_segments.len() - 1 {
-            original_segments[class_idx]
-                .strip_suffix(".lua")
-                .unwrap_or(original_segments[class_idx].as_str())
-                .to_string()
-        } else {
-            original_segments[class_idx].clone()
-        };
-        if class_name.is_empty() {
-            return None;
-        }
-
-        let class_name = match definition.class_name_prefix.as_deref() {
-            Some(prefix) if !prefix.is_empty() => format!("{prefix}{class_name}"),
-            _ => class_name,
-        };
-
-        Some(ResolvedGmodScriptedClassMatch {
-            definition,
-            class_name,
+        definitions.into_iter().find_map(|definition| {
+            let fixed_name = definition.fixed_class_name.clone()?;
+            matches_scope_patterns(file_path, &definition.include, &definition.exclude).then_some(
+                ResolvedGmodScriptedClassMatch {
+                    definition,
+                    class_name: fixed_name,
+                },
+            )
         })
+    }
+
+    pub fn detect_all_class_globals_for_path(&self, file_path: &Path) -> Vec<(String, bool)> {
+        let mut seen = HashSet::new();
+        self.resolved_definitions()
+            .into_iter()
+            .filter(|definition| {
+                matches_scope_patterns(file_path, &definition.include, &definition.exclude)
+            })
+            .filter_map(|definition| {
+                seen.insert(definition.class_global.to_ascii_lowercase())
+                    .then_some((definition.class_global, definition.is_global_singleton))
+            })
+            .collect()
+    }
+
+    pub fn detect_all_scoped_class_matches_for_path(
+        &self,
+        file_path: &Path,
+    ) -> Vec<ResolvedGmodScriptedClassMatch> {
+        let normalized_path = file_path.to_string_lossy().replace('\\', "/");
+        let original_segments = normalized_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let lower_segments = normalized_path
+            .to_ascii_lowercase()
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        let mut seen_globals = HashSet::new();
+
+        for definition in self.resolved_definitions() {
+            if !matches_scope_patterns(file_path, &definition.include, &definition.exclude) {
+                continue;
+            }
+            if !seen_globals.insert(definition.class_global.to_ascii_lowercase()) {
+                continue;
+            }
+
+            let class_name = if let Some(fixed_name) = definition.fixed_class_name.clone() {
+                Some(fixed_name)
+            } else {
+                find_scripted_class_path_end(&definition, &lower_segments).and_then(|end_idx| {
+                    derive_scripted_class_name(&definition, &original_segments, end_idx + 1)
+                })
+            };
+
+            if let Some(class_name) = class_name {
+                matches.push(ResolvedGmodScriptedClassMatch {
+                    definition,
+                    class_name,
+                });
+            }
+        }
+
+        matches
+    }
+
+    pub fn aliases_for_global(&self, global_name: &str) -> Vec<String> {
+        self.resolved_definitions()
+            .into_iter()
+            .find(|definition| {
+                definition.class_global.eq_ignore_ascii_case(global_name)
+                    || definition
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(global_name))
+            })
+            .map(|definition| definition.aliases)
+            .unwrap_or_default()
+    }
+
+    pub fn super_types_for_global(&self, global_name: &str) -> Vec<String> {
+        self.resolved_definitions()
+            .into_iter()
+            .find(|definition| {
+                definition.class_global.eq_ignore_ascii_case(global_name)
+                    || definition
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(global_name))
+            })
+            .map(|definition| definition.super_types)
+            .unwrap_or_default()
+    }
+
+    pub fn hook_owner_globals(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut globals = Vec::new();
+        for definition in self.resolved_definitions() {
+            if !definition.hook_owner {
+                continue;
+            }
+            if seen.insert(definition.class_global.clone()) {
+                globals.push(definition.class_global);
+            }
+            for alias in definition.aliases {
+                if seen.insert(alias.clone()) {
+                    globals.push(alias);
+                }
+            }
+        }
+        globals
     }
 
     pub fn scan_scripted_class_scope_files<'a, T>(
@@ -1410,6 +2015,67 @@ enum ScopePatternSet<'a> {
     Empty,
     Valid(wax::Any<'a>),
     Invalid,
+}
+
+fn find_scripted_class_path_end(
+    definition: &ResolvedGmodScriptedClassDefinition,
+    lower_segments: &[String],
+) -> Option<usize> {
+    let rule_len = definition.path.len();
+    if rule_len == 0 || lower_segments.len() < rule_len {
+        return None;
+    }
+
+    for start_idx in (0..=lower_segments.len() - rule_len).rev() {
+        let matched = definition
+            .path
+            .iter()
+            .enumerate()
+            .all(|(offset, rule_segment)| {
+                lower_segments[start_idx + offset] == rule_segment.to_ascii_lowercase()
+            });
+        if matched {
+            return Some(start_idx + rule_len - 1);
+        }
+    }
+
+    None
+}
+
+fn derive_scripted_class_name(
+    definition: &ResolvedGmodScriptedClassDefinition,
+    original_segments: &[String],
+    class_idx: usize,
+) -> Option<String> {
+    if let Some(fixed_name) = definition.fixed_class_name.clone() {
+        return Some(fixed_name);
+    }
+    if original_segments.is_empty() || class_idx >= original_segments.len() {
+        return None;
+    }
+
+    let class_name = if definition.strip_file_prefix {
+        let raw = original_segments
+            .last()?
+            .strip_suffix(".lua")
+            .unwrap_or(original_segments.last()?.as_str());
+        strip_realm_file_prefix(raw).to_string()
+    } else if class_idx == original_segments.len() - 1 {
+        original_segments[class_idx]
+            .strip_suffix(".lua")
+            .unwrap_or(original_segments[class_idx].as_str())
+            .to_string()
+    } else {
+        original_segments[class_idx].clone()
+    };
+    if class_name.is_empty() {
+        return None;
+    }
+
+    Some(match definition.class_name_prefix.as_deref() {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}{class_name}"),
+        _ => class_name,
+    })
 }
 
 fn compile_scope_definitions(
@@ -1503,32 +2169,23 @@ fn detect_class_for_path_with_compiled_definitions(
         }
     }
 
-    let (definition, best_end_idx, _) = best_match?;
-    let class_idx = best_end_idx + 1;
-    if class_idx >= lower_segments.len() {
-        return None;
+    if let Some((definition, best_end_idx, _)) = best_match
+        && let Some(class_name) =
+            derive_scripted_class_name(definition, &original_segments, best_end_idx + 1)
+    {
+        return Some(ResolvedGmodScriptedClassMatch {
+            definition: definition.clone(),
+            class_name,
+        });
     }
 
-    let class_name = if class_idx == original_segments.len() - 1 {
-        original_segments[class_idx]
-            .strip_suffix(".lua")
-            .unwrap_or(original_segments[class_idx].as_str())
-            .to_string()
-    } else {
-        original_segments[class_idx].clone()
-    };
-    if class_name.is_empty() {
-        return None;
-    }
-
-    let class_name = match definition.class_name_prefix.as_deref() {
-        Some(prefix) if !prefix.is_empty() => format!("{prefix}{class_name}"),
-        _ => class_name,
-    };
-
-    Some(ResolvedGmodScriptedClassMatch {
-        definition: definition.clone(),
-        class_name,
+    definitions.iter().find_map(|definition| {
+        let fixed_name = definition.definition.fixed_class_name.clone()?;
+        matches_compiled_scope_patterns(candidate_paths, &definition.include, &definition.exclude)
+            .then(|| ResolvedGmodScriptedClassMatch {
+                definition: definition.definition.clone(),
+                class_name: fixed_name,
+            })
     })
 }
 
@@ -1937,6 +2594,191 @@ mod tests {
                 .any(|pattern| pattern == "legacy/custom_scope/**")
         );
         Ok(())
+    }
+
+    #[gtest]
+    fn test_detect_class_fixed_class_name_returns_fixed_name() -> Result<()> {
+        let scopes: EmmyrcGmodScriptedClassScopes = serde_json::from_str(
+            r#"{
+                "include": [
+                    {
+                        "id": "helix-schema",
+                        "label": "Helix Schema",
+                        "classGlobal": "SCHEMA",
+                        "fixedClassName": "SCHEMA",
+                        "path": ["schema"],
+                        "include": ["schema/**", "gamemode/schema.lua"]
+                    }
+                ]
+            }"#,
+        )
+        .or_fail()?;
+
+        let result = scopes
+            .detect_class_for_path(Path::new("schema/meta/sh_character.lua"))
+            .map(|entry| (entry.class_name, entry.definition.class_global));
+        assert_eq!(result, Some(("SCHEMA".to_string(), "SCHEMA".to_string())));
+
+        let include_only = scopes
+            .detect_class_for_path(Path::new("gamemode/schema.lua"))
+            .map(|entry| entry.class_name);
+        assert_eq!(include_only, Some("SCHEMA".to_string()));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_detect_class_strip_file_prefix_for_single_file_classes() -> Result<()> {
+        let scopes: EmmyrcGmodScriptedClassScopes = serde_json::from_str(
+            r#"{
+                "include": [
+                    {
+                        "id": "helix-items",
+                        "label": "Helix Items",
+                        "classGlobal": "ITEM",
+                        "path": ["schema", "items"],
+                        "include": ["schema/items/**"],
+                        "stripFilePrefix": true
+                    }
+                ]
+            }"#,
+        )
+        .or_fail()?;
+
+        let result = scopes
+            .detect_class_for_path(Path::new("schema/items/books/sh_paper.lua"))
+            .map(|entry| entry.class_name);
+        assert_eq!(result, Some("paper".to_string()));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_scripted_class_metadata_normalizes_and_resolves_helpers() -> Result<()> {
+        let scopes: EmmyrcGmodScriptedClassScopes = serde_json::from_str(
+            r#"{
+                "include": [
+                    {
+                        "id": "helix-schema",
+                        "label": "Helix Schema",
+                        "classGlobal": "SCHEMA",
+                        "fixedClassName": "SCHEMA",
+                        "path": ["schema"],
+                        "include": ["schema/**"],
+                        "isGlobalSingleton": true,
+                        "hideFromOutline": true,
+                        "aliases": [" Schema ", " "],
+                        "superTypes": [" GM ", " "],
+                        "hookOwner": true
+                    }
+                ]
+            }"#,
+        )
+        .or_fail()?;
+
+        let definitions = scopes.resolved_definitions();
+        let schema = definitions
+            .iter()
+            .find(|definition| definition.id == "helix-schema")
+            .expect("expected helix schema definition");
+        verify_that!(schema.fixed_class_name.as_deref(), eq(Some("SCHEMA")))?;
+        verify_that!(schema.is_global_singleton, eq(true))?;
+        verify_that!(schema.hide_from_outline, eq(true))?;
+        verify_that!(schema.aliases.as_slice(), eq(&["Schema".to_string()]))?;
+        verify_that!(schema.super_types.as_slice(), eq(&["GM".to_string()]))?;
+        verify_that!(schema.hook_owner, eq(true))?;
+        verify_that!(
+            scopes.aliases_for_global("SCHEMA").as_slice(),
+            eq(&["Schema".to_string()])
+        )?;
+        verify_that!(
+            scopes.super_types_for_global("Schema").as_slice(),
+            eq(&["GM".to_string()])
+        )?;
+        let hook_owner_globals = scopes.hook_owner_globals();
+        assert!(hook_owner_globals.contains(&"SCHEMA".to_string()));
+        assert!(hook_owner_globals.contains(&"Schema".to_string()));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_detect_all_scoped_class_matches_keeps_overlapping_plugin_scope() -> Result<()> {
+        let scopes: EmmyrcGmodScriptedClassScopes = serde_json::from_str(
+            r#"{
+                "include": [
+                    {
+                        "id": "plugins",
+                        "label": "Plugins",
+                        "classGlobal": "PLUGIN",
+                        "path": ["plugins"],
+                        "include": ["plugins/**"]
+                    },
+                    {
+                        "id": "helix-items",
+                        "label": "Helix Items",
+                        "classGlobal": "ITEM",
+                        "path": ["items"],
+                        "include": ["plugins/*/items/**"],
+                        "stripFilePrefix": true
+                    }
+                ]
+            }"#,
+        )
+        .or_fail()?;
+
+        let matches = scopes.detect_all_scoped_class_matches_for_path(Path::new(
+            "plugins/writing/items/books/sh_paper.lua",
+        ));
+        let pairs = matches
+            .into_iter()
+            .map(|entry| (entry.definition.class_global, entry.class_name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            vec![
+                ("PLUGIN".to_string(), "writing".to_string()),
+                ("ITEM".to_string(), "paper".to_string()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_scripted_owners_resolve_candidates_and_fallbacks() -> Result<()> {
+        let owners: EmmyrcGmodScriptedOwners = serde_json::from_str(
+            r#"{
+                "include": [
+                    {
+                        "id": "schema",
+                        "global": "SCHEMA",
+                        "aliases": ["Schema", "schema"],
+                        "include": ["schema/**"],
+                        "hookOwner": true,
+                        "fallbackOwners": ["GM"]
+                    }
+                ]
+            }"#,
+        )
+        .or_fail()?;
+
+        let resolved = owners.resolved_owners();
+        verify_that!(resolved.len(), eq(1usize))?;
+        verify_that!(
+            owners.hook_owner_names().as_slice(),
+            eq(&["SCHEMA".to_string(), "Schema".to_string()])
+        )?;
+        verify_that!(
+            owners
+                .hook_owner_candidates_configured("Schema")
+                .unwrap()
+                .as_slice(),
+            eq(&["SCHEMA".to_string(), "Schema".to_string(), "GM".to_string()])
+        )?;
+        verify_that!(
+            owners
+                .hook_owner_fallbacks_configured("SCHEMA")
+                .unwrap()
+                .as_slice(),
+            eq(&["GM".to_string()])
+        )
     }
 
     #[gtest]

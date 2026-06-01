@@ -452,27 +452,48 @@ pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
         .get_gmod_infer_index()
         .get_scoped_class_info(&cache.get_file_id())
     {
-        return (info.global_name == name)
-            .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name));
+        if info.global_name == name || info.aliases.iter().any(|alias| alias == name) {
+            return Some(get_scripted_class_type_decl_id(
+                &info.global_name,
+                &info.class_name,
+            ));
+        }
+        if let Some((class_name, global_name, _, _, _)) = info
+            .extra_scope_matches
+            .iter()
+            .find(|(_, global_name, _, _, _)| global_name == name)
+        {
+            return Some(get_scripted_class_type_decl_id(global_name, class_name));
+        }
     }
 
-    if !db
+    for definition in db
         .get_emmyrc()
         .gmod
         .scripted_class_scopes
         .resolved_definitions()
-        .iter()
-        .any(|definition| definition.class_global == name)
     {
-        return None;
+        if definition.is_global_singleton
+            && (definition.class_global == name
+                || definition.aliases.iter().any(|alias| alias == name))
+        {
+            let class_name = definition
+                .fixed_class_name
+                .as_deref()
+                .unwrap_or(definition.class_global.as_str());
+            return Some(get_scripted_class_type_decl_id(
+                &definition.class_global,
+                class_name,
+            ));
+        }
+        if definition.class_global == name {
+            let (global_name, class_name) = detect_scoped_global_from_path_cached(db, cache)?;
+            return (global_name == name)
+                .then(|| get_scripted_class_type_decl_id(&global_name, &class_name));
+        }
     }
 
-    let (global_name, class_name) = detect_scoped_global_from_path_cached(db, cache)?;
-    if global_name != name {
-        return None;
-    }
-
-    Some(get_scripted_class_type_decl_id(&global_name, &class_name))
+    None
 }
 
 fn detect_scoped_global_from_path_cached(

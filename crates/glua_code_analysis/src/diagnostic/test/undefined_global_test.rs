@@ -500,6 +500,106 @@ mod test {
     }
 
     #[test]
+    fn global_singleton_scripted_scope_alias_is_available_workspace_wide() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes = serde_json::from_str(
+            r#"{
+                "include": [
+                    {
+                        "id": "helix-schema",
+                        "label": "Helix Schema",
+                        "classGlobal": "SCHEMA",
+                        "fixedClassName": "SCHEMA",
+                        "path": ["schema"],
+                        "include": ["gamemodes/*/schema/**"],
+                        "isGlobalSingleton": true,
+                        "aliases": ["Schema"],
+                        "superTypes": ["GM"],
+                        "hookOwner": true
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "gamemodes/ixhl2rp/schema/sh_schema.lua",
+            r#"
+            SCHEMA.Name = "Half-Life 2 RP"
+            function SCHEMA:PlayerSpawn(client)
+            end
+            "#,
+        );
+
+        let consumer = r#"
+            print(SCHEMA.Name)
+            print(Schema.Name)
+            "#;
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "gamemodes/ixhl2rp/schema/cl_hooks.lua",
+            consumer,
+            "SCHEMA"
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "gamemodes/ixhl2rp/schema/cl_hooks.lua",
+            consumer,
+            "Schema"
+        ));
+    }
+
+    #[test]
+    fn overlapping_scripted_scopes_allow_primary_and_parent_globals() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes = serde_json::from_str(
+            r#"{
+                "include": [
+                    {
+                        "id": "plugins",
+                        "label": "Plugins",
+                        "classGlobal": "PLUGIN",
+                        "path": ["plugins"],
+                        "include": ["plugins/**"]
+                    },
+                    {
+                        "id": "helix-items",
+                        "label": "Helix Items",
+                        "classGlobal": "ITEM",
+                        "path": ["items"],
+                        "include": ["plugins/*/items/**"],
+                        "stripFilePrefix": true
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        ws.update_emmyrc(emmyrc);
+
+        let item = r#"
+            PLUGIN.Name = "Writing"
+            ITEM.name = "Paper"
+            "#;
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "plugins/writing/items/books/sh_paper.lua",
+            item,
+            "PLUGIN"
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "plugins/writing/items/books/sh_paper.lua",
+            item,
+            "ITEM"
+        ));
+    }
+
+    #[test]
     fn test_guarded_global_with_index_expr_and_condition() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         // Pattern: if ctp and ctp.Disable then ... end

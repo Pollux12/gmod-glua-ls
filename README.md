@@ -124,4 +124,4 @@ If you are working outside the standard `garrysmod/addons` or `garrysmod/gamemod
 
 This is a hard fork of [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust), maintained specifically for Garry's Mod GLua.
 The original EmmyLua project does not support plugins, nor does it have any plan for them, making it difficult to fully adapt for Garry's Mod. This project contains significant changes from the original and only works for Garry's Mod GLua.
-While LuaLS has plugin support, it was annoyingly slow to use. Many features here are based on my [LuaLS plugin](https://github.com/Pollux12/gmod-luals-addon).
+While LuaLS has plugin support, it was annoyingly slow to use. Many features here are based on my earlier LuaLS addon work, now maintained in [annotations-gmod-glua-ls](https://github.com/Pollux12/annotations-gmod-glua-ls).

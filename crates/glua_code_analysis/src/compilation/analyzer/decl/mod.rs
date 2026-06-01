@@ -5,7 +5,7 @@ mod stats;
 
 use crate::{
     compilation::analyzer::AnalysisPipeline,
-    db_index::{DbIndex, LegacyModuleEnv, LuaScopeKind},
+    db_index::{DbIndex, GmodScopedClassInfo, LegacyModuleEnv, LuaScopeKind},
     profile::Profile,
 };
 
@@ -38,13 +38,13 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
 
         for in_filed_tree in tree_list.iter() {
             // Detect scoped class once here and cache in GmodInferIndex for gmod_pre reuse.
-            let scoped_class_global_name = if let Some(scripted_scope_infos) =
+            let scoped_class_info = if let Some(scripted_scope_infos) =
                 scripted_scope_infos.as_ref()
                 && let Some(info) = scripted_scope_infos.get(&in_filed_tree.file_id)
             {
                 db.get_gmod_infer_index_mut()
                     .set_scoped_class_info(in_filed_tree.file_id, info.clone());
-                Some(info.global_name.clone())
+                Some(info.clone())
             } else {
                 None
             };
@@ -57,7 +57,7 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
                 in_filed_tree.file_id,
                 in_filed_tree.value.clone(),
                 context,
-                scoped_class_global_name,
+                scoped_class_info,
             );
             analyzer.analyze();
             let decl_tree = analyzer.get_decl_tree();
@@ -203,7 +203,7 @@ pub struct DeclAnalyzer<'a> {
     db: &'a mut DbIndex,
     root: LuaChunk,
     decl: LuaDeclarationTree,
-    scoped_class_global_name: Option<String>,
+    scoped_class_info: Option<GmodScopedClassInfo>,
     seeded_scoped_class_decl: bool,
     legacy_module_envs: Vec<LegacyModuleEnv>,
     scopes: Vec<LuaScopeId>,
@@ -217,13 +217,13 @@ impl<'a> DeclAnalyzer<'a> {
         file_id: FileId,
         root: LuaChunk,
         context: &'a mut AnalyzeContext,
-        scoped_class_global_name: Option<String>,
+        scoped_class_info: Option<GmodScopedClassInfo>,
     ) -> DeclAnalyzer<'a> {
         DeclAnalyzer {
             db,
             root,
             decl: LuaDeclarationTree::new(file_id),
-            scoped_class_global_name,
+            scoped_class_info,
             seeded_scoped_class_decl: false,
             legacy_module_envs: Vec::new(),
             scopes: Vec::new(),
@@ -270,8 +270,9 @@ impl<'a> DeclAnalyzer<'a> {
     }
 
     pub fn add_decl(&mut self, mut decl: LuaDecl) -> LuaDeclId {
-        if let Some(scoped_class_global_name) = self.scoped_class_global_name.as_ref()
-            && decl.get_name() == scoped_class_global_name
+        if let Some(scoped_class_info) = self.scoped_class_info.as_ref()
+            && decl.get_name() == scoped_class_info.global_name
+            && !scoped_class_info.is_global_singleton
             && let LuaDeclExtra::Global { kind } = decl.extra.clone()
         {
             decl.extra = LuaDeclExtra::Local { kind, attrib: None };
@@ -342,9 +343,14 @@ impl<'a> DeclAnalyzer<'a> {
     }
 
     pub fn is_scoped_class_global_name(&self, name: &str) -> bool {
-        self.scoped_class_global_name
-            .as_ref()
-            .is_some_and(|scoped_name| scoped_name == name)
+        self.scoped_class_info.as_ref().is_some_and(|info| {
+            info.global_name == name
+                || info.aliases.iter().any(|alias| alias == name)
+                || info
+                    .extra_scope_matches
+                    .iter()
+                    .any(|(_, global_name, _, _, _)| global_name == name)
+        })
     }
 
     pub fn set_legacy_module_env(&mut self, legacy_module_env: LegacyModuleEnv) {
@@ -378,27 +384,68 @@ impl<'a> DeclAnalyzer<'a> {
             return;
         }
 
-        let Some(scoped_class_global_name) = self.scoped_class_global_name.as_ref() else {
+        let Some(scoped_class_info) = self.scoped_class_info.clone() else {
             return;
         };
 
-        let file_id = self.get_file_id();
         let synthetic_pos = chunk_range.start();
         let synthetic_range = TextRange::new(synthetic_pos, synthetic_pos);
-        let mut decl = LuaDecl::new(
-            scoped_class_global_name,
-            file_id,
+        self.seed_scoped_class_decl_name(
+            &scoped_class_info.global_name,
+            scoped_class_info.is_global_singleton,
             synthetic_range,
+        );
+
+        if scoped_class_info.is_global_singleton {
+            for alias in &scoped_class_info.aliases {
+                self.seed_scoped_class_decl_name(alias, true, synthetic_range);
+            }
+        }
+
+        for (_, extra_global_name, _, extra_is_singleton, _) in
+            &scoped_class_info.extra_scope_matches
+        {
+            self.seed_scoped_class_decl_name(
+                extra_global_name,
+                *extra_is_singleton,
+                synthetic_range,
+            );
+            if *extra_is_singleton {
+                for alias in super::gmod::remap_scoped_alias(
+                    extra_global_name,
+                    &self.db.get_emmyrc().gmod.scripted_class_scopes,
+                ) {
+                    self.seed_scoped_class_decl_name(&alias, true, synthetic_range);
+                }
+            }
+        }
+
+        self.seeded_scoped_class_decl = true;
+    }
+
+    fn seed_scoped_class_decl_name(
+        &mut self,
+        global_name: &str,
+        is_global_singleton: bool,
+        synthetic_range: TextRange,
+    ) {
+        let file_id = self.get_file_id();
+        let extra = if is_global_singleton {
+            LuaDeclExtra::Global {
+                kind: LuaSyntaxKind::NameExpr.into(),
+            }
+        } else {
             LuaDeclExtra::Local {
                 kind: LuaSyntaxKind::NameExpr.into(),
                 attrib: None,
-            },
-            None,
-        );
-        decl.mark_seeded_class_local();
+            }
+        };
+        let mut decl = LuaDecl::new(global_name, file_id, synthetic_range, extra, None);
+        if !is_global_singleton {
+            decl.mark_seeded_class_local();
+        }
 
         self.add_decl(decl);
-        self.seeded_scoped_class_decl = true;
     }
 
     fn project_legacy_module_chain_members(&mut self, legacy_module_env: &LegacyModuleEnv) {

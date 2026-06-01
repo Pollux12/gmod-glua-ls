@@ -221,7 +221,7 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
     }
 }
 
-const HOOK_OWNER_TYPES: &[&str] = &["GM", "GAMEMODE", "SANDBOX", "PLUGIN"];
+const HOOK_OWNER_TYPES: &[&str] = &["GM", "GAMEMODE", "SANDBOX"];
 
 fn hover_gmod_hook_name_string(
     analysis: &EmmyLuaAnalysis,
@@ -374,6 +374,27 @@ pub(crate) fn resolve_hook_property_owner(
                 .any(|n| n.eq_ignore_ascii_case(&normalized))
         {
             owner_names.push(normalized);
+        }
+    }
+    for configured_name in db.get_emmyrc().gmod.scripted_owners.hook_owner_names() {
+        if !owner_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&configured_name))
+        {
+            owner_names.push(configured_name);
+        }
+    }
+    for scoped_class_name in db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .hook_owner_globals()
+    {
+        if !owner_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&scoped_class_name))
+        {
+            owner_names.push(scoped_class_name);
         }
     }
 

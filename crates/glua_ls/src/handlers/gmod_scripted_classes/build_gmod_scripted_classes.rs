@@ -15,7 +15,11 @@ pub fn build_gmod_scripted_classes(
     }
 
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-    let definitions = scopes.resolved_definitions();
+    let definitions = scopes
+        .resolved_definitions()
+        .into_iter()
+        .filter(|definition| !definition.hide_from_outline)
+        .collect::<Vec<_>>();
 
     let mut file_paths = Vec::new();
     for file_id in db.get_vfs().get_all_local_file_ids() {
@@ -34,6 +38,9 @@ pub fn build_gmod_scripted_classes(
     for (file_id, scope_match) in scoped_matches {
         if cancel_token.is_cancelled() {
             return None;
+        }
+        if scope_match.definition.hide_from_outline {
+            continue;
         }
 
         let Some(uri) = file_uri_string(db, file_id) else {

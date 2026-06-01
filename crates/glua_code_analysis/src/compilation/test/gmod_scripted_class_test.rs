@@ -6,8 +6,9 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral,
-        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassDefinition,
+        EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral, LuaMemberId,
+        LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
     };
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
@@ -417,7 +418,83 @@ mod test {
                     .iter()
                     .any(|ty| ty == &LuaType::Ref(LuaTypeDeclId::global("GM")))
             );
+            assert!(
+                super_types
+                    .iter()
+                    .any(|ty| ty == &LuaType::Ref(LuaTypeDeclId::global("GAMEMODE")))
+            );
+            assert!(
+                super_types
+                    .iter()
+                    .any(|ty| ty == &LuaType::Ref(LuaTypeDeclId::global("SANDBOX")))
+            );
         }
+    }
+
+    #[gtest]
+    fn test_configured_hook_owner_scope_binds_matching_local_decl_without_plugin_literal() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include =
+            vec![EmmyrcGmodScriptedClassScopeEntry::Definition(Box::new(
+                EmmyrcGmodScriptedClassDefinition {
+                    id: "custom-plugins".to_string(),
+                    label: Some("Custom Plugins".to_string()),
+                    path: Some(vec!["custom_plugins".to_string()]),
+                    include: Some(vec!["custom_plugins/**".to_string()]),
+                    exclude: None,
+                    class_global: Some("CUSTOMPLUGIN".to_string()),
+                    fixed_class_name: None,
+                    is_global_singleton: None,
+                    strip_file_prefix: None,
+                    hide_from_outline: None,
+                    aliases: None,
+                    super_types: Some(vec!["GM".to_string()]),
+                    hook_owner: Some(true),
+                    parent_id: None,
+                    icon: None,
+                    root_dir: None,
+                    scaffold: None,
+                    class_name_prefix: None,
+                    disabled: None,
+                },
+            ))];
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "custom_plugins/weather/sh_plugin.lua",
+            r#"
+            local CUSTOMPLUGIN = {}
+
+            function CUSTOMPLUGIN:PlayerSpawn(client)
+            end
+        "#,
+        );
+
+        let custom_decl_id = {
+            let db = ws.get_db_mut();
+            let decl_tree = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .expect("expected decl tree");
+            decl_tree
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == "CUSTOMPLUGIN" && decl.is_local())
+                .expect("expected local CUSTOMPLUGIN declaration")
+                .get_id()
+        };
+
+        let db = ws.get_db_mut();
+        let type_cache = db
+            .get_type_index()
+            .get_type_cache(&custom_decl_id.into())
+            .expect("expected CUSTOMPLUGIN declaration type cache");
+        assert_eq!(
+            type_cache.as_type(),
+            &LuaType::Def(LuaTypeDeclId::global("weather"))
+        );
     }
 
     #[gtest]
