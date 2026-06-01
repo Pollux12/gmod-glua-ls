@@ -101,6 +101,10 @@ fn add_module_completion_item(
     let completion_item = CompletionItem {
         label: completion_name.clone(),
         kind: Some(lsp_types::CompletionItemKind::MODULE),
+        filter_text: Some(format!(
+            "{} {}",
+            completion_name, module_info.full_module_name
+        )),
         label_details: Some(lsp_types::CompletionItemLabelDetails {
             detail: Some(format!("    (in {})", module_info.full_module_name)),
             ..Default::default()
@@ -196,6 +200,12 @@ fn add_completion_item_by_type(
                         let completion_item = CompletionItem {
                             label: key_name.clone(),
                             kind: Some(get_completion_kind(&member_info.typ)),
+                            filter_text: Some(format!(
+                                "{} {} {}",
+                                key_name,
+                                module_info.full_module_name,
+                                member_info.key.to_path()
+                            )),
                             label_details: Some(lsp_types::CompletionItemLabelDetails {
                                 detail: Some(format!("    (in {})", module_info.full_module_name)),
                                 ..Default::default()
@@ -233,6 +243,7 @@ fn add_completion_item_by_type(
                         let completion_item = CompletionItem {
                             label: name.to_string(),
                             kind: Some(get_completion_kind(&export_type)),
+                            filter_text: Some(format!("{} {}", name, module_info.full_module_name)),
                             label_details: Some(lsp_types::CompletionItemLabelDetails {
                                 detail: Some(format!("    (in {})", module_info.full_module_name)),
                                 ..Default::default()

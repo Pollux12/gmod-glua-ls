@@ -13,11 +13,13 @@ use glua_parser::{
 use lsp_types::{Hover, HoverContents, MarkedString, MarkupContent};
 use rowan::{TextRange, TextSize};
 
+use crate::handlers::completion::{color_info_from_expr, color_info_from_type, is_color_type};
 use crate::handlers::hover::function::{build_function_hover, is_function};
 use crate::handlers::hover::humanize_type_decl::build_type_decl_hover;
 use crate::handlers::hover::humanize_types::hover_humanize_type;
 
 use super::{
+    color_swatch::color_swatch_markdown,
     find_origin::{find_decl_origin_owners, find_member_origin_owners},
     hover_builder::HoverBuilder,
     humanize_types::hover_const_type,
@@ -321,6 +323,9 @@ fn build_decl_hover(
     if let Some(desc) = get_gmod_class_description(db, &typ) {
         builder.add_annotation_description(desc);
     }
+    if !is_completion {
+        add_decl_color_preview(builder, db, &typ, decl_id);
+    }
 
     if let LuaDeclExtra::Param {
         idx, signature_id, ..
@@ -470,8 +475,118 @@ fn build_member_hover(
     if let Some(desc) = get_gmod_class_description(db, &typ) {
         builder.add_annotation_description(desc);
     }
+    if !is_completion {
+        add_member_color_preview(builder, db, &typ, member_id);
+    }
 
     Some(())
+}
+
+fn add_decl_color_preview(
+    builder: &mut HoverBuilder,
+    db: &DbIndex,
+    typ: &LuaType,
+    decl_id: LuaDeclId,
+) -> Option<()> {
+    if !db.get_emmyrc().document_color.enable {
+        return None;
+    }
+    let color = color_info_from_type(typ).or_else(|| {
+        if !is_color_type(typ) && !matches!(typ, LuaType::Unknown) {
+            return None;
+        }
+        let decl = db.get_decl_index().get_decl(&decl_id)?;
+        let value_syntax_id = decl.get_value_syntax_id()?;
+        if !can_hover_value_expr_be_color(value_syntax_id.get_kind()) {
+            return None;
+        }
+        let tree = db.get_vfs().get_syntax_tree(&decl_id.file_id)?;
+        let value_node = value_syntax_id.to_node_from_root(&tree.get_red_root())?;
+        LuaExpr::cast(value_node).and_then(|expr| color_info_from_expr(&expr))
+    })?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let prefix = if decl.is_local() {
+        "local "
+    } else {
+        "(global) "
+    };
+    builder.set_type_description(format!(
+        "{}{}: {}",
+        prefix,
+        decl.get_name(),
+        color.gmod_display
+    ));
+    builder.add_annotation_description(color_swatch_markdown(
+        color.red,
+        color.green,
+        color.blue,
+        color.alpha,
+        &color.gmod_display,
+    ));
+    Some(())
+}
+
+fn add_member_color_preview(
+    builder: &mut HoverBuilder,
+    db: &DbIndex,
+    typ: &LuaType,
+    member_id: LuaMemberId,
+) -> Option<()> {
+    if !db.get_emmyrc().document_color.enable {
+        return None;
+    }
+    let color = color_info_from_type(typ).or_else(|| {
+        if !is_color_type(typ) && !matches!(typ, LuaType::Unknown) {
+            return None;
+        }
+        get_member_value_expr(db, member_id).and_then(|expr| color_info_from_expr(&expr))
+    })?;
+    let member = db.get_member_index().get_member(&member_id)?;
+    let member_name: &str = match member.get_key() {
+        LuaMemberKey::Name(name) => name.as_str(),
+        _ => return None,
+    };
+    builder.set_type_description(format!("(field) {}: {}", member_name, color.gmod_display));
+    builder.add_annotation_description(color_swatch_markdown(
+        color.red,
+        color.green,
+        color.blue,
+        color.alpha,
+        &color.gmod_display,
+    ));
+    Some(())
+}
+
+fn can_hover_value_expr_be_color(kind: LuaSyntaxKind) -> bool {
+    matches!(kind, LuaSyntaxKind::CallExpr | LuaSyntaxKind::LiteralExpr)
+}
+
+fn get_member_value_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+
+    if let Some(field) = LuaTableField::cast(node.clone()) {
+        return field.get_value_expr();
+    }
+
+    if let Some(index_expr) = LuaIndexExpr::cast(node) {
+        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
+            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+            let value_idx = vars
+                .iter()
+                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
+            return value_exprs.get(value_idx).cloned();
+        }
+
+        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
+            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
+        }
+    }
+
+    None
 }
 
 fn get_gmod_class_description(db: &DbIndex, typ: &LuaType) -> Option<String> {

@@ -2829,6 +2829,82 @@ mod tests {
         ws
     }
 
+    #[gtest]
+    fn test_hover_color_decl_includes_preview() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Color
+                ---@return Color
+                function Color(r, g, b, a) end
+
+                local HEADLIGHT = Color(255, 231, 176)
+                <??>HEADLIGHT
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        verify_that!(
+            value,
+            contains_substring("local HEADLIGHT: Color(255, 231, 176)")
+        )?;
+        // The description region now carries an inline SVG swatch image plus the
+        // Color(...) text. The type line above remains plain text.
+        verify_that!(value, contains_substring("data:image/svg+xml;base64,"))?;
+        verify_that!(value, contains_substring("`Color(255, 231, 176)`"))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_color_decl_swatch_suppressed_when_disabled() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.document_color.enable = false;
+        ws.update_emmyrc(emmyrc);
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Color
+                ---@return Color
+                function Color(r, g, b, a) end
+
+                local HEADLIGHT = Color(255, 231, 176)
+                <??>HEADLIGHT
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        verify_that!(value, not(contains_substring("data:image/svg+xml;base64,")))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_color_member_includes_preview_with_alpha() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Color
+                ---@return Color
+                function Color(r, g, b, a) end
+
+                SKIN = {}
+                SKIN.HeaderColor = Color(20, 40, 60, 128)
+                SKIN.<??>HeaderColor
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        verify_that!(
+            value,
+            contains_substring("(field) HeaderColor: Color(20, 40, 60, 128)")
+        )?;
+        verify_that!(value, contains_substring("data:image/svg+xml;base64,"))?;
+        verify_that!(value, contains_substring("`Color(20, 40, 60, 128)`"))?;
+        Ok(())
+    }
+
     fn extract_hover_markdown(
         ws: &ProviderVirtualWorkspace,
         file_id: glua_code_analysis::FileId,

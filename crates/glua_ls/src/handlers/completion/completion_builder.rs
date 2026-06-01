@@ -17,6 +17,7 @@ pub struct CompletionBuilder<'a> {
     /// 是否为空格字符触发的补全(非主动触发)
     pub is_space_trigger_character: bool,
     pub position_offset: TextSize,
+    supports_deprecated_completion_tags: bool,
 }
 
 impl<'a> CompletionBuilder<'a> {
@@ -26,6 +27,7 @@ impl<'a> CompletionBuilder<'a> {
         cancel_token: CancellationToken,
         trigger_kind: CompletionTriggerKind,
         position_offset: TextSize,
+        supports_deprecated_completion_tags: bool,
     ) -> Self {
         let is_space_trigger_character = if trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
         {
@@ -44,6 +46,7 @@ impl<'a> CompletionBuilder<'a> {
             trigger_kind,
             is_space_trigger_character,
             position_offset,
+            supports_deprecated_completion_tags,
         }
     }
 
@@ -85,5 +88,9 @@ impl<'a> CompletionBuilder<'a> {
                 .get_emmyrc()
                 .completion
                 .call_snippet
+    }
+
+    pub fn supports_deprecated_completion_tags(&self) -> bool {
+        self.supports_deprecated_completion_tags
     }
 }

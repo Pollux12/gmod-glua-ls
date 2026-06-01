@@ -9,7 +9,7 @@ use lsp_types::{CompletionItem, InsertTextFormat, InsertTextMode};
 use rowan::NodeOrToken;
 
 use crate::handlers::completion::{
-    add_completions::{check_visibility, is_deprecated},
+    add_completions::{check_visibility, get_completion_tags, is_deprecated},
     completion_builder::CompletionBuilder,
     completion_data::CompletionData,
     providers::function_provider::dispatch_type,
@@ -150,6 +150,7 @@ fn add_field_key_completion(
         kind: Some(lsp_types::CompletionItemKind::PROPERTY),
         data,
         deprecated,
+        tags: get_completion_tags(builder, deprecated),
         insert_text: Some(insert_text),
         insert_text_format,
         ..Default::default()

@@ -1,4 +1,5 @@
 mod build_hover;
+mod color_swatch;
 mod find_origin;
 mod function;
 mod hover_builder;

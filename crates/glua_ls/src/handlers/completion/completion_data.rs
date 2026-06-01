@@ -13,6 +13,21 @@ pub struct CompletionData {
     pub typ: CompletionDataType,
     /// Total count of function overloads
     pub overload_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<CompletionColorInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionColorInfo {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+    pub hex: String,
+    pub rgb: String,
+    pub rgba: String,
+    pub gmod: String,
+    pub gmod_display: String,
 }
 
 #[allow(unused)]
@@ -27,6 +42,23 @@ impl CompletionData {
             uri: Some(builder.semantic_model.get_document().get_uri().clone()),
             typ: CompletionDataType::PropertyOwnerId(id),
             overload_count,
+            color: None,
+        };
+        Some(serde_json::to_value(data).unwrap())
+    }
+
+    pub fn from_property_owner_id_with_color(
+        builder: &CompletionBuilder,
+        id: LuaSemanticDeclId,
+        overload_count: Option<usize>,
+        color: CompletionColorInfo,
+    ) -> Option<Value> {
+        let data = Self {
+            field_id: builder.semantic_model.get_file_id(),
+            uri: Some(builder.semantic_model.get_document().get_uri().clone()),
+            typ: CompletionDataType::PropertyOwnerId(id),
+            overload_count,
+            color: Some(color),
         };
         Some(serde_json::to_value(data).unwrap())
     }
@@ -42,6 +74,7 @@ impl CompletionData {
             uri: Some(builder.semantic_model.get_document().get_uri().clone()),
             typ: CompletionDataType::Overload((id, index)),
             overload_count,
+            color: None,
         };
         Some(serde_json::to_value(data).unwrap())
     }
@@ -52,6 +85,7 @@ impl CompletionData {
             uri: Some(builder.semantic_model.get_document().get_uri().clone()),
             typ: CompletionDataType::Module(module),
             overload_count: None,
+            color: None,
         };
         Some(serde_json::to_value(data).unwrap())
     }

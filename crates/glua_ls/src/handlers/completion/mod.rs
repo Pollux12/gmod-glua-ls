@@ -6,6 +6,7 @@ mod providers;
 mod resolve_completion;
 
 pub use add_completions::get_index_alias_name;
+pub(crate) use add_completions::{color_info_from_expr, color_info_from_type, is_color_type};
 use completion_builder::CompletionBuilder;
 pub(crate) use completion_data::CompletionData;
 #[cfg(test)]
@@ -69,7 +70,7 @@ pub async fn on_completion_handler(
         return None;
     }
 
-    let result = completion(
+    let result = completion_with_deprecated_tag_support(
         &analysis,
         file_id,
         position,
@@ -78,17 +79,39 @@ pub async fn on_completion_handler(
             .map(|context| context.trigger_kind)
             .unwrap_or(CompletionTriggerKind::INVOKED),
         cancel_token,
+        context
+            .lsp_features()
+            .supports_completion_item_deprecated_tags(),
     );
 
     result
 }
 
+#[cfg(test)]
 pub fn completion(
     analysis: &EmmyLuaAnalysis,
     file_id: FileId,
     position: Position,
     trigger_kind: CompletionTriggerKind,
     cancel_token: CancellationToken,
+) -> Option<CompletionResponse> {
+    completion_with_deprecated_tag_support(
+        analysis,
+        file_id,
+        position,
+        trigger_kind,
+        cancel_token,
+        true,
+    )
+}
+
+pub fn completion_with_deprecated_tag_support(
+    analysis: &EmmyLuaAnalysis,
+    file_id: FileId,
+    position: Position,
+    trigger_kind: CompletionTriggerKind,
+    cancel_token: CancellationToken,
+    supports_deprecated_completion_tags: bool,
 ) -> Option<CompletionResponse> {
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     if !semantic_model.get_emmyrc().completion.enable {
@@ -119,6 +142,7 @@ pub fn completion(
         cancel_token.clone(),
         trigger_kind,
         position_offset,
+        supports_deprecated_completion_tags,
     );
     add_completions(&mut builder);
     if cancel_token.is_cancelled() {

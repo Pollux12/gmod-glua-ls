@@ -1,9 +1,15 @@
 #[cfg(test)]
 mod tests {
-    use crate::handlers::test_lib::{
-        ProviderVirtualWorkspace, VirtualCompletionResolveItem, check,
+    use crate::{
+        context::ClientId,
+        handlers::{
+            completion::{completion, completion_resolve},
+            test_lib::{ProviderVirtualWorkspace, VirtualCompletionResolveItem, check},
+        },
     };
     use googletest::prelude::*;
+    use lsp_types::{CompletionResponse, CompletionTriggerKind};
+    use tokio_util::sync::CancellationToken;
 
     #[gtest]
     fn test_1() -> Result<()> {
@@ -50,6 +56,56 @@ mod tests {
                 documentation: None,
             },
         ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_global_path_completion_resolve_preserves_function_union_overloads() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ix = ix or {}
+                ix.character = ix.character or {}
+
+                ---@type (fun(kind: "steamid"): string) | (fun(kind: "id"): number)
+                ix.character.lookup = nil
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ix = ix or {}
+                ix.character = ix.character or {}
+
+                ix.character.lo<??>
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .into_iter()
+            .find(|item| item.label == "lookup")
+            .ok_or("missing lookup completion")
+            .or_fail()?;
+        let item = completion_resolve(&ws.analysis, item, ClientId::VSCode);
+        let detail = item.detail.ok_or("item detail is empty").or_fail()?;
+        verify_eq!(
+            detail,
+            "function lookup(kind: \"steamid\") -> string (+1 overloads)"
+        )?;
+        verify_that!(item.documentation, none())?;
         Ok(())
     }
 

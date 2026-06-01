@@ -1,6 +1,6 @@
-mod build_color;
+pub(crate) mod build_color;
 
-use build_color::{build_colors, convert_color_to_hex};
+use build_color::{build_colors, convert_color_to_hex, gmod_color_from_hex_text};
 use glua_code_analysis::SemanticModel;
 use glua_parser::{LuaAstNode, LuaCallExpr};
 use lsp_types::{
@@ -48,6 +48,26 @@ fn convert_color_to_tuple(color: Color, original_text: &str, arity: Option<usize
         format!("{r}, {g}, {b}, {a}")
     } else {
         format!("{r}, {g}, {b}")
+    }
+}
+
+fn parse_numeric_color_tuple_arity(text: &str) -> Option<usize> {
+    let mut count = 0;
+    for component in text.split(',') {
+        let component = component.trim();
+        if component.is_empty() {
+            return None;
+        }
+        let value = component.parse::<f64>().ok()?;
+        if !(0.0..=255.0).contains(&value) {
+            return None;
+        }
+        count += 1;
+    }
+
+    match count {
+        3 | 4 => Some(count),
+        _ => None,
     }
 }
 
@@ -189,6 +209,26 @@ fn check_call_for_exact_tuple_range(
     }
 }
 
+fn color_presentation_text(
+    semantic_model: &SemanticModel,
+    range: rowan::TextRange,
+    color: Color,
+    text: &str,
+) -> Option<String> {
+    if is_gmod_color_call(text) {
+        Some(convert_color_to_gmod(color, text))
+    } else if text.contains(',') {
+        let arity = get_color_tuple_arity(semantic_model, range)
+            .or_else(|| parse_numeric_color_tuple_arity(text));
+        let arity = arity?;
+        Some(convert_color_to_tuple(color, text, Some(arity)))
+    } else if gmod_color_from_hex_text(text).is_some() {
+        Some(convert_color_to_hex(color, text.len()))
+    } else {
+        None
+    }
+}
+
 pub async fn on_document_color_presentation(
     context: ServerContextSnapshot,
     params: ColorPresentationParams,
@@ -219,13 +259,8 @@ pub async fn on_document_color_presentation(
     };
     let color = params.color;
     let text = document.get_text_slice(range);
-    let color_text = if is_gmod_color_call(text) {
-        convert_color_to_gmod(color, text)
-    } else if text.contains(',') {
-        let arity = get_color_tuple_arity(&semantic_model, range);
-        convert_color_to_tuple(color, text, arity)
-    } else {
-        convert_color_to_hex(color, text.len())
+    let Some(color_text) = color_presentation_text(&semantic_model, range, color, text) else {
+        return vec![];
     };
     let color_presentations = vec![ColorPresentation {
         label: text.to_string(),
@@ -250,7 +285,8 @@ impl RegisterCapabilities for DocumentColorCapabilities {
 #[cfg(test)]
 mod tests {
     use super::{
-        convert_color_to_gmod, convert_color_to_tuple, get_color_tuple_arity, is_gmod_color_call,
+        color_presentation_text, convert_color_to_gmod, convert_color_to_tuple,
+        get_color_tuple_arity, is_gmod_color_call, parse_numeric_color_tuple_arity,
     };
     use glua_parser::LuaAstNode;
     use lsp_types::Color;
@@ -276,6 +312,33 @@ mod tests {
         // to specifically test semantic tuple logic if there are multiple.
         let range = doc.to_rowan_range(colors.last().unwrap().range).unwrap();
         get_color_tuple_arity(&semantic_model, range)
+    }
+
+    fn get_color_presentation_text_for_last_color(text: &str) -> Option<String> {
+        let mut ws = glua_code_analysis::VirtualWorkspace::new();
+        let file_id = ws.def(text);
+        let semantic_model = ws.analysis.compilation.get_semantic_model(file_id).unwrap();
+        let doc = semantic_model.get_document();
+        let root = semantic_model.get_root();
+        let colors = crate::handlers::document_color::build_color::build_colors(
+            root.syntax().clone(),
+            &doc,
+            Some(&semantic_model),
+        );
+        let color_info = colors.last()?;
+        let range = doc.to_rowan_range(color_info.range)?;
+        let original_text = doc.get_text_slice(range);
+        color_presentation_text(
+            &semantic_model,
+            range,
+            Color {
+                red: 1.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            },
+            original_text,
+        )
     }
 
     #[test]
@@ -409,5 +472,62 @@ mod tests {
             convert_color_to_tuple(color_rgba_original, "255, 0, 0, 255", None),
             "255, 0, 0, 255"
         );
+    }
+
+    #[test]
+    fn test_parse_numeric_color_tuple_arity() {
+        assert_eq!(parse_numeric_color_tuple_arity("255, 0, 128"), Some(3));
+        assert_eq!(parse_numeric_color_tuple_arity("255, 0, 128, 64"), Some(4));
+        assert_eq!(parse_numeric_color_tuple_arity("foo, bar, baz"), None);
+        assert_eq!(parse_numeric_color_tuple_arity("255, 0"), None);
+        assert_eq!(parse_numeric_color_tuple_arity("255, 0, 256"), None);
+    }
+
+    #[test]
+    fn test_color_reference_presentation_is_read_only() {
+        let mut ws = glua_code_analysis::VirtualWorkspace::new();
+        let file_id = ws.def("local color = 1");
+        let semantic_model = ws.analysis.compilation.get_semantic_model(file_id).unwrap();
+        let presentation_text = color_presentation_text(
+            &semantic_model,
+            rowan::TextRange::new(rowan::TextSize::new(6), rowan::TextSize::new(11)),
+            Color {
+                red: 1.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            },
+            "color",
+        );
+
+        assert_eq!(presentation_text, None);
+    }
+
+    #[test]
+    fn test_hex_color_presentation_is_editable() {
+        let presentation_text = get_color_presentation_text_for_last_color(r##"print("#0000FF")"##);
+
+        assert_eq!(presentation_text, Some("#FF0000".to_string()));
+    }
+
+    #[test]
+    fn test_invalid_tuple_presentation_is_read_only() {
+        let mut ws = glua_code_analysis::VirtualWorkspace::new();
+        let file_id = ws.def("local a, b, c = 1, 2, 3");
+        let semantic_model = ws.analysis.compilation.get_semantic_model(file_id).unwrap();
+        let range = rowan::TextRange::new(rowan::TextSize::new(0), rowan::TextSize::new(9));
+        let presentation_text = color_presentation_text(
+            &semantic_model,
+            range,
+            Color {
+                red: 1.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            },
+            "foo, bar, baz",
+        );
+
+        assert_eq!(presentation_text, None);
     }
 }

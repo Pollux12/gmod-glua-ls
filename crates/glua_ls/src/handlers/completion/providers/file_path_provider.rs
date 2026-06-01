@@ -20,6 +20,12 @@ enum PathCompletionKind {
     Any,
 }
 
+struct PathCompletionContext {
+    roots: Vec<PathBuf>,
+    kind: PathCompletionKind,
+    lua_loader: bool,
+}
+
 pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
     if builder.is_cancelled() {
         return None;
@@ -38,12 +44,13 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
 
     let roots = context
         .as_ref()
-        .map(|(roots, _)| roots.clone())
+        .map(|context| context.roots.clone())
         .unwrap_or_else(|| collect_resource_roots(builder));
     let completion_kind = context
         .as_ref()
-        .map(|(_, completion_kind)| *completion_kind)
+        .map(|context| context.kind)
         .unwrap_or(PathCompletionKind::Any);
+    let lua_loader = context.as_ref().is_some_and(|context| context.lua_loader);
 
     let mut seen_insert_text = HashSet::new();
     let mut added_any = false;
@@ -71,7 +78,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
                 continue;
             }
 
-            if completion_kind == PathCompletionKind::Folder && !path.is_dir() {
+            if !should_include_path_completion(&path, path.is_dir(), completion_kind, lua_loader) {
                 continue;
             }
 
@@ -81,6 +88,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
                 name,
                 &prefix,
                 text_edit_range,
+                lua_loader,
                 &mut seen_insert_text,
             )
             .is_some()
@@ -100,7 +108,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
 fn detect_path_context(
     builder: &CompletionBuilder,
     string_token: &LuaStringToken,
-) -> Option<(Vec<PathBuf>, PathCompletionKind)> {
+) -> Option<PathCompletionContext> {
     let literal_expr = string_token.get_parent::<LuaLiteralExpr>()?;
     let args_list = literal_expr.get_parent::<LuaCallArgList>()?;
     let call_expr = args_list.get_parent::<LuaCallExpr>()?;
@@ -108,12 +116,21 @@ fn detect_path_context(
         .get_args()
         .position(|arg| arg.get_position() == literal_expr.get_position())?;
 
-    if is_include_loader_context(&call_expr, arg_idx) {
-        return Some((collect_contextual_roots(builder), PathCompletionKind::File));
+    let explicit_completion_kind = infer_param_path_completion_kind(builder, &call_expr, arg_idx);
+    if explicit_completion_kind.is_none() && is_include_loader_context(&call_expr, arg_idx) {
+        return Some(PathCompletionContext {
+            roots: collect_contextual_roots(builder),
+            kind: PathCompletionKind::File,
+            lua_loader: true,
+        });
     }
 
-    let completion_kind = infer_param_path_completion_kind(builder, &call_expr, arg_idx)?;
-    Some((collect_contextual_roots(builder), completion_kind))
+    let completion_kind = explicit_completion_kind?;
+    Some(PathCompletionContext {
+        roots: collect_contextual_roots(builder),
+        kind: completion_kind,
+        lua_loader: false,
+    })
 }
 
 fn is_include_loader_context(call_expr: &LuaCallExpr, arg_idx: usize) -> bool {
@@ -125,11 +142,7 @@ fn is_include_loader_context(call_expr: &LuaCallExpr, arg_idx: usize) -> bool {
         return false;
     };
 
-    matches_call_path(&call_path, "include") || matches_call_path(&call_path, "AddCSLuaFile")
-}
-
-fn matches_call_path(path: &str, target: &str) -> bool {
-    path == target || path.ends_with(&format!(".{target}")) || path.ends_with(&format!(":{target}"))
+    matches!(call_path.as_str(), "include" | "AddCSLuaFile")
 }
 
 fn infer_param_path_completion_kind(
@@ -310,12 +323,36 @@ fn split_path_prefix(path: &str) -> (String, String) {
     }
 }
 
+fn should_include_path_completion(
+    path: &Path,
+    is_dir: bool,
+    completion_kind: PathCompletionKind,
+    lua_loader: bool,
+) -> bool {
+    if is_dir {
+        return true;
+    }
+
+    if completion_kind == PathCompletionKind::Folder {
+        return false;
+    }
+
+    !lua_loader || is_lua_file(path)
+}
+
+fn is_lua_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
+}
+
 fn add_file_path_completion(
     builder: &mut CompletionBuilder,
     path: &PathBuf,
     name: &str,
     prefix: &str,
     text_edit_range: lsp_types::Range,
+    lua_loader: bool,
     seen_insert_text: &mut HashSet<String>,
 ) -> Option<()> {
     let kind: lsp_types::CompletionItemKind = if path.is_dir() {
@@ -339,6 +376,17 @@ fn add_file_path_completion(
         label: name.to_string(),
         kind: Some(kind),
         filter_text: Some(filter_text),
+        sort_text: lua_loader.then(|| {
+            format!(
+                "020_gmod_lua_path_{}_{}",
+                if path.is_dir() { 0 } else { 1 },
+                name.to_ascii_lowercase()
+            )
+        }),
+        label_details: lua_loader.then(|| lsp_types::CompletionItemLabelDetails {
+            description: Some("GMod Lua path".to_string()),
+            ..Default::default()
+        }),
         text_edit: Some(lsp_types::CompletionTextEdit::Edit(text_edit)),
         detail,
         ..Default::default()
@@ -353,8 +401,9 @@ fn add_file_path_completion(
 mod tests {
     use super::{
         PathCompletionKind, classify_path_type_name, map_call_param_to_decl_param_idx,
-        merge_path_completion_kind,
+        merge_path_completion_kind, should_include_path_completion,
     };
+    use std::path::Path;
 
     #[test]
     fn test_classify_path_type_name_file_folder_and_path() {
@@ -391,5 +440,33 @@ mod tests {
             merge_path_completion_kind(Some(PathCompletionKind::File), PathCompletionKind::Folder),
             PathCompletionKind::Any
         );
+    }
+
+    #[test]
+    fn test_gmod_lua_loader_path_filter_allows_dirs_and_lua_files_only() {
+        assert!(should_include_path_completion(
+            Path::new("entities"),
+            true,
+            PathCompletionKind::File,
+            true
+        ));
+        assert!(should_include_path_completion(
+            Path::new("cl_init.lua"),
+            false,
+            PathCompletionKind::File,
+            true
+        ));
+        assert!(!should_include_path_completion(
+            Path::new("icon.png"),
+            false,
+            PathCompletionKind::File,
+            true
+        ));
+        assert!(should_include_path_completion(
+            Path::new("icon.png"),
+            false,
+            PathCompletionKind::File,
+            false
+        ));
     }
 }

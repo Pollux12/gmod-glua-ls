@@ -40,6 +40,21 @@ impl LspFeatures {
         false
     }
 
+    pub fn supports_completion_item_deprecated_tags(&self) -> bool {
+        self.client_capabilities
+            .text_document
+            .as_ref()
+            .and_then(|text_document| text_document.completion.as_ref())
+            .and_then(|completion| completion.completion_item.as_ref())
+            .and_then(|completion_item| completion_item.tag_support.as_ref())
+            .is_some_and(|tag_support| {
+                tag_support.value_set.is_empty()
+                    || tag_support
+                        .value_set
+                        .contains(&lsp_types::CompletionItemTag::DEPRECATED)
+            })
+    }
+
     pub fn supports_workspace_diagnostic(&self) -> bool {
         self.supports_pull_diagnostic()
     }

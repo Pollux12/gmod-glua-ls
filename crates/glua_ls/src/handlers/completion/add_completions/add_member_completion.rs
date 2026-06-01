@@ -1,22 +1,29 @@
 use glua_code_analysis::{
-    DbIndex, LuaAliasCallKind, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId, LuaType,
-    SemanticModel, get_keyof_members, try_extract_signature_id_from_field,
+    DbIndex, LuaAliasCallKind, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
+    LuaSemanticDeclId, LuaType, SemanticModel, get_keyof_members,
+    try_extract_signature_id_from_field,
 };
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaFuncStat, LuaGeneralToken, LuaIndexExpr,
-    LuaParenExpr, LuaTokenKind,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaFuncStat, LuaGeneralToken, LuaIndexExpr,
+    LuaParenExpr, LuaTableField, LuaTokenKind,
 };
 use lsp_types::CompletionItem;
 
 use crate::handlers::completion::{
     add_completions::get_function_snippet,
     completion_builder::CompletionBuilder,
-    completion_data::CompletionData,
+    completion_data::{CompletionColorInfo, CompletionData},
     providers::{apply_staged_call_snippet, get_function_remove_nil},
 };
 
 use super::{
-    CallDisplay, check_visibility, get_completion_kind, get_description, get_detail, is_deprecated,
+    CallDisplay, check_visibility, color_label_detail,
+    completion_item_info::{
+        color_info_from_expr, color_info_from_type, gmod_constructor_literal_detail, is_color_type,
+        is_gmod_literal_constructor_type, scalar_literal_description, scalar_literal_detail,
+    },
+    get_completion_kind, get_completion_tags, get_description, get_detail, is_deprecated,
+    is_table_namespace_type,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -32,6 +39,16 @@ pub fn add_member_completion(
     member_info: LuaMemberInfo,
     status: CompletionTriggerStatus,
     overload_count: Option<usize>,
+) -> Option<()> {
+    add_member_completion_with_description_hint(builder, member_info, status, overload_count, None)
+}
+
+pub fn add_member_completion_with_description_hint(
+    builder: &mut CompletionBuilder,
+    member_info: LuaMemberInfo,
+    status: CompletionTriggerStatus,
+    overload_count: Option<usize>,
+    description_hint: Option<&str>,
 ) -> Option<()> {
     if builder.is_cancelled() {
         return None;
@@ -93,14 +110,30 @@ pub fn add_member_completion(
     let typ = &member_info.typ;
     let remove_nil_type =
         get_function_remove_nil(builder.semantic_model.get_db(), typ).unwrap_or(typ.clone());
-    if status == CompletionTriggerStatus::Colon && !remove_nil_type.is_function() {
+    if status == CompletionTriggerStatus::Colon && !is_completion_callable_type(&remove_nil_type) {
         return None;
     }
+    let (color, constructor_literal_detail) =
+        get_member_completion_literal_info(builder, property_owner, &remove_nil_type);
+    let completion_data_color = builder
+        .semantic_model
+        .get_emmyrc()
+        .document_color
+        .enable
+        .then(|| color.clone())
+        .flatten();
 
     // 附加数据, 用于在`resolve`时进一步处理
     let completion_data = if let Some(id) = &property_owner {
         if let Some(index) = member_info.overload_index {
             CompletionData::from_overload(builder, id.clone(), index, overload_count)
+        } else if let Some(color) = completion_data_color {
+            CompletionData::from_property_owner_id_with_color(
+                builder,
+                id.clone(),
+                overload_count,
+                color,
+            )
         } else {
             CompletionData::from_property_owner_id(builder, id.clone(), overload_count)
         }
@@ -112,38 +145,56 @@ pub fn add_member_completion(
         .unwrap_or(CallDisplay::None);
     let is_inferred_dynamic_member = property_owner.is_none();
     // 紧靠着 label 显示的描述
-    let detail = if is_inferred_dynamic_member {
+    let literal_detail = scalar_literal_detail(&remove_nil_type);
+    let detail = if let Some(color) = &color {
+        Some(color_label_detail(color))
+    } else if is_inferred_dynamic_member {
         None
     } else {
         get_detail(builder, &remove_nil_type, call_display)
+            .or(constructor_literal_detail)
+            .or(literal_detail)
     };
     // 在`detail`更右侧, 且不紧靠着`detail`显示
-    let description = if is_inferred_dynamic_member {
+    let description = if color.is_some() {
+        Some("Color".to_string())
+    } else if is_inferred_dynamic_member {
         None
     } else {
-        get_description(builder, &remove_nil_type)
+        scalar_literal_description(&remove_nil_type)
+            .or_else(|| get_description(builder, &remove_nil_type))
     };
+    let description = apply_description_hint(description, description_hint);
 
     let deprecated = property_owner
         .as_ref()
         .map(|id| is_deprecated(builder, id.clone()));
+    let tags = get_completion_tags(builder, deprecated);
+    let kind = if color.is_some() {
+        lsp_types::CompletionItemKind::COLOR
+    } else if is_inferred_dynamic_member {
+        lsp_types::CompletionItemKind::VARIABLE
+    } else {
+        get_member_completion_kind(
+            builder.semantic_model.get_db(),
+            property_owner,
+            &remove_nil_type,
+            status,
+        )
+    };
 
     let mut completion_item = CompletionItem {
         label: label.clone(),
-        kind: Some(if is_inferred_dynamic_member {
-            lsp_types::CompletionItemKind::VARIABLE
-        } else {
-            get_completion_kind(&remove_nil_type)
-        }),
+        kind: Some(kind),
         data: completion_data,
         label_details: Some(lsp_types::CompletionItemLabelDetails {
             detail,
             description,
         }),
         deprecated,
+        tags,
         ..Default::default()
     };
-
     if status == CompletionTriggerStatus::Dot
         && member_key.is_integer()
         && builder.trigger_token.kind() == LuaTokenKind::TkDot.into()
@@ -195,11 +246,88 @@ pub fn add_member_completion(
         &remove_nil_type,
         call_display,
         deprecated,
+        Some(kind),
         label,
         overload_count,
+        description_hint,
     );
 
     Some(())
+}
+
+fn apply_description_hint(
+    description: Option<String>,
+    description_hint: Option<&str>,
+) -> Option<String> {
+    let Some(hint) = description_hint else {
+        return description;
+    };
+
+    Some(match description {
+        Some(description) => format!("{hint} - {description}"),
+        None => hint.to_string(),
+    })
+}
+
+fn get_member_completion_literal_info(
+    builder: &CompletionBuilder,
+    property_owner: &Option<LuaSemanticDeclId>,
+    typ: &LuaType,
+) -> (Option<CompletionColorInfo>, Option<String>) {
+    let mut color = color_info_from_type(typ);
+    let should_inspect_color =
+        color.is_none() && (is_color_type(typ) || matches!(typ, LuaType::Unknown));
+    let should_inspect_constructor =
+        is_gmod_literal_constructor_type(typ) || matches!(typ, LuaType::Unknown);
+    if !should_inspect_color && !should_inspect_constructor {
+        return (color, None);
+    }
+
+    let Some(LuaSemanticDeclId::Member(member_id)) = property_owner.as_ref() else {
+        return (color, None);
+    };
+    let value_expr = get_member_value_expr(builder.semantic_model.get_db(), *member_id);
+    if should_inspect_color {
+        color = value_expr.as_ref().and_then(color_info_from_expr);
+    }
+
+    let constructor_literal_detail = if color.is_none() && should_inspect_constructor {
+        value_expr
+            .as_ref()
+            .and_then(gmod_constructor_literal_detail)
+    } else {
+        None
+    };
+
+    (color, constructor_literal_detail)
+}
+
+fn get_member_value_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+
+    if let Some(field) = LuaTableField::cast(node.clone()) {
+        return field.get_value_expr();
+    }
+
+    if let Some(index_expr) = LuaIndexExpr::cast(node) {
+        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
+            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+            let value_idx = vars
+                .iter()
+                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
+            return value_exprs.get(value_idx).cloned();
+        }
+
+        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
+            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
+        }
+    }
+
+    None
 }
 
 fn add_signature_overloads(
@@ -208,8 +336,10 @@ fn add_signature_overloads(
     typ: &LuaType,
     call_display: CallDisplay,
     deprecated: Option<bool>,
+    kind: Option<lsp_types::CompletionItemKind>,
     label: String,
     overload_count: Option<usize>,
+    description_hint: Option<&str>,
 ) -> Option<()> {
     let signature_id = match typ {
         LuaType::Signature(signature_id) => signature_id,
@@ -229,7 +359,8 @@ fn add_signature_overloads(
         .enumerate()
         .for_each(|(index, overload)| {
             let typ = LuaType::DocFunction(overload);
-            let description = get_description(builder, &typ);
+            let description =
+                apply_description_hint(get_description(builder, &typ), description_hint);
             let detail = get_detail(builder, &typ, call_display);
             let data = if let Some(id) = &property_owner {
                 CompletionData::from_overload(builder, id.clone(), index, overload_count)
@@ -238,19 +369,87 @@ fn add_signature_overloads(
             };
             let completion_item = CompletionItem {
                 label: label.clone(),
-                kind: Some(get_completion_kind(&typ)),
+                kind,
                 data,
                 label_details: Some(lsp_types::CompletionItemLabelDetails {
                     detail,
                     description,
                 }),
                 deprecated,
+                tags: get_completion_tags(builder, deprecated),
                 ..Default::default()
             };
 
             builder.add_completion_item(completion_item);
         });
     Some(())
+}
+
+fn get_member_completion_kind(
+    db: &DbIndex,
+    property_owner: &Option<LuaSemanticDeclId>,
+    typ: &LuaType,
+    status: CompletionTriggerStatus,
+) -> lsp_types::CompletionItemKind {
+    let type_kind = get_completion_kind(typ);
+    if type_kind != lsp_types::CompletionItemKind::FUNCTION {
+        if is_global_table_namespace_member(db, property_owner, typ) {
+            return lsp_types::CompletionItemKind::INTERFACE;
+        }
+
+        return match type_kind {
+            lsp_types::CompletionItemKind::CLASS
+            | lsp_types::CompletionItemKind::MODULE
+            | lsp_types::CompletionItemKind::STRUCT
+            | lsp_types::CompletionItemKind::TYPE_PARAMETER => type_kind,
+            _ => lsp_types::CompletionItemKind::FIELD,
+        };
+    }
+
+    if status == CompletionTriggerStatus::Colon || is_colon_defined_function(db, typ) {
+        lsp_types::CompletionItemKind::METHOD
+    } else {
+        type_kind
+    }
+}
+
+fn is_completion_callable_type(typ: &LuaType) -> bool {
+    typ.is_function() || get_completion_kind(typ) == lsp_types::CompletionItemKind::FUNCTION
+}
+
+fn is_global_table_namespace_member(
+    db: &DbIndex,
+    property_owner: &Option<LuaSemanticDeclId>,
+    typ: &LuaType,
+) -> bool {
+    if !is_table_namespace_type(typ) {
+        return false;
+    }
+
+    let Some(LuaSemanticDeclId::Member(member_id)) = property_owner else {
+        return false;
+    };
+
+    let member_index = db.get_member_index();
+    if let Some(LuaMemberOwner::GlobalPath(_)) = member_index.get_current_owner(member_id) {
+        return true;
+    }
+
+    member_index
+        .get_member(member_id)
+        .and_then(|member| member.get_global_id())
+        .is_some()
+}
+
+fn is_colon_defined_function(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Signature(signature_id) => db
+            .get_signature_index()
+            .get(signature_id)
+            .is_some_and(|signature| signature.is_colon_define),
+        LuaType::DocFunction(func) => func.is_colon_define(),
+        _ => false,
+    }
 }
 
 fn get_call_show(
@@ -382,6 +581,11 @@ fn try_add_alias_completion_item_new(
     let mut alias_completion_item = completion_item.clone();
     alias_completion_item.label = alias_label;
     alias_completion_item.insert_text = Some(label.clone());
+    alias_completion_item.filter_text = Some(format!(
+        "{} {}",
+        alias_completion_item.label.as_str(),
+        label.as_str()
+    ));
 
     // 更新 label_details 添加别名提示
     let index_hint = t!("completion.index %{label}", label = label).to_string();

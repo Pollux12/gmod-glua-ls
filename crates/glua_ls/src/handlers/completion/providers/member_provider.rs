@@ -11,7 +11,7 @@ use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
 use crate::handlers::completion::{
-    add_completions::{CompletionTriggerStatus, add_member_completion},
+    add_completions::{CompletionTriggerStatus, add_member_completion_with_description_hint},
     completion_builder::CompletionBuilder,
 };
 
@@ -64,9 +64,22 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         .get_member_info_map_at_offset(&prefix_type, builder.position_offset)
         .unwrap_or_default();
     extend_global_path_members(builder, &prefix_expr, &mut member_info_map);
-    extend_gmod_hook_fallback_members(builder, &prefix_expr, &prefix_type, &mut member_info_map);
+    let gmod_owner_name = gmod_hook_owner_name(&prefix_expr, &prefix_type);
+    let gmod_fallback_owner = if builder.semantic_model.get_emmyrc().gmod.enabled {
+        gmod_owner_name
+            .as_deref()
+            .and_then(gmod_hook_fallback_owner)
+    } else {
+        None
+    };
+    extend_gmod_hook_fallback_members(builder, gmod_fallback_owner, &mut member_info_map);
 
-    add_completions_for_members(builder, &member_info_map, completion_status)
+    add_completions_for_members_with_gmod_owner(
+        builder,
+        &member_info_map,
+        completion_status,
+        gmod_fallback_owner,
+    )
 }
 
 fn extend_global_path_members(
@@ -86,21 +99,11 @@ fn extend_global_path_members(
         return;
     };
 
-    let mut existing: HashMap<LuaMemberKey, HashSet<Option<LuaSemanticDeclId>>> = HashMap::new();
-    for (key, infos) in members.iter() {
-        let entry = existing.entry(key.clone()).or_default();
-        for info in infos {
-            entry.insert(info.property_owner_id.clone());
-        }
-    }
+    let mut existing = collect_member_identities(members);
 
     for (key, infos) in global_path_members {
-        let owners = existing.entry(key.clone()).or_default();
-        let target = members.entry(key).or_default();
         for info in infos {
-            if owners.insert(info.property_owner_id.clone()) {
-                target.push(info);
-            }
+            push_unique_member_info(members, &mut existing, key.clone(), info);
         }
     }
 }
@@ -148,40 +151,16 @@ fn expr_root_name(expr: &LuaExpr) -> Option<LuaNameExpr> {
 
 fn extend_gmod_hook_fallback_members(
     builder: &CompletionBuilder,
-    prefix_expr: &LuaExpr,
-    prefix_type: &LuaType,
+    fallback_owner: Option<GmodFallbackOwner<'_>>,
     members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) {
-    if !builder.semantic_model.get_emmyrc().gmod.enabled {
-        return;
-    }
-
-    let owner_name = match prefix_type {
-        LuaType::Ref(owner_type_decl_id) => Some(owner_type_decl_id.get_simple_name().to_string()),
-        _ => match prefix_expr {
-            LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
-            _ => None,
-        },
-    };
-
-    let Some(owner_name) = owner_name else {
+    let Some(fallback_owner) = fallback_owner else {
         return;
     };
 
-    let owner_candidates = gmod_hook_owner_candidates(owner_name.as_str());
-    if owner_candidates.is_empty() {
-        return;
-    }
+    let mut existing = collect_member_identities(members);
 
-    let mut existing: HashMap<LuaMemberKey, HashSet<Option<LuaSemanticDeclId>>> = HashMap::new();
-    for (key, infos) in members.iter() {
-        let entry = existing.entry(key.clone()).or_default();
-        for info in infos {
-            entry.insert(info.property_owner_id.clone());
-        }
-    }
-
-    for owner_candidate in owner_candidates {
+    for owner_candidate in fallback_owner.candidates {
         let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_candidate));
         let Some(fallback_map) = builder
             .semantic_model
@@ -191,14 +170,78 @@ fn extend_gmod_hook_fallback_members(
         };
 
         for (key, fallback_infos) in fallback_map {
-            let owners = existing.entry(key.clone()).or_default();
-            let target = members.entry(key).or_default();
             for info in fallback_infos {
-                if owners.insert(info.property_owner_id.clone()) {
-                    target.push(info);
-                }
+                push_unique_member_info(members, &mut existing, key.clone(), info);
             }
         }
+    }
+}
+
+type MemberIdentityMap = HashMap<LuaMemberKey, HashSet<MemberInfoIdentity>>;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MemberInfoIdentity {
+    property_owner_id: Option<LuaSemanticDeclId>,
+    overload_index: Option<usize>,
+}
+
+impl From<&LuaMemberInfo> for MemberInfoIdentity {
+    fn from(info: &LuaMemberInfo) -> Self {
+        Self {
+            property_owner_id: info.property_owner_id.clone(),
+            overload_index: info.overload_index,
+        }
+    }
+}
+
+fn collect_member_identities(
+    members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+) -> MemberIdentityMap {
+    let mut existing: MemberIdentityMap = HashMap::new();
+    for (key, infos) in members {
+        let entry = existing.entry(key.clone()).or_default();
+        entry.extend(infos.iter().map(MemberInfoIdentity::from));
+    }
+    existing
+}
+
+fn push_unique_member_info(
+    members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+    existing: &mut MemberIdentityMap,
+    key: LuaMemberKey,
+    info: LuaMemberInfo,
+) {
+    let identities = existing.entry(key.clone()).or_default();
+    if identities.insert(MemberInfoIdentity::from(&info)) {
+        members.entry(key).or_default().push(info);
+    }
+}
+
+fn gmod_hook_owner_name(prefix_expr: &LuaExpr, prefix_type: &LuaType) -> Option<String> {
+    match prefix_type {
+        LuaType::Ref(owner_type_decl_id) => Some(owner_type_decl_id.get_simple_name().to_string()),
+        _ => match prefix_expr {
+            LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+            _ => None,
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GmodFallbackOwner<'a> {
+    owner_name: &'a str,
+    candidates: &'static [&'static str],
+}
+
+fn gmod_hook_fallback_owner(owner_name: &str) -> Option<GmodFallbackOwner<'_>> {
+    let candidates = gmod_hook_owner_candidates(owner_name);
+    if candidates.is_empty() {
+        None
+    } else {
+        Some(GmodFallbackOwner {
+            owner_name,
+            candidates,
+        })
     }
 }
 
@@ -219,12 +262,26 @@ pub fn add_completions_for_members(
     members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
     completion_status: CompletionTriggerStatus,
 ) -> Option<()> {
+    add_completions_for_members_with_gmod_owner(builder, members, completion_status, None)
+}
+
+fn add_completions_for_members_with_gmod_owner(
+    builder: &mut CompletionBuilder,
+    members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+    completion_status: CompletionTriggerStatus,
+    gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
+) -> Option<()> {
     // 排序
     let mut sorted_entries: Vec<_> = members.iter().collect();
     sorted_entries.sort_unstable_by_key(|(name, _)| *name);
 
     for (_, member_infos) in sorted_entries {
-        add_resolve_member_infos(builder, member_infos, completion_status);
+        add_resolve_member_infos(
+            builder,
+            member_infos,
+            completion_status,
+            gmod_fallback_owner,
+        );
     }
 
     Some(())
@@ -234,6 +291,7 @@ fn add_resolve_member_infos(
     builder: &mut CompletionBuilder,
     member_infos: &Vec<LuaMemberInfo>,
     completion_status: CompletionTriggerStatus,
+    gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
 ) -> Option<()> {
     if member_infos.len() == 1 {
         let member_info = &member_infos[0];
@@ -257,11 +315,14 @@ fn add_resolve_member_infos(
             }
             _ => None,
         };
-        add_member_completion(
+        let description_hint =
+            gmod_fallback_description_hint(builder, gmod_fallback_owner, member_info);
+        add_member_completion_with_description_hint(
             builder,
             member_info.clone(),
             completion_status,
             overload_count,
+            description_hint.as_deref(),
         );
         return Some(());
     }
@@ -278,22 +339,28 @@ fn add_resolve_member_infos(
 
         match resolve_state {
             MemberResolveState::All => {
-                add_member_completion(
+                let description_hint =
+                    gmod_fallback_description_hint(builder, gmod_fallback_owner, member_info);
+                add_member_completion_with_description_hint(
                     builder,
                     member_info.clone(),
                     completion_status,
                     overload_count,
+                    description_hint.as_deref(),
                 );
             }
             MemberResolveState::Meta => {
                 if let Some(feature) = member_info.feature
                     && feature.is_meta_decl()
                 {
-                    add_member_completion(
+                    let description_hint =
+                        gmod_fallback_description_hint(builder, gmod_fallback_owner, member_info);
+                    add_member_completion_with_description_hint(
                         builder,
                         member_info.clone(),
                         completion_status,
                         overload_count,
+                        description_hint.as_deref(),
                     );
                 }
             }
@@ -301,11 +368,14 @@ fn add_resolve_member_infos(
                 if let Some(feature) = member_info.feature
                     && feature.is_file_decl()
                 {
-                    add_member_completion(
+                    let description_hint =
+                        gmod_fallback_description_hint(builder, gmod_fallback_owner, member_info);
+                    add_member_completion_with_description_hint(
                         builder,
                         member_info.clone(),
                         completion_status,
                         overload_count,
+                        description_hint.as_deref(),
                     );
                 }
             }
@@ -313,6 +383,26 @@ fn add_resolve_member_infos(
     }
 
     Some(())
+}
+
+fn gmod_fallback_description_hint(
+    builder: &CompletionBuilder,
+    fallback_owner: Option<GmodFallbackOwner<'_>>,
+    member_info: &LuaMemberInfo,
+) -> Option<String> {
+    let fallback_owner = fallback_owner?;
+    let source_owner = get_owner_type_id(builder.semantic_model.get_db(), member_info)?;
+    let source_owner_name = source_owner.get_simple_name();
+    if source_owner_name.eq_ignore_ascii_case(fallback_owner.owner_name)
+        || !fallback_owner
+            .candidates
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(source_owner_name))
+    {
+        return None;
+    }
+
+    Some(format!("from {source_owner_name}"))
 }
 
 /// 过滤成员信息，返回需要的成员列表和重载数量
@@ -574,5 +664,51 @@ fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
         "server" => Some(GmodRealm::Server),
         "shared" => Some(GmodRealm::Shared),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+
+    use super::*;
+
+    fn function_member(key: LuaMemberKey, overload_index: Option<usize>) -> LuaMemberInfo {
+        LuaMemberInfo {
+            property_owner_id: None,
+            key,
+            typ: LuaType::Function,
+            feature: None,
+            overload_index,
+        }
+    }
+
+    #[gtest]
+    fn push_unique_member_info_keeps_distinct_overload_indices() -> Result<()> {
+        let key = LuaMemberKey::Name("lookup".into());
+        let mut members = HashMap::new();
+        let mut existing = collect_member_identities(&members);
+
+        push_unique_member_info(
+            &mut members,
+            &mut existing,
+            key.clone(),
+            function_member(key.clone(), Some(0)),
+        );
+        push_unique_member_info(
+            &mut members,
+            &mut existing,
+            key.clone(),
+            function_member(key.clone(), Some(1)),
+        );
+        push_unique_member_info(
+            &mut members,
+            &mut existing,
+            key.clone(),
+            function_member(key.clone(), Some(1)),
+        );
+
+        let infos = members.get(&key).ok_or("missing member infos").or_fail()?;
+        verify_eq!(infos.len(), 2)
     }
 }

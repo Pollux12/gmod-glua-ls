@@ -6,7 +6,10 @@ use crate::{
     handlers::hover::{HoverBuilder, build_hover_content_for_completion},
 };
 
-use super::completion_data::{CompletionData, CompletionDataType};
+use super::{
+    add_completions::color_preview_documentation,
+    completion_data::{CompletionColorInfo, CompletionData, CompletionDataType},
+};
 
 pub fn resolve_completion(
     compilation: &LuaCompilation,
@@ -17,6 +20,7 @@ pub fn resolve_completion(
     client_id: ClientId,
 ) -> Option<()> {
     // todo: resolve completion
+    let color = completion_data.color.clone();
     match completion_data.typ {
         CompletionDataType::PropertyOwnerId(property_id) => {
             let hover_builder =
@@ -43,6 +47,9 @@ pub fn resolve_completion(
             }
         }
         _ => {}
+    }
+    if let Some(color) = color {
+        apply_color_completion_documentation(completion_item, &color);
     }
     Some(())
 }
@@ -186,4 +193,41 @@ fn build_other_completion_item(
         value: result,
     }));
     Some(())
+}
+
+fn apply_color_completion_documentation(
+    completion_item: &mut CompletionItem,
+    color: &CompletionColorInfo,
+) {
+    let preview_documentation = color_preview_documentation(color);
+
+    match completion_item.documentation.take() {
+        Some(Documentation::MarkupContent(mut markup)) => {
+            if !markup.value.contains(&preview_documentation) {
+                if !markup.value.trim().is_empty() {
+                    markup.value.push_str("\n\n");
+                }
+                markup.value.push_str(&preview_documentation);
+            }
+            completion_item.documentation = Some(Documentation::MarkupContent(markup));
+        }
+        Some(Documentation::String(mut text)) => {
+            if !text.contains(&preview_documentation) {
+                if !text.trim().is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&preview_documentation);
+            }
+            completion_item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: lsp_types::MarkupKind::Markdown,
+                value: text,
+            }));
+        }
+        None => {
+            completion_item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: lsp_types::MarkupKind::Markdown,
+                value: preview_documentation,
+            }));
+        }
+    }
 }
