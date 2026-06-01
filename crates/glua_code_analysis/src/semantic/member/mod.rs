@@ -145,8 +145,38 @@ fn merge_open_table_components(mut components: Vec<LuaType>) -> Option<LuaType> 
 fn is_open_table_merge_component(typ: &LuaType) -> bool {
     matches!(
         typ,
-        LuaType::Table | LuaType::TableConst(_) | LuaType::Object(_) | LuaType::MergedTable(_)
+        LuaType::Table
+            | LuaType::TableConst(_)
+            | LuaType::Object(_)
+            | LuaType::MergedTable(_)
+            | LuaType::TableOf(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::{DbIndex, LuaMemberKey, LuaObjectType, LuaType, LuaTypeDeclId};
+
+    use super::merge_open_table_types;
+
+    #[test]
+    fn merge_open_table_types_keeps_tableof_as_table_component() {
+        let db = DbIndex::new();
+        let table_of = LuaType::TableOf(Box::new(LuaType::Ref(LuaTypeDeclId::global("Entity"))));
+
+        let mut fields = HashMap::new();
+        fields.insert(LuaMemberKey::Name("flags".into()), LuaType::Table);
+        let object = LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into());
+
+        let merged = merge_open_table_types(&db, vec![table_of.clone(), object.clone()]);
+        let LuaType::MergedTable(merged_table) = merged else {
+            panic!("expected tableof and object fragments to merge as an open table");
+        };
+
+        assert_eq!(merged_table.get_types(), &[table_of, object]);
+    }
 }
 
 #[derive(Debug, Clone)]
