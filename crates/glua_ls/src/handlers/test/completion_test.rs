@@ -5,8 +5,8 @@ mod tests {
     };
     use googletest::prelude::*;
     use lsp_types::{
-        CompletionItemKind, CompletionResponse, CompletionTriggerKind, Documentation,
-        InsertTextFormat, MarkupContent,
+        CompletionItemKind, CompletionItemTag, CompletionResponse, CompletionTriggerKind,
+        Documentation, InsertTextFormat, MarkupContent,
     };
     use std::{
         fs,
@@ -15,7 +15,7 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    use crate::handlers::completion::completion;
+    use crate::handlers::completion::{completion, completion_with_deprecated_tag_support};
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualCompletionItem, check};
 
     #[gtest]
@@ -671,7 +671,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "box".to_string(),
-                kind: CompletionItemKind::VARIABLE,
+                kind: CompletionItemKind::STRUCT,
                 ..Default::default()
             }],
             CompletionTriggerKind::TRIGGER_CHARACTER,
@@ -1112,7 +1112,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "on_add".to_string(),
-                kind: CompletionItemKind::FUNCTION,
+                kind: CompletionItemKind::METHOD,
                 label_detail: Some("(a, b)".to_string()),
             }],
             CompletionTriggerKind::TRIGGER_CHARACTER,
@@ -1171,7 +1171,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "on_add".to_string(),
-                kind: CompletionItemKind::FUNCTION,
+                kind: CompletionItemKind::METHOD,
                 label_detail: Some("(owner)".to_string()),
             }],
             CompletionTriggerKind::TRIGGER_CHARACTER,
@@ -1407,7 +1407,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "nameX".to_string(),
-                kind: CompletionItemKind::CONSTANT,
+                kind: CompletionItemKind::FIELD,
                 label_detail: Some(" = 1".to_string()),
             }],
         ));
@@ -1437,12 +1437,12 @@ mod tests {
             vec![
                 VirtualCompletionItem {
                     label: "optional_num".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     ..Default::default()
                 },
                 VirtualCompletionItem {
                     label: "set".to_string(),
-                    kind: CompletionItemKind::FUNCTION,
+                    kind: CompletionItemKind::METHOD,
                     label_detail: Some("(self) -> nil".to_string()),
                 },
             ],
@@ -1518,7 +1518,7 @@ mod tests {
             vec![
                 VirtualCompletionItem {
                     label: "_abc".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
                 VirtualCompletionItem {
@@ -1665,7 +1665,7 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "foo".to_string(),
-                    kind: CompletionItemKind::CONSTANT,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: Some(" = 0".to_string()),
                 },
                 VirtualCompletionItem {
@@ -1753,7 +1753,7 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "x".to_string(),
-                    kind: CompletionItemKind::CONSTANT,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: Some(" = 1".to_string()),
                 },
             ],
@@ -1769,7 +1769,7 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "foo".to_string(),
-                    kind: CompletionItemKind::CONSTANT,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: Some(" = 1".to_string()),
                 },
             ],
@@ -1780,12 +1780,12 @@ mod tests {
             vec![
                 VirtualCompletionItem {
                     label: "[1]".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
                 VirtualCompletionItem {
                     label: "x".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
             ],
@@ -1828,12 +1828,12 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "x".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
                 VirtualCompletionItem {
                     label: "y".to_string(),
-                    kind: CompletionItemKind::CONSTANT,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: Some(" = 0".to_string()),
                 },
             ],
@@ -1862,7 +1862,7 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "x".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
                 VirtualCompletionItem {
@@ -1896,7 +1896,7 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "x".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
                 VirtualCompletionItem {
@@ -1930,12 +1930,12 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "x".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
                 VirtualCompletionItem {
                     label: "y".to_string(),
-                    kind: CompletionItemKind::FUNCTION,
+                    kind: CompletionItemKind::METHOD,
                     label_detail: Some("(self)".to_string()),
                 },
             ],
@@ -1964,12 +1964,12 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "x".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
                 VirtualCompletionItem {
                     label: "y".to_string(),
-                    kind: CompletionItemKind::CONSTANT,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: Some(" = 0".to_string()),
                 },
             ],
@@ -1998,7 +1998,7 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "x".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
                 VirtualCompletionItem {
@@ -2034,17 +2034,17 @@ mod tests {
                 },
                 VirtualCompletionItem {
                     label: "x".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: None,
                 },
                 VirtualCompletionItem {
                     label: "y".to_string(),
-                    kind: CompletionItemKind::CONSTANT,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: Some(" = 0".to_string()),
                 },
                 VirtualCompletionItem {
                     label: "init".to_string(),
-                    kind: CompletionItemKind::FUNCTION,
+                    kind: CompletionItemKind::METHOD,
                     label_detail: Some("(self) -> nil".to_string()),
                 },
             ],
@@ -2329,7 +2329,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "a".to_string(),
-                kind: CompletionItemKind::VARIABLE,
+                kind: CompletionItemKind::FIELD,
                 ..Default::default()
             },],
         ));
@@ -2464,7 +2464,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "negate".to_string(),
-                kind: CompletionItemKind::VARIABLE,
+                kind: CompletionItemKind::FIELD,
                 ..Default::default()
             },],
         ));
@@ -2487,7 +2487,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "a".to_string(),
-                kind: CompletionItemKind::VARIABLE,
+                kind: CompletionItemKind::FIELD,
                 ..Default::default()
             },],
         ));
@@ -2547,7 +2547,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "\"age\"".to_string(),
-                kind: CompletionItemKind::VARIABLE,
+                kind: CompletionItemKind::FIELD,
                 ..Default::default()
             },],
             CompletionTriggerKind::TRIGGER_CHARACTER
@@ -2575,12 +2575,12 @@ mod tests {
             vec![
                 VirtualCompletionItem {
                     label: "\"bar\"".to_string(),
-                    kind: CompletionItemKind::CONSTANT,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: Some(" = 2".to_string()),
                 },
                 VirtualCompletionItem {
                     label: "\"foo\"".to_string(),
-                    kind: CompletionItemKind::CONSTANT,
+                    kind: CompletionItemKind::FIELD,
                     label_detail: Some(" = 1".to_string()),
                 },
             ],
@@ -2615,7 +2615,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "toBe".to_string(),
-                kind: CompletionItemKind::FUNCTION,
+                kind: CompletionItemKind::METHOD,
                 label_detail: Some("()".to_string()),
             },],
             CompletionTriggerKind::TRIGGER_CHARACTER
@@ -3683,7 +3683,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "ClientOnlyMethod".to_string(),
-                kind: CompletionItemKind::FUNCTION,
+                kind: CompletionItemKind::METHOD,
                 label_detail: Some("()".to_string()),
             }],
         ));
@@ -3716,7 +3716,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "AnnotatedClientMethod".to_string(),
-                kind: CompletionItemKind::FUNCTION,
+                kind: CompletionItemKind::METHOD,
                 label_detail: Some("()".to_string()),
             }],
         ));
@@ -4021,7 +4021,7 @@ mod tests {
             .ok_or("missing ZzzPluginHook completion")
             .or_fail()?;
 
-        verify_eq!(item.kind, Some(CompletionItemKind::FUNCTION))?;
+        verify_eq!(item.kind, Some(CompletionItemKind::METHOD))?;
         let item_detail = item
             .label_details
             .as_ref()
@@ -4157,6 +4157,307 @@ mod tests {
             item.data.as_ref().and_then(|data| data.get("color")),
             none()
         )?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_deprecated_completion_uses_completion_item_tag() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@deprecated use new_api
+                function old_api() end
+
+                old<??>
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .into_iter()
+            .find(|item| item.label == "old_api")
+            .ok_or("missing old_api completion")
+            .or_fail()?;
+
+        verify_eq!(item.deprecated, Some(true))?;
+        verify_eq!(item.tags, Some(vec![CompletionItemTag::DEPRECATED]))?;
+
+        let result = completion_with_deprecated_tag_support(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+            false,
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .into_iter()
+            .find(|item| item.label == "old_api")
+            .ok_or("missing old_api completion")
+            .or_fail()?;
+
+        verify_eq!(item.deprecated, Some(true))?;
+        verify_eq!(item.tags, None)?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_member_completion_uses_method_and_property_kinds() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Panel
+                local PANEL = {}
+                PANEL.Title = "Scoreboard"
+                function PANEL:Paint(w, h) end
+
+                PANEL.<??>
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let paint = items
+            .iter()
+            .find(|item| item.label == "Paint")
+            .ok_or("missing Paint completion")
+            .or_fail()?;
+        verify_eq!(paint.kind, Some(CompletionItemKind::METHOD))?;
+        verify_that!(
+            paint
+                .label_details
+                .as_ref()
+                .and_then(|details| details.detail.as_ref()),
+            some(eq("(self, w, h)"))
+        )?;
+
+        let title = items
+            .iter()
+            .find(|item| item.label == "Title")
+            .ok_or("missing Title completion")
+            .or_fail()?;
+        verify_eq!(title.kind, Some(CompletionItemKind::FIELD))?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_callable_union_member_completion_keeps_callable_kinds() -> Result<()> {
+        fn completion_kind(source: &str, label: &str) -> Result<Option<CompletionItemKind>> {
+            let mut ws = ProviderVirtualWorkspace::new();
+            let (content, position) = ProviderVirtualWorkspace::handle_file_content(source)?;
+            let file_id = ws.def(&content);
+            let result = completion(
+                &ws.analysis,
+                file_id,
+                position,
+                CompletionTriggerKind::INVOKED,
+                CancellationToken::new(),
+            )
+            .ok_or("failed to get completion")
+            .or_fail()?;
+            let items = match result {
+                CompletionResponse::Array(items) => items,
+                CompletionResponse::List(list) => list.items,
+            };
+
+            Ok(items
+                .into_iter()
+                .find(|item| item.label == label)
+                .and_then(|item| item.kind))
+        }
+
+        verify_eq!(
+            completion_kind(
+                r#"
+                ---@class Panel
+                ---@field Callback fun(self: Panel)|fun(self: Panel, value: number)
+                ---@type Panel
+                local panel
+
+                panel.<??>
+            "#,
+                "Callback"
+            )?,
+            Some(CompletionItemKind::FUNCTION)
+        )?;
+
+        verify_eq!(
+            completion_kind(
+                r#"
+                ---@class Panel
+                ---@field Callback fun(self: Panel)|fun(self: Panel, value: number)
+                ---@type Panel
+                local panel
+
+                panel:<??>
+            "#,
+                "Callback"
+            )?,
+            Some(CompletionItemKind::METHOD)
+        )?;
+
+        verify_eq!(
+            completion_kind(
+                r#"
+                ---@class Panel
+                ---@field Callback { value: number } & fun(self: Panel)
+                ---@type Panel
+                local panel
+
+                panel:<??>
+            "#,
+                "Callback"
+            )?,
+            Some(CompletionItemKind::METHOD)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_completion_kinds_use_richer_type_mapping() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        check!(ws.check_completion(
+            r#"
+                local scoreboard = {}
+                scoreb<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "scoreboard".to_string(),
+                kind: CompletionItemKind::STRUCT,
+                ..Default::default()
+            }],
+        ));
+
+        check!(ws.check_completion(
+            r#"
+                ---@type number
+                local player_count
+                player_c<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "player_count".to_string(),
+                kind: CompletionItemKind::VALUE,
+                ..Default::default()
+            }],
+        ));
+
+        check!(ws.check_completion(
+            r#"
+                ---@type never
+                local no_value
+                no_v<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "no_value".to_string(),
+                kind: CompletionItemKind::UNIT,
+                ..Default::default()
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_global_table_namespace_completion_kinds() -> Result<()> {
+        fn completion_kind(source: &str, label: &str) -> Result<Option<CompletionItemKind>> {
+            let mut ws = ProviderVirtualWorkspace::new();
+            let (content, position) = ProviderVirtualWorkspace::handle_file_content(source)?;
+            let file_id = ws.def(&content);
+            let result = completion(
+                &ws.analysis,
+                file_id,
+                position,
+                CompletionTriggerKind::INVOKED,
+                CancellationToken::new(),
+            )
+            .ok_or("failed to get completion")
+            .or_fail()?;
+            let items = match result {
+                CompletionResponse::Array(items) => items,
+                CompletionResponse::List(list) => list.items,
+            };
+
+            Ok(items
+                .into_iter()
+                .find(|item| item.label == label)
+                .and_then(|item| item.kind))
+        }
+
+        verify_eq!(
+            completion_kind(
+                r#"
+                ix = ix or {}
+                ix.character = ix.character or {}
+                function ix.character.get(id) end
+
+                i<??>
+            "#,
+                "ix"
+            )?,
+            Some(CompletionItemKind::CLASS)
+        )?;
+
+        verify_eq!(
+            completion_kind(
+                r#"
+                ix = ix or {}
+                ix.character = ix.character or {}
+                function ix.character.get(id) end
+
+                ix.<??>
+            "#,
+                "character"
+            )?,
+            Some(CompletionItemKind::INTERFACE)
+        )?;
+
+        verify_eq!(
+            completion_kind(
+                r#"
+                ix = ix or {}
+                ix.character = ix.character or {}
+                function ix.character.get(id) end
+
+                ix.character.<??>
+            "#,
+                "get"
+            )?,
+            Some(CompletionItemKind::FUNCTION)
+        )?;
+
         Ok(())
     }
 
@@ -4364,7 +4665,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "SPAWN_POS".to_string(),
-                kind: CompletionItemKind::VARIABLE,
+                kind: CompletionItemKind::STRUCT,
                 label_detail: Some(" = Vector(-200, 0, 50)".to_string()),
             }],
         ));
@@ -4380,7 +4681,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "CAMERA_ANGLE".to_string(),
-                kind: CompletionItemKind::VARIABLE,
+                kind: CompletionItemKind::STRUCT,
                 label_detail: Some(" = Angle(10.5, 180, 0)".to_string()),
             }],
         ));
@@ -4411,12 +4712,12 @@ mod tests {
             vec![
                 VirtualCompletionItem {
                     label: "CameraOffset".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::STRUCT,
                     label_detail: Some(" = Vector(-200, 0, 50)".to_string()),
                 },
                 VirtualCompletionItem {
                     label: "SpawnAngle".to_string(),
-                    kind: CompletionItemKind::VARIABLE,
+                    kind: CompletionItemKind::STRUCT,
                     label_detail: Some(" = Angle(0, 180, 0)".to_string()),
                 },
             ],
@@ -4441,7 +4742,7 @@ mod tests {
             "#,
             vec![VirtualCompletionItem {
                 label: "DYNAMIC_POS".to_string(),
-                kind: CompletionItemKind::VARIABLE,
+                kind: CompletionItemKind::STRUCT,
                 label_detail: None,
             }],
         ));

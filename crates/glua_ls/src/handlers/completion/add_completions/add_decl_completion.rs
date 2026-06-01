@@ -14,7 +14,7 @@ use super::{
         color_info_from_expr, color_info_from_type, gmod_constructor_literal_detail, is_color_type,
         is_gmod_literal_constructor_type, scalar_literal_description, scalar_literal_detail,
     },
-    get_completion_kind, get_description, get_detail, is_deprecated,
+    get_completion_tags, get_decl_completion_kind, get_description, get_detail, is_deprecated,
 };
 
 pub fn add_decl_completion(
@@ -43,7 +43,7 @@ pub fn add_decl_completion(
         kind: Some(if color.is_some() {
             lsp_types::CompletionItemKind::COLOR
         } else {
-            get_completion_kind(typ)
+            get_decl_completion_kind(builder, decl_id, typ)
         }),
         data: match completion_data_color {
             Some(color) => CompletionData::from_property_owner_id_with_color(
@@ -69,8 +69,10 @@ pub fn add_decl_completion(
         }),
         ..Default::default()
     };
-    if is_deprecated(builder, property_owner.clone()) {
+    let deprecated = is_deprecated(builder, property_owner.clone());
+    if deprecated {
         completion_item.deprecated = Some(true);
+        completion_item.tags = get_completion_tags(builder, Some(true));
     }
 
     if builder.support_snippets(typ) {
