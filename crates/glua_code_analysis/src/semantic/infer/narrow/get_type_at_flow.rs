@@ -327,6 +327,17 @@ fn get_type_at_flow_walk(
                 };
 
                 if ref_id == *var_ref_id {
+                    if matches!(var_ref_id, VarRefId::VarRef(_)) {
+                        let Some(closure) = func_stat.get_closure() else {
+                            return Err(InferFailReason::None);
+                        };
+
+                        return Ok(LuaType::Signature(LuaSignatureId::from_closure(
+                            cache.get_file_id(),
+                            &closure,
+                        )));
+                    }
+
                     // Only use the func-stat's signature when the member isn't
                     // already declared (origin type is Nil). For Def types with
                     // @field annotations, let the flow continue so the declared

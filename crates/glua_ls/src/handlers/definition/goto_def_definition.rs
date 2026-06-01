@@ -2,11 +2,12 @@ use std::str::FromStr;
 
 use glua_code_analysis::{
     LuaCompilation, LuaDeclId, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
+    LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
 };
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaReturnStat, LuaStringToken,
-    LuaSyntaxKind, LuaSyntaxToken, LuaTableExpr, LuaTableField,
+    LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat,
+    LuaReturnStat, LuaStringToken, LuaSyntaxKind, LuaSyntaxToken, LuaTableExpr, LuaTableField,
+    LuaVarExpr,
 };
 use itertools::Itertools;
 use lsp_types::{GotoDefinitionResponse, Location, Position, Range, Uri};
@@ -67,9 +68,23 @@ fn handle_decl_definition(
         find_function_call_origin(semantic_model, compilation, trigger_token, property_owner)
         && let LuaSemanticDeclId::LuaDecl(matched_decl_id) = match_semantic_decl
     {
+        if let Some(signature_id) = trigger_token_signature_id(semantic_model, trigger_token)
+            && signature_id.get_file_id() == decl_id.file_id
+            && let Some(location) = get_signature_definition_location(semantic_model, &signature_id)
+        {
+            return Some(GotoDefinitionResponse::Scalar(location));
+        }
+
         if let Some(location) = get_decl_location(semantic_model, &matched_decl_id) {
             return Some(GotoDefinitionResponse::Scalar(location));
         }
+    }
+
+    if let Some(signature_id) = trigger_token_signature_id(semantic_model, trigger_token)
+        && signature_id.get_file_id() == decl_id.file_id
+        && let Some(location) = get_signature_definition_location(semantic_model, &signature_id)
+    {
+        return Some(GotoDefinitionResponse::Scalar(location));
     }
 
     // 返回声明的位置
@@ -85,6 +100,54 @@ fn handle_decl_definition(
         && let Some(location) = get_decl_location(semantic_model, &decl_id)
     {
         return Some(GotoDefinitionResponse::Scalar(location));
+    }
+
+    None
+}
+
+fn trigger_token_signature_id(
+    semantic_model: &SemanticModel,
+    trigger_token: &LuaSyntaxToken,
+) -> Option<LuaSignatureId> {
+    match semantic_model
+        .get_semantic_info(trigger_token.clone().into())?
+        .typ
+    {
+        LuaType::Signature(signature_id) => Some(signature_id),
+        _ => None,
+    }
+}
+
+fn get_signature_definition_location(
+    semantic_model: &SemanticModel,
+    signature_id: &LuaSignatureId,
+) -> Option<Location> {
+    let root = semantic_model.get_root_by_file_id(signature_id.get_file_id())?;
+    let token = match root.syntax().token_at_offset(signature_id.get_position()) {
+        rowan::TokenAtOffset::Single(token) => token,
+        rowan::TokenAtOffset::Between(left, _) => left,
+        rowan::TokenAtOffset::None => return None,
+    };
+
+    for ancestor in token.parent_ancestors() {
+        if let Some(func_stat) = LuaFuncStat::cast(ancestor.clone()) {
+            let func_name = func_stat.get_func_name()?;
+            let range = match func_name {
+                LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_token()?.get_range(),
+                LuaVarExpr::IndexExpr(index_expr) => index_expr
+                    .get_index_name_token()
+                    .map(|token| token.text_range())
+                    .unwrap_or_else(|| index_expr.get_range()),
+            };
+            let document = semantic_model.get_document_by_file_id(signature_id.get_file_id())?;
+            return document.to_lsp_location(range);
+        }
+
+        if let Some(local_func_stat) = LuaLocalFuncStat::cast(ancestor) {
+            let local_name = local_func_stat.get_local_name()?;
+            let document = semantic_model.get_document_by_file_id(signature_id.get_file_id())?;
+            return document.to_lsp_location(local_name.get_range());
+        }
     }
 
     None

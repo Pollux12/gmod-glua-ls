@@ -2,9 +2,10 @@
 mod tests {
     use std::collections::HashSet;
 
-    use crate::handlers::references::references;
+    use crate::handlers::references::{references, search_decl_usages};
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualLocation, check};
-    use glua_code_analysis::Emmyrc;
+    use glua_code_analysis::{Emmyrc, LuaDeclId};
+    use glua_parser::{LuaAstNode, LuaLocalFuncStat, LuaLocalName};
     use googletest::prelude::*;
     use tokio_util::sync::CancellationToken;
 
@@ -109,6 +110,90 @@ mod tests {
                 },
             ]
         ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_decl_usages_excludes_forward_declaration_and_function_definition() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+                local create_initial_simplex4
+
+                function create_initial_simplex4(points, thread_yield)
+                    return { points, thread_yield }
+                end
+
+                local faces = create_initial_simplex4({}, nil)
+            "#,
+        );
+        let semantic_model = check!(ws.analysis.compilation.get_semantic_model(file_id));
+        let local_name = check!(
+            semantic_model
+                .get_root()
+                .descendants::<LuaLocalName>()
+                .next()
+        );
+        let decl_id = LuaDeclId::new(file_id, local_name.get_position());
+
+        let mut results = Vec::new();
+        check!(search_decl_usages(
+            &ws.analysis.compilation,
+            decl_id,
+            &mut results,
+            &CancellationToken::new()
+        ));
+
+        assert_that!(results.len(), eq(1));
+        assert_that!(results[0].range.start.line, eq(7));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_decl_usages_traverses_module_alias_without_counting_alias_binding() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let module_file_id = ws.def_file(
+            "a.lua",
+            r#"
+                local function init()
+                end
+
+                return init
+            "#,
+        );
+        ws.def_file(
+            "consumer.lua",
+            r#"
+                local init = require("a")
+                init()
+            "#,
+        );
+        let semantic_model = check!(ws.analysis.compilation.get_semantic_model(module_file_id));
+        let local_func = check!(
+            semantic_model
+                .get_root()
+                .descendants::<LuaLocalFuncStat>()
+                .next()
+        );
+        let local_name = check!(local_func.get_local_name());
+        let decl_id = LuaDeclId::new(module_file_id, local_name.get_position());
+
+        let mut results = Vec::new();
+        check!(search_decl_usages(
+            &ws.analysis.compilation,
+            decl_id,
+            &mut results,
+            &CancellationToken::new()
+        ));
+
+        let consumer_lines = results
+            .iter()
+            .filter(|location| location.uri.to_string().contains("consumer.lua"))
+            .map(|location| location.range.start.line)
+            .collect::<HashSet<_>>();
+
+        assert_that!(consumer_lines.contains(&2), eq(true));
+        assert_that!(consumer_lines.contains(&1), eq(false));
         Ok(())
     }
 
