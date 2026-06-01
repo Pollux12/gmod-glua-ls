@@ -25,6 +25,7 @@ struct ReferenceSearchContext {
     visited_module_exports: HashSet<FileId>,
     visited_semantic_ids: HashSet<LuaSemanticDeclId>,
     include_declaration: bool,
+    include_write_references: bool,
     /// Tracks whether we are still processing the starting symbol (vs secondary
     /// symbols enqueued from the worklist).  Used to honour LSP
     /// `includeDeclaration` semantics: only the starting symbol's own
@@ -111,6 +112,7 @@ pub fn search_decl_references_with_token(
 ) -> Option<()> {
     let mut ctx = ReferenceSearchContext {
         include_declaration,
+        include_write_references: true,
         is_starting_symbol: true,
         ..Default::default()
     };
@@ -157,6 +159,30 @@ pub fn search_decl_references(
 ) -> Option<()> {
     let mut ctx = ReferenceSearchContext {
         include_declaration,
+        include_write_references: true,
+        is_starting_symbol: true,
+        ..Default::default()
+    };
+    let mut semantic_cache = HashMap::new();
+    search_semantic_references_with_ctx(
+        &mut ctx,
+        compilation,
+        &mut semantic_cache,
+        LuaSemanticDeclId::LuaDecl(decl_id),
+        result,
+        cancel_token,
+    )
+}
+
+pub fn search_decl_usages(
+    compilation: &LuaCompilation,
+    decl_id: LuaDeclId,
+    result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
+) -> Option<()> {
+    let mut ctx = ReferenceSearchContext {
+        include_declaration: false,
+        include_write_references: false,
         is_starting_symbol: true,
         ..Default::default()
     };
@@ -191,8 +217,8 @@ fn search_decl_references_with_ctx<'a>(
             .get_decl_references(&decl_id.file_id, &decl_id)?;
         let document = semantic_model.get_document();
         // 加入自己 (only for the starting symbol when include_declaration is true,
-        // or always for secondary symbols from the worklist)
-        if ctx.include_declaration || !ctx.is_starting_symbol {
+        // or for secondary symbols when write/reference locations are requested)
+        if ctx.include_declaration || (!ctx.is_starting_symbol && ctx.include_write_references) {
             if let Some(location) = document.to_lsp_location(decl.get_range()) {
                 result.push(location);
             }
@@ -208,11 +234,14 @@ fn search_decl_references_with_ctx<'a>(
         );
 
         for decl_ref in &decl_refs.cells {
-            let location = document.to_lsp_location(decl_ref.range)?;
-            result.push(location);
             if should_follow_value_alias {
                 let _ = enqueue_value_alias_references(ctx, semantic_model, decl_ref, worklist);
             }
+            if !ctx.include_write_references && decl_ref.is_write {
+                continue;
+            }
+            let location = document.to_lsp_location(decl_ref.range)?;
+            result.push(location);
         }
 
         let _ = extend_module_return_value_references(
@@ -273,6 +302,7 @@ pub fn search_member_references(
 ) -> Option<()> {
     let mut ctx = ReferenceSearchContext {
         include_declaration,
+        include_write_references: true,
         is_starting_symbol: true,
         ..Default::default()
     };
@@ -372,7 +402,9 @@ fn search_member_references_with_ctx<'a>(
 
     // If include_declaration is true (or secondary symbol) and the declaration
     // was not found in the reference loop, add it now.
-    if !decl_found_in_loop && (ctx.include_declaration || !ctx.is_starting_symbol) {
+    if !decl_found_in_loop
+        && (ctx.include_declaration || (!ctx.is_starting_symbol && ctx.include_write_references))
+    {
         if let Some(loc) = decl_location {
             result.push(loc);
         }
@@ -399,9 +431,11 @@ fn search_member_secondary_references(
             let var = vars.get(idx)?;
             let decl_id = LuaDeclId::new(semantic_model.get_file_id(), var.get_position());
             enqueue_semantic_id(ctx, worklist, LuaSemanticDeclId::LuaDecl(decl_id));
-            let document = semantic_model.get_document();
-            let range = document.to_lsp_location(var.get_range())?;
-            result.push(range);
+            if ctx.include_write_references {
+                let document = semantic_model.get_document();
+                let range = document.to_lsp_location(var.get_range())?;
+                result.push(range);
+            }
         }
         LuaAst::LuaLocalStat(local_stat) => {
             let local_names = local_stat.get_local_name_list().collect::<Vec<_>>();
@@ -410,9 +444,11 @@ fn search_member_secondary_references(
             let name = local_names.get(idx)?;
             let decl_id = LuaDeclId::new(semantic_model.get_file_id(), name.get_position());
             enqueue_semantic_id(ctx, worklist, LuaSemanticDeclId::LuaDecl(decl_id));
-            let document = semantic_model.get_document();
-            let range = document.to_lsp_location(name.get_range())?;
-            result.push(range);
+            if ctx.include_write_references {
+                let document = semantic_model.get_document();
+                let range = document.to_lsp_location(name.get_range())?;
+                result.push(range);
+            }
         }
         _ => {}
     }
@@ -944,9 +980,9 @@ fn search_semantic_references_with_ctx<'a>(
             _ => Some(()),
         };
 
-        // After the first iteration, we are no longer processing the
-        // starting symbol, so secondary symbol declarations are always
-        // included regardless of include_declaration.
+        // After the first iteration, we are no longer processing the starting
+        // symbol. Broad reference searches include secondary declarations;
+        // usage searches still traverse them but omit declaration/write ranges.
         if ctx.is_starting_symbol {
             ctx.is_starting_symbol = false;
             start_ret = ret;
