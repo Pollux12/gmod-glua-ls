@@ -66,7 +66,9 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
             | LuaType::Array(_)
             | LuaType::Tuple(_)
             | LuaType::Generic(_)
+            | LuaType::MergedTable(_)
             | LuaType::Object(_)
+            | LuaType::TableOf(_)
             | LuaType::TableGeneric(_) => return None,
             LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
                 let type_decl = db.get_type_index().get_type_decl(type_decl_id)?;

@@ -5,6 +5,8 @@ mod object_type_check;
 mod table_generic_check;
 mod tuple_type_check;
 
+use std::collections::HashMap;
+
 use array_type_check::check_array_type_compact;
 use call_type_check::check_call_type_compact;
 use intersection_type_check::check_intersection_type_compact;
@@ -13,8 +15,8 @@ use table_generic_check::check_table_generic_type_compact;
 use tuple_type_check::check_tuple_type_compact;
 
 use crate::{
-    LuaType, LuaUnionType, TypeSubstitutor,
-    semantic::type_check::type_check_context::TypeCheckContext,
+    LuaObjectType, LuaType, LuaUnionType, TypeSubstitutor,
+    semantic::{member::find_members, type_check::type_check_context::TypeCheckContext},
 };
 
 use super::{
@@ -71,6 +73,12 @@ pub fn check_complex_type_compact(
         }
         LuaType::Object(source_object) => {
             match check_object_type_compact(context, source_object, compact_type, check_guard) {
+                Err(TypeCheckFailReason::DonotCheck) => {}
+                result => return result,
+            }
+        }
+        LuaType::MergedTable(_) => {
+            match check_merged_table_type_compact(context, source, compact_type, check_guard) {
                 Err(TypeCheckFailReason::DonotCheck) => {}
                 result => return result,
             }
@@ -156,6 +164,66 @@ pub fn check_complex_type_compact(
     }
 
     Err(TypeCheckFailReason::TypeNotMatch)
+}
+
+fn check_merged_table_type_compact(
+    context: &mut TypeCheckContext,
+    source: &LuaType,
+    compact_type: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    if matches!(compact_type, LuaType::Any | LuaType::Table) {
+        return Ok(());
+    }
+
+    let Some(object) = structural_object_from_members(context, source) else {
+        return Err(TypeCheckFailReason::DonotCheck);
+    };
+
+    if matches!(compact_type, LuaType::MergedTable(_))
+        && let Some(compact_object) = structural_object_from_members(context, compact_type)
+    {
+        return check_general_type_compact(
+            context,
+            &object,
+            &compact_object,
+            check_guard.next_level()?,
+        );
+    }
+
+    check_general_type_compact(context, &object, compact_type, check_guard.next_level()?)
+}
+
+fn structural_object_from_members(context: &TypeCheckContext, typ: &LuaType) -> Option<LuaType> {
+    let members = find_members(context.db, typ).unwrap_or_default();
+    let fields: HashMap<_, _> = members
+        .into_iter()
+        .map(|member| (member.key, member.typ))
+        .collect();
+    let mut index_access = Vec::new();
+    collect_index_access_from_type(typ, &mut index_access);
+    if fields.is_empty() && index_access.is_empty() {
+        return None;
+    }
+
+    Some(LuaType::Object(
+        LuaObjectType::new_with_fields(fields, index_access).into(),
+    ))
+}
+
+fn collect_index_access_from_type(typ: &LuaType, index_access: &mut Vec<(LuaType, LuaType)>) {
+    match typ {
+        LuaType::Object(object) => {
+            index_access.extend(object.get_index_access().iter().cloned());
+        }
+        LuaType::MergedTable(merged_table) => {
+            for component in merged_table.get_types() {
+                collect_index_access_from_type(component, index_access);
+            }
+        }
+        LuaType::TableOf(inner) => collect_index_access_from_type(inner, index_access),
+        _ => {}
+    }
 }
 
 // too complex

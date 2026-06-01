@@ -233,6 +233,7 @@ fn check_general_type_compact(
         LuaType::Array(_)
         | LuaType::Tuple(_)
         | LuaType::Object(_)
+        | LuaType::MergedTable(_)
         | LuaType::Union(_)
         | LuaType::Intersection(_)
         | LuaType::TableGeneric(_)

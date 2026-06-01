@@ -36,6 +36,7 @@ pub fn check_simple_type_compact(
                     | LuaType::Object(_)
                     | LuaType::Ref(_)
                     | LuaType::Def(_)
+                    | LuaType::MergedTable(_)
                     | LuaType::TableGeneric(_)
                     | LuaType::Generic(_)
                     | LuaType::Global

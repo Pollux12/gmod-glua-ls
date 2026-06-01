@@ -46,6 +46,7 @@ pub enum LuaType {
     Object(Arc<LuaObjectType>),
     Union(Arc<LuaUnionType>),
     Intersection(Arc<LuaIntersectionType>),
+    MergedTable(Arc<LuaMergedTableType>),
     Generic(Arc<LuaGenericType>),
     TableGeneric(Arc<Vec<LuaType>>),
     TplRef(Arc<GenericTpl>),
@@ -104,6 +105,7 @@ impl PartialEq for LuaType {
             (LuaType::Object(a), LuaType::Object(b)) => a == b,
             (LuaType::Union(a), LuaType::Union(b)) => a == b,
             (LuaType::Intersection(a), LuaType::Intersection(b)) => a == b,
+            (LuaType::MergedTable(a), LuaType::MergedTable(b)) => a == b,
             (LuaType::Generic(a), LuaType::Generic(b)) => a == b,
             (LuaType::TableGeneric(a), LuaType::TableGeneric(b)) => a == b,
             (LuaType::TplRef(a), LuaType::TplRef(b)) => a == b,
@@ -173,6 +175,7 @@ impl Hash for LuaType {
                 let ptr = Arc::as_ptr(a);
                 (29, ptr).hash(state)
             }
+            LuaType::MergedTable(a) => (54, a).hash(state),
             LuaType::Generic(a) => {
                 let ptr = Arc::as_ptr(a);
                 (30, ptr).hash(state)
@@ -249,6 +252,7 @@ impl LuaType {
             LuaType::Table
                 | LuaType::TableGeneric(_)
                 | LuaType::TableConst(_)
+                | LuaType::MergedTable(_)
                 | LuaType::Global
                 | LuaType::Tuple(_)
                 | LuaType::Array(_)
@@ -440,6 +444,7 @@ impl LuaType {
             LuaType::Object(base) => base.contain_tpl(),
             LuaType::Union(base) => base.contain_tpl(),
             LuaType::Intersection(base) => base.contain_tpl(),
+            LuaType::MergedTable(base) => base.contain_tpl(),
             LuaType::Generic(base) => base.contain_tpl(),
             LuaType::Variadic(multi) => multi.contain_tpl(),
             LuaType::TableGeneric(params) => params.iter().any(|p| p.contain_tpl()),
@@ -532,6 +537,7 @@ impl TypeVisitTrait for LuaType {
             LuaType::Object(base) => base.visit_type(f),
             LuaType::Union(base) => base.visit_type(f),
             LuaType::Intersection(base) => base.visit_type(f),
+            LuaType::MergedTable(base) => base.visit_type(f),
             LuaType::Generic(base) => base.visit_type(f),
             LuaType::Variadic(multi) => multi.visit_type(f),
             LuaType::TableGeneric(params) => {
@@ -1096,6 +1102,42 @@ impl LuaIntersectionType {
 impl From<LuaIntersectionType> for LuaType {
     fn from(t: LuaIntersectionType) -> Self {
         LuaType::Intersection(t.into())
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct LuaMergedTableType {
+    types: Vec<LuaType>,
+}
+
+impl TypeVisitTrait for LuaMergedTableType {
+    fn visit_type<F>(&self, f: &mut F)
+    where
+        F: FnMut(&LuaType),
+    {
+        for ty in &self.types {
+            ty.visit_type(f);
+        }
+    }
+}
+
+impl LuaMergedTableType {
+    pub fn new(types: Vec<LuaType>) -> Self {
+        Self { types }
+    }
+
+    pub fn get_types(&self) -> &[LuaType] {
+        &self.types
+    }
+
+    pub fn contain_tpl(&self) -> bool {
+        self.types.iter().any(|t| t.contain_tpl())
+    }
+}
+
+impl From<LuaMergedTableType> for LuaType {
+    fn from(t: LuaMergedTableType) -> Self {
+        LuaType::MergedTable(t.into())
     }
 }
 
@@ -1705,24 +1747,25 @@ fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
         LuaType::Object(_) => 29,
         LuaType::Union(_) => 30,
         LuaType::Intersection(_) => 31,
-        LuaType::Generic(_) => 32,
-        LuaType::TableGeneric(_) => 33,
-        LuaType::TplRef(_) => 34,
-        LuaType::StrTplRef(_) => 35,
-        LuaType::Variadic(_) => 36,
-        LuaType::Signature(_) => 37,
-        LuaType::Instance(_) => 38,
-        LuaType::Namespace(_) => 39,
-        LuaType::Call(_) => 40,
-        LuaType::MultiLineUnion(_) => 41,
-        LuaType::TypeGuard(_) => 42,
-        LuaType::ConstTplRef(_) => 43,
-        LuaType::Language(_) => 44,
-        LuaType::ModuleRef(_) => 45,
-        LuaType::DocAttribute(_) => 46,
-        LuaType::Conditional(_) => 47,
-        LuaType::ConditionalInfer(_) => 48,
-        LuaType::Mapped(_) => 49,
+        LuaType::MergedTable(_) => 32,
+        LuaType::Generic(_) => 33,
+        LuaType::TableGeneric(_) => 34,
+        LuaType::TplRef(_) => 35,
+        LuaType::StrTplRef(_) => 36,
+        LuaType::Variadic(_) => 37,
+        LuaType::Signature(_) => 38,
+        LuaType::Instance(_) => 39,
+        LuaType::Namespace(_) => 40,
+        LuaType::Call(_) => 41,
+        LuaType::MultiLineUnion(_) => 42,
+        LuaType::TypeGuard(_) => 43,
+        LuaType::ConstTplRef(_) => 44,
+        LuaType::Language(_) => 45,
+        LuaType::ModuleRef(_) => 46,
+        LuaType::DocAttribute(_) => 47,
+        LuaType::Conditional(_) => 48,
+        LuaType::ConditionalInfer(_) => 49,
+        LuaType::Mapped(_) => 50,
     };
 
     // For same-variant tiebreaking, use a deterministic identity value.

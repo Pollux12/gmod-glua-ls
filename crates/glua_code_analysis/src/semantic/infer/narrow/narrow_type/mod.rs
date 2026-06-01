@@ -83,6 +83,9 @@ pub fn narrow_down_type(
             LuaType::Object(_) => {
                 return Some(source);
             }
+            LuaType::MergedTable(_) => {
+                return Some(source);
+            }
             LuaType::Table | LuaType::Userdata | LuaType::Any | LuaType::Unknown => {
                 return Some(LuaType::Table);
             }
@@ -178,6 +181,9 @@ pub fn narrow_down_type(
         LuaType::TableConst(t) => match real_source_ref {
             LuaType::TableConst(s) => {
                 return Some(LuaType::TableConst(s.clone()));
+            }
+            LuaType::MergedTable(_) => {
+                return Some(source);
             }
             LuaType::Table | LuaType::Userdata | LuaType::Any | LuaType::Unknown => {
                 return Some(LuaType::TableConst(t.clone()));

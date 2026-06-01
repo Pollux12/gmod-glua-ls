@@ -5,14 +5,14 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, FileId, GlobalId, InferFailReason, InferGuard, InferGuardRef, LuaGenericType,
-    LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType,
-    LuaTypeDeclId, LuaUnionType, TypeOps, check_type_compact,
+    LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType,
+    LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, TypeOps, check_type_compact,
     semantic::generic::{TypeSubstitutor, instantiate_type_generic},
 };
 
 use super::{
     RawGetMemberTypeResult, get_buildin_type_map_type_id, member_key_as_type,
-    member_key_matches_type,
+    member_key_matches_type, merge_open_table_types,
 };
 
 pub fn infer_raw_member_type(
@@ -77,10 +77,39 @@ fn infer_raw_member_type_guard(
         LuaType::Generic(generic_type) => {
             infer_generic_raw_member_type(db, generic_type, member_key, infer_guard)
         }
+        LuaType::MergedTable(merged_table) => {
+            infer_merged_table_raw_member_type(db, merged_table, member_key, infer_guard)
+        }
         LuaType::TableOf(inner) => infer_raw_member_type_guard(db, inner, member_key, infer_guard),
         // other do not support now
         _ => Err(InferFailReason::None),
     }
+}
+
+fn infer_merged_table_raw_member_type(
+    db: &DbIndex,
+    merged_table: &LuaMergedTableType,
+    member_key: &LuaMemberKey,
+    infer_guard: &InferGuardRef,
+) -> RawGetMemberTypeResult {
+    let mut member_types = Vec::new();
+    let mut last_resolve_reason = InferFailReason::FieldNotFound;
+
+    for component in merged_table.get_types() {
+        match infer_raw_member_type_guard(db, component, member_key, &infer_guard.fork()) {
+            Ok(typ) if !typ.is_never() => member_types.push(typ),
+            Ok(_) => {}
+            Err(InferFailReason::FieldNotFound | InferFailReason::None) => {}
+            Err(reason) if reason.is_need_resolve() => last_resolve_reason = reason,
+            Err(reason) => return Err(reason),
+        }
+    }
+
+    if member_types.is_empty() {
+        return Err(last_resolve_reason);
+    }
+
+    Ok(merge_open_table_types(db, member_types))
 }
 
 fn infer_owner_raw_member_type(

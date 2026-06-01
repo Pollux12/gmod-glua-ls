@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     DbIndex, InFiled, InferGuardRef, LuaGenericType, LuaIntersectionType, LuaMemberKey,
-    LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId,
-    LuaType, LuaTypeDeclId, LuaUnionType, TypeOps,
+    LuaMemberOwner, LuaMergedTableType, LuaObjectType, LuaOperatorMetaMethod, LuaOperatorOwner,
+    LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType, TypeOps,
     semantic::{
         InferGuard,
         generic::{TypeSubstitutor, instantiate_type_generic},
@@ -29,6 +29,9 @@ pub fn find_index_operations_guard(
         LuaType::Array(array_type) => find_index_array(db, array_type.get_base()),
         LuaType::Object(object) => find_index_object(db, object),
         LuaType::Union(union) => find_index_union(db, union, infer_guard),
+        LuaType::MergedTable(merged_table) => {
+            find_index_merged_table(db, merged_table, infer_guard)
+        }
         LuaType::Intersection(intersection) => {
             find_index_intersection(db, intersection, infer_guard)
         }
@@ -38,6 +41,7 @@ pub fn find_index_operations_guard(
             let base = inst.get_base();
             find_index_operations_guard(db, base, infer_guard)
         }
+        LuaType::TableOf(inner) => find_index_operations_guard(db, inner, infer_guard),
         LuaType::ModuleRef(file_id) => {
             let module_info = db.get_module_index().get_module(*file_id);
             if let Some(module_info) = module_info
@@ -230,6 +234,26 @@ fn find_index_union(
     for member in union.into_vec() {
         if let Some(sub_members) = find_index_operations_guard(db, &member, infer_guard) {
             members.extend(sub_members);
+        }
+    }
+
+    if members.is_empty() {
+        None
+    } else {
+        Some(members)
+    }
+}
+
+fn find_index_merged_table(
+    db: &DbIndex,
+    merged_table: &LuaMergedTableType,
+    infer_guard: &InferGuardRef,
+) -> FindMembersResult {
+    let mut members = Vec::new();
+
+    for component in merged_table.get_types() {
+        if let Some(component_members) = find_index_operations_guard(db, component, infer_guard) {
+            members.extend(component_members);
         }
     }
 

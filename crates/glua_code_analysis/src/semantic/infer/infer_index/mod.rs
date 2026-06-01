@@ -16,8 +16,8 @@ use crate::{
     LuaDeclOrMemberId, LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
     compilation::{get_scripted_class_info_for_file, get_scripted_class_type_decl_id},
     db_index::{
-        DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaObjectType,
-        LuaOperatorMetaMethod, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType,
+        DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaMergedTableType,
+        LuaObjectType, LuaOperatorMetaMethod, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType,
     },
     enum_variable_is_param, get_keyof_members, get_tpl_ref_extend_type,
     semantic::{
@@ -32,6 +32,7 @@ use crate::{
         member::infer_owner_raw_member_type_with_realm,
         member::intersect_member_types,
         member::member_key_matches_type,
+        member::merge_open_table_types,
         member::resolve_dynamic_field_member,
         type_check::{self, check_type_compact},
     },
@@ -275,6 +276,9 @@ pub fn infer_member_by_member_key(
         LuaType::Union(union_type) => {
             infer_union_member(db, cache, union_type, index_expr, infer_guard)
         }
+        LuaType::MergedTable(merged_table) => {
+            infer_merged_table_member(db, cache, merged_table, index_expr, infer_guard)
+        }
         LuaType::MultiLineUnion(multi_union) => {
             let union_type = multi_union.to_union();
             if let LuaType::Union(union_type) = union_type {
@@ -400,7 +404,11 @@ fn infer_table_member(
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
                 return Ok(nullable_any_type());
             }
-            if is_table_const_from_doc_tag(db, &inst) {
+            if let Ok(global_path_type) =
+                infer_global_path_member(db, cache, index_expr.clone(), Some(key.clone()))
+            {
+                Ok(global_path_type)
+            } else if is_table_const_from_doc_tag(db, &inst) {
                 Ok(nullable_any_type())
             } else {
                 Err(InferFailReason::FieldNotFound)
@@ -646,15 +654,17 @@ fn infer_plain_table_member(
         return Ok(member_type);
     }
 
-    let nullable_any = nullable_any_type();
+    if let Ok(global_path_type) = infer_global_path_member(db, cache, index_expr.clone(), None) {
+        return Ok(global_path_type);
+    }
 
     let index_prefix_expr = match index_expr.clone() {
-        LuaIndexMemberExpr::TableField(_) => return Ok(nullable_any),
+        LuaIndexMemberExpr::TableField(_) => return Ok(nullable_any_type()),
         _ => index_expr.get_prefix_expr().ok_or(InferFailReason::None)?,
     };
 
     let Some(index_key) = index_expr.get_index_key() else {
-        return Ok(nullable_any);
+        return Ok(nullable_any_type());
     };
 
     if let LuaIndexKey::Expr(expr) = index_key
@@ -663,7 +673,7 @@ fn infer_plain_table_member(
         return Ok(LuaType::Any);
     }
 
-    Ok(nullable_any)
+    Ok(nullable_any_type())
 }
 
 fn infer_gmod_plain_table_dynamic_field(
@@ -1312,6 +1322,43 @@ fn infer_union_member(
     Ok(LuaType::from_vec(member_types))
 }
 
+fn infer_merged_table_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    merged_table: &LuaMergedTableType,
+    index_expr: LuaIndexMemberExpr,
+    infer_guard: &InferGuardRef,
+) -> InferResult {
+    let mut member_types = Vec::new();
+    let mut last_resolve_reason = InferFailReason::FieldNotFound;
+
+    for component in merged_table.get_types() {
+        match infer_member_by_member_key(
+            db,
+            cache,
+            component,
+            index_expr.clone(),
+            &infer_guard.fork(),
+        ) {
+            Ok(typ) if !typ.is_never() => member_types.push(typ),
+            Ok(_) => {}
+            Err(InferFailReason::FieldNotFound | InferFailReason::None) => {}
+            Err(reason) if reason.is_need_resolve() => last_resolve_reason = reason,
+            Err(reason) => return Err(reason),
+        }
+    }
+
+    if member_types.is_empty() {
+        if let Ok(global_path_type) = infer_global_path_member(db, cache, index_expr.clone(), None)
+        {
+            return Ok(global_path_type);
+        }
+        return Err(last_resolve_reason);
+    }
+
+    Ok(merge_open_table_types(db, member_types))
+}
+
 fn infer_intersection_member(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -1472,6 +1519,9 @@ pub fn infer_member_by_operator(
             infer_member_by_index_array(db, cache, array_type.get_base(), index_expr)
         }
         LuaType::Object(object) => infer_member_by_index_object(db, cache, object, index_expr),
+        LuaType::MergedTable(merged_table) => {
+            infer_member_by_index_merged_table(db, cache, merged_table, index_expr, infer_guard)
+        }
         LuaType::Union(union) => {
             infer_member_by_index_union(db, cache, union, index_expr, infer_guard)
         }
@@ -1507,6 +1557,136 @@ pub fn infer_member_by_operator(
             Err(InferFailReason::FieldNotFound)
         }
         _ => Err(InferFailReason::FieldNotFound),
+    }
+}
+
+fn infer_member_by_index_merged_table(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    merged_table: &LuaMergedTableType,
+    index_expr: LuaIndexMemberExpr,
+    infer_guard: &InferGuardRef,
+) -> InferResult {
+    let mut member_types = Vec::new();
+    let mut last_resolve_reason = InferFailReason::FieldNotFound;
+
+    for component in merged_table.get_types() {
+        match infer_member_by_operator(
+            db,
+            cache,
+            component,
+            index_expr.clone(),
+            &infer_guard.fork(),
+        ) {
+            Ok(typ) if !typ.is_never() => member_types.push(typ),
+            Ok(_) => {}
+            Err(InferFailReason::FieldNotFound | InferFailReason::None) => {}
+            Err(reason) if reason.is_need_resolve() => last_resolve_reason = reason,
+            Err(reason) => return Err(reason),
+        }
+    }
+
+    if member_types.is_empty() {
+        if let Ok(global_path_type) = infer_global_path_member(db, cache, index_expr.clone(), None)
+        {
+            return Ok(global_path_type);
+        }
+        return Err(last_resolve_reason);
+    }
+
+    Ok(merge_open_table_types(db, member_types))
+}
+
+fn infer_global_path_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: LuaIndexMemberExpr,
+    resolved_key: Option<LuaMemberKey>,
+) -> InferResult {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+    let Some(prefix_path) = global_expr_access_path(db, cache.get_file_id(), &prefix_expr) else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+
+    let member_key = if let Some(resolved_key) = resolved_key {
+        resolved_key
+    } else {
+        let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
+        LuaMemberKey::from_index_key(db, cache, &index_key)?
+    };
+
+    let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&prefix_path));
+    let Some(member_item) = db.get_member_index().get_member_item(&owner, &member_key) else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+
+    let access_position = index_expr.get_position();
+    let resolved =
+        member_item.resolve_type_with_realm_at_offset(db, &cache.get_file_id(), access_position);
+    let decl_backed_type = resolve_decl_backed_global_path_member_type(
+        db,
+        member_item,
+        &cache.get_file_id(),
+        member_key.clone(),
+        Some(access_position),
+    );
+
+    if let Some(module_decl_type) = decl_backed_type.clone()
+        && resolved
+            .as_ref()
+            .is_ok_and(|resolved_type| resolved_type.is_table())
+    {
+        return Ok(module_decl_type);
+    }
+    if resolved.is_ok() {
+        return resolved;
+    }
+    if let Some(module_decl_type) = decl_backed_type {
+        return Ok(module_decl_type);
+    }
+
+    resolved
+}
+
+fn global_expr_access_path(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Option<String> {
+    if !expr_root_is_global(db, file_id, expr) {
+        return None;
+    }
+
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn expr_root_is_global(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {
+    let Some(root_name) = expr_root_name(expr) else {
+        return false;
+    };
+
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, root_name.get_range())
+    else {
+        return true;
+    };
+
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_global() || decl.is_module_scoped())
+}
+
+fn expr_root_name(expr: &LuaExpr) -> Option<LuaNameExpr> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => Some(name_expr.clone()),
+        LuaExpr::IndexExpr(index_expr) => {
+            let prefix_expr = index_expr.get_prefix_expr()?;
+            expr_root_name(&prefix_expr)
+        }
+        _ => None,
     }
 }
 

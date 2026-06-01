@@ -1,6 +1,12 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, LuaType, VirtualWorkspace};
+    use internment::ArcIntern;
+    use smol_str::SmolStr;
+
+    use crate::{
+        DiagnosticCode, GenericTpl, GenericTplId, LuaMergedTableType, LuaType, TypeSubstitutor,
+        VirtualWorkspace, instantiate_type_generic,
+    };
 
     #[test]
     fn test_variadic_func() {
@@ -28,6 +34,32 @@ mod test {
         let ty = ws.expr_ty("async_create(locaf)");
         let expected = ws.ty("async fun(a: number, b: string, c:boolean): number...");
         assert_eq!(ty, expected);
+    }
+
+    #[test]
+    fn test_merged_table_instantiates_generic_components() {
+        let ws = crate::VirtualWorkspace::new();
+        let mut substitutor = TypeSubstitutor::new();
+        substitutor.insert_type(GenericTplId::Type(0), LuaType::String, true);
+
+        let generic_type = LuaType::TplRef(
+            GenericTpl::new(
+                GenericTplId::Type(0),
+                ArcIntern::new(SmolStr::new("T")),
+                None,
+            )
+            .into(),
+        );
+        let merged_type = LuaMergedTableType::new(vec![generic_type, LuaType::Table]).into();
+
+        let instantiated =
+            instantiate_type_generic(ws.analysis.compilation.get_db(), &merged_type, &substitutor);
+
+        let LuaType::MergedTable(merged) = instantiated else {
+            panic!("expected merged table after generic instantiation");
+        };
+        assert_eq!(merged.get_types()[0], LuaType::String);
+        assert_eq!(merged.get_types()[1], LuaType::Table);
     }
 
     #[test]

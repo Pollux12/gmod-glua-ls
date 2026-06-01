@@ -5,8 +5,9 @@ use itertools::Itertools;
 use crate::{
     AsyncState, DbIndex, GenericTpl, LuaAliasCallType, LuaConditionalType, LuaFunctionType,
     LuaGenericType, LuaInstanceType, LuaIntersectionType, LuaMemberKey, LuaMemberOwner,
-    LuaObjectType, LuaSignatureId, LuaStringTplType, LuaTupleType, LuaType, LuaTypeDeclId,
-    LuaUnionType, TypeSubstitutor, VariadicType,
+    LuaMergedTableType, LuaObjectType, LuaSignatureId, LuaStringTplType, LuaTupleType, LuaType,
+    LuaTypeDeclId, LuaUnionType, TypeSubstitutor, VariadicType,
+    semantic::{LuaMemberInfo, find_members},
 };
 
 use super::{LuaAliasCallKind, LuaMultiLineUnion};
@@ -113,6 +114,7 @@ pub fn humanize_type(db: &DbIndex, ty: &LuaType, level: RenderLevel) -> String {
         LuaType::DocFunction(lua_func) => humanize_doc_function_type(db, lua_func, level),
         LuaType::Object(object) => humanize_object_type(db, object, level),
         LuaType::Intersection(inter) => humanize_intersect_type(db, inter, level),
+        LuaType::MergedTable(merged) => humanize_merged_table_type(db, merged, level),
         LuaType::Generic(generic) => humanize_generic_type(db, generic, level),
         LuaType::TableGeneric(table_generic_params) => {
             humanize_table_generic_type(db, table_generic_params, level)
@@ -644,6 +646,74 @@ fn humanize_table_const_type(
                 .unwrap_or("table".to_string())
         }
         _ => "table".to_string(),
+    }
+}
+
+fn humanize_merged_table_type(
+    db: &DbIndex,
+    merged: &LuaMergedTableType,
+    level: RenderLevel,
+) -> String {
+    match level {
+        RenderLevel::Detailed | RenderLevel::Simple => {
+            let typ = LuaType::MergedTable(merged.clone().into());
+            let Some(members) = find_members(db, &typ) else {
+                return "table".to_string();
+            };
+            humanize_member_list_as_table(db, members, level).unwrap_or("table".to_string())
+        }
+        _ => "table".to_string(),
+    }
+}
+
+fn humanize_member_list_as_table(
+    db: &DbIndex,
+    members: Vec<LuaMemberInfo>,
+    level: RenderLevel,
+) -> Option<String> {
+    let mut total_length = 0;
+    let mut total_line = 0;
+    let mut members_string = String::new();
+    for member in members {
+        let member_string = build_table_member_string(
+            db,
+            &member.key,
+            &member.typ,
+            humanize_type(db, &member.typ, level.next_level()),
+            level,
+        );
+
+        match level {
+            RenderLevel::Detailed => {
+                total_line += 1;
+                members_string.push_str(&format!("    {},\n", member_string));
+                if total_line >= 12 {
+                    members_string.push_str("    ...\n");
+                    break;
+                }
+            }
+            RenderLevel::Simple => {
+                let member_string_len = member_string.chars().count();
+                if total_length != 0 {
+                    members_string.push_str(", ");
+                    total_length += 2;
+                }
+
+                total_length += member_string_len;
+                members_string.push_str(&member_string);
+                if total_length > 54 {
+                    members_string.push_str(", ...");
+                    break;
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    match level {
+        RenderLevel::Detailed => Some(format!("{{\n{}}}", members_string)),
+        RenderLevel::Simple => Some(format!("{{ {} }}", members_string)),
+        _ => None,
     }
 }
 

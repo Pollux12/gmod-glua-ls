@@ -5,8 +5,8 @@ use glua_parser::{
 
 use crate::{
     DbIndex, GlobalId, LuaDeclId, LuaDeclOrMemberId, LuaInferCache, LuaInstanceType,
-    LuaIntersectionType, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-    LuaTypeDeclId, LuaUnionType,
+    LuaIntersectionType, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaMergedTableType,
+    LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType,
     semantic::{
         infer::{find_self_decl_or_member_id, resolve_scoped_scripted_global_type_decl_id},
         member::{get_buildin_type_map_type_id, resolve_dynamic_field_member},
@@ -341,6 +341,14 @@ fn infer_member_semantic_decl_by_member_key(
             member_access_position,
             semantic_guard.next_level()?,
         ),
+        LuaType::MergedTable(merged_table) => infer_merged_table_member_semantic_info(
+            db,
+            cache,
+            merged_table,
+            member_key,
+            member_access_position,
+            semantic_guard.next_level()?,
+        ),
         LuaType::TableOf(inner) => infer_member_semantic_decl_by_member_key(
             db,
             cache,
@@ -529,6 +537,30 @@ fn infer_intersection_member_semantic_info(
     semantic_guard: SemanticDeclGuard,
 ) -> Option<LuaSemanticDeclId> {
     for typ in intersection_type.get_types() {
+        if let Some(property_owner_id) = infer_member_semantic_decl_by_member_key(
+            db,
+            cache,
+            typ,
+            member_key,
+            member_access_position,
+            semantic_guard.next_level()?,
+        ) {
+            return Some(property_owner_id);
+        }
+    }
+
+    None
+}
+
+fn infer_merged_table_member_semantic_info(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    merged_table: &LuaMergedTableType,
+    member_key: &LuaMemberKey,
+    member_access_position: Option<rowan::TextSize>,
+    semantic_guard: SemanticDeclGuard,
+) -> Option<LuaSemanticDeclId> {
+    for typ in merged_table.get_types() {
         if let Some(property_owner_id) = infer_member_semantic_decl_by_member_key(
             db,
             cache,
