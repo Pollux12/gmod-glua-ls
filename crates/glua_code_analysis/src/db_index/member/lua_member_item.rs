@@ -1038,7 +1038,14 @@ fn widen_file_define_member_type(typ: &LuaType, widen_table_literals: bool) -> L
 }
 
 fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
-    matches!(typ, LuaType::Table | LuaType::TableConst(_))
+    matches!(
+        typ,
+        LuaType::Table
+            | LuaType::TableConst(_)
+            | LuaType::Object(_)
+            | LuaType::MergedTable(_)
+            | LuaType::TableOf(_)
+    )
 }
 
 fn member_item_from_ids(member_ids: Vec<LuaMemberId>) -> LuaMemberIndexItem {

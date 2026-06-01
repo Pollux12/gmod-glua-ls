@@ -5,8 +5,8 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, FileId, GlobalId, InferGuardRef, LuaGenericType, LuaInstanceType, LuaIntersectionType,
-    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
-    LuaTypeDeclId, LuaUnionType, WorkspaceId,
+    LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType, LuaSemanticDeclId,
+    LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, WorkspaceId,
     semantic::{
         InferGuard,
         generic::{TypeSubstitutor, instantiate_type_generic},
@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     FindMembersResult, LuaMemberInfo, get_buildin_type_map_type_id, intersect_member_types,
-    resolve_dynamic_field_member_for_file,
+    merge_open_table_types, resolve_dynamic_field_member_for_file,
 };
 
 #[derive(Debug, Clone)]
@@ -262,6 +262,9 @@ fn find_members_guard(
         }
         LuaType::Intersection(intersection_type) => {
             find_intersection_members(db, intersection_type, ctx, filter)
+        }
+        LuaType::MergedTable(merged_table) => {
+            find_merged_table_members(db, merged_table, ctx, filter)
         }
         LuaType::Generic(generic_type) => find_generic_members(db, generic_type, ctx, filter),
         LuaType::Global => find_global_members(db, ctx, filter),
@@ -686,6 +689,62 @@ fn find_intersection_members(
     }
 }
 
+fn find_merged_table_members(
+    db: &DbIndex,
+    merged_table: &LuaMergedTableType,
+    ctx: &FindMembersContext,
+    filter: &FindMemberFilter,
+) -> FindMembersResult {
+    let mut order: Vec<LuaMemberKey> = Vec::new();
+    let mut members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::new();
+
+    for typ in merged_table.get_types().iter() {
+        let instantiated_type = ctx.instantiate_type(db, typ);
+        let fork_ctx = ctx.fork_infer();
+        let Some(sub_members) = find_members_guard(db, &instantiated_type, &fork_ctx, filter)
+        else {
+            continue;
+        };
+
+        let mut component_seen: HashSet<LuaMemberKey> = HashSet::new();
+        for member in sub_members {
+            if !component_seen.insert(member.key.clone()) {
+                continue;
+            }
+
+            match members.entry(member.key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    order.push(member.key.clone());
+                    entry.insert(member);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let merged_type =
+                        merge_open_table_types(db, vec![entry.get().typ.clone(), member.typ]);
+                    entry.get_mut().typ = merged_type;
+                }
+            }
+        }
+    }
+
+    if members.is_empty() {
+        None
+    } else {
+        let mut result = Vec::new();
+        for key in order {
+            let Some(member) = members.get(&key) else {
+                continue;
+            };
+            result.push(member.clone());
+
+            if should_stop_collecting(result.len(), filter) {
+                break;
+            }
+        }
+
+        Some(result)
+    }
+}
+
 fn find_generic_members(
     db: &DbIndex,
     generic_type: &LuaGenericType,
@@ -823,6 +882,25 @@ fn find_namespace_members(
                     overload_index: None,
                 });
             }
+
+            if should_stop_collecting(members.len(), filter) {
+                break;
+            }
+        }
+    }
+
+    if let Some(global_path_members) = find_owner_members(
+        db,
+        ctx,
+        &LuaMemberOwner::GlobalPath(GlobalId::new(ns)),
+        filter,
+    ) {
+        for member in global_path_members {
+            if members.iter().any(|existing| existing.key == member.key) {
+                continue;
+            }
+
+            members.push(member);
 
             if should_stop_collecting(members.len(), filter) {
                 break;
@@ -1223,6 +1301,38 @@ mod tests {
         assert_eq!(members[0].key, key);
         assert_eq!(members[0].typ, LuaType::String);
         assert_eq!(members[0].property_owner_id, Some(shared_member.into()));
+    }
+
+    #[test]
+    fn find_namespace_members_include_direct_global_path_members() {
+        let mut db = make_db();
+        let member_id = make_member_id(FileId::new(20), 1);
+        let key = LuaMemberKey::Name("Print".into());
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new("marauth.util"));
+
+        db.get_member_index_mut().add_member(
+            owner,
+            LuaMember::new(
+                member_id,
+                key.clone(),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+        bind_member_type(&mut db, member_id, LuaType::Function);
+
+        let members = find_members_with_key(
+            &db,
+            &LuaType::Namespace(smol_str::SmolStr::new("marauth.util").into()),
+            key.clone(),
+            false,
+        )
+        .expect("namespace global-path member should resolve");
+
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].key, key);
+        assert_eq!(members[0].typ, LuaType::Function);
+        assert_eq!(members[0].property_owner_id, Some(member_id.into()));
     }
 
     #[test]

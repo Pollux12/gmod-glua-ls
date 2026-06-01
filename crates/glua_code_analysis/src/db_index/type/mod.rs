@@ -56,6 +56,19 @@ fn replace_table_const_in_type(
                 .collect();
             changed.then(|| LuaType::from_vec(new_types))
         }
+        LuaType::MergedTable(merged) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = merged
+                .get_types()
+                .iter()
+                .map(|sub_type| {
+                    replace_table_const_in_type(sub_type, table_range, replacement)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| sub_type.clone())
+                })
+                .collect();
+            changed.then(|| LuaMergedTableType::new(new_types).into())
+        }
         _ => None,
     }
 }
@@ -97,7 +110,7 @@ pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: Lu
         return collapse_guarded_table_bootstrap_branches(db, types);
     }
 
-    LuaType::from_vec(
+    merge_guarded_table_bootstrap_result(
         types
             .into_iter()
             .filter(|typ| !is_guarded_table_bootstrap_branch(db, typ))
@@ -121,7 +134,63 @@ fn collapse_guarded_table_bootstrap_branches(db: &DbIndex, types: Vec<LuaType>) 
         retained.push(LuaType::Table);
     }
 
-    LuaType::from_vec(retained)
+    merge_guarded_table_bootstrap_result(retained)
+}
+
+fn merge_guarded_table_bootstrap_result(types: Vec<LuaType>) -> LuaType {
+    let mut table_components = Vec::new();
+    let mut other_components = Vec::new();
+
+    for typ in types {
+        collect_guarded_table_merge_components(typ, &mut table_components, &mut other_components);
+    }
+
+    if table_components
+        .iter()
+        .any(|component| !matches!(component, LuaType::Table))
+    {
+        table_components.retain(|component| !matches!(component, LuaType::Table));
+    }
+
+    let merged_table = match table_components.len() {
+        0 => None,
+        1 => Some(table_components.remove(0)),
+        _ => Some(LuaMergedTableType::new(table_components).into()),
+    };
+
+    if other_components.is_empty() {
+        return merged_table.unwrap_or(LuaType::Nil);
+    }
+
+    if let Some(merged_table) = merged_table {
+        other_components.push(merged_table);
+    }
+
+    LuaType::from_vec(other_components)
+}
+
+fn collect_guarded_table_merge_components(
+    typ: LuaType,
+    table_components: &mut Vec<LuaType>,
+    other_components: &mut Vec<LuaType>,
+) {
+    match typ {
+        LuaType::MergedTable(merged) => {
+            for component in merged.get_types() {
+                collect_guarded_table_merge_components(
+                    component.clone(),
+                    table_components,
+                    other_components,
+                );
+            }
+        }
+        LuaType::Table
+        | LuaType::TableConst(_)
+        | LuaType::Object(_)
+        | LuaType::TableGeneric(_)
+        | LuaType::TableOf(_) => table_components.push(typ),
+        _ => other_components.push(typ),
+    }
 }
 
 fn is_informative_guarded_table_branch(db: &DbIndex, typ: &LuaType) -> bool {
@@ -134,6 +203,10 @@ fn is_informative_guarded_table_branch(db: &DbIndex, typ: &LuaType) -> bool {
         LuaType::Object(object) => {
             !object.get_fields().is_empty() || !object.get_index_access().is_empty()
         }
+        LuaType::MergedTable(merged) => merged
+            .get_types()
+            .iter()
+            .any(|typ| is_informative_guarded_table_branch(db, typ)),
         _ => false,
     }
 }
@@ -146,6 +219,10 @@ fn is_guarded_table_bootstrap_branch(db: &DbIndex, typ: &LuaType) -> bool {
                 .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
                 == 0
         }
+        LuaType::MergedTable(merged) => merged
+            .get_types()
+            .iter()
+            .all(|typ| is_guarded_table_bootstrap_branch(db, typ)),
         _ => false,
     }
 }

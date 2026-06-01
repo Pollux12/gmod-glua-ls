@@ -14,6 +14,7 @@ use crate::{
     infer_node_semantic_decl,
     semantic::{
         infer::narrow::{VarRefId, infer_expr_narrow_type},
+        member::merge_open_table_types,
         semantic_info::resolve_global_decl_id,
     },
 };
@@ -1013,8 +1014,70 @@ pub fn infer_global_type(
         return Err(InferFailReason::None);
     }
 
-    let decl_ids =
-        select_decl_ids_for_global_infer(db, current_file_id, call_offset, &priority_tiers);
+    // A top-priority global can exist before its type cache is resolved while
+    // analyzing assignments such as `x = x`. It must not hide lower-priority
+    // declarations that describe the value being read.
+    let call_realm = if db.get_emmyrc().gmod.enabled {
+        current_file_id
+            .zip(call_offset)
+            .map(|(file_id, call_offset)| {
+                db.get_gmod_infer_index()
+                    .get_realm_at_offset(&file_id, call_offset)
+            })
+    } else {
+        None
+    };
+
+    let mut last_resolve_reason = InferFailReason::None;
+    let mut saw_compatible_tier = false;
+    let mut fallback_best_tier = None;
+    for (_, decl_ids) in priority_tiers {
+        let decl_ids = if let Some(call_realm) = call_realm {
+            let selected_decl_ids =
+                select_realm_compatible_decl_ids_for_global_infer_tier(db, call_realm, &decl_ids);
+            if selected_decl_ids.is_empty() {
+                if fallback_best_tier.is_none() {
+                    fallback_best_tier = Some(decl_ids);
+                }
+                continue;
+            }
+
+            selected_decl_ids
+        } else {
+            decl_ids
+        };
+        if decl_ids.is_empty() {
+            continue;
+        }
+        saw_compatible_tier = true;
+
+        match infer_global_type_from_decl_ids(db, decl_ids) {
+            Ok(typ) => return Ok(typ),
+            Err(reason) if can_fall_through_global_tier(&reason) => last_resolve_reason = reason,
+            Err(reason) => return Err(reason),
+        }
+    }
+
+    if !saw_compatible_tier && let Some(decl_ids) = fallback_best_tier {
+        match infer_global_type_from_decl_ids(db, decl_ids) {
+            Ok(typ) => return Ok(typ),
+            Err(reason) => last_resolve_reason = reason,
+        }
+    }
+
+    Err(last_resolve_reason)
+}
+
+fn can_fall_through_global_tier(reason: &InferFailReason) -> bool {
+    matches!(
+        reason,
+        InferFailReason::UnResolveDeclType(_)
+            | InferFailReason::UnResolveTypeDecl(_)
+            | InferFailReason::UnResolveMemberType(_)
+    )
+}
+
+fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> InferResult {
     if decl_ids.is_empty() {
         return Err(InferFailReason::None);
     }
@@ -1042,16 +1105,16 @@ pub fn infer_global_type(
         b_is_std.cmp(&a_is_std)
     });
 
-    // Prefer callable declarations when a name has both callable and table-like
-    // global decls (e.g. constructor functions alongside class bootstrap tables).
     let mut callable_type: Option<LuaType> = None;
     let mut def_or_ref_type: Option<LuaType> = None;
-    let mut table_type: Option<LuaType> = None;
+    let mut table_types = Vec::new();
     let mut last_resolve_reason = InferFailReason::None;
+    let mut saw_resolved_decl_type = false;
     for decl_id in sorted_decl_ids {
         let decl_type_cache = db.get_type_index().get_type_cache(&decl_id.into());
         match decl_type_cache {
             Some(type_cache) => {
+                saw_resolved_decl_type = true;
                 let typ = type_cache.as_type();
 
                 if typ.contain_tpl() {
@@ -1076,8 +1139,8 @@ pub fn infer_global_type(
                     continue;
                 }
 
-                if type_cache.is_table() && table_type.is_none() {
-                    table_type = Some(typ.clone());
+                if collect_global_table_merge_candidates(typ, &mut table_types) {
+                    continue;
                 }
             }
             None => {
@@ -1094,11 +1157,42 @@ pub fn infer_global_type(
         return Ok(def_or_ref_type);
     }
 
-    if let Some(table_type) = table_type {
-        return Ok(table_type);
+    if !table_types.is_empty() {
+        return Ok(merge_open_table_types(db, table_types));
     }
 
-    Err(last_resolve_reason)
+    if saw_resolved_decl_type {
+        Err(InferFailReason::None)
+    } else {
+        Err(last_resolve_reason)
+    }
+}
+
+fn collect_global_table_merge_candidates(typ: &LuaType, table_types: &mut Vec<LuaType>) -> bool {
+    match typ {
+        LuaType::Object(_) => {
+            table_types.push(typ.clone());
+            true
+        }
+        LuaType::Union(union) => {
+            let mut nested = Vec::new();
+            if union
+                .into_vec()
+                .iter()
+                .all(|typ| collect_global_table_merge_candidates(typ, &mut nested))
+            {
+                table_types.extend(nested);
+                true
+            } else {
+                false
+            }
+        }
+        _ if typ.is_table() => {
+            table_types.push(typ.clone());
+            true
+        }
+        _ => false,
+    }
 }
 
 fn infer_legacy_module_local_type(
@@ -1191,41 +1285,20 @@ fn has_legacy_module_namespace_for_file(db: &DbIndex, file_id: Option<FileId>, n
     }) || file_id.is_none() && has_legacy_module_namespace(db, name)
 }
 
-fn select_decl_ids_for_global_infer(
+fn select_realm_compatible_decl_ids_for_global_infer_tier(
     db: &DbIndex,
-    current_file_id: Option<FileId>,
-    call_offset: Option<TextSize>,
-    priority_tiers: &[(u8, Vec<LuaDeclId>)],
+    call_realm: GmodRealm,
+    decl_ids: &[LuaDeclId],
 ) -> Vec<LuaDeclId> {
-    let Some((_, best_tier_decl_ids)) = priority_tiers.first() else {
-        return Vec::new();
-    };
-
-    if !db.get_emmyrc().gmod.enabled {
-        return best_tier_decl_ids.clone();
-    }
-
-    let (Some(file_id), Some(call_offset)) = (current_file_id, call_offset) else {
-        return best_tier_decl_ids.clone();
-    };
-
     let infer_index = db.get_gmod_infer_index();
-    let call_realm = infer_index.get_realm_at_offset(&file_id, call_offset);
-    for (_, decl_ids) in priority_tiers {
-        let mut compatible_decl_ids = Vec::new();
-        for decl_id in decl_ids {
+    decl_ids
+        .iter()
+        .copied()
+        .filter(|decl_id| {
             let decl_realm = infer_index.get_realm_at_offset(&decl_id.file_id, decl_id.position);
-            if is_realm_compatible(call_realm, decl_realm) {
-                compatible_decl_ids.push(*decl_id);
-            }
-        }
-
-        if !compatible_decl_ids.is_empty() {
-            return compatible_decl_ids;
-        }
-    }
-
-    best_tier_decl_ids.clone()
+            is_realm_compatible(call_realm, decl_realm)
+        })
+        .collect()
 }
 
 fn is_realm_compatible(call_realm: GmodRealm, decl_realm: GmodRealm) -> bool {

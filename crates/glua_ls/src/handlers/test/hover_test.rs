@@ -2919,6 +2919,52 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_guarded_global_table_field_when_child_indexes_first() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (child_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                marauth = marauth or {}
+                marauth.character = marauth.character or {}
+
+                function marauth.character:Create()
+                end
+
+                local util = marauth.<??>util
+            "#,
+        )?;
+
+        let file_ids = ws.def_files(vec![
+            (
+                "gamemodes/test/gamemode/sh_test1.lua",
+                child_content.as_str(),
+            ),
+            (
+                "gamemodes/test_base/gamemode/sh_test1.lua",
+                r#"
+                    marauth = marauth or {}
+                    marauth.util = marauth.util or {}
+
+                    function marauth.util:BaseFunction()
+                    end
+                "#,
+            ),
+        ]);
+        let child_file = file_ids[0];
+        let value = extract_hover_markdown(&ws, child_file, position);
+
+        assert!(
+            !value.contains("(field) util: nil"),
+            "guarded global table field must not hover as nil, got: {value}"
+        );
+        assert!(
+            value.contains("BaseFunction"),
+            "expected hover to include the merged util table method, got: {value}"
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_net_message_on_net_start_shows_send_and_receive_patterns() -> Result<()> {
         let mut ws = enable_gmod_workspace();
 

@@ -4,9 +4,10 @@ use glua_code_analysis::{
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
-    LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaStringToken,
+    LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaNameExpr, LuaStringToken, PathTrait,
 };
 use rowan::TextSize;
+use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
 use crate::handlers::completion::{
@@ -62,6 +63,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         .semantic_model
         .get_member_info_map_at_offset(&prefix_type, builder.position_offset)
         .unwrap_or_default();
+    extend_global_path_members(builder, &prefix_expr, &mut member_info_map);
     let gmod_owner_name = gmod_hook_owner_name(&prefix_expr, &prefix_type);
     let gmod_fallback_owner = if builder.semantic_model.get_emmyrc().gmod.enabled {
         gmod_owner_name
@@ -80,6 +82,73 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
     )
 }
 
+fn extend_global_path_members(
+    builder: &CompletionBuilder,
+    prefix_expr: &LuaExpr,
+    members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+) {
+    let Some(prefix_path) = global_expr_access_path(&builder.semantic_model, prefix_expr) else {
+        return;
+    };
+
+    let namespace_type = LuaType::Namespace(SmolStr::new(prefix_path).into());
+    let Some(global_path_members) = builder
+        .semantic_model
+        .get_member_info_map_at_offset(&namespace_type, builder.position_offset)
+    else {
+        return;
+    };
+
+    let mut existing = collect_member_identities(members);
+
+    for (key, infos) in global_path_members {
+        for info in infos {
+            push_unique_member_info(members, &mut existing, key.clone(), info);
+        }
+    }
+}
+
+fn global_expr_access_path(semantic_model: &SemanticModel, expr: &LuaExpr) -> Option<String> {
+    if !expr_root_is_global(semantic_model, expr) {
+        return None;
+    }
+
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        _ => None,
+    }
+}
+
+fn expr_root_is_global(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    let Some(root_name) = expr_root_name(expr) else {
+        return false;
+    };
+
+    let db = semantic_model.get_db();
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&semantic_model.get_file_id(), root_name.get_range())
+    else {
+        return true;
+    };
+
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_global() || decl.is_module_scoped())
+}
+
+fn expr_root_name(expr: &LuaExpr) -> Option<LuaNameExpr> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => Some(name_expr.clone()),
+        LuaExpr::IndexExpr(index_expr) => {
+            let prefix_expr = index_expr.get_prefix_expr()?;
+            expr_root_name(&prefix_expr)
+        }
+        _ => None,
+    }
+}
+
 fn extend_gmod_hook_fallback_members(
     builder: &CompletionBuilder,
     fallback_owner: Option<GmodFallbackOwner<'_>>,
@@ -89,13 +158,7 @@ fn extend_gmod_hook_fallback_members(
         return;
     };
 
-    let mut existing: HashMap<LuaMemberKey, HashSet<Option<LuaSemanticDeclId>>> = HashMap::new();
-    for (key, infos) in members.iter() {
-        let entry = existing.entry(key.clone()).or_default();
-        for info in infos {
-            entry.insert(info.property_owner_id.clone());
-        }
-    }
+    let mut existing = collect_member_identities(members);
 
     for owner_candidate in fallback_owner.candidates {
         let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_candidate));
@@ -107,14 +170,50 @@ fn extend_gmod_hook_fallback_members(
         };
 
         for (key, fallback_infos) in fallback_map {
-            let owners = existing.entry(key.clone()).or_default();
-            let target = members.entry(key).or_default();
             for info in fallback_infos {
-                if owners.insert(info.property_owner_id.clone()) {
-                    target.push(info);
-                }
+                push_unique_member_info(members, &mut existing, key.clone(), info);
             }
         }
+    }
+}
+
+type MemberIdentityMap = HashMap<LuaMemberKey, HashSet<MemberInfoIdentity>>;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MemberInfoIdentity {
+    property_owner_id: Option<LuaSemanticDeclId>,
+    overload_index: Option<usize>,
+}
+
+impl From<&LuaMemberInfo> for MemberInfoIdentity {
+    fn from(info: &LuaMemberInfo) -> Self {
+        Self {
+            property_owner_id: info.property_owner_id.clone(),
+            overload_index: info.overload_index,
+        }
+    }
+}
+
+fn collect_member_identities(
+    members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+) -> MemberIdentityMap {
+    let mut existing: MemberIdentityMap = HashMap::new();
+    for (key, infos) in members {
+        let entry = existing.entry(key.clone()).or_default();
+        entry.extend(infos.iter().map(MemberInfoIdentity::from));
+    }
+    existing
+}
+
+fn push_unique_member_info(
+    members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+    existing: &mut MemberIdentityMap,
+    key: LuaMemberKey,
+    info: LuaMemberInfo,
+) {
+    let identities = existing.entry(key.clone()).or_default();
+    if identities.insert(MemberInfoIdentity::from(&info)) {
+        members.entry(key).or_default().push(info);
     }
 }
 
@@ -565,5 +664,51 @@ fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
         "server" => Some(GmodRealm::Server),
         "shared" => Some(GmodRealm::Shared),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+
+    use super::*;
+
+    fn function_member(key: LuaMemberKey, overload_index: Option<usize>) -> LuaMemberInfo {
+        LuaMemberInfo {
+            property_owner_id: None,
+            key,
+            typ: LuaType::Function,
+            feature: None,
+            overload_index,
+        }
+    }
+
+    #[gtest]
+    fn push_unique_member_info_keeps_distinct_overload_indices() -> Result<()> {
+        let key = LuaMemberKey::Name("lookup".into());
+        let mut members = HashMap::new();
+        let mut existing = collect_member_identities(&members);
+
+        push_unique_member_info(
+            &mut members,
+            &mut existing,
+            key.clone(),
+            function_member(key.clone(), Some(0)),
+        );
+        push_unique_member_info(
+            &mut members,
+            &mut existing,
+            key.clone(),
+            function_member(key.clone(), Some(1)),
+        );
+        push_unique_member_info(
+            &mut members,
+            &mut existing,
+            key.clone(),
+            function_member(key.clone(), Some(1)),
+        );
+
+        let infos = members.get(&key).ok_or("missing member infos").or_fail()?;
+        verify_eq!(infos.len(), 2)
     }
 }

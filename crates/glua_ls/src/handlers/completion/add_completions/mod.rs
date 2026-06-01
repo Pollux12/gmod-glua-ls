@@ -55,6 +55,7 @@ pub fn get_completion_kind(typ: &LuaType) -> CompletionItemKind {
         LuaType::Namespace(_) | LuaType::ModuleRef(_) => CompletionItemKind::MODULE,
         LuaType::Table
         | LuaType::TableConst(_)
+        | LuaType::MergedTable(_)
         | LuaType::Array(_)
         | LuaType::Tuple(_)
         | LuaType::Object(_)
@@ -128,6 +129,7 @@ pub fn is_table_namespace_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Table
         | LuaType::TableConst(_)
+        | LuaType::MergedTable(_)
         | LuaType::TableGeneric(_)
         | LuaType::TableOf(_)
         | LuaType::Object(_)

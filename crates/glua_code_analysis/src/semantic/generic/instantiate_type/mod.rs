@@ -11,8 +11,8 @@ use crate::{
     LuaInstanceType, LuaMappedType, LuaMemberKey, LuaOperatorMetaMethod, LuaSignatureId,
     LuaTupleStatus, LuaTypeDeclId, TypeOps, check_type_compact,
     db_index::{
-        LuaFunctionType, LuaGenericType, LuaIntersectionType, LuaObjectType, LuaTupleType, LuaType,
-        LuaUnionType, VariadicType,
+        LuaFunctionType, LuaGenericType, LuaIntersectionType, LuaMergedTableType, LuaObjectType,
+        LuaTupleType, LuaType, LuaUnionType, VariadicType,
     },
     semantic::type_check::{TypeCheckCheckLevel, check_type_compact_with_level},
 };
@@ -38,6 +38,7 @@ pub fn instantiate_type_generic(
         LuaType::Intersection(intersection) => {
             instantiate_intersection(db, intersection, substitutor)
         }
+        LuaType::MergedTable(merged) => instantiate_merged_table(db, merged, substitutor),
         LuaType::Generic(generic) => instantiate_generic(db, generic, substitutor),
         LuaType::TableGeneric(table_params) => {
             instantiate_table_generic(db, table_params, substitutor)
@@ -69,6 +70,20 @@ pub fn instantiate_type_generic(
         LuaType::Mapped(mapped) => instantiate_mapped_type(db, mapped.deref(), substitutor),
         _ => ty.clone(),
     }
+}
+
+fn instantiate_merged_table(
+    db: &DbIndex,
+    merged: &LuaMergedTableType,
+    substitutor: &TypeSubstitutor,
+) -> LuaType {
+    let types = merged
+        .get_types()
+        .iter()
+        .map(|typ| instantiate_type_generic(db, typ, substitutor))
+        .collect();
+
+    LuaMergedTableType::new(types).into()
 }
 
 fn instantiate_array(db: &DbIndex, base: &LuaType, substitutor: &TypeSubstitutor) -> LuaType {

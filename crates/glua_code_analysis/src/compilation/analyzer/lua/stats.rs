@@ -1,6 +1,6 @@
 use crate::{
-    CacheEntry, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId,
-    LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
+    CacheEntry, FileId, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
+    LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
     compilation::{
         analyzer::{
             common::{add_member, bind_type},
@@ -9,7 +9,7 @@ use crate::{
         get_scripted_class_type_decl_id,
     },
     db_index::{LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType},
-    semantic::{member_key_matches_type, remove_false_or_nil},
+    semantic::{member_key_matches_type, merge_open_table_types, remove_false_or_nil},
 };
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
@@ -392,6 +392,16 @@ fn get_var_owner(analyzer: &mut LuaAnalyzer, var: LuaVarExpr) -> LuaTypeOwner {
     let file_id = analyzer.file_id;
     match var {
         LuaVarExpr::NameExpr(var_name) => {
+            let maybe_decl_id = LuaDeclId::new(file_id, var_name.get_position());
+            if analyzer
+                .db
+                .get_decl_index()
+                .get_decl(&maybe_decl_id)
+                .is_some()
+            {
+                return LuaTypeOwner::Decl(maybe_decl_id);
+            }
+
             let decl_id = analyzer
                 .db
                 .get_reference_index()
@@ -430,7 +440,8 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
 
     match analyzer.infer_expr(&prefix_expr.clone()) {
         Ok(prefix_type) => {
-            let (member_owner, set_owner_only) = resolve_index_expr_member_owner(&prefix_type)?;
+            let (member_owner, set_owner_only) =
+                resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))?;
             apply_index_expr_member_owner(analyzer, index_expr, member_owner, set_owner_only);
         }
         Err(InferFailReason::None) => {}
@@ -1107,6 +1118,10 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = widened_type;
     }
 
+    if is_global_decl_owner(analyzer, &type_owner) {
+        expr_type = merge_open_table_types(analyzer.db, vec![expr_type]);
+    }
+
     bind_type(
         analyzer.db,
         type_owner.clone(),
@@ -1139,6 +1154,18 @@ fn assign_merge_type_owner_and_expr_type(
     }
 
     Some(())
+}
+
+fn is_global_decl_owner(analyzer: &LuaAnalyzer, type_owner: &LuaTypeOwner) -> bool {
+    let LuaTypeOwner::Decl(decl_id) = type_owner else {
+        return false;
+    };
+
+    analyzer
+        .db
+        .get_decl_index()
+        .get_decl(decl_id)
+        .is_some_and(|decl| decl.is_global())
 }
 
 fn preserve_guarded_table_assignment_members(analyzer: &mut LuaAnalyzer, member_id: LuaMemberId) {
@@ -1425,7 +1452,14 @@ fn widen_related_assignment_type(typ: &LuaType, widen_table_literals: bool) -> L
 }
 
 fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
-    matches!(typ, LuaType::Table | LuaType::TableConst(_))
+    matches!(
+        typ,
+        LuaType::Table
+            | LuaType::TableConst(_)
+            | LuaType::Object(_)
+            | LuaType::MergedTable(_)
+            | LuaType::TableOf(_)
+    )
 }
 
 fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
@@ -1607,10 +1641,17 @@ fn member_key_as_expr_type(member_key: &LuaMemberKey) -> Option<&LuaType> {
 }
 
 fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwner> {
-    resolve_index_expr_member_owner(&prefix_type).map(|(owner, _)| owner)
+    resolve_index_expr_member_owner_for_file(&prefix_type, None).map(|(owner, _)| owner)
 }
 
 fn resolve_index_expr_member_owner(prefix_type: &LuaType) -> Option<(LuaMemberOwner, bool)> {
+    resolve_index_expr_member_owner_for_file(prefix_type, None)
+}
+
+fn resolve_index_expr_member_owner_for_file(
+    prefix_type: &LuaType,
+    preferred_file_id: Option<FileId>,
+) -> Option<(LuaMemberOwner, bool)> {
     match prefix_type {
         LuaType::TableConst(in_file_range) => {
             Some((LuaMemberOwner::Element(in_file_range.clone()), false))
@@ -1620,30 +1661,52 @@ fn resolve_index_expr_member_owner(prefix_type: &LuaType) -> Option<(LuaMemberOw
         LuaType::Instance(instance) => {
             Some((LuaMemberOwner::Element(instance.get_range().clone()), false))
         }
-        LuaType::TableOf(inner) => resolve_index_expr_member_owner(inner),
-        LuaType::TypeGuard(inner) => resolve_index_expr_member_owner(inner),
-        LuaType::Union(union) => pick_preferred_index_expr_member_owner(union.into_vec().iter()),
-        LuaType::Intersection(intersection) => {
-            pick_preferred_index_expr_member_owner(intersection.get_types().iter())
+        LuaType::TableOf(inner) => {
+            resolve_index_expr_member_owner_for_file(inner, preferred_file_id)
         }
-        LuaType::MultiLineUnion(union) => {
-            pick_preferred_index_expr_member_owner(union.get_unions().iter().map(|(typ, _)| typ))
+        LuaType::TypeGuard(inner) => {
+            resolve_index_expr_member_owner_for_file(inner, preferred_file_id)
         }
+        LuaType::Union(union) => {
+            pick_preferred_index_expr_member_owner(union.into_vec().iter(), preferred_file_id)
+        }
+        LuaType::Intersection(intersection) => pick_preferred_index_expr_member_owner(
+            intersection.get_types().iter(),
+            preferred_file_id,
+        ),
+        LuaType::MergedTable(merged_table) => pick_preferred_index_expr_member_owner(
+            merged_table.get_types().iter(),
+            preferred_file_id,
+        ),
+        LuaType::MultiLineUnion(union) => pick_preferred_index_expr_member_owner(
+            union.get_unions().iter().map(|(typ, _)| typ),
+            preferred_file_id,
+        ),
         _ => None,
     }
 }
 
 fn pick_preferred_index_expr_member_owner<'a>(
     types: impl Iterator<Item = &'a LuaType>,
+    preferred_file_id: Option<FileId>,
 ) -> Option<(LuaMemberOwner, bool)> {
+    let mut exact_type_owner = None;
     let mut fallback_owner = None;
     for typ in types {
-        let Some(owner_info) = resolve_index_expr_member_owner(typ) else {
+        let Some(owner_info) = resolve_index_expr_member_owner_for_file(typ, preferred_file_id)
+        else {
             continue;
         };
 
-        if matches!(&owner_info.0, LuaMemberOwner::Type(_)) && !owner_info.1 {
+        if owner_matches_preferred_file(&owner_info.0, preferred_file_id) {
             return Some(owner_info);
+        }
+
+        if matches!(&owner_info.0, LuaMemberOwner::Type(_)) && !owner_info.1 {
+            if exact_type_owner.is_none() {
+                exact_type_owner = Some(owner_info);
+            }
+            continue;
         }
 
         if fallback_owner.is_none() {
@@ -1651,7 +1714,15 @@ fn pick_preferred_index_expr_member_owner<'a>(
         }
     }
 
-    fallback_owner
+    exact_type_owner.or(fallback_owner)
+}
+
+fn owner_matches_preferred_file(owner: &LuaMemberOwner, preferred_file_id: Option<FileId>) -> bool {
+    let Some(preferred_file_id) = preferred_file_id else {
+        return false;
+    };
+
+    matches!(owner, LuaMemberOwner::Element(range) if range.file_id == preferred_file_id)
 }
 
 fn is_collection_append_write(index_expr: &LuaIndexExpr) -> Option<bool> {

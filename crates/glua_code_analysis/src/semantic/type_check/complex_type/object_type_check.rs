@@ -4,7 +4,7 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, RenderLevel,
     TypeCheckFailReason, TypeCheckResult, humanize_type,
     semantic::{
-        member::find_members,
+        member::{find_members, member_key_matches_type},
         type_check::{
             check_general_type_compact, type_check_context::TypeCheckContext,
             type_check_guard::TypeCheckGuard,
@@ -94,7 +94,109 @@ fn check_object_type_compact_object_type(
         )?;
     }
 
+    check_object_index_access_compact_object(context, source_object, compact_object, check_guard)?;
+
     Ok(())
+}
+
+fn check_object_index_access_compact_object(
+    context: &mut TypeCheckContext,
+    source_object: &LuaObjectType,
+    compact_object: &LuaObjectType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    for (key_type, source_type) in source_object.get_index_access() {
+        for (compact_key, compact_type) in compact_object.get_fields() {
+            if source_object.get_fields().contains_key(compact_key) {
+                continue;
+            }
+
+            if member_key_matches_type(context.db, key_type, compact_key) {
+                let Some(compact_key_type) = member_key_type_for_index(compact_key) else {
+                    continue;
+                };
+                check_member_value(
+                    context,
+                    compact_key,
+                    Some(&compact_key_type),
+                    source_type,
+                    compact_type,
+                    check_guard,
+                )?;
+            }
+        }
+
+        for (compact_key_type, compact_type) in compact_object.get_index_access() {
+            if !index_key_types_may_overlap(
+                context,
+                key_type,
+                compact_key_type,
+                check_guard.next_level()?,
+            )? {
+                continue;
+            }
+
+            check_general_type_compact(
+                context,
+                source_type,
+                compact_type,
+                check_guard.next_level()?,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn index_key_types_may_overlap(
+    context: &mut TypeCheckContext,
+    source_key_type: &LuaType,
+    compact_key_type: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> Result<bool, TypeCheckFailReason> {
+    if let Some(is_match) = exact_literal_key_type_match(source_key_type, compact_key_type) {
+        return Ok(is_match);
+    }
+
+    match check_general_type_compact(
+        context,
+        source_key_type,
+        compact_key_type,
+        check_guard.next_level()?,
+    ) {
+        Ok(_) => Ok(true),
+        Err(err) if err.is_type_not_match() => {
+            match check_general_type_compact(
+                context,
+                compact_key_type,
+                source_key_type,
+                check_guard.next_level()?,
+            ) {
+                Ok(_) => Ok(true),
+                Err(err) if err.is_type_not_match() => Ok(false),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn exact_literal_key_type_match(left: &LuaType, right: &LuaType) -> Option<bool> {
+    match (left, right) {
+        (LuaType::StringConst(left), LuaType::StringConst(right))
+        | (LuaType::StringConst(left), LuaType::DocStringConst(right))
+        | (LuaType::DocStringConst(left), LuaType::StringConst(right))
+        | (LuaType::DocStringConst(left), LuaType::DocStringConst(right)) => Some(left == right),
+        (LuaType::IntegerConst(left), LuaType::IntegerConst(right))
+        | (LuaType::IntegerConst(left), LuaType::DocIntegerConst(right))
+        | (LuaType::DocIntegerConst(left), LuaType::IntegerConst(right))
+        | (LuaType::DocIntegerConst(left), LuaType::DocIntegerConst(right)) => Some(left == right),
+        (LuaType::BooleanConst(left), LuaType::BooleanConst(right))
+        | (LuaType::BooleanConst(left), LuaType::DocBooleanConst(right))
+        | (LuaType::DocBooleanConst(left), LuaType::BooleanConst(right))
+        | (LuaType::DocBooleanConst(left), LuaType::DocBooleanConst(right)) => Some(left == right),
+        _ => None,
+    }
 }
 
 struct TypeMembers {

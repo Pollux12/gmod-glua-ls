@@ -63,6 +63,122 @@ pub(crate) fn intersect_member_types(db: &DbIndex, left: LuaType, right: LuaType
     }
 }
 
+pub(crate) fn merge_open_table_types(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
+    let mut table_components = Vec::new();
+    let mut other_types = Vec::new();
+    let mut seen = HashSet::new();
+
+    for typ in types {
+        if typ.is_never() {
+            continue;
+        }
+
+        if let LuaType::Union(union) = &typ {
+            let mut nested_components = Vec::new();
+            let mut all_components_are_tables = true;
+            for component in union.into_vec() {
+                if is_open_table_merge_component(&component) {
+                    nested_components.push(component);
+                } else {
+                    all_components_are_tables = false;
+                    break;
+                }
+            }
+
+            if all_components_are_tables {
+                for component in nested_components {
+                    if seen.insert(component.clone()) {
+                        table_components.push(component);
+                    }
+                }
+            } else if seen.insert(typ.clone()) {
+                other_types.push(typ);
+            }
+            continue;
+        }
+
+        if let LuaType::MergedTable(merged) = &typ {
+            for component in merged.get_types() {
+                if seen.insert(component.clone()) {
+                    table_components.push(component.clone());
+                }
+            }
+            continue;
+        }
+
+        if is_open_table_merge_component(&typ) {
+            if seen.insert(typ.clone()) {
+                table_components.push(typ);
+            }
+        } else if seen.insert(typ.clone()) {
+            other_types.push(typ);
+        }
+    }
+
+    let table_type = merge_open_table_components(table_components);
+    let mut result = table_type;
+    for typ in other_types {
+        result = match result {
+            Some(existing) => Some(TypeOps::Union.apply(db, &existing, &typ)),
+            None => Some(typ),
+        };
+    }
+
+    result.unwrap_or(LuaType::Never)
+}
+
+fn merge_open_table_components(mut components: Vec<LuaType>) -> Option<LuaType> {
+    if components
+        .iter()
+        .any(|component| !matches!(component, LuaType::Table))
+    {
+        components.retain(|component| !matches!(component, LuaType::Table));
+    }
+
+    match components.as_slice() {
+        [] => None,
+        [only] => Some(only.clone()),
+        _ => Some(crate::LuaMergedTableType::new(components).into()),
+    }
+}
+
+fn is_open_table_merge_component(typ: &LuaType) -> bool {
+    matches!(
+        typ,
+        LuaType::Table
+            | LuaType::TableConst(_)
+            | LuaType::Object(_)
+            | LuaType::MergedTable(_)
+            | LuaType::TableOf(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::{DbIndex, LuaMemberKey, LuaObjectType, LuaType, LuaTypeDeclId};
+
+    use super::merge_open_table_types;
+
+    #[test]
+    fn merge_open_table_types_keeps_tableof_as_table_component() {
+        let db = DbIndex::new();
+        let table_of = LuaType::TableOf(Box::new(LuaType::Ref(LuaTypeDeclId::global("Entity"))));
+
+        let mut fields = HashMap::new();
+        fields.insert(LuaMemberKey::Name("flags".into()), LuaType::Table);
+        let object = LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into());
+
+        let merged = merge_open_table_types(&db, vec![table_of.clone(), object.clone()]);
+        let LuaType::MergedTable(merged_table) = merged else {
+            panic!("expected tableof and object fragments to merge as an open table");
+        };
+
+        assert_eq!(merged_table.get_types(), &[table_of, object]);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DynamicFieldResolution {
     pub typ: LuaType,

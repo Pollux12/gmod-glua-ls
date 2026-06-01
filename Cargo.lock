@@ -942,6 +942,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "smol_str",
  "tokio",
  "tokio-util",
  "walkdir",
