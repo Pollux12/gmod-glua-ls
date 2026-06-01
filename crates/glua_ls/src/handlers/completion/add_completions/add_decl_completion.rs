@@ -29,6 +29,13 @@ pub fn add_decl_completion(
     let overload_count = count_function_overloads(builder.semantic_model.get_db(), typ);
     let (color, constructor_literal_detail) =
         get_decl_completion_literal_info(builder, decl_id, typ);
+    let completion_data_color = builder
+        .semantic_model
+        .get_emmyrc()
+        .document_color
+        .enable
+        .then(|| color.clone())
+        .flatten();
     let literal_detail = scalar_literal_detail(typ);
 
     let mut completion_item = CompletionItem {
@@ -38,7 +45,7 @@ pub fn add_decl_completion(
         } else {
             get_completion_kind(typ)
         }),
-        data: match color.clone() {
+        data: match completion_data_color {
             Some(color) => CompletionData::from_property_owner_id_with_color(
                 builder,
                 decl_id.into(),

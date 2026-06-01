@@ -115,10 +115,17 @@ pub fn add_member_completion_with_description_hint(
         get_member_completion_literal_info(builder, property_owner, &remove_nil_type);
 
     // 附加数据, 用于在`resolve`时进一步处理
+    let completion_data_color = builder
+        .semantic_model
+        .get_emmyrc()
+        .document_color
+        .enable
+        .then(|| color.clone())
+        .flatten();
     let completion_data = if let Some(id) = &property_owner {
         if let Some(index) = member_info.overload_index {
             CompletionData::from_overload(builder, id.clone(), index, overload_count)
-        } else if let Some(color) = color.clone() {
+        } else if let Some(color) = completion_data_color {
             CompletionData::from_property_owner_id_with_color(
                 builder,
                 id.clone(),

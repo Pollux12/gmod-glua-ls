@@ -4114,6 +4114,53 @@ mod tests {
     }
 
     #[gtest]
+    fn test_color_completion_preview_metadata_suppressed_when_document_color_disabled() -> Result<()>
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.document_color.enable = false;
+        ws.update_emmyrc(emmyrc);
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Color
+
+                ---@return Color
+                function Color(r, g, b, a) end
+
+                color_white = Color(255, 255, 255, 255)
+
+                color_w<??>
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .into_iter()
+            .find(|item| item.label == "color_white")
+            .ok_or("missing color_white completion")
+            .or_fail()?;
+
+        verify_eq!(item.kind, Some(CompletionItemKind::COLOR))?;
+        verify_that!(
+            item.data.as_ref().and_then(|data| data.get("color")),
+            none()
+        )?;
+        Ok(())
+    }
+
+    #[gtest]
     fn test_scalar_constant_completion_includes_literal_detail() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
 

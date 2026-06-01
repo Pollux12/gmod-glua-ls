@@ -521,6 +521,7 @@ fn add_decl_color_preview(
         color.green,
         color.blue,
         color.alpha,
+        &color.gmod_display,
     ));
     Some(())
 }
@@ -551,6 +552,7 @@ fn add_member_color_preview(
         color.green,
         color.blue,
         color.alpha,
+        &color.gmod_display,
     ));
     Some(())
 }

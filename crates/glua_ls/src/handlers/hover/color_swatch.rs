@@ -7,29 +7,34 @@
 const SWATCH_SIZE: u32 = 14;
 
 /// Builds the description-region markdown for a color swatch: an inline SVG
-/// image followed by the `Color(r, g, b[, a])` text.
-///
-/// `alpha` is included in the text only when it is not fully opaque.
-pub(crate) fn color_swatch_markdown(red: u8, green: u8, blue: u8, alpha: u8) -> String {
-    let data_uri = color_swatch_data_uri(red, green, blue);
-    let text = if alpha == u8::MAX {
-        format!("Color({}, {}, {})", red, green, blue)
-    } else {
-        format!("Color({}, {}, {}, {})", red, green, blue, alpha)
-    };
-    format!("![]({}) `{}`", data_uri, text)
+/// image followed by the already-rendered `Color(...)` text.
+pub(crate) fn color_swatch_markdown(
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: u8,
+    display: &str,
+) -> String {
+    let data_uri = color_swatch_data_uri(red, green, blue, alpha);
+    format!("![]({}) `{}`", data_uri, display)
 }
 
-/// Builds a `data:image/svg+xml;base64,...` URI for a solid color square.
-pub(crate) fn color_swatch_data_uri(red: u8, green: u8, blue: u8) -> String {
+/// Builds a `data:image/svg+xml;base64,...` URI for a color square.
+pub(crate) fn color_swatch_data_uri(red: u8, green: u8, blue: u8, alpha: u8) -> String {
+    let opacity = f32::from(alpha) / 255.0;
     let svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{size}\" height=\"{size}\">\
-<rect width=\"{size}\" height=\"{size}\" rx=\"2\" fill=\"#{r:02X}{g:02X}{b:02X}\" \
-stroke=\"#88888880\" stroke-width=\"1\"/></svg>",
+<defs><pattern id=\"checker\" width=\"4\" height=\"4\" patternUnits=\"userSpaceOnUse\">\
+<rect width=\"4\" height=\"4\" fill=\"#ffffff\"/>\
+<path d=\"M0 0h2v2H0zM2 2h2v2H2z\" fill=\"#c8c8c8\"/></pattern></defs>\
+<rect width=\"{size}\" height=\"{size}\" rx=\"2\" fill=\"url(#checker)\"/>\
+<rect width=\"{size}\" height=\"{size}\" rx=\"2\" fill=\"#{r:02X}{g:02X}{b:02X}\" fill-opacity=\"{opacity:.3}\"/>\
+<rect width=\"{size}\" height=\"{size}\" rx=\"2\" fill=\"none\" stroke=\"#88888880\" stroke-width=\"1\"/></svg>",
         size = SWATCH_SIZE,
         r = red,
         g = green,
         b = blue,
+        opacity = opacity,
     );
     format!(
         "data:image/svg+xml;base64,{}",
@@ -103,24 +108,34 @@ mod tests {
 
     #[test]
     fn data_uri_decodes_to_svg_with_expected_fill() {
-        let uri = color_swatch_data_uri(255, 0, 0);
+        let uri = color_swatch_data_uri(255, 0, 0, 255);
         let b64 = uri.strip_prefix("data:image/svg+xml;base64,").unwrap();
         let svg = String::from_utf8(base64_decode(b64)).unwrap();
         assert!(svg.contains("fill=\"#FF0000\""), "svg was: {svg}");
+        assert!(svg.contains("fill-opacity=\"1.000\""), "svg was: {svg}");
         assert!(svg.contains("<svg"));
     }
 
     #[test]
-    fn swatch_markdown_includes_image_and_text() {
-        let md = color_swatch_markdown(255, 0, 0, 255);
-        assert!(md.contains("data:image/svg+xml;base64,"));
-        assert!(md.contains("`Color(255, 0, 0)`"));
-        assert!(!md.contains("0, 0, 255)")); // no spurious alpha when opaque
+    fn translucent_data_uri_decodes_to_svg_with_alpha_and_checker() {
+        let uri = color_swatch_data_uri(20, 40, 60, 128);
+        let b64 = uri.strip_prefix("data:image/svg+xml;base64,").unwrap();
+        let svg = String::from_utf8(base64_decode(b64)).unwrap();
+        assert!(svg.contains("fill=\"#14283C\""), "svg was: {svg}");
+        assert!(svg.contains("fill-opacity=\"0.502\""), "svg was: {svg}");
+        assert!(svg.contains("id=\"checker\""), "svg was: {svg}");
     }
 
     #[test]
-    fn swatch_markdown_includes_alpha_when_translucent() {
-        let md = color_swatch_markdown(255, 0, 0, 128);
-        assert!(md.contains("`Color(255, 0, 0, 128)`"));
+    fn swatch_markdown_includes_image_and_text() {
+        let md = color_swatch_markdown(255, 0, 0, 255, "Color(255, 0, 0)");
+        assert!(md.contains("data:image/svg+xml;base64,"));
+        assert!(md.contains("`Color(255, 0, 0)`"));
+    }
+
+    #[test]
+    fn swatch_markdown_uses_caller_display_text() {
+        let md = color_swatch_markdown(255, 0, 0, 255, "Color(255, 0, 0, 255)");
+        assert!(md.contains("`Color(255, 0, 0, 255)`"));
     }
 }
