@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 
 use crate::{
     CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
-    LuaDeclOrMemberId, LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
+    LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
     compilation::{get_scripted_class_info_for_file, get_scripted_class_type_decl_id},
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaMergedTableType,
@@ -24,7 +24,7 @@ use crate::{
         InferGuard,
         generic::{TypeSubstitutor, instantiate_type_generic},
         infer::{
-            VarRefId, infer_index::infer_array::infer_array_member,
+            VarRefId, VarRefRootId, infer_index::infer_array::infer_array_member,
             infer_name::get_name_expr_var_ref_id, narrow::infer_expr_narrow_type,
         },
         is_doc_tag_table_const,
@@ -213,13 +213,13 @@ pub fn get_index_expr_var_ref_id(
     }
 
     if let LuaExpr::NameExpr(name_expr) = prefix_expr {
-        let decl_or_member_id = match get_name_expr_var_ref_id(db, cache, &name_expr) {
-            Some(VarRefId::SelfRef(decl_or_id)) => decl_or_id,
-            Some(VarRefId::VarRef(decl_id)) => LuaDeclOrMemberId::Decl(decl_id),
+        let root = match get_name_expr_var_ref_id(db, cache, &name_expr) {
+            Some(VarRefId::SelfRef(self_ref_id)) => VarRefRootId::SelfRef(self_ref_id),
+            Some(VarRefId::VarRef(decl_id)) => VarRefRootId::Decl(decl_id),
             _ => return None,
         };
 
-        let var_ref_id = VarRefId::IndexRef(decl_or_member_id, access_path);
+        let var_ref_id = VarRefId::IndexRef(root, access_path);
         cache
             .expr_var_ref_id_cache
             .insert(syntax_id, var_ref_id.clone());

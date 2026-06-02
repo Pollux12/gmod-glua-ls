@@ -50,6 +50,13 @@ pub struct LuaInferCache {
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
     /// within the same method body.
     pub self_type_cache: FxHashMap<LuaSyntaxId, Option<LuaType>>,
+    /// Region-aware base type seed for an implicit `self` flow query, set by
+    /// `infer_self` for the duration of a single `infer_expr_narrow_type_with_self_base`
+    /// call. When the flow walk reaches the origin for the matching `SelfRef`,
+    /// this seed is used as the base type instead of the (position-insensitive)
+    /// receiver decl/member cache, so reused locals resolve `self` per region
+    /// while still going through the normal narrowing pipeline.
+    pub self_base_seed: Option<(VarRefId, LuaType)>,
     /// Cache for `find_decl` results so that multiple diagnostic checkers
     /// processing the same file don't redo the full member-resolution chain.
     pub decl_cache: FxHashMap<LuaSyntaxId, Option<LuaSemanticDeclId>>,
@@ -161,6 +168,7 @@ impl LuaInferCache {
             scoped_scripted_global_cache: None,
             pending_str_tpl_type_decls: Vec::new(),
             self_type_cache: FxHashMap::default(),
+            self_base_seed: None,
             decl_cache: FxHashMap::default(),
             for_range_iter_var_type_cache: FxHashMap::default(),
             local_reassignment_positions_cache: FxHashMap::default(),
@@ -285,6 +293,7 @@ impl LuaInferCache {
         self.scoped_scripted_global_cache = None;
         self.pending_str_tpl_type_decls.clear();
         self.self_type_cache.clear();
+        self.self_base_seed = None;
         self.decl_cache.clear();
         self.for_range_iter_var_type_cache.clear();
         self.local_reassignment_positions_cache.clear();

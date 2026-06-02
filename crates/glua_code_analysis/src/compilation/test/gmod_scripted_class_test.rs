@@ -1705,6 +1705,218 @@ mod test {
         assert_eq!(panel_local_types[1].1, LuaType::Def(second_class_id));
     }
 
+    /// Regression: PANEL reassignment (`PANEL = {}`) should create distinct classes
+    /// per region. Today all PANEL references bind to a single class, so the set of
+    /// resolved class names contains only one entry instead of three.
+    #[gtest]
+    fn test_vgui_reassigned_panel_name_expr_resolves_per_region() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/vgui/reassigned_panel_regions.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("ReFrame", PANEL, "DFrame")
+
+            PANEL = {}
+            function PANEL:Paint() end
+            vgui.Register("ReButton", PANEL, "DButton")
+
+            PANEL = {}
+            function PANEL:Layout() end
+            derma.DefineControl("ReTree", "", PANEL, "DTree")
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let mut resolved_classes: Vec<_> = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter_map(|name_expr| {
+                let token = name_expr.get_name_token()?;
+                if token.get_name_text() != "PANEL" {
+                    return None;
+                }
+                let info = semantic_model.get_semantic_info(token.syntax().clone().into())?;
+                match &info.typ {
+                    LuaType::Def(id) => Some((name_expr.get_position(), id.get_simple_name().to_string())),
+                    _ => None,
+                }
+            })
+            .collect();
+        resolved_classes.sort_by_key(|(pos, _)| *pos);
+
+        let class_names: std::collections::HashSet<&str> =
+            resolved_classes.iter().map(|(_, n)| n.as_str()).collect();
+
+        assert!(
+            class_names.contains("ReFrame"),
+            "expected PANEL references to include ReFrame, got {class_names:?}"
+        );
+        assert!(
+            class_names.contains("ReButton"),
+            "expected PANEL references to include ReButton, got {class_names:?}"
+        );
+        assert!(
+            class_names.contains("ReTree"),
+            "expected PANEL references to include ReTree, got {class_names:?}"
+        );
+    }
+
+    /// Regression: the `local PANEL = {}` declaration should resolve to the FIRST
+    /// region's class ("ReFrame"), not a later region. Today it resolves to the
+    /// wrong (usually last) class.
+    #[gtest]
+    fn test_vgui_reassigned_panel_decl_token_first_region_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/vgui/reassigned_panel_decl_type.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("ReFrame", PANEL, "DFrame")
+
+            PANEL = {}
+            function PANEL:Paint() end
+            vgui.Register("ReButton", PANEL, "DButton")
+
+            PANEL = {}
+            function PANEL:Layout() end
+            derma.DefineControl("ReTree", "", PANEL, "DTree")
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let local_panel = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|t| t.get_name_text() == "PANEL")
+            })
+            .expect("expected one local PANEL declaration");
+
+        let token = local_panel.get_name_token().expect("expected PANEL token");
+        let semantic_info = semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("expected semantic info for local PANEL");
+
+        assert_eq!(
+            semantic_info.typ,
+            LuaType::Def(LuaTypeDeclId::global("ReFrame")),
+            "local PANEL should resolve to first region class ReFrame"
+        );
+    }
+
+    /// Regression: `self:ReloadTree()` inside the FIRST PANEL region should not
+    /// produce a false undefined-field diagnostic. Under the bug, all PANEL
+    /// references collapse to the LAST registered class ("BrowserPanel"), so
+    /// `self` in the early region resolves to BrowserPanel which lacks
+    /// ReloadTree → false positive. After the fix, each region resolves to its
+    /// own class: self in TreePanel's region finds ReloadTree → no diagnostic.
+    #[gtest]
+    fn test_vgui_reassigned_panel_self_method_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/vgui/reassigned_panel_self_method.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:ReloadTree() end
+            function PANEL:Refresh()
+                self:ReloadTree()
+            end
+            vgui.Register("TreePanel", PANEL, "DTree")
+
+            PANEL = {}
+            function PANEL:Paint() end
+            vgui.Register("BrowserPanel", PANEL, "DPanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_field_code),
+            "self:ReloadTree() in TreePanel region should not trigger undefined-field, got {diagnostics:?}"
+        );
+    }
+
+    /// Negative control: calling a method that exists on NO region should still
+    /// produce an undefined-field diagnostic. Guards against an over-broad fix
+    /// that suppresses all field checks on reassigned PANEL.
+    #[gtest]
+    fn test_vgui_reassigned_panel_wrong_method_still_flags_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/vgui/reassigned_panel_wrong_method.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("AlphaPanel", PANEL, "DFrame")
+
+            PANEL = {}
+            function PANEL:Refresh()
+                self:DoesNotExistAnywhere()
+            end
+            vgui.Register("BetaPanel", PANEL, "DPanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.code == undefined_field_code),
+            "self:DoesNotExistAnywhere() should produce an undefined-field diagnostic, got {diagnostics:?}"
+        );
+    }
+
     #[gtest]
     fn test_vgui_panel_self_dynamic_field_no_undefined_field_diagnostic() {
         let mut ws = VirtualWorkspace::new();
@@ -7123,6 +7335,129 @@ mod test {
         assert!(
             !member_names.contains(&"GetSpeed".to_string()),
             "unexpected GetSpeed from nonexistent target in {member_names:?}"
+        );
+    }
+
+    /// Oracle audit: `self.field` IndexRef root uses the shared receiver decl,
+    /// NOT the method-aware self_decl_id. Two methods of the SAME reused
+    /// `local PANEL` (regions A and B) share the same receiver `Decl(panel_decl)`.
+    /// If the IndexRef key for `self.value` collapses across regions, then
+    /// `self.value` typed as string in region A could poison region B's
+    /// `self.value` (which should be number), or vice-versa.
+    ///
+    /// This test assigns DIFFERENT types to `self.value` in each region and
+    /// asserts each resolves independently.
+    #[gtest]
+    fn test_vgui_reassigned_panel_self_field_type_not_collapsed_across_regions() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/vgui/self_field_collapse.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                self.value = "stringval"
+            end
+            function PANEL:UseValue()
+                local x = self.value
+            end
+            vgui.Register("PanelA", PANEL, "DPanel")
+
+            PANEL = {}
+            function PANEL:Init()
+                self.value = 123
+            end
+            function PANEL:UseValue()
+                local y = self.value
+            end
+            vgui.Register("PanelB", PANEL, "DPanel")
+            "#,
+        );
+
+        let x_type = local_name_type(&mut ws, file_id, "x");
+        let y_type = local_name_type(&mut ws, file_id, "y");
+
+        let x_display = ws.humanize_type(x_type.clone());
+        let y_display = ws.humanize_type(y_type.clone());
+
+        // Region A: self.value = "stringval" → x should resolve to string
+        assert!(
+            x_display.contains("string"),
+            "PanelA region: self.value should resolve to string, got {x_display:?}"
+        );
+
+        // Region B: self.value = 123 → y should resolve to number/integer
+        assert!(
+            y_display.contains("number")
+                || y_display.contains("integer")
+                || matches!(y_type, LuaType::IntegerConst(_) | LuaType::Number | LuaType::Integer),
+            "PanelB region: self.value should resolve to number/integer, got {y_display:?} ({y_type:?})"
+        );
+
+        // The two types must be distinct — collapse would make them identical
+        assert_ne!(
+            x_type, y_type,
+            "self.value types should differ across regions (collapse detected): \
+             x={x_display:?}, y={y_display:?}"
+        );
+    }
+
+    /// Regression: when PANEL is aliased (`local OLD = PANEL`), then PANEL is
+    /// reassigned (`PANEL = {}`), and a method is added via the OLD alias
+    /// (`function OLD:OldOnly() end`), the fallback member transfer must NOT
+    /// carry `OldOnly` into the new panel class. The member belongs to the
+    /// original initializer table through the OLD alias, not to the reassigned
+    /// PANEL table that is being registered.
+    ///
+    /// The risk: `collect_panel_member_source_ranges` includes the initializer
+    /// table range as a fallback source. If `OldOnly`'s position falls within
+    /// `[latest_write_position, register_position)` of the PANEL decl, the
+    /// position-slicing filter could wrongly transfer it to NewPanel.
+    #[gtest]
+    fn test_vgui_register_alias_after_reassignment_does_not_transfer_aliased_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/vgui/alias_after_reassign.lua",
+            r#"
+            local PANEL = {}
+            local OLD = PANEL
+            PANEL = {}
+            function OLD:OldOnly() end
+            vgui.Register("NewPanel", PANEL, "DPanel")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let new_panel_class_id = LuaTypeDeclId::global("NewPanel");
+
+        assert!(
+            db.get_type_index()
+                .get_type_decl(&new_panel_class_id)
+                .is_some(),
+            "NewPanel class should be created"
+        );
+
+        let new_panel_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(new_panel_class_id.clone()))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            !new_panel_members.contains(&"OldOnly".to_string()),
+            "NewPanel should NOT inherit OldOnly from the aliased OLD table, got {new_panel_members:?}"
         );
     }
 }

@@ -13,7 +13,9 @@ use crate::{
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
     semantic::{
-        infer::narrow::{VarRefId, infer_expr_narrow_type},
+        infer::narrow::{
+            SelfRefId, VarRefId, infer_expr_narrow_type, infer_expr_narrow_type_with_self_base,
+        },
         member::merge_open_table_types,
         semantic_info::resolve_global_decl_id,
     },
@@ -512,22 +514,45 @@ fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
 }
 
 fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -> InferResult {
-    if let Some(scoped_self_type) = infer_scoped_implicit_self_type(db, cache, &name_expr) {
-        return Ok(scoped_self_type);
-    }
+    let self_ref_id = find_self_ref_id(db, cache, &name_expr).ok_or(InferFailReason::None)?;
 
-    let decl_or_member_id =
-        find_self_decl_or_member_id(db, cache, &name_expr).ok_or(InferFailReason::None)?;
-    // LuaDeclOrMemberId::Member(member_id) => find_decl_member_type(db, member_id),
-    infer_expr_narrow_type(
+    // Compute a region-aware base for the implicit `self` (the colon-method
+    // receiver inferred at its own position). For reused locals reassigned per
+    // region this yields the correct per-region class; for stable globals it
+    // yields the same declared type the generic path would. We then run the
+    // normal flow-narrowing pipeline on top of this base, so guards like
+    // `if self == self.parent then ... end` still narrow correctly.
+    //
+    // The base is only seeded when concrete (Def/Ref/TableConst/Instance/...),
+    // so generic `SelfInfer`/declared-parameter `self` still falls through to
+    // the canonical `get_var_ref_type` resolution.
+    let base_seed = infer_implicit_method_self_type(db, cache, &name_expr);
+
+    infer_expr_narrow_type_with_self_base(
         db,
         cache,
         LuaExpr::NameExpr(name_expr),
-        VarRefId::SelfRef(decl_or_member_id),
+        VarRefId::SelfRef(self_ref_id),
+        base_seed,
     )
 }
 
-fn infer_scoped_implicit_self_type(
+/// Resolves the type of an implicit `self` inside a colon method by binding it
+/// to the method's receiver (the colon-method prefix), so `self` always agrees
+/// with the parent it is defined within — including reused locals reassigned to
+/// distinct tables/classes per region.
+///
+/// Resolution order:
+/// 1. Path-scoped seeded class locals (ENT/SWEP/GM) resolve by their scoped
+///    class name (one class per file) — preserved as-is.
+/// 2. Otherwise infer the enclosing colon-method prefix expression *at its
+///    position* (region-aware via flow + GMod table-literal class binding) and
+///    use it when it yields a concrete receiver type.
+///
+/// Returns `None` for explicit (non-implicit) `self`, or when no concrete
+/// receiver type can be derived, so callers fall back to the generic
+/// declaration/member `SelfRef` path.
+fn infer_implicit_method_self_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
@@ -542,23 +567,43 @@ fn infer_scoped_implicit_self_type(
     let func_stat = name_expr.ancestors::<LuaFuncStat>().next()?;
     let func_syntax_id = func_stat.get_syntax_id();
 
-    // Check self type cache for this method
+    // Cache the unified result (including a negative result) for subsequent
+    // `self` references in the same method body.
     if let Some(cached) = cache.self_type_cache.get(&func_syntax_id) {
         return cached.clone();
     }
 
-    let result = infer_scoped_implicit_self_type_inner(db, cache, func_stat);
-
-    // Cache the result for subsequent `self` references in the same method
+    let result = infer_implicit_method_self_type_inner(db, cache, name_expr);
     cache.self_type_cache.insert(func_syntax_id, result.clone());
     result
 }
 
-fn infer_scoped_implicit_self_type_inner(
+fn infer_implicit_method_self_type_inner(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    func_stat: LuaFuncStat,
+    name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
+    // 1. Path-scoped seeded class locals (ENT/SWEP/GM): name/path-driven, one
+    //    class per file. Keep this first to preserve scoped-class behavior.
+    if let Some(scoped_type) = infer_scoped_seeded_class_self_type(db, cache, name_expr) {
+        return Some(scoped_type);
+    }
+
+    // 2. General case: infer the enclosing colon-method prefix at its position.
+    //    This is region-aware, so a reused local resolves `self` to the class
+    //    of the table backing the current region.
+    let prefix_type = infer_enclosing_self_type(db, cache, name_expr)?;
+    is_concrete_self_receiver_type(&prefix_type).then_some(prefix_type)
+}
+
+/// Resolves `self` for synthetically-seeded scoped class locals (ENT/SWEP/GM),
+/// which map a file to a single class by name/path.
+fn infer_scoped_seeded_class_self_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaType> {
+    let func_stat = name_expr.ancestors::<LuaFuncStat>().next()?;
     let func_name = func_stat.get_func_name()?;
     let LuaVarExpr::IndexExpr(index_expr) = func_name else {
         return None;
@@ -585,6 +630,22 @@ fn infer_scoped_implicit_self_type_inner(
     Some(LuaType::Def(class_decl_id))
 }
 
+/// Returns true when `typ` is a concrete receiver type suitable to be used
+/// directly as an implicit `self` type. Rejects unconstrained/unknown types so
+/// the caller falls back to the generic `SelfRef` resolution path (preserving
+/// generic `SelfInfer` and declared-parameter behavior).
+fn is_concrete_self_receiver_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Def(_)
+        | LuaType::Ref(_)
+        | LuaType::TableConst(_)
+        | LuaType::Instance(_)
+        | LuaType::Object(_) => true,
+        LuaType::Union(union) => union.into_vec().iter().any(is_concrete_self_receiver_type),
+        _ => false,
+    }
+}
+
 pub fn get_name_expr_var_ref_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -594,8 +655,8 @@ pub fn get_name_expr_var_ref_id(
     let name = name_token.get_name_text();
     match name {
         "self" => {
-            let decl_or_id = find_self_decl_or_member_id(db, cache, name_expr)?;
-            Some(VarRefId::SelfRef(decl_or_id))
+            let self_ref_id = find_self_ref_id(db, cache, name_expr)?;
+            Some(VarRefId::SelfRef(self_ref_id))
         }
         _ => {
             let file_id = cache.get_file_id();
@@ -1308,18 +1369,48 @@ fn is_realm_compatible(call_realm: GmodRealm, decl_realm: GmodRealm) -> bool {
     )
 }
 
-pub fn find_self_decl_or_member_id(
+/// Resolves the full `self` reference identity for a `self` name expression.
+///
+/// Returns a [`SelfRefId`] carrying:
+/// - `self_decl_id`: the (implicit or explicit) `self` declaration — unique per
+///   method body, used as the flow-cache / `VarRefId` identity.
+/// - `receiver`: the colon-method prefix owner used for base/member lookup.
+///
+/// For an explicit (shadowing) `self` local/param, the receiver is the `self`
+/// decl itself, so it behaves like an ordinary local.
+pub fn find_self_ref_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
-) -> Option<LuaDeclOrMemberId> {
+) -> Option<SelfRefId> {
     let file_id = cache.get_file_id();
     let tree = db.get_decl_index().get_decl_tree(&file_id)?;
 
     let self_decl = tree.find_local_decl("self", name_expr.get_position())?;
+    let self_decl_id = self_decl.get_id();
     if !self_decl.is_implicit_self() {
-        return Some(LuaDeclOrMemberId::Decl(self_decl.get_id()));
+        return Some(SelfRefId {
+            self_decl_id,
+            receiver: LuaDeclOrMemberId::Decl(self_decl_id),
+        });
     }
+
+    let receiver = find_self_receiver_id(db, cache, &self_decl, name_expr)?;
+    Some(SelfRefId {
+        self_decl_id,
+        receiver,
+    })
+}
+
+/// Resolves the receiver owner (colon-method prefix) for an implicit `self`.
+fn find_self_receiver_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    self_decl: &LuaDecl,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaDeclOrMemberId> {
+    let file_id = cache.get_file_id();
+    let tree = db.get_decl_index().get_decl_tree(&file_id)?;
 
     let root = name_expr.get_root();
     let syntax_id = self_decl.get_syntax_id();
@@ -1354,6 +1445,19 @@ pub fn find_self_decl_or_member_id(
         }
         _ => None,
     }
+}
+
+/// Resolves only the receiver owner of a `self` expression (decl or member).
+///
+/// Retained for callers that need the receiver owner (member/base lookup,
+/// unresolved-reference rewriting) and do not care about the per-method `self`
+/// identity.
+pub fn find_self_decl_or_member_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaDeclOrMemberId> {
+    Some(find_self_ref_id(db, cache, name_expr)?.receiver)
 }
 
 /// Returns true if the type contains an unresolved `SelfInfer`.
@@ -1391,13 +1495,22 @@ fn infer_enclosing_self_type(
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
     for func_stat in name_expr.ancestors::<LuaFuncStat>() {
-        let func_name = func_stat.get_func_name()?;
-        if let LuaVarExpr::IndexExpr(index_expr) = func_name {
-            if index_expr.get_index_token()?.is_colon() {
-                let prefix_expr = index_expr.get_prefix_expr()?;
-                return infer_expr(db, cache, prefix_expr).ok();
-            }
+        // Skip anonymous/non-colon ancestors (e.g. nested closures) and keep
+        // walking outward to the enclosing colon method, rather than bailing out
+        // on the first ancestor that lacks a colon-method name.
+        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
+            continue;
+        };
+        if !index_expr
+            .get_index_token()
+            .is_some_and(|token| token.is_colon())
+        {
+            continue;
         }
+        let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+            continue;
+        };
+        return infer_expr(db, cache, prefix_expr).ok();
     }
     None
 }

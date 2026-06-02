@@ -9,14 +9,15 @@ use glua_parser::{
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
     LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaRepeatStat, LuaStat, LuaSyntaxNode,
-    LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
+    LuaTableExpr, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
 };
 
 use crate::{
     EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodScriptedClassCallKind,
-    GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, LuaDecl, LuaDeclExtra, LuaDeclId,
-    LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId,
-    LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
+    GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, InFiled, LuaDecl, LuaDeclExtra,
+    LuaDeclId, LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature,
+    LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
+    LuaTypeOwner,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -2189,7 +2190,6 @@ fn synthesize_scripted_class_members(
 
 /// Synthesize vgui.Register / derma.DefineControl class types.
 fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
-    let mut original_decl_table_types: HashMap<LuaDeclId, Option<LuaType>> = HashMap::new();
     // Track (file_id, table_var_name, panel_name) for AccessorFunc synthesis
     let mut vgui_table_vars: Vec<(FileId, String, String)> = Vec::new();
 
@@ -2212,7 +2212,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     vgui_table_vars.push((file_id, table_var.clone(), panel_name.clone()));
                 }
             }
-            synthesize_vgui_register(db, file_id, call, &mut original_decl_table_types);
+            synthesize_vgui_register(db, file_id, call);
         }
 
         for call in &metadata.derma_define_control_calls {
@@ -2224,7 +2224,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     vgui_table_vars.push((file_id, table_var.clone(), panel_name.clone()));
                 }
             }
-            synthesize_derma_define_control(db, file_id, call, &mut original_decl_table_types);
+            synthesize_derma_define_control(db, file_id, call);
         }
     }
 
@@ -3206,7 +3206,6 @@ fn synthesize_vgui_register(
     db: &mut DbIndex,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
-    original_decl_table_types: &mut HashMap<LuaDeclId, Option<LuaType>>,
 ) {
     // vgui.Register("PanelName", TABLE, "BasePanel")
     // args[0] = panel name (string)
@@ -3234,7 +3233,6 @@ fn synthesize_vgui_register(
         table_var_name.as_deref(),
         base_panel.as_deref(),
         call,
-        original_decl_table_types,
     );
 }
 
@@ -3242,7 +3240,6 @@ fn synthesize_derma_define_control(
     db: &mut DbIndex,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
-    original_decl_table_types: &mut HashMap<LuaDeclId, Option<LuaType>>,
 ) {
     // derma.DefineControl("ControlName", "description", TABLE, "BasePanel")
     // args[0] = control name (string)
@@ -3271,7 +3268,6 @@ fn synthesize_derma_define_control(
         table_var_name.as_deref(),
         base_panel.as_deref(),
         call,
-        original_decl_table_types,
     );
 
     // Register the control name as a global variable with the panel type
@@ -3319,25 +3315,88 @@ fn register_global_panel(
     );
 }
 
-fn find_table_type_for_register(
+// REMOVED: find_table_type_for_register — it fell back to the shared decl-level
+// type cache, which is exactly the position-insensitive slot that caused
+// reassigned-PANEL collapse. Resolution now goes through the concrete table
+// expression (find_registered_table_expr) instead.
+
+/// Locate the concrete table-constructor (`{}`) expression that backs the
+/// variable being registered, by scanning to the variable's latest write
+/// before the register call and taking the matching RHS expression.
+///
+/// VGUI files commonly reuse a single `local PANEL` decl with repeated plain
+/// reassignments (`PANEL = {}`), one per registered class. The class identity
+/// belongs to each individual table value, not to the shared decl slot — so we
+/// resolve the exact `{}` literal at the latest write position and return its
+/// table range plus syntax id. Callers bind the synthesized class to that
+/// `SyntaxId`, which the public `infer_expr` override consults, giving correct
+/// per-region resolution for hover/diagnostics/CodeLens alike.
+///
+/// Returns `None` (caller skips SyntaxId binding) when the RHS is not a table
+/// literal (e.g. `PANEL = make()`, `PANEL = SomeOther`), keeping behavior
+/// conservative for non-literal table values.
+fn find_registered_table_expr(
     db: &DbIndex,
     file_id: FileId,
     decl_id: LuaDeclId,
     register_position: TextSize,
-) -> Option<LuaType> {
-    let latest_write_decl_id =
+) -> Option<LuaTableExpr> {
+    // The latest write position is the start of the assigned name range for the
+    // most recent plain reassignment (`PANEL = {}`) before the register call.
+    //
+    // The original `local PANEL = {}` declaration is NOT recorded as a write
+    // reference cell (only later assignments are), so for the FIRST region
+    // there is no prior write — fall back to the decl's own position, where the
+    // enclosing `LuaLocalStat` yields the initializer table RHS.
+    let write_position =
         find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
-            .map(|position| LuaDeclId::new(file_id, position));
+            .unwrap_or(decl_id.position);
 
-    if let Some(write_decl_id) = latest_write_decl_id
-        && let Some(type_cache) = db.get_type_index().get_type_cache(&write_decl_id.into())
-    {
-        return Some(type_cache.as_type().clone());
+    let tree = db.get_vfs().get_syntax_tree(&file_id)?;
+    let chunk = tree.get_chunk_node();
+
+    // Find the name node at the write position, then walk up to its enclosing
+    // statement and select the RHS expression at the matching variable index.
+    let name_token = chunk
+        .syntax()
+        .token_at_offset(write_position)
+        .right_biased()?;
+
+    for ancestor in name_token.parent_ancestors() {
+        if let Some(local_stat) = LuaLocalStat::cast(ancestor.clone()) {
+            let names: Vec<LuaLocalName> = local_stat.get_local_name_list().collect();
+            let values: Vec<LuaExpr> = local_stat.get_value_exprs().collect();
+            let var_index = names.iter().position(|name| {
+                name.get_name_token()
+                    .is_some_and(|tok| tok.syntax().text_range().start() == write_position)
+            })?;
+            return value_expr_as_table(values.get(var_index)?);
+        }
+
+        if let Some(assign_stat) = LuaAssignStat::cast(ancestor.clone()) {
+            let (vars, exprs) = assign_stat.get_var_and_expr_list();
+            let var_index = vars.iter().position(|var| {
+                var.syntax().text_range().start() == write_position
+            })?;
+            return value_expr_as_table(exprs.get(var_index)?);
+        }
     }
 
-    db.get_type_index()
-        .get_type_cache(&decl_id.into())
-        .map(|type_cache| type_cache.as_type().clone())
+    None
+}
+
+/// Unwrap parenthesized expressions and require a table constructor.
+fn value_expr_as_table(expr: &LuaExpr) -> Option<LuaTableExpr> {
+    let mut current = expr.clone();
+    loop {
+        match current {
+            LuaExpr::TableExpr(table_expr) => return Some(table_expr),
+            LuaExpr::ParenExpr(paren_expr) => {
+                current = paren_expr.get_expr()?;
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn find_latest_decl_write_before_position(
@@ -3365,7 +3424,6 @@ fn synthesize_panel_class(
     table_var_name: Option<&str>,
     base_panel: Option<&str>,
     call: &GmodScriptedClassCallMetadata,
-    original_decl_table_types: &mut HashMap<LuaDeclId, Option<LuaType>>,
 ) {
     let class_decl_id = LuaTypeDeclId::global(panel_name);
 
@@ -3399,7 +3457,17 @@ fn synthesize_panel_class(
         synthesize_panel_baseclass_member(db, file_id, &class_decl_id, base_name, call);
     }
 
-    // Bind the table variable to the panel class
+    // Bind the table variable to the panel class.
+    //
+    // VGUI files reuse a single `local PANEL` decl with repeated plain
+    // reassignments (`PANEL = {}`), one per registered class. The class
+    // identity belongs to each concrete table value (the `{}` literal), NOT to
+    // the shared decl slot. Binding the decl slot collapses every region onto a
+    // single class (last-write-wins), which is the root cause of the
+    // reassigned-PANEL mis-binding. Instead we bind the class to the exact
+    // table-constructor expression via `LuaTypeOwner::SyntaxId`, which the
+    // public `infer_expr` override consults — yielding correct per-region
+    // resolution for hover, diagnostics, completion and CodeLens uniformly.
     if let Some(var_name) = table_var_name {
         let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) else {
             return;
@@ -3414,42 +3482,74 @@ fn synthesize_panel_class(
             return;
         };
 
-        let previous_decl_type =
-            find_table_type_for_register(db, file_id, decl_id, register_position);
-        let decl_table_type = original_decl_table_types
-            .entry(decl_id)
-            .or_insert_with(|| {
-                db.get_type_index()
-                    .get_type_cache(&decl_id.into())
-                    .map(|type_cache| type_cache.as_type().clone())
-            })
-            .clone();
+        let class_type = LuaType::Def(class_decl_id.clone());
         let latest_write_position =
             find_latest_decl_write_before_position(db, file_id, decl_id, register_position);
 
-        db.get_type_index_mut().force_bind_type(
-            decl_id.into(),
-            LuaTypeCache::InferType(LuaType::Def(class_decl_id.clone())),
-        );
+        // Resolve the concrete `{}` table literal backing this registration.
+        let registered_table = find_registered_table_expr(db, file_id, decl_id, register_position);
 
-        // Transfer table members to the class
-        let mut table_ranges = Vec::new();
-        if let Some(LuaType::TableConst(table_range)) = previous_decl_type {
-            table_ranges.push(table_range);
-        }
-        if let Some(LuaType::TableConst(table_range)) = decl_table_type
-            && !table_ranges.iter().any(|existing| existing == &table_range)
-        {
-            table_ranges.push(table_range);
+        if let Some(table_expr) = &registered_table {
+            // Bind the class to this exact table-constructor expression.
+            // Preserve any user `@as`/cast (DocType) binding already present.
+            let table_syntax_owner =
+                LuaTypeOwner::SyntaxId(InFiled::new(file_id, table_expr.get_syntax_id()));
+            let preserve_doc = db
+                .get_type_index()
+                .get_type_cache(&table_syntax_owner)
+                .is_some_and(|cache| cache.is_doc());
+            if !preserve_doc {
+                db.get_type_index_mut().force_bind_type(
+                    table_syntax_owner,
+                    LuaTypeCache::InferType(class_type.clone()),
+                );
+            }
+        } else if !decl_has_reassignment(db, file_id, decl_id) {
+            // Compatibility fallback for single-panel files (one `local PANEL`,
+            // no plain reassignments) where the RHS is not a recoverable table
+            // literal. Binding the decl slot is safe here because the local is
+            // never reused, so there is no region to collapse. Reassigned
+            // locals are deliberately left untouched to avoid collapse.
+            db.get_type_index_mut().force_bind_type(
+                decl_id.into(),
+                LuaTypeCache::InferType(class_type.clone()),
+            );
         }
 
-        if !table_ranges.is_empty() {
+        // Transfer the members defined in this registration's table region to
+        // the class, then rewrite that exact table-const range so persistent
+        // type caches (cross-file accesses, exports) resolve to the class.
+        if let Some(table_expr) = &registered_table {
+            let table_range = InFiled::new(file_id, table_expr.get_range());
             let class_member_owner = LuaMemberOwner::Type(class_decl_id.clone());
-            let mut table_member_ids = HashSet::new();
 
-            for table_range in &table_ranges {
-                let table_member_owner = LuaMemberOwner::Element(table_range.clone());
-                if let Some(members) = db.get_member_index().get_members(&table_member_owner) {
+            // Members defined via `function PANEL:Method()` / `PANEL.Field =`
+            // are collected during the `lua` analysis pass — which runs BEFORE
+            // this gmod post-analysis SyntaxId binding exists. At that point the
+            // flow inference of the reused `PANEL` local resolves to its
+            // *initializer* table literal, so EVERY region's members accumulate
+            // under that single `Element` owner, differentiated only by source
+            // position. The per-region table literal's own `Element` owner is
+            // therefore usually empty.
+            //
+            // To bridge synthesis (which knows the per-region boundary) with
+            // collection (which keyed everything on the initializer table), we
+            // gather all candidate member-source `Element` owners and slice them
+            // by source position `[latest_write_position, register_position)`.
+            // This stays correct if a future flow-aware collector starts keying
+            // members under the per-region literal instead.
+            let member_source_ranges = collect_panel_member_source_ranges(
+                db,
+                file_id,
+                decl_id,
+                &table_range,
+            );
+
+            let mut table_member_ids = HashSet::new();
+            for (source_idx, source_range) in member_source_ranges.iter().enumerate() {
+                let is_initializer_fallback = source_idx > 0;
+                let source_owner = LuaMemberOwner::Element(source_range.clone());
+                if let Some(members) = db.get_member_index().get_members(&source_owner) {
                     for member in members {
                         let member_position = member.get_id().get_position();
                         if member_position < register_position
@@ -3457,6 +3557,21 @@ fn synthesize_panel_class(
                                 .map(|write_position| member_position >= write_position)
                                 .unwrap_or(true)
                         {
+                            // For the initializer table fallback, verify the member
+                            // was defined using the registered variable name. Members
+                            // defined through aliases (e.g. `local OLD = PANEL;
+                            // function OLD:Method()`) must not be transferred to the
+                            // new panel class.
+                            if is_initializer_fallback
+                                && !member_defined_via_variable(
+                                    db,
+                                    file_id,
+                                    member_position,
+                                    var_name,
+                                )
+                            {
+                                continue;
+                            }
                             table_member_ids.insert(member.get_id());
                         }
                     }
@@ -3467,13 +3582,155 @@ fn synthesize_panel_class(
                 add_member(db, class_member_owner.clone(), member_id);
             }
 
-            // Replace stale table-const types with the synthesized class type so cross-file accesses resolve correctly.
-            let class_type = LuaType::Def(class_decl_id.clone());
-            for table_range in &table_ranges {
-                db.get_type_index_mut()
-                    .replace_table_const_type(table_range, &class_type);
-            }
+            // Backfill persistent type caches that still hold this exact
+            // table-const identity (scoped to the current range only — never
+            // carried forward across registrations).
+            db.get_type_index_mut()
+                .replace_table_const_type(&table_range, &class_type);
         }
+    }
+}
+
+/// Collect the candidate `Element` owner ranges that may hold this
+/// registration region's members, deduped and most-specific first.
+///
+/// `function PANEL:Method()` member collection happens in the `lua` pass before
+/// the gmod-post SyntaxId binding exists, so members of reused locals end up
+/// under the local's *initializer* table `Element` owner rather than each
+/// region's own table literal. We therefore consider:
+///
+/// 1. the exact per-region table literal range (precise / future-proof), and
+/// 2. the original local declaration's initializer `TableConst` range (where
+///    the lua pass actually accumulated the members today).
+///
+/// Callers slice the resulting members by source position to attribute them to
+/// the correct region.
+fn collect_panel_member_source_ranges(
+    db: &DbIndex,
+    file_id: FileId,
+    decl_id: LuaDeclId,
+    region_table_range: &InFiled<TextRange>,
+) -> Vec<InFiled<TextRange>> {
+    let mut ranges: Vec<InFiled<TextRange>> = Vec::with_capacity(2);
+    ranges.push(region_table_range.clone());
+
+    // The original local decl's initializer table literal (`local PANEL = {}`)
+    // is the `Element` owner the lua pass keyed all reused-local members under.
+    //
+    // We derive this range from the AST rather than the decl type cache: the
+    // cache is rewritten in-place by `replace_table_const_type` as each region
+    // is synthesized, so by the second registration the original decl's cache
+    // no longer reports its initializer `TableConst`.
+    if let Some(initializer_range) = find_decl_initializer_table_range(db, file_id, decl_id)
+        && !ranges.iter().any(|existing| existing == &initializer_range)
+    {
+        ranges.push(initializer_range);
+    }
+
+    ranges
+}
+
+/// Find the range of the table literal in a local declaration's initializer
+/// (`local PANEL = {}` -> range of `{}`), derived purely from the AST so it is
+/// stable against type-cache mutation during synthesis.
+fn find_decl_initializer_table_range(
+    db: &DbIndex,
+    file_id: FileId,
+    decl_id: LuaDeclId,
+) -> Option<InFiled<TextRange>> {
+    let tree = db.get_vfs().get_syntax_tree(&file_id)?;
+    let chunk = tree.get_chunk_node();
+    let name_token = chunk
+        .syntax()
+        .token_at_offset(decl_id.position)
+        .right_biased()?;
+
+    for ancestor in name_token.parent_ancestors() {
+        if let Some(local_stat) = LuaLocalStat::cast(ancestor.clone()) {
+            let names: Vec<LuaLocalName> = local_stat.get_local_name_list().collect();
+            let values: Vec<LuaExpr> = local_stat.get_value_exprs().collect();
+            let var_index = names.iter().position(|name| {
+                name.get_name_token()
+                    .is_some_and(|tok| tok.syntax().text_range().start() == decl_id.position)
+            })?;
+            let table_expr = value_expr_as_table(values.get(var_index)?)?;
+            return Some(InFiled::new(file_id, table_expr.get_range()));
+        }
+    }
+
+    None
+}
+
+/// Returns true when the local decl has at least one write that is not its
+/// initial declaration position — i.e. it is reassigned (`PANEL = {}`) after
+/// the original `local PANEL`. Used to keep the single-panel decl-binding
+/// compatibility path from contaminating reused locals.
+fn decl_has_reassignment(db: &DbIndex, file_id: FileId, decl_id: LuaDeclId) -> bool {
+    let decl_position = decl_id.position;
+    db.get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .map(|decl_references| {
+            decl_references
+                .cells
+                .iter()
+                .any(|cell| cell.is_write && cell.range.start() != decl_position)
+        })
+        .unwrap_or(false)
+}
+
+/// Check if a member at the given position was defined using a specific
+/// variable name. Walks up from the member's syntax position to find the
+/// enclosing `function VAR:Method()` / `VAR.Field = value` and checks the
+/// prefix variable name.
+///
+/// Returns `true` (conservative include) when the variable name cannot be
+/// determined, so callers don't accidentally drop members they can't trace.
+fn member_defined_via_variable(
+    db: &DbIndex,
+    file_id: FileId,
+    member_position: TextSize,
+    var_name: &str,
+) -> bool {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return true;
+    };
+    let chunk = tree.get_chunk_node();
+    let Some(token) = chunk
+        .syntax()
+        .token_at_offset(member_position)
+        .right_biased()
+    else {
+        return true;
+    };
+
+    for ancestor in token.parent_ancestors() {
+        if let Some(func_stat) = LuaFuncStat::cast(ancestor.clone()) {
+            if let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() {
+                return index_expr_prefix_matches(&index_expr, var_name);
+            }
+            return false;
+        }
+        if let Some(assign_stat) = LuaAssignStat::cast(ancestor.clone()) {
+            let (vars, _) = assign_stat.get_var_and_expr_list();
+            for var in vars {
+                if let LuaVarExpr::IndexExpr(index_expr) = &var {
+                    if index_expr_prefix_matches(index_expr, var_name) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
+    true
+}
+
+fn index_expr_prefix_matches(index_expr: &glua_parser::LuaIndexExpr, var_name: &str) -> bool {
+    if let Some(LuaExpr::NameExpr(prefix)) = index_expr.get_prefix_expr() {
+        prefix.get_name_text().as_deref() == Some(var_name)
+    } else {
+        false
     }
 }
 

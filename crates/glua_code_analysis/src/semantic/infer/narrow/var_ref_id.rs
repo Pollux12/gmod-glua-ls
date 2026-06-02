@@ -16,12 +16,136 @@ use crate::{
     },
 };
 
+/// Identity for an implicit `self` reference inside a colon method.
+///
+/// `self_decl_id` is the method's implicit `self` declaration, which is unique
+/// per method body. It is used as the flow-cache / `VarRefId` identity so that
+/// two methods of the *same* reused local (e.g. `local PANEL` reassigned and
+/// redefined per region) do NOT share a `SelfRef` key and poison each other's
+/// flow narrowing.
+///
+/// `receiver` is the colon-method prefix owner (decl or member) and is used
+/// only for base/member type lookup, never for identity.
+#[derive(Debug, Clone)]
+pub struct SelfRefId {
+    pub self_decl_id: LuaDeclId,
+    pub receiver: LuaDeclOrMemberId,
+}
+
+impl PartialEq for SelfRefId {
+    fn eq(&self, other: &Self) -> bool {
+        // Identity is keyed on the unique implicit-self decl, NOT the receiver.
+        self.self_decl_id == other.self_decl_id
+    }
+}
+
+impl Eq for SelfRefId {}
+
+impl Hash for SelfRefId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.self_decl_id.hash(state);
+    }
+}
+
+/// Root identity for [`VarRefId::IndexRef`].
+///
+/// An index expression like `self.value` or `tbl.field` has two parts: the root
+/// (what is being indexed) and the access path (`"value"`). This enum captures
+/// the root identity with enough precision so that two index expressions from
+/// *different* regions of a reused local (e.g. `local PANEL` reassigned and
+/// redefined per `vgui.Register` region) do NOT share a flow-cache key.
+///
+/// - `Decl` / `Member` preserve the old behaviour for ordinary table/variable
+///   index refs.
+/// - `SelfRef` carries the full [`SelfRefId`] (method-aware identity) so that
+///   `self.field` inside different colon-methods of the *same* reused local
+///   keeps distinct var-ref identity.  This prevents flow narrowing from one
+///   region poisoning another.
+#[derive(Debug, Clone)]
+pub enum VarRefRootId {
+    Decl(LuaDeclId),
+    Member(LuaMemberId),
+    SelfRef(SelfRefId),
+}
+
+impl PartialEq for VarRefRootId {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Decl(l), Self::Decl(r)) => l == r,
+            (Self::Member(l), Self::Member(r)) => l == r,
+            (Self::SelfRef(l), Self::SelfRef(r)) => l == r,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for VarRefRootId {}
+
+impl Hash for VarRefRootId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Decl(d) => d.hash(state),
+            Self::Member(m) => m.hash(state),
+            Self::SelfRef(s) => s.hash(state),
+        }
+    }
+}
+
+impl VarRefRootId {
+    /// Returns the underlying decl id, if any.
+    ///
+    /// For `SelfRef` roots this resolves through the receiver.
+    pub fn as_decl_id(&self) -> Option<LuaDeclId> {
+        match self {
+            Self::Decl(d) => Some(*d),
+            Self::SelfRef(s) => s.receiver.as_decl_id(),
+            Self::Member(_) => None,
+        }
+    }
+
+    /// Returns the underlying member id, if any.
+    pub fn as_member_id(&self) -> Option<LuaMemberId> {
+        match self {
+            Self::Member(m) => Some(*m),
+            Self::SelfRef(s) => s.receiver.as_member_id(),
+            Self::Decl(_) => None,
+        }
+    }
+
+    /// Source position used for realm resolution.
+    pub fn get_position(&self) -> TextSize {
+        match self {
+            Self::Decl(d) => d.position,
+            Self::Member(m) => m.get_position(),
+            // Use the implicit-self decl position so the flow query resolves the
+            // realm at the method body, consistent with the self identity.
+            Self::SelfRef(s) => s.self_decl_id.position,
+        }
+    }
+
+    /// Returns true when this root represents the same *receiver object* as the
+    /// given [`LuaDeclOrMemberId`].
+    ///
+    /// For `Decl` / `Member` roots the comparison is direct.  For `SelfRef`
+    /// roots the comparison goes through `SelfRefId::receiver`, so that effects
+    /// targeting `self` (as a `SelfRef`) correctly match index refs rooted in
+    /// the same receiver even across different method bodies.
+    pub fn receiver_eq(&self, other: &LuaDeclOrMemberId) -> bool {
+        match self {
+            Self::Decl(d) => LuaDeclOrMemberId::Decl(*d) == *other,
+            Self::Member(m) => LuaDeclOrMemberId::Member(*m) == *other,
+            Self::SelfRef(s) => s.receiver == *other,
+        }
+    }
+}
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 pub enum VarRefId {
     VarRef(LuaDeclId),
-    SelfRef(LuaDeclOrMemberId),
-    IndexRef(LuaDeclOrMemberId, ArcIntern<SmolStr>),
+    SelfRef(SelfRefId),
+    IndexRef(VarRefRootId, ArcIntern<SmolStr>),
     GlobalName(ArcIntern<SmolStr>, TextSize),
 }
 
@@ -31,9 +155,9 @@ impl PartialEq for VarRefId {
             (VarRefId::VarRef(left), VarRefId::VarRef(right)) => left == right,
             (VarRefId::SelfRef(left), VarRefId::SelfRef(right)) => left == right,
             (
-                VarRefId::IndexRef(left_owner, left_path),
-                VarRefId::IndexRef(right_owner, right_path),
-            ) => left_owner == right_owner && left_path == right_path,
+                VarRefId::IndexRef(left_root, left_path),
+                VarRefId::IndexRef(right_root, right_path),
+            ) => left_root == right_root && left_path == right_path,
             (VarRefId::GlobalName(left_name, _), VarRefId::GlobalName(right_name, _)) => {
                 left_name == right_name
             }
@@ -49,9 +173,9 @@ impl Hash for VarRefId {
         std::mem::discriminant(self).hash(state);
         match self {
             VarRefId::VarRef(decl_id) => decl_id.hash(state),
-            VarRefId::SelfRef(decl_or_member_id) => decl_or_member_id.hash(state),
-            VarRefId::IndexRef(decl_or_member_id, path) => {
-                decl_or_member_id.hash(state);
+            VarRefId::SelfRef(self_ref_id) => self_ref_id.hash(state),
+            VarRefId::IndexRef(root, path) => {
+                root.hash(state);
                 path.hash(state);
             }
             VarRefId::GlobalName(name, _) => name.hash(state),
@@ -63,14 +187,14 @@ impl VarRefId {
     pub fn get_decl_id_ref(&self) -> Option<LuaDeclId> {
         match self {
             VarRefId::VarRef(decl_id) => Some(*decl_id),
-            VarRefId::SelfRef(decl_or_member_id) => decl_or_member_id.as_decl_id(),
+            VarRefId::SelfRef(self_ref_id) => self_ref_id.receiver.as_decl_id(),
             _ => None,
         }
     }
 
     pub fn get_member_id_ref(&self) -> Option<LuaMemberId> {
         match self {
-            VarRefId::SelfRef(decl_or_member_id) => decl_or_member_id.as_member_id(),
+            VarRefId::SelfRef(self_ref_id) => self_ref_id.receiver.as_member_id(),
             _ => None,
         }
     }
@@ -78,25 +202,25 @@ impl VarRefId {
     pub fn get_position(&self) -> TextSize {
         match self {
             VarRefId::VarRef(decl_id) => decl_id.position,
-            VarRefId::SelfRef(decl_or_member_id) => decl_or_member_id.get_position(),
-            VarRefId::IndexRef(decl_or_member_id, _) => decl_or_member_id.get_position(),
+            // Use the implicit-self decl position so the flow query resolves the
+            // realm at the method body, consistent with the self identity.
+            VarRefId::SelfRef(self_ref_id) => self_ref_id.self_decl_id.position,
+            VarRefId::IndexRef(root, _) => root.get_position(),
             VarRefId::GlobalName(_, position) => *position,
         }
     }
 
     pub fn start_with(&self, prefix: &VarRefId) -> bool {
-        let (decl_or_member_id, path) = match self {
-            VarRefId::IndexRef(decl_or_member_id, path) => {
-                (decl_or_member_id.clone(), path.clone())
-            }
+        let (root, path) = match self {
+            VarRefId::IndexRef(root, path) => (root, path.clone()),
             _ => return false,
         };
 
         match prefix {
-            VarRefId::VarRef(decl_id) => decl_or_member_id.as_decl_id() == Some(*decl_id),
-            VarRefId::SelfRef(ref_decl_or_member_id) => *ref_decl_or_member_id == decl_or_member_id,
-            VarRefId::IndexRef(ref_decl_or_member_id, prefix_path) => {
-                *ref_decl_or_member_id == decl_or_member_id
+            VarRefId::VarRef(decl_id) => root.as_decl_id() == Some(*decl_id),
+            VarRefId::SelfRef(self_ref_id) => root.receiver_eq(&self_ref_id.receiver),
+            VarRefId::IndexRef(prefix_root, prefix_path) => {
+                *prefix_root == *root
                     && (path == *prefix_path
                         || path
                             .strip_prefix(prefix_path.deref().as_str())
@@ -137,9 +261,9 @@ fn get_call_expr_var_ref_id(
             let mut args_iter = args_list.get_args();
 
             let obj_expr = args_iter.next()?;
-            let decl_or_member_id = match get_var_expr_var_ref_id(db, cache, obj_expr.clone()) {
-                Some(VarRefId::SelfRef(decl_or_id)) => decl_or_id,
-                Some(VarRefId::VarRef(decl_id)) => LuaDeclOrMemberId::Decl(decl_id),
+            let root = match get_var_expr_var_ref_id(db, cache, obj_expr.clone()) {
+                Some(VarRefId::SelfRef(self_ref_id)) => VarRefRootId::SelfRef(self_ref_id),
+                Some(VarRefId::VarRef(decl_id)) => VarRefRootId::Decl(decl_id),
                 _ => return None,
             };
             // 开始构建 access_path
@@ -167,7 +291,7 @@ fn get_call_expr_var_ref_id(
             }
 
             Some(VarRefId::IndexRef(
-                decl_or_member_id,
+                root,
                 ArcIntern::new(SmolStr::new(access_path)),
             ))
         }

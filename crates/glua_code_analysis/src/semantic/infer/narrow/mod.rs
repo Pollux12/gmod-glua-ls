@@ -17,7 +17,7 @@ use crate::{
 pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
 pub use narrow_type::{narrow_down_type, narrow_false_or_nil, remove_false_or_nil};
-pub use var_ref_id::{VarRefId, get_var_expr_var_ref_id};
+pub use var_ref_id::{SelfRefId, VarRefId, VarRefRootId, get_var_expr_var_ref_id};
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
 
@@ -113,11 +113,52 @@ pub fn infer_expr_narrow_type(
     result
 }
 
+/// Like [`infer_expr_narrow_type`], but seeds the flow origin with a
+/// region-aware base type for an implicit `self` reference.
+///
+/// `self_base` is the receiver type inferred at the colon-method prefix
+/// position (region-aware). When the flow walk reaches the origin for this
+/// exact `var_ref_id`, the seed is used as the base instead of the
+/// position-insensitive receiver decl/member cache. This keeps `self` flowing
+/// through the normal narrowing pipeline (so guards still narrow) while fixing
+/// reused-local region collapse.
+///
+/// When `self_base` is `None`, this is identical to [`infer_expr_narrow_type`].
+pub fn infer_expr_narrow_type_with_self_base(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    var_ref_id: VarRefId,
+    self_base: Option<LuaType>,
+) -> InferResult {
+    let Some(self_base) = self_base else {
+        return infer_expr_narrow_type(db, cache, expr, var_ref_id);
+    };
+
+    let previous_seed = cache
+        .self_base_seed
+        .replace((var_ref_id.clone(), self_base));
+    let result = infer_expr_narrow_type(db, cache, expr, var_ref_id);
+    cache.self_base_seed = previous_seed;
+    result
+}
+
 pub fn get_var_ref_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     var_ref_id: &VarRefId,
 ) -> InferResult {
+    // Region-aware `self` base: if a seed was set for this exact `self`
+    // reference, use it as the flow origin type instead of resolving the
+    // (position-insensitive) receiver decl/member cache. See
+    // `infer_expr_narrow_type_with_self_base`.
+    if var_ref_id.is_self_ref()
+        && let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
+        && seed_ref == var_ref_id
+    {
+        return Ok(seed_type.clone());
+    }
+
     if let Some(decl_id) = var_ref_id.get_decl_id_ref() {
         let decl = db
             .get_decl_index()

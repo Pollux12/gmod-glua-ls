@@ -1070,4 +1070,58 @@ mod test {
         let ty = infer_last_name_expr_type(&mut ws, code, "A");
         assert!(!ty.is_unknown());
     }
+
+    #[test]
+    fn test_reassigned_local_table_resolves_to_new_table_identity() {
+        // General Lua semantics (no GMod): after `t = {}` the local must hold the
+        // NEW table literal identity, not the initializer table identity. The two
+        // table literals carry distinct fields; resolving the wrong identity is the
+        // root cause of reused-variable collapse.
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local t = {}
+            function t.first() end
+            t = {}
+            function t.second() end
+            "#,
+        );
+
+        let first_t = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("Semantic model must exist");
+            // The first `t` reference (after the initializer) should resolve to the
+            // initializer table identity.
+            let exprs = semantic_model
+                .get_root()
+                .descendants::<LuaNameExpr>()
+                .filter(|expr| expr.get_name_text().as_deref() == Some("t"))
+                .collect::<Vec<_>>();
+            // exprs: [t in `function t.first`, t in `t = {}` (lhs), t in `function t.second`]
+            let first_use = exprs.first().expect("first t use").clone();
+            let last_use = exprs.last().expect("last t use").clone();
+            let first_ty = semantic_model
+                .infer_expr(LuaExpr::NameExpr(first_use))
+                .unwrap_or(LuaType::Unknown);
+            let last_ty = semantic_model
+                .infer_expr(LuaExpr::NameExpr(last_use))
+                .unwrap_or(LuaType::Unknown);
+            (first_ty, last_ty)
+        };
+
+        let (LuaType::TableConst(first_range), LuaType::TableConst(last_range)) = first_t else {
+            panic!("expected both t uses to be table consts, got: {first_t:?}");
+        };
+
+        // The bug: both resolve to the SAME (initializer) table identity.
+        // Correct Lua: the use after reassignment must be a DISTINCT table identity.
+        assert!(
+            first_range != last_range,
+            "reassigned local `t` collapsed to the initializer table identity \
+             (first={first_range:?}, last={last_range:?}); each region must keep its own table"
+        );
+    }
 }

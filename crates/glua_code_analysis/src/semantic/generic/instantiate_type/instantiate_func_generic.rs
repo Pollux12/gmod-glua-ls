@@ -299,13 +299,22 @@ fn infer_enclosing_self_type(
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
     for func_stat in name_expr.ancestors::<LuaFuncStat>() {
-        let func_name = func_stat.get_func_name()?;
-        if let LuaVarExpr::IndexExpr(index_expr) = func_name
-            && index_expr.get_index_token()?.is_colon()
+        // Skip anonymous/non-colon ancestors (e.g. nested closures) and keep
+        // walking outward to the enclosing colon method, rather than bailing out
+        // on the first ancestor that lacks a colon-method name.
+        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
+            continue;
+        };
+        if !index_expr
+            .get_index_token()
+            .is_some_and(|token| token.is_colon())
         {
-            let prefix_expr = index_expr.get_prefix_expr()?;
-            return infer_expr(db, cache, prefix_expr).ok();
+            continue;
         }
+        let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+            continue;
+        };
+        return infer_expr(db, cache, prefix_expr).ok();
     }
 
     None
