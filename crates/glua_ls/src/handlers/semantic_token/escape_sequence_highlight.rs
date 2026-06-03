@@ -314,10 +314,7 @@ mod tests {
             vec![(0, 1, "string"), (1, 2, "invalid"), (3, 1, "string")]
         );
         // trailing backslash
-        assert_eq!(
-            segments("\"\\"),
-            vec![(0, 1, "string"), (1, 1, "invalid")]
-        );
+        assert_eq!(segments("\"\\"), vec![(0, 1, "string"), (1, 1, "invalid")]);
     }
 
     #[test]

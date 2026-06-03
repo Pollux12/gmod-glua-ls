@@ -26,8 +26,7 @@ use crate::{
     find_members_with_key, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
-        get_var_expr_var_ref_id,
-        infer_call_expr_func, infer_expr, infer_expr_semantic_decl,
+        get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, infer_expr_semantic_decl,
     },
 };
 use smol_str::SmolStr;
@@ -1787,18 +1786,14 @@ fn extend_var_ref_id_with_path(
     };
     let arc_path = ArcIntern::from(SmolStr::new(&full_path));
     match var_ref_id {
-        VarRefId::VarRef(decl_id) => Some(VarRefId::IndexRef(
-            VarRefRootId::Decl(decl_id),
-            arc_path,
-        )),
+        VarRefId::VarRef(decl_id) => {
+            Some(VarRefId::IndexRef(VarRefRootId::Decl(decl_id), arc_path))
+        }
         VarRefId::SelfRef(self_ref_id) => Some(VarRefId::IndexRef(
             VarRefRootId::SelfRef(self_ref_id),
             arc_path,
         )),
-        VarRefId::IndexRef(root, _) => Some(VarRefId::IndexRef(
-            root,
-            arc_path,
-        )),
+        VarRefId::IndexRef(root, _) => Some(VarRefId::IndexRef(root, arc_path)),
         VarRefId::GlobalName(_, _) => None,
     }
 }

@@ -1563,9 +1563,15 @@ mod test {
         let db = ws.analysis.compilation.get_db();
         let mut cache = LuaInferCache::new(file_id, Default::default());
 
-        expect_that!(cache.expr_var_ref_id_cache.contains_key(&syntax_id), eq(false));
+        expect_that!(
+            cache.expr_var_ref_id_cache.contains_key(&syntax_id),
+            eq(false)
+        );
         expect_that!(infer_name_expr(db, &mut cache, self_expr).is_ok(), eq(true));
-        expect_that!(cache.expr_var_ref_id_cache.contains_key(&syntax_id), eq(true));
+        expect_that!(
+            cache.expr_var_ref_id_cache.contains_key(&syntax_id),
+            eq(true)
+        );
 
         Ok(())
     }

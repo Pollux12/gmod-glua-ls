@@ -1046,9 +1046,7 @@ fn get_type_at_assign_stat(
         // doc `@type` override) so each region keeps its own table identity.
         let rhs_is_fresh_table_literal = explicit_var_type.is_none()
             && matches!(expr_type, LuaType::TableConst(_))
-            && exprs
-                .get(i)
-                .is_some_and(expr_is_table_constructor);
+            && exprs.get(i).is_some_and(expr_is_table_constructor);
 
         let narrowed = if rhs_is_fresh_table_literal {
             Some(expr_type.clone())

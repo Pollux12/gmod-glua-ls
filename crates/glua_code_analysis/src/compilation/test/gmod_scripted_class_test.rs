@@ -1860,7 +1860,9 @@ mod test {
                 }
                 let info = semantic_model.get_semantic_info(token.syntax().clone().into())?;
                 match &info.typ {
-                    LuaType::Def(id) => Some((name_expr.get_position(), id.get_simple_name().to_string())),
+                    LuaType::Def(id) => {
+                        Some((name_expr.get_position(), id.get_simple_name().to_string()))
+                    }
                     _ => None,
                 }
             })
@@ -7505,7 +7507,10 @@ mod test {
         assert!(
             y_display.contains("number")
                 || y_display.contains("integer")
-                || matches!(y_type, LuaType::IntegerConst(_) | LuaType::Number | LuaType::Integer),
+                || matches!(
+                    y_type,
+                    LuaType::IntegerConst(_) | LuaType::Number | LuaType::Integer
+                ),
             "PanelB region: self.value should resolve to number/integer, got {y_display:?} ({y_type:?})"
         );
 
