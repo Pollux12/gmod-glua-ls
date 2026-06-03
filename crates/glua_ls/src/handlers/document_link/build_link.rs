@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use glua_code_analysis::{DbIndex, LuaDocument, file_path_to_uri};
 use glua_parser::{
@@ -37,7 +37,7 @@ fn try_build_file_link(
     }
 
     let file_path = token.get_value();
-    if file_path.find(['\\', '/']).is_some() {
+    if file_path.find(['\\', '/']).is_some() && has_linkable_path_component(&file_path) {
         let suffix_path = PathBuf::from(file_path);
         if suffix_path.exists() {
             if let Some(uri) = file_path_to_uri(&suffix_path) {
@@ -75,6 +75,12 @@ fn try_build_file_link(
     Some(())
 }
 
+fn has_linkable_path_component(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|component| matches!(component, Component::Normal(_)))
+}
+
 fn try_build_module_link(
     db: &DbIndex,
     token: LuaStringToken,
@@ -108,4 +114,40 @@ pub fn is_require_path(token: LuaStringToken) -> Option<bool> {
         .get_parent::<LuaCallExpr>()?;
 
     Some(call_expr.is_require())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::test_lib::{ProviderVirtualWorkspace, check};
+    use googletest::prelude::*;
+
+    #[gtest]
+    fn separator_only_paths_are_not_linkable() {
+        for path in [r"\", r"\\", "/"] {
+            expect_that!(has_linkable_path_component(path), eq(false));
+        }
+    }
+
+    #[gtest]
+    fn paths_with_real_components_are_linkable() {
+        for path in ["materials/icon.png", r"materials\icon.png", "/lua/autorun"] {
+            expect_that!(has_linkable_path_component(path), eq(true));
+        }
+    }
+
+    #[gtest]
+    fn escaped_backslash_string_does_not_create_document_link() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let file_id = ws.def(r#"local value = "\\\\""#);
+        let semantic_model = check!(ws.analysis.compilation.get_semantic_model(file_id));
+        let links = check!(build_links(
+            semantic_model.get_db(),
+            semantic_model.get_root().syntax().clone(),
+            &semantic_model.get_document(),
+        ));
+
+        expect_that!(links, is_empty());
+        Ok(())
+    }
 }
