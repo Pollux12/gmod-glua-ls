@@ -44,9 +44,13 @@ fn hover_escape_string(s: &str) -> String {
         match ch {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
+            '\u{07}' => out.push_str("\\a"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\u{0b}' => out.push_str("\\v"),
             '\u{1b}' => out.push_str("\\27"),
             ch if ch.is_control() => {
                 let code = ch as u32;
@@ -488,7 +492,9 @@ fn humanize_object_type(db: &DbIndex, object: &LuaObjectType, level: RenderLevel
             let ty_str = humanize_type(db, field.1, level.next_level());
             match name {
                 LuaMemberKey::Integer(i) => format!("[{}]: {}", i, ty_str),
-                LuaMemberKey::Name(s) => format!("{}: {}", s, ty_str),
+                LuaMemberKey::Name(s) => {
+                    format!("{}: {}", render_member_key_name(s.as_str()), ty_str)
+                }
                 LuaMemberKey::None => ty_str,
                 LuaMemberKey::ExprType(_) => ty_str,
             }
@@ -906,7 +912,12 @@ fn build_table_member_string(
     };
 
     match member_key {
-        LuaMemberKey::Name(name) => format!("{name}{separator}{member_value}"),
+        LuaMemberKey::Name(name) => {
+            format!(
+                "{}{separator}{member_value}",
+                render_member_key_name(name.as_str())
+            )
+        }
         LuaMemberKey::Integer(i) => format!("[{i}]{separator}{member_value}"),
         LuaMemberKey::None => member_value,
         LuaMemberKey::ExprType(LuaType::Integer) => member_value,
@@ -917,13 +928,66 @@ fn build_table_member_string(
     }
 }
 
+fn render_member_key_name(name: &str) -> String {
+    if is_lua_identifier(name) && !is_lua_keyword(name) {
+        name.to_string()
+    } else {
+        format!("[\"{}\"]", hover_escape_string(name))
+    }
+}
+
+fn is_lua_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn is_lua_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "and"
+            | "break"
+            | "do"
+            | "else"
+            | "elseif"
+            | "end"
+            | "false"
+            | "for"
+            | "function"
+            | "goto"
+            | "if"
+            | "in"
+            | "local"
+            | "nil"
+            | "not"
+            | "or"
+            | "repeat"
+            | "return"
+            | "then"
+            | "true"
+            | "until"
+            | "while"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
-    use crate::{LuaType, LuaUnionType};
+    use googletest::prelude::*;
 
-    use super::{RenderLevel, format_union_type};
+    use smol_str::SmolStr;
+
+    use crate::{DbIndex, LuaMemberKey, LuaObjectType, LuaType, LuaUnionType};
+
+    use super::{
+        RenderLevel, build_table_member_string, format_union_type, humanize_type,
+        render_member_key_name,
+    };
 
     fn simple_type_label(ty: &LuaType) -> String {
         match ty {
@@ -936,7 +1000,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[gtest]
     fn format_union_type_sorts_members_consistently() {
         let left = LuaUnionType::from_vec(vec![LuaType::String, LuaType::Number, LuaType::Boolean]);
         let right =
@@ -947,11 +1011,11 @@ mod tests {
         let right_render =
             format_union_type(&right, RenderLevel::Detailed, |ty, _| simple_type_label(ty));
 
-        assert_eq!(left_render, right_render);
-        assert_eq!(left_render, "(boolean|number|string)");
+        expect_eq!(left_render, right_render);
+        expect_eq!(left_render, "(boolean|number|string)");
     }
 
-    #[test]
+    #[gtest]
     fn format_union_type_keeps_nullable_suffix_with_canonical_order() {
         let union = LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
             LuaType::String,
@@ -967,6 +1031,62 @@ mod tests {
             unreachable!("expected union type")
         };
 
-        assert_eq!(rendered, "(number|string)?");
+        expect_eq!(rendered, "(number|string)?");
+    }
+
+    #[gtest]
+    fn render_member_key_name_uses_bare_names_only_for_valid_identifiers() {
+        expect_eq!(render_member_key_name("valid_name1"), "valid_name1");
+        expect_eq!(render_member_key_name("end"), "[\"end\"]");
+        expect_eq!(render_member_key_name("not valid"), "[\"not valid\"]");
+    }
+
+    #[gtest]
+    fn table_member_string_escapes_control_character_keys() {
+        let db = DbIndex::default();
+        let cases = [
+            ("\u{07}", "\\a", r#"["\a"]: string = "\\a""#),
+            ("\u{08}", "\\b", r#"["\b"]: string = "\\b""#),
+            ("\u{0c}", "\\f", r#"["\f"]: string = "\\f""#),
+            ("\n", "\\n", r#"["\n"]: string = "\\n""#),
+            ("\r", "\\r", r#"["\r"]: string = "\\r""#),
+            ("\t", "\\t", r#"["\t"]: string = "\\t""#),
+            ("\u{0b}", "\\v", r#"["\v"]: string = "\\v""#),
+            ("\\", "\\\\", r#"["\\"]: string = "\\\\""#),
+            ("\"", "\\\"", r#"["\""]: string = "\\\"""#),
+            ("'", "\\'", r#"["'"]: string = "\\'""#),
+        ];
+
+        for (key, value, expected) in cases {
+            let value_type = LuaType::StringConst(SmolStr::new(value).into());
+            let rendered = build_table_member_string(
+                &db,
+                &LuaMemberKey::Name(key.into()),
+                &value_type,
+                humanize_type(&db, &value_type, RenderLevel::Detailed),
+                RenderLevel::Detailed,
+            );
+            expect_eq!(rendered, expected);
+        }
+    }
+
+    #[gtest]
+    fn object_type_escapes_control_character_field_names() {
+        let db = DbIndex::default();
+        let object = LuaType::Object(
+            LuaObjectType::new_with_fields(
+                HashMap::from([(
+                    LuaMemberKey::Name("\n".into()),
+                    LuaType::StringConst(SmolStr::new("\\n").into()),
+                )]),
+                Vec::new(),
+            )
+            .into(),
+        );
+
+        expect_eq!(
+            humanize_type(&db, &object, RenderLevel::Detailed),
+            r#"{ ["\n"]: "\\n" }"#
+        );
     }
 }

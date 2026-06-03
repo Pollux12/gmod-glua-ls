@@ -633,6 +633,47 @@ mod tests {
     }
 
     #[gtest]
+    fn test_table_escape_string_keys_hover_cleanly() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(
+            ws.check_hover(
+                r#"
+                local Escape<??>StringMap = {
+                    ["\a"] = "\\a",
+                    ["\b"] = "\\b",
+                    ["\f"] = "\\f",
+                    ["\n"] = "\\n",
+                    ["\r"] = "\\r",
+                    ["\t"] = "\\t",
+                    ["\v"] = "\\v",
+                    ["\\"] = "\\\\",
+                    ["\""] = "\\\"",
+                    ["\'"] = "\\\'"
+                }
+            "#,
+                VirtualHoverResult {
+                    value: r##"```lua
+local EscapeStringMap: {
+    ["\a"]: string = "\\a",
+    ["\b"]: string = "\\b",
+    ["\f"]: string = "\\f",
+    ["\n"]: string = "\\n",
+    ["\r"]: string = "\\r",
+    ["\t"]: string = "\\t",
+    ["\v"]: string = "\\v",
+    ["\\"]: string = "\\\\",
+    ["\""]: string = "\\\"",
+    ["'"]: string = "\\'",
+}
+```"##
+                        .to_string(),
+                },
+            )
+        );
+        Ok(())
+    }
+
+    #[gtest]
     fn test_field_key() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         ws.def(
