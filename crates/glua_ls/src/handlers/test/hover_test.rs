@@ -502,6 +502,85 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_dynamic_key_read_from_known_table_fields_stays_table() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class CSEnt
+                local CSEnt = {}
+                function CSEnt:Remove()
+                end
+
+                ---@param ent any
+                ---@return boolean
+                local function IsValid(ent)
+                end
+
+                ---@param modelPath string
+                ---@param renderGroup any
+                ---@return CSEnt
+                local function ClientsideModel(modelPath, renderGroup)
+                end
+
+                local PREVIEW_RENDER_GROUP = 0
+                Glide = {}
+                local Editor = Glide.VehicleLayoutEditor or {}
+                Glide.VehicleLayoutEditor = Editor
+
+                Editor.previewModels = Editor.previewModels or {
+                    seats = {},
+                    wheels = {}
+                }
+
+                function Editor:GetPreviewEntity(kind, itemId, modelPath)
+                    if not modelPath or modelPath == "" then return end
+                    self.previewModels = self.previewModels or { seats = {}, wheels = {} }
+                    local po<??>ol = self.previewModels[kind]
+                    if not pool then return end
+
+                    local entry = pool[itemId]
+                    if not entry or not IsValid(entry.ent) or entry.model ~= modelPath then
+                        if entry and IsValid(entry.ent) then
+                            entry.ent:Remove()
+                        end
+
+                        local ent = ClientsideModel(modelPath, PREVIEW_RENDER_GROUP)
+                        if not IsValid(ent) then
+                            pool[itemId] = nil
+                            return
+                        end
+
+                        entry = { ent = ent, model = modelPath }
+                        pool[itemId] = entry
+                    end
+
+                    for _, value in pairs(pool) do
+                    end
+
+                    return entry.ent
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/vehicle_layout_editor.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("local pool: table"),
+            "dynamic read of seats/wheels should hover as a table, got: {value}"
+        );
+        assert!(
+            !value.contains("[unknown]"),
+            "unknown dynamic write key must not become the displayed table shape, got: {value}"
+        );
+        Ok(())
+    }
+
+    #[gtest]
     fn test_decl_desc() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(

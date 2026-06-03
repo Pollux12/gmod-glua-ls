@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaIndexKey, LuaLocalName, LuaVarExpr};
+    use glua_parser::{
+        LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaIndexKey, LuaLocalName, LuaVarExpr,
+    };
     use googletest::prelude::*;
     use lsp_types::{NumberOrString, Uri};
     use smol_str::SmolStr;
@@ -25,6 +27,26 @@ mod test {
             diagnostic_code.get_name().to_string(),
         ));
         diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+    }
+
+    fn file_diagnostic_messages(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> Vec<String> {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect()
     }
 
     fn local_name_type(ws: &mut VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
@@ -76,6 +98,31 @@ mod test {
                 _ => None,
             })
             .expect("expected semantic info for index expr")
+    }
+
+    fn inferred_index_expr_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        semantic_model
+            .get_root()
+            .descendants::<LuaAst>()
+            .find_map(|node| match node {
+                LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
+                    semantic_model
+                        .infer_expr(LuaExpr::IndexExpr(index_expr))
+                        .ok()
+                }
+                _ => None,
+            })
+            .expect("expected inferred type for index expr")
     }
 
     fn first_index_expr_member_owner(
@@ -467,6 +514,135 @@ mod test {
         assert_that!(
             ws.check_type(&dynamic_lookup_ty, &LuaType::Boolean),
             eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_dynamic_key_read_from_known_table_fields_returns_child_table_value() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/glide/client/vehicle_layout_editor.lua",
+            r#"
+        ---@class CSEnt
+        local CSEnt = {}
+        function CSEnt:Remove()
+        end
+
+        ---@param ent any
+        ---@return boolean
+        local function IsValid(ent)
+        end
+
+        ---@param modelPath string
+        ---@param renderGroup any
+        ---@return CSEnt
+        local function ClientsideModel(modelPath, renderGroup)
+        end
+
+        local PREVIEW_RENDER_GROUP = 0
+        Glide = {}
+        local Editor = Glide.VehicleLayoutEditor or {}
+        Glide.VehicleLayoutEditor = Editor
+
+        Editor.previewModels = Editor.previewModels or {
+            seats = {},
+            wheels = {}
+        }
+
+        function Editor:GetPreviewEntity(kind, itemId, modelPath)
+            if not modelPath or modelPath == "" then return end
+            self.previewModels = self.previewModels or { seats = {}, wheels = {} }
+            local pool = self.previewModels[kind]
+            if not pool then return end
+            local after_guard = pool
+
+            local entry = pool[itemId]
+            if not entry or not IsValid(entry.ent) or entry.model ~= modelPath then
+                if entry and IsValid(entry.ent) then
+                    entry.ent:Remove()
+                end
+
+                local ent = ClientsideModel(modelPath, PREVIEW_RENDER_GROUP)
+                if not IsValid(ent) then
+                    pool[itemId] = nil
+                    return
+                end
+
+                entry = { ent = {}, model = modelPath }
+                pool[itemId] = entry
+            end
+
+            for _, value in pairs(pool) do
+            end
+
+            return entry.ent
+        end
+
+        function Editor:CleanupPreviewEntities(kind, usedMap)
+            if not self.previewModels then return end
+            local pool = self.previewModels[kind]
+            if not pool then return end
+
+            for id, entry in pairs(pool) do
+                if not usedMap[id] then
+                    if entry and IsValid(entry.ent) then
+                        entry.ent:Remove()
+                    end
+                    pool[id] = nil
+                end
+            end
+        end
+        "#,
+        );
+
+        let pool_ty = local_name_type(&mut ws, file_id, "pool");
+        assert!(
+            !ws.humanize_type_detailed(pool_ty.clone())
+                .contains("[unknown]"),
+            "dynamic read of seats/wheels should not expose unknown-key object shape, got {} ({:?})",
+            ws.humanize_type_detailed(pool_ty.clone()),
+            pool_ty
+        );
+
+        let pool_expr_ty = index_expr_type(&mut ws, file_id, "self.previewModels[kind]");
+        assert!(
+            !ws.humanize_type_detailed(pool_expr_ty.clone())
+                .contains("[unknown]"),
+            "dynamic read expression should not expose unknown-key object shape, got {} ({:?})",
+            ws.humanize_type_detailed(pool_expr_ty.clone()),
+            pool_expr_ty
+        );
+
+        let direct_pool_expr_ty =
+            inferred_index_expr_type(&mut ws, file_id, "self.previewModels[kind]");
+        assert!(
+            !ws.humanize_type_detailed(direct_pool_expr_ty.clone())
+                .contains("[unknown]"),
+            "direct dynamic read inference should not expose unknown-key object shape, got {} ({:?})",
+            ws.humanize_type_detailed(direct_pool_expr_ty.clone()),
+            direct_pool_expr_ty
+        );
+
+        let after_guard_ty = local_name_type(&mut ws, file_id, "after_guard");
+        assert_that!(
+            ws.check_type(&after_guard_ty, &LuaType::Table),
+            eq(true),
+            "expected guarded dynamic read to narrow to table, got {} ({:?})",
+            ws.humanize_type(after_guard_ty.clone()),
+            after_guard_ty
+        );
+
+        let diagnostics =
+            file_diagnostic_messages(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch);
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "`pairs(pool)` should accept a guarded child table read through an unknown key"
         );
     }
 
