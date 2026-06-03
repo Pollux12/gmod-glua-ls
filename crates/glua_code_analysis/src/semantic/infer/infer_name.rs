@@ -514,7 +514,10 @@ fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
 }
 
 fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -> InferResult {
-    let self_ref_id = find_self_ref_id(db, cache, &name_expr).ok_or(InferFailReason::None)?;
+    let self_ref_id = match get_name_expr_var_ref_id(db, cache, &name_expr) {
+        Some(VarRefId::SelfRef(self_ref_id)) => self_ref_id,
+        _ => return Err(InferFailReason::None),
+    };
 
     // Compute a region-aware base for the implicit `self` (the colon-method
     // receiver inferred at its own position). For reused locals reassigned per
@@ -651,12 +654,17 @@ pub fn get_name_expr_var_ref_id(
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
 ) -> Option<VarRefId> {
+    let syntax_id = name_expr.get_syntax_id();
+    if let Some(var_ref_id) = cache.expr_var_ref_id_cache.get(&syntax_id) {
+        return Some(var_ref_id.clone());
+    }
+
     let name_token = name_expr.get_name_token()?;
     let name = name_token.get_name_text();
-    match name {
+    let var_ref_id = match name {
         "self" => {
             let self_ref_id = find_self_ref_id(db, cache, name_expr)?;
-            Some(VarRefId::SelfRef(self_ref_id))
+            VarRefId::SelfRef(self_ref_id)
         }
         _ => {
             let file_id = cache.get_file_id();
@@ -666,19 +674,24 @@ pub fn get_name_expr_var_ref_id(
                 .get_local_reference(&file_id)
                 .and_then(|file_ref| file_ref.get_decl_id(&range))
             {
-                return Some(VarRefId::VarRef(decl_id));
+                VarRefId::VarRef(decl_id)
+            } else if let Some(global_decl_id) =
+                resolve_global_decl_id(db, cache, name, Some(name_expr))
+            {
+                VarRefId::VarRef(global_decl_id)
+            } else {
+                VarRefId::GlobalName(
+                    internment::ArcIntern::new(smol_str::SmolStr::new(name)),
+                    name_expr.get_position(),
+                )
             }
-
-            if let Some(global_decl_id) = resolve_global_decl_id(db, cache, name, Some(name_expr)) {
-                return Some(VarRefId::VarRef(global_decl_id));
-            }
-
-            Some(VarRefId::GlobalName(
-                internment::ArcIntern::new(smol_str::SmolStr::new(name)),
-                name_expr.get_position(),
-            ))
         }
-    }
+    };
+
+    cache
+        .expr_var_ref_id_cache
+        .insert(syntax_id, var_ref_id.clone());
+    Some(var_ref_id)
 }
 
 pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
@@ -1513,4 +1526,47 @@ fn infer_enclosing_self_type(
         return infer_expr(db, cache, prefix_expr).ok();
     }
     None
+}
+
+#[cfg(test)]
+mod test {
+    use super::infer_name_expr;
+    use crate::{LuaInferCache, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaNameExpr};
+    use googletest::prelude::*;
+
+    #[gtest]
+    fn test_infer_self_populates_name_var_ref_cache() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                local value = self
+            end
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model must exist");
+        let self_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("self"))
+            .expect("expected self name expr");
+        let syntax_id = self_expr.get_syntax_id();
+
+        let db = ws.analysis.compilation.get_db();
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+
+        expect_that!(cache.expr_var_ref_id_cache.contains_key(&syntax_id), eq(false));
+        expect_that!(infer_name_expr(db, &mut cache, self_expr).is_ok(), eq(true));
+        expect_that!(cache.expr_var_ref_id_cache.contains_key(&syntax_id), eq(true));
+
+        Ok(())
+    }
 }

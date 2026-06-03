@@ -344,8 +344,7 @@ fn get_type_at_flow_walk(
                     // type is preserved instead of being overridden by the
                     // implementation signature.
                     let is_undeclared = cache
-                        .index_ref_origin_type_cache
-                        .get(var_ref_id)
+                        .get_index_ref_origin_type_cache(var_ref_id)
                         .is_some_and(|entry| matches!(entry, CacheEntry::Cache(t) if t.is_nil()));
 
                     if is_undeclared {

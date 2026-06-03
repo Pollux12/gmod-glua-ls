@@ -147,9 +147,7 @@ fn infer_member_type_pass_flow(
         return Ok(member_type.clone());
     };
 
-    cache
-        .index_ref_origin_type_cache
-        .insert(var_ref_id.clone(), CacheEntry::Cache(member_type.clone()));
+    cache.set_index_ref_origin_type_cache(&var_ref_id, CacheEntry::Cache(member_type.clone()));
     let result = infer_expr_narrow_type(db, cache, LuaExpr::IndexExpr(index_expr), var_ref_id);
     match &result {
         Err(InferFailReason::None) => Ok(member_type.clone()),
@@ -171,9 +169,7 @@ fn infer_member_type_fallback_pass_flow(
         return Err(InferFailReason::FieldNotFound);
     };
 
-    cache
-        .index_ref_origin_type_cache
-        .insert(var_ref_id.clone(), CacheEntry::Cache(LuaType::Nil));
+    cache.set_index_ref_origin_type_cache(&var_ref_id, CacheEntry::Cache(LuaType::Nil));
     match infer_expr_narrow_type(db, cache, LuaExpr::IndexExpr(index_expr), var_ref_id) {
         Ok(member_type) if !member_type.is_nil() && !member_type.is_unknown() => Ok(member_type),
         Ok(member_type) if member_type.is_unknown() && unknown_truthy_as_any => Ok(LuaType::Any),

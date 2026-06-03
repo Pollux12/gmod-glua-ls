@@ -2,16 +2,54 @@ mod cache_options;
 
 pub use cache_options::{CacheOptions, LuaAnalysisPhase};
 use glua_parser::LuaSyntaxId;
+use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashMap;
+use smol_str::SmolStr;
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey,
-    LuaSemanticDeclId, VarRefId,
+    LuaSemanticDeclId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::infer::InferFailReason,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VarRefCacheRootKey {
+    Decl(LuaDeclId),
+    Member(LuaMemberId),
+    SelfRef(LuaDeclId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VarRefCacheKey {
+    VarRef(LuaDeclId),
+    SelfRef(LuaDeclId),
+    IndexRef(VarRefCacheRootKey, ArcIntern<SmolStr>),
+    GlobalName(ArcIntern<SmolStr>),
+}
+
+impl From<&VarRefRootId> for VarRefCacheRootKey {
+    fn from(value: &VarRefRootId) -> Self {
+        match value {
+            VarRefRootId::Decl(decl_id) => Self::Decl(*decl_id),
+            VarRefRootId::Member(member_id) => Self::Member(*member_id),
+            VarRefRootId::SelfRef(self_ref_id) => Self::SelfRef(self_ref_id.self_decl_id),
+        }
+    }
+}
+
+impl From<&VarRefId> for VarRefCacheKey {
+    fn from(value: &VarRefId) -> Self {
+        match value {
+            VarRefId::VarRef(decl_id) => Self::VarRef(*decl_id),
+            VarRefId::SelfRef(self_ref_id) => Self::SelfRef(self_ref_id.self_decl_id),
+            VarRefId::IndexRef(root, path) => Self::IndexRef(root.into(), path.clone()),
+            VarRefId::GlobalName(name, _) => Self::GlobalName(name.clone()),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum CacheEntry<T> {
@@ -38,10 +76,11 @@ pub struct LuaInferCache {
         FxHashMap<(LuaSyntaxId, Option<usize>, LuaType), CacheEntry<Arc<LuaFunctionType>>>,
     pub call_arg_types_cache:
         FxHashMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
-    pub flow_node_cache: FxHashMap<VarRefId, FxHashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>>,
+    pub flow_node_cache:
+        FxHashMap<VarRefCacheKey, FxHashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>>,
     pub flow_query_realm: Option<GmodRealm>,
     pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,
-    pub index_ref_origin_type_cache: FxHashMap<VarRefId, CacheEntry<LuaType>>,
+    pub index_ref_origin_type_cache: FxHashMap<VarRefCacheKey, CacheEntry<LuaType>>,
     pub expr_var_ref_id_cache: FxHashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
     pub scoped_scripted_global_cache: Option<Option<(String, String)>>,
@@ -316,8 +355,9 @@ impl LuaInferCache {
         flow_id: FlowId,
         query_realm: GmodRealm,
     ) -> Option<&CacheEntry<LuaType>> {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
         self.flow_node_cache
-            .get(var_ref_id)
+            .get(&cache_key)
             .and_then(|by_flow| by_flow.get(&(flow_id, query_realm)))
     }
 
@@ -328,10 +368,28 @@ impl LuaInferCache {
         query_realm: GmodRealm,
         entry: CacheEntry<LuaType>,
     ) {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
         self.flow_node_cache
-            .entry(var_ref_id.clone())
+            .entry(cache_key)
             .or_default()
             .insert((flow_id, query_realm), entry);
+    }
+
+    pub fn get_index_ref_origin_type_cache(
+        &self,
+        var_ref_id: &VarRefId,
+    ) -> Option<&CacheEntry<LuaType>> {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
+        self.index_ref_origin_type_cache.get(&cache_key)
+    }
+
+    pub fn set_index_ref_origin_type_cache(
+        &mut self,
+        var_ref_id: &VarRefId,
+        entry: CacheEntry<LuaType>,
+    ) {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
+        self.index_ref_origin_type_cache.insert(cache_key, entry);
     }
 
     pub fn flow_cache_entry_count(&self) -> usize {

@@ -231,7 +231,7 @@ pub fn get_var_ref_type(
         )
         .unwrap_or(LuaType::Unknown))
     } else {
-        if let Some(type_cache) = cache.index_ref_origin_type_cache.get(var_ref_id)
+        if let Some(type_cache) = cache.get_index_ref_origin_type_cache(var_ref_id)
             && let CacheEntry::Cache(ty) = type_cache
         {
             return Ok(ty.clone());
