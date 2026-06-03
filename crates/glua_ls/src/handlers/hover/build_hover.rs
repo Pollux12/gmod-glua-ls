@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 
-use glua_code_analysis::humanize_type;
 use glua_code_analysis::{
     DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaMemberId, LuaMemberKey,
     LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
     SemanticDeclLevel, SemanticInfo, SemanticModel,
 };
+use glua_code_analysis::{humanize_member_key_name, humanize_type};
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaSyntaxKind,
     LuaSyntaxToken, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
@@ -133,6 +133,7 @@ fn build_dynamic_field_hover_without_property(
     if field_name.is_empty() {
         return None;
     }
+    let display_field_name = humanize_member_key_name(&field_name);
 
     let prefix_type = semantic_model
         .infer_expr(index_expr.get_prefix_expr()?)
@@ -165,7 +166,7 @@ fn build_dynamic_field_hover_without_property(
 
     Some(format!(
         "```lua\n(infer) {}: {}\n```",
-        field_name, type_humanize_text
+        display_field_name, type_humanize_text
     ))
 }
 
@@ -366,7 +367,7 @@ fn build_member_hover(
             .any(|(_, semantic_typ)| is_function(semantic_typ));
 
     let member_name = match member.get_key() {
-        LuaMemberKey::Name(name) => name.to_string(),
+        LuaMemberKey::Name(name) => humanize_member_key_name(name.as_str()),
         LuaMemberKey::Integer(i) => format!("[{}]", i),
         _ => return None,
     };
@@ -542,8 +543,8 @@ fn add_member_color_preview(
         get_member_value_expr(db, member_id).and_then(|expr| color_info_from_expr(&expr))
     })?;
     let member = db.get_member_index().get_member(&member_id)?;
-    let member_name: &str = match member.get_key() {
-        LuaMemberKey::Name(name) => name.as_str(),
+    let member_name = match member.get_key() {
+        LuaMemberKey::Name(name) => humanize_member_key_name(name.as_str()),
         _ => return None,
     };
     builder.set_type_description(format!("(field) {}: {}", member_name, color.gmod_display));

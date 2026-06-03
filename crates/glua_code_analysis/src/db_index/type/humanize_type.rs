@@ -493,7 +493,7 @@ fn humanize_object_type(db: &DbIndex, object: &LuaObjectType, level: RenderLevel
             match name {
                 LuaMemberKey::Integer(i) => format!("[{}]: {}", i, ty_str),
                 LuaMemberKey::Name(s) => {
-                    format!("{}: {}", render_member_key_name(s.as_str()), ty_str)
+                    format!("{}: {}", humanize_member_key_name(s.as_str()), ty_str)
                 }
                 LuaMemberKey::None => ty_str,
                 LuaMemberKey::ExprType(_) => ty_str,
@@ -915,7 +915,7 @@ fn build_table_member_string(
         LuaMemberKey::Name(name) => {
             format!(
                 "{}{separator}{member_value}",
-                render_member_key_name(name.as_str())
+                humanize_member_key_name(name.as_str())
             )
         }
         LuaMemberKey::Integer(i) => format!("[{i}]{separator}{member_value}"),
@@ -928,7 +928,7 @@ fn build_table_member_string(
     }
 }
 
-fn render_member_key_name(name: &str) -> String {
+pub fn humanize_member_key_name(name: &str) -> String {
     if is_lua_identifier(name) && !is_lua_keyword(name) {
         name.to_string()
     } else {
@@ -985,8 +985,8 @@ mod tests {
     use crate::{DbIndex, LuaMemberKey, LuaObjectType, LuaType, LuaUnionType};
 
     use super::{
-        RenderLevel, build_table_member_string, format_union_type, humanize_type,
-        render_member_key_name,
+        RenderLevel, build_table_member_string, format_union_type, humanize_member_key_name,
+        humanize_type,
     };
 
     fn simple_type_label(ty: &LuaType) -> String {
@@ -1035,10 +1035,10 @@ mod tests {
     }
 
     #[gtest]
-    fn render_member_key_name_uses_bare_names_only_for_valid_identifiers() {
-        expect_eq!(render_member_key_name("valid_name1"), "valid_name1");
-        expect_eq!(render_member_key_name("end"), "[\"end\"]");
-        expect_eq!(render_member_key_name("not valid"), "[\"not valid\"]");
+    fn humanize_member_key_name_uses_bare_names_only_for_valid_identifiers() {
+        expect_eq!(humanize_member_key_name("valid_name1"), "valid_name1");
+        expect_eq!(humanize_member_key_name("end"), "[\"end\"]");
+        expect_eq!(humanize_member_key_name("not valid"), "[\"not valid\"]");
     }
 
     #[gtest]
