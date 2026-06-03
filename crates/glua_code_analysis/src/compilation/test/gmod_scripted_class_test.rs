@@ -1075,6 +1075,53 @@ mod test {
     }
 
     #[gtest]
+    fn test_derma_define_control_baseclass_member_uses_base_arg_syntax_id() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/vgui/baseclass_source_anchor.lua",
+            r#"
+            local PANEL = {}
+            derma.DefineControl("AnchorPanel", "", PANEL, "EditablePanel")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let metadata = db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+            .expect("expected gmod metadata");
+        let call = metadata
+            .derma_define_control_calls
+            .first()
+            .expect("expected derma.DefineControl call metadata");
+        let expected_member_id = LuaMemberId::new(
+            call.args
+                .get(3)
+                .expect("expected base panel arg metadata")
+                .syntax_id,
+            file_id,
+        );
+
+        let member_item = db
+            .get_member_index()
+            .get_member_item(
+                &LuaMemberOwner::Type(LuaTypeDeclId::global("AnchorPanel")),
+                &LuaMemberKey::Name("BaseClass".into()),
+            )
+            .expect("expected synthesized BaseClass member");
+
+        assert_eq!(
+            *member_item,
+            crate::LuaMemberIndexItem::One(expected_member_id),
+            "BaseClass member should be anchored to the base-panel arg syntax id"
+        );
+    }
+
+    #[gtest]
     fn test_ent_base_from_shared_file_sets_folder_class_super_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -1413,6 +1460,71 @@ mod test {
         assert!(
             !panel_b_members.contains(&"Init".to_string()),
             "PanelB should not inherit Init from first PANEL table, got {panel_b_members:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_reassigned_panel_accessor_func_stays_in_own_region() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/vgui/reassigned_panel_accessors.lua",
+            r#"
+            local PANEL = {}
+            AccessorFunc(PANEL, "m_a", "A")
+            vgui.Register("PanelA", PANEL, "DPanel")
+
+            PANEL = {}
+            AccessorFunc(PANEL, "m_b", "B")
+            vgui.Register("PanelB", PANEL, "DPanel")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let panel_a_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("PanelA")))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let panel_b_members = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("PanelB")))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            panel_a_members.contains(&"GetA".to_string())
+                && panel_a_members.contains(&"SetA".to_string()),
+            "PanelA should contain only A accessors, got {panel_a_members:?}"
+        );
+        assert!(
+            !panel_a_members.contains(&"GetB".to_string())
+                && !panel_a_members.contains(&"SetB".to_string()),
+            "PanelA should not inherit B accessors, got {panel_a_members:?}"
+        );
+
+        assert!(
+            panel_b_members.contains(&"GetB".to_string())
+                && panel_b_members.contains(&"SetB".to_string()),
+            "PanelB should contain only B accessors, got {panel_b_members:?}"
+        );
+        assert!(
+            !panel_b_members.contains(&"GetA".to_string())
+                && !panel_b_members.contains(&"SetA".to_string()),
+            "PanelB should not inherit A accessors, got {panel_b_members:?}"
         );
     }
 

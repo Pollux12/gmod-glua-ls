@@ -65,6 +65,7 @@ pub use guard::{InferGuard, InferGuardRef};
 pub use infer::InferFailReason;
 pub use infer::{SelfRefId, VarRefId, VarRefRootId};
 pub use infer::infer_call_expr_func;
+pub(crate) use infer::infer_enclosing_self_type;
 pub(crate) use infer::infer_expr;
 pub use infer::infer_param;
 pub(crate) use infer::remove_false_or_nil;

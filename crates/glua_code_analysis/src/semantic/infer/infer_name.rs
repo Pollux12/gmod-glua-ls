@@ -1502,7 +1502,7 @@ fn resolve_self_infer(typ: &LuaType, self_type: &LuaType) -> LuaType {
 
 /// Infers the self type from the enclosing method (colon function).
 /// For `function ENT:Update() ... end`, this returns the type of `ENT`.
-fn infer_enclosing_self_type(
+pub(crate) fn infer_enclosing_self_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,

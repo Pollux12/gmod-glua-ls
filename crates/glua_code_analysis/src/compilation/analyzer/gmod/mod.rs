@@ -2190,8 +2190,15 @@ fn synthesize_scripted_class_members(
 
 /// Synthesize vgui.Register / derma.DefineControl class types.
 fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
-    // Track (file_id, table_var_name, panel_name) for AccessorFunc synthesis
-    let mut vgui_table_vars: Vec<(FileId, String, String)> = Vec::new();
+    struct VguiRegistrationRegion {
+        file_id: FileId,
+        decl_id: LuaDeclId,
+        panel_name: String,
+        region_start: TextSize,
+        region_end: TextSize,
+    }
+
+    let mut vgui_registration_regions: Vec<VguiRegistrationRegion> = Vec::new();
 
     for file_id in file_ids.iter().copied() {
         let metadata = match db
@@ -2203,25 +2210,42 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
         };
 
         for call in &metadata.vgui_register_calls {
-            // Extract table var name and panel name before synthesizing
+            let register_position = call.syntax_id.get_range().start();
             if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first()
             {
                 if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
                     call.literal_args.get(1)
+                    && let Some((decl_id, region_start)) =
+                        resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
-                    vgui_table_vars.push((file_id, table_var.clone(), panel_name.clone()));
+                    vgui_registration_regions.push(VguiRegistrationRegion {
+                        file_id,
+                        decl_id,
+                        panel_name: panel_name.clone(),
+                        region_start,
+                        region_end: register_position,
+                    });
                 }
             }
             synthesize_vgui_register(db, file_id, call);
         }
 
         for call in &metadata.derma_define_control_calls {
+            let register_position = call.syntax_id.get_range().start();
             if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first()
             {
                 if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
                     call.literal_args.get(2)
+                    && let Some((decl_id, region_start)) =
+                        resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
-                    vgui_table_vars.push((file_id, table_var.clone(), panel_name.clone()));
+                    vgui_registration_regions.push(VguiRegistrationRegion {
+                        file_id,
+                        decl_id,
+                        panel_name: panel_name.clone(),
+                        region_start,
+                        region_end: register_position,
+                    });
                 }
             }
             synthesize_derma_define_control(db, file_id, call);
@@ -2229,34 +2253,70 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
     }
 
     // Synthesize AccessorFunc members for VGUI-registered classes
-    for (file_id, table_var_name, panel_name) in &vgui_table_vars {
+    for registration in &vgui_registration_regions {
         let metadata = match db
             .get_gmod_class_metadata_index()
-            .get_file_metadata(file_id)
+            .get_file_metadata(&registration.file_id)
         {
             Some(m) => m.clone(),
             None => continue,
         };
 
         log::debug!(
-            "VGUI AccessorFunc: file {:?} has {} accessor_func_calls for table_var={} panel={}",
-            file_id,
+            "VGUI AccessorFunc: file {:?} has {} accessor_func_calls for panel={} region={:?}..{:?}",
+            registration.file_id,
             metadata.accessor_func_calls.len(),
-            table_var_name,
-            panel_name
+            registration.panel_name,
+            registration.region_start,
+            registration.region_end,
         );
-        let class_decl_id = LuaTypeDeclId::global(panel_name);
+        let class_decl_id = LuaTypeDeclId::global(&registration.panel_name);
         for call in &metadata.accessor_func_calls {
-            // Check if the AccessorFunc's first arg matches this table variable
             if let Some(Some(GmodClassCallLiteral::NameRef(target_name))) =
                 call.literal_args.first()
+                && let Some(target_arg) = call.args.first()
             {
-                if target_name == table_var_name {
-                    synthesize_accessor_func(db, *file_id, &class_decl_id, call);
+                let accessor_position = call.syntax_id.get_range().start();
+                let target_decl_id = resolve_local_decl_id_at_position(
+                    db,
+                    registration.file_id,
+                    target_name,
+                    target_arg.syntax_id.get_range().start(),
+                );
+
+                if target_decl_id == Some(registration.decl_id)
+                    && accessor_position >= registration.region_start
+                    && accessor_position < registration.region_end
+                {
+                    synthesize_accessor_func(db, registration.file_id, &class_decl_id, call);
                 }
             }
         }
     }
+}
+
+fn resolve_local_registration_region(
+    db: &DbIndex,
+    file_id: FileId,
+    var_name: &str,
+    register_position: TextSize,
+) -> Option<(LuaDeclId, TextSize)> {
+    let decl_id = resolve_local_decl_id_at_position(db, file_id, var_name, register_position)?;
+    let region_start = find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
+        .unwrap_or(decl_id.position);
+    Some((decl_id, region_start))
+}
+
+fn resolve_local_decl_id_at_position(
+    db: &DbIndex,
+    file_id: FileId,
+    var_name: &str,
+    position: TextSize,
+) -> Option<LuaDeclId> {
+    db.get_decl_index()
+        .get_decl_tree(&file_id)?
+        .find_local_decl(var_name, position)
+        .map(|decl| decl.get_id())
 }
 
 fn synthesize_scoped_base_assignments_with(
@@ -3232,6 +3292,7 @@ fn synthesize_vgui_register(
         &panel_name,
         table_var_name.as_deref(),
         base_panel.as_deref(),
+        GmodScriptedClassCallKind::VguiRegister,
         call,
     );
 }
@@ -3267,6 +3328,7 @@ fn synthesize_derma_define_control(
         &control_name,
         table_var_name.as_deref(),
         base_panel.as_deref(),
+        GmodScriptedClassCallKind::DermaDefineControl,
         call,
     );
 
@@ -3423,6 +3485,7 @@ fn synthesize_panel_class(
     panel_name: &str,
     table_var_name: Option<&str>,
     base_panel: Option<&str>,
+    call_kind: GmodScriptedClassCallKind,
     call: &GmodScriptedClassCallMetadata,
 ) {
     let class_decl_id = LuaTypeDeclId::global(panel_name);
@@ -3454,7 +3517,7 @@ fn synthesize_panel_class(
             db.get_type_index_mut()
                 .add_super_type(class_decl_id.clone(), file_id, super_type);
         }
-        synthesize_panel_baseclass_member(db, file_id, &class_decl_id, base_name, call);
+        synthesize_panel_baseclass_member(db, file_id, &class_decl_id, base_name, call_kind, call);
     }
 
     // Bind the table variable to the panel class.
@@ -3469,22 +3532,15 @@ fn synthesize_panel_class(
     // public `infer_expr` override consults — yielding correct per-region
     // resolution for hover, diagnostics, completion and CodeLens uniformly.
     if let Some(var_name) = table_var_name {
-        let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) else {
-            return;
-        };
-
         let register_position = call.syntax_id.get_range().start();
-        let selected_decl_id = decl_tree
-            .find_local_decl(var_name, register_position)
-            .map(|decl| decl.get_id());
-
-        let Some(decl_id) = selected_decl_id else {
+        let Some((decl_id, region_start)) =
+            resolve_local_registration_region(db, file_id, var_name, register_position)
+        else {
             return;
         };
 
         let class_type = LuaType::Def(class_decl_id.clone());
-        let latest_write_position =
-            find_latest_decl_write_before_position(db, file_id, decl_id, register_position);
+        let latest_write_position = Some(region_start);
 
         // Resolve the concrete `{}` table literal backing this registration.
         let registered_table = find_registered_table_expr(db, file_id, decl_id, register_position);
@@ -3739,6 +3795,7 @@ fn synthesize_panel_baseclass_member(
     file_id: FileId,
     class_decl_id: &LuaTypeDeclId,
     base_name: &str,
+    call_kind: GmodScriptedClassCallKind,
     call: &GmodScriptedClassCallMetadata,
 ) {
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
@@ -3751,9 +3808,15 @@ fn synthesize_panel_baseclass_member(
         return;
     }
 
+    let base_arg_index = match call_kind {
+        GmodScriptedClassCallKind::VguiRegister => 2,
+        GmodScriptedClassCallKind::DermaDefineControl => 3,
+        _ => return,
+    };
+
     let syntax_id = call
         .args
-        .get(2)
+        .get(base_arg_index)
         .map(|arg| arg.syntax_id)
         .unwrap_or(call.syntax_id);
     let member_id = LuaMemberId::new(syntax_id, file_id);

@@ -1,6 +1,6 @@
 use std::{collections::HashSet, ops::Deref, sync::Arc};
 
-use glua_parser::{LuaAstNode, LuaDocTypeList, LuaFuncStat, LuaNameExpr, LuaVarExpr};
+use glua_parser::{LuaAstNode, LuaDocTypeList, LuaNameExpr};
 use glua_parser::{LuaCallExpr, LuaExpr};
 use internment::ArcIntern;
 
@@ -20,7 +20,7 @@ use crate::{
             },
         },
         infer::InferFailReason,
-        infer_expr,
+        infer_enclosing_self_type, infer_expr,
     },
 };
 use crate::{LuaMemberOwner, LuaSemanticDeclId, SemanticDeclLevel, infer_node_semantic_decl};
@@ -291,33 +291,6 @@ fn is_implicit_self_name(db: &DbIndex, cache: &LuaInferCache, name_expr: &LuaNam
         .get_decl_tree(&cache.get_file_id())
         .and_then(|tree| tree.find_local_decl("self", name_expr.get_position()))
         .is_some_and(|decl| decl.is_implicit_self())
-}
-
-fn infer_enclosing_self_type(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    name_expr: &LuaNameExpr,
-) -> Option<LuaType> {
-    for func_stat in name_expr.ancestors::<LuaFuncStat>() {
-        // Skip anonymous/non-colon ancestors (e.g. nested closures) and keep
-        // walking outward to the enclosing colon method, rather than bailing out
-        // on the first ancestor that lacks a colon-method name.
-        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
-            continue;
-        };
-        if !index_expr
-            .get_index_token()
-            .is_some_and(|token| token.is_colon())
-        {
-            continue;
-        }
-        let Some(prefix_expr) = index_expr.get_prefix_expr() else {
-            continue;
-        };
-        return infer_expr(db, cache, prefix_expr).ok();
-    }
-
-    None
 }
 
 fn check_expr_can_later_infer(
