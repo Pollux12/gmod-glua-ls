@@ -1,6 +1,7 @@
 use super::{
     SEMANTIC_TOKEN_MODIFIERS, SEMANTIC_TOKEN_TYPES, semantic_token_builder::SemanticBuilder,
 };
+use crate::handlers::semantic_token::escape_sequence_highlight::highlight_string_escapes;
 use crate::handlers::semantic_token::function_string_highlight::fun_string_highlight;
 use crate::handlers::semantic_token::semantic_token_builder::{
     CustomSemanticTokenModifier, CustomSemanticTokenType,
@@ -70,9 +71,17 @@ fn build_tokens_semantic_token(
     emmyrc: &Emmyrc,
 ) {
     match token.kind().into() {
-        LuaTokenKind::TkLongString | LuaTokenKind::TkString => {
+        LuaTokenKind::TkLongString => {
+            // Long strings do not process escape sequences, so keep a single STRING token.
             if !builder.is_special_string_range(&token.text_range()) {
                 builder.push(token, SemanticTokenType::STRING);
+            }
+        }
+        LuaTokenKind::TkString => {
+            // Regular strings: split out escape sequences as separate tokens so editors
+            // can color them distinctly.
+            if !builder.is_special_string_range(&token.text_range()) {
+                highlight_string_escapes(builder, token);
             }
         }
         LuaTokenKind::TkAnd

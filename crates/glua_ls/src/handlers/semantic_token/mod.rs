@@ -1,4 +1,5 @@
 mod build_semantic_tokens;
+mod escape_sequence_highlight;
 mod function_string_highlight;
 mod language_injector;
 mod semantic_token_builder;
