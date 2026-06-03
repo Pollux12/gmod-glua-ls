@@ -25,7 +25,8 @@ use crate::{
     db_index::{LuaFunctionType, LuaMemberOwner, LuaSignature, LuaSignatureId},
     find_members_with_key, humanize_type,
     semantic::{
-        InferGuard, LuaInferCache, SemanticDeclGuard, VarRefId, get_var_expr_var_ref_id,
+        InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
+        get_var_expr_var_ref_id,
         infer_call_expr_func, infer_expr, infer_expr_semantic_decl,
     },
 };
@@ -1738,7 +1739,7 @@ fn semantic_decl_has_write_before_position(
 fn semantic_decl_from_var_ref_id(var_ref_id: &VarRefId) -> Option<LuaSemanticDeclId> {
     match var_ref_id {
         VarRefId::VarRef(decl_id) => Some(LuaSemanticDeclId::LuaDecl(*decl_id)),
-        VarRefId::SelfRef(decl_or_member_id) => match decl_or_member_id {
+        VarRefId::SelfRef(self_ref_id) => match &self_ref_id.receiver {
             LuaDeclOrMemberId::Decl(decl_id) => Some(LuaSemanticDeclId::LuaDecl(*decl_id)),
             LuaDeclOrMemberId::Member(member_id) => Some(LuaSemanticDeclId::Member(*member_id)),
         },
@@ -1758,7 +1759,14 @@ fn type_owner_to_var_ref_id(type_owner: LuaTypeOwner) -> Option<VarRefId> {
     match type_owner {
         LuaTypeOwner::Decl(decl_id) => Some(VarRefId::VarRef(decl_id)),
         LuaTypeOwner::Member(member_id) => {
-            Some(VarRefId::SelfRef(LuaDeclOrMemberId::Member(member_id)))
+            // Represent a member-owner effect target as a member-rooted `SelfRef`.
+            // The `self_decl_id` is synthesized from the member's own location so
+            // the identity is unique; `receiver` carries the member used for
+            // base/member type lookup and index-ref extension.
+            Some(VarRefId::SelfRef(SelfRefId {
+                self_decl_id: LuaDeclId::new(member_id.file_id, member_id.get_position()),
+                receiver: LuaDeclOrMemberId::Member(member_id),
+            }))
         }
         LuaTypeOwner::SyntaxId(_) => None,
     }
@@ -1777,18 +1785,19 @@ fn extend_var_ref_id_with_path(
         Some(access_path) => format!("{}.{}", access_path, field_path.join(".")),
         None => field_path.join("."),
     };
+    let arc_path = ArcIntern::from(SmolStr::new(&full_path));
     match var_ref_id {
         VarRefId::VarRef(decl_id) => Some(VarRefId::IndexRef(
-            LuaDeclOrMemberId::Decl(decl_id),
-            ArcIntern::from(SmolStr::new(&full_path)),
+            VarRefRootId::Decl(decl_id),
+            arc_path,
         )),
-        VarRefId::SelfRef(decl_or_member_id) => Some(VarRefId::IndexRef(
-            decl_or_member_id,
-            ArcIntern::from(SmolStr::new(&full_path)),
+        VarRefId::SelfRef(self_ref_id) => Some(VarRefId::IndexRef(
+            VarRefRootId::SelfRef(self_ref_id),
+            arc_path,
         )),
-        VarRefId::IndexRef(decl_or_member_id, _) => Some(VarRefId::IndexRef(
-            decl_or_member_id,
-            ArcIntern::from(SmolStr::new(&full_path)),
+        VarRefId::IndexRef(root, _) => Some(VarRefId::IndexRef(
+            root,
+            arc_path,
         )),
         VarRefId::GlobalName(_, _) => None,
     }

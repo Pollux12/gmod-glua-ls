@@ -25,13 +25,14 @@ pub use infer_index::infer_index_expr;
 pub(crate) use infer_index::infer_member_by_member_key;
 pub(crate) use infer_index::resolve_decl_backed_global_path_member_type;
 use infer_name::infer_name_expr;
+pub(crate) use infer_name::infer_enclosing_self_type;
 pub(crate) use infer_name::resolve_scoped_scripted_global_type_decl_id;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
 pub use infer_name::{find_self_decl_or_member_id, infer_param};
 use infer_table::infer_table_expr;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};
 use infer_unary::infer_unary_expr;
-pub use narrow::VarRefId;
+pub use narrow::{SelfRefId, VarRefId, VarRefRootId};
 pub(crate) use narrow::{contains_gmod_null_type, get_var_expr_var_ref_id, remove_false_or_nil};
 
 use rowan::TextRange;

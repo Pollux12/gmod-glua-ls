@@ -118,7 +118,9 @@ fn add_func_stat_code_lens(
             });
 
             if enable_vgui_code_lens
-                && let Some(info) = find_gmod_class_from_decl(semantic_model, decl_id)
+                && let Some(semantic_info) =
+                    semantic_model.get_semantic_info(NodeOrToken::Node(name_expr.syntax().clone()))
+                && let Some(info) = find_gmod_class_from_type(semantic_model, &semantic_info.typ)
             {
                 push_gmod_class_code_lens(result, range, &info);
             }
@@ -150,7 +152,10 @@ fn add_local_func_stat_code_lens(
         data: Some(serde_json::to_value(data).unwrap()),
     });
 
-    if enable_vgui_code_lens && let Some(info) = find_gmod_class_from_decl(semantic_model, decl_id)
+    if enable_vgui_code_lens
+        && let Some(semantic_info) =
+            semantic_model.get_semantic_info(NodeOrToken::Node(func_name.syntax().clone()))
+        && let Some(info) = find_gmod_class_from_type(semantic_model, &semantic_info.typ)
     {
         push_gmod_class_code_lens(result, range, &info);
     }
@@ -168,7 +173,6 @@ fn add_local_stat_code_lens(
         return Some(());
     }
 
-    let file_id = semantic_model.get_file_id();
     let document = semantic_model.get_document();
 
     for local_name in local_stat.get_local_name_list() {
@@ -176,8 +180,12 @@ fn add_local_stat_code_lens(
             continue;
         };
 
-        let decl_id = LuaDeclId::new(file_id, name_token.get_position());
-        let Some(info) = find_gmod_class_from_decl(semantic_model, decl_id) else {
+        let Some(semantic_info) =
+            semantic_model.get_semantic_info(NodeOrToken::Node(local_name.syntax().clone()))
+        else {
+            continue;
+        };
+        let Some(info) = find_gmod_class_from_type(semantic_model, &semantic_info.typ) else {
             continue;
         };
 
@@ -199,15 +207,17 @@ fn add_assign_stat_code_lens(
     }
 
     let document = semantic_model.get_document();
-    let (vars, _) = assign_stat.get_var_and_expr_list();
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
 
-    for var in vars {
-        let Some(semantic_info) =
-            semantic_model.get_semantic_info(NodeOrToken::Node(var.syntax().clone()))
-        else {
+    for (i, var) in vars.into_iter().enumerate() {
+        let Some(expr) = exprs.get(i) else {
             continue;
         };
-        let Some(info) = find_gmod_class_from_type(semantic_model, &semantic_info.typ) else {
+
+        let Ok(expr_type) = semantic_model.infer_expr(expr.clone()) else {
+            continue;
+        };
+        let Some(info) = find_gmod_class_from_type(semantic_model, &expr_type) else {
             continue;
         };
 
@@ -221,19 +231,6 @@ fn add_assign_stat_code_lens(
 struct GmodClassInfo {
     class_name: String,
     base_name: Option<String>,
-}
-
-fn find_gmod_class_from_decl(
-    semantic_model: &SemanticModel,
-    decl_id: LuaDeclId,
-) -> Option<GmodClassInfo> {
-    let typ = semantic_model
-        .get_db()
-        .get_type_index()
-        .get_type_cache(&decl_id.into())?
-        .as_type();
-
-    find_gmod_class_from_type(semantic_model, typ)
 }
 
 fn find_gmod_class_from_member_owner(
@@ -480,7 +477,7 @@ fn resolve_receive_kind_label(semantic_model: &SemanticModel, call_expr: &LuaCal
 #[cfg(test)]
 mod tests {
     use glua_code_analysis::VirtualWorkspace;
-    use glua_parser::{LuaAstNode, LuaLocalName};
+    use glua_parser::{LuaAssignStat, LuaAst, LuaAstNode, LuaLocalName};
     use googletest::prelude::*;
 
     use super::build_code_lens;
@@ -518,5 +515,110 @@ mod tests {
             panic!("expected declaration code lens");
         };
         assert_that!(actual_decl, eq(expected_decl));
+    }
+
+    #[gtest]
+    fn vgui_reassigned_panel_code_lens_labels_resolve_per_region() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = glua_code_analysis::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.vgui.code_lens_enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+                local PANEL = {}
+                function PANEL:Init() end
+                vgui.Register("ReFrame", PANEL, "DFrame")
+
+                PANEL = {}
+                function PANEL:Paint() end
+                vgui.Register("ReButton", PANEL, "DButton")
+
+                PANEL = {}
+                function PANEL:Think() end
+                vgui.Register("ReTree", PANEL, "DTree")
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let lenses = build_code_lens(&semantic_model).expect("expected code lenses");
+
+        let titles: Vec<String> = lenses
+            .iter()
+            .filter_map(|l| l.command.as_ref().map(|c| c.title.clone()))
+            .collect();
+
+        assert_that!(titles, contains(eq("ReFrame : DFrame")));
+        assert_that!(titles, contains(eq("ReButton : DButton")));
+        assert_that!(titles, contains(eq("ReTree : DTree")));
+    }
+
+    #[gtest]
+    fn vgui_reassigned_panel_assignment_code_lens_resolves_per_region() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = glua_code_analysis::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.vgui.code_lens_enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+                local PANEL = {}
+                function PANEL:Init() end
+                vgui.Register("ReFrame", PANEL, "DFrame")
+
+                PANEL = {}
+                function PANEL:Paint() end
+                vgui.Register("ReButton", PANEL, "DButton")
+
+                PANEL = {}
+                function PANEL:Think() end
+                vgui.Register("ReTree", PANEL, "DTree")
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let document = semantic_model.get_document();
+        let lenses = build_code_lens(&semantic_model).expect("expected code lenses");
+
+        let assign_ranges: Vec<_> = semantic_model
+            .get_root()
+            .clone()
+            .descendants::<LuaAst>()
+            .filter_map(|node| match node {
+                LuaAst::LuaAssignStat(assign_stat) => Some(assign_stat),
+                _ => None,
+            })
+            .map(|assign_stat: LuaAssignStat| {
+                let (vars, _) = assign_stat.get_var_and_expr_list();
+                document
+                    .to_lsp_range(vars[0].get_range())
+                    .expect("assignment var range")
+            })
+            .collect();
+
+        assert_that!(assign_ranges.len(), eq(2usize));
+
+        let assignment_titles: Vec<_> = assign_ranges
+            .iter()
+            .map(|range| {
+                lenses
+                    .iter()
+                    .find(|lens| lens.range == *range)
+                    .and_then(|lens| lens.command.as_ref())
+                    .map(|command| command.title.clone())
+                    .expect("expected class CodeLens on assignment")
+            })
+            .collect();
+
+        assert_that!(assignment_titles[0].as_str(), eq("ReButton : DButton"));
+        assert_that!(assignment_titles[1].as_str(), eq("ReTree : DTree"));
     }
 }

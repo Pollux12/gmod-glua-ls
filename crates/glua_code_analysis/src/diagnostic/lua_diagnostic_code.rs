@@ -194,6 +194,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::GmodNetReadWriteBitsMismatch => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodDuplicateSystemRegistration => DiagnosticSeverity::HINT,
         DiagnosticCode::GmodNullCheck => DiagnosticSeverity::WARNING,
+        DiagnosticCode::RedundantParameter => DiagnosticSeverity::INFORMATION,
         _ => DiagnosticSeverity::WARNING,
     }
 }

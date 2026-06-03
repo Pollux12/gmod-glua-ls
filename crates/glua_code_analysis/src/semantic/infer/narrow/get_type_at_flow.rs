@@ -344,8 +344,7 @@ fn get_type_at_flow_walk(
                     // type is preserved instead of being overridden by the
                     // implementation signature.
                     let is_undeclared = cache
-                        .index_ref_origin_type_cache
-                        .get(var_ref_id)
+                        .get_index_ref_origin_type_cache(var_ref_id)
                         .is_some_and(|entry| matches!(entry, CacheEntry::Cache(t) if t.is_nil()));
 
                     if is_undeclared {
@@ -959,8 +958,8 @@ fn special_call_effect_matches_var_ref(effect_target: &VarRefId, var_ref_id: &Va
     effect_target == var_ref_id
         || matches!(
             (effect_target, var_ref_id),
-            (VarRefId::SelfRef(effect_base), VarRefId::IndexRef(current_base, _))
-                if effect_base == current_base
+            (VarRefId::SelfRef(effect_self), VarRefId::IndexRef(root, _))
+                if root.receiver_eq(&effect_self.receiver)
         )
 }
 
@@ -1036,7 +1035,24 @@ fn get_type_at_assign_stat(
             }
         };
 
-        let narrowed = if source_type == LuaType::Nil {
+        // Assignment is value REPLACEMENT, not condition refinement. When the RHS is a
+        // fresh table-literal constructor, its table identity must replace the
+        // antecedent's identity rather than being narrowed against it. Narrowing
+        // (`narrow_down_type`) intentionally preserves the antecedent `TableConst`
+        // identity for `TableConst -> TableConst`, which is correct for guards like
+        // `if type(x) == "table"` but wrong for `x = {}`: it would keep the previous
+        // table, collapsing every reassigned region of a reused local onto the first
+        // table literal. Bypass narrowing for literal-table assignments (no explicit
+        // doc `@type` override) so each region keeps its own table identity.
+        let rhs_is_fresh_table_literal = explicit_var_type.is_none()
+            && matches!(expr_type, LuaType::TableConst(_))
+            && exprs
+                .get(i)
+                .is_some_and(expr_is_table_constructor);
+
+        let narrowed = if rhs_is_fresh_table_literal {
+            Some(expr_type.clone())
+        } else if source_type == LuaType::Nil {
             None
         } else {
             let declared =
@@ -1062,6 +1078,19 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+/// Returns true when `expr` is a table-constructor literal `{ ... }`, unwrapping
+/// redundant parentheses (e.g. `({})`). Used to detect value-replacement
+/// assignments where the RHS introduces a fresh table identity.
+fn expr_is_table_constructor(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::TableExpr(_) => true,
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|inner| expr_is_table_constructor(&inner)),
+        _ => false,
+    }
 }
 
 fn guarded_global_self_assignment_type(
