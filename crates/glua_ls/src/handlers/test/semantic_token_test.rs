@@ -61,6 +61,21 @@ mod tests {
         tokens.contains(&(line, col, len, token_type, modifiers))
     }
 
+    fn has_token_type(
+        tokens: &[(u32, u32, u32, u32, u32)],
+        line: u32,
+        col: u32,
+        len: u32,
+        token_type: SemanticTokenType,
+    ) -> bool {
+        let token_type = token_type_index(token_type);
+        tokens
+            .iter()
+            .any(|(token_line, token_col, token_len, typ, _)| {
+                *token_line == line && *token_col == col && *token_len == len && *typ == token_type
+            })
+    }
+
     #[gtest]
     fn test_1() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
@@ -89,10 +104,11 @@ m.foo()
         let tokens = decode(&data);
 
         let namespace_idx = token_type_index(SemanticTokenType::NAMESPACE);
-        let method_idx = token_type_index(SemanticTokenType::METHOD);
+        let field_idx = token_type_index(CustomSemanticTokenType::FIELD);
         let readonly_declaration = modifier_bitset(&[
             SemanticTokenModifier::READONLY,
             SemanticTokenModifier::DECLARATION,
+            CustomSemanticTokenModifier::LOCAL,
         ]);
 
         // `local m = require("mod")`
@@ -110,7 +126,7 @@ m.foo()
                     1,
                     2,
                     3,
-                    method_idx,
+                    field_idx,
                     modifier_bitset(&[CustomSemanticTokenModifier::CALLABLE]),
                 ))),
             ]
@@ -148,7 +164,23 @@ local x = 1
     }
 
     #[gtest]
-    fn test_variable_and_builtin_tokens_follow_vscode_semantics() -> Result<()> {
+    fn test_string_literal_segments_use_utf16_lengths() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file("main.lua", "local s = \"😀\\n\"\n");
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
+        verify_that!(
+            has_token(&tokens, 0, 10, 3, SemanticTokenType::STRING, &[]),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_variable_and_unresolved_call_tokens_follow_vscode_semantics() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let main = ws.def_file(
             "main.lua",
@@ -212,12 +244,23 @@ print(global_var, x)
                 0,
                 5,
                 SemanticTokenType::FUNCTION,
+                &[CustomSemanticTokenModifier::CALLABLE],
+            ),
+            eq(true)
+        )?;
+        verify_that!(
+            has_token(
+                &tokens,
+                3,
+                0,
+                5,
+                SemanticTokenType::FUNCTION,
                 &[
                     SemanticTokenModifier::DEFAULT_LIBRARY,
                     SemanticTokenModifier::READONLY,
                 ],
             ),
-            eq(true)
+            eq(false)
         )?;
         verify_that!(
             has_token(
@@ -298,7 +341,7 @@ end
     }
 
     #[gtest]
-    fn test_builtin_library_namespaces_are_not_plain_globals() -> Result<()> {
+    fn test_unresolved_builtin_like_namespace_does_not_use_spelling_heuristic() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let main = ws.def_file(
             "main.lua",
@@ -308,7 +351,6 @@ end
 
         let data = ws.get_semantic_token_data_for_file(main)?;
         let tokens = decode(&data);
-
         verify_that!(
             has_token(
                 &tokens,
@@ -318,7 +360,7 @@ end
                 SemanticTokenType::NAMESPACE,
                 &[SemanticTokenModifier::DEFAULT_LIBRARY],
             ),
-            eq(true)
+            eq(false)
         )?;
 
         verify_that!(
@@ -327,11 +369,215 @@ end
                 0,
                 13,
                 5,
-                SemanticTokenType::METHOD,
+                CustomSemanticTokenType::FIELD,
                 &[CustomSemanticTokenModifier::CALLABLE],
             ),
             eq(true)
         )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_doc_payload_tokens_keep_documentation_context() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"---@field callback fun()
+---@realm server
+---@namespace MyNS
+---@using string
+---@return string result
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+        verify_that!(
+            has_token(
+                &tokens,
+                0,
+                10,
+                8,
+                CustomSemanticTokenType::FIELD,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    SemanticTokenModifier::DOCUMENTATION,
+                ],
+            ),
+            eq(true)
+        )?;
+        verify_that!(
+            has_token(
+                &tokens,
+                1,
+                10,
+                6,
+                SemanticTokenType::ENUM_MEMBER,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    SemanticTokenModifier::DOCUMENTATION,
+                ],
+            ),
+            eq(true)
+        )?;
+        verify_that!(
+            has_token(
+                &tokens,
+                2,
+                14,
+                4,
+                SemanticTokenType::NAMESPACE,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    SemanticTokenModifier::DOCUMENTATION,
+                ],
+            ),
+            eq(true)
+        )?;
+        verify_that!(
+            has_token(
+                &tokens,
+                3,
+                10,
+                6,
+                SemanticTokenType::NAMESPACE,
+                &[SemanticTokenModifier::DOCUMENTATION],
+            ),
+            eq(true)
+        )?;
+        verify_that!(
+            has_token(
+                &tokens,
+                4,
+                18,
+                6,
+                SemanticTokenType::VARIABLE,
+                &[SemanticTokenModifier::DOCUMENTATION],
+            ),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_unresolved_builtin_like_local_alias_does_not_use_spelling_heuristic() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"local str = string
+str.lower("demo")
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+        verify_that!(
+            has_token(
+                &tokens,
+                0,
+                6,
+                3,
+                SemanticTokenType::NAMESPACE,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    SemanticTokenModifier::DEFAULT_LIBRARY,
+                    CustomSemanticTokenModifier::LOCAL,
+                ],
+            ),
+            eq(false)
+        )?;
+
+        verify_that!(
+            has_token(
+                &tokens,
+                1,
+                0,
+                3,
+                SemanticTokenType::NAMESPACE,
+                &[
+                    SemanticTokenModifier::DEFAULT_LIBRARY,
+                    CustomSemanticTokenModifier::LOCAL,
+                ],
+            ),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_shadowed_builtin_namespace_alias_stays_local_variable() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"local string = {}
+local str = string
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+        verify_that!(
+            has_token(
+                &tokens,
+                1,
+                6,
+                3,
+                SemanticTokenType::VARIABLE,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    CustomSemanticTokenModifier::LOCAL,
+                    CustomSemanticTokenModifier::OBJECT,
+                ],
+            ),
+            eq(true)
+        )?;
+
+        verify_that!(
+            has_token(
+                &tokens,
+                1,
+                6,
+                3,
+                SemanticTokenType::NAMESPACE,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    SemanticTokenModifier::DEFAULT_LIBRARY,
+                    CustomSemanticTokenModifier::LOCAL,
+                ],
+            ),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_unresolved_gmod_realm_constants_do_not_use_spelling_heuristic() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file("main.lua", r#"print(CLIENT, SERVER, MENU_DLL)"#);
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
+        for (col, len) in [(6, 6), (14, 6), (22, 8)] {
+            verify_that!(
+                has_token(
+                    &tokens,
+                    0,
+                    col,
+                    len,
+                    SemanticTokenType::ENUM_MEMBER,
+                    &[
+                        SemanticTokenModifier::DEFAULT_LIBRARY,
+                        SemanticTokenModifier::READONLY,
+                    ],
+                ),
+                eq(false)
+            )?;
+        }
 
         Ok(())
     }
@@ -484,6 +730,215 @@ print(panel.headerPanel)
     }
 
     #[gtest]
+    fn test_callable_table_fields_stay_fields_not_methods() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"local callbacks = {
+    onClick = function() end
+}
+callbacks.onClick()
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+        verify_that!(
+            has_token(
+                &tokens,
+                1,
+                4,
+                7,
+                CustomSemanticTokenType::FIELD,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    CustomSemanticTokenModifier::CALLABLE,
+                ],
+            ),
+            eq(true)
+        )?;
+        verify_that!(
+            has_token(
+                &tokens,
+                3,
+                10,
+                7,
+                CustomSemanticTokenType::FIELD,
+                &[CustomSemanticTokenModifier::CALLABLE],
+            ),
+            eq(true)
+        )?;
+        verify_that!(
+            has_token(
+                &tokens,
+                3,
+                10,
+                7,
+                SemanticTokenType::METHOD,
+                &[CustomSemanticTokenModifier::CALLABLE],
+            ),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_table_locals_and_index_prefixes_get_object_modifier() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"local Editor = {}
+Editor.SAVE_DIR = "cityrp_glide_layouts/"
+Editor.previewHookId = "Glide.VehicleLayoutEditorPreview"
+Editor.sessions = Editor.sessions or {}
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
+        for (line, col) in [(1, 0), (2, 0), (3, 0), (3, 18)] {
+            verify_that!(
+                has_token(
+                    &tokens,
+                    line,
+                    col,
+                    6,
+                    SemanticTokenType::VARIABLE,
+                    &[
+                        CustomSemanticTokenModifier::LOCAL,
+                        CustomSemanticTokenModifier::OBJECT,
+                    ],
+                ),
+                eq(true)
+            )?;
+        }
+
+        verify_that!(
+            has_token(
+                &tokens,
+                0,
+                6,
+                6,
+                SemanticTokenType::VARIABLE,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    CustomSemanticTokenModifier::LOCAL,
+                    CustomSemanticTokenModifier::OBJECT,
+                ],
+            ),
+            eq(true)
+        )?;
+
+        verify_that!(
+            has_token(
+                &tokens,
+                1,
+                7,
+                8,
+                CustomSemanticTokenType::FIELD,
+                &[SemanticTokenModifier::MODIFICATION],
+            ),
+            eq(true)
+        )?;
+
+        verify_that!(
+            has_token(
+                &tokens,
+                2,
+                7,
+                13,
+                CustomSemanticTokenType::FIELD,
+                &[SemanticTokenModifier::MODIFICATION],
+            ),
+            eq(true)
+        )?;
+
+        verify_that!(
+            has_token(
+                &tokens,
+                1,
+                7,
+                8,
+                CustomSemanticTokenType::FIELD,
+                &[
+                    SemanticTokenModifier::READONLY,
+                    SemanticTokenModifier::MODIFICATION,
+                ],
+            ),
+            eq(false)
+        )?;
+
+        verify_that!(
+            has_token(&tokens, 3, 25, 8, CustomSemanticTokenType::FIELD, &[]),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_table_field_alias_keeps_local_object_signal() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"local StyledTheme = { colors = {} }
+local colors = StyledTheme.colors
+colors.primary = "white"
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
+        verify_that!(
+            has_token(
+                &tokens,
+                1,
+                6,
+                6,
+                SemanticTokenType::VARIABLE,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    CustomSemanticTokenModifier::LOCAL,
+                    CustomSemanticTokenModifier::OBJECT,
+                ],
+            ),
+            eq(true)
+        )?;
+
+        verify_that!(
+            has_token(
+                &tokens,
+                2,
+                0,
+                6,
+                SemanticTokenType::VARIABLE,
+                &[
+                    CustomSemanticTokenModifier::LOCAL,
+                    CustomSemanticTokenModifier::OBJECT,
+                ],
+            ),
+            eq(true)
+        )?;
+
+        verify_that!(
+            has_token(
+                &tokens,
+                2,
+                7,
+                7,
+                CustomSemanticTokenType::FIELD,
+                &[SemanticTokenModifier::MODIFICATION],
+            ),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_local_class_instances_stay_variables_with_object_modifier() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let main = ws.def_file(
@@ -529,11 +984,94 @@ local pnl = create()
     }
 
     #[gtest]
-    fn test_hook_name_strings_use_event_tokens() -> Result<()> {
+    fn test_local_class_alias_keeps_class_and_local_signal() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let main = ws.def_file(
             "main.lua",
-            r#"hook.Add("Think", "demo", function() end)
+            r#"---@class Glide.VehicleLayoutEditor
+Glide = {}
+Glide.VehicleLayoutEditor = {}
+
+local Editor = Glide.VehicleLayoutEditor
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
+        verify_that!(
+            has_token(
+                &tokens,
+                4,
+                6,
+                6,
+                SemanticTokenType::CLASS,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    CustomSemanticTokenModifier::LOCAL,
+                ],
+            ),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_shadowed_class_path_alias_stays_local_variable() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"---@class Glide.VehicleLayoutEditor
+local Glide = { VehicleLayoutEditor = 1 }
+
+local Editor = Glide.VehicleLayoutEditor
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
+        verify_that!(
+            has_token(
+                &tokens,
+                3,
+                6,
+                6,
+                SemanticTokenType::VARIABLE,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    CustomSemanticTokenModifier::LOCAL,
+                ],
+            ),
+            eq(true)
+        )?;
+
+        verify_that!(
+            has_token(
+                &tokens,
+                3,
+                6,
+                6,
+                SemanticTokenType::CLASS,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    CustomSemanticTokenModifier::LOCAL,
+                ],
+            ),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hook_name_strings_do_not_use_call_path_heuristic() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"local hook = { Add = function() end, Run = function() end }
+hook.Add("Think", "demo", function() end)
 hook.Run("Think")
 "#,
         );
@@ -542,11 +1080,43 @@ hook.Run("Think")
         let tokens = decode(&data);
 
         verify_that!(
-            has_token(&tokens, 0, 9, 7, SemanticTokenType::EVENT, &[]),
+            has_token(&tokens, 1, 9, 7, SemanticTokenType::EVENT, &[]),
+            eq(false)
+        )?;
+        verify_that!(
+            has_token(&tokens, 2, 9, 7, SemanticTokenType::EVENT, &[]),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_labels_and_goto_use_label_tokens() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"::done::
+goto done
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
+        verify_that!(
+            has_token(
+                &tokens,
+                0,
+                2,
+                4,
+                CustomSemanticTokenType::LABEL,
+                &[SemanticTokenModifier::DECLARATION],
+            ),
             eq(true)
         )?;
         verify_that!(
-            has_token(&tokens, 1, 9, 7, SemanticTokenType::EVENT, &[]),
+            has_token(&tokens, 1, 5, 4, CustomSemanticTokenType::LABEL, &[]),
             eq(true)
         )?;
 
@@ -576,12 +1146,42 @@ end
         let tokens = decode(&data);
 
         verify_that!(
-            has_token(&tokens, 0, 0, 3, SemanticTokenType::CLASS, &[]),
+            has_token_type(&tokens, 0, 0, 3, SemanticTokenType::CLASS),
             eq(true)
         )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_local_shadow_of_scoped_gmod_class_global_stays_local_variable() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include =
+            vec![EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(
+                "entities/**".to_string(),
+            )];
+        ws.update_emmyrc(emmyrc);
+
+        let main = ws.def_file(
+            "lua/entities/test_entity/shared.lua",
+            r#"local ENT = {}
+ENT.Type = "anim"
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
         verify_that!(
-            has_token(&tokens, 1, 9, 3, SemanticTokenType::CLASS, &[]),
-            eq(true)
+            has_token_type(&tokens, 0, 6, 3, SemanticTokenType::CLASS),
+            eq(false)
+        )?;
+
+        verify_that!(
+            has_token_type(&tokens, 1, 0, 3, SemanticTokenType::CLASS),
+            eq(false)
         )?;
 
         Ok(())
@@ -752,7 +1352,7 @@ function cityrp.vehicle.drive() end
                 SemanticTokenType::NAMESPACE,
                 &[CustomSemanticTokenModifier::GLOBAL,]
             ),
-            eq(true)
+            eq(false)
         )?;
 
         verify_that!(
@@ -809,7 +1409,8 @@ my_table.first.second = 1
                 SemanticTokenType::VARIABLE,
                 &[
                     SemanticTokenModifier::DECLARATION,
-                    CustomSemanticTokenModifier::LOCAL
+                    CustomSemanticTokenModifier::LOCAL,
+                    CustomSemanticTokenModifier::OBJECT
                 ]
             ),
             eq(true)
@@ -860,7 +1461,7 @@ my_table.first.second = 1
     }
 
     #[gtest]
-    fn test_single_method_global_member_stays_property() -> Result<()> {
+    fn test_global_table_method_owner_is_namespace_like() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let main = ws.def_file(
             "main.lua",
@@ -873,14 +1474,7 @@ function my_global.action() end
 
         // my_global
         verify_that!(
-            has_token(
-                &tokens,
-                1,
-                9,
-                9,
-                SemanticTokenType::NAMESPACE,
-                &[CustomSemanticTokenModifier::GLOBAL]
-            ),
+            has_token(&tokens, 1, 9, 9, SemanticTokenType::NAMESPACE, &[]),
             eq(true)
         )?;
 

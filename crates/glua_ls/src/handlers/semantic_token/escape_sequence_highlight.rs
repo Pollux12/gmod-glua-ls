@@ -100,7 +100,16 @@ where
     };
 
     match next {
-        'a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' | '\\' | '\'' | '"' | 'z' | '\r' | '\n' => true,
+        'a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' | '\\' | '\'' | '"' | '\r' | '\n' => true,
+        'z' => {
+            while let Some((_, c)) = chars.peek() {
+                if !c.is_ascii_whitespace() {
+                    break;
+                }
+                chars.next();
+            }
+            true
+        }
         'x' => {
             // Exactly two hex digits.
             let mut count = 0;
@@ -233,6 +242,22 @@ mod tests {
         assert_eq!(
             segments("\"\\\n\""),
             vec![(0, 1, "string"), (1, 2, "escape"), (3, 1, "string")]
+        );
+    }
+
+    #[test]
+    fn z_escape_consumes_following_whitespace() {
+        assert_eq!(
+            segments("\"a\\z\n  b\""),
+            vec![(0, 2, "string"), (2, 5, "escape"), (7, 2, "string")]
+        );
+    }
+
+    #[test]
+    fn z_escape_does_not_consume_unicode_whitespace() {
+        assert_eq!(
+            segments("\"\\z\u{00a0}x\""),
+            vec![(0, 1, "string"), (1, 2, "escape"), (3, 4, "string")]
         );
     }
 
