@@ -19,6 +19,7 @@ use crate::{
         initialized::std_i18n::try_generate_translated_std, text_document::register_files_watch,
     },
     logger::init_logger,
+    util::{LongRunningWatchdogStatus, spawn_long_running_watchdog},
 };
 pub use client_config::{ClientConfig, get_client_config};
 use codestyle::load_editorconfig;
@@ -34,6 +35,7 @@ pub async fn initialized_handler(
     params: InitializeParams,
     cmd_args: CmdArgs,
 ) -> Option<()> {
+    log::info!("initialized handler started");
     // init locale
     locale::set_ls_locale(&params);
     let workspace_folders = get_workspace_folders(&params);
@@ -45,6 +47,8 @@ pub async fn initialized_handler(
     // init logger
     init_logger(main_root, &cmd_args);
     log::info!("main root: {:?}", main_root);
+    let watchdog_status = LongRunningWatchdogStatus::new("reading client capabilities");
+    let _watchdog = spawn_long_running_watchdog("language server startup", watchdog_status.clone());
 
     let client_id = if let Some(editor) = &cmd_args.editor {
         editor.clone().into()
@@ -121,6 +125,8 @@ pub async fn initialized_handler(
     log::info!("initialization_params: {}", params_json);
 
     // init config
+    watchdog_status.set_phase("Loading GLuaLS configuration");
+    log::info!("loading GLuaLS configuration");
     let config_roots = workspace_folders
         .iter()
         .map(|workspace| workspace.root.clone())
@@ -131,11 +137,17 @@ pub async fn initialized_handler(
     let workspace_emmyrcs = loaded.workspace_emmyrcs;
     let workspace_matchers = loaded.workspace_matchers;
     load_editorconfig(workspace_folders.clone(), emmyrc.as_ref());
+    log::info!("configuration loaded");
 
     // init std lib
+    watchdog_status.set_phase("Loading standard libraries");
+    log::info!("loading standard libraries");
     init_std_lib(context.analysis(), &cmd_args, emmyrc.clone()).await;
+    log::info!("standard libraries loaded");
 
     {
+        watchdog_status.set_phase("Preparing workspace manager");
+        log::info!("preparing workspace manager");
         let mut workspace_manager = context.workspace_manager().write().await;
         workspace_manager.client_config = client_config.clone();
         let (include, exclude, exclude_dir) = calculate_include_and_exclude(&emmyrc);
@@ -154,10 +166,13 @@ pub async fn initialized_handler(
         emmyrc.clone(),
         workspace_diagnostic_configs,
         workspace_emmyrcs,
+        watchdog_status.clone(),
     )
     .await;
 
     register_files_watch(context.clone(), &params.capabilities).await;
+    log::info!("initialized handler completed; notifying workspace loaded");
+    context.file_diagnostic().notify_workspace_loaded();
     Some(())
 }
 
@@ -170,6 +185,7 @@ pub async fn init_analysis(
     emmyrc: Arc<Emmyrc>,
     workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
     workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
+    watchdog_status: LongRunningWatchdogStatus,
 ) {
     if let Ok(emmyrc_json) = serde_json::to_string_pretty(emmyrc.as_ref()) {
         log::info!("current config : {}", emmyrc_json);
@@ -181,8 +197,10 @@ pub async fn init_analysis(
     status_bar.update_progress_task(
         ProgressTask::LoadWorkspace,
         None,
-        Some("Loading workspace files".to_string()),
+        Some("Loading folders".to_string()),
     );
+    watchdog_status.set_phase("Preparing workspace folders");
+    log::info!("preparing workspace folders for initial indexing");
 
     let workspace_roots = workspace_folders
         .into_iter()
@@ -211,8 +229,10 @@ pub async fn init_analysis(
     status_bar.update_progress_task(
         ProgressTask::LoadWorkspace,
         None,
-        Some(String::from("Collecting files")),
+        Some(String::from("Scanning Lua files")),
     );
+    watchdog_status.set_phase("Collecting Lua files");
+    log::info!("collecting workspace files for initial indexing");
 
     // load files with per-workspace configs
     let mut files = Vec::new();
@@ -247,10 +267,21 @@ pub async fn init_analysis(
             None,
             Some(format!("Indexing {} files", file_count)),
         );
+        watchdog_status.set_progress("Indexing Lua files", 0, file_count);
+        log::info!("indexing {} Lua files", file_count);
+    } else {
+        log::info!("no Lua files found during initial indexing");
     }
 
     // Hold the write lock only for analysis state mutations.
     let mut mut_analysis = analysis.write().await;
+    status_bar.update_progress_task(
+        ProgressTask::LoadWorkspace,
+        None,
+        Some(String::from("Applying config")),
+    );
+    watchdog_status.set_phase("Applying workspace configuration");
+    log::info!("applying workspace configuration to analysis");
 
     // update config
     mut_analysis.update_config(emmyrc.clone());
@@ -290,7 +321,15 @@ pub async fn init_analysis(
     }
 
     if file_count != 0 {
+        status_bar.update_progress_task(
+            ProgressTask::LoadWorkspace,
+            None,
+            Some(format!("Analyzing {} files", file_count)),
+        );
+        watchdog_status.set_progress("Analyzing Lua files", 0, file_count);
+        log::info!("analyzing {} Lua files", file_count);
         mut_analysis.update_files_by_path(files);
+        watchdog_status.set_progress("Analyzing Lua files", file_count, file_count);
     }
 
     let schema_urls = if mut_analysis.check_schema_update() {
@@ -305,24 +344,40 @@ pub async fn init_analysis(
     status_bar.update_progress_task(
         ProgressTask::LoadWorkspace,
         None,
-        Some(String::from("Finished loading workspace files")),
+        Some(String::from("Workspace ready")),
     );
-    status_bar.finish_progress_task(
-        ProgressTask::LoadWorkspace,
-        Some("Indexing complete".to_string()),
-    );
+    watchdog_status.set_phase("Workspace index ready");
+    log::info!("workspace index ready");
 
     if !schema_urls.is_empty() {
+        status_bar.update_progress_task(
+            ProgressTask::LoadWorkspace,
+            None,
+            Some(format!("Fetching {} schemas", schema_urls.len())),
+        );
+        watchdog_status.set_progress("Fetching JSON schemas", 0, schema_urls.len());
+        log::info!("fetching {} JSON schemas", schema_urls.len());
         let url_contents = fetch_schema_urls(schema_urls).await;
         let mut mut_analysis = analysis.write().await;
         mut_analysis.apply_fetched_schemas(url_contents);
         file_diagnostic.invalidate_shared_diagnostic_data();
+        watchdog_status.set_phase("JSON schema fetch/apply complete");
+        log::info!("JSON schema fetch/apply complete");
     }
 
+    status_bar.finish_progress_task(
+        ProgressTask::LoadWorkspace,
+        Some("Workspace ready".to_string()),
+    );
+    file_diagnostic.notify_workspace_loaded();
+
     if !lsp_features.supports_workspace_diagnostic() {
+        log::info!("client does not support workspace diagnostics; scheduling push diagnostics");
         file_diagnostic
             .add_workspace_diagnostic_task(0, false)
             .await;
+    } else {
+        log::info!("client supports workspace diagnostics; waiting for diagnostic pull requests");
     }
 }
 

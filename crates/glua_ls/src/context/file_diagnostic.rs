@@ -13,6 +13,8 @@ use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
+
 use super::{ClientProxy, ProgressTask, StatusBar};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +81,7 @@ pub struct FileDiagnostic {
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     client: Arc<ClientProxy>,
     status_bar: Arc<StatusBar>,
+    workspace_loaded_notified: Arc<AtomicBool>,
     startup_complete_notified: Arc<AtomicBool>,
     diagnostic_tokens: Arc<Mutex<HashMap<FileId, CancellationToken>>>,
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
@@ -96,6 +99,7 @@ impl FileDiagnostic {
         Self {
             analysis,
             client,
+            workspace_loaded_notified: Arc::new(AtomicBool::new(false)),
             startup_complete_notified: Arc::new(AtomicBool::new(false)),
             diagnostic_tokens: Arc::new(Mutex::new(HashMap::new())),
             workspace_diagnostic_token: Arc::new(Mutex::new(None)),
@@ -176,15 +180,29 @@ impl FileDiagnostic {
         self.recently_edited_lines.lock().await.remove(uri);
     }
 
+    pub fn notify_workspace_loaded(&self) {
+        if self.workspace_loaded_notified.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        info!("workspace loaded; language server is ready while diagnostics may continue");
+        self.send_server_status("workspaceLoaded");
+    }
+
     fn notify_startup_complete(&self) {
         if self.startup_complete_notified.swap(true, Ordering::AcqRel) {
             return;
         }
 
+        info!("workspace diagnostics complete; language server startup fully complete");
+        self.send_server_status("startupComplete");
+    }
+
+    fn send_server_status(&self, state: &'static str) {
         self.client.send_notification(
             "gluals/serverStatus",
             serde_json::json!({
-                "state": "startupComplete",
+                "state": state,
             }),
         );
     }
@@ -455,6 +473,11 @@ impl FileDiagnostic {
         &self,
         cancel_token: CancellationToken,
     ) -> Vec<(Uri, Vec<Diagnostic>)> {
+        info!("workspace diagnostic pull slow started");
+        let watchdog_status =
+            LongRunningWatchdogStatus::new("Preparing workspace diagnostics (slow pull)");
+        let _watchdog =
+            spawn_long_running_watchdog("workspace diagnostics", watchdog_status.clone());
         let mut token = self.workspace_diagnostic_token.lock().await;
         if let Some(token) = token.as_ref() {
             token.cancel();
@@ -464,6 +487,17 @@ impl FileDiagnostic {
         drop(token);
 
         let mut result = Vec::new();
+        let status_bar = self.status_bar.clone();
+        status_bar
+            .create_progress_task(ProgressTask::DiagnoseWorkspace)
+            .await;
+        status_bar.update_progress_task(
+            ProgressTask::DiagnoseWorkspace,
+            None,
+            Some(String::from("Preparing diagnostics")),
+        );
+        watchdog_status.set_phase("Preparing workspace diagnostics (slow pull)");
+
         let (main_workspace_file_ids, shared_data) = {
             let analysis = self.analysis.read().await;
             let file_ids = analysis
@@ -471,11 +505,27 @@ impl FileDiagnostic {
                 .get_db()
                 .get_module_index()
                 .get_main_workspace_file_ids();
+            info!(
+                "precomputing shared diagnostic data for {} workspace files",
+                file_ids.len()
+            );
             let shared_data = self.force_precompute_shared_diagnostic_data(&analysis);
             (file_ids, shared_data)
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
         let valid_file_count = main_workspace_file_ids.len();
+        if valid_file_count != 0 {
+            status_bar.update_progress_task(
+                ProgressTask::DiagnoseWorkspace,
+                Some(0),
+                Some(format!("Diagnosing 0/{}", valid_file_count)),
+            );
+            watchdog_status.set_progress(
+                "Diagnosing workspace files (slow pull)",
+                0,
+                valid_file_count,
+            );
+        }
         let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
 
         for file_id in main_workspace_file_ids {
@@ -499,6 +549,7 @@ impl FileDiagnostic {
         drop(tx);
 
         let mut count = 0;
+        let mut last_percentage = 0;
         while count < valid_file_count {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
@@ -513,6 +564,24 @@ impl FileDiagnostic {
                         result.push((uri, diagnostics));
                     }
                     count += 1;
+                    let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
+                    if last_percentage != percentage_done {
+                        last_percentage = percentage_done;
+                        let message = format!(
+                            "Diagnosing {}/{} ({}%)",
+                            count, valid_file_count, percentage_done
+                        );
+                        status_bar.update_progress_task(
+                            ProgressTask::DiagnoseWorkspace,
+                            Some(percentage_done),
+                            Some(message),
+                        );
+                        watchdog_status.set_progress(
+                            "Diagnosing workspace files (slow pull)",
+                            count,
+                            valid_file_count,
+                        );
+                    }
                 }
             }
         }
@@ -523,6 +592,21 @@ impl FileDiagnostic {
             );
         }
 
+        status_bar.finish_progress_task(
+            ProgressTask::DiagnoseWorkspace,
+            Some("Diagnostics complete".to_string()),
+        );
+        if count == valid_file_count && !cancel_token.is_cancelled() {
+            self.notify_startup_complete();
+        } else {
+            info!(
+                "workspace diagnostic pull slow finished without startup completion: completed={} expected={} cancelled={}",
+                count,
+                valid_file_count,
+                cancel_token.is_cancelled()
+            );
+        }
+
         result
     }
 
@@ -530,6 +614,11 @@ impl FileDiagnostic {
         &self,
         cancel_token: CancellationToken,
     ) -> Vec<(Uri, Vec<Diagnostic>)> {
+        info!("workspace diagnostic pull fast started");
+        let watchdog_status =
+            LongRunningWatchdogStatus::new("Preparing workspace diagnostics (fast pull)");
+        let _watchdog =
+            spawn_long_running_watchdog("workspace diagnostics", watchdog_status.clone());
         let mut token = self.workspace_diagnostic_token.lock().await;
         if let Some(token) = token.as_ref() {
             token.cancel();
@@ -539,6 +628,17 @@ impl FileDiagnostic {
         drop(token);
 
         let mut result = Vec::new();
+        let status_bar = self.status_bar.clone();
+        status_bar
+            .create_progress_task(ProgressTask::DiagnoseWorkspace)
+            .await;
+        status_bar.update_progress_task(
+            ProgressTask::DiagnoseWorkspace,
+            None,
+            Some(String::from("Preparing diagnostics")),
+        );
+        watchdog_status.set_phase("Preparing workspace diagnostics (fast pull)");
+
         let (main_workspace_file_ids, shared_data) = {
             let analysis = self.analysis.read().await;
             let file_ids = analysis
@@ -546,17 +646,28 @@ impl FileDiagnostic {
                 .get_db()
                 .get_module_index()
                 .get_main_workspace_file_ids();
+            info!(
+                "precomputing shared diagnostic data for {} workspace files",
+                file_ids.len()
+            );
             let shared_data = self.force_precompute_shared_diagnostic_data(&analysis);
             (file_ids, shared_data)
         };
 
-        let status_bar = self.status_bar.clone();
-        status_bar
-            .create_progress_task(ProgressTask::DiagnoseWorkspace)
-            .await;
-
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
         let valid_file_count = main_workspace_file_ids.len();
+        if valid_file_count != 0 {
+            status_bar.update_progress_task(
+                ProgressTask::DiagnoseWorkspace,
+                Some(0),
+                Some(format!("Diagnosing 0/{}", valid_file_count)),
+            );
+            watchdog_status.set_progress(
+                "Diagnosing workspace files (fast pull)",
+                0,
+                valid_file_count,
+            );
+        }
 
         let analysis = self.analysis.clone();
         let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
@@ -602,11 +713,19 @@ impl FileDiagnostic {
                         let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
                         if last_percentage != percentage_done {
                             last_percentage = percentage_done;
-                            let message = format!("diagnostic {}%", percentage_done);
+                            let message = format!(
+                                "Diagnosing {}/{} ({}%)",
+                                count, valid_file_count, percentage_done
+                            );
                             status_bar.update_progress_task(
                                 ProgressTask::DiagnoseWorkspace,
                                 Some(percentage_done),
                                 Some(message),
+                            );
+                            watchdog_status.set_progress(
+                                "Diagnosing workspace files (fast pull)",
+                                count,
+                                valid_file_count,
                             );
                         }
                     }
@@ -622,10 +741,17 @@ impl FileDiagnostic {
 
         status_bar.finish_progress_task(
             ProgressTask::DiagnoseWorkspace,
-            Some("Diagnosis complete".to_string()),
+            Some("Diagnostics complete".to_string()),
         );
         if count == valid_file_count && !cancel_token.is_cancelled() {
             self.notify_startup_complete();
+        } else {
+            info!(
+                "workspace diagnostic pull fast finished without startup completion: completed={} expected={} cancelled={}",
+                count,
+                valid_file_count,
+                cancel_token.is_cancelled()
+            );
         }
 
         result
@@ -709,6 +835,21 @@ async fn push_workspace_diagnostic(
     silent: bool,
     cancel_token: CancellationToken,
 ) {
+    info!("workspace diagnostic push started; silent={}", silent);
+    let watchdog_status = LongRunningWatchdogStatus::new("Preparing workspace diagnostics (push)");
+    let _watchdog = spawn_long_running_watchdog("workspace diagnostics", watchdog_status.clone());
+    if !silent {
+        status_bar
+            .create_progress_task(ProgressTask::DiagnoseWorkspace)
+            .await;
+        status_bar.update_progress_task(
+            ProgressTask::DiagnoseWorkspace,
+            None,
+            Some(String::from("Preparing diagnostics")),
+        );
+    }
+    watchdog_status.set_phase("Preparing workspace diagnostics (push)");
+
     let (main_workspace_file_ids, shared_data) = {
         let read_analysis = analysis.read().await;
         let file_ids = read_analysis
@@ -716,16 +857,25 @@ async fn push_workspace_diagnostic(
             .get_db()
             .get_module_index()
             .get_main_workspace_file_ids();
+        info!(
+            "precomputing shared diagnostic data for {} workspace files",
+            file_ids.len()
+        );
         let shared_data = file_diagnostic.force_precompute_shared_diagnostic_data(&read_analysis);
         (file_ids, shared_data)
     };
     // diagnostic files
     let (tx, mut rx) = tokio::sync::mpsc::channel::<FileId>(100);
     let valid_file_count = main_workspace_file_ids.len();
-    if !silent {
-        status_bar
-            .create_progress_task(ProgressTask::DiagnoseWorkspace)
-            .await;
+    if !silent && valid_file_count != 0 {
+        status_bar.update_progress_task(
+            ProgressTask::DiagnoseWorkspace,
+            Some(0),
+            Some(format!("Diagnosing 0/{}", valid_file_count)),
+        );
+    }
+    if valid_file_count != 0 {
+        watchdog_status.set_progress("Diagnosing workspace files (push)", 0, valid_file_count);
     }
 
     let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
@@ -760,29 +910,37 @@ async fn push_workspace_diagnostic(
 
     let mut count = 0;
     if valid_file_count != 0 {
-        if silent {
-            while (rx.recv().await).is_some() {
-                count += 1;
-                if count == valid_file_count {
+        let mut last_percentage = 0;
+        while count < valid_file_count {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
                     break;
                 }
-            }
-        } else {
-            let mut last_percentage = 0;
-            while (rx.recv().await).is_some() {
-                count += 1;
-                let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
-                if last_percentage != percentage_done {
-                    last_percentage = percentage_done;
-                    let message = format!("diagnostic {}%", percentage_done);
-                    status_bar.update_progress_task(
-                        ProgressTask::DiagnoseWorkspace,
-                        Some(percentage_done),
-                        Some(message),
-                    );
-                }
-                if count == valid_file_count {
-                    break;
+                maybe_file_id = rx.recv() => {
+                    if maybe_file_id.is_none() {
+                        break;
+                    }
+                    count += 1;
+                    let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
+                    if last_percentage != percentage_done {
+                        last_percentage = percentage_done;
+                        if !silent {
+                            let message = format!(
+                                "Diagnosing {}/{} ({}%)",
+                                count, valid_file_count, percentage_done
+                            );
+                            status_bar.update_progress_task(
+                                ProgressTask::DiagnoseWorkspace,
+                                Some(percentage_done),
+                                Some(message),
+                            );
+                        }
+                        watchdog_status.set_progress(
+                            "Diagnosing workspace files (push)",
+                            count,
+                            valid_file_count,
+                        );
+                    }
                 }
             }
         }
@@ -797,10 +955,18 @@ async fn push_workspace_diagnostic(
     if !silent {
         status_bar.finish_progress_task(
             ProgressTask::DiagnoseWorkspace,
-            Some("Diagnosis complete".to_string()),
+            Some("Diagnostics complete".to_string()),
         );
         if count == valid_file_count && !cancel_token.is_cancelled() {
             file_diagnostic.notify_startup_complete();
+        } else {
+            info!(
+                "workspace diagnostic push finished without startup completion: completed={} expected={} cancelled={} silent={}",
+                count,
+                valid_file_count,
+                cancel_token.is_cancelled(),
+                silent
+            );
         }
     }
 }
@@ -860,7 +1026,7 @@ mod tests {
     use crate::context::{ClientProxy, StatusBar};
     use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, Emmyrc, file_path_to_uri};
     use googletest::prelude::*;
-    use lsp_server::Connection;
+    use lsp_server::{Connection, Message};
     use lsp_types::NumberOrString;
     use lsp_types::{Position, Range};
     use std::sync::Arc;
@@ -929,6 +1095,42 @@ mod tests {
         .collect::<Vec<_>>();
 
         verify_that!(filtered.as_slice(), eq(&[(0, 0), (3, 3)]))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn workspace_loaded_notification_does_not_suppress_startup_complete() -> Result<()> {
+        let (connection, peer) = Connection::memory();
+        let client = Arc::new(ClientProxy::new(connection));
+        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+        let file_diagnostic = FileDiagnostic::new(analysis, status_bar, client);
+
+        file_diagnostic.notify_workspace_loaded();
+        file_diagnostic.notify_workspace_loaded();
+        file_diagnostic.notify_startup_complete();
+
+        let statuses = peer
+            .receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                Message::Notification(notification)
+                    if notification.method == "gluals/serverStatus" =>
+                {
+                    notification
+                        .params
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        verify_that!(
+            statuses.as_slice(),
+            eq(&["workspaceLoaded".to_string(), "startupComplete".to_string()])
+        )?;
         Ok(())
     }
 

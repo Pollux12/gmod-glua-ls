@@ -561,39 +561,6 @@ fn insert_index_expr_member_owner(
     owners.len() > 1
 }
 
-#[cfg(test)]
-mod tests {
-    use rowan::{TextRange, TextSize};
-
-    use crate::{FileId, InFiled, LuaMergedTableType, LuaUnionType};
-
-    use super::*;
-
-    fn table_const(start: u32, end: u32) -> LuaType {
-        LuaType::TableConst(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(start), TextSize::new(end)),
-        ))
-    }
-
-    #[test]
-    fn duplicate_table_owner_is_not_ambiguous() {
-        let table = table_const(1, 2);
-        let typ = LuaMergedTableType::new(vec![table.clone(), table]).into();
-
-        assert!(!has_multiple_distinct_index_expr_member_owners(&typ));
-    }
-
-    #[test]
-    fn distinct_table_owners_are_ambiguous() {
-        let typ = LuaType::Union(
-            LuaUnionType::from_vec(vec![table_const(1, 2), table_const(3, 4)]).into(),
-        );
-
-        assert!(has_multiple_distinct_index_expr_member_owners(&typ));
-    }
-}
-
 fn try_resolve_scoped_class_prefix_member_owner(
     analyzer: &LuaAnalyzer,
     prefix_expr: &LuaExpr,
@@ -2377,4 +2344,37 @@ fn is_undefined_global_name_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool
         global_index.is_exist_global_decl(&name)
     };
     !has_global
+}
+
+#[cfg(test)]
+mod tests {
+    use rowan::{TextRange, TextSize};
+
+    use crate::{FileId, InFiled, LuaMergedTableType, LuaUnionType};
+
+    use super::*;
+
+    fn table_const(start: u32, end: u32) -> LuaType {
+        LuaType::TableConst(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(start), TextSize::new(end)),
+        ))
+    }
+
+    #[test]
+    fn duplicate_table_owner_is_not_ambiguous() {
+        let table = table_const(1, 2);
+        let typ = LuaMergedTableType::new(vec![table.clone(), table]).into();
+
+        assert!(!has_multiple_distinct_index_expr_member_owners(&typ));
+    }
+
+    #[test]
+    fn distinct_table_owners_are_ambiguous() {
+        let typ = LuaType::Union(
+            LuaUnionType::from_vec(vec![table_const(1, 2), table_const(3, 4)]).into(),
+        );
+
+        assert!(has_multiple_distinct_index_expr_member_owners(&typ));
+    }
 }
