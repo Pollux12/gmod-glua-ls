@@ -2536,6 +2536,58 @@ return t
             "#
         ));
     }
+
+    /// Named fields on a shaped literal must stay strict even when the literal
+    /// also has integer members. Assigning a wrong type to `.kind` should error.
+    #[test]
+    fn test_mixed_literal_named_field_stay_strict_with_integer_members() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local mixed = { { id = 1 }, kind = "metadata" }
+                mixed.kind = 42
+            "#
+        ));
+    }
+
+    /// A numeric-key object with named fields must keep named fields strict.
+    /// Assigning a wrong type to `.name` should error.
+    #[test]
+    fn test_numeric_key_object_named_field_stays_strict() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local obj = { [100] = { id = 1 }, name = "x" }
+                obj.name = 42
+            "#
+        ));
+    }
+
+    /// A simple inferred named-field literal should remain lenient even when
+    /// later code writes a numeric member. Widening an inferred table to accept
+    /// both named fields and numeric-indexed entries must not produce
+    /// AssignTypeMismatch for the existing named field.
+    #[test]
+    fn test_inferred_named_field_literal_lenient_with_later_numeric_member() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@class Vector
+                ---@return Vector
+                local function Vector() end
+
+                local cfg = {
+                    color = "white",
+                }
+
+                cfg[1] = { id = 1 }
+                cfg.color = Vector()
+            "#
+        ));
+    }
 }
 
 #[test]

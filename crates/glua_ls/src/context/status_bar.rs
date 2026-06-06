@@ -35,27 +35,6 @@ impl ProgressTask {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ProgressTask;
-
-    #[test]
-    fn progress_task_names_are_concise() {
-        assert_eq!(
-            ProgressTask::LoadWorkspace.get_task_name(),
-            "Loading workspace"
-        );
-        assert_eq!(
-            ProgressTask::DiagnoseWorkspace.get_task_name(),
-            "Running diagnostics"
-        );
-        assert_eq!(
-            ProgressTask::RefreshIndex.get_task_name(),
-            "Refreshing index"
-        );
-    }
-}
-
 impl StatusBar {
     pub fn new(client: Arc<ClientProxy>) -> Self {
         Self { client }
@@ -122,5 +101,26 @@ impl StatusBar {
                 })),
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProgressTask;
+
+    #[test]
+    fn progress_task_names_are_concise() {
+        assert_eq!(
+            ProgressTask::LoadWorkspace.get_task_name(),
+            "Loading workspace"
+        );
+        assert_eq!(
+            ProgressTask::DiagnoseWorkspace.get_task_name(),
+            "Running diagnostics"
+        );
+        assert_eq!(
+            ProgressTask::RefreshIndex.get_task_name(),
+            "Refreshing index"
+        );
     }
 }

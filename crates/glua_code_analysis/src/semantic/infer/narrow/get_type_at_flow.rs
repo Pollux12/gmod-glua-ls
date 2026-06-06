@@ -1276,7 +1276,7 @@ fn is_inferred_member_collection_expr(
         if !type_cache.is_infer() {
             return Ok(false);
         }
-        if normalize_infer_collection_type(type_cache.as_type()).is_none() {
+        if normalize_infer_collection_type(db, type_cache.as_type()).is_none() {
             return Ok(false);
         }
         saw_collection = true;
@@ -1294,10 +1294,13 @@ fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwn
     }
 }
 
-fn normalize_infer_collection_type(typ: &LuaType) -> Option<()> {
+fn normalize_infer_collection_type(db: &DbIndex, typ: &LuaType) -> Option<()> {
     match typ {
         LuaType::Array(_) => Some(()),
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(()),
+        // Shaped sequential literals are inferred as TableConst; treat them as
+        // inferred collections too so flow narrowing over their elements works.
+        LuaType::TableConst(range) => crate::table_const_array_base(db, range).map(|_| ()),
         _ => None,
     }
 }
@@ -1306,6 +1309,7 @@ fn infer_collection_base_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
     match typ {
         LuaType::Array(array) => Some(array.get_base().clone()),
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(tuple.cast_down_array_base(db)),
+        LuaType::TableConst(range) => crate::table_const_array_base(db, range),
         _ => None,
     }
 }

@@ -581,11 +581,41 @@ fn humanize_generic_type(db: &DbIndex, generic: &LuaGenericType, level: RenderLe
     generic_base
 }
 
+/// How a table-like type should be laid out at a given [`RenderLevel`].
+///
+/// `Detailed` is the multi-line block form; `Compact` is the inline
+/// `{ a, b }` form. Returns `None` for levels that should collapse the table to
+/// a bare `table` (Brief/Minimal), which also terminates nested recursion.
+#[derive(Clone, Copy)]
+enum TableLayout {
+    Detailed,
+    Compact,
+}
+
+impl TableLayout {
+    fn from_level(level: RenderLevel) -> Option<Self> {
+        match level {
+            RenderLevel::Documentation | RenderLevel::Detailed => Some(Self::Detailed),
+            // `Normal` reuses the compact inline form (rather than collapsing to
+            // a bare `table`) so nested table rows inside a `Simple`-rendered
+            // parent — e.g. field hovers, whose members render one level down at
+            // `Normal` — still show their shape instead of `table`. Recursion
+            // still terminates because `Normal.next_level()` is `Brief`, which
+            // maps to `None` below.
+            RenderLevel::CustomDetailed(_) | RenderLevel::Simple | RenderLevel::Normal => {
+                Some(Self::Compact)
+            }
+            RenderLevel::Brief | RenderLevel::Minimal => None,
+        }
+    }
+}
+
 fn humanize_table_const_type_detail_and_simple(
     db: &DbIndex,
     member_owned: LuaMemberOwner,
     level: RenderLevel,
 ) -> Option<String> {
+    let layout = TableLayout::from_level(level)?;
     let member_index = db.get_member_index();
     let members = member_index.get_sorted_members(&member_owned)?;
 
@@ -607,8 +637,8 @@ fn humanize_table_const_type_detail_and_simple(
             level,
         );
 
-        match level {
-            RenderLevel::Detailed => {
+        match layout {
+            TableLayout::Detailed => {
                 total_line += 1;
                 members_string.push_str(&format!("    {},\n", member_string));
                 if total_line >= 12 {
@@ -616,7 +646,7 @@ fn humanize_table_const_type_detail_and_simple(
                     break;
                 }
             }
-            RenderLevel::Simple => {
+            TableLayout::Compact => {
                 let member_string_len = member_string.chars().count();
                 if total_length != 0 {
                     members_string.push_str(", ");
@@ -630,15 +660,13 @@ fn humanize_table_const_type_detail_and_simple(
                     break;
                 }
             }
-            _ => return None,
         }
     }
 
-    match level {
-        RenderLevel::Detailed => Some(format!("{{\n{}}}", members_string)),
-        RenderLevel::Simple => Some(format!("{{ {} }}", members_string)),
-        _ => None,
-    }
+    Some(match layout {
+        TableLayout::Detailed => format!("{{\n{}}}", members_string),
+        TableLayout::Compact => format!("{{ {} }}", members_string),
+    })
 }
 
 fn humanize_table_const_type(
@@ -646,13 +674,11 @@ fn humanize_table_const_type(
     member_owned: LuaMemberOwner,
     level: RenderLevel,
 ) -> String {
-    match level {
-        RenderLevel::Detailed | RenderLevel::Simple => {
-            humanize_table_const_type_detail_and_simple(db, member_owned, level)
-                .unwrap_or("table".to_string())
-        }
-        _ => "table".to_string(),
+    if TableLayout::from_level(level).is_none() {
+        return "table".to_string();
     }
+    humanize_table_const_type_detail_and_simple(db, member_owned, level)
+        .unwrap_or("table".to_string())
 }
 
 fn humanize_merged_table_type(

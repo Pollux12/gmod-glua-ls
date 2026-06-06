@@ -4426,10 +4426,15 @@ mod test {
             eq("tableof<base_glide>"),
             "the local should keep the GetTable(self) tableof<self> type after `entTbl = entTbl or getTable(self)`"
         );
+        // The shaped sequential literal `{ { 1.0 } }` is modeled as a dynamic
+        // table (TableConst) with an integer member `[1]` holding the inner row,
+        // rather than the old immutable nested-tuple `((1.0))`. The detailed
+        // rendering preserves that rich shape instead of degrading to a generic
+        // `table`, which is the property this test guards.
         assert_that!(
-            ws.humanize_type(input_floats_type).as_str(),
-            eq("((1.0))"),
-            "entTbl.inputFloats should keep the scripted-class field type instead of degrading to generic table access"
+            ws.humanize_type_detailed(input_floats_type).as_str(),
+            eq("{\n    [1]: (1.0),\n}"),
+            "entTbl.inputFloats should keep the scripted-class field shape instead of degrading to generic table access"
         );
 
         let diagnostics = ws

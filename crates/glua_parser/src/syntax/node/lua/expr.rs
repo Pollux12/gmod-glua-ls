@@ -521,6 +521,51 @@ impl LuaTableExpr {
     pub fn get_fields(&self) -> LuaAstChildren<LuaTableField> {
         self.children()
     }
+
+    /// Maximum number of positional rows a sequential ("array-style") table
+    /// literal may have while still being materialized with per-index members
+    /// and rich shape. Beyond this the literal is summarized as an array
+    /// (`T[]`) to keep inference/hover cheap on very large literals.
+    pub const SHAPED_ARRAY_LITERAL_LIMIT: usize = 50;
+
+    /// Whether this is a sequential ("array-style") table literal whose entries
+    /// are themselves table literals — e.g.
+    /// `{ { offset = .. }, { offset = .. } }`.
+    ///
+    /// Such literals carry meaningful per-row shape, so they are materialized as
+    /// a dynamic [`crate::LuaSyntaxKind::TableArrayExpr`]-backed table (with
+    /// integer-keyed members `[1]`, `[2]`, ...) rather than collapsed to a bare
+    /// `table`. Simple scalar arrays (`{ 1, 2, 3 }`) intentionally do NOT match,
+    /// so they stay summarized as `T[]`.
+    ///
+    /// This is a purely syntactic check so the declaration analyzer (which
+    /// registers members) and the inference pass (which assigns the type) make
+    /// the same decision without needing inferred element types.
+    pub fn is_shaped_array_literal(&self) -> bool {
+        if !self.is_array() {
+            return false;
+        }
+
+        let mut count = 0usize;
+        let mut has_table_row = false;
+        for field in self.get_fields() {
+            // Variadic spreads (`{ f() }` where the last value is `...`) cannot
+            // have a fixed member set; bail out to the array summary path.
+            let Some(value_expr) = field.get_value_expr() else {
+                return false;
+            };
+            if !matches!(value_expr, LuaExpr::TableExpr(_)) {
+                return false;
+            }
+            has_table_row = true;
+            count += 1;
+            if count > Self::SHAPED_ARRAY_LITERAL_LIMIT {
+                return false;
+            }
+        }
+
+        has_table_row
+    }
 }
 
 impl From<LuaTableExpr> for LuaSingleArgExpr {

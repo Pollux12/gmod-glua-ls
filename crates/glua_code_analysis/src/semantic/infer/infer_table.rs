@@ -22,8 +22,20 @@ pub fn infer_table_expr(
     cache: &mut LuaInferCache,
     table: LuaTableExpr,
 ) -> InferResult {
+    // A sequential literal whose rows are themselves table literals carries
+    // meaningful per-index shape. Materialize it as a dynamic table (TableConst)
+    // so integer-keyed members (`[1]`, `[2]`, ...) hold the rich row shapes and
+    // the table stays mutable. Simple scalar arrays fall through to the array
+    // summary path below so they remain `T[]`.
+    if table.is_shaped_array_literal() {
+        return Ok(LuaType::TableConst(crate::InFiled {
+            file_id: cache.get_file_id(),
+            value: table.get_range(),
+        }));
+    }
+
     if table.is_array() {
-        return infer_table_tuple_or_array(db, cache, table);
+        return infer_table_array_summary(db, cache, table);
     }
 
     Ok(LuaType::TableConst(crate::InFiled {
@@ -32,7 +44,19 @@ pub fn infer_table_expr(
     }))
 }
 
-fn infer_table_tuple_or_array(
+/// Summarize a sequential ("array-style") table literal that is NOT a shaped
+/// table-of-tables (see [`LuaTableExpr::is_shaped_array_literal`]).
+///
+/// Small scalar/mixed literals (`{1, 2, 3}`, `{ self, "player" }`) are inferred
+/// as an infer-resolve [`LuaType::Tuple`]. Despite the name, this is NOT an
+/// immutable tuple value: it is an internal *positional-evidence carrier* that
+/// preserves exact per-index types so machinery like `table.unpack`,
+/// `std.Unpack<T>`, multi-value assignment, and positional `[1]`/`[2]` field
+/// checks stay precise. Mutation of such a table is treated leniently elsewhere
+/// (see `assign_type_mismatch`), so it behaves as a dynamic table for
+/// diagnostics. Large literals collapse to `T[]`; dots/variadic spreads are
+/// handled as before.
+fn infer_table_array_summary(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     table: LuaTableExpr,
@@ -108,6 +132,9 @@ fn infer_table_tuple_or_array(
         };
     }
 
+    // Small scalar/mixed sequential literal: retain exact per-index types as an
+    // infer-resolve tuple (a positional-evidence carrier; see the function doc).
+    // Mutation leniency is handled in the diagnostic layer.
     let mut types = Vec::new();
     for field in fields {
         let value_expr = field.get_value_expr().ok_or(InferFailReason::None)?;

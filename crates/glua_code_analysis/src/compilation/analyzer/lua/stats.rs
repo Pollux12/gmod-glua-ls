@@ -2140,10 +2140,22 @@ fn register_expr_key_member(analyzer: &mut LuaAnalyzer, field: &LuaTableField) {
         .add_member(owner_id, member);
 }
 
+/// Whether this value-field (positional `{ expr }`) belongs to a shaped
+/// sequential table literal whose integer members were registered in the
+/// declaration pass (see `analyze_table_expr`). Such members need their value
+/// types inferred and bound here, exactly like keyed/assign fields, otherwise
+/// the registered `[n]` member has no type cache and dynamic indexing degrades.
+fn is_shaped_array_value_field(field: &LuaTableField) -> bool {
+    field.is_value_field()
+        && field
+            .get_parent::<LuaTableExpr>()
+            .is_some_and(|table_expr| table_expr.is_shaped_array_literal())
+}
+
 pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> Option<()> {
     register_expr_key_member(analyzer, &field);
 
-    if field.is_assign_field() {
+    if field.is_assign_field() || is_shaped_array_value_field(&field) {
         let value_expr = field.get_value_expr()?;
         let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
         let value_type = match analyzer.infer_expr(&value_expr.clone()) {

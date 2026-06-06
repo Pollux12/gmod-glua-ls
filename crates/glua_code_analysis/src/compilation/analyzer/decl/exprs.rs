@@ -225,7 +225,14 @@ fn analyze_closure_params(
 }
 
 pub fn analyze_table_expr(analyzer: &mut DeclAnalyzer, table_expr: LuaTableExpr) -> Option<()> {
-    if table_expr.is_object() {
+    // Register members for keyed/object tables AND for shaped sequential
+    // literals (arrays whose rows are themselves table literals). The latter are
+    // inferred as TableConst (see `infer_table_expr`), so their integer-keyed
+    // members (`[1]`, `[2]`, ...) must be registered here for `t[1]` lookups and
+    // rich hover. Simple scalar arrays are summarized as `T[]` and need no
+    // members. The predicate is purely syntactic so this declaration pass and
+    // the inference pass agree on which literals are materialized.
+    if table_expr.is_object() || table_expr.is_shaped_array_literal() {
         let file_id = analyzer.get_file_id();
         let owner_id = LuaMemberOwner::Element(InFiled {
             file_id,

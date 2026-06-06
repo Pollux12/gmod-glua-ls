@@ -13,6 +13,8 @@ use crate::{
     db_index::{LuaMemberKey, LuaSignatureId, r#type::type_visit_trait::TypeVisitTrait},
     first_param_may_not_self,
 };
+use glua_parser::{LuaAstNode, LuaTableExpr};
+use rowan::NodeOrToken;
 
 use super::{GenericParam, TypeOps, type_decl::LuaTypeDeclId};
 
@@ -647,6 +649,81 @@ impl From<LuaTupleType> for LuaType {
     fn from(t: LuaTupleType) -> Self {
         LuaType::Tuple(t.into())
     }
+}
+
+/// Checks whether an `InFiled<TextRange>` for a `TableConst` resolves back to a
+/// `LuaTableExpr` whose `is_shaped_array_literal()` is true. This ensures that
+/// only true shaped sequential table literals (all integer-keyed, no named fields,
+/// each value is itself a table literal) receive array-like `TableConst`
+/// treatment.
+///
+/// Uses the existing syntax lookup path: `db.get_vfs().get_syntax_tree()` →
+/// `get_red_root()` → `covering_element()` → walk up to `LuaTableExpr`.
+pub fn is_table_const_shaped_array(db: &DbIndex, range: &InFiled<TextRange>) -> bool {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&range.file_id) else {
+        return false;
+    };
+    let root = tree.get_red_root();
+
+    let mut node = match root.covering_element(range.value) {
+        NodeOrToken::Node(node) => Some(node),
+        NodeOrToken::Token(token) => token.parent(),
+    };
+
+    while let Some(current) = node {
+        if let Some(table_expr) = LuaTableExpr::cast(current.clone()) {
+            return table_expr.get_range() == range.value && table_expr.is_shaped_array_literal();
+        }
+        node = current.parent();
+    }
+
+    false
+}
+
+/// Derive the array element base type for a `TableConst` produced from a shaped
+/// sequential table literal (see `infer_table_expr`).
+///
+/// Iterates the integer-keyed members `[1..=n]` and unions their resolved types,
+/// applying the same literal-widening as [`LuaTupleType::cast_down_array_base`]
+/// (`IntegerConst` → `DocIntegerConst`, `FloatConst` → `number`, `StringConst` →
+/// `DocStringConst`). Returns `None` when the table has no integer members or
+/// when the provenance check (`is_table_const_shaped_array`) fails, so callers
+/// can fall back to their existing behavior. Bounded by the shaped-literal
+/// member cap, so this stays cheap.
+pub fn table_const_array_base(db: &DbIndex, range: &InFiled<TextRange>) -> Option<LuaType> {
+    if !is_table_const_shaped_array(db, range) {
+        return None;
+    }
+
+    let owner = crate::LuaMemberOwner::Element(range.clone());
+    let member_index = db.get_member_index();
+    let members = member_index.get_members(&owner)?;
+
+    let mut ty = LuaType::Unknown;
+    let mut saw_integer_member = false;
+    for member in members {
+        if !matches!(member.get_key(), LuaMemberKey::Integer(_)) {
+            continue;
+        }
+        // Read the inferred type from the type cache rather than `resolve_type`,
+        // which can fail with a NeedResolve error mid-analysis. An unresolved
+        // member falls back to `Unknown`, matching other member-reading sites.
+        let member_type = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())
+            .map(|cache| cache.as_type().clone())
+            .unwrap_or(LuaType::Unknown);
+        saw_integer_member = true;
+        let widened = match &member_type {
+            LuaType::IntegerConst(int) => LuaType::DocIntegerConst(*int),
+            LuaType::FloatConst(_) => LuaType::Number,
+            LuaType::StringConst(s) => LuaType::DocStringConst(s.clone()),
+            _ => member_type,
+        };
+        ty = TypeOps::Union.apply(db, &ty, &widened);
+    }
+
+    saw_integer_member.then_some(ty)
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
