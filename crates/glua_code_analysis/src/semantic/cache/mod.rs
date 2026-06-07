@@ -81,6 +81,7 @@ pub struct LuaInferCache {
     pub flow_query_realm: Option<GmodRealm>,
     pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,
     pub index_ref_origin_type_cache: FxHashMap<VarRefCacheKey, CacheEntry<LuaType>>,
+    pub param_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
     pub expr_var_ref_id_cache: FxHashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
     pub scoped_scripted_global_cache: Option<Option<(String, String)>>,
@@ -202,6 +203,7 @@ impl LuaInferCache {
             flow_query_realm: None,
             flow_node_realm_cache: FxHashMap::default(),
             index_ref_origin_type_cache: FxHashMap::default(),
+            param_type_cache: FxHashMap::default(),
             expr_var_ref_id_cache: FxHashMap::default(),
             narrow_by_literal_stop_position_cache: HashSet::new(),
             scoped_scripted_global_cache: None,
@@ -328,6 +330,7 @@ impl LuaInferCache {
         self.flow_query_realm = None;
         self.flow_node_realm_cache.clear();
         self.index_ref_origin_type_cache.clear();
+        self.param_type_cache.clear();
         self.expr_var_ref_id_cache.clear();
         self.scoped_scripted_global_cache = None;
         self.pending_str_tpl_type_decls.clear();

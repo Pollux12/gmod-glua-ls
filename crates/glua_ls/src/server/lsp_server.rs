@@ -149,6 +149,7 @@ fn should_fail_fast_request_during_init(method: &str) -> bool {
             | "gluals/gmodScriptedClasses"
             | "gluals/gmodScriptedClassesV2"
             | "gluals/docSearch"
+            | "gluals/hoverExpand"
             | "emmy/annotator"
     )
 }

@@ -4,8 +4,8 @@ mod test {
     use smol_str::SmolStr;
 
     use crate::{
-        DiagnosticCode, GenericTpl, GenericTplId, LuaMergedTableType, LuaType, TypeSubstitutor,
-        VirtualWorkspace, instantiate_type_generic,
+        DiagnosticCode, GenericTpl, GenericTplId, LuaMergedTableType, LuaType, RenderLevel,
+        TypeSubstitutor, VirtualWorkspace, humanize_type, instantiate_type_generic,
     };
 
     #[test]
@@ -225,7 +225,11 @@ result = {
         );
 
         let a = ws.expr_ty("result");
-        let a_desc = ws.humanize_type_detailed(a);
+        let a_desc = humanize_type(
+            ws.analysis.compilation.get_db(),
+            &a,
+            RenderLevel::DetailedCount(12),
+        );
         let expected = r#"{
     direct: string,
     class_a: string,

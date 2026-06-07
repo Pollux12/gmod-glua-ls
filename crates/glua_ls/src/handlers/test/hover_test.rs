@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualHoverResult, check};
-    use glua_code_analysis::EmmyrcGmodScriptedClassScopeEntry;
+    use glua_code_analysis::{EmmyrcGmodScriptedClassScopeEntry, RenderLevel};
     use googletest::prelude::*;
     use lsp_types::HoverContents;
 
@@ -298,6 +298,31 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_unannotated_param_with_gmod_name_hint() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        check!(ws.check_hover(
+            r#"
+                ---@class Entity
+
+                local function foo(<??>ent)
+                    local value = ent
+                end
+            "#,
+            VirtualHoverResult {
+                value: dedent(
+                    r#"
+                    ```lua
+                    local ent: Entity
+                    ```
+                    "#
+                )
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_param_func() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(
@@ -374,7 +399,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -410,7 +435,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -447,7 +472,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -484,7 +509,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -715,7 +740,7 @@ mod tests {
     fn test_table_escape_string_keys_hover_cleanly() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(
-            ws.check_hover(
+            ws.check_hover_with_level(
                 r#"
                 local Escape<??>StringMap = {
                     ["\a"] = "\\a",
@@ -747,6 +772,7 @@ local EscapeStringMap: {
 ```"##
                         .to_string(),
                 },
+                Some(RenderLevel::DetailedCount(12)),
             )
         );
         Ok(())
@@ -974,7 +1000,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("cityrp/plugins/vehicles/sh_plugin.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1002,7 +1028,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("cityrp/plugins/vehicles/sh_plugin.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1042,7 +1068,7 @@ local EscapeStringMap: {
             "cityrp/entities/entities/cityrp_money/sh_init.lua",
             &content,
         );
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1082,7 +1108,7 @@ local EscapeStringMap: {
             "cityrp/entities/entities/cityrp_inventory/init.lua",
             &content,
         );
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1139,7 +1165,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1216,7 +1242,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1275,7 +1301,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1318,7 +1344,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1370,7 +1396,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("sv_badge_priority.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1426,7 +1452,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/shared.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1478,7 +1504,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("sh_test_tbl.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1528,7 +1554,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("sh_global_function.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1575,7 +1601,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/shared.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1702,7 +1728,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("use.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -1741,7 +1767,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -2412,7 +2438,7 @@ local EscapeStringMap: {
                 "#,
         ))?;
         let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -2485,7 +2511,7 @@ local EscapeStringMap: {
                 "#,
         ))?;
         let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -2557,7 +2583,7 @@ local EscapeStringMap: {
                 "#,
         ))?;
         let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -2613,7 +2639,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2695,7 +2721,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2740,7 +2766,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2786,7 +2812,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2829,7 +2855,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2870,7 +2896,7 @@ local EscapeStringMap: {
         let file_id = ws.def_file("gamemode/init.lua", &content);
         // When the hook is not registered, hover_gmod_hook_callback_function returns None and
         // the dispatch falls through to the generic keyword hover — always Some(...).
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected keyword fallback hover for unregistered hook")
             .or_fail()?;
 
@@ -2919,7 +2945,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover for return-only hook")
             .or_fail()?;
 
@@ -3030,8 +3056,8 @@ local EscapeStringMap: {
         file_id: glua_code_analysis::FileId,
         position: lsp_types::Position,
     ) -> String {
-        let hover =
-            crate::handlers::hover::hover(&ws.analysis, file_id, position).expect("expected hover");
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .expect("expected hover");
         let HoverContents::Markup(markup) = hover.contents else {
             panic!("expected HoverContents::Markup");
         };
@@ -3386,7 +3412,7 @@ local EscapeStringMap: {
             "#,
         )?;
         let file_id = ws.def_file("lua/autorun/server/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None);
         if let Some(hover) = hover {
             let HoverContents::Markup(markup) = hover.contents else {
                 return Ok(());

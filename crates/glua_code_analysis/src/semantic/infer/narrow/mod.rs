@@ -8,7 +8,7 @@ use crate::{
     CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason,
     LuaInferCache, LuaType, TypeOps,
     db_index::LuaTypeDeclId,
-    get_real_type, infer_param,
+    get_real_type, infer_param_with_cache,
     semantic::infer::{
         InferResult,
         infer_name::{find_decl_member_type, infer_global_type},
@@ -169,7 +169,7 @@ pub fn get_var_ref_type(
         // Flow/assignment analysis may also create a decl type cache entry for params,
         // but that inferred cache must not replace the declared parameter type.
         if decl.is_param() {
-            if let Ok(param_type) = infer_param(db, decl) {
+            if let Ok(param_type) = infer_param_with_cache(db, cache, decl) {
                 return Ok(param_type);
             }
 

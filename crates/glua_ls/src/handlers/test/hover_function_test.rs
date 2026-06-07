@@ -805,7 +805,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -903,7 +903,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/shared.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -976,7 +976,7 @@ mod tests {
         )?;
         let server_file_id = ws.def_file("gamemode/init.lua", &server_content);
         let server_hover =
-            crate::handlers::hover::hover(&ws.analysis, server_file_id, server_position)
+            crate::handlers::hover::hover(&ws.analysis, server_file_id, server_position, None)
                 .ok_or("expected server hover")
                 .or_fail()?;
 
@@ -1001,7 +1001,7 @@ mod tests {
         )?;
         let client_file_id = ws.def_file("gamemode/cl_init.lua", &client_content);
         let client_hover =
-            crate::handlers::hover::hover(&ws.analysis, client_file_id, client_position)
+            crate::handlers::hover::hover(&ws.analysis, client_file_id, client_position, None)
                 .ok_or("expected client hover")
                 .or_fail()?;
 
@@ -1107,7 +1107,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1154,7 +1154,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1204,7 +1204,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1256,7 +1256,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1316,7 +1316,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1367,7 +1367,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 

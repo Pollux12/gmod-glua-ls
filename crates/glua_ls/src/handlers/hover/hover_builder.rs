@@ -50,12 +50,19 @@ impl<'a> HoverBuilder<'a> {
         token: Option<LuaSyntaxToken>,
         is_completion: bool,
     ) -> Self {
-        let detail_render_level =
-            if let Some(custom_detail) = semantic_model.get_emmyrc().hover.custom_detail {
-                RenderLevel::CustomDetailed(custom_detail)
-            } else {
-                RenderLevel::Detailed
-            };
+        Self::new_with_level(compilation, semantic_model, token, is_completion, None)
+    }
+
+    /// Create a new `HoverBuilder` with an explicit render level override.
+    /// When `render_level` is `Some`, it overrides the default `Detailed` level.
+    pub fn new_with_level(
+        compilation: &'a LuaCompilation,
+        semantic_model: &'a SemanticModel,
+        token: Option<LuaSyntaxToken>,
+        is_completion: bool,
+        render_level: Option<RenderLevel>,
+    ) -> Self {
+        let detail_render_level = render_level.unwrap_or(RenderLevel::Detailed);
 
         let substitutor = if let Some(token) = token.clone() {
             infer_substitutor_base_type(semantic_model, token)

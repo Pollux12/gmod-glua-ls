@@ -3,6 +3,8 @@ mod color_swatch;
 mod find_origin;
 mod function;
 mod hover_builder;
+pub mod hover_expand;
+pub mod hover_expand_request;
 mod humanize_type_decl;
 mod humanize_types;
 mod keyword_hover;
@@ -53,10 +55,15 @@ pub async fn on_hover(
         return None;
     }
     let file_id = analysis.get_file_id(&uri)?;
-    hover(&analysis, file_id, position)
+    hover(&analysis, file_id, position, None)
 }
 
-pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) -> Option<Hover> {
+pub fn hover(
+    analysis: &EmmyLuaAnalysis,
+    file_id: FileId,
+    position: Position,
+    render_level: Option<RenderLevel>,
+) -> Option<Hover> {
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     if !semantic_model.get_emmyrc().hover.enable {
         return None;
@@ -149,6 +156,7 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
                 detail,
                 semantic_info,
                 path.last()?.1,
+                render_level,
             )
         }
         doc_see if doc_see.kind() == LuaTokenKind::TkDocSeeContent.into() => {
@@ -168,6 +176,7 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
                 doc_see,
                 semantic_info,
                 path.last()?.1,
+                render_level,
             )
         }
         _ => {
@@ -196,6 +205,7 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
                     db,
                     &document,
                     token,
+                    render_level,
                 );
             };
             let range = token.text_range();
@@ -208,6 +218,7 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
                 token.clone(),
                 semantic_info,
                 range,
+                render_level,
             )
             .or_else(|| {
                 build_assignment_target_hover(
@@ -216,6 +227,7 @@ pub fn hover(analysis: &EmmyLuaAnalysis, file_id: FileId, position: Position) ->
                     db,
                     &document,
                     token,
+                    render_level,
                 )
             })
         }

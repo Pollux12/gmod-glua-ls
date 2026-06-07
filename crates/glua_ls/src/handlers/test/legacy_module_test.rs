@@ -43,7 +43,7 @@ local mod = inclu<??>des
 "#,
         )?;
         let file_id = ws.def_file("consumer_bare.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover result for bare module name")
             .or_fail()?;
 
@@ -92,7 +92,7 @@ includes.Fi<??>le("sv_init.lua")
 "#,
         )?;
         let file_id = ws.def_file("consumer_hover.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover result for includes.File")
             .or_fail()?;
 
@@ -156,7 +156,7 @@ netstream.Se<??>nd("chat", {})
 "#,
         )?;
         let file_id = ws.def_file("consumer_netstream.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover result for netstream.Send")
             .or_fail()?;
 

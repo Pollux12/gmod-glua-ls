@@ -12,8 +12,7 @@ use crate::{
     LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeOwner, LuaUnionType,
     TypeOps, infer_expr,
     semantic::infer::{
-        InferResult, VarRefId, infer_expr_list_value_type_at,
-        infer_name::infer_param,
+        InferResult, VarRefId, infer_expr_list_value_type_at, infer_param_with_cache,
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{InferConditionFlow, get_type_at_condition_flow},
@@ -491,7 +490,7 @@ fn get_decl_position_var_ref_type(
         && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
     {
         if decl.is_param()
-            && let Ok(param_type) = infer_param(db, decl)
+            && let Ok(param_type) = infer_param_with_cache(db, cache, decl)
         {
             return Ok(param_type);
         }

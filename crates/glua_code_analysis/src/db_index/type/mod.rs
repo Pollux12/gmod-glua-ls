@@ -12,7 +12,10 @@ use crate::{
     DbIndex, FileId, InFiled, LuaMemberOwner, db_index::r#type::type_decl::LuaTypeIdentifier,
 };
 pub use generic_param::GenericParam;
-pub use humanize_type::{RenderLevel, format_union_type, humanize_member_key_name, humanize_type};
+pub use humanize_type::{
+    DEFAULT_DETAIL_MEMBER_DISPLAY_COUNT, RenderLevel, format_union_type, humanize_member_key_name,
+    humanize_type,
+};
 use rowan::TextRange;
 use std::collections::{HashMap, HashSet};
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};

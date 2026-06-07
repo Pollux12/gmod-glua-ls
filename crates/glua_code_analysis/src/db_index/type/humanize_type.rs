@@ -12,11 +12,14 @@ use crate::{
 
 use super::{LuaAliasCallKind, LuaMultiLineUnion};
 
+pub const DEFAULT_DETAIL_MEMBER_DISPLAY_COUNT: usize = 6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderLevel {
     Documentation,
-    // donot more than 255
-    CustomDetailed(u8),
+    /// Like `Detailed`, but with a custom max display count for class members.
+    /// Used by the hover verbosity system to show progressively more members.
+    DetailedCount(usize),
     Detailed,
     Simple,
     Normal,
@@ -28,7 +31,7 @@ impl RenderLevel {
     pub fn next_level(self) -> RenderLevel {
         match self {
             RenderLevel::Documentation => RenderLevel::Simple,
-            RenderLevel::CustomDetailed(_) => RenderLevel::Simple,
+            RenderLevel::DetailedCount(_) => RenderLevel::Simple,
             RenderLevel::Detailed => RenderLevel::Simple,
             RenderLevel::Simple => RenderLevel::Normal,
             RenderLevel::Normal => RenderLevel::Brief,
@@ -190,8 +193,8 @@ fn humanize_simple_type(
 ) -> Option<String> {
     let max_display_count = match level {
         RenderLevel::Documentation => 500,
-        RenderLevel::CustomDetailed(n) => n as usize,
-        RenderLevel::Detailed => 12,
+        RenderLevel::DetailedCount(n) => n,
+        RenderLevel::Detailed => DEFAULT_DETAIL_MEMBER_DISPLAY_COUNT,
         _ => return Some(name.to_string()),
     };
 
@@ -276,8 +279,7 @@ where
     let types = union.into_vec();
     let num = match level {
         RenderLevel::Documentation => 500,
-        RenderLevel::CustomDetailed(n) => n as usize,
-        RenderLevel::Detailed => 8,
+        RenderLevel::DetailedCount(_) | RenderLevel::Detailed => 8,
         RenderLevel::Simple => 6,
         RenderLevel::Normal => 4,
         RenderLevel::Brief => 2,
@@ -330,8 +332,7 @@ fn humanize_multi_line_union_type(
 
     let num = match level {
         RenderLevel::Documentation => 500,
-        RenderLevel::CustomDetailed(n) => n as usize,
-        RenderLevel::Detailed => 10,
+        RenderLevel::DetailedCount(_) | RenderLevel::Detailed => 10,
         RenderLevel::Simple => 8,
         RenderLevel::Normal => 4,
         RenderLevel::Brief => 2,
@@ -347,7 +348,7 @@ fn humanize_multi_line_union_type(
         .join("|");
 
     let mut text = format!("({}{})", type_str, dots);
-    if level != RenderLevel::Detailed {
+    if !matches!(level, RenderLevel::DetailedCount(_) | RenderLevel::Detailed) {
         return text;
     }
 
@@ -372,8 +373,7 @@ fn humanize_tuple_type(db: &DbIndex, tuple: &LuaTupleType, level: RenderLevel) -
     let types = tuple.get_types();
     let num = match level {
         RenderLevel::Documentation => 500,
-        RenderLevel::CustomDetailed(n) => n as usize,
-        RenderLevel::Detailed => 10,
+        RenderLevel::DetailedCount(_) | RenderLevel::Detailed => 10,
         RenderLevel::Simple => 8,
         RenderLevel::Normal => 4,
         RenderLevel::Brief => 2,
@@ -466,8 +466,7 @@ fn humanize_doc_function_type(
 fn humanize_object_type(db: &DbIndex, object: &LuaObjectType, level: RenderLevel) -> String {
     let num = match level {
         RenderLevel::Documentation => 500,
-        RenderLevel::CustomDetailed(n) => n as usize,
-        RenderLevel::Detailed => 10,
+        RenderLevel::DetailedCount(_) | RenderLevel::Detailed => 10,
         RenderLevel::Simple => 8,
         RenderLevel::Normal => 4,
         RenderLevel::Brief => 2,
@@ -528,8 +527,7 @@ fn humanize_intersect_type(
 ) -> String {
     let num = match level {
         RenderLevel::Documentation => 500,
-        RenderLevel::CustomDetailed(n) => n as usize,
-        RenderLevel::Detailed => 10,
+        RenderLevel::DetailedCount(_) | RenderLevel::Detailed => 10,
         RenderLevel::Simple => 8,
         RenderLevel::Normal => 4,
         RenderLevel::Brief => 2,
@@ -567,7 +565,7 @@ fn humanize_generic_type(db: &DbIndex, generic: &LuaGenericType, level: RenderLe
     let generic_base = format!("{}<{}>", full_name, generic_inst_params);
     if matches!(
         level,
-        RenderLevel::Documentation | RenderLevel::CustomDetailed(_) | RenderLevel::Detailed
+        RenderLevel::Documentation | RenderLevel::DetailedCount(_) | RenderLevel::Detailed
     ) && type_decl.is_alias()
     {
         let substituor = TypeSubstitutor::from_type_array(generic.get_params().clone());
@@ -595,16 +593,16 @@ enum TableLayout {
 impl TableLayout {
     fn from_level(level: RenderLevel) -> Option<Self> {
         match level {
-            RenderLevel::Documentation | RenderLevel::Detailed => Some(Self::Detailed),
+            RenderLevel::Documentation | RenderLevel::DetailedCount(_) | RenderLevel::Detailed => {
+                Some(Self::Detailed)
+            }
             // `Normal` reuses the compact inline form (rather than collapsing to
             // a bare `table`) so nested table rows inside a `Simple`-rendered
             // parent — e.g. field hovers, whose members render one level down at
             // `Normal` — still show their shape instead of `table`. Recursion
             // still terminates because `Normal.next_level()` is `Brief`, which
             // maps to `None` below.
-            RenderLevel::CustomDetailed(_) | RenderLevel::Simple | RenderLevel::Normal => {
-                Some(Self::Compact)
-            }
+            RenderLevel::Simple | RenderLevel::Normal => Some(Self::Compact),
             RenderLevel::Brief | RenderLevel::Minimal => None,
         }
     }
@@ -618,6 +616,12 @@ fn humanize_table_const_type_detail_and_simple(
     let layout = TableLayout::from_level(level)?;
     let member_index = db.get_member_index();
     let members = member_index.get_sorted_members(&member_owned)?;
+
+    // Use the custom count from DetailedCount, or the compact default for Detailed.
+    let detailed_max = match level {
+        RenderLevel::DetailedCount(n) => n,
+        _ => DEFAULT_DETAIL_MEMBER_DISPLAY_COUNT,
+    };
 
     let mut total_length = 0;
     let mut total_line = 0;
@@ -641,7 +645,7 @@ fn humanize_table_const_type_detail_and_simple(
             TableLayout::Detailed => {
                 total_line += 1;
                 members_string.push_str(&format!("    {},\n", member_string));
-                if total_line >= 12 {
+                if total_line >= detailed_max {
                     members_string.push_str("    ...\n");
                     break;
                 }
@@ -687,7 +691,7 @@ fn humanize_merged_table_type(
     level: RenderLevel,
 ) -> String {
     match level {
-        RenderLevel::Detailed | RenderLevel::Simple => {
+        RenderLevel::DetailedCount(_) | RenderLevel::Detailed | RenderLevel::Simple => {
             let typ = LuaType::MergedTable(merged.clone().into());
             let Some(members) = find_members(db, &typ) else {
                 return "table".to_string();
@@ -716,10 +720,18 @@ fn humanize_member_list_as_table(
         );
 
         match level {
+            RenderLevel::DetailedCount(n) => {
+                total_line += 1;
+                members_string.push_str(&format!("    {},\n", member_string));
+                if total_line >= n {
+                    members_string.push_str("    ...\n");
+                    break;
+                }
+            }
             RenderLevel::Detailed => {
                 total_line += 1;
                 members_string.push_str(&format!("    {},\n", member_string));
-                if total_line >= 12 {
+                if total_line >= DEFAULT_DETAIL_MEMBER_DISPLAY_COUNT {
                     members_string.push_str("    ...\n");
                     break;
                 }
@@ -743,7 +755,9 @@ fn humanize_member_list_as_table(
     }
 
     match level {
-        RenderLevel::Detailed => Some(format!("{{\n{}}}", members_string)),
+        RenderLevel::DetailedCount(_) | RenderLevel::Detailed => {
+            Some(format!("{{\n{}}}", members_string))
+        }
         RenderLevel::Simple => Some(format!("{{ {} }}", members_string)),
         _ => None,
     }
@@ -756,8 +770,7 @@ fn humanize_table_generic_type(
 ) -> String {
     let num = match level {
         RenderLevel::Documentation => 500,
-        RenderLevel::CustomDetailed(n) => n as usize,
-        RenderLevel::Detailed => 10,
+        RenderLevel::DetailedCount(_) | RenderLevel::Detailed => 10,
         RenderLevel::Simple => 8,
         RenderLevel::Normal => 4,
         RenderLevel::Brief => 2,
@@ -820,8 +833,7 @@ fn humanize_variadic_type(db: &DbIndex, multi: &VariadicType, level: RenderLevel
         VariadicType::Multi(types) => {
             let max_num = match level {
                 RenderLevel::Documentation => 500,
-                RenderLevel::CustomDetailed(n) => n as usize,
-                RenderLevel::Detailed => 10,
+                RenderLevel::DetailedCount(_) | RenderLevel::Detailed => 10,
                 RenderLevel::Simple => 8,
                 RenderLevel::Normal => 4,
                 RenderLevel::Brief => 2,
@@ -920,22 +932,23 @@ fn build_table_member_string(
     member_value_string: String,
     level: RenderLevel,
 ) -> String {
-    let (member_value, separator) = if level == RenderLevel::Detailed {
-        let val = match ty {
-            LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) => {
-                format!("integer = {member_value_string}")
-            }
-            LuaType::FloatConst(_) => format!("number = {member_value_string}"),
-            LuaType::StringConst(_) | LuaType::DocStringConst(_) => {
-                format!("string = {member_value_string}")
-            }
-            LuaType::BooleanConst(_) => format!("boolean = {member_value_string}"),
-            _ => member_value_string,
+    let (member_value, separator) =
+        if matches!(level, RenderLevel::DetailedCount(_) | RenderLevel::Detailed) {
+            let val = match ty {
+                LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) => {
+                    format!("integer = {member_value_string}")
+                }
+                LuaType::FloatConst(_) => format!("number = {member_value_string}"),
+                LuaType::StringConst(_) | LuaType::DocStringConst(_) => {
+                    format!("string = {member_value_string}")
+                }
+                LuaType::BooleanConst(_) => format!("boolean = {member_value_string}"),
+                _ => member_value_string,
+            };
+            (val, ": ")
+        } else {
+            (member_value_string, " = ")
         };
-        (val, ": ")
-    } else {
-        (member_value_string, " = ")
-    };
 
     match member_key {
         LuaMemberKey::Name(name) => {

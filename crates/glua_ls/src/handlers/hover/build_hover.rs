@@ -33,6 +33,7 @@ pub fn build_semantic_info_hover(
     token: LuaSyntaxToken,
     semantic_info: SemanticInfo,
     range: TextRange,
+    render_level: Option<RenderLevel>,
 ) -> Option<Hover> {
     let typ = semantic_info.clone().typ;
     if semantic_info.semantic_decl.is_none() {
@@ -46,6 +47,7 @@ pub fn build_semantic_info_hover(
         semantic_info.semantic_decl.unwrap(),
         false,
         Some(token.clone()),
+        render_level,
     );
     if let Some(hover_builder) = hover_builder {
         hover_builder.build_hover_result(document.to_lsp_range(range))
@@ -60,6 +62,7 @@ pub fn build_assignment_target_hover(
     db: &DbIndex,
     document: &LuaDocument,
     token: LuaSyntaxToken,
+    render_level: Option<RenderLevel>,
 ) -> Option<Hover> {
     let typ = get_assignment_target_type(&token, semantic_model)?;
     let range = token.text_range();
@@ -72,6 +75,7 @@ pub fn build_assignment_target_hover(
             semantic_decl,
             false,
             Some(token.clone()),
+            render_level,
         )?;
         return hover_builder.build_hover_result(document.to_lsp_range(range));
     }
@@ -98,13 +102,7 @@ fn build_hover_without_property(
         });
     }
 
-    let render_level = db
-        .get_emmyrc()
-        .hover
-        .custom_detail
-        .map_or(RenderLevel::Detailed, |custom_detail| {
-            RenderLevel::CustomDetailed(custom_detail)
-        });
+    let render_level = RenderLevel::Detailed;
 
     let hover = humanize_type(db, &typ, render_level);
     Some(Hover {
@@ -159,7 +157,7 @@ fn build_dynamic_field_hover_without_property(
     };
 
     let type_humanize_text = if hover_type.is_const() {
-        hover_const_type(db, &hover_type)
+        hover_const_type(db, &hover_type, RenderLevel::Detailed)
     } else {
         humanize_type(db, &hover_type, RenderLevel::Simple)
     };
@@ -215,6 +213,7 @@ pub fn build_hover_content_for_completion<'a>(
         property_id,
         true,
         None,
+        None,
     )
 }
 
@@ -226,8 +225,18 @@ fn build_hover_content<'a>(
     property_id: LuaSemanticDeclId,
     is_completion: bool,
     token: Option<LuaSyntaxToken>,
+    render_level: Option<RenderLevel>,
 ) -> Option<HoverBuilder<'a>> {
-    let mut builder = HoverBuilder::new(compilation, semantic_model, token, is_completion);
+    let mut builder = match render_level {
+        Some(level) => HoverBuilder::new_with_level(
+            compilation,
+            semantic_model,
+            token,
+            is_completion,
+            Some(level),
+        ),
+        None => HoverBuilder::new(compilation, semantic_model, token, is_completion),
+    };
     match property_id {
         LuaSemanticDeclId::LuaDecl(decl_id) => {
             let typ = typ?;
@@ -284,7 +293,7 @@ fn build_decl_hover(
             .add_signature_params_rets_description(builder.semantic_model.get_type(decl_id.into()));
     } else {
         if typ.is_const() {
-            let const_value = hover_const_type(db, &typ);
+            let const_value = hover_const_type(db, &typ, builder.detail_render_level);
             let prefix = if decl.is_local() {
                 "local "
             } else {
@@ -406,7 +415,7 @@ fn build_member_hover(
         }
     } else {
         if typ.is_const() {
-            let const_value = hover_const_type(db, &typ);
+            let const_value = hover_const_type(db, &typ, builder.detail_render_level);
             builder.set_type_description(format!("(field) {}: {}", member_name, const_value));
             builder.set_location_path(Some(member));
         } else {
