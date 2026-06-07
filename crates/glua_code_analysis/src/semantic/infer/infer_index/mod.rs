@@ -4,8 +4,8 @@ pub(crate) use infer_array::check_iter_var_range;
 use std::collections::HashSet;
 
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaLocalStat,
-    LuaNameExpr, NumberResult, PathTrait,
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaForStat, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
+    LuaLocalStat, LuaNameExpr, NumberResult, PathTrait,
 };
 use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
@@ -657,11 +657,27 @@ fn is_dynamic_index_in_len_for_range(
     let LuaIndexKey::Expr(expr) = index_key else {
         return false;
     };
-    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+
+    if !matches!(expr, LuaExpr::NameExpr(_) | LuaExpr::UnaryExpr(_)) {
         return false;
     };
 
+    if !is_inside_numeric_for_stat(index_expr) {
+        return false;
+    }
+
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
     check_iter_var_range(db, cache, expr, prefix_expr).unwrap_or(false)
+}
+
+fn is_inside_numeric_for_stat(index_expr: &LuaIndexMemberExpr) -> bool {
+    index_expr
+        .syntax()
+        .ancestors()
+        .skip(1)
+        .any(|ancestor| LuaForStat::cast(ancestor).is_some())
 }
 
 fn table_const_has_no_specific_data(
