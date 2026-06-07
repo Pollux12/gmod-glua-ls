@@ -1,10 +1,10 @@
 use glua_code_analysis::{
-    LuaType, LuaUnionType, RenderLevel, SemanticModel, format_union_type, humanize_type,
+    LuaDeclId, LuaType, LuaUnionType, RenderLevel, SemanticModel, format_union_type, humanize_type,
+    infer_param_with_cache,
 };
-use glua_parser::{LuaAstNode, LuaAstToken, LuaClosureExpr};
+use glua_parser::{LuaAstNode, LuaAstToken, LuaClosureExpr, LuaParamName};
 use itertools::Itertools;
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, Location};
-use rowan::NodeOrToken;
 
 pub fn build_closure_hint(
     semantic_model: &SemanticModel,
@@ -17,13 +17,7 @@ pub fn build_closure_hint(
     let lua_params = closure.get_params_list()?;
     let document = semantic_model.get_document();
     for lua_param in lua_params.get_params() {
-        let token = lua_param
-            .get_name_token()
-            .map(|token| token.syntax().clone())
-            .or_else(|| lua_param.syntax().first_token())?;
-        let typ = semantic_model
-            .get_semantic_info(NodeOrToken::Token(token))?
-            .typ;
+        let typ = infer_lua_param_hint_type(semantic_model, &lua_param)?;
         if typ.is_any() || typ.is_unknown() {
             continue;
         }
@@ -58,6 +52,27 @@ pub fn build_closure_hint(
     }
 
     Some(())
+}
+
+fn infer_lua_param_hint_type(
+    semantic_model: &SemanticModel,
+    lua_param: &LuaParamName,
+) -> Option<LuaType> {
+    let token = lua_param
+        .get_name_token()
+        .map(|token| token.syntax().clone())
+        .or_else(|| lua_param.syntax().first_token())?;
+    let decl_id = LuaDeclId::new(semantic_model.get_file_id(), token.text_range().start());
+    let decl = semantic_model
+        .get_db()
+        .get_decl_index()
+        .get_decl(&decl_id)?;
+    infer_param_with_cache(
+        semantic_model.get_db(),
+        &mut semantic_model.get_cache().borrow_mut(),
+        decl,
+    )
+    .ok()
 }
 
 pub fn build_label_parts(semantic_model: &SemanticModel, typ: &LuaType) -> Vec<InlayHintLabelPart> {

@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use glua_code_analysis::{DbIndex, LuaDocument, file_path_to_uri};
 use glua_parser::{
@@ -76,9 +76,8 @@ fn try_build_file_link(
 }
 
 fn has_linkable_path_component(path: &str) -> bool {
-    Path::new(path)
-        .components()
-        .any(|component| matches!(component, Component::Normal(_)))
+    path.split(['\\', '/'])
+        .any(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn try_build_module_link(

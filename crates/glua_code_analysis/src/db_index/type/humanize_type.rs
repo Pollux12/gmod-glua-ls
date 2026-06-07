@@ -201,8 +201,10 @@ fn humanize_simple_type(
     let member_owner = LuaMemberOwner::Type(id.clone());
     let member_index = db.get_member_index();
     let members = member_index.get_sorted_members(&member_owner)?;
-    let mut member_vec = Vec::new();
+    let all_count = members.len();
+    let mut member_strings = String::new();
     let mut function_vec = Vec::new();
+    let mut count = 0;
     for member in members {
         let member_key = member.get_key();
         let type_cache = db.get_type_index().get_type_cache(&member.get_id().into());
@@ -211,34 +213,31 @@ fn humanize_simple_type(
             None => &super::LuaTypeCache::InferType(LuaType::Any),
         };
         if type_cache.is_function() {
-            function_vec.push(member_key);
+            if function_vec.len() < max_display_count {
+                function_vec.push(member_key);
+            }
         } else {
-            member_vec.push((member_key, type_cache.as_type()));
+            let typ = type_cache.as_type();
+            let member_string = build_table_member_string(
+                db,
+                member_key,
+                typ,
+                humanize_type(db, typ, level.next_level()),
+                level,
+            );
+
+            member_strings.push_str(&format!("    {},\n", member_string));
+            count += 1;
+            if count >= max_display_count {
+                break;
+            }
         }
     }
 
-    if member_vec.is_empty() && function_vec.is_empty() {
+    if all_count == 0 {
         return Some(name.to_string());
     }
-    let all_count = member_vec.len() + function_vec.len();
 
-    let mut member_strings = String::new();
-    let mut count = 0;
-    for (member_key, typ) in member_vec {
-        let member_string = build_table_member_string(
-            db,
-            member_key,
-            typ,
-            humanize_type(db, typ, level.next_level()),
-            level,
-        );
-
-        member_strings.push_str(&format!("    {},\n", member_string));
-        count += 1;
-        if count >= max_display_count {
-            break;
-        }
-    }
     if count < all_count {
         for function_key in function_vec {
             let member_string = build_table_member_string(
