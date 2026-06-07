@@ -62,7 +62,11 @@ pub fn compute_max_level(total: usize) -> u32 {
 
 fn compute_max_level_for_type(semantic_model: &SemanticModel, typ: &LuaType) -> u32 {
     let total = match typ {
-        LuaType::Ref(_) | LuaType::TableConst(_) | LuaType::MergedTable(_) => semantic_model
+        LuaType::Def(_)
+        | LuaType::Ref(_)
+        | LuaType::TableConst(_)
+        | LuaType::MergedTable(_)
+        | LuaType::Instance(_) => semantic_model
             .get_member_infos(typ)
             .map(|members| members.len())
             .unwrap_or(0),
@@ -101,12 +105,15 @@ pub fn compute_max_level_at_position(semantic_model: &SemanticModel, position: P
 mod tests {
     use crate::handlers::test_lib::check;
 
-    use glua_code_analysis::{RenderLevel, VirtualWorkspace};
+    use glua_code_analysis::{LuaType, LuaTypeDeclId, RenderLevel, VirtualWorkspace};
     use googletest::prelude::*;
     use lsp_types::HoverContents;
     use rowan::TextSize;
 
-    use super::{compute_max_level, compute_max_level_at_position, level_to_display_count};
+    use super::{
+        compute_max_level, compute_max_level_at_position, compute_max_level_for_type,
+        level_to_display_count,
+    };
 
     #[gtest]
     fn max_level_display_count_covers_large_member_count() {
@@ -121,6 +128,34 @@ mod tests {
         assert_that!(level_to_display_count(0), eq(6));
         assert_that!(compute_max_level(6), eq(0));
         assert_that!(compute_max_level(7), eq(1));
+    }
+
+    #[gtest]
+    fn def_type_hover_reports_expandable_max_level() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/entities/base_glide.lua",
+            r#"
+                ---@class base_glide
+                ---@field crosshair table?
+                ---@field _playerListExpanded any
+                ---@field weaponSwitchNotification table?
+                ---@field _expandTimer number
+                ---@field AutomaticFrameAdvance boolean
+                ---@field _hasBothSpriteBeams boolean?
+                ---@field EnableCrosshair function
+            "#,
+        );
+        let semantic_model = check!(ws.analysis.compilation.get_semantic_model(file_id));
+
+        assert_that!(
+            compute_max_level_for_type(
+                &semantic_model,
+                &LuaType::Def(LuaTypeDeclId::global("base_glide")),
+            ),
+            eq(1)
+        );
+        Ok(())
     }
 
     #[gtest]
