@@ -54,6 +54,36 @@ mod tests {
     }
 
     #[gtest]
+    fn test_unannotated_param_with_gmod_name_hint() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        check!(ws.check_inlay_hint(
+            r#"
+                ---@class Entity
+
+                local function foo(ent)
+                    local value = ent
+                end
+            "#,
+            vec![
+                VirtualInlayHint {
+                    label: ": Entity".to_string(),
+                    line: 3,
+                    pos: 38,
+                    ref_file: Some("".to_string()),
+                },
+                VirtualInlayHint {
+                    label: ": Entity".to_string(),
+                    line: 4,
+                    pos: 31,
+                    ref_file: Some("".to_string()),
+                },
+            ]
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_local_hint_1() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_inlay_hint(

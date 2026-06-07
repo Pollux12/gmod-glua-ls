@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::{
     CacheEntry, FileId, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
     LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
@@ -440,6 +442,9 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
 
     match analyzer.infer_expr(&prefix_expr.clone()) {
         Ok(prefix_type) => {
+            if should_skip_ambiguous_unknown_key_table_owner(analyzer, &prefix_type, &index_expr) {
+                return Some(());
+            }
             let (member_owner, set_owner_only) =
                 resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))?;
             apply_index_expr_member_owner(analyzer, index_expr, member_owner, set_owner_only);
@@ -461,6 +466,99 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
     }
 
     Some(())
+}
+
+fn should_skip_ambiguous_unknown_key_table_owner(
+    analyzer: &mut LuaAnalyzer,
+    prefix_type: &LuaType,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let Some(index_key) = index_expr.get_index_key() else {
+        return false;
+    };
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let Ok(member_key) = LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
+    else {
+        return false;
+    };
+    if !matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
+        return false;
+    }
+
+    has_multiple_distinct_index_expr_member_owners(prefix_type)
+}
+
+fn has_multiple_distinct_index_expr_member_owners(typ: &LuaType) -> bool {
+    let mut owners = HashSet::new();
+    collect_distinct_index_expr_member_owners(typ, &mut owners);
+    owners.len() > 1
+}
+
+fn collect_distinct_index_expr_member_owners(
+    typ: &LuaType,
+    owners: &mut HashSet<LuaMemberOwner>,
+) -> bool {
+    match typ {
+        LuaType::TableConst(in_file_range) => {
+            insert_index_expr_member_owner(owners, LuaMemberOwner::Element(in_file_range.clone()))
+        }
+        LuaType::Def(def_id) => {
+            insert_index_expr_member_owner(owners, LuaMemberOwner::Type(def_id.clone()))
+        }
+        LuaType::Ref(ref_id) => {
+            insert_index_expr_member_owner(owners, LuaMemberOwner::Type(ref_id.clone()))
+        }
+        LuaType::Instance(instance) => insert_index_expr_member_owner(
+            owners,
+            LuaMemberOwner::Element(instance.get_range().clone()),
+        ),
+        LuaType::TableOf(inner) => collect_distinct_index_expr_member_owners(inner, owners),
+        LuaType::TypeGuard(inner) => collect_distinct_index_expr_member_owners(inner, owners),
+        LuaType::Union(union) => {
+            for typ in union.into_vec() {
+                if collect_distinct_index_expr_member_owners(&typ, owners) {
+                    return true;
+                }
+            }
+            false
+        }
+        LuaType::Intersection(intersection) => {
+            for typ in intersection.get_types() {
+                if collect_distinct_index_expr_member_owners(typ, owners) {
+                    return true;
+                }
+            }
+            false
+        }
+        LuaType::MergedTable(merged_table) => {
+            for typ in merged_table.get_types() {
+                if collect_distinct_index_expr_member_owners(typ, owners) {
+                    return true;
+                }
+            }
+            false
+        }
+        LuaType::MultiLineUnion(union) => {
+            for (typ, _) in union.get_unions() {
+                if collect_distinct_index_expr_member_owners(typ, owners) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn insert_index_expr_member_owner(
+    owners: &mut HashSet<LuaMemberOwner>,
+    owner: LuaMemberOwner,
+) -> bool {
+    owners.insert(owner);
+    owners.len() > 1
 }
 
 fn try_resolve_scoped_class_prefix_member_owner(
@@ -947,6 +1045,10 @@ fn is_table_shape_cleanup_type(typ: &LuaType) -> bool {
                     .all(|typ| typ.is_nil() || typ.is_never() || is_table_shape_cleanup_type(typ))
         }
         LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .all(is_table_shape_cleanup_type),
+        LuaType::MergedTable(merged_table) => merged_table
             .get_types()
             .iter()
             .all(is_table_shape_cleanup_type),
@@ -2038,10 +2140,22 @@ fn register_expr_key_member(analyzer: &mut LuaAnalyzer, field: &LuaTableField) {
         .add_member(owner_id, member);
 }
 
+/// Whether this value-field (positional `{ expr }`) belongs to a shaped
+/// sequential table literal whose integer members were registered in the
+/// declaration pass (see `analyze_table_expr`). Such members need their value
+/// types inferred and bound here, exactly like keyed/assign fields, otherwise
+/// the registered `[n]` member has no type cache and dynamic indexing degrades.
+fn is_shaped_array_value_field(field: &LuaTableField) -> bool {
+    field.is_value_field()
+        && field
+            .get_parent::<LuaTableExpr>()
+            .is_some_and(|table_expr| table_expr.is_shaped_array_literal())
+}
+
 pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> Option<()> {
     register_expr_key_member(analyzer, &field);
 
-    if field.is_assign_field() {
+    if field.is_assign_field() || is_shaped_array_value_field(&field) {
         let value_expr = field.get_value_expr()?;
         let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
         let value_type = match analyzer.infer_expr(&value_expr.clone()) {
@@ -2242,4 +2356,37 @@ fn is_undefined_global_name_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool
         global_index.is_exist_global_decl(&name)
     };
     !has_global
+}
+
+#[cfg(test)]
+mod tests {
+    use rowan::{TextRange, TextSize};
+
+    use crate::{FileId, InFiled, LuaMergedTableType, LuaUnionType};
+
+    use super::*;
+
+    fn table_const(start: u32, end: u32) -> LuaType {
+        LuaType::TableConst(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(start), TextSize::new(end)),
+        ))
+    }
+
+    #[test]
+    fn duplicate_table_owner_is_not_ambiguous() {
+        let table = table_const(1, 2);
+        let typ = LuaMergedTableType::new(vec![table.clone(), table]).into();
+
+        assert!(!has_multiple_distinct_index_expr_member_owners(&typ));
+    }
+
+    #[test]
+    fn distinct_table_owners_are_ambiguous() {
+        let typ = LuaType::Union(
+            LuaUnionType::from_vec(vec![table_const(1, 2), table_const(3, 4)]).into(),
+        );
+
+        assert!(has_multiple_distinct_index_expr_member_owners(&typ));
+    }
 }

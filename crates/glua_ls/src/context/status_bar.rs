@@ -28,9 +28,9 @@ impl ProgressTask {
 
     pub fn get_task_name(&self) -> &'static str {
         match self {
-            ProgressTask::LoadWorkspace => "Load workspace",
-            ProgressTask::DiagnoseWorkspace => "Diagnose workspace",
-            ProgressTask::RefreshIndex => "Refresh index",
+            ProgressTask::LoadWorkspace => "Loading workspace",
+            ProgressTask::DiagnoseWorkspace => "Running diagnostics",
+            ProgressTask::RefreshIndex => "Refreshing index",
         }
     }
 }
@@ -101,5 +101,26 @@ impl StatusBar {
                 })),
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProgressTask;
+
+    #[test]
+    fn progress_task_names_are_concise() {
+        assert_eq!(
+            ProgressTask::LoadWorkspace.get_task_name(),
+            "Loading workspace"
+        );
+        assert_eq!(
+            ProgressTask::DiagnoseWorkspace.get_task_name(),
+            "Running diagnostics"
+        );
+        assert_eq!(
+            ProgressTask::RefreshIndex.get_task_name(),
+            "Refreshing index"
+        );
     }
 }

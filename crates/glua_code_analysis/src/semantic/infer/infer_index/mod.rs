@@ -4,8 +4,8 @@ pub(crate) use infer_array::check_iter_var_range;
 use std::collections::HashSet;
 
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaLocalStat,
-    LuaNameExpr, NumberResult, PathTrait,
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaForStat, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
+    LuaLocalStat, LuaNameExpr, NumberResult, PathTrait,
 };
 use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
@@ -336,6 +336,9 @@ fn infer_table_member(
         Err(err)
             if is_unknown_dynamic_key_without_table_data(db, &owner, &inst, &index_key, &err) =>
         {
+            if is_dynamic_index_in_len_for_range(db, cache, &index_expr, &index_key) {
+                return Ok(LuaType::Any);
+            }
             return Ok(nullable_any_type());
         }
         Err(err) => return Err(err),
@@ -346,6 +349,18 @@ fn infer_table_member(
             &cache.get_file_id(),
             index_expr.get_position(),
         );
+    }
+
+    // Dynamic numeric index (e.g. `t[i]` where `i` is an `integer`) on a shaped
+    // sequential literal: no exact `[n]` member matches, so fall back to the
+    // unioned array element base. Mirrors the tuple dynamic-index behavior so
+    // shaped table-of-table literals keep their per-row element type under a
+    // non-constant index.
+    if dynamic_numeric_index_key(&key)
+        && let Some(base) =
+            resolve_table_const_array_base(db, cache, &owner, index_expr.get_position())?
+    {
+        return Ok(base);
     }
 
     if let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
@@ -398,6 +413,9 @@ fn infer_table_member(
                 return Ok(dynamic_field.typ);
             }
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
+                if is_dynamic_index_in_len_for_range(db, cache, &index_expr, &index_key) {
+                    return Ok(LuaType::Any);
+                }
                 return Ok(nullable_any_type());
             }
             if let Ok(global_path_type) =
@@ -628,6 +646,38 @@ fn is_dynamic_expr_key_without_table_data(
     key: &LuaMemberKey,
 ) -> bool {
     matches!(key, LuaMemberKey::ExprType(_)) && table_const_has_no_specific_data(db, owner, inst)
+}
+
+fn is_dynamic_index_in_len_for_range(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexMemberExpr,
+    index_key: &LuaIndexKey,
+) -> bool {
+    let LuaIndexKey::Expr(expr) = index_key else {
+        return false;
+    };
+
+    if !matches!(expr, LuaExpr::NameExpr(_) | LuaExpr::UnaryExpr(_)) {
+        return false;
+    };
+
+    if !is_inside_numeric_for_stat(index_expr) {
+        return false;
+    }
+
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    check_iter_var_range(db, cache, expr, prefix_expr).unwrap_or(false)
+}
+
+fn is_inside_numeric_for_stat(index_expr: &LuaIndexMemberExpr) -> bool {
+    index_expr
+        .syntax()
+        .ancestors()
+        .skip(1)
+        .any(|ancestor| LuaForStat::cast(ancestor).is_some())
 }
 
 fn table_const_has_no_specific_data(
@@ -1720,28 +1770,43 @@ fn infer_member_by_index_table(
         None => {
             let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
             let key_type = index_key_access_type(db, cache, &index_key)?;
-            let members = db
-                .get_member_index()
-                .get_members(&LuaMemberOwner::Element(table_range.clone()));
+            let owner = LuaMemberOwner::Element(table_range.clone());
+            let members = db.get_member_index().get_members(&owner);
             if let Some(mut members) = members {
                 members.sort_by(|a, b| a.get_key().cmp(b.get_key()));
                 let mut result_type = LuaType::Unknown;
                 let mut matched_inferred_index_key = false;
+                // Track matches independently of the union being non-Unknown:
+                // a matched member whose type is (temporarily) Unknown must not
+                // be confused with "no member matched". This keeps shaped
+                // sequential TableConst rows indexable via the operator path
+                // (MergedTable/Union components), mirroring `infer_table_member`.
+                let mut saw_match = false;
                 for member in members {
                     if member_key_matches_type(db, &key_type, member.get_key()) {
+                        saw_match = true;
                         matched_inferred_index_key |=
                             is_inferred_index_member_key(member.get_key());
+                        // Resolve the member type instead of reading the raw
+                        // cache, which may still be Unknown mid-analysis.
                         let member_type = db
-                            .get_type_index()
-                            .get_type_cache(&member.get_id().into())
-                            .map(|it| it.as_type())
-                            .unwrap_or(&LuaType::Unknown);
+                            .get_member_index()
+                            .get_member_item(&owner, member.get_key())
+                            .and_then(|item| {
+                                item.resolve_type_with_realm_at_offset(
+                                    db,
+                                    &cache.get_file_id(),
+                                    index_expr.get_position(),
+                                )
+                                .ok()
+                            })
+                            .unwrap_or(LuaType::Unknown);
 
-                        result_type = TypeOps::Union.apply(db, &result_type, member_type);
+                        result_type = TypeOps::Union.apply(db, &result_type, &member_type);
                     }
                 }
 
-                if !result_type.is_unknown() {
+                if saw_match {
                     if table_index_result_may_be_nil(db, &key_type, matched_inferred_index_key) {
                         result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
                     }
@@ -1777,6 +1842,75 @@ fn is_numeric_access_key_type(key_type: &LuaType) -> bool {
 
 fn is_inferred_index_member_key(key: &LuaMemberKey) -> bool {
     matches!(key, LuaMemberKey::ExprType(_))
+}
+
+/// Whether a member key is a non-constant numeric index (`integer`/`number`),
+/// as opposed to a constant `[n]`. Used to decide when to fall back to a
+/// `TableConst`'s unioned array element base.
+fn dynamic_numeric_index_key(key: &LuaMemberKey) -> bool {
+    matches!(
+        key,
+        LuaMemberKey::ExprType(LuaType::Integer | LuaType::Number)
+    )
+}
+
+/// Resolve the array element base of a shaped sequential `TableConst` by
+/// unioning the *resolved* types of its integer-keyed members.
+///
+/// Unlike [`crate::table_const_array_base`] (which reads the type cache and may
+/// see `Unknown` mid-analysis), this resolves each member via
+/// `resolve_type_with_realm_at_offset` so dynamic indexing (`t[i]`) stays
+/// precise even when the member's cache is not yet populated — e.g. when the
+/// table is reached through a `MergedTable`/`Union` component.
+///
+/// Returns:
+/// - `Ok(None)` when there are no integer members (caller falls back).
+/// - `Err(reason)` when a member is not yet resolvable, so the inference engine
+///   reschedules instead of silently degrading to `Unknown`.
+fn resolve_table_const_array_base(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    owner: &LuaMemberOwner,
+    position: TextSize,
+) -> Result<Option<LuaType>, InferFailReason> {
+    // Only true shaped sequential table literals should receive array-like
+    // treatment. Mixed/object literals with integer-keyed members must not
+    // fall back to an array element union.
+    if let LuaMemberOwner::Element(range) = owner {
+        if !crate::is_table_const_shaped_array(db, range) {
+            return Ok(None);
+        }
+    }
+
+    let Some(members) = db.get_member_index().get_members(owner) else {
+        return Ok(None);
+    };
+    let mut ty = LuaType::Unknown;
+    let mut saw_integer_member = false;
+    for member in members {
+        if !matches!(member.get_key(), LuaMemberKey::Integer(_)) {
+            continue;
+        }
+        saw_integer_member = true;
+        let member_type = match db
+            .get_member_index()
+            .get_member_item(owner, member.get_key())
+        {
+            Some(item) => {
+                item.resolve_type_with_realm_at_offset(db, &cache.get_file_id(), position)?
+            }
+            None => LuaType::Unknown,
+        };
+        let widened = match &member_type {
+            LuaType::IntegerConst(int) => LuaType::DocIntegerConst(*int),
+            LuaType::FloatConst(_) => LuaType::Number,
+            LuaType::StringConst(s) => LuaType::DocStringConst(s.clone()),
+            _ => member_type,
+        };
+        ty = TypeOps::Union.apply(db, &ty, &widened);
+    }
+
+    Ok(saw_integer_member.then_some(ty))
 }
 
 fn infer_member_by_index_custom_type(

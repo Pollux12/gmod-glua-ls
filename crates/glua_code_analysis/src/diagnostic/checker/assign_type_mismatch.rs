@@ -2,14 +2,14 @@ use std::ops::Deref;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCommentOwner, LuaDocTag,
-    LuaExpr, LuaIndexExpr, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaSyntaxNode,
+    LuaExpr, LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaSyntaxNode,
     LuaSyntaxToken, LuaTableExpr, LuaTableField, LuaVarExpr, NumberResult, PathTrait,
     UnaryOperator,
 };
 use rowan::{NodeOrToken, TextRange};
 
 use crate::{
-    DiagnosticCode, LuaDeclExtra, LuaDeclId, LuaMemberKey, LuaSemanticDeclId, LuaType,
+    DbIndex, DiagnosticCode, LuaDeclExtra, LuaDeclId, LuaMemberKey, LuaSemanticDeclId, LuaType,
     SemanticDeclLevel, SemanticModel, TypeCheckFailReason, TypeCheckResult, VariadicType,
     infer_index_expr,
 };
@@ -163,13 +163,17 @@ fn check_index_expr(
         .map(|(is_inferred, _)| is_inferred)
         .unwrap_or(false);
 
-    let source_type = infer_index_expr(
-        semantic_model.get_db(),
-        &mut semantic_model.get_cache().borrow_mut(),
-        index_expr.clone(),
-        false,
-    )
-    .ok();
+    // Prefer the pre-write member type to avoid the current assignment
+    // widening the target field type before comparison.
+    let source_type = pre_write_index_expr_type(semantic_model, index_expr).or_else(|| {
+        infer_index_expr(
+            semantic_model.get_db(),
+            &mut semantic_model.get_cache().borrow_mut(),
+            index_expr.clone(),
+            false,
+        )
+        .ok()
+    });
 
     check_assign_type_mismatch(
         context,
@@ -196,6 +200,97 @@ fn check_index_expr(
         }
     }
     Some(())
+}
+
+/// Resolve the **pre-write** source type for an indexed assignment target by
+/// looking up the member type before the current write. This avoids the
+/// current assignment widening the target field type before comparison.
+///
+/// For `TableConst` prefix types (table literals) that are truly mixed in
+/// their **original syntax** — containing both integer-style entries
+/// (implicit array fields or explicit integer keys) and named fields —
+/// resolves the field type from the literal AST rather than the member
+/// index, since the member index may have been updated by the current write.
+///
+/// Returns `None` when the prefix type, key, or field cannot be resolved,
+/// or when the original literal is not mixed, causing the caller to fall
+/// back to the normal `infer_index_expr` path.
+fn pre_write_index_expr_type(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> Option<LuaType> {
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let prefix_type = semantic_model.infer_expr(prefix_expr).ok()?;
+
+    let LuaType::TableConst(in_file_range) = &prefix_type else {
+        return None;
+    };
+
+    // Get the table literal's AST node from the source range.
+    let root = semantic_model
+        .get_db()
+        .get_vfs()
+        .get_syntax_tree(&in_file_range.file_id)?;
+    let red_root = root.get_red_root();
+    let table_node = red_root.covering_element(in_file_range.value).into_node()?;
+    let table_expr = LuaTableExpr::cast(table_node)?;
+
+    // Only apply the pre-write strict path when the **original literal
+    // syntax** is truly mixed — has both integer-style entries and named
+    // fields. This check uses the AST, not the member index, so later
+    // numeric writes cannot retroactively turn a pure named-field literal
+    // into a "mixed" one.
+    if !table_literal_is_mixed(&table_expr) {
+        return None;
+    }
+
+    let index_key = index_expr.get_index_key()?;
+    let member_key = LuaMemberKey::from_index_key(
+        semantic_model.get_db(),
+        &mut semantic_model.get_cache().borrow_mut(),
+        &index_key,
+    )
+    .ok()?;
+
+    // Find the field matching the key and infer its value type directly
+    // from the literal AST — this is the pre-write type.
+    for field in table_expr.get_fields() {
+        let field_key = field.get_field_key()?;
+        let field_member_key = semantic_model.get_member_key(&field_key)?;
+        if field_member_key == member_key {
+            let value_expr = field.get_value_expr()?;
+            return semantic_model.infer_expr(value_expr).ok();
+        }
+    }
+
+    None
+}
+
+/// Whether a table literal's **original syntax** is mixed — contains both
+/// integer-style entries (implicit value fields or explicit integer keys)
+/// and named fields (name or string keys). Used to detect shaped table
+/// literals where named fields should remain strictly typed.
+fn table_literal_is_mixed(table_expr: &LuaTableExpr) -> bool {
+    let mut has_integer_style = false;
+    let mut has_named = false;
+
+    for field in table_expr.get_fields() {
+        if field.is_value_field() {
+            has_integer_style = true;
+        } else if let Some(key) = field.get_field_key() {
+            match key {
+                LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_) => has_integer_style = true,
+                LuaIndexKey::Name(_) | LuaIndexKey::String(_) => has_named = true,
+                LuaIndexKey::Expr(_) => {}
+            }
+        }
+
+        if has_integer_style && has_named {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn inferred_target_requires_explicit_table_field_checks(expr: &LuaExpr) -> bool {
@@ -447,15 +542,12 @@ where
             return Some((false, false));
         }
 
-        if !is_lenient_inferred_member_type(type_cache.as_type()) {
+        let db = semantic_model.get_db();
+        if !is_lenient_inferred_member_type(db, type_cache.as_type()) {
             all_lenient = false;
         }
 
-        let is_collection = match type_cache.as_type() {
-            LuaType::Array(_) => true,
-            LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
-            _ => false,
-        };
+        let is_collection = is_inferred_collection_member_type(db, type_cache.as_type());
         if !is_collection {
             all_collection = false;
         }
@@ -464,11 +556,29 @@ where
     Some((all_lenient, all_collection))
 }
 
-fn is_lenient_inferred_member_type(typ: &LuaType) -> bool {
+/// Whether an inferred member type is a sequential collection (array-like).
+///
+/// Shaped sequential table literals infer as `TableConst` with integer members,
+/// so they qualify; keyed/object `TableConst` literals (no integer members) do
+/// NOT, preserving strict field-mismatch checking for them.
+fn is_inferred_collection_member_type(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Array(_) => true,
+        LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
+        LuaType::TableConst(range) => crate::table_const_array_base(db, range).is_some(),
+        _ => false,
+    }
+}
+
+fn is_lenient_inferred_member_type(db: &DbIndex, typ: &LuaType) -> bool {
     matches!(
         typ,
         LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_)
     ) || matches!(typ, LuaType::Tuple(tuple) if tuple.is_infer_resolve())
+        // Shaped sequential literals infer as TableConst and are mutable dynamic
+        // tables, so later modification must not be flagged. Object/keyed
+        // TableConst literals are excluded so their fields stay strictly checked.
+        || matches!(typ, LuaType::TableConst(range) if crate::table_const_array_base(db, range).is_some())
 }
 
 fn check_local_stat(

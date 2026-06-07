@@ -8,6 +8,7 @@ use super::{ClientProxy, FileDiagnostic, StatusBar};
 use crate::codestyle::{apply_editorconfig_file, apply_workspace_code_style};
 use crate::context::lsp_features::LspFeatures;
 use crate::handlers::{ClientConfig, init_analysis};
+use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 use glua_code_analysis::uri_to_file_path;
 use glua_code_analysis::{
     EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, WorkspaceImport,
@@ -113,6 +114,9 @@ impl WorkspaceManager {
             }
 
             let config_roots = collect_config_roots(&workspace_folders, Some(file_dir.clone()));
+            let watchdog_status = LongRunningWatchdogStatus::new("Reloading GLuaLS configuration");
+            let _watchdog =
+                spawn_long_running_watchdog("workspace config reload", watchdog_status.clone());
             let loaded = load_emmy_config(config_roots, client_config);
             apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
 
@@ -134,6 +138,7 @@ impl WorkspaceManager {
                 loaded.emmyrc,
                 loaded.workspace_diagnostic_configs,
                 loaded.workspace_emmyrcs,
+                watchdog_status,
             )
             .await;
             client.refresh_semantic_tokens();
@@ -166,6 +171,9 @@ impl WorkspaceManager {
         let client = self.client.clone();
         let workspace_diagnostic_status = self.workspace_diagnostic_level.clone();
         tokio::spawn(async move {
+            let watchdog_status = LongRunningWatchdogStatus::new("Reloading workspace");
+            let _watchdog =
+                spawn_long_running_watchdog("workspace reload", watchdog_status.clone());
             apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
 
             // Refresh per-root matchers before re-indexing.
@@ -186,6 +194,7 @@ impl WorkspaceManager {
                 loaded.emmyrc,
                 loaded.workspace_diagnostic_configs,
                 loaded.workspace_emmyrcs,
+                watchdog_status,
             )
             .await;
 

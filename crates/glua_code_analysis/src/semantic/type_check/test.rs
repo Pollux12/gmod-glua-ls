@@ -200,6 +200,15 @@ mod test {
         assert!(check_type_compact(&db, &source, &compact).is_ok());
     }
 
+    #[test]
+    fn test_table_generic_accepts_merged_table_argument() {
+        let db = crate::DbIndex::new();
+        let source = LuaType::TableGeneric(vec![LuaType::Any, LuaType::Any].into());
+        let compact = LuaMergedTableType::new(vec![LuaType::Table]).into();
+
+        assert!(check_type_compact(&db, &source, &compact).is_ok());
+    }
+
     fn merged_table_with_field(name: &str, typ: LuaType) -> LuaType {
         merged_table_from_object(object_with_field(name, typ))
     }

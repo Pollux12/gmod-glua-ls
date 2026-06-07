@@ -1,4 +1,4 @@
-use glua_code_analysis::{EmmyLuaAnalysis, Emmyrc, FileId, VirtualUrlGenerator};
+use glua_code_analysis::{EmmyLuaAnalysis, Emmyrc, FileId, RenderLevel, VirtualUrlGenerator};
 use googletest::prelude::*;
 use itertools::Itertools;
 use lsp_types::{
@@ -224,9 +224,18 @@ impl ProviderVirtualWorkspace {
     }
 
     pub fn check_hover(&mut self, block_str: &str, expected: VirtualHoverResult) -> Result<()> {
+        self.check_hover_with_level(block_str, expected, None)
+    }
+
+    pub fn check_hover_with_level(
+        &mut self,
+        block_str: &str,
+        expected: VirtualHoverResult,
+        render_level: Option<RenderLevel>,
+    ) -> Result<()> {
         let (content, position) = Self::handle_file_content(block_str)?;
         let file_id = self.def(&content);
-        let result = hover(&self.analysis, file_id, position)
+        let result = hover(&self.analysis, file_id, position, render_level)
             .ok_or("couldn't get a hover")
             .or_fail()?;
         let Hover { contents, range } = result;

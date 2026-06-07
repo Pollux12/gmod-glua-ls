@@ -743,11 +743,42 @@ pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
     Err(InferFailReason::UnResolveDeclType(decl.get_id()))
 }
 
-fn infer_param_type_from_gmod_name_hint(db: &DbIndex, param_name: &str) -> Option<LuaType> {
-    if !db.get_emmyrc().gmod.enabled {
-        return None;
+pub fn infer_param_with_cache(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl: &LuaDecl,
+) -> InferResult {
+    let decl_id = decl.get_id();
+    if let Some(cache_entry) = cache.param_type_cache.get(&decl_id) {
+        return match cache_entry {
+            CacheEntry::Cache(typ) => Ok(typ.clone()),
+            CacheEntry::Error(reason) => Err(reason.clone()),
+            CacheEntry::Ready => Err(InferFailReason::RecursiveInfer),
+        };
     }
 
+    cache.param_type_cache.insert(decl_id, CacheEntry::Ready);
+    let result = infer_param(db, decl);
+    match &result {
+        Ok(typ) => {
+            cache
+                .param_type_cache
+                .insert(decl_id, CacheEntry::Cache(typ.clone()));
+        }
+        Err(reason) if cache.get_config().analysis_phase.is_diagnostics() => {
+            cache
+                .param_type_cache
+                .insert(decl_id, CacheEntry::Error(reason.clone()));
+        }
+        Err(_) => {
+            cache.param_type_cache.remove(&decl_id);
+        }
+    }
+
+    result
+}
+
+fn infer_param_type_from_gmod_name_hint(db: &DbIndex, param_name: &str) -> Option<LuaType> {
     let hints = &db.get_emmyrc().gmod.file_param_defaults;
     if hints.is_empty() {
         return None;
@@ -766,10 +797,6 @@ fn infer_param_type_from_gmod_name_hint(db: &DbIndex, param_name: &str) -> Optio
 }
 
 fn infer_param_type_from_file_hint(db: &DbIndex, decl: &LuaDecl) -> Option<LuaType> {
-    if !db.get_emmyrc().gmod.enabled {
-        return None;
-    }
-
     let target_name = decl.get_name().to_ascii_lowercase();
     let type_text = db
         .get_gmod_infer_index()
@@ -1563,9 +1590,15 @@ mod test {
         let db = ws.analysis.compilation.get_db();
         let mut cache = LuaInferCache::new(file_id, Default::default());
 
-        expect_that!(cache.expr_var_ref_id_cache.contains_key(&syntax_id), eq(false));
+        expect_that!(
+            cache.expr_var_ref_id_cache.contains_key(&syntax_id),
+            eq(false)
+        );
         expect_that!(infer_name_expr(db, &mut cache, self_expr).is_ok(), eq(true));
-        expect_that!(cache.expr_var_ref_id_cache.contains_key(&syntax_id), eq(true));
+        expect_that!(
+            cache.expr_var_ref_id_cache.contains_key(&syntax_id),
+            eq(true)
+        );
 
         Ok(())
     }

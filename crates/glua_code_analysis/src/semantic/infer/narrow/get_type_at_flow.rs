@@ -12,8 +12,7 @@ use crate::{
     LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeOwner, LuaUnionType,
     TypeOps, infer_expr,
     semantic::infer::{
-        InferResult, VarRefId, infer_expr_list_value_type_at,
-        infer_name::infer_param,
+        InferResult, VarRefId, infer_expr_list_value_type_at, infer_param_with_cache,
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{InferConditionFlow, get_type_at_condition_flow},
@@ -491,7 +490,7 @@ fn get_decl_position_var_ref_type(
         && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
     {
         if decl.is_param()
-            && let Ok(param_type) = infer_param(db, decl)
+            && let Ok(param_type) = infer_param_with_cache(db, cache, decl)
         {
             return Ok(param_type);
         }
@@ -1046,9 +1045,7 @@ fn get_type_at_assign_stat(
         // doc `@type` override) so each region keeps its own table identity.
         let rhs_is_fresh_table_literal = explicit_var_type.is_none()
             && matches!(expr_type, LuaType::TableConst(_))
-            && exprs
-                .get(i)
-                .is_some_and(expr_is_table_constructor);
+            && exprs.get(i).is_some_and(expr_is_table_constructor);
 
         let narrowed = if rhs_is_fresh_table_literal {
             Some(expr_type.clone())
@@ -1278,7 +1275,7 @@ fn is_inferred_member_collection_expr(
         if !type_cache.is_infer() {
             return Ok(false);
         }
-        if normalize_infer_collection_type(type_cache.as_type()).is_none() {
+        if normalize_infer_collection_type(db, type_cache.as_type()).is_none() {
             return Ok(false);
         }
         saw_collection = true;
@@ -1296,10 +1293,13 @@ fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwn
     }
 }
 
-fn normalize_infer_collection_type(typ: &LuaType) -> Option<()> {
+fn normalize_infer_collection_type(db: &DbIndex, typ: &LuaType) -> Option<()> {
     match typ {
         LuaType::Array(_) => Some(()),
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(()),
+        // Shaped sequential literals are inferred as TableConst; treat them as
+        // inferred collections too so flow narrowing over their elements works.
+        LuaType::TableConst(range) => crate::table_const_array_base(db, range).map(|_| ()),
         _ => None,
     }
 }
@@ -1308,6 +1308,7 @@ fn infer_collection_base_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
     match typ {
         LuaType::Array(array) => Some(array.get_base().clone()),
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(tuple.cast_down_array_base(db)),
+        LuaType::TableConst(range) => crate::table_const_array_base(db, range),
         _ => None,
     }
 }

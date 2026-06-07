@@ -1,4 +1,4 @@
-use glua_code_analysis::{GlobalId, LuaDocument};
+use glua_code_analysis::{GlobalId, LuaDeclId, LuaDocument};
 use glua_parser::LuaSyntaxToken;
 use lsp_types::{SemanticToken, SemanticTokenModifier, SemanticTokenType};
 use rowan::{TextRange, TextSize};
@@ -12,6 +12,7 @@ impl CustomSemanticTokenType {
     // neovim supports custom semantic token types, we add a custom type for delimiter
     pub const DELIMITER: SemanticTokenType = SemanticTokenType::new("delimiter");
     pub const FIELD: SemanticTokenType = SemanticTokenType::new("field");
+    pub const LABEL: SemanticTokenType = SemanticTokenType::new("label");
 }
 
 pub struct CustomSemanticTokenModifier;
@@ -49,6 +50,7 @@ pub const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
     // Custom types
     CustomSemanticTokenType::DELIMITER,
     CustomSemanticTokenType::FIELD,
+    CustomSemanticTokenType::LABEL,
 ];
 
 pub const SEMANTIC_TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
@@ -92,6 +94,8 @@ pub struct SemanticBuilder<'a> {
     data: HashMap<TextSize, SemanticTokenData>,
     string_special_range: HashSet<TextRange>,
     class_like_global_cache: HashMap<GlobalId, bool>,
+    alias_target_cache:
+        HashMap<LuaDeclId, Option<(SemanticTokenType, Option<SemanticTokenModifier>)>>,
 }
 
 impl<'a> SemanticBuilder<'a> {
@@ -118,6 +122,7 @@ impl<'a> SemanticBuilder<'a> {
             data: HashMap::new(),
             string_special_range: HashSet::new(),
             class_like_global_cache: HashMap::new(),
+            alias_target_cache: HashMap::new(),
         }
     }
 
@@ -163,7 +168,7 @@ impl<'a> SemanticBuilder<'a> {
             self.data
                 .insert(position, SemanticTokenData::MultiLine(multi_line_data));
         } else {
-            let length = text.chars().count() as u32;
+            let length = text.encode_utf16().count() as u32;
             self.data.insert(
                 position,
                 SemanticTokenData::Basic(BasicSemanticTokenData {
@@ -201,6 +206,21 @@ impl<'a> SemanticBuilder<'a> {
         Some(())
     }
 
+    pub fn push_with_modifier_force(
+        &mut self,
+        token: &LuaSyntaxToken,
+        ty: SemanticTokenType,
+        modifier: SemanticTokenModifier,
+    ) -> Option<()> {
+        self.data.remove(&token.text_range().start());
+        self.push_with_modifier(token, ty, modifier)
+    }
+
+    pub fn push_force(&mut self, token: &LuaSyntaxToken, ty: SemanticTokenType) -> Option<()> {
+        self.data.remove(&token.text_range().start());
+        self.push(token, ty)
+    }
+
     pub fn push_at_position(
         &mut self,
         position: TextSize,
@@ -232,6 +252,21 @@ impl<'a> SemanticBuilder<'a> {
     pub fn cache_class_like_global(&mut self, global_id: GlobalId, is_class_like: bool) {
         self.class_like_global_cache
             .insert(global_id, is_class_like);
+    }
+
+    pub fn cached_alias_target(
+        &self,
+        decl_id: &LuaDeclId,
+    ) -> Option<Option<(SemanticTokenType, Option<SemanticTokenModifier>)>> {
+        self.alias_target_cache.get(decl_id).cloned()
+    }
+
+    pub fn cache_alias_target(
+        &mut self,
+        decl_id: LuaDeclId,
+        target: Option<(SemanticTokenType, Option<SemanticTokenModifier>)>,
+    ) {
+        self.alias_target_cache.insert(decl_id, target);
     }
 
     pub fn push_at_range(

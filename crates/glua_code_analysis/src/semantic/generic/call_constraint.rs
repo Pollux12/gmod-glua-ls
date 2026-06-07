@@ -62,6 +62,10 @@ pub fn build_call_constraint_context(
 pub fn normalize_constraint_type(db: &DbIndex, ty: LuaType) -> LuaType {
     match ty {
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => tuple.cast_down_array_base(db),
+        // Shaped sequential literals infer as TableConst; normalize to their
+        // array element base for generic argument matching, matching the prior
+        // tuple-based behavior.
+        LuaType::TableConst(ref range) => crate::table_const_array_base(db, range).unwrap_or(ty),
         _ => ty,
     }
 }

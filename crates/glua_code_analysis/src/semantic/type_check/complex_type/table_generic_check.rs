@@ -79,6 +79,18 @@ pub fn check_table_generic_type_compact(
                 return Ok(());
             }
         }
+        LuaType::MergedTable(merged_table) => {
+            for component in merged_table.get_types() {
+                check_table_generic_type_compact(
+                    context,
+                    source_generic_param,
+                    component,
+                    check_guard.next_level()?,
+                )?;
+            }
+
+            return Ok(());
+        }
         LuaType::Userdata => return Ok(()),
         // maybe support object
         // need check later

@@ -2302,8 +2302,9 @@ fn resolve_local_registration_region(
     register_position: TextSize,
 ) -> Option<(LuaDeclId, TextSize)> {
     let decl_id = resolve_local_decl_id_at_position(db, file_id, var_name, register_position)?;
-    let region_start = find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
-        .unwrap_or(decl_id.position);
+    let region_start =
+        find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
+            .unwrap_or(decl_id.position);
     Some((decl_id, region_start))
 }
 
@@ -3437,9 +3438,9 @@ fn find_registered_table_expr(
 
         if let Some(assign_stat) = LuaAssignStat::cast(ancestor.clone()) {
             let (vars, exprs) = assign_stat.get_var_and_expr_list();
-            let var_index = vars.iter().position(|var| {
-                var.syntax().text_range().start() == write_position
-            })?;
+            let var_index = vars
+                .iter()
+                .position(|var| var.syntax().text_range().start() == write_position)?;
             return value_expr_as_table(exprs.get(var_index)?);
         }
     }
@@ -3566,10 +3567,8 @@ fn synthesize_panel_class(
             // literal. Binding the decl slot is safe here because the local is
             // never reused, so there is no region to collapse. Reassigned
             // locals are deliberately left untouched to avoid collapse.
-            db.get_type_index_mut().force_bind_type(
-                decl_id.into(),
-                LuaTypeCache::InferType(class_type.clone()),
-            );
+            db.get_type_index_mut()
+                .force_bind_type(decl_id.into(), LuaTypeCache::InferType(class_type.clone()));
         }
 
         // Transfer the members defined in this registration's table region to
@@ -3594,12 +3593,8 @@ fn synthesize_panel_class(
             // by source position `[latest_write_position, register_position)`.
             // This stays correct if a future flow-aware collector starts keying
             // members under the per-region literal instead.
-            let member_source_ranges = collect_panel_member_source_ranges(
-                db,
-                file_id,
-                decl_id,
-                &table_range,
-            );
+            let member_source_ranges =
+                collect_panel_member_source_ranges(db, file_id, decl_id, &table_range);
 
             let mut table_member_ids = HashSet::new();
             for (source_idx, source_range) in member_source_ranges.iter().enumerate() {

@@ -5,7 +5,6 @@ mod semantic_guard;
 
 use crate::{
     DbIndex, LuaDeclExtra, LuaDeclId, LuaMemberId, LuaSemanticDeclId, LuaType, LuaTypeCache,
-    TypeOps,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaDocNameType, LuaDocTag, LuaExpr, LuaLocalName, LuaParamName,
@@ -17,7 +16,9 @@ pub use semantic_decl_level::SemanticDeclLevel;
 pub use semantic_guard::SemanticDeclGuard;
 
 use super::infer::try_local_decl_initializer_fallback_type;
-use super::{InferFailReason, LuaInferCache, infer_bind_value_type, infer_expr};
+use super::{
+    InferFailReason, LuaInferCache, infer_bind_value_type, infer_expr, infer_param_with_cache,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticInfo {
@@ -58,15 +59,8 @@ pub fn infer_token_semantic_info(
             let decl_id = LuaDeclId::new(file_id, token.text_range().start());
             let decl = db.get_decl_index().get_decl(&decl_id)?;
             match &decl.extra {
-                LuaDeclExtra::Param {
-                    idx, signature_id, ..
-                } => {
-                    let signature = db.get_signature_index().get(signature_id)?;
-                    let param_info = signature.get_param_info_by_id(*idx)?;
-                    let mut typ = param_info.type_ref.clone();
-                    if param_info.nullable && !typ.is_nullable() {
-                        typ = TypeOps::Union.apply(db, &typ, &LuaType::Nil);
-                    }
+                LuaDeclExtra::Param { .. } => {
+                    let typ = infer_param_with_cache(db, cache, decl).ok()?;
 
                     Some(SemanticInfo {
                         typ,

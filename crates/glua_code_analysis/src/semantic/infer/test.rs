@@ -1071,6 +1071,54 @@ mod test {
         assert!(!ty.is_unknown());
     }
 
+    /// `table_const_array_base` should only return `Some` for true shaped
+    /// sequential literals (all integer-keyed, no named fields). Mixed tables
+    /// with named fields or sparse numeric keys must return `None`.
+    #[test]
+    fn test_table_const_array_base_only_matches_shaped_sequential_literals() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local shaped = { { id = 1 }, { id = 2 } }
+            local mixed = { { id = 1 }, kind = "metadata" }
+            local numeric_object = { [100] = { id = 1 }, name = "x" }
+            print(shaped, mixed, numeric_object)
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+
+        // shaped: two sequential elements, no named fields → Some(...)
+        let shaped_ty = infer_last_name_expr_type_in_file(&ws, file_id, "shaped");
+        let LuaType::TableConst(shaped_range) = shaped_ty else {
+            panic!("expected TableConst for shaped, got: {shaped_ty:?}");
+        };
+        assert!(
+            crate::table_const_array_base(db, &shaped_range).is_some(),
+            "shaped sequential literal should be treated as array-like"
+        );
+
+        // mixed: has integer [1] but also named field `kind` → None
+        let mixed_ty = infer_last_name_expr_type_in_file(&ws, file_id, "mixed");
+        let LuaType::TableConst(mixed_range) = mixed_ty else {
+            panic!("expected TableConst for mixed, got: {mixed_ty:?}");
+        };
+        assert!(
+            crate::table_const_array_base(db, &mixed_range).is_none(),
+            "mixed literal with named fields should not be treated as array-like"
+        );
+
+        // numeric_object: has [100] but also named field `name` → None
+        let numeric_ty = infer_last_name_expr_type_in_file(&ws, file_id, "numeric_object");
+        let LuaType::TableConst(numeric_range) = numeric_ty else {
+            panic!("expected TableConst for numeric_object, got: {numeric_ty:?}");
+        };
+        assert!(
+            crate::table_const_array_base(db, &numeric_range).is_none(),
+            "numeric-key object with named fields should not be treated as array-like"
+        );
+    }
+
     #[test]
     fn test_reassigned_local_table_resolves_to_new_table_identity() {
         // General Lua semantics (no GMod): after `t = {}` the local must hold the

@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualHoverResult, check};
-    use glua_code_analysis::EmmyrcGmodScriptedClassScopeEntry;
+    use glua_code_analysis::{EmmyrcGmodScriptedClassScopeEntry, RenderLevel};
     use googletest::prelude::*;
     use lsp_types::HoverContents;
 
@@ -298,6 +298,31 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_unannotated_param_with_gmod_name_hint() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        check!(ws.check_hover(
+            r#"
+                ---@class Entity
+
+                local function foo(<??>ent)
+                    local value = ent
+                end
+            "#,
+            VirtualHoverResult {
+                value: dedent(
+                    r#"
+                    ```lua
+                    local ent: Entity
+                    ```
+                    "#
+                )
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_param_func() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(
@@ -374,7 +399,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -410,7 +435,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -447,7 +472,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -484,7 +509,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -498,6 +523,85 @@ mod tests {
             markup.value
         );
 
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_dynamic_key_read_from_known_table_fields_stays_table() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class CSEnt
+                local CSEnt = {}
+                function CSEnt:Remove()
+                end
+
+                ---@param ent any
+                ---@return boolean
+                local function IsValid(ent)
+                end
+
+                ---@param modelPath string
+                ---@param renderGroup any
+                ---@return CSEnt
+                local function ClientsideModel(modelPath, renderGroup)
+                end
+
+                local PREVIEW_RENDER_GROUP = 0
+                Glide = {}
+                local Editor = Glide.VehicleLayoutEditor or {}
+                Glide.VehicleLayoutEditor = Editor
+
+                Editor.previewModels = Editor.previewModels or {
+                    seats = {},
+                    wheels = {}
+                }
+
+                function Editor:GetPreviewEntity(kind, itemId, modelPath)
+                    if not modelPath or modelPath == "" then return end
+                    self.previewModels = self.previewModels or { seats = {}, wheels = {} }
+                    local po<??>ol = self.previewModels[kind]
+                    if not pool then return end
+
+                    local entry = pool[itemId]
+                    if not entry or not IsValid(entry.ent) or entry.model ~= modelPath then
+                        if entry and IsValid(entry.ent) then
+                            entry.ent:Remove()
+                        end
+
+                        local ent = ClientsideModel(modelPath, PREVIEW_RENDER_GROUP)
+                        if not IsValid(ent) then
+                            pool[itemId] = nil
+                            return
+                        end
+
+                        entry = { ent = ent, model = modelPath }
+                        pool[itemId] = entry
+                    end
+
+                    for _, value in pairs(pool) do
+                    end
+
+                    return entry.ent
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/glide/client/vehicle_layout_editor.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("local pool: table"),
+            "dynamic read of seats/wheels should hover as a table, got: {value}"
+        );
+        assert!(
+            !value.contains("[unknown]"),
+            "unknown dynamic write key must not become the displayed table shape, got: {value}"
+        );
         Ok(())
     }
 
@@ -629,6 +733,48 @@ mod tests {
                 value: "```lua\n(field) vvv: number?\n```\n\n---\n\nactiveSub".to_string(),
             },
         ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_table_escape_string_keys_hover_cleanly() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(
+            ws.check_hover_with_level(
+                r#"
+                local Escape<??>StringMap = {
+                    ["\a"] = "\\a",
+                    ["\b"] = "\\b",
+                    ["\f"] = "\\f",
+                    ["\n"] = "\\n",
+                    ["\r"] = "\\r",
+                    ["\t"] = "\\t",
+                    ["\v"] = "\\v",
+                    ["\\"] = "\\\\",
+                    ["\""] = "\\\"",
+                    ["\'"] = "\\\'"
+                }
+            "#,
+                VirtualHoverResult {
+                    value: r##"```lua
+local EscapeStringMap: {
+    ["\a"]: string = "\\a",
+    ["\b"]: string = "\\b",
+    ["\f"]: string = "\\f",
+    ["\n"]: string = "\\n",
+    ["\r"]: string = "\\r",
+    ["\t"]: string = "\\t",
+    ["\v"]: string = "\\v",
+    ["\\"]: string = "\\\\",
+    ["\""]: string = "\\\"",
+    ["'"]: string = "\\'",
+}
+```"##
+                        .to_string(),
+                },
+                Some(RenderLevel::DetailedCount(12)),
+            )
+        );
         Ok(())
     }
 
@@ -854,7 +1000,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("cityrp/plugins/vehicles/sh_plugin.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -882,7 +1028,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("cityrp/plugins/vehicles/sh_plugin.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -922,7 +1068,7 @@ mod tests {
             "cityrp/entities/entities/cityrp_money/sh_init.lua",
             &content,
         );
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -962,7 +1108,7 @@ mod tests {
             "cityrp/entities/entities/cityrp_inventory/init.lua",
             &content,
         );
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1019,7 +1165,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1096,7 +1242,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1155,7 +1301,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1198,7 +1344,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1250,7 +1396,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("sv_badge_priority.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1306,7 +1452,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/shared.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1358,7 +1504,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("sh_test_tbl.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1408,7 +1554,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("sh_global_function.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1455,7 +1601,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/shared.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -1582,7 +1728,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("use.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -1621,7 +1767,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def(&content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -2292,7 +2438,7 @@ mod tests {
                 "#,
         ))?;
         let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -2365,7 +2511,7 @@ mod tests {
                 "#,
         ))?;
         let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -2437,7 +2583,7 @@ mod tests {
                 "#,
         ))?;
         let file_id = ws.def_file("cityrp/entities/entities/glide_wheel/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
         let HoverContents::Markup(markup) = hover.contents else {
@@ -2493,7 +2639,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2575,7 +2721,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2620,7 +2766,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2666,7 +2812,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2709,7 +2855,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover")
             .or_fail()?;
 
@@ -2750,7 +2896,7 @@ mod tests {
         let file_id = ws.def_file("gamemode/init.lua", &content);
         // When the hook is not registered, hover_gmod_hook_callback_function returns None and
         // the dispatch falls through to the generic keyword hover — always Some(...).
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected keyword fallback hover for unregistered hook")
             .or_fail()?;
 
@@ -2799,7 +2945,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("gamemode/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position)
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
             .ok_or("expected hover for return-only hook")
             .or_fail()?;
 
@@ -2910,8 +3056,8 @@ mod tests {
         file_id: glua_code_analysis::FileId,
         position: lsp_types::Position,
     ) -> String {
-        let hover =
-            crate::handlers::hover::hover(&ws.analysis, file_id, position).expect("expected hover");
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .expect("expected hover");
         let HoverContents::Markup(markup) = hover.contents else {
             panic!("expected HoverContents::Markup");
         };
@@ -3266,7 +3412,7 @@ mod tests {
             "#,
         )?;
         let file_id = ws.def_file("lua/autorun/server/init.lua", &content);
-        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None);
         if let Some(hover) = hover {
             let HoverContents::Markup(markup) = hover.contents else {
                 return Ok(());

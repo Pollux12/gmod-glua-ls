@@ -1860,7 +1860,9 @@ mod test {
                 }
                 let info = semantic_model.get_semantic_info(token.syntax().clone().into())?;
                 match &info.typ {
-                    LuaType::Def(id) => Some((name_expr.get_position(), id.get_simple_name().to_string())),
+                    LuaType::Def(id) => {
+                        Some((name_expr.get_position(), id.get_simple_name().to_string()))
+                    }
                     _ => None,
                 }
             })
@@ -4424,10 +4426,15 @@ mod test {
             eq("tableof<base_glide>"),
             "the local should keep the GetTable(self) tableof<self> type after `entTbl = entTbl or getTable(self)`"
         );
+        // The shaped sequential literal `{ { 1.0 } }` is modeled as a dynamic
+        // table (TableConst) with an integer member `[1]` holding the inner row,
+        // rather than the old immutable nested-tuple `((1.0))`. The detailed
+        // rendering preserves that rich shape instead of degrading to a generic
+        // `table`, which is the property this test guards.
         assert_that!(
-            ws.humanize_type(input_floats_type).as_str(),
-            eq("((1.0))"),
-            "entTbl.inputFloats should keep the scripted-class field type instead of degrading to generic table access"
+            ws.humanize_type_detailed(input_floats_type).as_str(),
+            eq("{\n    [1]: (1.0),\n}"),
+            "entTbl.inputFloats should keep the scripted-class field shape instead of degrading to generic table access"
         );
 
         let diagnostics = ws
@@ -4582,6 +4589,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
 
         ws.def_file(
             "lua/entities/base_glide/shared.lua",
@@ -4631,18 +4639,36 @@ mod test {
             "#,
         );
 
-        let field_names: Vec<String> = ws
+        let diagnostics = ws
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
-            .unwrap_or_default()
-            .into_iter()
+            .unwrap_or_default();
+
+        let field_names: Vec<String> = diagnostics
+            .iter()
             .filter(|d| d.code == Some(NumberOrString::String("undefined-field".to_string())))
-            .map(|d| d.message)
+            .map(|d| d.message.clone())
             .collect();
 
         assert!(
             !field_names.iter().any(|m| m.contains("`[i]`")),
             "numeric for index into inferred ENT weapons table should not trigger undefined-field: {field_names:?}"
+        );
+
+        let unchecked_nil_accesses: Vec<String> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|d| d.message.clone())
+            .collect();
+
+        assert!(
+            unchecked_nil_accesses.is_empty(),
+            "numeric for index into inferred ENT weapons table should not trigger unchecked-nil-access: {unchecked_nil_accesses:?}"
         );
     }
 
@@ -7505,7 +7531,10 @@ mod test {
         assert!(
             y_display.contains("number")
                 || y_display.contains("integer")
-                || matches!(y_type, LuaType::IntegerConst(_) | LuaType::Number | LuaType::Integer),
+                || matches!(
+                    y_type,
+                    LuaType::IntegerConst(_) | LuaType::Number | LuaType::Integer
+                ),
             "PanelB region: self.value should resolve to number/integer, got {y_display:?} ({y_type:?})"
         );
 

@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-
 use glua_code_analysis::{
-    LuaSignatureId, LuaType, LuaUnionType, RenderLevel, SemanticModel, format_union_type,
-    humanize_type,
+    LuaDeclId, LuaType, LuaUnionType, RenderLevel, SemanticModel, format_union_type, humanize_type,
+    infer_param_with_cache,
 };
-use glua_parser::{LuaAstNode, LuaClosureExpr};
+use glua_parser::{LuaAstNode, LuaAstToken, LuaClosureExpr, LuaParamName};
 use itertools::Itertools;
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, Location};
 
@@ -16,67 +14,65 @@ pub fn build_closure_hint(
     if !semantic_model.get_emmyrc().hint.param_hint {
         return Some(());
     }
-    let file_id = semantic_model.get_file_id();
-    let signature_id = LuaSignatureId::from_closure(file_id, &closure);
-    let signature = semantic_model
-        .get_db()
-        .get_signature_index()
-        .get(&signature_id)?;
-
     let lua_params = closure.get_params_list()?;
-    let signature_params = signature.get_type_params();
-    let mut lua_params_map = HashMap::new();
-    for param in lua_params.get_params() {
-        if let Some(name_token) = param.get_name_token() {
-            let name = name_token.get_name_text().to_string();
-            lua_params_map.insert(name, param);
-        } else if param.is_dots() {
-            lua_params_map.insert("...".to_string(), param);
-        }
-    }
-
     let document = semantic_model.get_document();
-    for (signature_param_name, typ) in &signature_params {
-        if let Some(typ) = typ {
-            if typ.is_any() {
-                continue;
-            }
-
-            if let Some(lua_param) = lua_params_map.get(signature_param_name) {
-                let lsp_range = document.to_lsp_range(lua_param.get_range())?;
-                // 构造 label
-                let mut label_parts = build_label_parts(semantic_model, typ);
-                // 为空时添加默认值
-                if label_parts.is_empty() {
-                    let typ_desc = format!(
-                        ": {}",
-                        hint_humanize_type(semantic_model, typ, RenderLevel::Simple)
-                    );
-                    label_parts.push(InlayHintLabelPart {
-                        value: typ_desc,
-                        location: Some(
-                            get_type_location(semantic_model, typ, 0)
-                                .unwrap_or(Location::new(document.get_uri(), lsp_range)),
-                        ),
-                        ..Default::default()
-                    });
-                }
-                let hint = InlayHint {
-                    kind: Some(InlayHintKind::TYPE),
-                    label: InlayHintLabel::LabelParts(label_parts),
-                    position: lsp_range.end,
-                    text_edits: None,
-                    tooltip: None,
-                    padding_left: Some(true),
-                    padding_right: None,
-                    data: None,
-                };
-                result.push(hint);
-            }
+    for lua_param in lua_params.get_params() {
+        let typ = infer_lua_param_hint_type(semantic_model, &lua_param)?;
+        if typ.is_any() || typ.is_unknown() {
+            continue;
         }
+
+        let lsp_range = document.to_lsp_range(lua_param.get_range())?;
+        let mut label_parts = build_label_parts(semantic_model, &typ);
+        if label_parts.is_empty() {
+            let typ_desc = format!(
+                ": {}",
+                hint_humanize_type(semantic_model, &typ, RenderLevel::Simple)
+            );
+            label_parts.push(InlayHintLabelPart {
+                value: typ_desc,
+                location: Some(
+                    get_type_location(semantic_model, &typ, 0)
+                        .unwrap_or(Location::new(document.get_uri(), lsp_range)),
+                ),
+                ..Default::default()
+            });
+        }
+        let hint = InlayHint {
+            kind: Some(InlayHintKind::TYPE),
+            label: InlayHintLabel::LabelParts(label_parts),
+            position: lsp_range.end,
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(true),
+            padding_right: None,
+            data: None,
+        };
+        result.push(hint);
     }
 
     Some(())
+}
+
+fn infer_lua_param_hint_type(
+    semantic_model: &SemanticModel,
+    lua_param: &LuaParamName,
+) -> Option<LuaType> {
+    let token = lua_param
+        .get_name_token()
+        .map(|token| token.syntax().clone())
+        .or_else(|| lua_param.syntax().first_token())?;
+    let decl_id = LuaDeclId::new(semantic_model.get_file_id(), token.text_range().start());
+    let decl = semantic_model
+        .get_db()
+        .get_decl_index()
+        .get_decl(&decl_id)?;
+    infer_param_with_cache(
+        semantic_model.get_db(),
+        &mut semantic_model.get_cache().borrow_mut(),
+        decl,
+    )
+    .ok()
 }
 
 pub fn build_label_parts(semantic_model: &SemanticModel, typ: &LuaType) -> Vec<InlayHintLabelPart> {
