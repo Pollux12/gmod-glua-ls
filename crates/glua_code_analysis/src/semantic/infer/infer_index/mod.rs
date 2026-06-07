@@ -336,6 +336,9 @@ fn infer_table_member(
         Err(err)
             if is_unknown_dynamic_key_without_table_data(db, &owner, &inst, &index_key, &err) =>
         {
+            if is_dynamic_index_in_len_for_range(db, cache, &index_expr, &index_key) {
+                return Ok(LuaType::Any);
+            }
             return Ok(nullable_any_type());
         }
         Err(err) => return Err(err),
@@ -410,6 +413,9 @@ fn infer_table_member(
                 return Ok(dynamic_field.typ);
             }
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
+                if is_dynamic_index_in_len_for_range(db, cache, &index_expr, &index_key) {
+                    return Ok(LuaType::Any);
+                }
                 return Ok(nullable_any_type());
             }
             if let Ok(global_path_type) =
@@ -640,6 +646,22 @@ fn is_dynamic_expr_key_without_table_data(
     key: &LuaMemberKey,
 ) -> bool {
     matches!(key, LuaMemberKey::ExprType(_)) && table_const_has_no_specific_data(db, owner, inst)
+}
+
+fn is_dynamic_index_in_len_for_range(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexMemberExpr,
+    index_key: &LuaIndexKey,
+) -> bool {
+    let LuaIndexKey::Expr(expr) = index_key else {
+        return false;
+    };
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    check_iter_var_range(db, cache, expr, prefix_expr).unwrap_or(false)
 }
 
 fn table_const_has_no_specific_data(

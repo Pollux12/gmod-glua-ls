@@ -975,6 +975,110 @@ mod test {
     }
 
     #[gtest]
+    fn test_reverse_len_for_loop_index_on_plain_table_has_no_nil_access_diagnostic_in_strict_array_mode()
+     {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.strict.array_index = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@param myWeapons table
+            local function clear(myWeapons)
+                if not myWeapons then
+                    return
+                end
+
+                for i = #myWeapons, 1, -1 do
+                    myWeapons[i]:OnRemove()
+                    myWeapons[i] = nil
+                end
+            end
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_reverse_len_for_loop_index_on_guarded_class_table_field_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.strict.array_index = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Vehicle
+            ---@field weapons table?
+            local Vehicle = {}
+
+            function Vehicle:ClearWeapons()
+                local myWeapons = self.weapons
+                if not myWeapons then
+                    return
+                end
+
+                for i = #myWeapons, 1, -1 do
+                    myWeapons[i]:OnRemove()
+                    myWeapons[i] = nil
+                end
+            end
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_reverse_len_for_loop_index_on_empty_table_const_alias_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.strict.array_index = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            local ENT = {}
+
+            function ENT:Initialize()
+                self.weapons = {}
+            end
+
+            function ENT:ClearWeapons()
+                local myWeapons = self.weapons
+                if not myWeapons then
+                    return
+                end
+
+                for i = #myWeapons, 1, -1 do
+                    myWeapons[i]:OnRemove()
+                    myWeapons[i] = nil
+                end
+            end
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_reverse_len_for_loop_index_with_zero_bound_still_reports_nil_access() {
         let mut ws = VirtualWorkspace::new();
         let code = r#"

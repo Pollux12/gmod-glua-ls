@@ -4589,6 +4589,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
 
         ws.def_file(
             "lua/entities/base_glide/shared.lua",
@@ -4638,18 +4639,36 @@ mod test {
             "#,
         );
 
-        let field_names: Vec<String> = ws
+        let diagnostics = ws
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
-            .unwrap_or_default()
-            .into_iter()
+            .unwrap_or_default();
+
+        let field_names: Vec<String> = diagnostics
+            .iter()
             .filter(|d| d.code == Some(NumberOrString::String("undefined-field".to_string())))
-            .map(|d| d.message)
+            .map(|d| d.message.clone())
             .collect();
 
         assert!(
             !field_names.iter().any(|m| m.contains("`[i]`")),
             "numeric for index into inferred ENT weapons table should not trigger undefined-field: {field_names:?}"
+        );
+
+        let unchecked_nil_accesses: Vec<String> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|d| d.message.clone())
+            .collect();
+
+        assert!(
+            unchecked_nil_accesses.is_empty(),
+            "numeric for index into inferred ENT weapons table should not trigger unchecked-nil-access: {unchecked_nil_accesses:?}"
         );
     }
 
