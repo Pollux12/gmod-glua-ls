@@ -2740,6 +2740,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             util.AddNetworkString("known_message")
@@ -2789,12 +2790,45 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_net_message_completion_uses_annotated_call_arg_role() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            util.AddNetworkString("known_message")
+
+            ---@[call_arg("gmod.net_message", "start")]
+            ---@param name string
+            function startNet(name) end
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            startNet("<??>")
+            "#,
+            vec![VirtualCompletionItem {
+                label: "known_message".to_string(),
+                kind: CompletionItemKind::EVENT,
+                label_detail: Some("(1 registration, 0 receivers)".to_string()),
+            }],
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_net_read_completion_in_receive_callback() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.network.completion.smart_read_suggestions = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "addons/test/lua/autorun/server/send.lua",
@@ -2861,6 +2895,7 @@ mod tests {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.network.completion.smart_read_suggestions = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "addons/test/lua/autorun/server/send.lua",
@@ -3024,6 +3059,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             hook.Add("Think", "id", function() end)
@@ -3077,6 +3113,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             hook.Add("PlayerSpawn", "id", function(a, b) end)
@@ -3130,6 +3167,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             function GM:PlayerSpawn(ply, transition) end
@@ -3151,12 +3189,81 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_hook_completion_requires_annotated_call_arg_role() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            hook.Run("<??>")
+            "#,
+        )?;
+        let file_id = ws.def(content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(
+            items.iter().any(|item| item.label == "PlayerSpawn"),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_hook_completion_uses_annotated_call_arg_role() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        check!(ws.check_completion(
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            function GM:PlayerSpawn(ply, transition) end
+
+            ---@[call_arg("gmod.hook", "emit")]
+            ---@param name string
+            local function runHook(name) end
+
+            runHook("<??>")
+            "#,
+            vec![VirtualCompletionItem {
+                label: "PlayerSpawn".to_string(),
+                kind: CompletionItemKind::EVENT,
+                label_detail: Some("(1 method; args: ply, transition)".to_string()),
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_hook_completion_prefers_method_callback_params_over_hook_add_callback()
     -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             hook.Add("PlayerSpawn", "id", function(a, b) end)
@@ -3261,12 +3368,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
-        ws.def(
-            r#"
-            hook = hook or {}
-            function hook.Add(eventName, identifier, func) end
-            "#,
-        );
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -3312,6 +3414,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             function GM:PlayerSpawn(ply, transition) end
@@ -3372,11 +3475,74 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_annotated_hook_wrapper_uses_call_arg_staged_snippet() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def(
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            function GM:PlayerSpawn(ply, transition) end
+
+            mylib = { hook = {} }
+            ---@[call_arg("gmod.hook", "add")]
+            ---@param eventName string
+            function mylib.hook.Add(eventName, identifier, func) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            mylib.hook.Add("<??>")
+            "#,
+        )?;
+        let file_id = ws.def(content.as_str());
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        let item = items
+            .iter()
+            .find(|item| item.label == "PlayerSpawn")
+            .ok_or("missing PlayerSpawn completion")
+            .or_fail()?;
+        let text_edit = item
+            .text_edit
+            .as_ref()
+            .ok_or("missing hook completion text edit")
+            .or_fail()?;
+        let lsp_types::CompletionTextEdit::Edit(text_edit) = text_edit else {
+            return fail!("expected text edit for annotated hook wrapper completion");
+        };
+
+        verify_eq!(item.kind, Some(CompletionItemKind::EVENT))?;
+        verify_that!(
+            text_edit.new_text.as_str(),
+            eq("PlayerSpawn\", \"${1:identifier}\", function(ply, transition)\n\t$0\nend)")
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_hook_run_string_completion_expands_emit_snippet() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             function GM:PlayerSpawn(ply, transition) end
@@ -3442,6 +3608,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             function GM:PlayerSpawn(ply, transition) end
@@ -3505,6 +3672,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             function GM:PlayerSpawn(ply, transition) end
@@ -3546,12 +3714,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
-        ws.def(
-            r#"
-            net = net or {}
-            function net.Receive(name, func) end
-            "#,
-        );
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -3597,6 +3760,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "addons/test/lua/autorun/server/send.lua",
             r#"
@@ -3659,6 +3823,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "sv_hook.lua",
             r#"
@@ -3693,6 +3858,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "sh_hook_annotated.lua",
             r#"

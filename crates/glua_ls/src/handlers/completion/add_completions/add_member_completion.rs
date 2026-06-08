@@ -223,7 +223,14 @@ pub fn add_member_completion_with_description_hint(
     }
 
     if can_add_snippet {
-        if apply_staged_call_snippet(builder, &label, status, &mut completion_item).is_none()
+        if apply_staged_call_snippet(
+            builder,
+            &label,
+            status,
+            &remove_nil_type,
+            &mut completion_item,
+        )
+        .is_none()
             && builder.support_snippets(typ)
             && let Some(snippet) = get_function_snippet(builder, &label, typ, call_display)
         {
