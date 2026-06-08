@@ -1309,6 +1309,82 @@ mod test {
     }
 
     #[gtest]
+    fn test_annotated_network_var_wrapper_synthesizes_get_set_with_reordered_args() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/entities/annotated_network/shared.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.network_var", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param typeName string
+            local function addNetworkVar(name, typeName)
+            end
+
+            function ENT:SetupDataTables()
+                addNetworkVar("Enabled", "Bool")
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("annotated_network"));
+        let getter = db
+            .get_member_index()
+            .get_member_item(&owner, &LuaMemberKey::Name("GetEnabled".into()));
+        let setter = db
+            .get_member_index()
+            .get_member_item(&owner, &LuaMemberKey::Name("SetEnabled".into()));
+
+        assert!(getter.is_some(), "expected annotated wrapper getter");
+        assert!(setter.is_some(), "expected annotated wrapper setter");
+    }
+
+    #[gtest]
+    fn test_annotated_network_var_element_wrapper_synthesizes_number_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/entities/annotated_network_element/shared.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.network_var", "define_element")]
+            ---@param name string
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param typeName string
+            local function addNetworkElement(name, typeName)
+            end
+
+            function ENT:SetupDataTables()
+                addNetworkElement("VelocityX", "Vector")
+            end
+
+            local value = ENT:GetVelocityX()
+        "#,
+        );
+
+        let value_type = local_name_type(&mut ws, file_id, "value");
+        assert!(
+            matches!(value_type, LuaType::Number | LuaType::Integer),
+            "NetworkVarElement wrapper should synthesize numeric getter, got {value_type:?}"
+        );
+    }
+
+    #[gtest]
     fn test_annotated_derma_skin_wrapper_records_skin_definition() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -7157,6 +7233,72 @@ mod test {
             crate::LuaMemberIndexItem::Many(ids) => ids.len(),
         };
         assert_eq!(count, 1);
+    }
+
+    #[gtest]
+    fn test_annotated_define_baseclass_wrapper_synthesizes_parent_alias() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        add_gamemode_gm_library(&mut ws);
+
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/player.lua",
+            r#"function GM:SetupMove(ply, mv, cmd) end"#,
+        );
+
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            ---@[call_arg("gmod.class_base", "reference")]
+            ---@param base string
+            local function setBaseClass(base) end
+
+            setBaseClass("gamemode_sandbox")
+            "#,
+        );
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_darkrp"));
+        let member_item = ws
+            .get_db_mut()
+            .get_member_index()
+            .get_member_item(&owner, &LuaMemberKey::Name("Sandbox".into()));
+
+        assert!(
+            member_item.is_some(),
+            "annotated class_base wrapper should synthesize Sandbox alias"
+        );
+    }
+
+    #[gtest]
+    fn test_annotated_derive_gamemode_wrapper_adds_prefixed_super_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        add_gamemode_gm_library(&mut ws);
+
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            ---@[call_arg("gmod.gamemode", "reference")]
+            ---@param base string
+            local function derive(base) end
+
+            derive("sandbox")
+            "#,
+        );
+
+        let super_types = super_types_of(&mut ws, "gamemode_darkrp");
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("gamemode_sandbox"))),
+            "annotated gamemode wrapper should add gamemode_sandbox super type, got {super_types:?}"
+        );
     }
 
     #[gtest]

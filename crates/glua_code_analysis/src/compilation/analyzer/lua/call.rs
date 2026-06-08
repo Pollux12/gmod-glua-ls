@@ -1356,6 +1356,8 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
             syntax_id: call_expr.get_syntax_id(),
             literal_args,
             args,
+            inheritance_roles: None,
+            network_var_roles: None,
             vgui_panel_roles: None,
             derma_skin_roles: None,
         },

@@ -47,6 +47,8 @@ concommand = concommand or {}
 vgui = vgui or {}
 derma = derma or {}
 
+Entity = Entity or {}
+
 ---@[call_arg("gmod.net_message", "define")]
 ---@param str string
 function util.AddNetworkString(str) end
@@ -92,6 +94,25 @@ function _G.CreateConVar(name, value, flags, helptext, min, max) end
 ---@param name string
 function _G.CreateClientConVar(name, default, shouldsave, userinfo, helptext, min, max) end
 
+---@[call_arg("gmod.class_base", "reference")]
+---@param value string
+function _G.DEFINE_BASECLASS(value) end
+
+---@[call_arg("gmod.gamemode", "reference")]
+---@param base string
+function _G.DeriveGamemode(base) end
+
+---@[call_arg("gmod.color", "r")]
+---@param r number
+---@[call_arg("gmod.color", "g")]
+---@param g number
+---@[call_arg("gmod.color", "b")]
+---@param b number
+---@[call_arg("gmod.color", "a")]
+---@param a? number
+---@return Color
+function _G.Color(r, g, b, a) end
+
 ---@[call_arg("gmod.timer", "define")]
 ---@param identifier string
 ---@[call_arg("gmod.timer", "callback")]
@@ -131,6 +152,22 @@ function derma.DefineSkin(name, description, skin) end
 ---@[call_arg("gmod.derma_skin", "reference")]
 ---@param name string
 function derma.GetSkinTable(name) end
+
+---@[call_arg("gmod.network_var", "type")]
+---@param type string
+---@param slot number
+---@[call_arg("gmod.network_var", "define")]
+---@param name string
+---@param extended? table
+function Entity:NetworkVar(type, slot, name, extended) end
+
+---@[call_arg("gmod.network_var", "type")]
+---@param type string
+---@param slot number
+---@param element number
+---@[call_arg("gmod.network_var", "define_element")]
+---@param name string
+function Entity:NetworkVarElement(type, slot, element, name) end
 "#;
 
 #[cfg(test)]

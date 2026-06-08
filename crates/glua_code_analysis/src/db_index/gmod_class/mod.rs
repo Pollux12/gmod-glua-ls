@@ -53,8 +53,21 @@ pub struct GmodScriptedClassCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub literal_args: Vec<Option<GmodClassCallLiteral>>,
     pub args: Vec<GmodClassCallArg>,
+    pub inheritance_roles: Option<GmodNamedStringCallRoles>,
+    pub network_var_roles: Option<GmodNetworkVarCallRoles>,
     pub vgui_panel_roles: Option<GmodVguiPanelCallRoles>,
     pub derma_skin_roles: Option<GmodDermaSkinCallRoles>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GmodNamedStringCallRoles {
+    pub name_arg_idx: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GmodNetworkVarCallRoles {
+    pub type_arg_idx: Option<usize>,
+    pub name_arg_idx: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +83,22 @@ pub struct GmodDermaSkinCallRoles {
 }
 
 impl GmodScriptedClassCallMetadata {
+    pub fn inheritance_name_arg_idx(&self) -> usize {
+        self.inheritance_roles
+            .map(|roles| roles.name_arg_idx)
+            .unwrap_or(0)
+    }
+
+    pub fn network_var_type_arg_idx(&self) -> Option<usize> {
+        self.network_var_roles
+            .and_then(|roles| roles.type_arg_idx)
+            .or(Some(0))
+    }
+
+    pub fn network_var_name_arg_idx(&self) -> Option<usize> {
+        self.network_var_roles.map(|roles| roles.name_arg_idx)
+    }
+
     pub fn vgui_panel_define_arg_idx(&self) -> usize {
         self.vgui_panel_roles
             .map(|roles| roles.define_arg_idx)
@@ -96,6 +125,12 @@ impl GmodScriptedClassCallMetadata {
 
     pub fn define_arg_range(&self, kind: GmodScriptedClassCallKind) -> rowan::TextRange {
         let arg_idx = match kind {
+            GmodScriptedClassCallKind::DefineBaseClass
+            | GmodScriptedClassCallKind::DeriveGamemode => self.inheritance_name_arg_idx(),
+            GmodScriptedClassCallKind::NetworkVar
+            | GmodScriptedClassCallKind::NetworkVarElement => {
+                self.network_var_name_arg_idx().unwrap_or(0)
+            }
             GmodScriptedClassCallKind::DermaDefineSkin => self.derma_skin_define_arg_idx(),
             _ => self.vgui_panel_define_arg_idx(),
         };
@@ -120,15 +155,14 @@ pub struct GmodScriptedClassFileMetadata {
 
 impl GmodScriptedClassFileMetadata {
     pub fn get_define_baseclass_name(&self) -> Option<&str> {
-        self.define_baseclass_calls
-            .iter()
-            .rev()
-            .find_map(|call| match call.literal_args.first() {
+        self.define_baseclass_calls.iter().rev().find_map(|call| {
+            match call.literal_args.get(call.inheritance_name_arg_idx()) {
                 Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
                     Some(name.as_str())
                 }
                 _ => None,
-            })
+            }
+        })
     }
 
     fn calls_by_kind_mut(
@@ -249,7 +283,10 @@ impl GmodClassMetadataIndex {
         file_id: FileId,
         call_metadata: &GmodScriptedClassCallMetadata,
     ) {
-        let Some(skin_name) = Self::extract_non_empty_string_arg(call_metadata, 0) else {
+        let Some(skin_name) = Self::extract_non_empty_string_arg(
+            call_metadata,
+            call_metadata.derma_skin_define_arg_idx(),
+        ) else {
             return;
         };
 
@@ -471,6 +508,8 @@ mod tests {
                     Some(GmodClassCallLiteral::String(base.to_string())),
                 ),
             ],
+            inheritance_roles: None,
+            network_var_roles: None,
             vgui_panel_roles: None,
             derma_skin_roles: None,
         }

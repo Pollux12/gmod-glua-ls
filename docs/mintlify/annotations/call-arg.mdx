@@ -1,0 +1,185 @@
+---
+title: "@call_arg"
+description: Mark string and callback parameters so GLuaLS can understand custom GMod wrappers.
+---
+
+## Overview
+
+`@call_arg` marks a function parameter that requires special handling. Use it when you write a wrapper around base gmod functions and still want GLuaLS to understand the names, callbacks, colors, panels, skins, or scripted-class metadata passed through that wrapper. This system was implemented to replace previously hardcoded handling of special base gmod functions / methods / classes to instead implement a more generic system that can be used for other advanced use cases.
+
+Most addons do not need this annotation. The official GMod annotations already apply it to built-in functions like `util.AddNetworkString`, `net.Start`, `hook.Add`, `vgui.Register`, and `derma.DefineSkin`.
+
+It is expected that you know what you are doing if you use this annotation.
+
+---
+
+## Syntax
+
+```lua
+---@[call_arg("domain", "role")]
+---@param paramName type
+```
+
+Put `@call_arg` directly above the `@param` it describes.
+
+```lua
+---@[call_arg("gmod.net_message", "start")]
+---@param messageName string
+---@param ply Player
+local function StartMessage(messageName, ply)
+    net.Start(messageName)
+    net.Send(ply)
+end
+```
+
+After this, `StartMessage("...")` gets the same net message lookup, completion, hover, and navigation as `net.Start("...")`. While the net system already does try to detect cases similar to the above code, this is more of an example of how it could be used to add detection for wrappers that aren't currently autodetected.
+
+---
+
+## Supported roles
+
+| Domain | Roles | Used for |
+|---|---|---|
+| `gmod.net_message` | `define`, `start`, `receive`, `callback`, `reference` | Net message definitions, sends, receives, callbacks, and name lookups |
+| `gmod.hook` | `add`, `emit`, `callback`, `gamemode_table`, `remove`, `reference` | Hook registration, hook calls, callback inference, and hook name lookup |
+| `gmod.concommand` | `define`, `callback` | Console command registration and callback tracking |
+| `gmod.convar` | `define`, `define_server`, `define_client` | Server and client ConVar registration |
+| `gmod.timer` | `define`, `callback`, `simple` | Timer creation and callback tracking |
+| `gmod.vgui_panel` | `define`, `define_control`, `table`, `base`, `reference` | VGUI panel registration, inheritance, and panel name lookup |
+| `gmod.derma_skin` | `define`, `reference` | Derma skin registration and skin name lookup |
+| `gmod.network_var` | `type`, `define`, `define_element` | Entity `NetworkVar` and `NetworkVarElement` accessor generation |
+| `gmod.class_base` | `reference` | `DEFINE_BASECLASS` inheritance metadata |
+| `gmod.gamemode` | `reference` | `DeriveGamemode` inheritance metadata |
+| `gmod.color` | `r`, `g`, `b`, `a` | Color previews for custom color constructors |
+
+Unknown domains and roles are stored as metadata but ignored by GMod-specific features until GLuaLS adds a consumer for them. This is intentional to prevent errors for outdated clients.
+
+---
+
+## Hooks with callbacks
+
+Use one role for the hook name and one role for the callback function:
+
+```lua
+---@[call_arg("gmod.hook", "add")]
+---@param eventName string
+---@param id any
+---@[call_arg("gmod.hook", "callback")]
+---@param callback fun(...)
+local function AddHook(eventName, id, callback)
+    hook.Add(eventName, id, callback)
+end
+```
+
+GLuaLS uses the hook name to infer callback parameters:
+
+```lua
+AddHook("PlayerSpawn", "my-addon", function(ply)
+    ply:SteamID() -- ply is Player
+end)
+```
+
+Use `emit` for functions that call hooks:
+
+```lua
+---@[call_arg("gmod.hook", "emit")]
+---@param eventName string
+local function RunHook(eventName, ...)
+    return hook.Run(eventName, ...)
+end
+```
+
+---
+
+## VGUI panels
+
+Use `define`, `table`, and `base` for a `vgui.Register` wrapper:
+
+```lua
+---@[call_arg("gmod.vgui_panel", "define")]
+---@param className string
+---@[call_arg("gmod.vgui_panel", "table")]
+---@param panel table
+---@[call_arg("gmod.vgui_panel", "base")]
+---@param baseName string
+local function RegisterPanel(className, panel, baseName)
+    vgui.Register(className, panel, baseName)
+end
+```
+
+Use `define_control` instead of `define` for `derma.DefineControl` wrappers. Use `reference` for functions that create or look up panels by name.
+
+---
+
+## Derma skins
+
+Use `gmod.derma_skin` when wrapping Derma skin functions:
+
+```lua
+---@[call_arg("gmod.derma_skin", "define")]
+---@param name string
+---@param description string
+---@param skin table
+local function DefineSkin(name, description, skin)
+    derma.DefineSkin(name, description, skin)
+end
+
+---@[call_arg("gmod.derma_skin", "reference")]
+---@param name string
+local function UseSkin(name)
+    return derma.GetSkinTable(name)
+end
+```
+
+GLuaLS can then find references between `DefineSkin("MySkin", ...)` and `UseSkin("MySkin")`.
+
+---
+
+## Scripted classes
+
+Use `gmod.network_var` when wrapping entity NetworkVar helpers:
+
+```lua
+---@[call_arg("gmod.network_var", "define")]
+---@param name string
+---@[call_arg("gmod.network_var", "type")]
+---@param typeName string
+local function AddVar(name, typeName)
+    ENT:NetworkVar(typeName, 0, name)
+end
+```
+
+Use `define_element` for wrappers around `NetworkVarElement`, because element accessors always return numbers.
+
+For gamemode inheritance wrappers, mark the base-name parameter:
+
+```lua
+---@[call_arg("gmod.gamemode", "reference")]
+---@param base string
+local function Derive(base)
+    DeriveGamemode(base)
+end
+```
+
+Use `gmod.class_base` `reference` for wrappers around `DEFINE_BASECLASS`.
+
+---
+
+## Priority
+
+An optional third argument breaks ties when one parameter can inherit multiple roles:
+
+```lua
+---@[call_arg("gmod.hook", "emit", 10)]
+---@param name string
+```
+
+Higher priority wins. You normally do not need this unless you are annotating a function with overloads or a generic wrapper that can behave like several GMod APIs.
+
+---
+
+## See also
+
+- [Network analysis](/language/network-analysis): net message tracking
+- [Hook intelligence](/language/hook-intelligence): hook completion and callback inference
+- [VGUI support](/language/vgui-support): panels and Derma skins

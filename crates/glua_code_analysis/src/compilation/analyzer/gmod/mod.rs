@@ -15,10 +15,11 @@ use glua_parser::{
 
 use crate::{
     EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodDermaSkinCallRoles,
-    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata,
-    GmodVguiPanelCallRoles, InFiled, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclLocation,
-    LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
-    LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
+    GmodNamedStringCallRoles, GmodNetworkVarCallRoles, GmodScriptedClassCallKind,
+    GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, GmodVguiPanelCallRoles, InFiled,
+    LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaMember,
+    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeCache,
+    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -42,7 +43,7 @@ struct GmodKeywords {
     has_net: bool,
     /// timer/concommand/ConVar/AddNetworkString — system call metadata
     has_system_call: bool,
-    /// Annotated VGUI/Derma class registration wrappers
+    /// Annotated scripted-class wrappers (VGUI, Derma, NetworkVar, inheritance)
     has_scripted_class_call: bool,
     /// "GM:" or "GAMEMODE:" — GM/GAMEMODE method sites
     has_gm_func: bool,
@@ -91,8 +92,11 @@ fn scan_gmod_keywords(
         || content.contains("gmod.concommand")
         || content.contains("gmod.convar")
         || content.contains("gmod.timer");
-    let has_scripted_class_annotation =
-        content.contains("gmod.vgui_panel") || content.contains("gmod.derma_skin");
+    let has_scripted_class_annotation = content.contains("gmod.vgui_panel")
+        || content.contains("gmod.derma_skin")
+        || content.contains("gmod.network_var")
+        || content.contains("gmod.class_base")
+        || content.contains("gmod.gamemode");
     let annotated_candidates = annotated_global_call_roles.candidate_call_paths_in_content(content);
     GmodKeywords {
         has_hook: content.contains("hook") || has_hook_annotation || annotated_candidates.has_hook,
@@ -3020,7 +3024,7 @@ fn resolve_effective_inheritance_call(
 
 fn valid_inheritance_literal(call: &GmodScriptedClassCallMetadata) -> bool {
     matches!(
-        call.literal_args.first(),
+        call.literal_args.get(call.inheritance_name_arg_idx()),
         Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty()
     )
 }
@@ -3030,7 +3034,7 @@ fn resolve_effective_inheritance_base(
     class_name_prefix: Option<&str>,
 ) -> Option<(String, bool)> {
     let call = resolve_effective_inheritance_call(metadata)?;
-    let base_name = match call.literal_args.first() {
+    let base_name = match call.literal_args.get(call.inheritance_name_arg_idx()) {
         Some(Some(GmodClassCallLiteral::String(name))) => name.as_str(),
         _ => return None,
     };
@@ -3083,7 +3087,7 @@ fn synthesize_define_baseclass_parent_alias(
         _ => return,
     };
 
-    let base_name = match call.literal_args.first() {
+    let base_name = match call.literal_args.get(call.inheritance_name_arg_idx()) {
         Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name.as_str(),
         _ => return,
     };
@@ -3251,22 +3255,33 @@ fn synthesize_network_var(
     // args[1] = slot (integer) OR name (string, if 2-arg form)
     // args[2] = name (string, if 3-arg form)
 
-    let type_name = match call.literal_args.first() {
+    let type_arg_idx = call.network_var_type_arg_idx().unwrap_or(0);
+    let type_name = match call.literal_args.get(type_arg_idx) {
         Some(Some(GmodClassCallLiteral::String(name))) => name.clone(),
         _ => return,
     };
 
-    // Try index 2 first (3-arg form), then index 1 (2-arg form)
-    let (prop_name, prop_name_arg_idx) = match call.literal_args.get(2) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-            (name.clone(), 2usize)
-        }
-        _ => match call.literal_args.get(1) {
+    let (prop_name, prop_name_arg_idx) = if let Some(name_arg_idx) = call.network_var_name_arg_idx()
+    {
+        match call.literal_args.get(name_arg_idx) {
             Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-                (name.clone(), 1usize)
+                (name.clone(), name_arg_idx)
             }
             _ => return,
-        },
+        }
+    } else {
+        // Try index 2 first (3-arg form), then index 1 (2-arg form)
+        match call.literal_args.get(2) {
+            Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                (name.clone(), 2usize)
+            }
+            _ => match call.literal_args.get(1) {
+                Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                    (name.clone(), 1usize)
+                }
+                _ => return,
+            },
+        }
     };
 
     let value_type = resolve_networkvar_type(&type_name);
@@ -3330,27 +3345,42 @@ fn synthesize_network_var_element(
     // args[2] = element or name
     // args[3] = name (if 4-arg form)
 
-    // Type name must be present (first arg is always the type)
-    if call.literal_args.first().and_then(|a| a.as_ref()).is_none() {
+    let type_arg_idx = call.network_var_type_arg_idx().unwrap_or(0);
+    if call
+        .literal_args
+        .get(type_arg_idx)
+        .and_then(|a| a.as_ref())
+        .is_none()
+    {
         return;
     }
 
-    // Find the property name: try index 3, then 2, then 1
-    let (prop_name, prop_name_arg_idx) = match call.literal_args.get(3) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-            (name.clone(), 3usize)
-        }
-        _ => match call.literal_args.get(2) {
+    let (prop_name, prop_name_arg_idx) = if let Some(name_arg_idx) = call.network_var_name_arg_idx()
+    {
+        match call.literal_args.get(name_arg_idx) {
             Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-                (name.clone(), 2usize)
+                (name.clone(), name_arg_idx)
             }
-            _ => match call.literal_args.get(1) {
+            _ => return,
+        }
+    } else {
+        // Find the property name: try index 3, then 2, then 1
+        match call.literal_args.get(3) {
+            Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                (name.clone(), 3usize)
+            }
+            _ => match call.literal_args.get(2) {
                 Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-                    (name.clone(), 1usize)
+                    (name.clone(), 2usize)
                 }
-                _ => return,
+                _ => match call.literal_args.get(1) {
+                    Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                        (name.clone(), 1usize)
+                    }
+                    _ => return,
+                },
             },
-        },
+        }
     };
 
     // NetworkVarElement always produces number accessors
@@ -4110,6 +4140,10 @@ struct AnnotatedGmodCallRoles {
     system_callback_roles: Vec<(GmodSystemCallKind, usize, i64)>,
     hook_roles: Vec<(GmodHookKind, usize, i64)>,
     hook_callback_roles: Vec<(usize, i64)>,
+    inheritance_roles: Vec<(GmodScriptedClassCallKind, usize, i64)>,
+    network_var_kind: Option<GmodScriptedClassCallKind>,
+    network_var_type_roles: Vec<(usize, i64)>,
+    network_var_define_roles: Vec<(usize, i64)>,
     vgui_panel_kind: Option<GmodScriptedClassCallKind>,
     vgui_panel_define_roles: Vec<(usize, i64)>,
     vgui_panel_table_roles: Vec<(usize, i64)>,
@@ -4158,9 +4192,54 @@ impl AnnotatedGmodCallRoles {
                 )
             }),
             has_hook: !self.hook_roles.is_empty() || !self.hook_callback_roles.is_empty(),
-            has_scripted_class: !self.vgui_panel_define_roles.is_empty()
+            has_scripted_class: !self.inheritance_roles.is_empty()
+                || !self.network_var_define_roles.is_empty()
+                || !self.vgui_panel_define_roles.is_empty()
                 || !self.derma_skin_define_roles.is_empty(),
         }
+    }
+
+    fn inheritance_call(
+        &self,
+        is_colon_call: bool,
+    ) -> Option<(GmodScriptedClassCallKind, GmodNamedStringCallRoles)> {
+        let (kind, param_idx, _) = *self.inheritance_roles.first()?;
+        Some((
+            kind,
+            GmodNamedStringCallRoles {
+                name_arg_idx: param_idx_to_call_arg_idx(
+                    param_idx,
+                    is_colon_call,
+                    self.is_colon_define,
+                )?,
+            },
+        ))
+    }
+
+    fn network_var_call(
+        &self,
+        is_colon_call: bool,
+    ) -> Option<(GmodScriptedClassCallKind, GmodNetworkVarCallRoles)> {
+        let (define_param_idx, _) = *self.network_var_define_roles.first()?;
+        let kind = self
+            .network_var_kind
+            .unwrap_or(GmodScriptedClassCallKind::NetworkVar);
+        Some((
+            kind,
+            GmodNetworkVarCallRoles {
+                type_arg_idx: self
+                    .network_var_type_roles
+                    .first()
+                    .and_then(|(param_idx, _)| {
+                        param_idx_to_call_arg_idx(*param_idx, is_colon_call, self.is_colon_define)
+                    }),
+                name_arg_idx: param_idx_to_call_arg_idx(
+                    define_param_idx,
+                    is_colon_call,
+                    self.is_colon_define,
+                )?,
+            },
+        ))
     }
 
     fn vgui_panel_call(
@@ -4470,6 +4549,28 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             .and_then(|roles| roles.vgui_panel_call(call_expr.is_colon_call()))
     }
 
+    fn inheritance_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(GmodScriptedClassCallKind, GmodNamedStringCallRoles)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.inheritance_call(call_expr.is_colon_call()))
+    }
+
+    fn network_var_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(GmodScriptedClassCallKind, GmodNetworkVarCallRoles)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.network_var_call(call_expr.is_colon_call()))
+    }
+
     fn derma_skin_call(
         &self,
         db: &DbIndex,
@@ -4599,6 +4700,33 @@ fn roles_from_signature(
                     .push((GmodHookKind::Emit, role.param_idx, priority))
             }
             ("gmod.hook", "callback") => roles.hook_callback_roles.push((role.param_idx, priority)),
+            ("gmod.class_base", "reference") => roles.inheritance_roles.push((
+                GmodScriptedClassCallKind::DefineBaseClass,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.gamemode", "reference") => roles.inheritance_roles.push((
+                GmodScriptedClassCallKind::DeriveGamemode,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.network_var", "type") => roles
+                .network_var_type_roles
+                .push((role.param_idx, priority)),
+            ("gmod.network_var", "define") => {
+                roles.network_var_kind = roles
+                    .network_var_kind
+                    .or(Some(GmodScriptedClassCallKind::NetworkVar));
+                roles
+                    .network_var_define_roles
+                    .push((role.param_idx, priority));
+            }
+            ("gmod.network_var", "define_element") => {
+                roles.network_var_kind = Some(GmodScriptedClassCallKind::NetworkVarElement);
+                roles
+                    .network_var_define_roles
+                    .push((role.param_idx, priority));
+            }
             ("gmod.vgui_panel", "define") => {
                 roles.vgui_panel_kind = roles
                     .vgui_panel_kind
@@ -4638,6 +4766,15 @@ fn roles_from_signature(
         .hook_callback_roles
         .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
     roles
+        .inheritance_roles
+        .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+    roles
+        .network_var_type_roles
+        .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+    roles
+        .network_var_define_roles
+        .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+    roles
         .vgui_panel_define_roles
         .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
     roles
@@ -4653,6 +4790,9 @@ fn roles_from_signature(
     (!roles.system_roles.is_empty()
         || !roles.system_callback_roles.is_empty()
         || !roles.hook_roles.is_empty()
+        || !roles.hook_callback_roles.is_empty()
+        || !roles.inheritance_roles.is_empty()
+        || !roles.network_var_define_roles.is_empty()
         || !roles.vgui_panel_define_roles.is_empty()
         || !roles.derma_skin_define_roles.is_empty())
     .then_some(roles)
@@ -5029,6 +5169,46 @@ fn collect_annotated_scripted_class_call_metadata(
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
 
+    if let Some((kind, inheritance_roles)) =
+        annotated_roles.inheritance_call(db, file_id, &call_expr, &call_path)
+    {
+        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        db.get_gmod_class_metadata_index_mut().add_call(
+            file_id,
+            kind,
+            GmodScriptedClassCallMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                literal_args,
+                args,
+                inheritance_roles: Some(inheritance_roles),
+                network_var_roles: None,
+                vgui_panel_roles: None,
+                derma_skin_roles: None,
+            },
+        );
+        return Some(());
+    }
+
+    if let Some((kind, network_var_roles)) =
+        annotated_roles.network_var_call(db, file_id, &call_expr, &call_path)
+    {
+        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        db.get_gmod_class_metadata_index_mut().add_call(
+            file_id,
+            kind,
+            GmodScriptedClassCallMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                literal_args,
+                args,
+                inheritance_roles: None,
+                network_var_roles: Some(network_var_roles),
+                vgui_panel_roles: None,
+                derma_skin_roles: None,
+            },
+        );
+        return Some(());
+    }
+
     if let Some((kind, vgui_panel_roles)) =
         annotated_roles.vgui_panel_call(db, file_id, &call_expr, &call_path)
     {
@@ -5040,6 +5220,8 @@ fn collect_annotated_scripted_class_call_metadata(
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
+                inheritance_roles: None,
+                network_var_roles: None,
                 vgui_panel_roles: Some(vgui_panel_roles),
                 derma_skin_roles: None,
             },
@@ -5058,6 +5240,8 @@ fn collect_annotated_scripted_class_call_metadata(
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
+                inheritance_roles: None,
+                network_var_roles: None,
                 vgui_panel_roles: None,
                 derma_skin_roles: Some(derma_skin_roles),
             },
