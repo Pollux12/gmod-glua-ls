@@ -1,17 +1,16 @@
 use std::{cmp::Reverse, collections::HashMap};
 
+use crate::handlers::gmod_string_context::is_net_message_string_context;
 use glua_code_analysis::{
     EmmyLuaAnalysis, FileId, NetFlowKind, NetOpEntry, NetOpKind, NetReceiveFlow, NetSendFlow,
     SemanticModel,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken,
-    LuaSyntaxToken, PathTrait,
+    LuaSyntaxToken,
 };
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
 use rowan::TextRange;
-
-const NET_TRIGGER_CALL_PATHS: &[&str] = &["net.Start", "net.Receive", "util.AddNetworkString"];
 
 pub fn hover_gmod_net_message_string(
     analysis: &EmmyLuaAnalysis,
@@ -30,7 +29,7 @@ pub fn hover_gmod_net_message_string(
         .get_parent::<LuaCallArgList>()?
         .get_parent::<LuaCallExpr>()?;
 
-    if !is_net_message_name_context(&call_expr, &literal_expr) {
+    if !is_net_message_name_context(semantic_model, &call_expr, &literal_expr) {
         return None;
     }
 
@@ -57,20 +56,22 @@ pub fn hover_gmod_net_message_string(
     })
 }
 
-fn is_net_message_name_context(call_expr: &LuaCallExpr, literal_expr: &LuaLiteralExpr) -> bool {
-    let Some(call_path) = call_expr.get_access_path() else {
-        return false;
-    };
-    if !NET_TRIGGER_CALL_PATHS.iter().any(|p| *p == call_path) {
-        return false;
-    }
+fn is_net_message_name_context(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    literal_expr: &LuaLiteralExpr,
+) -> bool {
     let Some(args_list) = call_expr.get_args_list() else {
         return false;
     };
     let arg_idx = args_list
         .get_args()
         .position(|arg| arg.get_position() == literal_expr.get_position());
-    arg_idx == Some(0)
+    let Some(arg_idx) = arg_idx else {
+        return false;
+    };
+
+    is_net_message_string_context(semantic_model, call_expr, arg_idx)
 }
 
 fn render_net_message_hover(

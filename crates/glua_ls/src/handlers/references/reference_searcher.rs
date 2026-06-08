@@ -4,19 +4,20 @@ use std::{
 };
 
 use glua_code_analysis::{
-    DeclReferenceCell, FileId, LuaCompilation, LuaDeclId, LuaMemberId, LuaMemberKey,
-    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
+    DeclReferenceCell, FileId, GmodScriptedClassCallKind, LuaCompilation, LuaDeclId, LuaMemberId,
+    LuaMemberKey, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
 };
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaLiteralToken,
-    LuaNameToken, LuaStringToken, LuaSyntaxNode, LuaSyntaxToken, LuaTableField, PathTrait,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaExpr,
+    LuaLiteralExpr, LuaLiteralToken, LuaNameToken, LuaStringToken, LuaSyntaxNode, LuaSyntaxToken,
+    LuaTableField,
 };
 use lsp_types::Location;
 use tokio_util::sync::CancellationToken;
 
 use crate::handlers::gmod_string_context::{
-    extract_string_call_context, is_vgui_panel_string_context, net_message_call_kind,
-    normalize_string_name,
+    extract_string_call_context, is_annotated_derma_skin_string_context,
+    is_annotated_vgui_panel_string_context, is_net_message_string_context, normalize_string_name,
 };
 use crate::handlers::hover::find_member_origin_owner;
 
@@ -75,6 +76,18 @@ pub fn search_references(
     } else if let Some(string_token) = LuaStringToken::cast(token.clone()) {
         if semantic_model.get_emmyrc().gmod.enabled {
             if search_vgui_panel_string_references(
+                semantic_model,
+                compilation,
+                string_token.clone(),
+                &mut result,
+                cancel_token,
+            )
+            .is_some()
+            {
+                return Some(result);
+            }
+
+            if search_derma_skin_string_references(
                 semantic_model,
                 compilation,
                 string_token.clone(),
@@ -484,7 +497,14 @@ fn search_vgui_panel_string_references(
     cancel_token: &CancellationToken,
 ) -> Option<()> {
     let context = extract_string_call_context(&token)?;
-    if !is_vgui_panel_string_context(&context.call_path, context.arg_index) {
+    let annotated_context = token
+        .get_parent::<LuaLiteralExpr>()
+        .and_then(|literal| literal.get_parent::<LuaCallArgList>())
+        .and_then(|args| args.get_parent::<LuaCallExpr>())
+        .is_some_and(|call_expr| {
+            is_annotated_vgui_panel_string_context(semantic_model, &call_expr, context.arg_index)
+        });
+    if !annotated_context {
         return None;
     }
 
@@ -493,11 +513,7 @@ fn search_vgui_panel_string_references(
         .get_gmod_class_metadata_index()
         .find_vgui_panel_definitions(&context.name)
     {
-        let definition_range = call
-            .args
-            .first()
-            .map(|arg| arg.syntax_id.get_range())
-            .unwrap_or(call.syntax_id.get_range());
+        let definition_range = call.define_arg_range(GmodScriptedClassCallKind::VguiRegister);
         let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
             continue;
         };
@@ -536,9 +552,18 @@ fn search_vgui_panel_string_references(
         let Some(reference_context) = extract_string_call_context(&reference_string_token) else {
             continue;
         };
-        if !is_vgui_panel_string_context(&reference_context.call_path, reference_context.arg_index)
-            || reference_context.name != context.name
-        {
+        let annotated_reference_context = reference_string_token
+            .get_parent::<LuaLiteralExpr>()
+            .and_then(|literal| literal.get_parent::<LuaCallArgList>())
+            .and_then(|args| args.get_parent::<LuaCallExpr>())
+            .is_some_and(|call_expr| {
+                is_annotated_vgui_panel_string_context(
+                    reference_semantic_model.as_ref(),
+                    &call_expr,
+                    reference_context.arg_index,
+                )
+            });
+        if !annotated_reference_context || reference_context.name != context.name {
             continue;
         }
 
@@ -585,13 +610,9 @@ fn collect_vgui_context_string_references_from_ast(
 
         let root = semantic_model.get_root();
         for call_expr in root.descendants::<LuaCallExpr>() {
-            let Some(call_path) = call_expr.get_access_path() else {
-                continue;
-            };
             let Some(args_list) = call_expr.get_args_list() else {
                 continue;
             };
-
             for (arg_index, arg) in args_list.get_args().enumerate() {
                 let LuaExpr::LiteralExpr(literal_expr) = arg else {
                     continue;
@@ -603,7 +624,168 @@ fn collect_vgui_context_string_references_from_ast(
                     continue;
                 };
 
-                if name != panel_name || !is_vgui_panel_string_context(&call_path, arg_index) {
+                let annotated_context =
+                    is_annotated_vgui_panel_string_context(&semantic_model, &call_expr, arg_index);
+                if name != panel_name || !annotated_context {
+                    continue;
+                }
+
+                let Some(location) = semantic_model
+                    .get_document()
+                    .to_lsp_location(string_token.get_range())
+                else {
+                    continue;
+                };
+                push_unique_location(result, location);
+            }
+        }
+    }
+}
+
+fn search_derma_skin_string_references(
+    semantic_model: &SemanticModel,
+    compilation: &LuaCompilation,
+    token: LuaStringToken,
+    result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
+) -> Option<()> {
+    let context = extract_string_call_context(&token)?;
+    let annotated_context = token
+        .get_parent::<LuaLiteralExpr>()
+        .and_then(|literal| literal.get_parent::<LuaCallArgList>())
+        .and_then(|args| args.get_parent::<LuaCallExpr>())
+        .is_some_and(|call_expr| {
+            is_annotated_derma_skin_string_context(semantic_model, &call_expr, context.arg_index)
+        });
+    if !annotated_context {
+        return None;
+    }
+    if let Some(location) = semantic_model
+        .get_document()
+        .to_lsp_location(token.get_range())
+    {
+        push_unique_location(result, location);
+    }
+
+    for (file_id, call) in semantic_model
+        .get_db()
+        .get_gmod_class_metadata_index()
+        .find_derma_skin_definitions(&context.name)
+    {
+        let definition_range = call.define_arg_range(GmodScriptedClassCallKind::DermaDefineSkin);
+        let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
+            continue;
+        };
+        let Some(location) = document.to_lsp_location(definition_range) else {
+            continue;
+        };
+        push_unique_location(result, location);
+    }
+
+    let string_refs = semantic_model
+        .get_db()
+        .get_reference_index()
+        .get_string_references(&context.name);
+    let before_usage_refs = result.len();
+    let mut semantic_cache = HashMap::new();
+    for in_filed_reference_range in string_refs {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
+
+        let Some(reference_semantic_model) = get_semantic_model_cached(
+            compilation,
+            &mut semantic_cache,
+            in_filed_reference_range.file_id,
+        ) else {
+            continue;
+        };
+
+        let root = reference_semantic_model.get_root();
+        let Some(reference_token) = root
+            .syntax()
+            .token_at_offset(in_filed_reference_range.value.start())
+            .right_biased()
+        else {
+            continue;
+        };
+        let Some(reference_string_token) = LuaStringToken::cast(reference_token) else {
+            continue;
+        };
+        let Some(reference_context) = extract_string_call_context(&reference_string_token) else {
+            continue;
+        };
+        let annotated_reference_context = reference_string_token
+            .get_parent::<LuaLiteralExpr>()
+            .and_then(|literal| literal.get_parent::<LuaCallArgList>())
+            .and_then(|args| args.get_parent::<LuaCallExpr>())
+            .is_some_and(|call_expr| {
+                is_annotated_derma_skin_string_context(
+                    reference_semantic_model.as_ref(),
+                    &call_expr,
+                    reference_context.arg_index,
+                )
+            });
+        if !annotated_reference_context || reference_context.name != context.name {
+            continue;
+        }
+
+        let document = reference_semantic_model.get_document();
+        let Some(location) = document.to_lsp_location(in_filed_reference_range.value) else {
+            continue;
+        };
+        push_unique_location(result, location);
+    }
+
+    if result.len() == before_usage_refs {
+        collect_derma_skin_context_string_references_from_ast(
+            compilation,
+            &context.name,
+            result,
+            cancel_token,
+        );
+    }
+
+    Some(())
+}
+
+fn collect_derma_skin_context_string_references_from_ast(
+    compilation: &LuaCompilation,
+    skin_name: &str,
+    result: &mut Vec<Location>,
+    cancel_token: &CancellationToken,
+) {
+    let mut semantic_cache = HashMap::new();
+    let file_ids = compilation.get_db().get_vfs().get_all_file_ids();
+    for file_id in file_ids {
+        if cancel_token.is_cancelled() {
+            return;
+        }
+        let Some(semantic_model) =
+            get_semantic_model_cached(compilation, &mut semantic_cache, file_id)
+        else {
+            continue;
+        };
+
+        let root = semantic_model.get_root();
+        for call_expr in root.descendants::<LuaCallExpr>() {
+            let Some(args_list) = call_expr.get_args_list() else {
+                continue;
+            };
+            for (arg_index, arg) in args_list.get_args().enumerate() {
+                let LuaExpr::LiteralExpr(literal_expr) = arg else {
+                    continue;
+                };
+                let Some(LuaLiteralToken::String(string_token)) = literal_expr.get_literal() else {
+                    continue;
+                };
+                let Some(name) = normalize_string_name(string_token.get_value()) else {
+                    continue;
+                };
+
+                let annotated_context =
+                    is_annotated_derma_skin_string_context(&semantic_model, &call_expr, arg_index);
+                if name != skin_name || !annotated_context {
                     continue;
                 }
 
@@ -625,11 +807,42 @@ fn search_net_message_references(
     result: &mut Vec<Location>,
 ) -> Option<()> {
     let context = extract_string_call_context(&token)?;
-    let _ = net_message_call_kind(&context.call_path, context.arg_index)?;
-
+    let call_expr = token
+        .get_parent::<LuaLiteralExpr>()
+        .and_then(|literal| literal.get_parent::<LuaCallArgList>())
+        .and_then(|args| args.get_parent::<LuaCallExpr>())?;
+    if !is_net_message_string_context(semantic_model, &call_expr, context.arg_index) {
+        return None;
+    }
     let network_index = semantic_model.get_db().get_gmod_network_index();
+    let send_flows = network_index.get_send_flows_for_message(&context.name);
+    let receive_flows = network_index.get_receive_flows_for_message(&context.name);
+    let file_id = semantic_model.get_file_id();
+    let call_range = call_expr.get_range();
+    let indexed_flow_context = send_flows
+        .iter()
+        .any(|(flow_file_id, flow)| *flow_file_id == file_id && flow.start_range == call_range)
+        || receive_flows.iter().any(|(flow_file_id, flow)| {
+            *flow_file_id == file_id && flow.receive_range == call_range
+        });
+    let annotated_literal_context = !indexed_flow_context
+        && crate::handlers::gmod_string_context::find_string_call_arg_role(
+            semantic_model,
+            &call_expr,
+            context.arg_index,
+            "gmod.net_message",
+            &["define", "start", "receive", "reference"],
+        )
+        .is_some();
+    if annotated_literal_context
+        && let Some(location) = semantic_model
+            .get_document()
+            .to_lsp_location(token.get_range())
+    {
+        push_unique_location(result, location);
+    }
 
-    for (file_id, flow) in network_index.get_send_flows_for_message(&context.name) {
+    for (file_id, flow) in send_flows {
         let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
             continue;
         };
@@ -639,7 +852,7 @@ fn search_net_message_references(
         push_unique_location(result, location);
     }
 
-    for (file_id, flow) in network_index.get_receive_flows_for_message(&context.name) {
+    for (file_id, flow) in receive_flows {
         let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
             continue;
         };

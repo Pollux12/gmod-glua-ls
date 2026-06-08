@@ -1136,6 +1136,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "library/lua/includes/extensions/sandbox_hooks.lua",
@@ -1219,6 +1220,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "library/lua/includes/extensions/sandbox_hooks.lua",
@@ -1267,11 +1269,57 @@ local EscapeStringMap: {
     }
 
     #[gtest]
+    fn test_hover_hook_name_does_not_match_lookalike_builtin_path() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "library/lua/includes/extensions/gm_hooks.lua",
+            r#"
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                function GM:PlayerSpawn(ply) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                mylib = { hook = {} }
+                function mylib.hook.Run(name) end
+
+                mylib.hook.Run("PlayerSpa<??>wn")
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+
+        if let Some(hover) = crate::handlers::hover::hover(&ws.analysis, file_id, position, None) {
+            let HoverContents::Markup(markup) = hover.contents else {
+                return fail!("expected HoverContents::Markup");
+            };
+            assert!(
+                !markup.value.contains("GM:PlayerSpawn")
+                    && !markup.value.contains("(method) PlayerSpawn")
+                    && !markup.value.contains("(method) GM"),
+                "lookalike mylib.hook.Run should not use builtin hook hover without call_arg annotation, got: {}",
+                markup.value
+            );
+        }
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_hook_add_callback_parameter_usage_shows_inferred_type() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -1288,12 +1336,6 @@ local EscapeStringMap: {
                 ---@param value any
                 ---@return boolean
                 function GM:AcceptInput(ent, input, activator, caller, value) end
-
-                hook = {}
-                ---@param eventName string
-                ---@param identifier any
-                ---@param func function
-                function hook.Add(eventName, identifier, func) end
 
                 hook.Add("AcceptInput", "test", function(ent, input, activator, caller, value)
                     print(in<??>put)
@@ -1379,6 +1421,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -1489,6 +1532,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -1543,6 +1587,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -1593,6 +1638,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -2613,6 +2659,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -2628,12 +2675,6 @@ local EscapeStringMap: {
                 ---@param veh Vehicle
                 ---@return boolean
                 function GM:CanPlayerEnterVehicle(ply, veh) end
-
-                hook = {}
-                ---@param eventName string
-                ---@param identifier any
-                ---@param func function
-                function hook.Add(eventName, identifier, func) end
 
                 hook.Add("CanPlayerEnterVehicle", "test", fu<??>nction(ply, veh) end)
             "#,
@@ -2698,6 +2739,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -2710,12 +2752,6 @@ local EscapeStringMap: {
                 ---@param ply Player
                 ---@return boolean
                 function GM:PlayerConnect(ply) end
-
-                hook = {}
-                ---@param eventName string
-                ---@param identifier any
-                ---@param func function
-                function hook.Add(eventName, identifier, func) end
 
                 hook.Add("PlayerConnect", "test", fu<??>nction(ply) end)
             "#,
@@ -2745,6 +2781,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -2755,12 +2792,6 @@ local EscapeStringMap: {
                 ---@param ply Player
                 ---@return boolean
                 function GM:SomeHook(ply) end
-
-                hook = {}
-                ---@param eventName string
-                ---@param identifier any
-                ---@param func function
-                function hook.Add(eventName, identifier, func) end
 
                 hook.Add("SomeHo<??>ok", "test", function(ply) end)
             "#,
@@ -2777,6 +2808,83 @@ local EscapeStringMap: {
         assert!(
             markup.value.contains("SomeHook"),
             "hook-name hover should still show hook function signature, got: {}",
+            markup.value
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_hook_name_from_annotated_call_arg_role() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@param ply Player
+                ---@return boolean
+                function GM:SomeHook(ply) end
+
+                ---@[call_arg("gmod.hook", "emit")]
+                ---@param eventName string
+                local function emit_hook(eventName) end
+
+                emit_hook("SomeHo<??>ok")
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("SomeHook"),
+            "annotated hook-name hover should show hook function signature, got: {value}"
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_hook_callback_from_annotated_call_arg_role() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class Player
+
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                ---@param ply Player
+                ---@return boolean
+                function GM:PlayerSpawn(ply) end
+
+                ---@[call_arg("gmod.hook", "add")]
+                ---@param eventName string
+                ---@[call_arg("gmod.hook", "callback")]
+                ---@param callback function
+                local function add_hook(eventName, callback, identifier) end
+
+                add_hook("PlayerSpawn", fu<??>nction(ply) end, "test")
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected annotated hook callback hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert!(
+            markup.value.contains("function(ply: Player) -> boolean"),
+            "annotated hook callback hover should show hook callback signature, got: {}",
             markup.value
         );
 
@@ -2801,12 +2909,6 @@ local EscapeStringMap: {
                 ---@param ply Player
                 ---@return boolean
                 function GM:SomeHook(ply) end
-
-                hook = {}
-                ---@param eventName string
-                ---@param identifier any
-                ---@param func function
-                function hook.Add(eventName, identifier, func) end
 
                 hook.Add("SomeHook", "test", fu<??>nction(ply) end)
             "#,
@@ -2847,6 +2949,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -2883,12 +2986,10 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
-                hook = {}
-                function hook.Add(eventName, identifier, func) end
-
                 -- "NonExistentHook" is not defined on GM/GAMEMODE, so no hook doc is available.
                 hook.Add("NonExistentHook", "test", fu<??>nction(ply) end)
             "#,
@@ -2925,6 +3026,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -2934,12 +3036,6 @@ local EscapeStringMap: {
 
                 ---@return boolean
                 function GM:ReturnOnlyHook() end
-
-                hook = {}
-                ---@param eventName string
-                ---@param identifier any
-                ---@param func function
-                function hook.Add(eventName, identifier, func) end
 
                 hook.Add("ReturnOnlyHook", "test", fu<??>nction() end)
             "#,
@@ -2972,6 +3068,7 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws
     }
 
@@ -3220,6 +3317,81 @@ local EscapeStringMap: {
         );
         assert!(value.contains("**Senders**"), "got: {value}");
         assert!(value.contains("net.WriteFloat"), "got: {value}");
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_from_annotated_call_arg_role() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/client/recv.lua",
+            r#"
+                net.Receive("WrappedMessage", function()
+                    net.ReadString()
+                end)
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.net_message", "reference")]
+                ---@param name string
+                local function describe_message(name) end
+
+                util.AddNetworkString("WrappedMessage")
+                describe_message("WrappedMes<??>sage")
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/server/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert!(
+            value.contains("(net) \"WrappedMessage\""),
+            "expected annotated net hover header, got: {value}"
+        );
+        assert!(value.contains("**Receivers**"), "got: {value}");
+        assert!(value.contains("net.ReadString"), "got: {value}");
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_net_message_does_not_match_lookalike_builtin_path() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+                util.AddNetworkString("Lookalike")
+                net.Start("Lookalike")
+                net.Send(Entity(1))
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                mylib = { net = {} }
+                function mylib.net.Start(name) end
+
+                mylib.net.Start("Looka<??>like")
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/client/init.lua", &content);
+
+        if let Some(hover) = crate::handlers::hover::hover(&ws.analysis, file_id, position, None) {
+            let HoverContents::Markup(markup) = hover.contents else {
+                return fail!("expected HoverContents::Markup");
+            };
+            assert!(
+                !markup.value.contains("(net) \"Lookalike\""),
+                "lookalike mylib.net.Start should not use builtin net hover without call_arg annotation, got: {}",
+                markup.value
+            );
+        }
+
         Ok(())
     }
 

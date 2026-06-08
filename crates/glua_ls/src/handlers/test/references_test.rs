@@ -307,13 +307,20 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
 
         check!(ws.check_references(
             r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.vgui_panel", "reference")]
+                ---@param name string
+                local function addPanel(name) end
+
                 local parent = vgui.Create("MyPa<??>nel")
 
 
-                parent:Add("MyPanel")
+                addPanel("MyPanel")
             "#,
             vec![
                 (
@@ -328,11 +335,11 @@ mod tests {
             vec![
                 VirtualLocation {
                     file: "virtual_0.lua".to_string(),
-                    line: 1,
+                    line: 7,
                 },
                 VirtualLocation {
                     file: "virtual_0.lua".to_string(),
-                    line: 4,
+                    line: 10,
                 },
                 VirtualLocation {
                     file: "defs.lua".to_string(),
@@ -349,11 +356,213 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_vgui_panel_string_references_from_annotated_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        check!(ws.check_references(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.vgui_panel", "reference")]
+                ---@param name string
+                local function createPanel(name) end
+
+                local parent = createPanel("MyPa<??>nel")
+            "#,
+            vec![
+                (
+                    "panels.lua",
+                    "\n\n\n\n\n\n\n\nvgui.Register(\"MyPanel\", PANEL, \"DPanel\")\n",
+                ),
+                (
+                    "usage.lua",
+                    "\n\n\n\n\n\n\n\n\n\n\n\nlocal created = vgui.Create(\"MyPanel\")\n",
+                ),
+            ],
+            vec![
+                VirtualLocation {
+                    file: "panels.lua".to_string(),
+                    line: 8,
+                },
+                VirtualLocation {
+                    file: "virtual_0.lua".to_string(),
+                    line: 7,
+                },
+                VirtualLocation {
+                    file: "usage.lua".to_string(),
+                    line: 12,
+                },
+            ],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_vgui_panel_references_use_non_first_annotated_define_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        check!(ws.check_references(
+            r#"
+                vgui.Create("MyPa<??>nel")
+            "#,
+            vec![(
+                "panels.lua",
+                r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@param description string
+                ---@[call_arg("gmod.vgui_panel", "define")]
+                ---@param name string
+                local function registerPanel(description, name) end
+
+                registerPanel(
+                    "desc",
+                    "MyPanel"
+                )
+                "#,
+            )],
+            vec![
+                VirtualLocation {
+                    file: "panels.lua".to_string(),
+                    line: 10,
+                },
+                VirtualLocation {
+                    file: "virtual_0.lua".to_string(),
+                    line: 1,
+                },
+            ],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_derma_skin_string_references() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        check!(ws.check_references(
+            r#"
+                derma.GetSkinTable("MyS<??>kin")
+            "#,
+            vec![(
+                "skins.lua",
+                "\n\n\n\n\n\n\nderma.DefineSkin(\"MySkin\", \"Nice skin\", {})\n",
+            ),],
+            vec![
+                VirtualLocation {
+                    file: "skins.lua".to_string(),
+                    line: 7,
+                },
+                VirtualLocation {
+                    file: "virtual_0.lua".to_string(),
+                    line: 1,
+                },
+            ],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_derma_skin_string_references_from_annotated_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        check!(ws.check_references(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.derma_skin", "reference")]
+                ---@param name string
+                local function useSkin(name) end
+
+                useSkin("MyS<??>kin")
+            "#,
+            vec![(
+                "skins.lua",
+                "\n\n\n\n\n\n\nderma.DefineSkin(\"MySkin\", \"Nice skin\", {})\n",
+            ),],
+            vec![
+                VirtualLocation {
+                    file: "virtual_0.lua".to_string(),
+                    line: 7,
+                },
+                VirtualLocation {
+                    file: "skins.lua".to_string(),
+                    line: 7,
+                },
+            ],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_derma_skin_references_use_non_first_annotated_define_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        check!(ws.check_references(
+            r#"
+                derma.GetSkinTable("MyS<??>kin")
+            "#,
+            vec![(
+                "skins.lua",
+                r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@param description string
+                ---@[call_arg("gmod.derma_skin", "define")]
+                ---@param name string
+                local function defineSkin(description, name) end
+
+                defineSkin(
+                    "desc",
+                    "MySkin"
+                )
+                "#,
+            )],
+            vec![
+                VirtualLocation {
+                    file: "skins.lua".to_string(),
+                    line: 10,
+                },
+                VirtualLocation {
+                    file: "virtual_0.lua".to_string(),
+                    line: 1,
+                },
+            ],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_net_message_string_references() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
 
         check!(ws.check_references(
             r#"
@@ -371,6 +580,42 @@ mod tests {
                 VirtualLocation {
                     file: "send.lua".to_string(),
                     line: 7,
+                },
+            ],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_message_string_references_from_annotated_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_references(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.net_message", "start")]
+                ---@param name string
+                local function startNet(name) end
+
+                startNet("MyMe<??>ssage")
+            "#,
+            vec![(
+                "receive.lua",
+                "\n\n\nnet.Receive(\"MyMessage\", function() end)\n"
+            )],
+            vec![
+                VirtualLocation {
+                    file: "virtual_0.lua".to_string(),
+                    line: 7,
+                },
+                VirtualLocation {
+                    file: "receive.lua".to_string(),
+                    line: 3,
                 },
             ],
         ));
