@@ -49,6 +49,7 @@ pub struct GmodHookSiteMetadata {
     pub hook_name: Option<String>,
     pub name_range: Option<TextRange>,
     pub name_issue: Option<GmodHookNameIssue>,
+    pub callback_arg_idx: Option<usize>,
     pub callback_params: Vec<String>,
 }
 

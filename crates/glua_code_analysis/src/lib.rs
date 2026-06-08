@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
-pub use test_lib::VirtualWorkspace;
+pub use test_lib::{GMOD_CALL_ARG_BUILTINS_FIXTURE, VirtualWorkspace};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 pub use vfs::*;

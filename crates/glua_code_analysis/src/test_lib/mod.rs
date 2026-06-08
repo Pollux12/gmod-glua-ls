@@ -35,6 +35,104 @@ pub struct DiagnosticSnapshot {
     pub message: String,
 }
 
+pub const GMOD_CALL_ARG_BUILTINS_FIXTURE: &str = r#"
+---@meta
+---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+util = util or {}
+net = net or {}
+hook = hook or {}
+timer = timer or {}
+concommand = concommand or {}
+vgui = vgui or {}
+derma = derma or {}
+
+---@[call_arg("gmod.net_message", "define")]
+---@param str string
+function util.AddNetworkString(str) end
+
+---@[call_arg("gmod.net_message", "start")]
+---@param messageName string
+function net.Start(messageName, unreliable) end
+
+---@[call_arg("gmod.net_message", "receive")]
+---@param messageName string
+---@[call_arg("gmod.net_message", "callback")]
+---@param callback function
+function net.Receive(messageName, callback) end
+
+---@[call_arg("gmod.hook", "add")]
+---@param eventName string
+---@param identifier any
+---@[call_arg("gmod.hook", "callback")]
+---@param func function
+function hook.Add(eventName, identifier, func) end
+
+---@[call_arg("gmod.hook", "emit")]
+---@param eventName string
+function hook.Run(eventName, ...) end
+
+---@[call_arg("gmod.hook", "emit")]
+---@param eventName string
+---@[call_arg("gmod.hook", "gamemode_table")]
+---@param gamemodeTable table
+function hook.Call(eventName, gamemodeTable, ...) end
+
+---@[call_arg("gmod.concommand", "define")]
+---@param name string
+---@[call_arg("gmod.concommand", "callback")]
+---@param callback function
+function concommand.Add(name, callback, autoComplete, helpText, flags) end
+
+---@[call_arg("gmod.convar", "define_server")]
+---@param name string
+function _G.CreateConVar(name, value, flags, helptext, min, max) end
+
+---@[call_arg("gmod.convar", "define_client")]
+---@param name string
+function _G.CreateClientConVar(name, default, shouldsave, userinfo, helptext, min, max) end
+
+---@[call_arg("gmod.timer", "define")]
+---@param identifier string
+---@[call_arg("gmod.timer", "callback")]
+---@param func function
+function timer.Create(identifier, delay, repetitions, func) end
+
+---@param delay number
+---@[call_arg("gmod.timer", "simple")]
+---@param func function
+function timer.Simple(delay, func) end
+
+---@[call_arg("gmod.vgui_panel", "reference")]
+---@param className string
+function vgui.Create(className, parent, name) end
+
+---@[call_arg("gmod.vgui_panel", "define")]
+---@param name string
+---@[call_arg("gmod.vgui_panel", "table")]
+---@param panel table
+---@[call_arg("gmod.vgui_panel", "base")]
+---@param base string
+function vgui.Register(name, panel, base) end
+
+---@[call_arg("gmod.vgui_panel", "define_control")]
+---@param class string
+---@param description string
+---@[call_arg("gmod.vgui_panel", "table")]
+---@param panel table
+---@[call_arg("gmod.vgui_panel", "base")]
+---@param base string
+function derma.DefineControl(class, description, panel, base) end
+
+---@[call_arg("gmod.derma_skin", "define")]
+---@param name string
+function derma.DefineSkin(name, description, skin) end
+
+---@[call_arg("gmod.derma_skin", "reference")]
+---@param name string
+function derma.GetSkinTable(name) end
+"#;
+
 #[cfg(test)]
 pub fn diagnostics_to_snapshot_set(
     file: impl Into<String>,
@@ -193,6 +291,13 @@ impl VirtualWorkspace {
             ---@return TypeGuard<Color>
             function IsColor(value) end
             "#,
+        )
+    }
+
+    pub fn def_gmod_call_arg_builtins(&mut self) -> FileId {
+        self.def_file(
+            "lua/includes/glua_ls_gmod_call_arg_builtins.lua",
+            GMOD_CALL_ARG_BUILTINS_FIXTURE,
         )
     }
 

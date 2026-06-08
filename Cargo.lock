@@ -842,6 +842,7 @@ dependencies = [
 name = "glua_code_analysis"
 version = "0.1.5"
 dependencies = [
+ "aho-corasick",
  "dirs",
  "emmy_lsp_types",
  "emmylua_codestyle",

@@ -31,6 +31,7 @@ glua_parser.workspace = true
 glua_diagnostic_macro.workspace = true
 
 # external
+aho-corasick.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 lsp_types.workspace = true

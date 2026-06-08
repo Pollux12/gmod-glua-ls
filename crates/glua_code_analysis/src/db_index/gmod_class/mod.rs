@@ -15,6 +15,7 @@ pub enum GmodScriptedClassCallKind {
     NetworkVarElement,
     VguiRegister,
     DermaDefineControl,
+    DermaDefineSkin,
 }
 
 impl GmodScriptedClassCallKind {
@@ -27,16 +28,6 @@ impl GmodScriptedClassCallKind {
             "NetworkVarElement" => Some(Self::NetworkVarElement),
             _ => None,
         }
-    }
-
-    pub fn from_call_path(path: &str) -> Option<Self> {
-        if path == "vgui.Register" || path.ends_with(".vgui.Register") {
-            return Some(Self::VguiRegister);
-        }
-        if path == "derma.DefineControl" || path.ends_with(".derma.DefineControl") {
-            return Some(Self::DermaDefineControl);
-        }
-        None
     }
 }
 
@@ -62,6 +53,57 @@ pub struct GmodScriptedClassCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub literal_args: Vec<Option<GmodClassCallLiteral>>,
     pub args: Vec<GmodClassCallArg>,
+    pub vgui_panel_roles: Option<GmodVguiPanelCallRoles>,
+    pub derma_skin_roles: Option<GmodDermaSkinCallRoles>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GmodVguiPanelCallRoles {
+    pub define_arg_idx: usize,
+    pub table_arg_idx: Option<usize>,
+    pub base_arg_idx: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GmodDermaSkinCallRoles {
+    pub define_arg_idx: usize,
+}
+
+impl GmodScriptedClassCallMetadata {
+    pub fn vgui_panel_define_arg_idx(&self) -> usize {
+        self.vgui_panel_roles
+            .map(|roles| roles.define_arg_idx)
+            .unwrap_or(0)
+    }
+
+    pub fn vgui_panel_table_arg_idx(&self, default_arg_idx: usize) -> usize {
+        self.vgui_panel_roles
+            .and_then(|roles| roles.table_arg_idx)
+            .unwrap_or(default_arg_idx)
+    }
+
+    pub fn vgui_panel_base_arg_idx(&self, default_arg_idx: Option<usize>) -> Option<usize> {
+        self.vgui_panel_roles
+            .and_then(|roles| roles.base_arg_idx)
+            .or(default_arg_idx)
+    }
+
+    pub fn derma_skin_define_arg_idx(&self) -> usize {
+        self.derma_skin_roles
+            .map(|roles| roles.define_arg_idx)
+            .unwrap_or(0)
+    }
+
+    pub fn define_arg_range(&self, kind: GmodScriptedClassCallKind) -> rowan::TextRange {
+        let arg_idx = match kind {
+            GmodScriptedClassCallKind::DermaDefineSkin => self.derma_skin_define_arg_idx(),
+            _ => self.vgui_panel_define_arg_idx(),
+        };
+        self.args
+            .get(arg_idx)
+            .map(|arg| arg.syntax_id.get_range())
+            .unwrap_or_else(|| self.syntax_id.get_range())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -73,6 +115,7 @@ pub struct GmodScriptedClassFileMetadata {
     pub network_var_element_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_calls: Vec<GmodScriptedClassCallMetadata>,
     pub derma_define_control_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub derma_define_skin_calls: Vec<GmodScriptedClassCallMetadata>,
 }
 
 impl GmodScriptedClassFileMetadata {
@@ -100,6 +143,7 @@ impl GmodScriptedClassFileMetadata {
             GmodScriptedClassCallKind::NetworkVarElement => &mut self.network_var_element_calls,
             GmodScriptedClassCallKind::VguiRegister => &mut self.vgui_register_calls,
             GmodScriptedClassCallKind::DermaDefineControl => &mut self.derma_define_control_calls,
+            GmodScriptedClassCallKind::DermaDefineSkin => &mut self.derma_define_skin_calls,
         }
     }
 }
@@ -108,6 +152,7 @@ impl GmodScriptedClassFileMetadata {
 pub struct GmodClassMetadataIndex {
     file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
     vgui_panels: HashMap<String, Vec<VguiPanelDefinition>>,
+    derma_skins: HashMap<String, Vec<DermaSkinDefinition>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,11 +162,18 @@ struct VguiPanelDefinition {
     base_name: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DermaSkinDefinition {
+    file_id: FileId,
+    range_start: TextSize,
+}
+
 impl GmodClassMetadataIndex {
     pub fn new() -> Self {
         Self {
             file_metadata: HashMap::new(),
             vgui_panels: HashMap::new(),
+            derma_skins: HashMap::new(),
         }
     }
 
@@ -147,14 +199,18 @@ impl GmodClassMetadataIndex {
         kind: GmodScriptedClassCallKind,
         call_metadata: &GmodScriptedClassCallMetadata,
     ) -> Option<(String, Option<String>)> {
-        let base_arg_index = match kind {
-            GmodScriptedClassCallKind::VguiRegister => 2,
-            GmodScriptedClassCallKind::DermaDefineControl => 3,
-            _ => return None,
+        let default_base_arg_index = match kind {
+            GmodScriptedClassCallKind::VguiRegister => Some(2),
+            GmodScriptedClassCallKind::DermaDefineControl => Some(3),
+            _ => None,
         };
 
-        let panel_name = Self::extract_non_empty_string_arg(call_metadata, 0)?;
-        let base_name = Self::extract_non_empty_string_arg(call_metadata, base_arg_index);
+        let define_arg_index = call_metadata.vgui_panel_define_arg_idx();
+        let base_arg_index = call_metadata.vgui_panel_base_arg_idx(default_base_arg_index);
+
+        let panel_name = Self::extract_non_empty_string_arg(call_metadata, define_arg_index)?;
+        let base_name = base_arg_index
+            .and_then(|arg_index| Self::extract_non_empty_string_arg(call_metadata, arg_index));
         Some((panel_name, base_name))
     }
 
@@ -188,8 +244,38 @@ impl GmodClassMetadataIndex {
         Self::insert_vgui_panel_from_call(&mut self.vgui_panels, file_id, kind, call_metadata);
     }
 
+    fn insert_derma_skin_from_call(
+        derma_skins: &mut HashMap<String, Vec<DermaSkinDefinition>>,
+        file_id: FileId,
+        call_metadata: &GmodScriptedClassCallMetadata,
+    ) {
+        let Some(skin_name) = Self::extract_non_empty_string_arg(call_metadata, 0) else {
+            return;
+        };
+
+        derma_skins
+            .entry(skin_name)
+            .or_default()
+            .push(DermaSkinDefinition {
+                file_id,
+                range_start: call_metadata.syntax_id.get_range().start(),
+            });
+    }
+
+    fn update_derma_skins_from_call(
+        &mut self,
+        file_id: FileId,
+        kind: GmodScriptedClassCallKind,
+        call_metadata: &GmodScriptedClassCallMetadata,
+    ) {
+        if kind == GmodScriptedClassCallKind::DermaDefineSkin {
+            Self::insert_derma_skin_from_call(&mut self.derma_skins, file_id, call_metadata);
+        }
+    }
+
     fn recompute_vgui_panels(&mut self) {
         let mut vgui_panels = HashMap::new();
+        let mut derma_skins = HashMap::new();
 
         for (file_id, file_metadata) in &self.file_metadata {
             for call in &file_metadata.vgui_register_calls {
@@ -208,9 +294,13 @@ impl GmodClassMetadataIndex {
                     call,
                 );
             }
+            for call in &file_metadata.derma_define_skin_calls {
+                Self::insert_derma_skin_from_call(&mut derma_skins, *file_id, call);
+            }
         }
 
         self.vgui_panels = vgui_panels;
+        self.derma_skins = derma_skins;
     }
 
     pub fn add_call(
@@ -219,8 +309,24 @@ impl GmodClassMetadataIndex {
         kind: GmodScriptedClassCallKind,
         call_metadata: GmodScriptedClassCallMetadata,
     ) {
-        self.update_vgui_panels_from_call(file_id, kind, &call_metadata);
+        {
+            let calls = self
+                .file_metadata
+                .entry(file_id)
+                .or_default()
+                .calls_by_kind_mut(kind);
+            if let Some(existing) = calls
+                .iter_mut()
+                .find(|existing| existing.syntax_id == call_metadata.syntax_id)
+            {
+                *existing = call_metadata;
+                self.recompute_vgui_panels();
+                return;
+            }
+        }
 
+        self.update_vgui_panels_from_call(file_id, kind, &call_metadata);
+        self.update_derma_skins_from_call(file_id, kind, &call_metadata);
         self.file_metadata
             .entry(file_id)
             .or_default()
@@ -257,13 +363,42 @@ impl GmodClassMetadataIndex {
                 .iter()
                 .chain(file_metadata.derma_define_control_calls.iter())
             {
+                let define_arg_index = call.vgui_panel_define_arg_idx();
                 let Some(Some(GmodClassCallLiteral::String(panel_name))) =
-                    call.literal_args.first()
+                    call.literal_args.get(define_arg_index)
                 else {
                     continue;
                 };
 
                 if panel_name == name {
+                    definitions.push((*file_id, call));
+                }
+            }
+        }
+
+        definitions.sort_by_key(|(file_id, call)| (file_id.id, call.syntax_id.get_range().start()));
+        definitions
+    }
+
+    pub fn find_derma_skin_definitions(
+        &self,
+        name: &str,
+    ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
+        if name.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let mut definitions = Vec::new();
+        for (file_id, file_metadata) in &self.file_metadata {
+            for call in &file_metadata.derma_define_skin_calls {
+                let define_arg_index = call.derma_skin_define_arg_idx();
+                let Some(Some(GmodClassCallLiteral::String(skin_name))) =
+                    call.literal_args.get(define_arg_index)
+                else {
+                    continue;
+                };
+
+                if skin_name == name {
                     definitions.push((*file_id, call));
                 }
             }
@@ -336,6 +471,8 @@ mod tests {
                     Some(GmodClassCallLiteral::String(base.to_string())),
                 ),
             ],
+            vgui_panel_roles: None,
+            derma_skin_roles: None,
         }
     }
 

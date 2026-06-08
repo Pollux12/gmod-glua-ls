@@ -50,14 +50,15 @@ pub fn analyze(
 
         run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
         run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
-        run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
 
         // Gmod pre-analysis: collect realm metadata, scripted class types, hooks,
-        // and network flow BEFORE lua_analyze. This ensures flow analysis uses
+        // and network flow before flow/lua analysis. This ensures flow analysis uses
         // correct realm keys (Client/Server/Shared) from the start, avoiding the
         // previous problem where all flow caches used realm=Unknown and had to be
         // fully recomputed in the unresolve phase.
         run_analysis::<gmod::GmodPreAnalysisPipeline>(db, &mut context);
+
+        run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
 
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
 

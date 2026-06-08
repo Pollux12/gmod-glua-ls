@@ -5,6 +5,7 @@ pub use analyzer::gmod::get_scripted_class_info_for_file;
 pub(crate) use analyzer::gmod::get_scripted_class_type_decl_id;
 pub use analyzer::unresolve::extract_hook_name;
 pub use analyzer::unresolve::resolve_gmod_hook_add_callback_doc_function;
+pub use analyzer::unresolve::resolve_gmod_hook_callback_doc_function;
 
 use std::sync::Arc;
 

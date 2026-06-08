@@ -12,6 +12,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
     }
 
     #[gtest]
@@ -395,6 +396,459 @@ mod test {
     }
 
     #[gtest]
+    fn test_system_metadata_detection_uses_annotated_net_message_call_arg_roles() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.net_message", "define")]
+            ---@param name string
+            function RegisterNetMessage(name) end
+
+            ---@[call_arg("gmod.net_message", "start")]
+            ---@param name string
+            function StartWrappedNet(name) end
+
+            ---@[call_arg("gmod.net_message", "receive")]
+            ---@param name string
+            function ReceiveWrappedNet(name, callback) end
+
+            ---@[call_arg("gmod.net_message", "start")]
+            ---@param name string
+            local function StartLocalWrappedNet(name) end
+
+            RegisterNetMessage("wrapped.net")
+            StartWrappedNet("wrapped.net")
+            ReceiveWrappedNet("wrapped.net", function(_, _) end)
+            StartLocalWrappedNet("local.wrapped.net")
+            do
+                local StartWrappedNet = function(name) end
+                StartWrappedNet("shadowed.net")
+            end
+            "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_system_file_metadata(&file_id)
+            .cloned()
+            .expect("expected system metadata");
+
+        assert!(
+            metadata
+                .net_add_string_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("wrapped.net"))
+        );
+        assert!(
+            metadata
+                .net_start_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("wrapped.net"))
+        );
+        assert!(
+            metadata
+                .net_start_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("local.wrapped.net"))
+        );
+        assert!(metadata.net_receive_calls.iter().any(|site| {
+            site.message_name.as_deref() == Some("wrapped.net") && site.callback.syntax_id.is_some()
+        }));
+        assert!(
+            !metadata
+                .net_start_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("shadowed.net"))
+        );
+    }
+
+    #[gtest]
+    fn test_hook_detection_uses_annotated_hook_call_arg_roles() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.hook", "add")]
+            ---@param name string
+            function AddWrappedHook(name, identifier, callback) end
+
+            ---@[call_arg("gmod.hook", "emit")]
+            ---@param name string
+            function RunWrappedHook(name) end
+
+            AddWrappedHook("WrappedThink", "id", function(ply, data) end)
+            RunWrappedHook("WrappedEmit")
+            "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_hook_file_metadata(&file_id)
+            .cloned()
+            .expect("expected hook metadata");
+
+        assert!(metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Add
+                && site.hook_name.as_deref() == Some("WrappedThink")
+                && site.callback_params == vec!["ply".to_string(), "data".to_string()]
+        }));
+        assert!(metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Emit && site.hook_name.as_deref() == Some("WrappedEmit")
+        }));
+    }
+
+    #[gtest]
+    fn test_gmod_system_detection_does_not_match_lookalike_builtin_paths() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def(
+            r#"
+            mylib = { hook = {}, net = {}, timer = {}, concommand = {} }
+            function mylib.hook.Add(name, id, callback) end
+            function mylib.hook.Run(name) end
+            function mylib.net.Start(name) end
+            function mylib.net.Receive(name, callback) end
+            function mylib.timer.Create(name, delay, repetitions, callback) end
+            function mylib.concommand.Add(name, callback) end
+
+            mylib.hook.Add("LookalikeAdd", "id", function() end)
+            mylib.hook.Run("LookalikeRun")
+            mylib.net.Start("lookalike.net")
+            mylib.net.Receive("lookalike.net", function() end)
+            mylib.timer.Create("lookalike.timer", 1, 1, function() end)
+            mylib.concommand.Add("lookalike_command", function() end)
+
+            do
+                local hook = { Add = function() end, Run = function() end }
+                local net = { Start = function() end, Receive = function() end }
+                local timer = { Create = function() end }
+                local concommand = { Add = function() end }
+                local CreateConVar = function() end
+                local CreateClientConVar = function() end
+
+                hook.Add("ShadowedAdd", "id", function() end)
+                hook.Run("ShadowedRun")
+                net.Start("shadowed.net")
+                net.Receive("shadowed.net", function() end)
+                timer.Create("shadowed.timer", 1, 1, function() end)
+                concommand.Add("shadowed_command", function() end)
+                CreateConVar("shadowed_server_convar")
+                CreateClientConVar("shadowed_client_convar")
+            end
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        assert!(
+            db.get_gmod_infer_index()
+                .get_hook_file_metadata(&file_id)
+                .is_none()
+        );
+        let system_metadata = db
+            .get_gmod_infer_index()
+            .get_system_file_metadata(&file_id)
+            .cloned();
+        assert!(
+            system_metadata.is_none_or(|metadata| {
+                metadata.net_start_calls.is_empty()
+                    && metadata.net_receive_calls.is_empty()
+                    && metadata.timer_calls.is_empty()
+                    && metadata.concommand_add_calls.is_empty()
+                    && metadata.convar_create_calls.is_empty()
+            }),
+            "lookalike builtin paths should not be collected as GMod system metadata"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_system_detection_keeps_local_aliases_to_builtin_globals() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def(
+            r#"
+            do
+                local hook = hook
+                local net = net
+                local timer = timer
+                local concommand = concommand
+                local CreateConVar = CreateConVar
+                local CreateClientConVar = _G.CreateClientConVar
+
+                hook.Add("AliasAdd", "id", function() end)
+                hook.Run("AliasRun")
+                net.Start("alias.start")
+                net.Receive("alias.receive", function() end)
+                timer.Create("alias.timer", 1, 1, function() end)
+                concommand.Add("alias_command", function() end)
+                CreateConVar("alias_server_convar")
+                CreateClientConVar("alias_client_convar")
+            end
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let hook_metadata = db
+            .get_gmod_infer_index()
+            .get_hook_file_metadata(&file_id)
+            .cloned()
+            .expect("expected hook metadata");
+        assert!(hook_metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Add && site.hook_name.as_deref() == Some("AliasAdd")
+        }));
+        assert!(hook_metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Emit && site.hook_name.as_deref() == Some("AliasRun")
+        }));
+
+        let system_metadata = db
+            .get_gmod_infer_index()
+            .get_system_file_metadata(&file_id)
+            .cloned()
+            .expect("expected system metadata");
+        assert!(
+            system_metadata
+                .net_start_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("alias.start"))
+        );
+        assert!(
+            system_metadata
+                .net_receive_calls
+                .iter()
+                .any(|site| site.message_name.as_deref() == Some("alias.receive"))
+        );
+        assert!(
+            system_metadata
+                .timer_calls
+                .iter()
+                .any(|site| site.timer_name.as_deref() == Some("alias.timer"))
+        );
+        assert!(
+            system_metadata
+                .concommand_add_calls
+                .iter()
+                .any(|site| site.command_name.as_deref() == Some("alias_command"))
+        );
+        assert!(
+            system_metadata
+                .convar_create_calls
+                .iter()
+                .any(|site| site.kind == GmodConVarKind::Server
+                    && site.convar_name.as_deref() == Some("alias_server_convar"))
+        );
+        assert!(
+            system_metadata
+                .convar_create_calls
+                .iter()
+                .any(|site| site.kind == GmodConVarKind::Client
+                    && site.convar_name.as_deref() == Some("alias_client_convar"))
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_system_detection_keeps_global_owner_prefixed_builtin_paths() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def(
+            r#"
+            _G.util.AddNetworkString("global.add")
+            _G.net.Start("global.start")
+            _G.net.Receive("global.receive", function() end)
+            _G.hook.Add("GlobalAdd", "id", function() end)
+            _G.hook.Run("GlobalRun")
+            _G.timer.Create("global.timer", 1, 1, function() end)
+            _G.concommand.Add("global_command", function() end)
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let hook_metadata = db
+            .get_gmod_infer_index()
+            .get_hook_file_metadata(&file_id)
+            .cloned()
+            .expect("expected hook metadata");
+        assert!(hook_metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Add && site.hook_name.as_deref() == Some("GlobalAdd")
+        }));
+        assert!(hook_metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Emit && site.hook_name.as_deref() == Some("GlobalRun")
+        }));
+
+        let system_metadata = db
+            .get_gmod_infer_index()
+            .get_system_file_metadata(&file_id)
+            .cloned()
+            .expect("expected system metadata");
+        assert!(
+            system_metadata
+                .net_add_string_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("global.add"))
+        );
+        assert!(
+            system_metadata
+                .net_start_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("global.start"))
+        );
+        assert!(
+            system_metadata
+                .net_receive_calls
+                .iter()
+                .any(|site| site.message_name.as_deref() == Some("global.receive"))
+        );
+        assert!(
+            system_metadata
+                .timer_calls
+                .iter()
+                .any(|site| site.timer_name.as_deref() == Some("global.timer"))
+        );
+        assert!(
+            system_metadata
+                .concommand_add_calls
+                .iter()
+                .any(|site| site.command_name.as_deref() == Some("global_command"))
+        );
+    }
+
+    #[gtest]
+    fn test_system_metadata_detection_uses_cross_file_annotated_net_message_roles() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/autorun/net_wrappers.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.net_message", "define")]
+            ---@param name string
+            function RegisterGlobalNetMessage(name) end
+
+            API = API or {}
+
+            ---@[call_arg("gmod.net_message", "start")]
+            ---@param name string
+            function API.StartGlobalNet(name) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/use_net_wrappers.lua",
+            r#"
+            RegisterGlobalNetMessage("cross.file.net")
+            API.StartGlobalNet("cross.file.indexed.net")
+
+            do
+                local API = {}
+                API.StartGlobalNet("shadowed.index.net")
+            end
+            "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_system_file_metadata(&file_id)
+            .cloned()
+            .expect("expected system metadata");
+
+        assert!(
+            metadata
+                .net_add_string_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("cross.file.net"))
+        );
+        assert!(
+            metadata
+                .net_start_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("cross.file.indexed.net"))
+        );
+        assert!(
+            !metadata
+                .net_start_calls
+                .iter()
+                .any(|site| site.name.as_deref() == Some("shadowed.index.net"))
+        );
+    }
+
+    #[gtest]
+    fn test_system_metadata_detection_uses_annotated_concommand_convar_and_timer_roles() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.concommand", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.concommand", "callback")]
+            ---@param callback function
+            function RegisterCommand(name, callback) end
+
+            ---@[call_arg("gmod.convar", "define_server")]
+            ---@param name string
+            function CreateServerCVar(name, value) end
+
+            ---@[call_arg("gmod.convar", "define_client")]
+            ---@param name string
+            function CreateClientCVar(name, value) end
+
+            ---@[call_arg("gmod.timer", "define")]
+            ---@param identifier string
+            ---@[call_arg("gmod.timer", "callback")]
+            ---@param callback function
+            function CreateWrappedTimer(identifier, delay, repetitions, callback) end
+
+            ---@param delay number
+            ---@[call_arg("gmod.timer", "simple")]
+            ---@param callback function
+            function SimpleWrappedTimer(delay, callback) end
+
+            RegisterCommand("wrapped_cmd", function() end)
+            CreateServerCVar("wrapped_server_cvar", "1")
+            CreateClientCVar("wrapped_client_cvar", "1")
+            CreateWrappedTimer("wrapped_timer", 1, 0, function() end)
+            SimpleWrappedTimer(0.25, function() end)
+            "#,
+        );
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_system_file_metadata(&file_id)
+            .cloned()
+            .expect("expected system metadata");
+
+        assert!(metadata.concommand_add_calls.iter().any(|site| {
+            site.command_name.as_deref() == Some("wrapped_cmd") && site.callback.syntax_id.is_some()
+        }));
+        assert!(metadata.convar_create_calls.iter().any(|site| {
+            site.kind == GmodConVarKind::Server
+                && site.convar_name.as_deref() == Some("wrapped_server_cvar")
+        }));
+        assert!(metadata.convar_create_calls.iter().any(|site| {
+            site.kind == GmodConVarKind::Client
+                && site.convar_name.as_deref() == Some("wrapped_client_cvar")
+        }));
+        assert!(metadata.timer_calls.iter().any(|site| {
+            site.kind == GmodTimerKind::Create
+                && site.timer_name.as_deref() == Some("wrapped_timer")
+                && site.callback.syntax_id.is_some()
+        }));
+        assert!(metadata.timer_calls.iter().any(|site| {
+            site.kind == GmodTimerKind::Simple
+                && site.timer_name.is_none()
+                && site.callback.syntax_id.is_some()
+        }));
+    }
+
+    #[gtest]
     fn test_realm_inference_respects_default_realm_config() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -425,12 +879,17 @@ mod test {
             .gmod
             .hook_mappings
             .emitter_to_hook
-            .insert("myhooks.Emit".to_string(), "*".to_string());
+            .insert("Emit".to_string(), "*".to_string());
         ws.update_emmyrc(emmyrc);
         let file_id = ws.def(
             r#"
             function PLUGIN:PlayerConnect(ply) end
             myhooks.Emit("MappedEmit")
+
+            do
+                local myhooks = { Emit = function() end }
+                myhooks.Emit("ShadowedMappedEmit")
+            end
             "#,
         );
 
@@ -447,6 +906,10 @@ mod test {
         }));
         assert!(metadata.sites.iter().any(|site| {
             site.kind == GmodHookKind::Emit && site.hook_name.as_deref() == Some("MappedEmit")
+        }));
+        assert!(!metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Emit
+                && site.hook_name.as_deref() == Some("ShadowedMappedEmit")
         }));
     }
 

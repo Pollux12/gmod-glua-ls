@@ -29,7 +29,9 @@ use resolve_closure::{
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
 pub use resolve_closure::extract_hook_name;
-pub use resolve_closure::resolve_gmod_hook_add_callback_doc_function;
+pub use resolve_closure::{
+    resolve_gmod_hook_add_callback_doc_function, resolve_gmod_hook_callback_doc_function,
+};
 use rowan::TextRange;
 
 use super::{AnalyzeContext, infer_cache_manager::InferCacheManager, lua::LuaReturnPoint};
