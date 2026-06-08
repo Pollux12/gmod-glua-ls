@@ -1292,6 +1292,33 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_hook_definition_from_hook_remove() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        check!(ws.check_definition(
+            r#"
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                function GM:SomeHook(ply) end
+
+                hook.Remove("SomeHo<??>ok", "id")
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 5,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_source_file_uri_redirects_before_stub_definition() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
 
@@ -1475,7 +1502,7 @@ mod tests {
 
         check!(ws.check_definition(
             r#"
-                derma.GetSkinTable("MyS<??>kin")
+                derma.GetNamedSkin("MyS<??>kin")
             "#,
             vec![Expected {
                 file: "skins.lua".to_string(),
@@ -1547,7 +1574,7 @@ mod tests {
 
         check!(ws.check_definition(
             r#"
-                derma.GetSkinTable("MyS<??>kin")
+                derma.GetNamedSkin("MyS<??>kin")
             "#,
             vec![Expected {
                 file: "skins.lua".to_string(),
@@ -1585,7 +1612,7 @@ mod tests {
 
         check!(ws.check_definition(
             r#"
-                derma.GetSkinTable("MyS<??>kin")
+                derma.GetNamedSkin("MyS<??>kin")
             "#,
             vec![Expected {
                 file: "skins.lua".to_string(),
@@ -1841,8 +1868,8 @@ mod tests {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 mylib = { derma = {} }
-                function mylib.derma.GetSkinTable(name) end
-                mylib.derma.GetSkinTable("MyS<??>kin")
+                function mylib.derma.GetNamedSkin(name) end
+                mylib.derma.GetNamedSkin("MyS<??>kin")
             "#,
         )?;
         let file_id = ws.def(&content);
@@ -1870,7 +1897,7 @@ mod tests {
 
         check!(ws.check_definition(
             r#"
-                _G.derma.GetSkinTable("MyS<??>kin")
+                _G.derma.GetNamedSkin("MyS<??>kin")
             "#,
             vec![Expected {
                 file: "skins.lua".to_string(),

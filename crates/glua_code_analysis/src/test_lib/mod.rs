@@ -80,6 +80,11 @@ function hook.Run(eventName, ...) end
 ---@param gamemodeTable table
 function hook.Call(eventName, gamemodeTable, ...) end
 
+---@[call_arg("gmod.hook", "remove")]
+---@param eventName string
+---@param identifier any
+function hook.Remove(eventName, identifier) end
+
 ---@[call_arg("gmod.concommand", "define")]
 ---@param name string
 ---@[call_arg("gmod.concommand", "callback")]
@@ -151,7 +156,13 @@ function derma.DefineSkin(name, description, skin) end
 
 ---@[call_arg("gmod.derma_skin", "reference")]
 ---@param name string
-function derma.GetSkinTable(name) end
+function derma.GetNamedSkin(name) end
+
+function derma.GetSkinTable() end
+
+---@[call_arg("gmod.derma_skin", "reference")]
+---@param skinName string
+function Panel:SetSkin(skinName) end
 
 ---@[call_arg("gmod.network_var", "type")]
 ---@param type string

@@ -455,7 +455,7 @@ mod tests {
 
         check!(ws.check_references(
             r#"
-                derma.GetSkinTable("MyS<??>kin")
+                derma.GetNamedSkin("MyS<??>kin")
             "#,
             vec![(
                 "skins.lua",
@@ -523,7 +523,7 @@ mod tests {
 
         check!(ws.check_references(
             r#"
-                derma.GetSkinTable("MyS<??>kin")
+                derma.GetNamedSkin("MyS<??>kin")
             "#,
             vec![(
                 "skins.lua",
