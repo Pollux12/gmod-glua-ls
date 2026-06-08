@@ -713,6 +713,7 @@ mod tests {
     #[gtest]
     fn vgui_panel_symbols_are_class_named_and_methods_are_nested() -> Result<()> {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
@@ -783,6 +784,7 @@ mod tests {
     fn vgui_panel_assignment_symbols_keep_selection_range_and_expand_container_range() -> Result<()>
     {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
@@ -931,6 +933,7 @@ mod tests {
     #[gtest]
     fn hook_add_has_named_outline_symbol() -> Result<()> {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
@@ -959,6 +962,7 @@ mod tests {
     #[gtest]
     fn hook_symbol_range_contains_nested_children() -> Result<()> {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.outline.verbosity = EmmyrcGmodOutlineVerbosity::Verbose;
@@ -1063,6 +1067,7 @@ mod tests {
     #[gtest]
     fn net_receive_callback_params_are_inlined_to_call_symbol() -> Result<()> {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);

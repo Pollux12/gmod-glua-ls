@@ -140,10 +140,13 @@ impl<'a> DocumentSymbolBuilder<'a> {
     fn collect_vgui_panel_call(
         decl_tree: &LuaDeclarationTree,
         call: &GmodScriptedClassCallMetadata,
-        table_var_arg_index: usize,
+        default_table_var_arg_index: usize,
         panel_names: &mut HashMap<LuaDeclId, String>,
     ) {
-        let panel_name = match call.literal_args.first() {
+        let panel_arg_index = call.vgui_panel_define_arg_idx();
+        let table_var_arg_index = call.vgui_panel_table_arg_idx(default_table_var_arg_index);
+
+        let panel_name = match call.literal_args.get(panel_arg_index) {
             Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name,
             _ => return,
         };
