@@ -6,6 +6,8 @@ use glua_parser::{
 use lsp_types::{Color, ColorInformation};
 use rowan::{TextRange, TextSize};
 
+use crate::handlers::gmod_string_context::find_call_arg_roles;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct GmodColor {
     pub(crate) red: f32,
@@ -82,6 +84,12 @@ fn try_build_semantic_color_tuple(
     }).count();
     if numeric_literal_count < 3 {
         return None;
+    }
+
+    if try_build_annotated_color_tuple(call_expr.clone(), document, semantic_model, &args, result)
+        .is_some()
+    {
+        return Some(());
     }
 
     let func = semantic_model.infer_call_expr_func(call_expr.clone(), Some(args.len()))?;
@@ -182,6 +190,75 @@ fn try_build_semantic_color_tuple(
     Some(())
 }
 
+fn try_build_annotated_color_tuple(
+    call_expr: LuaCallExpr,
+    document: &LuaDocument,
+    semantic_model: &SemanticModel,
+    args: &[LuaExpr],
+    result: &mut Vec<ColorInformation>,
+) -> Option<()> {
+    let mut red_idx = None;
+    let mut green_idx = None;
+    let mut blue_idx = None;
+    let mut alpha_idx = None;
+
+    for (arg_idx, role) in find_call_arg_roles(
+        semantic_model,
+        &call_expr,
+        args.len(),
+        "gmod.color",
+        &["r", "red", "g", "green", "b", "blue", "a", "alpha"],
+    ) {
+        match role.role.as_str() {
+            "r" | "red" => red_idx = Some(arg_idx),
+            "g" | "green" => green_idx = Some(arg_idx),
+            "b" | "blue" => blue_idx = Some(arg_idx),
+            "a" | "alpha" => alpha_idx = Some(arg_idx),
+            _ => {}
+        }
+    }
+
+    let red_idx = red_idx?;
+    let green_idx = green_idx?;
+    let blue_idx = blue_idx?;
+    if !(red_idx < green_idx && green_idx < blue_idx) {
+        return None;
+    }
+    if alpha_idx.is_some_and(|alpha_idx| alpha_idx <= blue_idx) {
+        return None;
+    }
+
+    let mut components = [0.0f32; 4];
+    components[0] = numeric_color_component(args.get(red_idx)?)?;
+    components[1] = numeric_color_component(args.get(green_idx)?)?;
+    components[2] = numeric_color_component(args.get(blue_idx)?)?;
+    components[3] = if let Some(alpha_idx) = alpha_idx {
+        numeric_color_component(args.get(alpha_idx)?)?
+    } else {
+        1.0
+    };
+
+    let first_arg = args.get(red_idx)?;
+    let last_arg = args.get(alpha_idx.unwrap_or(blue_idx))?;
+    let text_range = TextRange::new(
+        first_arg.syntax().text_range().start(),
+        last_arg.syntax().text_range().end(),
+    );
+    let range = document.to_lsp_range(text_range)?;
+
+    result.push(ColorInformation {
+        range,
+        color: Color {
+            red: components[0],
+            green: components[1],
+            blue: components[2],
+            alpha: components[3],
+        },
+    });
+
+    Some(())
+}
+
 /// Detects `Color(r, g, b)` or `Color(r, g, b, a)` calls where every argument is a
 /// numeric integer literal in the 0–255 range and registers a color swatch for them.
 fn try_build_gmod_color_call(
@@ -260,6 +337,23 @@ fn gmod_color_call_info(call_expr: &LuaCallExpr) -> Option<(GmodColor, Vec<LuaEx
         },
         args,
     ))
+}
+
+fn numeric_color_component(arg: &LuaExpr) -> Option<f32> {
+    let LuaExpr::LiteralExpr(lit_expr) = arg else {
+        return None;
+    };
+    let LuaLiteralToken::Number(num_token) = lit_expr.get_literal()? else {
+        return None;
+    };
+    let value: f64 = match num_token.get_number_value() {
+        NumberResult::Int(n) => n as f64,
+        NumberResult::Uint(n) => n as f64,
+        NumberResult::Float(n) => n,
+    };
+    (0.0..=255.0)
+        .contains(&value)
+        .then_some((value / 255.0) as f32)
 }
 
 fn try_build_color_information(
@@ -446,6 +540,86 @@ mod tests {
         verify_that!(colors.len(), eq(2))?;
         verify_that!(colors[0].color.alpha, eq(1.0))?;
         verify_that!(colors[1].color.alpha, eq(1.0))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn detects_annotated_gmod_color_tuple() -> Result<()> {
+        let colors = collect_colors_semantic(
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@param first number
+            ---@[call_arg("gmod.color", "r")]
+            ---@param second number
+            ---@[call_arg("gmod.color", "g")]
+            ---@param third number
+            ---@[call_arg("gmod.color", "b")]
+            ---@param fourth number
+            function Paint(first, second, third, fourth) end
+
+            Paint(12, 34, 56, 78)
+            "#,
+        );
+
+        verify_that!(colors.len(), eq(1))?;
+        verify_that!(colors[0].color.red, eq(34.0 / 255.0))?;
+        verify_that!(colors[0].color.green, eq(56.0 / 255.0))?;
+        verify_that!(colors[0].color.blue, eq(78.0 / 255.0))?;
+        verify_that!(colors[0].color.alpha, eq(1.0))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn detects_annotated_gmod_color_tuple_with_alpha_on_colon_call() -> Result<()> {
+        let colors = collect_colors_semantic(
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            Painter = {}
+
+            ---@param self table
+            ---@[call_arg("gmod.color", "r")]
+            ---@param redish number
+            ---@[call_arg("gmod.color", "g")]
+            ---@param greenish number
+            ---@[call_arg("gmod.color", "b")]
+            ---@param blueish number
+            ---@[call_arg("gmod.color", "a")]
+            ---@param alphaish number
+            function Painter.SetTint(self, redish, greenish, blueish, alphaish) end
+
+            Painter:SetTint(10, 20, 30, 40)
+            "#,
+        );
+
+        verify_that!(colors.len(), eq(1))?;
+        verify_that!(colors[0].color.red, eq(10.0 / 255.0))?;
+        verify_that!(colors[0].color.green, eq(20.0 / 255.0))?;
+        verify_that!(colors[0].color.blue, eq(30.0 / 255.0))?;
+        verify_that!(colors[0].color.alpha, eq(40.0 / 255.0))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn annotated_color_tuple_does_not_duplicate_param_name_tuple() -> Result<()> {
+        let colors = collect_colors_semantic(
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.color", "r")]
+            ---@param r number
+            ---@[call_arg("gmod.color", "g")]
+            ---@param g number
+            ---@[call_arg("gmod.color", "b")]
+            ---@param b number
+            function Paint(r, g, b) end
+
+            Paint(1, 2, 3)
+            "#,
+        );
+
+        verify_that!(colors.len(), eq(1))?;
         Ok(())
     }
 
