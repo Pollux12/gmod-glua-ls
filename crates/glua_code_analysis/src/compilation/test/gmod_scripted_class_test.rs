@@ -1349,6 +1349,52 @@ mod test {
     }
 
     #[gtest]
+    fn test_annotated_network_var_overload_roles_synthesize_omitted_slot_form() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/entities/annotated_network_overload/shared.lua",
+            r#"
+            ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
+            ---@[overload_call_arg(0, "gmod.network_var", "type")]
+            ---@[overload_call_arg(1, "gmod.network_var", "define")]
+            ---@overload fun(type: string, name: string, extended?: table)
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param type string
+            ---@param slot number
+            ---@[call_arg("gmod.network_var", "define")]
+            ---@param name string
+            ---@param extended? table
+            local function DefineNetworkVar(type, slot, name, extended)
+            end
+
+            function ENT:SetupDataTables()
+                DefineNetworkVar("Bool", "Active")
+                DefineNetworkVar("Float", 0, "Speed")
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("annotated_network_overload"));
+        for name in ["GetActive", "SetActive", "GetSpeed", "SetSpeed"] {
+            let member = db
+                .get_member_index()
+                .get_member_item(&owner, &LuaMemberKey::Name(name.into()));
+            assert!(
+                member.is_some(),
+                "expected annotated NetworkVar overload to synthesize {name}"
+            );
+        }
+    }
+
+    #[gtest]
     fn test_annotated_network_var_element_wrapper_synthesizes_number_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -1382,6 +1428,52 @@ mod test {
             matches!(value_type, LuaType::Number | LuaType::Integer),
             "NetworkVarElement wrapper should synthesize numeric getter, got {value_type:?}"
         );
+    }
+
+    #[gtest]
+    fn test_annotated_network_var_element_overload_roles_synthesize_omitted_slot_form() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/entities/annotated_network_element_overload/shared.lua",
+            r#"
+            ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
+            ---@[overload_call_arg(0, "gmod.network_var", "type")]
+            ---@[overload_call_arg(2, "gmod.network_var", "define_element")]
+            ---@overload fun(type: string, element: string, name: string, extended?: table)
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param type string
+            ---@param slot number
+            ---@param element string
+            ---@[call_arg("gmod.network_var", "define_element")]
+            ---@param name string
+            ---@param extended? table
+            local function DefineNetworkVarElement(type, slot, element, name, extended)
+            end
+
+            function ENT:SetupDataTables()
+                DefineNetworkVarElement("Vector", "x", "OffsetX")
+                DefineNetworkVarElement("Vector", 0, "y", "OffsetY")
+            end
+
+            local x = ENT:GetOffsetX()
+            local y = ENT:GetOffsetY()
+        "#,
+        );
+
+        for name in ["x", "y"] {
+            let value_type = local_name_type(&mut ws, file_id, name);
+            assert!(
+                matches!(value_type, LuaType::Number | LuaType::Integer),
+                "NetworkVarElement overload wrapper should synthesize numeric getter for {name}, got {value_type:?}"
+            );
+        }
     }
 
     #[gtest]

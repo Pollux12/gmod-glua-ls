@@ -34,6 +34,22 @@ end
 
 After this, `StartMessage("...")` gets the same net message lookup, completion, hover, and navigation as `net.Start("...")`. While the net system already does try to detect cases similar to the above code, this is more of an example of how it could be used to add detection for wrappers that aren't currently autodetected.
 
+For overloaded signatures, use `@overload_call_arg` directly above the `@overload` it describes:
+
+```lua
+---@[overload_call_arg(0, "gmod.network_var", "type")]
+---@[overload_call_arg(1, "gmod.network_var", "define")]
+---@overload fun(typeName: string, name: string, extended?: table)
+---@[call_arg("gmod.network_var", "type")]
+---@param typeName string
+---@param slot number
+---@[call_arg("gmod.network_var", "define")]
+---@param name string
+local function AddVar(typeName, slot, name) end
+```
+
+The first argument is the zero-based parameter index inside that overload.
+
 ---
 
 ## Supported roles
@@ -174,7 +190,7 @@ An optional third argument breaks ties when one parameter can inherit multiple r
 ---@param name string
 ```
 
-Higher priority wins. You normally do not need this unless you are annotating a function with overloads or a generic wrapper that can behave like several GMod APIs.
+Higher priority wins. You normally do not need this unless you are annotating a generic wrapper that can behave like several GMod APIs.
 
 ---
 

@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    AsyncState, DbIndex, FileId, InFiled, SemanticModel,
+    AsyncState, DbIndex, FileId, InFiled, LuaCallArgRole, SemanticModel,
     db_index::{LuaMemberKey, LuaSignatureId, r#type::type_visit_trait::TypeVisitTrait},
     first_param_may_not_self,
 };
@@ -733,6 +733,7 @@ pub struct LuaFunctionType {
     is_variadic: bool,
     params: Vec<(String, Option<LuaType>)>,
     optional_params: Vec<bool>,
+    call_arg_roles: Vec<LuaCallArgRole>,
     ret: LuaType,
 }
 
@@ -765,6 +766,7 @@ impl LuaFunctionType {
             is_variadic,
             params,
             optional_params,
+            call_arg_roles: Vec::new(),
             ret,
         }
     }
@@ -773,6 +775,15 @@ impl LuaFunctionType {
         self.optional_params = optional_params;
         self.optional_params.resize(self.params.len(), false);
         self
+    }
+
+    pub fn with_call_arg_roles(mut self, call_arg_roles: Vec<LuaCallArgRole>) -> Self {
+        self.call_arg_roles = call_arg_roles;
+        self
+    }
+
+    pub fn get_call_arg_roles(&self) -> &[LuaCallArgRole] {
+        &self.call_arg_roles
     }
 
     pub fn get_async_state(&self) -> AsyncState {

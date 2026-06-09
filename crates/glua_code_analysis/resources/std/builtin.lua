@@ -208,6 +208,16 @@
 --- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
 ---@attribute call_arg(domain: string, role: string, priority: integer?)
 
+--- Marks a parameter inside the following `@overload` function type as carrying call-site
+--- metadata.
+---
+--- Parameters:
+--- - `param`: Zero-based overload parameter index.
+--- - `domain`: Stable namespace for the metadata, such as `gmod.network_var`.
+--- - `role`: Meaning of this parameter in that domain, such as `define`.
+--- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
+---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
 ---
 --- Associates `getter` and `setter` methods with a field. Currently provides only definition navigation functionality,
 --- and the target methods must reside within the same class.

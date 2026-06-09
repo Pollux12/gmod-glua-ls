@@ -428,6 +428,7 @@ fn infer_unary_type(ctx: DocTypeInferContext<'_>, unary_type: &LuaDocUnaryType) 
 
 fn infer_func_type(ctx: DocTypeInferContext<'_>, func: &LuaDocFuncType) -> LuaType {
     let mut params_result = Vec::new();
+    let mut optional_params = Vec::new();
     let mut is_variadic = false;
     for param in func.get_params() {
         let name = if let Some(param) = param.get_name_token() {
@@ -451,6 +452,7 @@ fn infer_func_type(ctx: DocTypeInferContext<'_>, func: &LuaDocFuncType) -> LuaTy
             None
         };
 
+        optional_params.push(nullable && name != "...");
         params_result.push((name, type_ref));
     }
 
@@ -495,6 +497,7 @@ fn infer_func_type(ctx: DocTypeInferContext<'_>, func: &LuaDocFuncType) -> LuaTy
             params_result,
             return_type,
         )
+        .with_optional_params(optional_params)
         .into(),
     )
 }

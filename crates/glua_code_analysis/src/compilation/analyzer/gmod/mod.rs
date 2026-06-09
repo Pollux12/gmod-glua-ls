@@ -17,9 +17,9 @@ use crate::{
     EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodDermaSkinCallRoles,
     GmodNamedStringCallRoles, GmodNetworkVarCallRoles, GmodScriptedClassCallKind,
     GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, GmodVguiPanelCallRoles, InFiled,
-    LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaMember,
-    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeCache,
-    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
+    LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclLocation, LuaDeclTypeKind,
+    LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature,
+    LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -4136,6 +4136,10 @@ struct AnnotatedGmodCallRoleMap<'a> {
 #[derive(Clone, Default)]
 struct AnnotatedGmodCallRoles {
     is_colon_define: bool,
+    params: Vec<Option<LuaType>>,
+    optional_params: Vec<bool>,
+    is_variadic: bool,
+    overloads: Vec<AnnotatedGmodCallRoles>,
     system_roles: Vec<(GmodSystemCallKind, usize, i64)>,
     system_callback_roles: Vec<(GmodSystemCallKind, usize, i64)>,
     hook_roles: Vec<(GmodHookKind, usize, i64)>,
@@ -4152,6 +4156,253 @@ struct AnnotatedGmodCallRoles {
 }
 
 impl AnnotatedGmodCallRoles {
+    fn from_signature_shape(signature: &LuaSignature) -> Self {
+        Self {
+            is_colon_define: signature.is_colon_define,
+            params: signature
+                .params
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| {
+                    signature
+                        .param_docs
+                        .get(&idx)
+                        .map(|param| param.type_ref.clone())
+                })
+                .collect(),
+            optional_params: signature.get_param_optional_flags(),
+            is_variadic: signature.is_vararg,
+            ..Self::default()
+        }
+    }
+
+    fn from_function_shape(func: &LuaFunctionType) -> Self {
+        Self {
+            is_colon_define: func.is_colon_define(),
+            params: func
+                .get_params()
+                .iter()
+                .map(|(_, typ)| typ.clone())
+                .collect(),
+            optional_params: func.get_optional_params().to_vec(),
+            is_variadic: func.is_variadic(),
+            ..Self::default()
+        }
+    }
+
+    fn add_call_arg_role(&mut self, role: &LuaCallArgRole) {
+        let priority = role.priority.unwrap_or(0);
+        match (role.domain.as_str(), role.role.as_str()) {
+            ("gmod.net_message", "define") => self.system_roles.push((
+                GmodSystemCallKind::AddNetworkString,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.net_message", "start") => {
+                self.system_roles
+                    .push((GmodSystemCallKind::NetStart, role.param_idx, priority));
+            }
+            ("gmod.net_message", "receive") => {
+                self.system_roles
+                    .push((GmodSystemCallKind::NetReceive, role.param_idx, priority));
+            }
+            ("gmod.net_message", "callback") => self.system_callback_roles.push((
+                GmodSystemCallKind::NetReceive,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.concommand", "define") => self.system_roles.push((
+                GmodSystemCallKind::ConcommandAdd,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.concommand", "callback") => self.system_callback_roles.push((
+                GmodSystemCallKind::ConcommandAdd,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.convar", "define") | ("gmod.convar", "define_server") => self
+                .system_roles
+                .push((GmodSystemCallKind::CreateConVar, role.param_idx, priority)),
+            ("gmod.convar", "define_client") => self.system_roles.push((
+                GmodSystemCallKind::CreateClientConVar,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.timer", "define") => {
+                self.system_roles
+                    .push((GmodSystemCallKind::TimerCreate, role.param_idx, priority))
+            }
+            ("gmod.timer", "callback") => self.system_callback_roles.push((
+                GmodSystemCallKind::TimerCreate,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.timer", "simple") => self.system_callback_roles.push((
+                GmodSystemCallKind::TimerSimple,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.hook", "add") => {
+                self.hook_roles
+                    .push((GmodHookKind::Add, role.param_idx, priority))
+            }
+            ("gmod.hook", "emit") => {
+                self.hook_roles
+                    .push((GmodHookKind::Emit, role.param_idx, priority))
+            }
+            ("gmod.hook", "callback") => {
+                self.hook_callback_roles.push((role.param_idx, priority));
+            }
+            ("gmod.class_base", "reference") => self.inheritance_roles.push((
+                GmodScriptedClassCallKind::DefineBaseClass,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.gamemode", "reference") => self.inheritance_roles.push((
+                GmodScriptedClassCallKind::DeriveGamemode,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.network_var", "type") => {
+                self.network_var_type_roles.push((role.param_idx, priority));
+            }
+            ("gmod.network_var", "define") => {
+                self.network_var_kind = self
+                    .network_var_kind
+                    .or(Some(GmodScriptedClassCallKind::NetworkVar));
+                self.network_var_define_roles
+                    .push((role.param_idx, priority));
+            }
+            ("gmod.network_var", "define_element") => {
+                self.network_var_kind = Some(GmodScriptedClassCallKind::NetworkVarElement);
+                self.network_var_define_roles
+                    .push((role.param_idx, priority));
+            }
+            ("gmod.vgui_panel", "define") => {
+                self.vgui_panel_kind = self
+                    .vgui_panel_kind
+                    .or(Some(GmodScriptedClassCallKind::VguiRegister));
+                self.vgui_panel_define_roles
+                    .push((role.param_idx, priority));
+            }
+            ("gmod.vgui_panel", "define_control") => {
+                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::DermaDefineControl);
+                self.vgui_panel_define_roles
+                    .push((role.param_idx, priority));
+            }
+            ("gmod.vgui_panel", "table") => {
+                self.vgui_panel_table_roles.push((role.param_idx, priority));
+            }
+            ("gmod.vgui_panel", "base") => {
+                self.vgui_panel_base_roles.push((role.param_idx, priority));
+            }
+            ("gmod.derma_skin", "define") => {
+                self.derma_skin_define_roles
+                    .push((role.param_idx, priority));
+            }
+            _ => {}
+        }
+    }
+
+    fn sort_roles(&mut self) {
+        self.system_roles
+            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.system_callback_roles
+            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.hook_roles
+            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.hook_callback_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.inheritance_roles
+            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.network_var_type_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.network_var_define_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.vgui_panel_define_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.vgui_panel_table_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.vgui_panel_base_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.derma_skin_define_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+    }
+
+    fn has_any_roles(&self) -> bool {
+        !self.system_roles.is_empty()
+            || !self.system_callback_roles.is_empty()
+            || !self.hook_roles.is_empty()
+            || !self.hook_callback_roles.is_empty()
+            || !self.inheritance_roles.is_empty()
+            || !self.network_var_define_roles.is_empty()
+            || !self.vgui_panel_define_roles.is_empty()
+            || !self.derma_skin_define_roles.is_empty()
+    }
+
+    fn select_for_call(&self, call_expr: &LuaCallExpr) -> Option<AnnotatedGmodCallRoles> {
+        let mut best_roles = None;
+        let mut best_score = i32::MIN;
+
+        for roles in std::iter::once(self).chain(self.overloads.iter()) {
+            let Some(score) = roles.match_score(call_expr) else {
+                continue;
+            };
+            if score > best_score {
+                best_score = score;
+                best_roles = Some(roles.clone_without_overloads());
+            }
+        }
+
+        best_roles.or_else(|| Some(self.clone_without_overloads()))
+    }
+
+    fn clone_without_overloads(&self) -> AnnotatedGmodCallRoles {
+        let mut roles = self.clone();
+        roles.overloads.clear();
+        roles
+    }
+
+    fn match_score(&self, call_expr: &LuaCallExpr) -> Option<i32> {
+        if self.params.is_empty() && self.optional_params.is_empty() && !self.is_variadic {
+            return Some(0);
+        }
+
+        let args = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
+        let effective_arg_count =
+            args.len() + usize::from(call_expr.is_colon_call() && !self.is_colon_define);
+        let required_count = self
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !self.optional_params.get(*idx).copied().unwrap_or(false))
+            .count();
+
+        if effective_arg_count < required_count {
+            return None;
+        }
+        if !self.is_variadic && effective_arg_count > self.params.len() {
+            return None;
+        }
+
+        let first_param_offset = usize::from(call_expr.is_colon_call() && !self.is_colon_define);
+        let mut score = 0;
+        for (arg_idx, arg) in args.iter().enumerate() {
+            let param_idx = arg_idx + first_param_offset;
+            let Some(Some(param_type)) = self.params.get(param_idx) else {
+                continue;
+            };
+            match static_arg_matches_type(arg, param_type) {
+                StaticArgTypeMatch::Match => score += 2,
+                StaticArgTypeMatch::Unknown => {}
+                StaticArgTypeMatch::Mismatch => return None,
+            }
+        }
+
+        Some(score)
+    }
+
     fn system_call_site(&self) -> Option<GmodSystemCallSite> {
         if let Some((kind, name_arg_idx, _)) = self.system_roles.first() {
             return Some(GmodSystemCallSite {
@@ -4293,6 +4544,124 @@ fn param_idx_to_call_arg_idx(
         param_idx.checked_sub(1)
     } else {
         Some(param_idx)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticArgTypeMatch {
+    Match,
+    Mismatch,
+    Unknown,
+}
+
+fn static_arg_matches_type(arg: &LuaExpr, param_type: &LuaType) -> StaticArgTypeMatch {
+    let Some(kind) = static_arg_kind(arg) else {
+        return StaticArgTypeMatch::Unknown;
+    };
+
+    static_arg_kind_matches_type(kind, param_type)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticArgKind {
+    String,
+    Number,
+    Boolean,
+    Table,
+    Function,
+    Nil,
+}
+
+fn static_arg_kind(arg: &LuaExpr) -> Option<StaticArgKind> {
+    match arg {
+        LuaExpr::LiteralExpr(literal) => match literal.get_literal()? {
+            LuaLiteralToken::String(_) => Some(StaticArgKind::String),
+            LuaLiteralToken::Number(_) => Some(StaticArgKind::Number),
+            LuaLiteralToken::Bool(_) => Some(StaticArgKind::Boolean),
+            LuaLiteralToken::Nil(_) => Some(StaticArgKind::Nil),
+            LuaLiteralToken::Dots(_) | LuaLiteralToken::Question(_) => None,
+        },
+        LuaExpr::TableExpr(_) => Some(StaticArgKind::Table),
+        LuaExpr::ClosureExpr(_) => Some(StaticArgKind::Function),
+        _ => None,
+    }
+}
+
+fn static_arg_kind_matches_type(kind: StaticArgKind, param_type: &LuaType) -> StaticArgTypeMatch {
+    match param_type {
+        LuaType::Any | LuaType::Unknown => StaticArgTypeMatch::Unknown,
+        LuaType::String | LuaType::StringConst(_) | LuaType::DocStringConst(_) => {
+            match_bool(kind == StaticArgKind::String)
+        }
+        LuaType::Number
+        | LuaType::Integer
+        | LuaType::IntegerConst(_)
+        | LuaType::DocIntegerConst(_) => match_bool(kind == StaticArgKind::Number),
+        LuaType::Boolean | LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_) => {
+            match_bool(kind == StaticArgKind::Boolean)
+        }
+        LuaType::Table | LuaType::Object(_) | LuaType::TableConst(_) => {
+            match_bool(kind == StaticArgKind::Table)
+        }
+        LuaType::DocFunction(_) | LuaType::Signature(_) | LuaType::Function => {
+            match_bool(kind == StaticArgKind::Function)
+        }
+        LuaType::Nil => match_bool(kind == StaticArgKind::Nil),
+        LuaType::Union(union) => {
+            let mut saw_unknown = false;
+            for typ in union.into_vec() {
+                match static_arg_kind_matches_type(kind, &typ) {
+                    StaticArgTypeMatch::Match => return StaticArgTypeMatch::Match,
+                    StaticArgTypeMatch::Unknown => saw_unknown = true,
+                    StaticArgTypeMatch::Mismatch => {}
+                }
+            }
+            if saw_unknown {
+                StaticArgTypeMatch::Unknown
+            } else {
+                StaticArgTypeMatch::Mismatch
+            }
+        }
+        LuaType::MultiLineUnion(union) => {
+            let mut saw_unknown = false;
+            for (typ, _) in union.get_unions() {
+                match static_arg_kind_matches_type(kind, typ) {
+                    StaticArgTypeMatch::Match => return StaticArgTypeMatch::Match,
+                    StaticArgTypeMatch::Unknown => saw_unknown = true,
+                    StaticArgTypeMatch::Mismatch => {}
+                }
+            }
+            if saw_unknown {
+                StaticArgTypeMatch::Unknown
+            } else {
+                StaticArgTypeMatch::Mismatch
+            }
+        }
+        LuaType::TypeGuard(inner) => static_arg_kind_matches_type(kind, inner),
+        LuaType::TableOf(inner) => static_arg_kind_matches_type(kind, inner),
+        LuaType::Instance(instance) => static_arg_kind_matches_type(kind, instance.get_base()),
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            crate::db_index::VariadicType::Base(inner) => static_arg_kind_matches_type(kind, inner),
+            crate::db_index::VariadicType::Multi(types) => {
+                if types
+                    .iter()
+                    .any(|typ| static_arg_kind_matches_type(kind, typ) == StaticArgTypeMatch::Match)
+                {
+                    StaticArgTypeMatch::Match
+                } else {
+                    StaticArgTypeMatch::Unknown
+                }
+            }
+        },
+        _ => StaticArgTypeMatch::Unknown,
+    }
+}
+
+fn match_bool(matches: bool) -> StaticArgTypeMatch {
+    if matches {
+        StaticArgTypeMatch::Match
+    } else {
+        StaticArgTypeMatch::Mismatch
     }
 }
 
@@ -4592,7 +4961,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         if let Some(local_path_roles) =
             annotated_roles_from_local_call_path(self, db, file_id, call_expr, call_path)
         {
-            return local_path_roles;
+            return local_path_roles.and_then(|roles| roles.select_for_call(call_expr));
         }
 
         if self.global_roles.contains(call_path) {
@@ -4602,14 +4971,17 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
                 file_id,
                 call_expr.get_prefix_expr(),
             ) {
-                return local_roles;
+                return local_roles.and_then(|roles| roles.select_for_call(call_expr));
             }
 
             if call_expr_has_shadowing_local_root(db, file_id, call_expr) {
                 return None;
             }
 
-            return self.global_roles.get(call_path);
+            return self
+                .global_roles
+                .get(call_path)
+                .and_then(|roles| roles.select_for_call(call_expr));
         }
 
         if !self.local_candidate_names.contains(call_path) {
@@ -4617,6 +4989,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         }
 
         annotated_roles_from_local_call_prefix(self, db, file_id, call_expr.get_prefix_expr())?
+            .and_then(|roles| roles.select_for_call(call_expr))
     }
 }
 
@@ -4629,173 +5002,28 @@ fn roles_from_signature(
         return None;
     }
 
-    let mut roles = AnnotatedGmodCallRoles {
-        is_colon_define: signature.is_colon_define,
-        ..AnnotatedGmodCallRoles::default()
-    };
+    let mut roles = AnnotatedGmodCallRoles::from_signature_shape(signature);
     for role in signature.call_arg_roles() {
-        let priority = role.priority.unwrap_or(0);
-        match (role.domain.as_str(), role.role.as_str()) {
-            ("gmod.net_message", "define") => roles.system_roles.push((
-                GmodSystemCallKind::AddNetworkString,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.net_message", "start") => {
-                roles
-                    .system_roles
-                    .push((GmodSystemCallKind::NetStart, role.param_idx, priority))
-            }
-            ("gmod.net_message", "receive") => {
-                roles
-                    .system_roles
-                    .push((GmodSystemCallKind::NetReceive, role.param_idx, priority))
-            }
-            ("gmod.net_message", "callback") => roles.system_callback_roles.push((
-                GmodSystemCallKind::NetReceive,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.concommand", "define") => roles.system_roles.push((
-                GmodSystemCallKind::ConcommandAdd,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.concommand", "callback") => roles.system_callback_roles.push((
-                GmodSystemCallKind::ConcommandAdd,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.convar", "define") | ("gmod.convar", "define_server") => roles
-                .system_roles
-                .push((GmodSystemCallKind::CreateConVar, role.param_idx, priority)),
-            ("gmod.convar", "define_client") => roles.system_roles.push((
-                GmodSystemCallKind::CreateClientConVar,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.timer", "define") => {
-                roles
-                    .system_roles
-                    .push((GmodSystemCallKind::TimerCreate, role.param_idx, priority))
-            }
-            ("gmod.timer", "callback") => roles.system_callback_roles.push((
-                GmodSystemCallKind::TimerCreate,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.timer", "simple") => roles.system_callback_roles.push((
-                GmodSystemCallKind::TimerSimple,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.hook", "add") => {
-                roles
-                    .hook_roles
-                    .push((GmodHookKind::Add, role.param_idx, priority))
-            }
-            ("gmod.hook", "emit") => {
-                roles
-                    .hook_roles
-                    .push((GmodHookKind::Emit, role.param_idx, priority))
-            }
-            ("gmod.hook", "callback") => roles.hook_callback_roles.push((role.param_idx, priority)),
-            ("gmod.class_base", "reference") => roles.inheritance_roles.push((
-                GmodScriptedClassCallKind::DefineBaseClass,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.gamemode", "reference") => roles.inheritance_roles.push((
-                GmodScriptedClassCallKind::DeriveGamemode,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.network_var", "type") => roles
-                .network_var_type_roles
-                .push((role.param_idx, priority)),
-            ("gmod.network_var", "define") => {
-                roles.network_var_kind = roles
-                    .network_var_kind
-                    .or(Some(GmodScriptedClassCallKind::NetworkVar));
-                roles
-                    .network_var_define_roles
-                    .push((role.param_idx, priority));
-            }
-            ("gmod.network_var", "define_element") => {
-                roles.network_var_kind = Some(GmodScriptedClassCallKind::NetworkVarElement);
-                roles
-                    .network_var_define_roles
-                    .push((role.param_idx, priority));
-            }
-            ("gmod.vgui_panel", "define") => {
-                roles.vgui_panel_kind = roles
-                    .vgui_panel_kind
-                    .or(Some(GmodScriptedClassCallKind::VguiRegister));
-                roles
-                    .vgui_panel_define_roles
-                    .push((role.param_idx, priority));
-            }
-            ("gmod.vgui_panel", "define_control") => {
-                roles.vgui_panel_kind = Some(GmodScriptedClassCallKind::DermaDefineControl);
-                roles
-                    .vgui_panel_define_roles
-                    .push((role.param_idx, priority));
-            }
-            ("gmod.vgui_panel", "table") => roles
-                .vgui_panel_table_roles
-                .push((role.param_idx, priority)),
-            ("gmod.vgui_panel", "base") => {
-                roles.vgui_panel_base_roles.push((role.param_idx, priority))
-            }
-            ("gmod.derma_skin", "define") => roles
-                .derma_skin_define_roles
-                .push((role.param_idx, priority)),
-            _ => {}
+        roles.add_call_arg_role(&role);
+    }
+
+    for overload in &signature.overloads {
+        if overload.get_call_arg_roles().is_empty() {
+            continue;
+        }
+        let mut overload_roles = AnnotatedGmodCallRoles::from_function_shape(overload);
+        for role in overload.get_call_arg_roles() {
+            overload_roles.add_call_arg_role(role);
+        }
+        overload_roles.sort_roles();
+        if overload_roles.has_any_roles() {
+            roles.overloads.push(overload_roles);
         }
     }
-    roles
-        .system_roles
-        .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .system_callback_roles
-        .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .hook_roles
-        .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .hook_callback_roles
-        .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .inheritance_roles
-        .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .network_var_type_roles
-        .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .network_var_define_roles
-        .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .vgui_panel_define_roles
-        .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .vgui_panel_table_roles
-        .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .vgui_panel_base_roles
-        .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-    roles
-        .derma_skin_define_roles
-        .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
 
-    (!roles.system_roles.is_empty()
-        || !roles.system_callback_roles.is_empty()
-        || !roles.hook_roles.is_empty()
-        || !roles.hook_callback_roles.is_empty()
-        || !roles.inheritance_roles.is_empty()
-        || !roles.network_var_define_roles.is_empty()
-        || !roles.vgui_panel_define_roles.is_empty()
-        || !roles.derma_skin_define_roles.is_empty())
-    .then_some(roles)
+    roles.sort_roles();
+
+    (roles.has_any_roles() || !roles.overloads.is_empty()).then_some(roles)
 }
 
 fn closure_from_signature_id(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {

@@ -148,6 +148,7 @@ fn attribute_find_doc(comment: &LuaSyntaxNode) -> Option<LuaSyntaxNode> {
             match sibling.kind() {
                 LuaKind::Syntax(
                     LuaSyntaxKind::DocTagField
+                    | LuaSyntaxKind::DocTagOverload
                     | LuaSyntaxKind::DocTagParam
                     | LuaSyntaxKind::DocTagReturn,
                 ) => {
@@ -207,10 +208,17 @@ fn find_up_attribute(
 }
 
 pub fn find_attach_attribute(ast: LuaAst) -> Option<Vec<LuaDocTagAttributeUse>> {
-    if let LuaAst::LuaDocTagParam(param) = ast {
-        let mut result = Vec::new();
-        find_up_attribute(param.syntax(), &mut result, true);
-        return Some(result);
+    match ast {
+        LuaAst::LuaDocTagParam(param) => {
+            let mut result = Vec::new();
+            find_up_attribute(param.syntax(), &mut result, true);
+            Some(result)
+        }
+        LuaAst::LuaDocTagOverload(overload) => {
+            let mut result = Vec::new();
+            find_up_attribute(overload.syntax(), &mut result, true);
+            Some(result)
+        }
+        _ => None,
     }
-    None
 }

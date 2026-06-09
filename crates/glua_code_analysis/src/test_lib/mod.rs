@@ -38,6 +38,7 @@ pub struct DiagnosticSnapshot {
 pub const GMOD_CALL_ARG_BUILTINS_FIXTURE: &str = r#"
 ---@meta
 ---@attribute call_arg(domain: string, role: string, priority: integer?)
+---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
 
 util = util or {}
 net = net or {}
@@ -164,6 +165,9 @@ function derma.GetSkinTable() end
 ---@param skinName string
 function Panel:SetSkin(skinName) end
 
+---@[overload_call_arg(0, "gmod.network_var", "type")]
+---@[overload_call_arg(1, "gmod.network_var", "define")]
+---@overload fun(type: string, name: string, extended?: table)
 ---@[call_arg("gmod.network_var", "type")]
 ---@param type string
 ---@param slot number
@@ -172,13 +176,17 @@ function Panel:SetSkin(skinName) end
 ---@param extended? table
 function Entity:NetworkVar(type, slot, name, extended) end
 
+---@[overload_call_arg(0, "gmod.network_var", "type")]
+---@[overload_call_arg(2, "gmod.network_var", "define_element")]
+---@overload fun(type: string, element: string, name: string, extended?: table)
 ---@[call_arg("gmod.network_var", "type")]
 ---@param type string
 ---@param slot number
----@param element number
+---@param element string
 ---@[call_arg("gmod.network_var", "define_element")]
 ---@param name string
-function Entity:NetworkVarElement(type, slot, element, name) end
+---@param extended? table
+function Entity:NetworkVarElement(type, slot, element, name, extended) end
 "#;
 
 #[cfg(test)]

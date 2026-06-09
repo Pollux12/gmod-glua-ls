@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub const CALL_ARG_ATTRIBUTE: &str = "call_arg";
+pub const OVERLOAD_CALL_ARG_ATTRIBUTE: &str = "overload_call_arg";
 
 #[derive(Debug)]
 pub struct LuaSignature {
@@ -30,7 +31,7 @@ pub struct LuaSignature {
     pub is_vararg: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaCallArgRole {
     pub param_idx: usize,
     pub domain: String,
@@ -91,7 +92,10 @@ impl LuaSignature {
             param_info
                 .get_attribute_by_name(CALL_ARG_ATTRIBUTE)
                 .is_some()
-        })
+        }) || self
+            .overloads
+            .iter()
+            .any(|overload| !overload.get_call_arg_roles().is_empty())
     }
 
     pub fn call_arg_roles_for_param(&self, param_idx: usize) -> Vec<LuaCallArgRole> {
@@ -106,6 +110,13 @@ impl LuaSignature {
     {
         if let Some(param_info) = self.get_param_info_by_id(param_idx) {
             visit_call_arg_roles_from_param_attribute(param_idx, param_info, visitor);
+        }
+        for overload in &self.overloads {
+            for role in overload.get_call_arg_roles() {
+                if role.param_idx == param_idx {
+                    visitor(role);
+                }
+            }
         }
     }
 
@@ -123,6 +134,12 @@ impl LuaSignature {
             )
         });
         roles
+    }
+
+    pub fn overload_call_arg_roles(&self) -> impl Iterator<Item = &LuaCallArgRole> {
+        self.overloads
+            .iter()
+            .flat_map(|overload| overload.get_call_arg_roles().iter())
     }
 
     pub fn get_type_params(&self) -> Vec<(String, Option<LuaType>)> {

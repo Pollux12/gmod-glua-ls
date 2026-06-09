@@ -1413,6 +1413,45 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_vgui_panel_definition_from_overload_call_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                local PANEL = {}
+                vgui.Register("MyPanel", PANEL, "DPanel")
+            "#,
+        );
+        ws.def(
+            r#"
+                ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
+                ---@[overload_call_arg(0, "gmod.vgui_panel", "reference")]
+                ---@overload fun(className: string): Panel
+                ---@param panel Panel
+                function addPanel(panel) end
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                local pnl = addPanel("MyPa<??>nel")
+            "#,
+            vec![Expected {
+                file: "panels.lua".to_string(),
+                line: 2,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_vgui_panel_definition_from_annotated_define_arg() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

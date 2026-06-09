@@ -4,6 +4,7 @@ use glua_parser::{
     LuaDocTagReturn, LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType,
     LuaDocTypeFlag, LuaExpr, LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
 };
+use std::sync::Arc;
 
 use super::{
     DocAnalyzer, apply_nullable_doc_default, convert_doc_default_value,
@@ -19,8 +20,8 @@ use crate::{
     },
 };
 use crate::{
-    InFiled, JsonSchemaFile, LuaOperatorMetaMethod, LuaTypeCache, LuaTypeOwner, OperatorFunction,
-    ReturnTypeKind, SignatureReturnStatus,
+    InFiled, JsonSchemaFile, LuaCallArgRole, LuaOperatorMetaMethod, LuaTypeCache, LuaTypeOwner,
+    OVERLOAD_CALL_ARG_ATTRIBUTE, OperatorFunction, ReturnTypeKind, SignatureReturnStatus,
     compilation::analyzer::common::bind_type,
     db_index::{
         AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType,
@@ -452,12 +453,72 @@ pub fn analyze_overload(analyzer: &mut DocAnalyzer, tag: LuaDocTagOverload) -> O
     } else if let Some(closure) = find_owner_closure_or_report(analyzer, &tag) {
         let type_ref = infer_type(analyzer, tag.get_type()?);
         if let LuaType::DocFunction(func) = type_ref {
+            let func = if let Some(call_arg_roles) = overload_call_arg_roles(analyzer, &tag)
+                && !call_arg_roles.is_empty()
+            {
+                Arc::new(func.as_ref().clone().with_call_arg_roles(call_arg_roles))
+            } else {
+                func
+            };
             let id = LuaSignatureId::from_closure(analyzer.file_id, &closure);
             let signature = analyzer.db.get_signature_index_mut().get_or_create(id);
             signature.overloads.push(func);
         }
     }
     Some(())
+}
+
+fn overload_call_arg_roles(
+    analyzer: &mut DocAnalyzer,
+    tag: &LuaDocTagOverload,
+) -> Option<Vec<LuaCallArgRole>> {
+    let mut roles = Vec::new();
+    let attributes = find_attach_attribute(LuaAst::LuaDocTagOverload(tag.clone()))?;
+    for tag_use in attributes {
+        for attribute_use in infer_attribute_uses(analyzer, tag_use)? {
+            if attribute_use.id.get_name() != OVERLOAD_CALL_ARG_ATTRIBUTE {
+                continue;
+            }
+
+            let Some(LuaType::DocIntegerConst(param_idx) | LuaType::IntegerConst(param_idx)) =
+                attribute_use.get_param_by_name("param")
+            else {
+                continue;
+            };
+            let Some(domain) = attribute_string_param(&attribute_use, "domain") else {
+                continue;
+            };
+            let Some(role) = attribute_string_param(&attribute_use, "role") else {
+                continue;
+            };
+            let priority = match attribute_use.get_param_by_name("priority") {
+                Some(LuaType::DocIntegerConst(value) | LuaType::IntegerConst(value)) => {
+                    Some(*value)
+                }
+                _ => None,
+            };
+
+            let Ok(param_idx) = usize::try_from(*param_idx) else {
+                continue;
+            };
+
+            roles.push(LuaCallArgRole {
+                param_idx,
+                domain,
+                role,
+                priority,
+            });
+        }
+    }
+
+    Some(roles)
+}
+
+fn attribute_string_param(attribute_use: &LuaAttributeUse, name: &str) -> Option<String> {
+    match attribute_use.get_param_by_name(name)? {
+        LuaType::DocStringConst(value) | LuaType::StringConst(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 pub fn analyze_module(analyzer: &mut DocAnalyzer, tag: LuaDocTagModule) -> Option<()> {
