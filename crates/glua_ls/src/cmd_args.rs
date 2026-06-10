@@ -28,10 +28,6 @@ pub struct CmdArgs {
     #[cfg_attr(feature = "cli", structopt(long, default_value = "none"))]
     pub log_path: NoneableString,
 
-    /// Path to the resources and logs directory. Use 'none' to indicate that assets should not be output to the file system.
-    #[cfg_attr(feature = "cli", structopt(long, default_value = ""))]
-    pub resources_path: NoneableString,
-
     /// Whether to load the standard library.
     #[cfg_attr(feature = "cli", structopt(long, default_value = "true"))]
     pub load_stdlib: CmdBool,
@@ -170,5 +166,32 @@ impl From<Editor> for ClientId {
             Editor::Intellij => ClientId::Intellij,
             Editor::Neovim => ClientId::Neovim,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use googletest::prelude::*;
+    use std::str::FromStr;
+
+    #[gtest]
+    fn noneable_string_none_value_parses_to_none() {
+        let parsed = NoneableString::from_str("none").unwrap();
+        expect_that!(parsed.0, none());
+    }
+
+    #[gtest]
+    fn noneable_string_none_case_insensitive() {
+        let parsed = NoneableString::from_str("None").unwrap();
+        expect_that!(parsed.0, none());
+        let parsed2 = NoneableString::from_str("NONE").unwrap();
+        expect_that!(parsed2.0, none());
+    }
+
+    #[gtest]
+    fn noneable_string_non_none_value_parses_to_some() {
+        let parsed = NoneableString::from_str("/some/path").unwrap();
+        expect_that!(parsed.0, some(eq("/some/path")));
     }
 }

@@ -38,7 +38,7 @@ pub fn build_need_check_nil(
         };
 
         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: t!("use cast to remove nil").to_string(),
+            title: "use cast to remove nil".to_string(),
             kind: Some(CodeActionKind::QUICKFIX),
             edit: Some(WorkspaceEdit {
                 changes: Some(HashMap::from([(document.get_uri(), vec![text_edit])])),
@@ -63,10 +63,10 @@ pub fn build_add_doc_tag(
 
     let tag_name = data.as_str()?;
     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-        title: t!("Add @%{name} to the list of known tags", name = tag_name).to_string(),
+        title: format!("Add @{tag_name} to the list of known tags"),
         kind: Some(CodeActionKind::QUICKFIX),
         command: Some(make_auto_doc_tag_command(
-            t!("Add @%{name} to the list of known tags", name = tag_name).as_ref(),
+            format!("Add @{tag_name} to the list of known tags").as_ref(),
             tag_name,
         )),
 
@@ -173,7 +173,7 @@ fn push_gmod_null_check_action(
     let text_edit = TextEdit { range, new_text };
 
     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-        title: t!("Use IsValid(...) for GMod NULL check").to_string(),
+        title: "Use IsValid(...) for GMod NULL check".to_string(),
         kind: Some(CodeActionKind::QUICKFIX),
         edit: Some(WorkspaceEdit {
             changes: Some(HashMap::from([(document.get_uri(), vec![text_edit])])),
@@ -197,7 +197,7 @@ pub fn build_preferred_local_alias_fix(
     };
 
     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-        title: t!("Replace with local alias '%{name}'", name = alias_name).to_string(),
+        title: format!("Replace with local alias '{alias_name}'"),
         kind: Some(CodeActionKind::QUICKFIX),
         edit: Some(WorkspaceEdit {
             changes: Some(HashMap::from([(document.get_uri(), vec![text_edit])])),

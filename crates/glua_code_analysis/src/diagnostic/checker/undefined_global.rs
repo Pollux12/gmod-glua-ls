@@ -728,7 +728,7 @@ fn check_name_expr(
         context.add_diagnostic(
             undefined_global_diagnostic_code(name_range, silent_use_ranges),
             name_range,
-            t!("undefined global variable: %{name}", name = name_text).to_string(),
+            format!("undefined global variable: {name}", name = name_text).to_string(),
             None,
         );
         return Some(());
@@ -808,7 +808,7 @@ fn check_name_expr(
     context.add_diagnostic(
         diag_code,
         name_range,
-        t!("undefined global variable: %{name}", name = name_text).to_string(),
+        format!("undefined global variable: {name}", name = name_text).to_string(),
         None,
     );
 

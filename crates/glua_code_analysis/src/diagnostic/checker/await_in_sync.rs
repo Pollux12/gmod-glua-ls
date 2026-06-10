@@ -357,7 +357,7 @@ fn check_call_in_async(
             context.add_diagnostic(
                 DiagnosticCode::AwaitInSync,
                 prefix_expr.get_range(),
-                t!("Async function can only be called in async function.").to_string(),
+                "Async function can only be called in async function.".to_string(),
                 None,
             );
         }
@@ -475,7 +475,7 @@ fn check_call_as_arg(
                         context.add_diagnostic(
                             DiagnosticCode::AwaitInSync,
                             arg.get_range(),
-                            t!("Async function can only be called in async function.").to_string(),
+                            "Async function can only be called in async function.".to_string(),
                             None,
                         );
                     }

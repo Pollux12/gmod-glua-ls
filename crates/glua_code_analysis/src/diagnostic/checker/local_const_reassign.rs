@@ -48,7 +48,7 @@ fn check_local_const_reassign(
                     context.add_diagnostic(
                         DiagnosticCode::LocalConstReassign,
                         decl_ref.range,
-                        t!("Cannot reassign to a constant variable").to_string(),
+                        "Cannot reassign to a constant variable".to_string(),
                         None,
                     );
                 }
@@ -56,7 +56,7 @@ fn check_local_const_reassign(
                     context.add_diagnostic(
                         DiagnosticCode::IterVariableReassign,
                         decl_ref.range,
-                        t!("Should not reassign to iter variable").to_string(),
+                        "Should not reassign to iter variable".to_string(),
                         None,
                     );
                 }

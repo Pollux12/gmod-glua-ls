@@ -61,11 +61,7 @@ pub fn float_token_value(token: &LuaSyntaxToken) -> Result<f64, LuaParseError> {
         let mut value = float_part.parse::<f64>().map_err(|e| {
             LuaParseError::new(
                 LuaParseErrorKind::SyntaxError,
-                &t!(
-                    "The float literal '%{text}' is invalid, %{err}",
-                    text = text,
-                    err = e
-                ),
+                &format!("The float literal '{}' is invalid, {}", text, e),
                 token.text_range(),
             )
         })?;
@@ -240,17 +236,13 @@ pub fn int_token_value(token: &LuaSyntaxToken) -> Result<NumberResult, LuaParseE
 
                 Err(LuaParseError::new(
                     LuaParseErrorKind::SyntaxError,
-                    &t!("malformed number"),
+                    "malformed number",
                     token.text_range(),
                 ))
             } else {
                 Err(LuaParseError::new(
                     LuaParseErrorKind::SyntaxError,
-                    &t!(
-                        "Failed to parse integer literal %{text}: %{err}",
-                        text = token.text(),
-                        err = e
-                    ),
+                    &format!("Failed to parse integer literal {}: {}", token.text(), e),
                     token.text_range(),
                 ))
             }

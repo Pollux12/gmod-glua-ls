@@ -185,7 +185,7 @@ fn check_decl_duplicate_field(
                 context.add_diagnostic(
                     DiagnosticCode::DuplicateSetField,
                     signature.member.get_range(),
-                    t!("Duplicate field `%{name}`.", name = key.to_path()).to_string(),
+                    format!("Duplicate field `{name}`.", name = key.to_path()).to_string(),
                     None,
                 );
             }
@@ -214,7 +214,7 @@ fn check_decl_duplicate_field(
                             DiagnosticCode::DuplicateDocField,
                             // TODO: 范围缩小到名称而不是整个 ---@field
                             field_decl.member.get_range(),
-                            t!("Duplicate field `%{name}`.", name = key.to_path()).to_string(),
+                            format!("Duplicate field `{name}`.", name = key.to_path()).to_string(),
                             None,
                         );
                     }
@@ -289,7 +289,7 @@ fn check_one_member(
         context.add_diagnostic(
             DiagnosticCode::DuplicateSetField,
             in_filed.value.get_range(),
-            t!("Duplicate field `%{name}`.", name = key.to_path()).to_string(),
+            format!("Duplicate field `{name}`.", name = key.to_path()).to_string(),
             None,
         );
     }

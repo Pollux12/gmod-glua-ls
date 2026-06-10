@@ -29,36 +29,36 @@ pub fn parse_chunk(p: &mut LuaParser) {
             // Provide more detailed error information
             let error_msg = match p.current_token() {
                 LuaTokenKind::TkRightBrace => {
-                    t!("unexpected '}' - missing opening '{{' or extra closing brace")
+                    "unexpected '}' - missing opening '{' or extra closing brace".to_string()
                 }
                 LuaTokenKind::TkRightParen => {
-                    t!("unexpected ')' - missing opening '(' or extra closing parenthesis")
+                    "unexpected ')' - missing opening '(' or extra closing parenthesis".to_string()
                 }
                 LuaTokenKind::TkRightBracket => {
-                    t!("unexpected ']' - missing opening '[' or extra closing bracket")
+                    "unexpected ']' - missing opening '[' or extra closing bracket".to_string()
                 }
                 LuaTokenKind::TkElse => {
-                    t!("unexpected 'else' - missing corresponding 'if' statement")
+                    "unexpected 'else' - missing corresponding 'if' statement".to_string()
                 }
                 LuaTokenKind::TkElseIf => {
-                    t!("unexpected 'elseif' - missing corresponding 'if' statement")
+                    "unexpected 'elseif' - missing corresponding 'if' statement".to_string()
                 }
                 LuaTokenKind::TkEnd => {
-                    t!("unexpected 'end' - missing corresponding block statement")
+                    "unexpected 'end' - missing corresponding block statement".to_string()
                 }
                 LuaTokenKind::TkUntil => {
-                    t!("unexpected 'until' - missing corresponding 'repeat' statement")
+                    "unexpected 'until' - missing corresponding 'repeat' statement".to_string()
                 }
                 LuaTokenKind::TkThen => {
-                    t!("unexpected 'then' - missing corresponding 'if' statement")
+                    "unexpected 'then' - missing corresponding 'if' statement".to_string()
                 }
                 LuaTokenKind::TkDo => {
-                    t!("unexpected 'do' - missing corresponding loop statement")
+                    "unexpected 'do' - missing corresponding loop statement".to_string()
                 }
                 _ => {
-                    t!(
-                        "unexpected token '%{token}' - expected statement",
-                        token = p.current_token()
+                    format!(
+                        "unexpected token '{}' - expected statement",
+                        p.current_token()
                     )
                 }
             };

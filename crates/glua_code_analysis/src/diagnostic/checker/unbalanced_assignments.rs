@@ -73,7 +73,7 @@ fn check_unbalanced_assignment(
             context.add_diagnostic(
                 DiagnosticCode::UnbalancedAssignments,
                 var.get_range(),
-                t!("The value is assigned as `nil` because the number of values is not enough.")
+                "The value is assigned as `nil` because the number of values is not enough."
                     .to_string(),
                 None,
             );

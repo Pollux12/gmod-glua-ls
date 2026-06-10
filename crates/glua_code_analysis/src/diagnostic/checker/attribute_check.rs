@@ -87,8 +87,8 @@ fn check_param_count(
                     Some(arg) => arg.get_range(),
                     None => attribute_use.get_range(),
                 },
-                t!(
-                    "expected %{num} parameters but found %{found_num}",
+                format!(
+                    "expected {num} parameters but found {found_num}",
                     num = def_params.len(),
                     found_num = call_args_count
                 )
@@ -109,8 +109,8 @@ fn check_param_count(
             context.add_diagnostic(
                 DiagnosticCode::AttributeRedundantParameter,
                 arg.get_range(),
-                t!(
-                    "expected %{num} parameters but found %{found_num}",
+                format!(
+                    "expected {num} parameters but found {found_num}",
                     num = def_params.len(),
                     found_num = call_args_count
                 )
@@ -200,8 +200,8 @@ fn add_type_check_diagnostic(
             context.add_diagnostic(
                 DiagnosticCode::AttributeParamTypeMismatch,
                 range,
-                t!(
-                    "expected `%{source}` but found `%{found}`. %{reason}",
+                format!(
+                    "expected `{source}` but found `{found}`. {reason}",
                     source = humanize_lint_type(db, param_type),
                     found = humanize_lint_type(db, expr_type),
                     reason = reason_message

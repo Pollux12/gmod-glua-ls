@@ -46,7 +46,7 @@ fn check_tag(
         context.add_diagnostic(
             DiagnosticCode::UnknownDocTag,
             token.get_range(),
-            t!("Unknown doc tag: `%{name}`", name = token.get_text()).to_string(),
+            format!("Unknown doc tag: `{name}`", name = token.get_text()).to_string(),
             Some(Value::String(token.get_text().to_string())),
         );
     }

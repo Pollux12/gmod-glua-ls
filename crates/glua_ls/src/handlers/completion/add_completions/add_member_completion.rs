@@ -595,7 +595,7 @@ fn try_add_alias_completion_item_new(
     ));
 
     // 更新 label_details 添加别名提示
-    let index_hint = t!("completion.index %{label}", label = label).to_string();
+    let index_hint = format!("index {label}");
     let label_details = alias_completion_item
         .label_details
         .get_or_insert_with(Default::default);

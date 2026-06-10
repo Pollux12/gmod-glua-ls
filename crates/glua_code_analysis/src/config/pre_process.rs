@@ -73,6 +73,15 @@ impl PreProcessContext {
 
         path = self.replace_placeholders(&path, workspace_str);
 
+        // Guard: after env-var expansion + placeholder replacement the path may
+        // be empty (e.g. unset `$GLUA_SNIPPETS_PATH` expanding to ""). An empty
+        // path would silently join to the workspace root and cause an unbounded
+        // re-scan of the entire workspace — return it empty so downstream
+        // ingestion filters can drop it.
+        if path.trim().is_empty() {
+            return path;
+        }
+
         if path.starts_with('~') {
             let home_dir = match dirs::home_dir() {
                 Some(path) => path,

@@ -93,15 +93,15 @@ fn check_normal_string_error(string_token: &LuaSyntaxToken) -> Result<(), String
                             let hex = chars.by_ref().take(2).collect::<String>();
                             if hex.len() == 2 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
                                 if u8::from_str_radix(&hex, 16).is_err() {
-                                    return Err(t!(
-                                        "Invalid hex escape sequence '\\x%{hex}'",
+                                    return Err(format!(
+                                        "Invalid hex escape sequence '\\x{hex}'",
                                         hex = hex
                                     )
                                     .to_string());
                                 }
                             } else {
-                                return Err(t!(
-                                    "Invalid hex escape sequence '\\x%{hex}'",
+                                return Err(format!(
+                                    "Invalid hex escape sequence '\\x{hex}'",
                                     hex = hex
                                 )
                                 .to_string());
@@ -115,8 +115,8 @@ fn check_normal_string_error(string_token: &LuaSyntaxToken) -> Result<(), String
                                 if let Ok(code_point) = u32::from_str_radix(&unicode_hex, 16)
                                     && std::char::from_u32(code_point).is_none()
                                 {
-                                    return Err(t!(
-                                        "Invalid unicode escape sequence '\\u{{%{unicode_hex}}}'",
+                                    return Err(format!(
+                                        "Invalid unicode escape sequence '\\u{{{unicode_hex}}}'",
                                         unicode_hex = unicode_hex
                                     )
                                     .to_string());
@@ -175,7 +175,7 @@ fn check_dots_literal_error(
                 context.add_diagnostic(
                     DiagnosticCode::SyntaxError,
                     literal_expr.get_range(),
-                    t!("Cannot use `...` outside a vararg function.").to_string(),
+                    "Cannot use `...` outside a vararg function.".to_string(),
                     None,
                 );
             }

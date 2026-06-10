@@ -119,14 +119,14 @@ fn add_cast_type_mismatch_diagnostic(
                 TypeCheckFailReason::TypeNotMatch | TypeCheckFailReason::DonotCheck => {
                     "".to_string()
                 }
-                TypeCheckFailReason::TypeRecursion => t!("type recursion").to_string(),
+                TypeCheckFailReason::TypeRecursion => "type recursion".to_string(),
             };
 
             context.add_diagnostic(
                 DiagnosticCode::CastTypeMismatch,
                 range,
-                t!(
-                    "Cannot cast `%{original}` to `%{target}`. %{reason}",
+                format!(
+                    "Cannot cast `{original}` to `{target}`. {reason}",
                     original = humanize_lint_type(db, origin_type),
                     target = humanize_lint_type(db, target_type),
                     reason = reason_message

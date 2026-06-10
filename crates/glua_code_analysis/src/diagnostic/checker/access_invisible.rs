@@ -177,8 +177,8 @@ fn report_reason(
         let version_number = emmyrc.runtime.version.to_lua_version_number();
         let visible = version_conds.iter().any(|cond| cond.check(&version_number));
         if !visible {
-            let message = t!(
-                "The current Lua version %{version} is not accessible; expected %{conds}.",
+            let message = format!(
+                "The current Lua version {version} is not accessible; expected {conds}.",
                 version = version_number,
                 conds = version_conds
                     .iter()
@@ -199,16 +199,17 @@ fn report_reason(
 
     let message = match property.visibility {
         VisibilityKind::Protected => {
-            t!("The property is protected and cannot be accessed outside its subclasses.")
+            "The property is protected and cannot be accessed outside its subclasses.".to_string()
         }
         VisibilityKind::Private => {
-            t!("The property is private and cannot be accessed outside the class.")
+            "The property is private and cannot be accessed outside the class.".to_string()
         }
         VisibilityKind::Package => {
-            t!("The property is package-private and cannot be accessed outside the package.")
+            "The property is package-private and cannot be accessed outside the package."
+                .to_string()
         }
         VisibilityKind::Internal => {
-            t!("The property is internal and cannot be accessed outside the module.")
+            "The property is internal and cannot be accessed outside the module.".to_string()
         }
         _ => {
             return None;

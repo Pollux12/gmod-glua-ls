@@ -76,9 +76,9 @@ pub async fn on_did_rename_files_handler(
 
             let show_message_params = ShowMessageRequestParams {
                 typ: MessageType::INFO,
-                message: t!("Do you want to modify the require path?").to_string(),
+                message: "Do you want to modify the require path?".to_string(),
                 actions: Some(vec![MessageActionItem {
-                    title: t!("Modify").to_string(),
+                    title: "Modify".to_string(),
                     properties: HashMap::new(),
                 }]),
             };
@@ -90,7 +90,7 @@ pub async fn on_did_rename_files_handler(
                 .await
             {
                 let cancel_token = CancellationToken::new();
-                if selected_action.title == t!("Modify") {
+                if selected_action.title == "Modify" {
                     client
                         .apply_edit(
                             ApplyWorkspaceEditParams {

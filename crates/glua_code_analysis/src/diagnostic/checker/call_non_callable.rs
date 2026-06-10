@@ -58,15 +58,15 @@ fn check_call_expr(
     }
 
     let message = if !non_callable_types.is_empty() {
-        t!(
-            "Cannot call expression of type `%{full}`; non-callable type(s): %{types}.",
+        format!(
+            "Cannot call expression of type `{full}`; non-callable type(s): {types}.",
             full = humanize_type(db, &call_expr_type, RenderLevel::Detailed),
             types = non_callable_types.join(", "),
         )
         .to_string()
     } else {
-        t!(
-            "Cannot call expression of type `%{typ}`.",
+        format!(
+            "Cannot call expression of type `{typ}`.",
             typ = humanize_lint_type(db, &call_expr_type),
         )
         .to_string()

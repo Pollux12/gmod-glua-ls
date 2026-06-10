@@ -252,7 +252,7 @@ pub fn report_orphan_tag(analyzer: &mut DocAnalyzer, tag: &impl LuaAstNode) {
         analyzer.file_id,
         AnalyzeError {
             kind: DiagnosticCode::AnnotationUsageError,
-            message: t!("`@%{name}` can't be used here", name = tag.get_text()).to_string(),
+            message: format!("`@{name}` can't be used here", name = tag.get_text()).to_string(),
             range: tag.get_range(),
         },
     );

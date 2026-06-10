@@ -41,7 +41,6 @@ regex.workspace = true
 internment.workspace = true
 log.workspace = true
 tokio-util.workspace = true
-rust-i18n.workspace = true
 walkdir.workspace = true
 ignore.workspace = true
 dirs.workspace = true
@@ -59,7 +58,3 @@ luars.workspace = true
 reqwest.workspace = true
 schema_to_glua.workspace = true
 rustc-hash.workspace = true
-
-[package.metadata.i18n]
-available-locales = ["en", "zh_CN", "zh_HK"]
-default-locale = "en"

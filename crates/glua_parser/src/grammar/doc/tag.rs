@@ -286,10 +286,10 @@ fn parse_tag_module(p: &mut LuaDocParser) -> DocParseResult {
         }
         _ => {
             return Err(LuaParseError::syntax_error_from(
-                &t!(
-                    "expected %{token}, but get %{current}",
-                    token = LuaTokenKind::TkString,
-                    current = p.current_token()
+                &format!(
+                    "expected {}, but get {}",
+                    LuaTokenKind::TkString,
+                    p.current_token()
                 ),
                 p.current_token_range(),
             ));
@@ -330,10 +330,7 @@ fn parse_tag_field(p: &mut LuaDocParser) -> DocParseResult {
         }
         _ => {
             return Err(LuaParseError::doc_error_from(
-                &t!(
-                    "expect field name or '[', but get %{current}",
-                    current = p.current_token()
-                ),
+                &format!("expect field name or '[', but get {}", p.current_token()),
                 p.current_token_range(),
             ));
         }
@@ -386,10 +383,7 @@ fn parse_tag_param(p: &mut LuaDocParser) -> DocParseResult {
         p.bump();
     } else {
         return Err(LuaParseError::doc_error_from(
-            &t!(
-                "expect param name or '...', but get %{current}",
-                current = p.current_token()
-            ),
+            &format!("expect param name or '...', but get {}", p.current_token()),
             p.current_token_range(),
         ));
     }
@@ -462,7 +456,7 @@ fn parse_doc_default_value(p: &mut LuaDocParser) -> DocParseResult {
                 LuaTokenKind::TkInt | LuaTokenKind::TkFloat => p.bump(),
                 _ => {
                     return Err(LuaParseError::doc_error_from(
-                        &t!("expect numeric default literal value"),
+                        "expect numeric default literal value",
                         p.current_token_range(),
                     ));
                 }
@@ -470,7 +464,7 @@ fn parse_doc_default_value(p: &mut LuaDocParser) -> DocParseResult {
         }
         _ => {
             return Err(LuaParseError::doc_error_from(
-                &t!("expect default literal value"),
+                "expect default literal value",
                 p.current_token_range(),
             ));
         }

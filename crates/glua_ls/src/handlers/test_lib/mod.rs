@@ -128,7 +128,7 @@ impl ProviderVirtualWorkspace {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = false;
         analysis.update_config(Arc::new(emmyrc));
-        analysis.init_std_lib(None);
+        analysis.init_std_lib();
         let base = &generator.base;
         analysis.add_main_workspace(base.clone());
         ProviderVirtualWorkspace {

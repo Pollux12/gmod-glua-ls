@@ -91,8 +91,8 @@ fn check_closure_expr(
         context.add_diagnostic(
             DiagnosticCode::RedundantParameter,
             param.get_range(),
-            t!(
-                "expected %{num} parameters but found %{found_num}",
+            format!(
+                "expected {num} parameters but found {found_num}",
                 num = source_params_len,
                 found_num = params.len(),
             )
@@ -182,7 +182,8 @@ fn check_call_expr(
                 && !is_nullable(context.db, &typ)
                 && !fake_param_optional.get(i).copied().unwrap_or(false)
             {
-                miss_parameter_info.push(t!("missing parameter: %{name}", name = param_info.0,));
+                miss_parameter_info
+                    .push(format!("missing parameter: {name}", name = param_info.0,));
             }
         }
 
@@ -198,8 +199,8 @@ fn check_call_expr(
             context.add_diagnostic(
                 DiagnosticCode::MissingParameter,
                 right_paren.get_range(),
-                t!(
-                    "expected %{num} parameters but found %{found_num}. %{infos}",
+                format!(
+                    "expected {num} parameters but found {found_num}. {infos}",
                     num = fake_params.len(),
                     found_num = call_args_count,
                     infos = miss_parameter_info.join(" \n ")
@@ -256,8 +257,8 @@ fn check_call_expr(
             context.add_diagnostic(
                 DiagnosticCode::RedundantParameter,
                 arg.get_range(),
-                t!(
-                    "expected %{num} parameters but found %{found_num}",
+                format!(
+                    "expected {num} parameters but found {found_num}",
                     num = fake_params.len(),
                     found_num = min_call_args_count,
                 )

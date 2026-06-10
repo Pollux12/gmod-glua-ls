@@ -66,7 +66,7 @@ fn check_table_duplicate_index(
                 context.add_diagnostic(
                     DiagnosticCode::DuplicateIndex,
                     range,
-                    t!("Duplicate index `%{name}`.", name = name).to_string(),
+                    format!("Duplicate index `{name}`.", name = name).to_string(),
                     None,
                 );
             }

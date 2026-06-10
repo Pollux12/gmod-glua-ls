@@ -49,8 +49,8 @@ fn check_doc(
             context.add_diagnostic(
                 DiagnosticCode::MissingGlobalDoc,
                 stat.get_range(),
-                t!(
-                    "Missing comment for global function `%{name}`.",
+                format!(
+                    "Missing comment for global function `{name}`.",
                     name = function_name
                 )
                 .to_string(),
@@ -131,14 +131,14 @@ fn check_params(
         let name = name_token.get_name_text();
         if !doc_param_names.contains(name) && name != "_" {
             let message = if is_global {
-                t!(
-                    "Missing @param annotation for parameter `%{name}` in global function `%{function_name}`.",
+                format!(
+                    "Missing @param annotation for parameter `{name}` in global function `{function_name}`.",
                     name = name,
                     function_name = function_name
                 )
             } else {
-                t!(
-                    "Incomplete signature. Missing @param annotation for parameter `%{name}`.",
+                format!(
+                    "Incomplete signature. Missing @param annotation for parameter `{name}`.",
                     name = name
                 )
             };
@@ -174,14 +174,14 @@ fn check_returns(
 
             if return_stat_len > doc_return_len {
                 let message = if is_global {
-                    t!(
-                        "Missing @return annotation at index `%{index}` in global function `%{function_name}`.",
+                    format!(
+                        "Missing @return annotation at index `{index}` in global function `{function_name}`.",
                         index = i + 1,
                         function_name = function_name
                     )
                 } else {
-                    t!(
-                        "Incomplete signature. Missing @return annotation at index `%{index}`.",
+                    format!(
+                        "Incomplete signature. Missing @return annotation at index `{index}`.",
                         index = i + 1
                     )
                 };

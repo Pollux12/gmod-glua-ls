@@ -757,8 +757,8 @@ fn add_type_check_diagnostic(
             context.add_diagnostic(
                 DiagnosticCode::ParamTypeMismatch,
                 range,
-                t!(
-                    "expected `%{source}` but found `%{found}`. %{reason}",
+                format!(
+                    "expected `{source}` but found `{found}`. {reason}",
                     source = humanize_type(db, param_type, RenderLevel::Simple),
                     found = humanize_type(db, expr_type, RenderLevel::Simple),
                     reason = reason_message

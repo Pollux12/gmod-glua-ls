@@ -266,7 +266,7 @@ impl VirtualWorkspace {
     pub fn new_with_init_std_lib() -> Self {
         let generator = VirtualUrlGenerator::new();
         let mut analysis = EmmyLuaAnalysis::new();
-        analysis.init_std_lib(None);
+        analysis.init_std_lib();
         let base = &generator.base;
         analysis.add_main_workspace(base.clone());
         VirtualWorkspace {

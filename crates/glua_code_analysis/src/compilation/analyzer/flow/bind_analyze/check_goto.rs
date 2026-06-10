@@ -13,8 +13,8 @@ pub fn check_goto_label(binder: &mut FlowBinder) {
         {
             binder.report_error(AnalyzeError::new(
                 DiagnosticCode::SyntaxError,
-                &t!(
-                    "goto label '%{label_name}' not found",
+                &format!(
+                    "goto label '{label_name}' not found",
                     label_name = label_name
                 ),
                 label_token.get_range(),

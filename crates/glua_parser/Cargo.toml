@@ -16,9 +16,5 @@ workspace = true
 
 [dependencies]
 rowan.workspace = true
-rust-i18n.workspace = true
 serde.workspace = true
 
-[package.metadata.i18n]
-available-locales = ["en", "zh_CN", "zh_HK"]
-default-locale = "en"

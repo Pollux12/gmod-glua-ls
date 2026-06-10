@@ -124,7 +124,7 @@ async fn main() {
     let t = Instant::now();
     let mut analysis = EmmyLuaAnalysis::new();
     analysis.update_config(Arc::new(emmyrc.clone()));
-    analysis.init_std_lib(None);
+    analysis.init_std_lib();
 
     // Add annotations as library workspace
     analysis.add_library_workspace(annotations_path.clone());

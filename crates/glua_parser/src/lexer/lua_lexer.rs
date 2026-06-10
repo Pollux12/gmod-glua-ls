@@ -160,7 +160,7 @@ impl<'a> LuaLexer<'a> {
                     return LuaTokenKind::TkLeftBracket;
                 }
                 if self.reader.current_char() != '[' {
-                    self.error(|| t!("invalid long string delimiter"));
+                    self.error(|| "invalid long string delimiter");
                     return LuaTokenKind::TkLongString;
                 }
 
@@ -185,7 +185,7 @@ impl<'a> LuaLexer<'a> {
                     }
                     '<' => {
                         if !self.lexer_config.support_integer_operation() {
-                            self.error(|| t!("bitwise operation is not supported"));
+                            self.error(|| "bitwise operation is not supported");
                         }
 
                         self.reader.bump();
@@ -209,7 +209,7 @@ impl<'a> LuaLexer<'a> {
                     }
                     '>' => {
                         if !self.lexer_config.support_integer_operation() {
-                            self.error(|| t!("bitwise operation is not supported"));
+                            self.error(|| "bitwise operation is not supported");
                         }
 
                         self.reader.bump();
@@ -228,7 +228,7 @@ impl<'a> LuaLexer<'a> {
                 self.reader.bump();
                 if self.reader.current_char() != '=' {
                     if !self.lexer_config.support_integer_operation() {
-                        self.error(|| t!("bitwise operation is not supported"));
+                        self.error(|| "bitwise operation is not supported");
                     }
                     return LuaTokenKind::TkBitXor;
                 }
@@ -289,7 +289,7 @@ impl<'a> LuaLexer<'a> {
                                     }
                                 }
                                 _ if self.reader.is_eof() => {
-                                    self.error(|| t!("unfinished long comment"));
+                                    self.error(|| "unfinished long comment");
                                     return LuaTokenKind::TkLongComment;
                                 }
                                 _ => {
@@ -311,7 +311,7 @@ impl<'a> LuaLexer<'a> {
                     }
                     _ => {
                         if !self.lexer_config.support_integer_operation() {
-                            self.error(|| t!("integer division is not supported"));
+                            self.error(|| "integer division is not supported");
                         }
 
                         self.reader.bump();
@@ -400,7 +400,7 @@ impl<'a> LuaLexer<'a> {
                 }
 
                 if !self.lexer_config.support_integer_operation() {
-                    self.error(|| t!("bitwise operation is not supported"));
+                    self.error(|| "bitwise operation is not supported");
                 }
                 LuaTokenKind::TkBitAnd
             }
@@ -421,7 +421,7 @@ impl<'a> LuaLexer<'a> {
                 }
 
                 if !self.lexer_config.support_integer_operation() {
-                    self.error(|| t!("bitwise operation is not supported"));
+                    self.error(|| "bitwise operation is not supported");
                 }
                 LuaTokenKind::TkBitOr
             }
@@ -535,7 +535,7 @@ impl<'a> LuaLexer<'a> {
         }
 
         if self.reader.current_char() != quote {
-            self.error(|| t!("unfinished string"));
+            self.error(|| "unfinished string");
             return LuaTokenKind::TkString;
         }
 
@@ -567,7 +567,7 @@ impl<'a> LuaLexer<'a> {
         }
 
         if !end {
-            self.error(|| t!("unfinished long string or comment"));
+            self.error(|| "unfinished long string or comment");
         }
 
         LuaTokenKind::TkLongString
@@ -687,7 +687,7 @@ impl<'a> LuaLexer<'a> {
 
         if self.reader.current_char().is_alphabetic() {
             let ch = self.reader.current_char();
-            self.error(|| t!("unexpected character '%{ch}' after number literal", ch = ch));
+            self.error(|| format!("unexpected character '{}' after number literal", ch));
         }
 
         match state {

@@ -300,8 +300,8 @@ fn check_index_expr_preference(
     context.add_diagnostic(
         DiagnosticCode::PreferredLocalAlias,
         index_expr.get_range(),
-        t!(
-            "Prefer use local alias variable '%{name}'",
+        format!(
+            "Prefer use local alias variable '{name}'",
             name = alias_info.preferred_name
         )
         .to_string(),

@@ -57,6 +57,18 @@ pub fn load_workspace_files(
         return Ok(files);
     }
 
+    // Guard: if the root doesn't exist or isn't a directory, skip the walk
+    // entirely. This prevents walking nonexistent paths or non-directory roots
+    // (e.g. an empty path that resolved to the workspace root, or a library
+    // path that was removed/renamed).
+    if !root.exists() || !root.is_dir() {
+        log::warn!(
+            "Workspace root does not exist or is not a directory, skipping: {:?}",
+            root
+        );
+        return Ok(Vec::new());
+    }
+
     let include_pattern: Vec<&str> = include_pattern.iter().map(String::as_str).collect();
     let include_set = match wax::any(include_pattern) {
         Ok(glob) => glob,
@@ -156,6 +168,8 @@ pub fn read_file_with_encoding(path: &Path, encoding: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{LuaFileInfo, normalize_path_for_ordering, sort_lua_files_by_normalized_path};
+    use googletest::prelude::*;
+    use std::path::PathBuf;
 
     #[test]
     fn vfs_loader_normalizes_slashes_and_trailing_separator() {
@@ -181,5 +195,28 @@ mod tests {
 
         assert_eq!(files[0].path, r"C:/workspace/A.lua");
         assert_eq!(files[1].path, r"C:\workspace\z.lua");
+    }
+
+    #[gtest]
+    fn load_workspace_files_returns_empty_for_nonexistent_root() {
+        let nonexistent = PathBuf::from("/some/path/that/does/not/exist/__glua_ls_test__");
+        let result =
+            super::load_workspace_files(&nonexistent, &["*.lua".to_string()], &[], &[], None);
+
+        expect_that!(result, ok(anything()));
+        let files = result.unwrap();
+        expect_that!(files.len(), eq(0));
+    }
+
+    #[gtest]
+    fn load_workspace_files_returns_empty_for_nonexistent_root_windows() {
+        // Use a Windows-style path that is extremely unlikely to exist.
+        let nonexistent = PathBuf::from(r"C:\__glua_ls_nonexistent_test_dir__\workspace");
+        let result =
+            super::load_workspace_files(&nonexistent, &["*.lua".to_string()], &[], &[], None);
+
+        expect_that!(result, ok(anything()));
+        let files = result.unwrap();
+        expect_that!(files.len(), eq(0));
     }
 }

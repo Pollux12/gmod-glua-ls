@@ -124,7 +124,7 @@ fn check_missing_return(
             context.add_diagnostic(
                 DiagnosticCode::MissingReturn,
                 range,
-                t!("Annotations specify that a return value is required here.").to_string(),
+                "Annotations specify that a return value is required here.".to_string(),
                 None,
             );
         }
@@ -304,8 +304,8 @@ fn check_return_count(
         context.add_diagnostic(
             DiagnosticCode::MissingReturnValue,
             return_stat.get_range(),
-            t!(
-                "Annotations specify that at least %{min} return value(s) are required, found %{rmin} returned here instead.",
+            format!(
+                "Annotations specify that at least {min} return value(s) are required, found {rmin} returned here instead.",
                 min = min_expected_return_count,
                 rmin = total_return_count
             )
@@ -319,8 +319,8 @@ fn check_return_count(
         context.add_diagnostic(
             DiagnosticCode::RedundantReturnValue,
             range,
-            t!(
-                "Annotations specify that at most %{max} return value(s) are required, found %{rmax} returned here instead.",
+            format!(
+                "Annotations specify that at most {max} return value(s) are required, found {rmax} returned here instead.",
                 max = max_expected_return_count?,
                 rmax = total_return_count
             )

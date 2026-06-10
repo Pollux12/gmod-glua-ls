@@ -254,8 +254,8 @@ fn check_member_value(
             }
 
             Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                t!(
-                    "member %{key} not match, expect %{typ}, but got %{got}",
+                format!(
+                    "member {key} not match, expect {typ}, but got {got}",
                     key = key_display,
                     typ = humanize_type(context.db, source_type, RenderLevel::Simple),
                     got = humanize_type(context.db, member_type, RenderLevel::Simple)
@@ -296,7 +296,7 @@ fn check_object_type_compact_table_const(
                     continue;
                 } else {
                     return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                        t!("missing member %{key}", key = key.to_path().to_string()).to_string(),
+                        format!("missing member {key}", key = key.to_path()).to_string(),
                     ));
                 }
             }
@@ -391,7 +391,7 @@ fn check_object_type_compact_type_ref(
             }
 
             return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                t!("missing member %{key}", key = key.to_path().to_string()).to_string(),
+                format!("missing member {key}", key = key.to_path()).to_string(),
             ));
         };
 

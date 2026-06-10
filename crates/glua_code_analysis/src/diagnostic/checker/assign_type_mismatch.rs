@@ -907,15 +907,15 @@ fn add_type_check_diagnostic(
         Err(reason) => {
             let reason_message = match reason {
                 TypeCheckFailReason::TypeNotMatchWithReason(reason) => reason,
-                TypeCheckFailReason::TypeRecursion => t!("type recursion").to_string(),
+                TypeCheckFailReason::TypeRecursion => "type recursion".to_string(),
                 _ => "".to_string(),
             };
 
             context.add_diagnostic(
                 DiagnosticCode::AssignTypeMismatch,
                 range,
-                t!(
-                    "Cannot assign `%{value}` to `%{source}`. %{reason}",
+                format!(
+                    "Cannot assign `{value}` to `{source}`. {reason}",
                     value = humanize_lint_type(db, value_type),
                     source = humanize_lint_type(db, source_type),
                     reason = reason_message

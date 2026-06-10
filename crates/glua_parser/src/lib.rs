@@ -13,12 +13,3 @@ pub use parser_error::{LuaParseError, LuaParseErrorKind};
 pub use syntax::*;
 pub use text::LineIndex;
 pub use text::{Reader, SourceRange};
-
-#[macro_use]
-extern crate rust_i18n;
-
-rust_i18n::i18n!("./locales", fallback = "en");
-
-pub fn set_locale(locale: &str) {
-    rust_i18n::set_locale(locale);
-}

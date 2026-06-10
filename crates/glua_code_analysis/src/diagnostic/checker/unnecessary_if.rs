@@ -35,14 +35,14 @@ fn check_condition(
         context.add_diagnostic(
             DiagnosticCode::UnnecessaryIf,
             condition.get_range(),
-            t!("Unnecessary `if` statement: this condition is always truthy").to_string(),
+            "Unnecessary `if` statement: this condition is always truthy".to_string(),
             None,
         );
     } else if expr_type.is_always_falsy() {
         context.add_diagnostic(
             DiagnosticCode::UnnecessaryIf,
             condition.get_range(),
-            t!("Impossible `if` statement: this condition is always falsy").to_string(),
+            "Impossible `if` statement: this condition is always falsy".to_string(),
             None,
         );
     }

@@ -34,7 +34,7 @@ fn check_assign_stat(
             context.add_diagnostic(
                 DiagnosticCode::GlobalInNonModule,
                 var.get_range(),
-                t!("Global variable should only be defined in module scope").to_string(),
+                "Global variable should only be defined in module scope".to_string(),
                 None,
             );
         }

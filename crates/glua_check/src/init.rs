@@ -96,7 +96,7 @@ pub async fn load_workspace(
         .collect::<Vec<WorkspaceFolder>>();
     let mut analysis = EmmyLuaAnalysis::new();
     analysis.update_config(emmyrc.clone().into());
-    analysis.init_std_lib(None);
+    analysis.init_std_lib();
 
     // Add GMod annotations as library workspace if provided
     if let Some(annotations_path) = gmod_annotations {
@@ -115,8 +115,41 @@ pub async fn load_workspace(
         }
     }
 
+    // Canonicalize main workspace root for self-overlap detection.
+    let main_root_canon = main_path.canonicalize().ok();
+
     for lib in &emmyrc.workspace.library {
-        let path = PathBuf::from(lib.get_path().clone());
+        let configured = lib.get_path();
+        let path = PathBuf::from(configured);
+
+        // Filter invalid library paths: empty, nonexistent, not a directory,
+        // or resolves to the same path as the main workspace root (self-overlap
+        // would cause a redundant full re-scan of the workspace).
+        if configured.trim().is_empty() {
+            log::warn!(
+                "Skipping empty library path from config entry: {:?}",
+                configured
+            );
+            continue;
+        }
+        if !path.exists() {
+            log::warn!("Skipping library path that does not exist: {:?}", path);
+            continue;
+        }
+        if !path.is_dir() {
+            log::warn!("Skipping library path that is not a directory: {:?}", path);
+            continue;
+        }
+        if let (Ok(lib_canon), Some(ws_canon)) = (path.canonicalize(), &main_root_canon)
+            && lib_canon == *ws_canon
+        {
+            log::warn!(
+                "Skipping library path that resolves to the workspace root (self-overlap): {:?}",
+                path
+            );
+            continue;
+        }
+
         analysis.add_library_workspace(path.clone());
         workspace_folders.push(WorkspaceFolder::new(path.clone(), true));
     }

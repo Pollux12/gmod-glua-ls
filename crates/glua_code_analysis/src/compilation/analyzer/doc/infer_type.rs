@@ -191,7 +191,7 @@ fn infer_buildin_or_ref_type(
                     analyzer.file_id,
                     AnalyzeError::new(
                         DiagnosticCode::TypeNotFound,
-                        &t!("Type '%{name}' not found", name = name),
+                        &format!("Type '{name}' not found", name = name),
                         range,
                     ),
                 );
@@ -242,7 +242,7 @@ fn infer_generic_type(analyzer: &mut DocAnalyzer, generic_type: &LuaDocGenericTy
                 analyzer.file_id,
                 AnalyzeError::new(
                     DiagnosticCode::TypeNotFound,
-                    &t!("Type '%{name}' not found", name = name),
+                    &format!("Type '{name}' not found", name = name),
                     generic_type.get_range(),
                 ),
             );

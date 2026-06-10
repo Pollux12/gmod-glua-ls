@@ -96,7 +96,7 @@ fn check_tuple_types_compact_tuple_types(
                 continue;
             } else {
                 return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                    t!("missing tuple member %{idx}", idx = i + source_start + 1).to_string(),
+                    format!("missing tuple member {idx}", idx = i + source_start + 1).to_string(),
                 ));
             }
         }
@@ -150,8 +150,8 @@ fn check_tuple_types_compact_tuple_types(
                     Ok(_) => {}
                     Err(TypeCheckFailReason::TypeNotMatch) => {
                         return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                            t!(
-                                "tuple member %{idx} not match, expect %{typ}, but got %{got}",
+                            format!(
+                                "tuple member {idx} not match, expect {typ}, but got {got}",
                                 idx = i + source_start + 1,
                                 typ = humanize_type(
                                     context.db,
@@ -201,8 +201,8 @@ fn check_tuple_type_compact_table(
                 Ok(_) => {}
                 Err(TypeCheckFailReason::TypeNotMatch) => {
                     return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                        t!(
-                            "tuple member %{idx} not match, expect %{typ}, but got %{got}",
+                        format!(
+                            "tuple member {idx} not match, expect {typ}, but got {got}",
                             idx = i + 1,
                             typ = humanize_type(
                                 context.db,
@@ -222,7 +222,7 @@ fn check_tuple_type_compact_table(
             continue;
         } else {
             return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                t!("missing tuple member %{idx}", idx = i + 1).to_string(),
+                format!("missing tuple member {idx}", idx = i + 1).to_string(),
             ));
         }
     }
@@ -252,8 +252,8 @@ fn check_tuple_type_compact_object_type(
                 Ok(_) => {}
                 Err(TypeCheckFailReason::TypeNotMatch) => {
                     return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                        t!(
-                            "tuple member %{idx} not match, expect %{typ}, but got %{got}",
+                        format!(
+                            "tuple member {idx} not match, expect {typ}, but got {got}",
                             idx = i + 1,
                             typ = humanize_type(
                                 context.db,
@@ -274,7 +274,7 @@ fn check_tuple_type_compact_object_type(
             continue;
         } else {
             return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                t!("missing tuple member %{idx}", idx = i + 1).to_string(),
+                format!("missing tuple member {idx}", idx = i + 1).to_string(),
             ));
         }
     }

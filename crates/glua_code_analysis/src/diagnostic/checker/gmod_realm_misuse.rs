@@ -1177,27 +1177,27 @@ fn mismatch_message(
     let callee_realm = realm_label(callee_realm);
 
     match code {
-        DiagnosticCode::GmodRealmMismatch => t!(
-            "Realm mismatch: calling `%{name}` in %{call_realm} realm but declaration is %{decl_realm}.",
+        DiagnosticCode::GmodRealmMismatch => format!(
+            "Realm mismatch: calling `{name}` in {call_realm} realm but declaration is {decl_realm}.",
             name = call_name,
             call_realm = call_realm,
             decl_realm = callee_realm,
         )
         .to_string(),
-        DiagnosticCode::GmodRealmMismatchHeuristic => t!(
-            "Potential realm mismatch (heuristic): `%{name}` is called in inferred %{call_realm} realm while declaration is inferred %{decl_realm}.",
+        DiagnosticCode::GmodRealmMismatchHeuristic => format!(
+            "Potential realm mismatch (heuristic): `{name}` is called in inferred {call_realm} realm while declaration is inferred {decl_realm}.",
             name = call_name,
             call_realm = call_realm,
             decl_realm = callee_realm,
         )
         .to_string(),
-        DiagnosticCode::GmodUnknownRealm => t!(
-            "Unable to resolve call realm for `%{name}`; declaration appears to be %{decl_realm}.",
+        DiagnosticCode::GmodUnknownRealm => format!(
+            "Unable to resolve call realm for `{name}`; declaration appears to be {decl_realm}.",
             name = call_name,
             decl_realm = callee_realm,
         )
         .to_string(),
-        _ => t!("Realm mismatch for `%{name}`.", name = call_name).to_string(),
+        _ => format!("Realm mismatch for `{name}`.", name = call_name).to_string(),
     }
 }
 

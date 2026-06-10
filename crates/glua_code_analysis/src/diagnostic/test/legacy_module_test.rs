@@ -321,7 +321,7 @@ mod test {
     #[test]
     fn legacy_module_namespace_does_not_leak_across_main_workspaces() {
         let mut analysis = crate::EmmyLuaAnalysis::new();
-        analysis.init_std_lib(None);
+        analysis.init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.workspace.enable_isolation = true;
         analysis.update_config(Arc::new(emmyrc));

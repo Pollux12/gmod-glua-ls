@@ -47,8 +47,8 @@ fn check_require_call_expr(
         context.add_diagnostic(
             DiagnosticCode::RequireModuleNotVisible,
             arg_expr.get_range(),
-            t!(
-                "Module '%{module}' is not visible. It has @export restrictions.",
+            format!(
+                "Module '{module}' is not visible. It has @export restrictions.",
                 module = module_info.full_module_name
             )
             .to_string(),
