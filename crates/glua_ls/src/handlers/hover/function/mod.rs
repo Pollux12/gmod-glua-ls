@@ -764,7 +764,7 @@ fn build_function_param(
     rendered
 }
 
-fn format_doc_default_value(default_value: &LuaDocDefaultValue) -> String {
+pub(crate) fn format_doc_default_value(default_value: &LuaDocDefaultValue) -> String {
     match default_value {
         LuaDocDefaultValue::Nil => "nil".to_string(),
         LuaDocDefaultValue::Boolean(value) => value.to_string(),

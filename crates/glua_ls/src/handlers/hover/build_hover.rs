@@ -1,20 +1,23 @@
 use std::collections::HashSet;
 
 use glua_code_analysis::{
-    DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
-    SemanticDeclLevel, SemanticInfo, SemanticModel,
+    DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaInferCache, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
+    RenderLevel, SemanticDeclLevel, SemanticInfo, SemanticModel,
+    explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
 use glua_code_analysis::{humanize_member_key_name, humanize_type};
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaSyntaxKind,
-    LuaSyntaxToken, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaChunk, LuaExpr, LuaFuncStat, LuaIndexExpr,
+    LuaSyntaxId, LuaSyntaxKind, LuaSyntaxToken, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use lsp_types::{Hover, HoverContents, MarkedString, MarkupContent};
 use rowan::{TextRange, TextSize};
 
 use crate::handlers::completion::{color_info_from_expr, color_info_from_type, is_color_type};
-use crate::handlers::hover::function::{build_function_hover, is_function};
+use crate::handlers::hover::function::{
+    build_function_hover, format_doc_default_value, is_function,
+};
 use crate::handlers::hover::humanize_type_decl::build_type_decl_hover;
 use crate::handlers::hover::humanize_types::hover_humanize_type;
 
@@ -310,11 +313,17 @@ fn build_decl_hover(
             } else {
                 "(global) "
             };
+
+            // Append default value when available (explicit param default or
+            // inferred `x = x or "literal"` default), using the same syntax
+            // as function-hover default params/returns.
+            let default_suffix = resolve_decl_default_display(builder, decl_id);
             builder.set_type_description(format!(
-                "{}{}: {}",
+                "{}{}: {}{}",
                 prefix,
                 decl.get_name(),
-                type_humanize_text
+                type_humanize_text,
+                default_suffix,
             ));
         }
 
@@ -350,6 +359,154 @@ fn build_decl_hover(
     }
 
     Some(())
+}
+
+/// Resolve a displayable default suffix for a declaration at the hover site.
+///
+/// Checks for an explicit param default first (from `---@param x type="default"`),
+/// then for an inferred default (from `x = x or "literal"`).
+/// Returns a string like ` = "value"` or ` = 3` (empty string if no default).
+///
+/// Uses flow-validity checking to ensure the default is still live at the
+/// hover site (not killed by a later reassignment).
+fn resolve_decl_default_display(builder: &HoverBuilder, decl_id: LuaDeclId) -> String {
+    let Some(trigger_token) = builder.get_trigger_token() else {
+        return String::new();
+    };
+
+    let file_id = builder.semantic_model.get_file_id();
+    let db = builder.semantic_model.get_db();
+    let flow_tree = db.get_flow_index().get_flow_tree(&file_id);
+    let root = flow_tree.and_then(|_| {
+        db.get_vfs()
+            .get_syntax_tree(&file_id)
+            .and_then(|tree| LuaChunk::cast(tree.get_red_root()))
+    });
+
+    let Some((flow_tree, root)) = flow_tree.zip(root) else {
+        return String::new();
+    };
+
+    // Walk up ancestors to find a node with a flow binding.
+    // This handles declaration sites (LocalName), assignment LHS,
+    // and reference sites (NameExpr) uniformly.
+    let mut use_flow_id = None;
+
+    // First check if the trigger token itself has a flow binding.
+    let token_syntax_id = LuaSyntaxId::from_token(&trigger_token);
+    if let Some(flow_id) = flow_tree.get_flow_id(token_syntax_id) {
+        use_flow_id = Some(flow_id);
+    }
+
+    // Then walk up ancestors.
+    if use_flow_id.is_none() {
+        let mut current = trigger_token.parent();
+        while let Some(node) = current {
+            let syntax_id = LuaSyntaxId::from_node(&node);
+            if let Some(flow_id) = flow_tree.get_flow_id(syntax_id) {
+                use_flow_id = Some(flow_id);
+                break;
+            }
+            current = node.parent();
+        }
+    }
+
+    // Create a temporary cache for flow-validity checking.
+    let mut cache = LuaInferCache::new(file_id, Default::default());
+
+    // Seed the cache with the use-site realm so that flow-reachability
+    // checks evaluate from the correct realm context (not the declaration
+    // position fallback).
+    let use_site_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&file_id, trigger_token.text_range().start());
+    cache.flow_query_realm = Some(use_site_realm);
+
+    // 1. Explicit param default from signature metadata.
+    if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
+        if let LuaDeclExtra::Param {
+            idx, signature_id, ..
+        } = &decl.extra
+        {
+            if let Some(default_val) = db
+                .get_signature_index()
+                .get(signature_id)
+                .and_then(|sig| sig.get_param_info_by_id(*idx))
+                .and_then(|info| info.default_value.as_ref())
+            {
+                // At the declaration site itself (hovering the param name in
+                // the function signature), the explicit default is always valid.
+                // For use sites, check flow-validity.
+                let flow_valid = match use_flow_id {
+                    Some(use_flow_id) => explicit_param_string_default_reaches_flow(
+                        db,
+                        flow_tree,
+                        &mut cache,
+                        &root,
+                        decl_id,
+                        use_flow_id,
+                    ),
+                    // No flow binding found — this is likely the declaration
+                    // site. Show the explicit default.
+                    None => true,
+                };
+
+                if flow_valid {
+                    return format!(" = {}", format_doc_default_value(default_val));
+                }
+            }
+        }
+    }
+
+    // 2. Inferred default from `x = x or "literal"` pattern.
+    // Only show if we have a flow ID to validate against.
+    let Some(use_flow_id) = use_flow_id else {
+        return String::new();
+    };
+
+    if let Some(candidates) = db
+        .get_property_index()
+        .get_inferred_string_defaults(&decl_id)
+    {
+        let trigger_range = trigger_token.text_range();
+        for candidate in candidates {
+            // If the trigger token is the LHS variable of the self-coalescing
+            // assignment (e.g. hovering the LHS `x` of `x = x or "literal"`),
+            // the default is being established here, so it's always valid.
+            // Narrow check: only the matching LHS variable range — NOT the
+            // entire assignment statement — so that hovering the RHS read
+            // (e.g. the `x` in `x = <here>x or "literal"`) does not inherit
+            // the default.
+            let at_assignment_site = candidate.source_range.contains_range(trigger_range)
+                && trigger_token.parent().is_some_and(|parent| {
+                    parent
+                        .ancestors()
+                        .find_map(LuaAssignStat::cast)
+                        .is_some_and(|assign| {
+                            assign.get_range() == candidate.source_range
+                                && assign.get_var_and_expr_list().0.iter().any(|var| {
+                                    var.syntax().text_range().contains_range(trigger_range)
+                                })
+                        })
+                });
+
+            let reaches = at_assignment_site
+                || inferred_string_default_reaches_flow(
+                    db,
+                    flow_tree,
+                    &mut cache,
+                    &root,
+                    decl_id,
+                    use_flow_id,
+                    candidate.source_range,
+                );
+            if reaches {
+                return format!(" = {:?}", candidate.value);
+            }
+        }
+    }
+
+    String::new()
 }
 
 fn build_member_hover(

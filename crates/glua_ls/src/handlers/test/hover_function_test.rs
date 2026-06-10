@@ -1388,4 +1388,147 @@ mod tests {
 
         Ok(())
     }
+
+    /// Hover on a local variable with an explicit param default should display
+    /// the default value using the same syntax as function-hover default params.
+    #[gtest]
+    fn test_local_explicit_param_default_hover() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@param panelClass string="DPanel"
+                local function create(<??>panelClass)
+                end
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal panelClass: string = \"DPanel\"\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    /// Hover on a local variable with an inferred default from
+    /// `x = x or "literal"` should display the default value.
+    #[gtest]
+    fn test_local_inferred_default_hover() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@param panelClass string|nil
+                local function create(panelClass)
+                    <??>panelClass = panelClass or "DScrollPanel"
+                end
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal panelClass: string = \"DScrollPanel\"\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    /// Explicit default must NOT show after a later reassignment kills it.
+    #[gtest]
+    fn test_local_explicit_param_default_hover_killed_by_reassignment() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@param panelClass string="DPanel"
+                ---@param otherClass string
+                local function foo(panelClass, otherClass)
+                    panelClass = otherClass
+                    local p = <??>panelClass
+                end
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal panelClass: string\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    /// Hovering the RHS read of `x = x or "literal"` must NOT show the
+    /// inferred default, because the RHS is read *before* the assignment
+    /// establishes the default.
+    #[gtest]
+    fn test_hover_rhs_of_inferred_default_assignment_shows_no_default() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@param panelClass string|nil
+                local function create(panelClass)
+                    panelClass = <??>panelClass or "DScrollPanel"
+                end
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal panelClass: string?\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    /// Inferred default must NOT show after a later reassignment kills it.
+    #[gtest]
+    fn test_local_inferred_default_hover_killed_by_reassignment() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@param panelClass string|nil
+                ---@param otherClass string
+                local function foo(panelClass, otherClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    panelClass = otherClass
+                    local p = <??>panelClass
+                end
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal panelClass: string\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    /// In a shared file, a wrong-realm reassignment (e.g. `if SERVER then`)
+    /// must NOT kill an inferred default when the hover use-site is in a
+    /// different realm (e.g. `if CLIENT then`).
+    #[gtest]
+    fn test_inferred_default_hover_shared_file_wrong_realm_reassignment_preserves_default()
+    -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@param panelClass string|nil
+                local function create(panelClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    if SERVER then
+                        panelClass = "ServerPanel"
+                    end
+                    if CLIENT then
+                        local p = <??>panelClass
+                    end
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/shared/sh_test.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        // The default "DScrollPanel" must still be shown because the
+        // SERVER-only reassignment should not kill the default at a
+        // CLIENT use-site.
+        assert!(
+            markup.value.contains("DScrollPanel"),
+            "expected inferred default 'DScrollPanel' to survive SERVER-only reassignment at CLIENT use-site, got: {}",
+            markup.value
+        );
+        Ok(())
+    }
 }
