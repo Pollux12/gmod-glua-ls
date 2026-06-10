@@ -1413,3 +1413,436 @@ fn prefer_table_of_over_bare_table(_db: &DbIndex, ty: LuaType) -> LuaType {
         _ => ty,
     }
 }
+
+/// Check whether an explicit `---@param x string = "literal"` default is
+/// still live at a given use site by walking the flow graph backward.
+///
+/// Returns `true` only when the declaration origin for `decl_id` is reachable
+/// from `use_flow_id` without passing through a killing assignment.  A
+/// self-coalescing `x = x or ...` assignment is NOT a kill — it is a fallback
+/// that the explicit default takes precedence over.  Any other assignment to
+/// the same variable kills the explicit default.
+pub fn explicit_param_string_default_reaches_flow(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    decl_id: LuaDeclId,
+    use_flow_id: FlowId,
+) -> bool {
+    let var_ref_id = VarRefId::VarRef(decl_id);
+    let mut visited = HashSet::new();
+    explicit_default_reaches_inner(
+        db,
+        tree,
+        cache,
+        root,
+        &var_ref_id,
+        use_flow_id,
+        &mut visited,
+    )
+}
+
+fn explicit_default_reaches_inner(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_id: FlowId,
+    visited: &mut HashSet<FlowId>,
+) -> bool {
+    // Guard against infinite loops in cyclic flow graphs.
+    if !visited.insert(flow_id) {
+        return false;
+    }
+
+    let Some(flow_node) = tree.get_flow_node(flow_id) else {
+        return false;
+    };
+
+    match &flow_node.kind {
+        // Reached the declaration origin for our target variable —
+        // explicit default is proven valid.
+        FlowNodeKind::DeclPosition(position) => {
+            if matches!(var_ref_id.get_decl_id_ref(), Some(decl_id) if decl_id.position == *position)
+            {
+                true
+            } else {
+                // DeclPosition for another variable — walk past it.
+                walk_antecedents_for_explicit_default(
+                    db, tree, cache, root, var_ref_id, flow_node, visited,
+                )
+            }
+        }
+        // For parameters, the flow tree may not have a DeclPosition node;
+        // reaching Start without encountering a killing assignment proves
+        // the explicit default is still live.
+        FlowNodeKind::Start => true,
+        // Dead paths.
+        FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break => false,
+        FlowNodeKind::Assignment(assign_ptr, assign_hint) => {
+            let can_match = matches!(
+                (assign_hint, var_ref_id),
+                (AssignVarHint::Mixed, _)
+                    | (AssignVarHint::NameOnly, VarRefId::VarRef(_))
+                    | (AssignVarHint::NameOnly, VarRefId::GlobalName(_, _))
+                    | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
+                    | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
+            );
+
+            if can_match {
+                if let Some(assign_stat) = assign_ptr.to_node(root) {
+                    let (vars, _) = assign_stat.get_var_and_expr_list();
+                    for var in vars.iter() {
+                        if let Some(ref_id) = get_var_expr_var_ref_id(db, cache, var.to_expr()) {
+                            if ref_id == *var_ref_id {
+                                // Any assignment to the variable kills the
+                                // explicit default — including self-coalescing
+                                // assignments like `x = x or "literal"`.
+                                // After such an assignment, the inferred-default
+                                // path takes over for downstream use sites.
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            walk_antecedents_for_explicit_default(
+                db, tree, cache, root, var_ref_id, flow_node, visited,
+            )
+        }
+        _ => walk_antecedents_for_explicit_default(
+            db, tree, cache, root, var_ref_id, flow_node, visited,
+        ),
+    }
+}
+
+/// Walk backward through antecedents of a flow node, requiring the explicit
+/// default to reach on ALL live paths (conjunction).
+///
+/// Mirrors the realm-filtering approach from `merge_antecedent_types`:
+/// wrong-realm antecedents are skipped on the first pass.  If filtering
+/// removes ALL live antecedents, a second pass without realm checks
+/// preserves conservative behaviour.
+fn walk_antecedents_for_explicit_default(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    visited: &mut HashSet<FlowId>,
+) -> bool {
+    match &flow_node.antecedent {
+        Some(FlowAntecedent::Single(antecedent_id)) => explicit_default_reaches_inner(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            *antecedent_id,
+            visited,
+        ),
+        Some(FlowAntecedent::Multiple(idx)) => {
+            if let Some(antecedents) = tree.get_multi_antecedents(*idx) {
+                let target_realm = cache.flow_query_realm.unwrap_or_else(|| {
+                    db.get_gmod_infer_index()
+                        .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
+                });
+
+                // First pass: realm-filtered.
+                let base_visited = visited.clone();
+                let mut any_live = false;
+                for &antecedent_id in antecedents {
+                    let Some(ante_node) = tree.get_flow_node(antecedent_id) else {
+                        continue;
+                    };
+                    if ante_node.kind.is_unreachable() || ante_node.kind.is_change_flow() {
+                        continue;
+                    }
+
+                    let ante_realm =
+                        get_or_compute_flow_node_realm(db, cache, root, antecedent_id, ante_node);
+                    if !realms_can_reach(target_realm, ante_realm) {
+                        continue;
+                    }
+
+                    any_live = true;
+                    let mut path_visited = base_visited.clone();
+                    if !explicit_default_reaches_inner(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        antecedent_id,
+                        &mut path_visited,
+                    ) {
+                        return false;
+                    }
+                    visited.extend(path_visited);
+                }
+
+                if any_live {
+                    return true;
+                }
+
+                // Fallback: no live antecedents after realm filtering —
+                // retry without realm checks for conservative behaviour.
+                let mut any_live = false;
+                for &antecedent_id in antecedents {
+                    let Some(ante_node) = tree.get_flow_node(antecedent_id) else {
+                        continue;
+                    };
+                    if ante_node.kind.is_unreachable() || ante_node.kind.is_change_flow() {
+                        continue;
+                    }
+                    any_live = true;
+                    let mut path_visited = base_visited.clone();
+                    if !explicit_default_reaches_inner(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        antecedent_id,
+                        &mut path_visited,
+                    ) {
+                        return false;
+                    }
+                    visited.extend(path_visited);
+                }
+                any_live
+            } else {
+                false
+            }
+        }
+        None => false,
+    }
+}
+
+/// Check whether an inferred string default (from `x = x or "literal"`) is
+/// still live at a given use site by walking the flow graph backward.
+///
+/// Returns `true` only when the self-coalescing assignment at
+/// `default_source_range` is the **last** assignment to `decl_id` that
+/// dominates the use — any later write to the same variable kills it.
+pub fn inferred_string_default_reaches_flow(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    decl_id: LuaDeclId,
+    use_flow_id: FlowId,
+    default_source_range: rowan::TextRange,
+) -> bool {
+    let var_ref_id = VarRefId::VarRef(decl_id);
+    let mut visited = HashSet::new();
+    inferred_string_default_reaches_inner(
+        db,
+        tree,
+        cache,
+        root,
+        &var_ref_id,
+        use_flow_id,
+        default_source_range,
+        &mut visited,
+    )
+}
+
+fn inferred_string_default_reaches_inner(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_id: FlowId,
+    default_source_range: rowan::TextRange,
+    visited: &mut HashSet<FlowId>,
+) -> bool {
+    // Guard against infinite loops in cyclic flow graphs.
+    if !visited.insert(flow_id) {
+        return false;
+    }
+
+    let Some(flow_node) = tree.get_flow_node(flow_id) else {
+        return false;
+    };
+
+    match &flow_node.kind {
+        FlowNodeKind::Start => false,
+        FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break => false,
+        FlowNodeKind::DeclPosition(_) => walk_antecedents_for_default(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            default_source_range,
+            visited,
+        ),
+        FlowNodeKind::Assignment(assign_ptr, assign_hint) => {
+            let can_match = matches!(
+                (assign_hint, var_ref_id),
+                (AssignVarHint::Mixed, _)
+                    | (AssignVarHint::NameOnly, VarRefId::VarRef(_))
+                    | (AssignVarHint::NameOnly, VarRefId::GlobalName(_, _))
+                    | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
+                    | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
+            );
+
+            if can_match {
+                if let Some(assign_stat) = assign_ptr.to_node(root) {
+                    let (vars, _exprs) = assign_stat.get_var_and_expr_list();
+                    for var in vars {
+                        if let Some(ref_id) = get_var_expr_var_ref_id(db, cache, var.to_expr()) {
+                            if ref_id == *var_ref_id {
+                                let assign_range = assign_stat.get_range();
+                                // Same range → matching assignment (default proven).
+                                // Different range → later write kills the default.
+                                return assign_range == default_source_range;
+                            }
+                        }
+                    }
+                }
+            }
+
+            walk_antecedents_for_default(
+                db,
+                tree,
+                cache,
+                root,
+                var_ref_id,
+                flow_node,
+                default_source_range,
+                visited,
+            )
+        }
+        _ => walk_antecedents_for_default(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            default_source_range,
+            visited,
+        ),
+    }
+}
+
+/// Walk backward through antecedents of a flow node, requiring the default
+/// to reach on ALL live paths (conjunction).
+///
+/// Mirrors the realm-filtering approach from `merge_antecedent_types`:
+/// wrong-realm antecedents are skipped on the first pass.  If filtering
+/// removes ALL live antecedents, a second pass without realm checks
+/// preserves conservative behaviour.
+fn walk_antecedents_for_default(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    default_source_range: rowan::TextRange,
+    visited: &mut HashSet<FlowId>,
+) -> bool {
+    match &flow_node.antecedent {
+        Some(FlowAntecedent::Single(antecedent_id)) => inferred_string_default_reaches_inner(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            *antecedent_id,
+            default_source_range,
+            visited,
+        ),
+        Some(FlowAntecedent::Multiple(idx)) => {
+            if let Some(antecedents) = tree.get_multi_antecedents(*idx) {
+                let target_realm = cache.flow_query_realm.unwrap_or_else(|| {
+                    db.get_gmod_infer_index()
+                        .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
+                });
+
+                // First pass: realm-filtered.
+                let base_visited = visited.clone();
+                let mut any_live = false;
+                for &antecedent_id in antecedents {
+                    let Some(ante_node) = tree.get_flow_node(antecedent_id) else {
+                        continue;
+                    };
+                    if ante_node.kind.is_unreachable() || ante_node.kind.is_change_flow() {
+                        continue;
+                    }
+
+                    let ante_realm =
+                        get_or_compute_flow_node_realm(db, cache, root, antecedent_id, ante_node);
+                    if !realms_can_reach(target_realm, ante_realm) {
+                        continue;
+                    }
+
+                    any_live = true;
+                    let mut path_visited = base_visited.clone();
+                    if !inferred_string_default_reaches_inner(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        antecedent_id,
+                        default_source_range,
+                        &mut path_visited,
+                    ) {
+                        return false;
+                    }
+                    visited.extend(path_visited);
+                }
+
+                if any_live {
+                    return true;
+                }
+
+                // Fallback: no live antecedents after realm filtering —
+                // retry without realm checks for conservative behaviour.
+                let mut any_live = false;
+                for &antecedent_id in antecedents {
+                    let Some(ante_node) = tree.get_flow_node(antecedent_id) else {
+                        continue;
+                    };
+                    if ante_node.kind.is_unreachable() || ante_node.kind.is_change_flow() {
+                        continue;
+                    }
+                    any_live = true;
+                    let mut path_visited = base_visited.clone();
+                    if !inferred_string_default_reaches_inner(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        antecedent_id,
+                        default_source_range,
+                        &mut path_visited,
+                    ) {
+                        return false;
+                    }
+                    visited.extend(path_visited);
+                }
+                any_live
+            } else {
+                false
+            }
+        }
+        None => {
+            // No antecedents — reached the implicit start without ever
+            // encountering the recorded assignment.  The default was NOT
+            // proven on this path.
+            false
+        }
+    }
+}

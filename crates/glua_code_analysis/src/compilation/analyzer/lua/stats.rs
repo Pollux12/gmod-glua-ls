@@ -768,7 +768,15 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         record_assign_elapsed(analyzer, step_start, AssignProfileStep::GetOwner);
 
         let step_start = profile_enabled.then(std::time::Instant::now);
-        if special_assign_pattern(analyzer, type_owner.clone(), var.clone(), expr.clone()).is_some()
+        let assign_stat_range = assign_stat.get_range();
+        if special_assign_pattern(
+            analyzer,
+            type_owner.clone(),
+            var.clone(),
+            expr.clone(),
+            assign_stat_range,
+        )
+        .is_some()
         {
             record_assign_elapsed(analyzer, step_start, AssignProfileStep::Special);
             if profile_enabled {
@@ -2194,11 +2202,23 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
     Some(())
 }
 
+/// Extract a string literal value from an expression, if it is a literal string.
+fn extract_string_literal_from_expr(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(string_token) => Some(string_token.get_value().to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn special_assign_pattern(
     analyzer: &mut LuaAnalyzer,
     type_owner: LuaTypeOwner,
     var: LuaVarExpr,
     expr: LuaExpr,
+    assign_stat_range: rowan::TextRange,
 ) -> Option<()> {
     let access_path = var.get_access_path()?;
     let binary_expr = if let LuaExpr::BinaryExpr(binary_expr) = expr {
@@ -2236,6 +2256,28 @@ fn special_assign_pattern(
             if guarded_table_expr {
                 set_index_expr_owner(analyzer, var);
             }
+
+            // Register inferred string default for `x = x or "literal"`.
+            // This is a SIBLING branch to the table-guard path: only fires
+            // when the RHS is NOT a TableExpr and IS a string literal,
+            // and the type_owner is a plain Decl. Completely disjoint from
+            // the table-guard path.
+            if !guarded_table_expr {
+                if let LuaTypeOwner::Decl(decl_id) = &type_owner {
+                    if let Some(string_value) = extract_string_literal_from_expr(&right) {
+                        analyzer
+                            .db
+                            .get_property_index_mut()
+                            .add_inferred_string_default(
+                                analyzer.file_id,
+                                *decl_id,
+                                smol_str::SmolStr::new(string_value),
+                                assign_stat_range,
+                            );
+                    }
+                }
+            }
+
             assign_merge_type_owner_and_expr_type(
                 analyzer,
                 type_owner,

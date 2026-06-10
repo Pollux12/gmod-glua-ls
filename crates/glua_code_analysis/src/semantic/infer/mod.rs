@@ -6,7 +6,7 @@ mod infer_index;
 mod infer_name;
 mod infer_table;
 mod infer_unary;
-mod narrow;
+pub(crate) mod narrow;
 mod test;
 
 use std::{ops::Deref, sync::Arc};

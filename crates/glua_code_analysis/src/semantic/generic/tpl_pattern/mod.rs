@@ -185,7 +185,14 @@ pub fn tpl_pattern_match(
             }
         }
         LuaType::StrTplRef(str_tpl) => {
-            if let LuaType::StringConst(s) = target {
+            // Bind from StringConst (existing), DocStringConst (adjacent
+            // soundness), or StringConst carried as an effective default.
+            let string_value = match target {
+                LuaType::StringConst(s) => Some(s),
+                LuaType::DocStringConst(s) => Some(s),
+                _ => None,
+            };
+            if let Some(s) = string_value {
                 let prefix = str_tpl.get_prefix();
                 let suffix = str_tpl.get_suffix();
                 let type_name = SmolStr::new(format!("{}{}{}", prefix, s, suffix));
