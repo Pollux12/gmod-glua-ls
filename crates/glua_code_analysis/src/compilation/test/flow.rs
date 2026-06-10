@@ -4678,4 +4678,168 @@ _2 = a[1]
         let not_narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "y", 0);
         assert_eq!(not_narrowed, LuaType::Unknown);
     }
+
+    // ── Table-guard / self-coalescing regression guards ────────────────────
+
+    #[gtest]
+    fn test_self_coalescing_table_or_keeps_table_behavior() {
+        // `opts = opts or {}` then `opts.foo = "x"` must keep table behavior;
+        // opts must NOT collapse to string after the second assignment.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param opts table|nil
+            function foo(opts)
+                opts = opts or {}
+                opts.foo = "x"
+                a = opts
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            not(contains_substring("string")),
+            "table-guard self-coalescing must not leak string into opts: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_self_coalescing_registry_table_of_over_bare_table_unchanged() {
+        // `Glide = Glide or {}` and `Glide.Registry = Glide.Registry or {}`
+        // must keep the table-of-over-bare-table preference unchanged.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            Glide = Glide or {}
+            Glide.Registry = Glide.Registry or {}
+            a = Glide
+            b = Glide.Registry
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let a_desc = ws.humanize_type(a_ty);
+        assert_that!(
+            a_desc,
+            not(contains_substring("string")),
+            "Glide self-coalescing must keep table type: {}",
+            a_desc
+        );
+
+        let b_ty = ws.expr_ty("b");
+        let b_desc = ws.humanize_type(b_ty);
+        assert_that!(
+            b_desc,
+            not(contains_substring("string")),
+            "Glide.Registry self-coalescing must keep table type: {}",
+            b_desc
+        );
+    }
+
+    /// Regression: a wrong-realm assignment (e.g. inside `if SERVER`) must NOT
+    /// kill an inferred default for a client-side use site when used as a
+    /// generic string template argument.
+    #[gtest]
+    fn test_inferred_default_survives_wrong_realm_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            ---@class ServerPanel: Panel
+
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@return T
+            function create_panel(classname)
+            end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/autorun/client/test.lua",
+            r#"
+            ---@param panelClass string|nil
+            local function create(panelClass)
+                panelClass = panelClass or "DPanel"
+                if SERVER then
+                    panelClass = "ServerPanel"
+                end
+                result = create_panel(panelClass)
+            end
+            "#,
+        );
+
+        // At the client use site, panelClass's inferred default "DPanel"
+        // should survive because the SERVER-only reassignment must be
+        // filtered out by realm-aware reachability.
+        let ty = nth_name_expr_type_from_end(&mut ws, file_id, "result", 0);
+        let desc = ws.humanize_type(ty);
+        assert_that!(
+            desc,
+            contains_substring("DPanel"),
+            "inferred default must survive wrong-realm assignment for generic binding, got: {}",
+            desc
+        );
+    }
+
+    /// Regression: a wrong-realm assignment must NOT kill an explicit param
+    /// default for a client-side use site when used as a generic string
+    /// template argument.
+    #[gtest]
+    fn test_explicit_default_survives_wrong_realm_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            ---@class ServerPanel: Panel
+
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@return T
+            function create_panel(classname)
+            end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/autorun/client/test.lua",
+            r#"
+            ---@param panelClass string="DPanel"
+            local function create(panelClass)
+                if SERVER then
+                    panelClass = "ServerPanel"
+                end
+                result = create_panel(panelClass)
+            end
+            "#,
+        );
+
+        // Inside the function body, at the client use site, panelClass's
+        // explicit default "DPanel" should survive because the SERVER-only
+        // reassignment must be filtered out.
+        let ty = nth_name_expr_type_from_end(&mut ws, file_id, "result", 0);
+        let desc = ws.humanize_type(ty);
+        assert_that!(
+            desc,
+            contains_substring("DPanel"),
+            "explicit default must survive wrong-realm assignment for generic binding, got: {}",
+            desc
+        );
+    }
 }

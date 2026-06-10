@@ -1169,4 +1169,427 @@ mod test {
         let ply_field_type = ws.expr_ty("scenario_ply_test_var");
         assert!(ws.check_type(&ply_field_type, &bool_type));
     }
+
+    // ── Inferred string default binding tests ───────────────────────────
+
+    #[gtest]
+    fn test_inferred_str_default_binds_str_tpl_generic() {
+        // `panelClass = panelClass or "DScrollPanel"` then
+        // `local p = fn(panelClass)` ⇒ p is DScrollPanel.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                function foo(panelClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_no_or_default_does_not_bind_str_tpl() {
+        // `---@param panelClass string` with NO or-default ⇒
+        // `fn(panelClass)` ⇒ Panel (no binding).
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string
+                function foo(panelClass)
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_non_self_or_does_not_bind_from_default_metadata() {
+        // `local y = panelClass or "DScrollPanel"; fn(y)` ⇒
+        // y is a different decl with no registered default ⇒ Panel.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                function foo(panelClass)
+                    local y = panelClass or "DScrollPanel"
+                    local p = create_panel(y)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_inferred_str_default_binds_unannotated_variable() {
+        // Without any annotation, `panelClass = panelClass or "DScrollPanel"`
+        // still carries the inferred default and binds.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                function foo(panelClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(a_ty, expected);
+    }
+
+    // ── Flow-sensitive inferred default tests ──────────────────────────
+
+    #[gtest]
+    fn test_inferred_str_default_is_killed_by_later_reassignment() {
+        // After `panelClass = panelClass or "DScrollPanel"` followed by
+        // `panelClass = otherClass`, the default is dead at the use site.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                ---@param otherClass string
+                function AddTab(panelClass, otherClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    panelClass = otherClass
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_inferred_str_default_inside_conditional_does_not_bind() {
+        // The default is inside a conditional — it does not dominate the use,
+        // so it must NOT bind.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                ---@param cond boolean
+                function AddTab(panelClass, cond)
+                    if cond then
+                        panelClass = panelClass or "DScrollPanel"
+                    end
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_inferred_str_default_before_branch_still_binds() {
+        // The default is before the branch and no reassignment happens,
+        // so it MUST still bind.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                ---@param cond boolean
+                function AddTab(panelClass, cond)
+                    panelClass = panelClass or "DScrollPanel"
+                    if cond then
+                        local x = 1
+                    end
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_inferred_str_default_branch_reassignment_kills_binding() {
+        // Default before branch, but branch reassigns → default is dead.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                ---@param cond boolean
+                ---@param otherClass string
+                function AddTab(panelClass, cond, otherClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    if cond then
+                        panelClass = otherClass
+                    end
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_self_coalescing_assignment_kills_explicit_default() {
+        // When a function has `---@param panelClass string = "DPanel"` AND
+        // then `panelClass = panelClass or "DScrollPanel"`,
+        // the self-coalescing assignment kills the explicit default.
+        // The inferred default "DScrollPanel" should bind downstream.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+                ---@class DPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                function foo(panelClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    ---@cast panelClass string
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+
+                ---@param panelClass string = "DPanel"
+                function bar(panelClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    local p = create_panel(panelClass)
+                    b = p
+                end
+            "#,
+        );
+
+        // foo: no explicit default → inferred "DScrollPanel" binds
+        let a_ty = ws.expr_ty("a");
+        let expected_inferred = ws.ty("DScrollPanel");
+        assert_eq!(a_ty, expected_inferred);
+
+        // bar: self-coalescing assignment kills explicit default,
+        // inferred "DScrollPanel" binds
+        let b_ty = ws.expr_ty("b");
+        let expected_inferred = ws.ty("DScrollPanel");
+        assert_eq!(b_ty, expected_inferred);
+    }
+
+    // ── Explicit param default flow-validity tests ─────────────────────
+
+    #[gtest]
+    fn test_explicit_param_default_is_killed_by_reassignment() {
+        // When a function parameter has `---@param panelClass string = "DPanel"`
+        // but `panelClass = otherClass` reassigns it before the use site,
+        // the explicit default must be killed. Expected: `p` is `Panel`.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string = "DPanel"
+                ---@param otherClass string
+                function AddTab(panelClass, otherClass)
+                    panelClass = otherClass
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_non_string_explicit_param_default_does_not_bind_str_tpl() {
+        // When a function parameter has a non-string explicit default (e.g. boolean),
+        // the string-template default resolver must NOT bind from it.
+        // Expected: `p` is `Panel` (no binding from boolean default).
+        // No reassignment — isolates the non-string-default behavior.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string = true
+                function AddTab(panelClass)
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
 }
