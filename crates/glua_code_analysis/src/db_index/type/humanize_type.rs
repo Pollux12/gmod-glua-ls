@@ -959,6 +959,9 @@ fn build_table_member_string(
         LuaMemberKey::Integer(i) => format!("[{i}]{separator}{member_value}"),
         LuaMemberKey::None => member_value,
         LuaMemberKey::ExprType(LuaType::Integer) => member_value,
+        LuaMemberKey::ExprType(typ) if typ.is_unknown() => {
+            format!("[dynamic]{separator}{member_value}")
+        }
         LuaMemberKey::ExprType(typ) => {
             let key_type = humanize_type(db, typ, level.next_level());
             format!("[{key_type}]{separator}{member_value}")

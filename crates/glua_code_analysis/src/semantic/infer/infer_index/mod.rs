@@ -343,6 +343,20 @@ fn infer_table_member(
         }
         Err(err) => return Err(err),
     };
+
+    if matches!(index_key, LuaIndexKey::Expr(_))
+        && member_key_is_unknown_expr(&key)
+        && let Some(member_type) = infer_gmod_same_file_expr_key_member_type(
+            db,
+            &owner,
+            &key,
+            cache.get_file_id(),
+            index_expr.get_position(),
+        )
+    {
+        return Ok(member_type);
+    }
+
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
         return member_item.resolve_type_with_realm_at_offset(
             db,
@@ -361,6 +375,18 @@ fn infer_table_member(
             resolve_table_const_array_base(db, cache, &owner, index_expr.get_position())?
     {
         return Ok(base);
+    }
+
+    if matches!(index_key, LuaIndexKey::Expr(_))
+        && let Some(member_type) = infer_gmod_same_file_expr_key_member_type(
+            db,
+            &owner,
+            &key,
+            cache.get_file_id(),
+            index_expr.get_position(),
+        )
+    {
+        return Ok(member_type);
     }
 
     if let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
@@ -434,6 +460,81 @@ fn infer_table_member(
 
 fn is_literal_table_field_access(index_key: &LuaIndexKey) -> bool {
     matches!(index_key, LuaIndexKey::Name(_) | LuaIndexKey::String(_))
+}
+
+fn infer_gmod_same_file_expr_key_member_type(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    access_file_id: FileId,
+    access_position: TextSize,
+) -> Option<LuaType> {
+    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+        return None;
+    }
+
+    let access_key_type = crate::semantic::member::member_key_as_type(key)?;
+    let members = db.get_member_index().get_members(owner)?;
+    let mut result = LuaType::Unknown;
+
+    for member in members {
+        if member.get_file_id() != access_file_id {
+            continue;
+        }
+
+        let key_match = if member_key_is_unknown_expr(member.get_key()) {
+            expr_dynamic_access_matches_unknown_member(&access_key_type)
+        } else {
+            member_key_matches_type(db, &access_key_type, member.get_key())
+        };
+        if !key_match {
+            continue;
+        }
+
+        let member_item = crate::db_index::LuaMemberIndexItem::One(member.get_id());
+        let Ok(member_type) =
+            member_item.resolve_type_with_realm_at_offset(db, &access_file_id, access_position)
+        else {
+            continue;
+        };
+
+        result = TypeOps::Union.apply(db, &result, &member_type);
+    }
+
+    if result.is_unknown() {
+        None
+    } else {
+        Some(nullable_if_needed(db, result))
+    }
+}
+
+fn expr_dynamic_access_matches_unknown_member(access_key_type: &LuaType) -> bool {
+    match access_key_type {
+        LuaType::Any
+        | LuaType::Unknown
+        | LuaType::String
+        | LuaType::StringConst(_)
+        | LuaType::DocStringConst(_)
+        | LuaType::Number
+        | LuaType::Integer
+        | LuaType::IntegerConst(_)
+        | LuaType::DocIntegerConst(_)
+        | LuaType::FloatConst(_) => true,
+        LuaType::TypeGuard(inner) => expr_dynamic_access_matches_unknown_member(inner),
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .any(expr_dynamic_access_matches_unknown_member),
+        _ => false,
+    }
+}
+
+fn nullable_if_needed(db: &DbIndex, typ: LuaType) -> LuaType {
+    if typ.is_nullable() {
+        typ
+    } else {
+        TypeOps::Union.apply(db, &typ, &LuaType::Nil)
+    }
 }
 
 fn infer_cross_file_matching_expr_key_member_type(

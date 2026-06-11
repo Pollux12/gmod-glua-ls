@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     CacheEntry, FileId, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
-    LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
+    LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::{
         analyzer::{
             common::{add_member, bind_type},
@@ -112,7 +112,9 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
                     continue;
                 }
-                if should_defer_nil_gmod_index_alias(analyzer, &expr, &expr_type) {
+                if should_defer_nil_gmod_index_alias(analyzer, &expr, &expr_type)
+                    || should_defer_weak_gmod_dynamic_index_alias(analyzer, &expr, &expr_type)
+                {
                     analyzer.context.request_stabilization(analyzer.file_id);
                     clear_index_expr_type_cache(analyzer, &expr);
                     let unresolve = UnResolveDecl {
@@ -324,6 +326,28 @@ fn should_defer_nil_gmod_index_alias(
         && matches!(expr, LuaExpr::IndexExpr(_))
 }
 
+fn should_defer_weak_gmod_dynamic_index_alias(
+    analyzer: &LuaAnalyzer,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    analyzer.gmod_enabled
+        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        && matches!(expr, LuaExpr::IndexExpr(index_expr) if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))))
+        && is_weak_dynamic_index_alias_type(expr_type)
+}
+
+fn is_weak_dynamic_index_alias_type(expr_type: &LuaType) -> bool {
+    match expr_type {
+        LuaType::Any | LuaType::Unknown => true,
+        LuaType::Union(union) => match union.as_ref() {
+            LuaUnionType::Nullable(inner) => inner.is_any() || inner.is_unknown(),
+            LuaUnionType::Multi(_) => false,
+        },
+        _ => false,
+    }
+}
+
 fn should_defer_gmod_self_index(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
     if !analyzer.gmod_enabled || !analyzer.db.get_emmyrc().gmod.infer_dynamic_fields {
         return false;
@@ -378,7 +402,7 @@ fn clear_index_expr_type_cache(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) {
     let mut current_expr = expr.clone();
     while let LuaExpr::IndexExpr(index_expr) = current_expr {
         let syntax_id = index_expr.get_syntax_id();
-        if matches!(cache.expr_cache.get(&syntax_id), Some(CacheEntry::Cache(typ)) if typ.is_nil())
+        if matches!(cache.expr_cache.get(&syntax_id), Some(CacheEntry::Cache(typ)) if typ.is_nil() || is_weak_dynamic_index_alias_type(typ))
         {
             cache.expr_cache.remove(&syntax_id);
             cache.expr_var_ref_id_cache.remove(&syntax_id);
