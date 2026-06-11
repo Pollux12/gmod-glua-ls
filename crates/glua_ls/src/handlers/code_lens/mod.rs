@@ -23,6 +23,15 @@ pub async fn on_code_lens_handler(
         return None;
     }
 
+    let uri = params.text_document.uri;
+
+    if !context
+        .wait_until_latest_document_version_applied(&uri, &cancel_token)
+        .await
+    {
+        return None;
+    }
+
     // Wait for pending reindex work so VS Code keeps the current lenses visible
     // instead of clearing them during the dirty window, which causes layout flicker.
     if !context
@@ -33,7 +42,6 @@ pub async fn on_code_lens_handler(
         return None;
     }
 
-    let uri = params.text_document.uri;
     let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;

@@ -792,7 +792,8 @@ mod test {
             ws.humanize_type_detailed(base_class_name_ty.clone())
         );
 
-        let base_class_read_ty = index_expr_type(&mut ws, file_id, "Glide.WeaponRegistry[baseClassName]");
+        let base_class_read_ty =
+            index_expr_type(&mut ws, file_id, "Glide.WeaponRegistry[baseClassName]");
         let base_class_read_display = ws.humanize_type_detailed(base_class_read_ty.clone());
         assert_that!(
             base_class_read_display.as_str(),
