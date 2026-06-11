@@ -3987,10 +3987,16 @@ _2 = a[1]
         set_gmod_enabled(&mut ws);
         ws.def_gmod_type_predicates();
 
-        assert!(ws.check_file_for(
-            DiagnosticCode::ParamTypeMismatch,
+        let file_id = ws.def_file(
             "lua/entities/starfall_prop/init.lua",
             r#"
+            SF = {}
+
+            function SF.Throw(msg, level, uncatchable, userdata)
+                local level = 1 + (level or 1)
+                error(msg, level)
+            end
+
             util = {}
 
             ---@param str string
@@ -4091,7 +4097,95 @@ _2 = a[1]
                 return propent
             end
             "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::ParamTypeMismatch,
         ));
+
+        let mesh_convexes_ty = nth_name_expr_type_from_end(&mut ws, file_id, "meshConvexes", 0);
+        assert_that!(ws.humanize_type(mesh_convexes_ty), eq("table"));
+    }
+
+    #[gtest]
+    fn test_never_returning_call_branch_does_not_leave_uninitialized_local_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return never
+            local function Throw() end
+
+            local value
+            if condition then
+                value = "ok"
+            else
+                Throw()
+            end
+
+            local result = value
+            "#,
+        );
+
+        let value_ty = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        assert_that!(ws.humanize_type(value_ty), eq("\"ok\""));
+    }
+
+    #[gtest]
+    fn test_error_wrapper_call_branch_does_not_leave_uninitialized_local_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local function Throw(message)
+                error(message, 2)
+            end
+
+            local value
+            if condition then
+                value = "ok"
+            else
+                Throw("invalid")
+            end
+
+            local result = value
+            "#,
+        );
+
+        let value_ty = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        assert_that!(ws.humanize_type(value_ty), eq("\"ok\""));
+    }
+
+    #[gtest]
+    fn test_shadowed_global_never_member_call_does_not_mark_branch_unreachable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            GlobalApi = {}
+
+            ---@return never
+            function GlobalApi.Throw() end
+            "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            local GlobalApi = {}
+            function GlobalApi.Throw() end
+
+            local value
+            if condition then
+                value = "ok"
+            else
+                GlobalApi.Throw()
+            end
+
+            local result = value
+            "#,
+        );
+
+        let value_ty = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        assert_that!(ws.humanize_type(value_ty), eq("\"ok\"?"));
     }
 
     #[gtest]

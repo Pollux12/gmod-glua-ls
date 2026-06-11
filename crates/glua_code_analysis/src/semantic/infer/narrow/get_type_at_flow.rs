@@ -8,9 +8,9 @@ use rowan::TextSize;
 
 use crate::{
     AssignVarHint, CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
-    GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeOwner, LuaUnionType,
-    TypeOps, infer_expr,
+    GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeOwner,
+    LuaUnionType, TypeOps, infer_expr,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at, infer_param_with_cache,
         narrow::{
@@ -275,10 +275,14 @@ fn get_type_at_flow_walk(
                 }
             }
             FlowNodeKind::Call(call_ptr) => {
-                let call_expr_stat = call_ptr.to_node(root).ok_or(InferFailReason::None)?;
+                let call_expr = call_ptr.to_node(root).ok_or(InferFailReason::None)?;
+                if call_expr_returns_never(db, cache, call_expr.clone()) {
+                    return Ok(LuaType::Never);
+                }
+
                 if let Some(effects) = db
                     .get_flow_index()
-                    .get_special_call_effects(&cache.get_file_id(), call_expr_stat.get_position())
+                    .get_special_call_effects(&cache.get_file_id(), call_expr.get_position())
                 {
                     let mut effect_type = None;
                     for effect in effects {
@@ -643,7 +647,8 @@ fn merge_antecedent_types(
         if matches!(
             antecedent_node.kind,
             FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break
-        ) {
+        ) || call_flow_node_returns_never(db, cache, root, antecedent_node)
+        {
             continue;
         }
 
@@ -675,7 +680,8 @@ fn merge_antecedent_types(
         if matches!(
             antecedent_node.kind,
             FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break
-        ) {
+        ) || call_flow_node_returns_never(db, cache, root, antecedent_node)
+        {
             continue;
         }
 
@@ -689,6 +695,140 @@ fn merge_antecedent_types(
     }
 
     Ok(merge_flow_branch_types(db, var_ref_id, branch_types))
+}
+
+fn call_flow_node_returns_never(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    flow_node: &FlowNode,
+) -> bool {
+    let FlowNodeKind::Call(call_ptr) = &flow_node.kind else {
+        return false;
+    };
+    let Some(call_expr) = call_ptr.to_node(root) else {
+        return false;
+    };
+    call_expr_returns_never(db, cache, call_expr)
+}
+
+fn call_expr_returns_never(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: glua_parser::LuaCallExpr,
+) -> bool {
+    if call_expr.is_error() {
+        return true;
+    }
+
+    match call_expr.get_prefix_expr() {
+        Some(LuaExpr::NameExpr(name_expr)) => db
+            .get_reference_index()
+            .get_local_reference(&cache.get_file_id())
+            .and_then(|local_ref| local_ref.get_decl_id(&name_expr.get_range()))
+            .is_some_and(|decl_id| {
+                semantic_decl_returns_never(db, LuaSemanticDeclId::LuaDecl(decl_id))
+            }),
+        Some(LuaExpr::IndexExpr(index_expr)) => {
+            index_call_prefix_returns_never(db, cache, index_expr)
+        }
+        _ => false,
+    }
+}
+
+fn index_call_prefix_returns_never(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: LuaIndexExpr,
+) -> bool {
+    if semantic_decl_returns_never(
+        db,
+        LuaSemanticDeclId::Member(LuaMemberId::new(
+            index_expr.get_syntax_id(),
+            cache.get_file_id(),
+        )),
+    ) {
+        return true;
+    }
+
+    let Some(LuaExpr::NameExpr(prefix_name)) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    if !name_expr_is_global_root(db, cache, &prefix_name) {
+        return false;
+    }
+
+    let Some(global_name) = prefix_name.get_name_text() else {
+        return false;
+    };
+    let Some(member_key) = index_expr
+        .get_index_key()
+        .and_then(|key| LuaMemberKey::from_index_key(db, cache, &key).ok())
+    else {
+        return false;
+    };
+
+    let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&global_name));
+    db.get_member_index()
+        .get_member_item(&owner, &member_key)
+        .and_then(|member_item| {
+            member_item.resolve_semantic_decl_with_realm_at_offset(
+                db,
+                &cache.get_file_id(),
+                index_expr.get_position(),
+            )
+        })
+        .is_some_and(|semantic_decl| semantic_decl_returns_never(db, semantic_decl))
+}
+
+fn name_expr_is_global_root(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    name_expr: &glua_parser::LuaNameExpr,
+) -> bool {
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())
+    else {
+        return true;
+    };
+
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_global() || decl.is_module_scoped())
+}
+
+fn semantic_decl_returns_never(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -> bool {
+    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
+        return signature_returns_never(db, signature_id);
+    }
+
+    match semantic_decl {
+        LuaSemanticDeclId::Signature(signature_id) => signature_returns_never(db, signature_id),
+        LuaSemanticDeclId::LuaDecl(decl_id) => db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .is_some_and(|type_cache| type_returns_never(db, type_cache.as_type())),
+        LuaSemanticDeclId::Member(member_id) => db
+            .get_type_index()
+            .get_type_cache(&member_id.into())
+            .is_some_and(|type_cache| type_returns_never(db, type_cache.as_type())),
+        LuaSemanticDeclId::TypeDecl(_) => false,
+    }
+}
+
+fn signature_returns_never(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    db.get_signature_index()
+        .get(&signature_id)
+        .is_some_and(|signature| signature.get_return_type().is_never())
+}
+
+fn type_returns_never(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Signature(signature_id) => signature_returns_never(db, *signature_id),
+        LuaType::DocFunction(func) => func.get_ret().is_never(),
+        _ => false,
+    }
 }
 
 fn merge_flow_branch_types(
