@@ -172,6 +172,27 @@ mod test {
     }
 
     #[test]
+    fn test_guard_clause_not_compound_and_suppresses_following_uses() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_sv/wire.lua",
+            r#"
+            module("sf_wire", package.seeall)
+
+            return function(instance)
+                if not (WireLib and WireLib.CreateInputs) then return end
+
+                instance:AddHook("initialize", function()
+                    WireLib.CreateInputs()
+                end)
+            end
+            "#,
+            "WireLib",
+        ));
+    }
+
+    #[test]
     fn test_top_level_guard_clause_not_global_suppresses_later_direct_use() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(ws.check_code_for(
@@ -512,6 +533,47 @@ mod test {
                 print(ctp)
             end
             "#
+        ));
+    }
+
+    #[test]
+    fn test_short_circuit_and_guards_rhs_global_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "lua/entities/starfall_processor/init.lua",
+            r#"
+            function ENT:PreEntityCopy()
+                local info = WireLib and WireLib.BuildDupeInfo(self) or {}
+            end
+            "#,
+            "WireLib",
+        ));
+    }
+
+    #[test]
+    fn test_short_circuit_and_lhs_optional_global_probe_is_silent() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            local enabled = OptionalAddon and true
+            "#,
+            "OptionalAddon",
+        ));
+    }
+
+    #[test]
+    fn test_short_circuit_and_does_not_guard_unrelated_rhs_global() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            local info = WireLib and OtherLib.BuildDupeInfo(self) or {}
+            "#,
+            "OtherLib",
         ));
     }
 
