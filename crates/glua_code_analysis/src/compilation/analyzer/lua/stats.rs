@@ -2333,11 +2333,25 @@ fn infer_guarded_table_assignment_type(
     if left_type.is_nil() || left_type.is_unknown() || left_type.is_never() {
         return Ok(right_type);
     }
+    if should_prefer_guarded_dynamic_index_rhs(analyzer, left, &left_type) {
+        return Ok(right_type);
+    }
     if !(left_type.is_any() || left_type.is_table()) {
         return analyzer.infer_expr(binary_expr);
     }
 
     Ok(TypeOps::Union.apply(analyzer.db, &left_type, &right_type))
+}
+
+fn should_prefer_guarded_dynamic_index_rhs(
+    analyzer: &LuaAnalyzer,
+    left: &LuaExpr,
+    left_type: &LuaType,
+) -> bool {
+    analyzer.gmod_enabled
+        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        && left_type.is_any()
+        && matches!(left, LuaExpr::IndexExpr(index_expr) if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))))
 }
 
 fn has_delayed_definition_attribute(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bool {

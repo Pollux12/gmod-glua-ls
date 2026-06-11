@@ -856,6 +856,87 @@ mod test {
     }
 
     #[gtest]
+    fn test_guarded_dynamic_key_assignment_preserves_shaped_table_value() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/glide/client/debugging.lua",
+            r#"
+        ---@class Vector
+        local Vector = {}
+        ---@param other Vector
+        function Vector:Add(other)
+        end
+
+        ---@return Vector
+        local function vec()
+        end
+
+        ---@return any
+        local function getVid()
+        end
+
+        local vehicleContacts = {}
+        local vid = getVid()
+        local contactPos = vec()
+        local d = { contactPos = true, contactNormal = true }
+
+        if d.contactPos then
+            vehicleContacts[vid] = vehicleContacts[vid] or {
+                sum = vec(),
+                n = 0,
+                normalSum = vec(),
+                normalN = 0,
+            }
+            vehicleContacts[vid].sum:Add(contactPos)
+            vehicleContacts[vid].n = vehicleContacts[vid].n + 1
+            if d.contactNormal then
+                vehicleContacts[vid].normalSum:Add(vec())
+                vehicleContacts[vid].normalN = vehicleContacts[vid].normalN + 1
+            end
+        end
+
+        local contacts = vehicleContacts
+        local contact = vehicleContacts[vid]
+        "#,
+        );
+
+        let contacts_ty = local_name_type(&mut ws, file_id, "contacts");
+        let contacts_display = ws.humanize_type_detailed(contacts_ty.clone());
+        assert_that!(
+            contacts_display.as_str(),
+            all!(
+                contains_substring("sum"),
+                contains_substring("n"),
+                contains_substring("normalSum"),
+                contains_substring("normalN"),
+                not(contains_substring(": any"))
+            ),
+            "guarded dynamic-key table should preserve the shaped value type on `vehicleContacts`: {}",
+            contacts_display
+        );
+
+        let contact_ty = local_name_type(&mut ws, file_id, "contact");
+        let contact_display = ws.humanize_type_detailed(contact_ty.clone());
+        assert_that!(
+            contact_display.as_str(),
+            all!(
+                contains_substring("sum"),
+                contains_substring("n"),
+                contains_substring("normalSum"),
+                contains_substring("normalN"),
+                not(eq("any?"))
+            ),
+            "guarded dynamic-key read should preserve the shaped contact value: {}",
+            contact_display
+        );
+    }
+
+    #[gtest]
     fn test_dynamic_key_read_from_known_table_fields_returns_child_table_value() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
