@@ -13,8 +13,6 @@ use glua_code_analysis::{
 };
 use tokio_util::sync::CancellationToken;
 
-
-
 fn setup_logger() {
     let log_file =
         std::env::var("BENCH_LOG").unwrap_or_else(|_| "benchmark_profile.log".to_string());
@@ -201,14 +199,14 @@ async fn main() {
         Ok(val) => match val.parse::<usize>() {
             Ok(n) if n > 0 => n,
             Ok(_) => {
-                eprintln!("ERROR: BENCH_THREADS must be a positive integer, got: {}", val);
+                eprintln!(
+                    "ERROR: BENCH_THREADS must be a positive integer, got: {}",
+                    val
+                );
                 std::process::exit(1);
             }
             Err(_) => {
-                eprintln!(
-                    "ERROR: BENCH_THREADS is not a valid integer: {}",
-                    val
-                );
+                eprintln!("ERROR: BENCH_THREADS is not a valid integer: {}", val);
                 std::process::exit(1);
             }
         },
