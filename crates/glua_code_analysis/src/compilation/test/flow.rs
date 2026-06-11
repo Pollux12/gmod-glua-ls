@@ -3956,6 +3956,145 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_elseif_type_guard_narrows_after_previous_type_guard_false_branch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
+        ws.def(
+            r#"
+            ---@param value table
+            local function RequiresTable(value) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param sfmeshdata string|table
+            local function test(sfmeshdata)
+                if isstring(sfmeshdata) then
+                    return
+                elseif istable(sfmeshdata) then
+                    RequiresTable(sfmeshdata)
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_starfall_mesh_convexes_do_not_keep_string_after_elseif_istable_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_gmod_type_predicates();
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::ParamTypeMismatch,
+            "lua/entities/starfall_prop/init.lua",
+            r#"
+            util = {}
+
+            ---@param str string
+            ---@return string
+            function util.Compress(str) end
+
+            ---@param compressedString string
+            ---@param maxSize? number
+            ---@return string|nil
+            function util.Decompress(compressedString, maxSize) end
+
+            ---@class Vector
+
+            ---@return Vector
+            function Vector(x, y, z) end
+
+            local function streamToMesh(meshdata)
+                local meshConvexes = {}
+
+                meshdata = SF.StringStream(util.Decompress(meshdata, 65536))
+                local nConvexes = meshdata:readInt32()
+                if nConvexes > maxConvexesPerProp then SF.Throw("Exceeded", 2) end
+                for iConvex = 1, nConvexes do
+                    local nVertices = meshdata:readInt32()
+                    if nVertices > maxVerticesPerConvex then SF.Throw("Exceeded", 2) end
+                    local convex = {}
+                    for iVertex = 1, nVertices do
+                        convex[iVertex] = Vector(meshdata:readFloat(), meshdata:readFloat(), meshdata:readFloat())
+                    end
+                    meshConvexes[iConvex] = convex
+                end
+
+                return meshConvexes
+            end
+
+            local function meshToStream(meshConvexes)
+                local meshdata = SF.StringStream()
+                meshdata:writeInt32(#meshConvexes)
+                for _, convex in ipairs(meshConvexes) do
+                    meshdata:writeInt32(#convex)
+                    for _, vertex in ipairs(convex) do
+                        meshdata:writeFloat(vertex[1]) meshdata:writeFloat(vertex[2]) meshdata:writeFloat(vertex[3])
+                    end
+                end
+                return util.Compress(meshdata:getString())
+            end
+
+            local function checkMesh(ply, meshConvexes)
+                if #meshConvexes > maxConvexesPerProp then SF.Throw("Exceeded", 2) end
+                if #meshConvexes <= 0 then SF.Throw("Invalid", 2) end
+
+                local totalVertices = 0
+                for _, convex in ipairs(meshConvexes) do
+                    if #convex > maxVerticesPerConvex then SF.Throw("Exceeded", 2) end
+                    if #convex < 4 then SF.Throw("Invalid", 2) end
+
+                    totalVertices = totalVertices + #convex
+                    customPropVertexLimit:checkuse(ply, totalVertices)
+
+                    for k, vertex in ipairs(convex) do
+                        for i = 1, k - 1 do
+                            if convex[i]:DistToSqr(vertex) < mindist then
+                                SF.Throw("No two vertices can have a distance less", 2)
+                            end
+                        end
+                    end
+                end
+            end
+
+            local function createCustomProp(ply, pos, ang, sfmeshdata)
+                local meshConvexes
+                if isstring(sfmeshdata) then
+                    meshConvexes = streamToMesh(sfmeshdata)
+                elseif istable(sfmeshdata) then
+                    meshConvexes = sfmeshdata
+                    sfmeshdata = meshToStream(meshConvexes)
+                else
+                    SF.Throw("Invalid sfmeshdata", 2)
+                end
+                if #sfmeshdata > 65536 then
+                    SF.Throw("sfmeshdata is too long!", 2)
+                end
+
+                checkMesh(ply, meshConvexes)
+                SF.NetBurst:use(ply, #sfmeshdata * 8)
+
+                local propent = ents.Create("starfall_prop")
+                propent.sf_physmesh = meshConvexes
+
+                propent.sfmeshdata = sfmeshdata
+                propent:Spawn()
+
+                local totalVertices = 0
+                for k, v in ipairs(meshConvexes) do
+                    totalVertices = totalVertices + #v
+                end
+
+                return propent
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
     fn test_realistic_registry_lookup_keeps_value_type_for_followup_field_access() {
         let mut ws = VirtualWorkspace::new();
 
