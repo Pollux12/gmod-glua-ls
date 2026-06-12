@@ -8721,6 +8721,70 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_vgui_self_field_assigned_class_return_keeps_methods_for_diagnostics() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/derma/derma_animation.lua",
+            r#"
+            local DermaAnimation = {}
+            DermaAnimation.__index = DermaAnimation
+
+            function DermaAnimation:Run() end
+
+            function Derma_Anim(name, panel, func)
+                local anim = {}
+                anim.Name = name
+                anim.Panel = panel
+                anim.Func = func
+                setmetatable(anim, DermaAnimation)
+                return anim
+            end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/anim_panel.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.animSlide = Derma_Anim("Anim", self, self.AnimSlide)
+            end
+
+            function PANEL:Think()
+                self.animSlide:Run()
+            end
+
+            function PANEL:AnimSlide(anim, delta, data)
+            end
+
+            derma.DefineControl("AnimPanel", "Description", PANEL, "DPanel")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("undefined-field".to_string()))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected undefined-field diagnostics for self.animSlide: {undefined_fields:?}"
+        );
+    }
+
     /// Regression: when PANEL is aliased (`local OLD = PANEL`), then PANEL is
     /// reassigned (`PANEL = {}`), and a method is added via the OLD alias
     /// (`function OLD:OldOnly() end`), the fallback member transfer must NOT
