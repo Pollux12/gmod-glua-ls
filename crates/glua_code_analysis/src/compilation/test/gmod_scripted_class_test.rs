@@ -881,6 +881,59 @@ mod test {
     }
 
     #[gtest]
+    fn test_accessor_func_forced_setter_accepts_uncoerced_inputs() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::AssignTypeMismatch);
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+
+        let file_id = ws.def_file(
+            "lua/entities/accessor_input/init.lua",
+            r#"
+            AccessorFunc(ENT, "m_bChecked", "Checked", FORCE_BOOL)
+
+            function ENT:SetValue(val)
+                if (tonumber(val) == 0) then val = 0 end
+                val = tobool(val)
+
+                self:SetChecked(val)
+
+                if (val) then val = "1" else val = "0" end
+                self:SetChecked("1")
+                self:SetChecked(0)
+            end
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let assign_type_mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
+        ));
+        let param_type_mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let mismatch_diags = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == assign_type_mismatch_code
+                    || diagnostic.code == param_type_mismatch_code
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            mismatch_diags.is_empty(),
+            "AccessorFunc forced setters should accept raw values before coercion: {mismatch_diags:?}"
+        );
+    }
+
+    #[gtest]
     fn test_network_var_synthesizes_get_set_members() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

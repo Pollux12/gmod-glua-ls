@@ -3306,6 +3306,7 @@ fn synthesize_accessor_func(
 
     let force_type = call.literal_args.get(3).and_then(|arg| arg.as_ref());
     let value_type = resolve_accessor_force_type(force_type);
+    let setter_input_type = resolve_accessor_setter_input_type(force_type);
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
 
     // Synthesize the backing field if var_key is present
@@ -3350,7 +3351,7 @@ fn synthesize_accessor_func(
         AsyncState::None,
         true,
         false,
-        vec![("value".to_string(), Some(value_type))],
+        vec![("value".to_string(), Some(setter_input_type))],
         LuaType::Nil,
     );
     let member_id = LuaMemberId::new(setter_syntax_id, file_id);
@@ -4248,6 +4249,14 @@ fn resolve_accessor_force_type(force_arg: Option<&GmodClassCallLiteral>) -> LuaT
         },
         Some(GmodClassCallLiteral::Boolean(true)) => LuaType::Boolean,
         _ => LuaType::Any,
+    }
+}
+
+fn resolve_accessor_setter_input_type(force_arg: Option<&GmodClassCallLiteral>) -> LuaType {
+    if force_arg.is_some() {
+        LuaType::Any
+    } else {
+        resolve_accessor_force_type(force_arg)
     }
 }
 
