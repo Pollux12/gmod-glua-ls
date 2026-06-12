@@ -1317,12 +1317,29 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
             .get_name_token()
             .and_then(|t| GmodScriptedClassCallKind::from_call_name(t.get_name_text())),
         Some(LuaExpr::IndexExpr(index_expr)) => {
+            let scripted_ents_register = index_expr
+                .get_prefix_expr()
+                .and_then(|expr| match expr {
+                    LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+                    _ => None,
+                })
+                .is_some_and(|name| name == "scripted_ents");
             index_expr.get_index_key().and_then(|key| match &key {
                 LuaIndexKey::Name(name_token) => {
-                    GmodScriptedClassCallKind::from_call_name(name_token.get_name_text())
+                    let name = name_token.get_name_text();
+                    if scripted_ents_register && name == "Register" {
+                        Some(GmodScriptedClassCallKind::ScriptedEntRegister)
+                    } else {
+                        GmodScriptedClassCallKind::from_call_name(name)
+                    }
                 }
                 LuaIndexKey::String(string_token) => {
-                    GmodScriptedClassCallKind::from_call_name(&string_token.get_value())
+                    let name = string_token.get_value();
+                    if scripted_ents_register && name == "Register" {
+                        Some(GmodScriptedClassCallKind::ScriptedEntRegister)
+                    } else {
+                        GmodScriptedClassCallKind::from_call_name(&name)
+                    }
                 }
                 _ => None,
             })
@@ -1340,6 +1357,7 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
     if kind != GmodScriptedClassCallKind::DefineBaseClass
         && kind != GmodScriptedClassCallKind::DeriveGamemode
         && kind != GmodScriptedClassCallKind::AccessorFunc
+        && kind != GmodScriptedClassCallKind::ScriptedEntRegister
         && !analyzer.is_scripted_class_scope
     {
         return;

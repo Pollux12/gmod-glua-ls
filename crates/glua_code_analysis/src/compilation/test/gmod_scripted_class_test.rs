@@ -4408,6 +4408,116 @@ mod test {
     }
 
     #[gtest]
+    fn test_scripted_ent_register_local_table_synthesizes_class_and_networkvar_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            function Entity:NetworkVar(type, slot, name) end
+
+            ---@return widget_base
+            function Entity:GetParent() end
+
+            ---@class widget_arrow : Entity
+            local widget_arrow = {}
+            function widget_arrow:SetupDataTables() end
+
+            ---@class widget_disc : Entity
+            local widget_disc = {}
+            function widget_disc:SetupDataTables() end
+
+            ---@class widget_base : Entity
+            local widget_base = {}
+            function widget_base:OnArrowDragged(axis, dist, pl, mv) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/widget_axis/shared.lua",
+            r#"
+            DEFINE_BASECLASS("widget_arrow")
+            local widget_axis_arrow = { Base = "widget_arrow" }
+
+            function widget_axis_arrow:SetupDataTables()
+                BaseClass.SetupDataTables(self)
+                self:NetworkVar("Int", 0, "AxisIndex")
+            end
+
+            function widget_axis_arrow:ArrowDragged(pl, mv, dist)
+                self:GetParent():OnArrowDragged(self:GetAxisIndex(), dist, pl, mv)
+            end
+
+            scripted_ents.Register(widget_axis_arrow, "widget_axis_arrow")
+
+            DEFINE_BASECLASS("widget_disc")
+            local widget_axis_disc = { Base = "widget_disc" }
+
+            function widget_axis_disc:SetupDataTables()
+                BaseClass.SetupDataTables(self)
+                self:NetworkVar("Int", 0, "AxisIndex")
+            end
+
+            function widget_axis_disc:ArrowDragged(pl, mv, dist)
+                self:GetParent():OnArrowDragged(self:GetAxisIndex(), dist, pl, mv)
+            end
+
+            scripted_ents.Register(widget_axis_disc, "widget_axis_disc")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
+        assert!(
+            undefined_field_diags.is_empty(),
+            "unexpected undefined-field diagnostics for local scripted_ents.Register class: {undefined_field_diags:?}"
+        );
+
+        for class_name in ["widget_axis_arrow", "widget_axis_disc"] {
+            let owner = LuaMemberOwner::Type(LuaTypeDeclId::global(class_name));
+            let members = ws
+                .get_db_mut()
+                .get_member_index()
+                .get_members(&owner)
+                .unwrap_or_else(|| panic!("expected synthesized members on {class_name}"));
+            let member_names: Vec<_> = members
+                .iter()
+                .filter_map(|member| member.get_key().get_name().map(|name| name.to_string()))
+                .collect();
+
+            assert!(
+                member_names.contains(&"GetAxisIndex".to_string()),
+                "missing GetAxisIndex on {class_name} in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"SetAxisIndex".to_string()),
+                "missing SetAxisIndex on {class_name} in {member_names:?}"
+            );
+        }
+    }
+
+    #[gtest]
     fn test_network_var_same_function_usage_with_real_config() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();

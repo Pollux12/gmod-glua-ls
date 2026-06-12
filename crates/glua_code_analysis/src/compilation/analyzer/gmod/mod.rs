@@ -496,6 +496,15 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
             log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed());
         }
 
+        let t_local_register = do_profile.then(std::time::Instant::now);
+        synthesize_scripted_ent_registrations(db, &file_ids);
+        if let Some(t_local_register) = t_local_register {
+            log::info!(
+                "gmod post: scripted_ent_registrations cost {:?}",
+                t_local_register.elapsed()
+            );
+        }
+
         let t0 = do_profile.then(std::time::Instant::now);
         synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
         if let Some(t0) = t0 {
@@ -2584,6 +2593,222 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                 }
             }
         }
+    }
+}
+
+fn synthesize_scripted_ent_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
+    for file_id in file_ids.iter().copied() {
+        let metadata = match db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+        {
+            Some(metadata) => metadata.clone(),
+            None => continue,
+        };
+
+        for call in &metadata.scripted_ent_register_calls {
+            synthesize_scripted_ent_registration(db, file_id, &metadata, call);
+        }
+    }
+}
+
+fn synthesize_scripted_ent_registration(
+    db: &mut DbIndex,
+    file_id: FileId,
+    metadata: &GmodScriptedClassFileMetadata,
+    call: &GmodScriptedClassCallMetadata,
+) {
+    let Some(class_name) = call
+        .literal_args
+        .get(1)
+        .and_then(|arg| arg.as_ref())
+        .and_then(|arg| match arg {
+            GmodClassCallLiteral::String(name) if !name.is_empty() => Some(name.as_str()),
+            _ => None,
+        })
+    else {
+        return;
+    };
+
+    let class_decl_id = LuaTypeDeclId::global(class_name);
+    if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
+        db.get_type_index_mut().add_type_decl(
+            file_id,
+            LuaTypeDecl::new(
+                file_id,
+                call.syntax_id.get_range(),
+                class_name.to_string(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::None.into(),
+                class_decl_id.clone(),
+            ),
+        );
+    }
+
+    let register_position = call.syntax_id.get_range().start();
+    let class_type = LuaType::Def(class_decl_id.clone());
+
+    let (registered_table, region_start, decl_id) = match call
+        .literal_args
+        .first()
+        .and_then(|arg| arg.as_ref())
+    {
+        Some(GmodClassCallLiteral::NameRef(var_name)) => {
+            if db
+                .get_gmod_infer_index()
+                .get_scoped_class_info(&file_id)
+                .is_some_and(|info| info.global_name == var_name.as_str())
+            {
+                return;
+            }
+            let Some((decl_id, region_start)) =
+                resolve_local_registration_region(db, file_id, var_name, register_position)
+            else {
+                return;
+            };
+            (
+                find_registered_table_expr(db, file_id, decl_id, register_position),
+                region_start,
+                Some(decl_id),
+            )
+        }
+        _ => (
+            find_table_expr_for_arg_source(db, file_id, call, &GmodClassCallArgSource::direct(0)),
+            TextSize::new(0),
+            None,
+        ),
+    };
+
+    let Some(table_expr) = registered_table else {
+        return;
+    };
+
+    let table_range = InFiled::new(file_id, table_expr.get_range());
+    let table_syntax_owner =
+        LuaTypeOwner::SyntaxId(InFiled::new(file_id, table_expr.get_syntax_id()));
+    let preserve_doc = db
+        .get_type_index()
+        .get_type_cache(&table_syntax_owner)
+        .is_some_and(|cache| cache.is_doc());
+    if !preserve_doc {
+        db.get_type_index_mut().force_bind_type(
+            table_syntax_owner,
+            LuaTypeCache::InferType(class_type.clone()),
+        );
+    }
+
+    if let Some(decl_id) = decl_id
+        && !decl_has_reassignment(db, file_id, decl_id)
+    {
+        db.get_type_index_mut()
+            .force_bind_type(decl_id.into(), LuaTypeCache::InferType(class_type.clone()));
+    }
+
+    let source_owner = LuaMemberOwner::Element(table_range.clone());
+    let class_member_owner = LuaMemberOwner::Type(class_decl_id.clone());
+    let table_member_ids: Vec<_> = db
+        .get_member_index()
+        .get_members(&source_owner)
+        .map(|members| {
+            members
+                .iter()
+                .filter(|member| member.get_key().get_name() != Some("BaseClass"))
+                .map(|member| member.get_id())
+                .collect()
+        })
+        .unwrap_or_default();
+    for member_id in table_member_ids {
+        add_member(db, class_member_owner.clone(), member_id);
+    }
+
+    db.get_type_index_mut()
+        .replace_table_const_type(&table_range, &class_type);
+
+    let base_name =
+        resolve_registered_scripted_ent_base(table_expr.clone(), metadata, register_position);
+    if let Some(base_name) = base_name {
+        let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
+        if super_type != class_type {
+            db.get_type_index_mut().add_super_type_if_missing(
+                class_decl_id.clone(),
+                file_id,
+                super_type,
+            );
+        }
+    }
+
+    synthesize_registered_scripted_ent_region_members(
+        db,
+        file_id,
+        &class_decl_id,
+        metadata,
+        region_start,
+        register_position,
+    );
+}
+
+fn resolve_registered_scripted_ent_base(
+    table_expr: LuaTableExpr,
+    metadata: &GmodScriptedClassFileMetadata,
+    register_position: TextSize,
+) -> Option<String> {
+    if let Some(field) = find_table_field_by_name(&table_expr, "Base")
+        && let Some(value_expr) = field.get_value_expr()
+        && let Some(base_name) = extract_scoped_base_name(&value_expr)
+    {
+        return Some(base_name);
+    }
+
+    metadata
+        .define_baseclass_calls
+        .iter()
+        .rev()
+        .find(|call| call.syntax_id.get_range().start() < register_position)
+        .and_then(
+            |call| match call.literal_args.get(call.inheritance_name_arg_idx()) {
+                Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                    Some(name.clone())
+                }
+                _ => None,
+            },
+        )
+}
+
+fn synthesize_registered_scripted_ent_region_members(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    metadata: &GmodScriptedClassFileMetadata,
+    region_start: TextSize,
+    register_position: TextSize,
+) {
+    let in_region = |call: &GmodScriptedClassCallMetadata| {
+        let position = call.syntax_id.get_range().start();
+        position >= region_start && position < register_position
+    };
+
+    for call in metadata
+        .accessor_func_calls
+        .iter()
+        .filter(|call| in_region(call))
+    {
+        synthesize_accessor_func(db, file_id, class_decl_id, call);
+    }
+
+    for call in metadata
+        .network_var_calls
+        .iter()
+        .filter(|call| in_region(call))
+    {
+        synthesize_network_var(db, file_id, class_decl_id, call);
+    }
+
+    for call in metadata
+        .network_var_element_calls
+        .iter()
+        .filter(|call| in_region(call))
+    {
+        synthesize_network_var_element(db, file_id, class_decl_id, call);
     }
 }
 

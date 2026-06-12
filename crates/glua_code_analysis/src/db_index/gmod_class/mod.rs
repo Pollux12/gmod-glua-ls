@@ -13,6 +13,7 @@ pub enum GmodScriptedClassCallKind {
     AccessorFunc,
     NetworkVar,
     NetworkVarElement,
+    ScriptedEntRegister,
     VguiRegister,
     VguiRegisterFile,
     VguiRegisterTable,
@@ -197,6 +198,7 @@ impl GmodScriptedClassCallMetadata {
             | GmodScriptedClassCallKind::NetworkVarElement => {
                 self.network_var_name_arg_idx().unwrap_or(0)
             }
+            GmodScriptedClassCallKind::ScriptedEntRegister => 1,
             GmodScriptedClassCallKind::DermaDefineSkin => self.derma_skin_define_arg_idx(),
             _ => self.vgui_panel_define_arg_idx(),
         };
@@ -214,6 +216,7 @@ pub struct GmodScriptedClassFileMetadata {
     pub accessor_func_calls: Vec<GmodScriptedClassCallMetadata>,
     pub network_var_calls: Vec<GmodScriptedClassCallMetadata>,
     pub network_var_element_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub scripted_ent_register_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_file_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_table_calls: Vec<GmodScriptedClassCallMetadata>,
@@ -243,6 +246,7 @@ impl GmodScriptedClassFileMetadata {
             GmodScriptedClassCallKind::AccessorFunc => &mut self.accessor_func_calls,
             GmodScriptedClassCallKind::NetworkVar => &mut self.network_var_calls,
             GmodScriptedClassCallKind::NetworkVarElement => &mut self.network_var_element_calls,
+            GmodScriptedClassCallKind::ScriptedEntRegister => &mut self.scripted_ent_register_calls,
             GmodScriptedClassCallKind::VguiRegister => &mut self.vgui_register_calls,
             GmodScriptedClassCallKind::VguiRegisterFile => &mut self.vgui_register_file_calls,
             GmodScriptedClassCallKind::VguiRegisterTable => &mut self.vgui_register_table_calls,
