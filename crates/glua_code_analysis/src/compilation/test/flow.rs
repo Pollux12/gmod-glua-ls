@@ -135,6 +135,66 @@ mod test {
     }
 
     #[test]
+    fn gmod_zero_delay_timer_initializes_typed_global_for_later_callbacks() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@class MenuPanel
+        MenuPanel = {}
+        function MenuPanel:Call(js) end
+
+        ---@type MenuPanel
+        pnlMainMenu = nil
+        "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+        pnlMainMenu = nil
+
+        timer = {}
+        function timer.Simple(delay, callback) end
+
+        timer.Simple(0, function()
+            pnlMainMenu = MenuPanel
+        end)
+
+        function RefreshMenu()
+            pnlMainMenu:Call("Update()")
+        end
+        "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UncheckedNilAccess
+        ));
+    }
+
+    #[test]
+    fn untyped_global_nil_assignment_still_reports_unchecked_access() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        pnlMainMenu = nil
+
+        function RefreshMenu()
+            pnlMainMenu:Call("Update()")
+        end
+        "#,
+        );
+
+        assert!(file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UncheckedNilAccess
+        ));
+    }
+
+    #[test]
     fn test_issue_140_1() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

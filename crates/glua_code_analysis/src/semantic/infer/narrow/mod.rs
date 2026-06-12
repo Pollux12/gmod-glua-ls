@@ -190,6 +190,17 @@ pub fn get_var_ref_type(
 
             if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
                 let typ = type_cache.as_type();
+                if typ.is_nil()
+                    && let Ok(global_type) =
+                        infer_global_type(db, Some(cache.get_file_id()), None, decl.get_name())
+                    && !global_type.is_nil()
+                    && !global_type.is_nullable()
+                    && !global_type.is_unknown()
+                    && !matches!(global_type, LuaType::Any | LuaType::Never)
+                {
+                    return Ok(global_type);
+                }
+
                 return if typ.contain_tpl() {
                     Ok(LuaType::Unknown)
                 } else {

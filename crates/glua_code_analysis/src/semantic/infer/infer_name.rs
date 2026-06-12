@@ -1172,6 +1172,7 @@ pub fn infer_global_type(
     let mut last_resolve_reason = InferFailReason::None;
     let mut saw_compatible_tier = false;
     let mut fallback_best_tier = None;
+    let mut nil_fallback_type = None;
     for (_, decl_ids) in priority_tiers {
         let decl_ids = if let Some(call_state_mask) = call_state_mask {
             let selected_decl_ids = select_realm_compatible_decl_ids_for_global_infer_tier(
@@ -1196,6 +1197,10 @@ pub fn infer_global_type(
         saw_compatible_tier = true;
 
         match infer_global_type_from_decl_ids(db, decl_ids) {
+            Ok(typ) if typ.is_nil() => {
+                nil_fallback_type.get_or_insert(typ);
+                continue;
+            }
             Ok(typ) => return Ok(typ),
             Err(reason) if can_fall_through_global_tier(&reason) => last_resolve_reason = reason,
             Err(reason) => return Err(reason),
@@ -1204,9 +1209,16 @@ pub fn infer_global_type(
 
     if !saw_compatible_tier && let Some(decl_ids) = fallback_best_tier {
         match infer_global_type_from_decl_ids(db, decl_ids) {
+            Ok(typ) if typ.is_nil() => {
+                nil_fallback_type.get_or_insert(typ);
+            }
             Ok(typ) => return Ok(typ),
             Err(reason) => last_resolve_reason = reason,
         }
+    }
+
+    if let Some(typ) = nil_fallback_type {
+        return Ok(typ);
     }
 
     Err(last_resolve_reason)

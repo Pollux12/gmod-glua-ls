@@ -12,7 +12,9 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeOwner,
     LuaUnionType, TypeOps, infer_expr,
     semantic::infer::{
-        InferResult, VarRefId, infer_expr_list_value_type_at, infer_param_with_cache,
+        InferResult, VarRefId, infer_expr_list_value_type_at,
+        infer_name::infer_global_type,
+        infer_param_with_cache,
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{InferConditionFlow, get_type_at_condition_flow},
@@ -497,6 +499,16 @@ fn get_decl_position_var_ref_type(
             && let Ok(param_type) = infer_param_with_cache(db, cache, decl)
         {
             return Ok(param_type);
+        }
+
+        if decl.is_global()
+            && db
+                .get_type_index()
+                .get_type_cache(&decl.get_id().into())
+                .is_some_and(|type_cache| type_cache.as_type().is_nil())
+            && let Some(global_type) = typed_global_nil_placeholder_type(db, cache, var_ref_id)
+        {
+            return Ok(global_type);
         }
     }
 
@@ -1161,6 +1173,13 @@ fn get_type_at_assign_stat(
             return Ok(ResultTypeOrContinue::Result(expr_type));
         }
 
+        if explicit_var_type.is_none()
+            && expr_type.is_nil()
+            && typed_global_nil_placeholder_type(db, cache, &maybe_ref_id).is_some()
+        {
+            return Ok(ResultTypeOrContinue::Continue);
+        }
+
         let source_type = if let Some(explicit) = explicit_var_type.clone() {
             explicit
         } else {
@@ -1216,6 +1235,30 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+fn typed_global_nil_placeholder_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    var_ref_id: &VarRefId,
+) -> Option<LuaType> {
+    let declared_type = match var_ref_id {
+        VarRefId::GlobalName(name, position) => {
+            infer_global_type(db, Some(cache.get_file_id()), Some(*position), name).ok()
+        }
+        VarRefId::VarRef(decl_id) => db.get_decl_index().get_decl(decl_id).and_then(|decl| {
+            decl.is_global().then(|| {
+                infer_global_type(db, Some(cache.get_file_id()), None, decl.get_name()).ok()
+            })?
+        }),
+        _ => None,
+    };
+    declared_type.filter(|typ| {
+        !typ.is_nil()
+            && !typ.is_nullable()
+            && !typ.is_unknown()
+            && !matches!(typ, LuaType::Any | LuaType::Never)
+    })
 }
 
 /// Returns true when `expr` is a table-constructor literal `{ ... }`, unwrapping
