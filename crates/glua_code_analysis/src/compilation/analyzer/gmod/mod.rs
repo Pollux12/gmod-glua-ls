@@ -5846,7 +5846,10 @@ fn find_prior_static_field_assignment(
     let Some(chunk) = LuaChunk::cast(root) else {
         return StaticFieldLookup::NoEvidence;
     };
-    let call_block = call_expr.ancestors::<LuaBlock>().next();
+    let call_blocks = call_expr
+        .ancestors::<LuaBlock>()
+        .map(|block| block.syntax().clone())
+        .collect::<Vec<_>>();
     let call_position = call_expr.get_position();
     let target_path = format!("{root_path}.{}", field_path.join("."));
     let mut best = StaticFieldLookup::NoEvidence;
@@ -5855,11 +5858,12 @@ fn find_prior_static_field_assignment(
         if assign_stat.get_position() >= call_position {
             continue;
         }
-        if let Some(call_block) = &call_block
-            && assign_stat
-                .ancestors::<LuaBlock>()
-                .next()
-                .is_none_or(|assign_block| assign_block.syntax() != call_block.syntax())
+        let Some(assign_block) = assign_stat.ancestors::<LuaBlock>().next() else {
+            continue;
+        };
+        if !call_blocks
+            .iter()
+            .any(|call_block| call_block == assign_block.syntax())
         {
             continue;
         }

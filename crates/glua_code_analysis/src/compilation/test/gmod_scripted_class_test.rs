@@ -2375,6 +2375,146 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_create_from_table_resolves_base_field_from_enclosing_scope() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            Panel = Panel or {}
+
+            function Panel:Remove() end
+        "#,
+        );
+        ws.def_file(
+            "annotations/editablepanel.lua",
+            r#"
+            ---@meta
+
+            ---@class (partial) EditablePanel: Panel
+            local EditablePanel = {}
+        "#,
+        );
+        ws.def_file(
+            "annotations/dframe.lua",
+            r#"
+            ---@meta
+
+            ---@class DFrame: EditablePanel
+            local DFrame = {}
+
+            ---@param title string
+            function DFrame:SetTitle(title) end
+        "#,
+        );
+        ws.def_file(
+            "annotations/html.lua",
+            r#"
+            ---@meta
+
+            ---@class (partial) HTML: Panel
+            HTML = {}
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_generic_create_parent.lua",
+            r#"
+
+            vgui = {}
+
+            ---@generic T: Panel
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@param parent Panel?
+            ---@return (instance) T
+            function vgui.Create(classname, parent) end
+
+            ---@type DFrame
+            local frame
+            frame:SetTitle("Title")
+
+            local PANEL_Browser = {}
+            PANEL_Browser.Base = "DFrame"
+
+            function PANEL_Browser:Init()
+                self.HTML = vgui.Create("HTML", self)
+                self:SetTitle("Title")
+            end
+
+            function OpenBrowser()
+                vgui.CreateFromTable(PANEL_Browser)
+            end
+
+            local PANEL = {}
+            PANEL.Base = "DFrame"
+
+            function PANEL:Init()
+                self.Label = vgui.Create("HTML", self)
+                self:Remove()
+            end
+
+            function OpenPanel()
+                vgui.CreateFromTable(PANEL)
+            end
+        "#,
+        );
+
+        {
+            let db = ws.get_db_mut();
+            let metadata = db
+                .get_gmod_class_metadata_index()
+                .get_file_metadata(&file_id)
+                .expect("expected gmod metadata for CreateFromTable test file");
+            assert_eq!(
+                metadata.vgui_register_table_calls.len(),
+                2,
+                "expected two CreateFromTable calls"
+            );
+            for call in &metadata.vgui_register_table_calls {
+                let base_source = call
+                    .vgui_panel_base_arg_source(None)
+                    .expect("CreateFromTable metadata should use PANEL.Base as base source");
+                assert!(
+                    matches!(
+                        call.value_for_arg_source(&base_source),
+                        Some(GmodClassCallLiteral::String(name)) if name == "DFrame"
+                    ),
+                    "CreateFromTable should extract DFrame from PANEL.Base, got call metadata {call:?}"
+                );
+            }
+        }
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_mismatch = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != param_type_mismatch
+                    && diagnostic.code != undefined_field),
+            "vgui.CreateFromTable should infer self as Panel-compatible for vgui.Create parent, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vgui_create_from_table_ignores_stale_base_after_dynamic_table_overwrite() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
