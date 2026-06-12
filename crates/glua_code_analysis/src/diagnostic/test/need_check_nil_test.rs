@@ -1122,6 +1122,78 @@ mod test {
     }
 
     #[gtest]
+    fn test_numeric_for_populated_table_field_constant_index_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class DButton
+            ---@field SetText fun(self: DButton, text: any)
+
+            ---@return DButton
+            local function make_button() end
+
+            local KP_ENTER = 11
+
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.Buttons = {}
+
+                for i = 0, 15 do
+                    self.Buttons[i] = make_button()
+                end
+
+                self.Buttons[KP_ENTER]:SetText("")
+            end
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_field_out_of_range_constant_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class DButton
+            ---@field SetText fun(self: DButton, text: any)
+
+            ---@return DButton
+            local function make_button() end
+
+            local KP_OUT_OF_RANGE = 20
+
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.Buttons = {}
+
+                for i = 0, 15 do
+                    self.Buttons[i] = make_button()
+                end
+
+                self.Buttons[KP_OUT_OF_RANGE]:SetText("")
+            end
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
     fn test_reverse_len_for_loop_index_with_zero_bound_still_reports_nil_access() {
         let mut ws = VirtualWorkspace::new();
         let code = r#"

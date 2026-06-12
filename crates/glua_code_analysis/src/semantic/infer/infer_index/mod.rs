@@ -348,6 +348,7 @@ fn infer_table_member(
         && member_key_is_unknown_expr(&key)
         && let Some(member_type) = infer_gmod_same_file_expr_key_member_type(
             db,
+            cache,
             &owner,
             &key,
             cache.get_file_id(),
@@ -380,6 +381,7 @@ fn infer_table_member(
     if matches!(index_key, LuaIndexKey::Expr(_))
         && let Some(member_type) = infer_gmod_same_file_expr_key_member_type(
             db,
+            cache,
             &owner,
             &key,
             cache.get_file_id(),
@@ -537,6 +539,7 @@ fn is_literal_table_field_access(index_key: &LuaIndexKey) -> bool {
 
 fn infer_gmod_same_file_expr_key_member_type(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     owner: &LuaMemberOwner,
     key: &LuaMemberKey,
     access_file_id: FileId,
@@ -550,6 +553,7 @@ fn infer_gmod_same_file_expr_key_member_type(
     let members = db.get_member_index().get_members(owner)?;
     let mut result = LuaType::Unknown;
 
+    let mut matched_covered_numeric_for_write = false;
     for member in members {
         if member.get_file_id() != access_file_id {
             continue;
@@ -564,6 +568,10 @@ fn infer_gmod_same_file_expr_key_member_type(
             continue;
         }
 
+        if numeric_for_write_covers_integer_access(db, cache, member, key, access_position) {
+            matched_covered_numeric_for_write = true;
+        }
+
         let member_item = crate::db_index::LuaMemberIndexItem::One(member.get_id());
         let Ok(member_type) =
             member_item.resolve_type_with_realm_at_offset(db, &access_file_id, access_position)
@@ -576,8 +584,135 @@ fn infer_gmod_same_file_expr_key_member_type(
 
     if result.is_unknown() {
         None
+    } else if matched_covered_numeric_for_write {
+        Some(result)
     } else {
         Some(nullable_if_needed(db, result))
+    }
+}
+
+fn numeric_for_write_covers_integer_access(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    member: &crate::db_index::LuaMember,
+    access_key: &LuaMemberKey,
+    access_position: TextSize,
+) -> bool {
+    if member.get_range().start() >= access_position {
+        return false;
+    }
+
+    let LuaMemberKey::Integer(access_index) = access_key else {
+        return false;
+    };
+
+    let Some(root) = db.get_vfs().get_syntax_tree(&member.get_file_id()) else {
+        return false;
+    };
+    let root = root.get_red_root();
+    let Some(node) = member.get_syntax_id().to_node_from_root(&root) else {
+        return false;
+    };
+    let Some(index_expr) = LuaIndexExpr::cast(node) else {
+        return false;
+    };
+    let Some(LuaIndexKey::Expr(key_expr)) = index_expr.get_index_key() else {
+        return false;
+    };
+    let LuaExpr::NameExpr(key_name) = &key_expr else {
+        return false;
+    };
+
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&member.get_file_id(), key_name.get_range())
+    else {
+        return false;
+    };
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return false;
+    };
+    let Some(decl_token) = decl.get_syntax_id().to_token_from_root(&root) else {
+        return false;
+    };
+    let Some(for_stat) = decl_token.parent().and_then(LuaForStat::cast) else {
+        return false;
+    };
+    if !key_expr
+        .syntax()
+        .ancestors()
+        .any(|ancestor| ancestor == for_stat.syntax().clone())
+    {
+        return false;
+    }
+
+    numeric_for_bounds_cover_index(db, cache, &for_stat, *access_index)
+}
+
+fn numeric_for_bounds_cover_index(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    for_stat: &LuaForStat,
+    access_index: i64,
+) -> bool {
+    let iter_exprs = for_stat.get_iter_expr().collect::<Vec<_>>();
+    let [start_expr, end_expr] = iter_exprs.as_slice() else {
+        let [start_expr, end_expr, step_expr] = iter_exprs.as_slice() else {
+            return false;
+        };
+        let Some(step) = integer_const_expr_value(db, cache, step_expr) else {
+            return false;
+        };
+        return numeric_for_bounds_with_step_cover_index(
+            db,
+            cache,
+            start_expr,
+            end_expr,
+            step,
+            access_index,
+        );
+    };
+
+    numeric_for_bounds_with_step_cover_index(db, cache, start_expr, end_expr, 1, access_index)
+}
+
+fn numeric_for_bounds_with_step_cover_index(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    start_expr: &LuaExpr,
+    end_expr: &LuaExpr,
+    step: i64,
+    access_index: i64,
+) -> bool {
+    if step == 0 {
+        return false;
+    }
+
+    let Some(start) = integer_const_expr_value(db, cache, start_expr) else {
+        return false;
+    };
+    let Some(end) = integer_const_expr_value(db, cache, end_expr) else {
+        return false;
+    };
+
+    if step > 0 {
+        access_index >= start && access_index <= end && (access_index - start) % step == 0
+    } else {
+        let Some(step_magnitude) = step.checked_abs() else {
+            return false;
+        };
+        access_index <= start && access_index >= end && (start - access_index) % step_magnitude == 0
+    }
+}
+
+fn integer_const_expr_value(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<i64> {
+    match infer_expr(db, cache, expr.clone()).ok()? {
+        LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => Some(value),
+        _ => None,
     }
 }
 
