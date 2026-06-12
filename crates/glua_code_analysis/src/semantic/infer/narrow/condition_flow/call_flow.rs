@@ -5,7 +5,7 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexKey, LuaIn
 use crate::{
     DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaAliasCallKind, LuaAliasCallType,
     LuaFunctionType, LuaInferCache, LuaSignatureCast, LuaSignatureId, LuaType, TypeOps,
-    infer_call_expr_func, infer_expr, resolve_global_decl_id,
+    infer_call_expr_func, infer_expr,
     semantic::infer::{
         VarRefId,
         infer_index::infer_member_by_member_key,
@@ -223,7 +223,7 @@ fn resolve_builtin_name_fallback_target(
     let local_ref = references_index.get_local_reference(&cache.get_file_id());
     let Some(decl_id) = local_ref.and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
     else {
-        return is_builtin_or_unresolved_global_name(db, cache, name_expr)
+        return is_unshadowed_gmod_guard_global_name(db, cache, name_expr)
             .then(|| LuaExpr::NameExpr(name_expr.clone()));
     };
 
@@ -251,7 +251,7 @@ fn resolve_builtin_name_fallback_target(
         return None;
     }
 
-    is_builtin_or_unresolved_global_name(db, cache, &alias_name_expr)
+    is_unshadowed_gmod_guard_global_name(db, cache, &alias_name_expr)
         .then(|| LuaExpr::NameExpr(alias_name_expr))
 }
 
@@ -278,7 +278,7 @@ fn name_expr_has_local_binding(
     by_reference || by_scope
 }
 
-fn is_builtin_or_unresolved_global_name(
+fn is_unshadowed_gmod_guard_global_name(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &glua_parser::LuaNameExpr,
@@ -296,18 +296,7 @@ fn is_builtin_or_unresolved_global_name(
         return false;
     }
 
-    let Some(global_decl_id) = resolve_global_decl_id(db, cache, helper_name, Some(name_expr))
-    else {
-        return true;
-    };
-
-    let Some(global_decl) = db.get_decl_index().get_decl(&global_decl_id) else {
-        return false;
-    };
-
-    let module_index = db.get_module_index();
-    module_index.is_std(&global_decl.get_file_id())
-        || module_index.is_library(&global_decl.get_file_id())
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -330,7 +319,7 @@ fn try_narrow_isfunction_member(
         return Ok(None);
     }
 
-    if !is_builtin_or_unresolved_global_name(db, cache, name_expr) {
+    if !is_unshadowed_gmod_guard_global_name(db, cache, name_expr) {
         return Ok(None);
     }
 
@@ -811,7 +800,7 @@ fn try_narrow_isvalid(
             if name_expr.get_name_text().as_deref() != Some("IsValid") {
                 return Ok(None);
             }
-            if !is_builtin_or_unresolved_global_name(db, cache, name_expr) {
+            if !is_unshadowed_gmod_guard_global_name(db, cache, name_expr) {
                 return Ok(None);
             }
             let arg_list = match call_expr.get_args_list() {

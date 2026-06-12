@@ -1206,6 +1206,60 @@ mod test {
     }
 
     #[gtest]
+    fn test_isvalid_narrows_reassigned_clientside_model_negative_branch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field SetModel fun(self: Entity, model: string)
+            ---@field SetNoDraw fun(self: Entity, noDraw: boolean)
+            ---@class NULL : Entity
+
+            ---@return Entity|NULL
+            function ClientsideModel(model, renderGroup) end
+
+            ---@param ent Entity?
+            local function Draw(ent)
+                if ent == nil then
+                    ent = ClientsideModel("error.mdl", 0)
+                end
+
+                if ( !IsValid( ent ) ) then return end
+
+                ent:SetModel("error.mdl")
+                ent:SetNoDraw(true)
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_isvalid_narrows_net_read_entity_negative_branch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            net = {}
+
+            ---@return EntityOrNULL
+            function net.ReadEntity() end
+
+            local ent = net.ReadEntity()
+
+            if ( !IsValid( ent ) ) then return end
+
+            local editor = ent:GetEditingData()[ "key" ]
+            "#,
+        ));
+    }
+
+    #[gtest]
     fn test_isvalid_narrows_loop_assigned_local_negative_branch() {
         // GMod pattern: find an object in a loop, then guard it with IsValid before use.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -1443,6 +1497,90 @@ mod test {
     }
 
     #[gtest]
+    fn test_library_isvalid_prior_guard_suppresses_entity_or_null_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_isvalid_entity_or_null");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("global.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class Entity
+                ---@field GetEditingData fun(self: Entity): table
+                ---@class NULL : Entity
+                ---@alias EntityOrNULL Entity|NULL
+
+                ---@param value any
+                ---@return boolean
+                function _G.IsValid(value) end
+                "#
+                .to_string(),
+            ),
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            net = {}
+
+            ---@return EntityOrNULL
+            function net.ReadEntity() end
+
+            local ent = net.ReadEntity()
+            if ( !IsValid( ent ) ) then return end
+
+            local editor = ent:GetEditingData()[ "key" ]
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_indexed_annotation_isvalid_prior_guard_suppresses_entity_or_null_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@param value any
+            ---@return boolean
+            function _G.IsValid(value) end
+            "#,
+        );
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::NeedCheckNil,
+            "lua/includes/extensions/entity.lua",
+            r#"
+            net = {}
+
+            ---@return EntityOrNULL
+            function net.ReadEntity() end
+
+            local ent = net.ReadEntity()
+            if ( !IsValid( ent ) ) then return end
+
+            local editor = ent:GetEditingData()[ "key" ]
+            "#,
+        ));
+    }
+
+    #[gtest]
     fn test_local_cached_isvalid_narrows_nil() {
         // Regression: `local IsValid = IsValid` is common in GMod addons for performance.
         // The cached local must still narrow away nil.
@@ -1456,6 +1594,38 @@ mod test {
             if IsValid(maybe) then
                 maybe:reverse()
             end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_renamed_local_cached_isvalid_prior_guard_suppresses_null_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return EntityOrNULL
+            function getEntity() end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local isValid = IsValid
+            local ent = getEntity()
+            if not isValid(ent) then
+                return
+            end
+
+            local editor = ent:GetEditingData()
             "#,
         ));
     }

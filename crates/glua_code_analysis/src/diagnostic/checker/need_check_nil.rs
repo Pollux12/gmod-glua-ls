@@ -8,7 +8,7 @@ use rowan::TextRange;
 use crate::{
     DiagnosticCode, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType,
     SemanticModel,
-    semantic::{contains_gmod_null_type, get_var_expr_var_ref_id, resolve_global_decl_id},
+    semantic::{contains_gmod_null_type, get_var_expr_var_ref_id},
 };
 
 use super::{
@@ -948,7 +948,7 @@ fn is_isvalid_call_guarding_var(
 
     match prefix {
         LuaExpr::NameExpr(name_expr) => {
-            if !is_builtin_or_unresolved_isvalid_name(semantic_model, &name_expr) {
+            if !is_unshadowed_isvalid_name(semantic_model, &name_expr) {
                 return false;
             }
 
@@ -984,10 +984,7 @@ fn is_isvalid_call_guarding_var(
     }
 }
 
-fn is_builtin_or_unresolved_isvalid_name(
-    semantic_model: &SemanticModel,
-    name_expr: &LuaNameExpr,
-) -> bool {
+fn is_unshadowed_isvalid_name(semantic_model: &SemanticModel, name_expr: &LuaNameExpr) -> bool {
     if name_expr.get_name_text().as_deref() != Some("IsValid") {
         return false;
     }
@@ -1009,7 +1006,7 @@ fn is_builtin_or_unresolved_isvalid_name(
         });
 
     let Some(decl_id) = decl_id else {
-        return is_builtin_or_unresolved_global_isvalid_name(semantic_model, name_expr);
+        return is_unshadowed_global_isvalid_name(name_expr);
     };
 
     let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
@@ -1033,31 +1030,15 @@ fn is_builtin_or_unresolved_isvalid_name(
         return false;
     };
 
-    is_builtin_or_unresolved_isvalid_name(semantic_model, &alias_name_expr)
+    is_unshadowed_isvalid_name(semantic_model, &alias_name_expr)
 }
 
-fn is_builtin_or_unresolved_global_isvalid_name(
-    semantic_model: &SemanticModel,
-    name_expr: &LuaNameExpr,
-) -> bool {
+fn is_unshadowed_global_isvalid_name(name_expr: &LuaNameExpr) -> bool {
     if name_expr.get_name_text().as_deref() != Some("IsValid") {
         return false;
     }
 
-    let db = semantic_model.get_db();
-    let mut cache = semantic_model.get_cache().borrow_mut();
-    let Some(global_decl_id) = resolve_global_decl_id(db, &mut cache, "IsValid", Some(name_expr))
-    else {
-        return true;
-    };
-
-    let Some(global_decl) = db.get_decl_index().get_decl(&global_decl_id) else {
-        return false;
-    };
-
-    let module_index = db.get_module_index();
-    module_index.is_std(&global_decl.get_file_id())
-        || module_index.is_library(&global_decl.get_file_id())
+    true
 }
 
 fn exprs_reference_same_var(
