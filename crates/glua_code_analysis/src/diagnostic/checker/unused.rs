@@ -160,10 +160,11 @@ fn is_generic_for_placeholder(
         return false;
     };
 
-    vars.iter().skip(index + 1).any(|var| {
-        decls_by_range
-            .get(&var.get_range())
-            .is_some_and(|later_decl| decl_has_references(ref_index, later_decl))
+    vars.iter().enumerate().any(|(other_index, var)| {
+        other_index != index
+            && decls_by_range
+                .get(&var.get_range())
+                .is_some_and(|other_decl| decl_has_references(ref_index, other_decl))
     })
 }
 
@@ -198,16 +199,19 @@ fn is_local_multireturn_placeholder(
         return false;
     };
 
-    local_names.iter().skip(index + 1).any(|local| {
-        let Some(later_decl) = decls_by_range.get(&local.get_range()) else {
+    local_names.iter().enumerate().any(|(other_index, local)| {
+        if other_index == index {
+            return false;
+        }
+
+        let Some(other_decl) = decls_by_range.get(&local.get_range()) else {
             return false;
         };
-        let Some(later_initializer) = later_decl.get_initializer() else {
+        let Some(other_initializer) = other_decl.get_initializer() else {
             return false;
         };
-        later_initializer.get_expr_syntax_id() == initializer.get_expr_syntax_id()
-            && later_initializer.get_ret_idx() > initializer.get_ret_idx()
-            && decl_has_references(ref_index, later_decl)
+        other_initializer.get_expr_syntax_id() == initializer.get_expr_syntax_id()
+            && decl_has_references(ref_index, other_decl)
     })
 }
 

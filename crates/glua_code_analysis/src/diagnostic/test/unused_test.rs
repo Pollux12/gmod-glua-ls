@@ -147,6 +147,23 @@ mod test {
     }
 
     #[test]
+    fn test_generic_for_placeholder_after_used_key_is_not_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function consume(v)
+                    return v
+                end
+
+                for k, v in pairs({ 1, 2, 3 }) do
+                    consume(k)
+                end
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_generic_for_all_unused_values_still_reports_unused() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
@@ -183,6 +200,22 @@ mod test {
 
                 local x, y = pos()
                 return y
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_multireturn_placeholder_after_used_values_is_not_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function hsv()
+                    return 1, 2, 3
+                end
+
+                local h, s, v = hsv()
+                return h + s
             "#,
         ));
     }
