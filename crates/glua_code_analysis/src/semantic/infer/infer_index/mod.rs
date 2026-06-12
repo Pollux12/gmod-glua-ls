@@ -438,6 +438,11 @@ fn infer_table_member(
             {
                 return Ok(dynamic_field.typ);
             }
+            if let Ok(metatable_type) =
+                infer_table_metatable_member(db, cache, &inst, index_expr.clone(), &index_key)
+            {
+                return Ok(metatable_type);
+            }
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
                 if is_dynamic_index_in_len_for_range(db, cache, &index_expr, &index_key) {
                     return Ok(LuaType::Any);
@@ -455,6 +460,74 @@ fn infer_table_member(
             }
         }
         Err(err) => Err(err),
+    }
+}
+
+fn infer_table_metatable_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table_range: &InFiled<TextRange>,
+    index_expr: LuaIndexMemberExpr,
+    index_key: &LuaIndexKey,
+) -> InferResult {
+    let metatable = db
+        .get_metatable_index()
+        .get(table_range)
+        .ok_or(InferFailReason::FieldNotFound)?;
+
+    let meta_owner = LuaMemberOwner::Element(metatable.clone());
+    let index_member_key = LuaMemberKey::Name("__index".into());
+    if let Ok(index_type) = infer_owner_raw_member_type_with_realm(
+        db,
+        meta_owner.clone(),
+        &index_member_key,
+        cache.get_file_id(),
+        Some(index_expr.get_position()),
+    ) && !metatable_index_type_points_to_table(&index_type, table_range)
+        && let Ok(typ) = infer_member_by_member_key(
+            db,
+            cache,
+            &index_type,
+            index_expr.clone(),
+            &InferGuard::new(),
+        )
+    {
+        return Ok(typ);
+    }
+
+    let operator_ids = db
+        .get_operator_index()
+        .get_operators(
+            &LuaOperatorOwner::Table(metatable.clone()),
+            LuaOperatorMetaMethod::Index,
+        )
+        .ok_or(InferFailReason::FieldNotFound)?;
+
+    for operator_id in operator_ids {
+        let operator = db
+            .get_operator_index()
+            .get_operator(operator_id)
+            .ok_or(InferFailReason::None)?;
+        let operand = operator.get_operand(db);
+        let return_type = operator.get_result(db)?;
+        if let Ok(typ) = infer_index_metamethod(db, cache, index_key, &operand, &return_type) {
+            return Ok(typ);
+        }
+    }
+
+    Err(InferFailReason::FieldNotFound)
+}
+
+fn metatable_index_type_points_to_table(typ: &LuaType, table_range: &InFiled<TextRange>) -> bool {
+    match typ {
+        LuaType::TableConst(range) => range == table_range,
+        LuaType::Instance(instance) => instance.get_range() == table_range,
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .any(|typ| metatable_index_type_points_to_table(typ, table_range)),
+        LuaType::TypeGuard(inner) => metatable_index_type_points_to_table(inner, table_range),
+        _ => false,
     }
 }
 

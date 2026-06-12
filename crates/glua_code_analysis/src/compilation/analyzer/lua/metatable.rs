@@ -1,4 +1,4 @@
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaTableField};
+use glua_parser::{BinaryOperator, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaTableField};
 
 use crate::{
     InFiled, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, OperatorFunction,
@@ -21,17 +21,74 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     };
 
     let file_id = analyzer.file_id;
+    let metatable_range = InFiled::new(file_id, metatable.get_range());
     analyzer.db.get_metatable_index_mut().add(
         InFiled::new(file_id, table.get_range()),
-        InFiled::new(file_id, metatable.get_range()),
+        metatable_range.clone(),
     );
 
-    let operator_owner = LuaOperatorOwner::Table(InFiled::new(file_id, metatable.get_range()));
+    if let Some(backing_table) = resolve_metatable_backing_table(analyzer, &table) {
+        analyzer
+            .db
+            .get_metatable_index_mut()
+            .add(backing_table, metatable_range.clone());
+    }
+
+    let operator_owner = LuaOperatorOwner::Table(metatable_range);
     for field in metatable.get_fields() {
         analyze_metable_field(analyzer, &field, &operator_owner);
     }
 
     Some(())
+}
+
+fn resolve_metatable_backing_table(
+    analyzer: &mut LuaAnalyzer,
+    table: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    table_backing_range_from_expr(analyzer, table)
+}
+
+fn table_backing_range_from_expr(
+    analyzer: &LuaAnalyzer,
+    expr: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    match expr {
+        LuaExpr::TableExpr(table_expr) => {
+            Some(InFiled::new(analyzer.file_id, table_expr.get_range()))
+        }
+        LuaExpr::ParenExpr(paren_expr) => {
+            table_backing_range_from_expr(analyzer, &paren_expr.get_expr()?)
+        }
+        LuaExpr::BinaryExpr(binary_expr)
+            if binary_expr.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpOr) =>
+        {
+            let (_, right) = binary_expr.get_exprs()?;
+            table_backing_range_from_expr(analyzer, &right)
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let decl_id = analyzer
+                .db
+                .get_reference_index()
+                .get_var_reference_decl(&analyzer.file_id, name_expr.get_range())?;
+            let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
+            if !decl.is_local() {
+                return None;
+            }
+
+            let root = analyzer
+                .db
+                .get_vfs()
+                .get_syntax_tree(&decl_id.file_id)?
+                .get_red_root();
+            let value_expr = decl
+                .get_value_syntax_id()?
+                .to_node_from_root(&root)
+                .and_then(LuaExpr::cast)?;
+            table_backing_range_from_expr(analyzer, &value_expr)
+        }
+        _ => None,
+    }
 }
 
 fn analyze_metable_field(

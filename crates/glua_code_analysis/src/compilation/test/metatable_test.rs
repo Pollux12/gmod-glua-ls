@@ -268,4 +268,40 @@ mod test {
             "expected returned weapon to expose Initialize from __index, got {initialize_member_ty:?}"
         );
     }
+
+    #[test]
+    fn test_in_place_setmetatable_name_argument_uses_table_backing_range() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local base = {}
+            function base:Init() end
+
+            local obj = {}
+            setmetatable(obj, { __index = base })
+
+            obj:Init()
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
+
+        assert!(
+            undefined_field_diags.is_empty(),
+            "unexpected UndefinedField diagnostics for in-place setmetatable: {undefined_field_diags:?}"
+        );
+    }
 }
