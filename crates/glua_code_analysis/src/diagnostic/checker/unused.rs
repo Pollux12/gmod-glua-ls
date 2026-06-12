@@ -1,4 +1,8 @@
-use glua_parser::LuaChunk;
+use std::collections::HashMap;
+
+use glua_parser::{
+    LuaAstNode, LuaAstToken, LuaChunk, LuaExpr, LuaForRangeStat, LuaLocalName, LuaLocalStat,
+};
 use rowan::TextRange;
 
 use crate::{DiagnosticCode, LuaDecl, LuaReferenceIndex, SemanticModel};
@@ -22,6 +26,11 @@ impl Checker for UnusedChecker {
 
         let root = semantic_model.get_root();
         let ref_index = semantic_model.get_db().get_reference_index();
+        let decls_by_range = decl_tree
+            .get_decls()
+            .values()
+            .map(|decl| (decl.get_range(), decl))
+            .collect::<HashMap<_, _>>();
         for (_, decl) in decl_tree.get_decls().iter() {
             if decl.is_global() || decl.is_param() && decl.get_name() == "..." {
                 continue;
@@ -36,6 +45,9 @@ impl Checker for UnusedChecker {
             if let Err(result) = get_unused_check_result(ref_index, decl, root) {
                 let name = decl.get_name();
                 if name.starts_with('_') {
+                    continue;
+                }
+                if should_ignore_positional_placeholder(ref_index, &decls_by_range, decl, root) {
                     continue;
                 }
                 match result {
@@ -115,6 +127,101 @@ fn get_unused_check_result(
     // }
 
     Ok(())
+}
+
+fn should_ignore_positional_placeholder(
+    ref_index: &LuaReferenceIndex,
+    decls_by_range: &HashMap<TextRange, &LuaDecl>,
+    decl: &LuaDecl,
+    root: &LuaChunk,
+) -> bool {
+    is_generic_for_placeholder(ref_index, decls_by_range, decl, root)
+        || is_local_multireturn_placeholder(ref_index, decls_by_range, decl, root)
+}
+
+fn is_generic_for_placeholder(
+    ref_index: &LuaReferenceIndex,
+    decls_by_range: &HashMap<TextRange, &LuaDecl>,
+    decl: &LuaDecl,
+    root: &LuaChunk,
+) -> bool {
+    let Some(token) = decl.get_syntax_id().to_token_from_root(root.syntax()) else {
+        return false;
+    };
+    let Some(for_range_stat) = token.parent_ancestors().find_map(LuaForRangeStat::cast) else {
+        return false;
+    };
+
+    let vars = for_range_stat.get_var_name_list().collect::<Vec<_>>();
+    let Some(index) = vars
+        .iter()
+        .position(|var| var.get_range() == decl.get_range())
+    else {
+        return false;
+    };
+
+    vars.iter().skip(index + 1).any(|var| {
+        decls_by_range
+            .get(&var.get_range())
+            .is_some_and(|later_decl| decl_has_references(ref_index, later_decl))
+    })
+}
+
+fn is_local_multireturn_placeholder(
+    ref_index: &LuaReferenceIndex,
+    decls_by_range: &HashMap<TextRange, &LuaDecl>,
+    decl: &LuaDecl,
+    root: &LuaChunk,
+) -> bool {
+    let Some(initializer) = decl.get_initializer() else {
+        return false;
+    };
+    if !initializer_is_call(root, initializer.get_expr_syntax_id()) {
+        return false;
+    }
+
+    let Some(node) = decl.get_syntax_id().to_node_from_root(root.syntax()) else {
+        return false;
+    };
+    let Some(local_name) = LuaLocalName::cast(node) else {
+        return false;
+    };
+    let Some(local_stat) = local_name.get_parent::<LuaLocalStat>() else {
+        return false;
+    };
+
+    let local_names = local_stat.get_local_name_list().collect::<Vec<_>>();
+    let Some(index) = local_names
+        .iter()
+        .position(|local| local.get_range() == decl.get_range())
+    else {
+        return false;
+    };
+
+    local_names.iter().skip(index + 1).any(|local| {
+        let Some(later_decl) = decls_by_range.get(&local.get_range()) else {
+            return false;
+        };
+        let Some(later_initializer) = later_decl.get_initializer() else {
+            return false;
+        };
+        later_initializer.get_expr_syntax_id() == initializer.get_expr_syntax_id()
+            && later_initializer.get_ret_idx() > initializer.get_ret_idx()
+            && decl_has_references(ref_index, later_decl)
+    })
+}
+
+fn initializer_is_call(root: &LuaChunk, syntax_id: glua_parser::LuaSyntaxId) -> bool {
+    syntax_id
+        .to_node_from_root(root.syntax())
+        .and_then(LuaExpr::cast)
+        .is_some_and(|expr| matches!(expr, LuaExpr::CallExpr(_)))
+}
+
+fn decl_has_references(ref_index: &LuaReferenceIndex, decl: &LuaDecl) -> bool {
+    ref_index
+        .get_decl_references(&decl.get_file_id(), &decl.get_id())
+        .is_some_and(|decl_ref| !decl_ref.cells.is_empty())
 }
 
 // remove for future implement

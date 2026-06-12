@@ -128,4 +128,77 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_generic_for_placeholder_before_used_value_is_not_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function consume(v)
+                    return v
+                end
+
+                for k, v in pairs({ 1, 2, 3 }) do
+                    consume(v)
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_generic_for_all_unused_values_still_reports_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                for k, v in pairs({ 1, 2, 3 }) do
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_numeric_for_unused_counter_still_reports_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                for i = 1, 3 do
+                    print("tick")
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_multireturn_placeholder_before_used_value_is_not_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function pos()
+                    return 1, 2
+                end
+
+                local x, y = pos()
+                return y
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_multireturn_all_unused_values_still_reports_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function pos()
+                    return 1, 2
+                end
+
+                local x, y = pos()
+            "#,
+        ));
+    }
 }
