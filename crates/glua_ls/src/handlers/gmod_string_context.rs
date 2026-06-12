@@ -346,12 +346,8 @@ fn find_call_arg_role_from_decl_id(
     }
 
     let typ = semantic_model.get_type(decl_id.into());
-    let param_idx = call_arg_to_param_idx_for_type(
-        semantic_model.get_db(),
-        &typ,
-        arg_index,
-        is_colon_call,
-    );
+    let param_idx =
+        call_arg_to_param_idx_for_type(semantic_model.get_db(), &typ, arg_index, is_colon_call);
     find_call_arg_role_from_type(semantic_model.get_db(), &typ, param_idx, domain, roles)
 }
 
@@ -364,12 +360,8 @@ fn find_call_arg_role_from_member_id(
     roles: &[&str],
 ) -> Option<LuaCallArgRole> {
     let typ = semantic_model.get_type(LuaTypeOwner::Member(member_id));
-    let param_idx = call_arg_to_param_idx_for_type(
-        semantic_model.get_db(),
-        &typ,
-        arg_index,
-        is_colon_call,
-    );
+    let param_idx =
+        call_arg_to_param_idx_for_type(semantic_model.get_db(), &typ, arg_index, is_colon_call);
     find_call_arg_role_from_type(semantic_model.get_db(), &typ, param_idx, domain, roles)
 }
 

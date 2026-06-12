@@ -724,7 +724,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_unknown_dynamic_key_does_not_match_exact_field_lookup() {
+    fn test_unknown_dynamic_key_does_not_apply_to_unresolved_named_field_lookup() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -736,7 +736,9 @@ mod test {
             B = test[key]
         end
 
+        test.meow = nil
         A = test.meow
+        C = test.unobserved
         "#,
         );
 
@@ -748,6 +750,9 @@ mod test {
             ws.check_type(&dynamic_lookup_ty, &LuaType::Boolean),
             eq(true)
         );
+
+        let unobserved_lookup_ty = ws.expr_ty("C");
+        assert_eq!(ws.humanize_type(unobserved_lookup_ty), "nil");
     }
 
     #[gtest]
@@ -1142,6 +1147,94 @@ mod test {
 
         let ty = ws.expr_ty("A");
         assert_that!(ws.check_type(&ty, &LuaType::Integer), eq(true));
+    }
+
+    #[gtest]
+    fn test_dynamic_table_unresolved_named_field_stays_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+        ---@class SoundPatch
+        ---@field Stop fun(self: SoundPatch)
+
+        ---@return SoundPatch
+        local function CreateSound()
+        end
+
+        local sounds = {}
+
+        ---@param id string
+        local function CreateLoopingSound(id)
+            sounds[id] = CreateSound()
+        end
+
+        CreateLoopingSound("start")
+
+        sounds.start = nil
+        local start = sounds.start
+        "#,
+        );
+
+        let ty = local_name_type(&mut ws, file_id, "start");
+        assert_eq!(ws.humanize_type(ty), "nil");
+    }
+
+    #[gtest]
+    fn test_tableof_dynamic_table_unresolved_named_field_stays_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+        ---@class SoundPatch
+        ---@field Stop fun(self: SoundPatch)
+
+        ---@return SoundPatch
+        local function CreateSound()
+        end
+
+        ---@class TestEntity
+        local TestEntity = {}
+
+        ---@generic T
+        ---@param ent T
+        ---@return tableof<T>
+        local function GetTable(ent)
+        end
+
+        function TestEntity:Initialize()
+            self.sounds = {}
+        end
+
+        ---@param id string
+        function TestEntity:CreateLoopingSound(id)
+            local snd = self.sounds[id]
+
+            if not snd then
+                snd = CreateSound()
+                self.sounds[id] = snd
+            end
+
+            return snd
+        end
+
+        function TestEntity:InternalDeactivateSounds()
+            for id in pairs(self.sounds) do
+                self.sounds[id] = nil
+            end
+        end
+
+        function TestEntity:Update()
+            local selfTbl = GetTable(self)
+            local sounds = selfTbl.sounds
+            sounds.start = nil
+            local start = sounds.start
+        end
+        "#,
+        );
+
+        let ty = local_name_type(&mut ws, file_id, "start");
+        assert_eq!(ws.humanize_type(ty), "nil");
     }
 
     #[gtest]

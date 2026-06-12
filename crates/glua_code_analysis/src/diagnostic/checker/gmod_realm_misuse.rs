@@ -302,6 +302,23 @@ fn resolve_callee_realms(
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return Vec::new();
     };
+
+    // Dynamic member calls (`tbl[expr]()` where `expr` is not a compile-time
+    // constant) produce `LuaMemberKey::ExprType` keys. Those keys match *any*
+    // other dynamic access whose key infers to the same type — e.g. an
+    // unrelated `ent[k] = v` in a server file — never the member actually
+    // being called, so realm evidence resolved through them is meaningless.
+    if let Some(index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
+        && let Some(index_key) = index_expr.get_index_key()
+        && LuaMemberKey::index_key_is_dynamic(
+            semantic_model.get_db(),
+            &mut semantic_model.get_cache().borrow_mut(),
+            &index_key,
+        )
+    {
+        return Vec::new();
+    }
+
     let semantic_decl = semantic_model.find_decl(
         NodeOrToken::Node(prefix_expr.syntax().clone()),
         SemanticDeclLevel::default(),

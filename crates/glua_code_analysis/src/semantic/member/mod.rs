@@ -23,8 +23,10 @@ pub use get_member_map::{
 };
 use glua_parser::{LuaAssignStat, LuaSyntaxKind, LuaTableExpr, LuaTableField};
 use glua_parser::{LuaAstNode, LuaIndexExpr};
-pub(crate) use infer_raw_member::infer_owner_raw_member_type_with_realm;
 pub use infer_raw_member::infer_raw_member_type;
+pub(crate) use infer_raw_member::{
+    infer_owner_raw_member_type_with_realm, resolve_member_item_with_realm,
+};
 use rowan::{TextRange, TextSize};
 
 use super::{
