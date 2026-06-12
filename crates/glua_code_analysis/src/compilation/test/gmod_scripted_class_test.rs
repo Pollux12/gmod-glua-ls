@@ -2259,6 +2259,63 @@ mod test {
         assert_eq!(panel_local_types[1].1, LuaType::Def(second_class_id));
     }
 
+    #[gtest]
+    fn test_vgui_register_table_self_uses_base_panel_type_for_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/vgui/register_table_panel.lua",
+            r#"
+            ---@class Panel
+            ---@field SetTitle fun(self: Panel, title: string)
+            ---@class DFrame: Panel
+
+            vgui = {}
+
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param className string
+            ---@param parent Panel?
+            ---@return Panel
+            function vgui.Create(className, parent) end
+
+            local PANEL = {}
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+                self.child = vgui.Create("Panel", self)
+            end
+
+            local panelType = vgui.RegisterTable(PANEL, "DFrame")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_mismatch = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != param_type_mismatch
+                    && diagnostic.code != undefined_field),
+            "vgui.RegisterTable should infer PANEL self as a DFrame/Panel-compatible type, got {diagnostics:?}"
+        );
+    }
+
     /// Regression: PANEL reassignment (`PANEL = {}`) should create distinct classes
     /// per region. Today all PANEL references bind to a single class, so the set of
     /// resolved class names contains only one entry instead of three.

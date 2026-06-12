@@ -142,6 +142,14 @@ function vgui.Create(className, parent, name) end
 ---@param base string
 function vgui.Register(name, panel, base) end
 
+---@generic T: table
+---@[call_arg("gmod.vgui_panel", "register_table")]
+---@param panel T
+---@[call_arg("gmod.vgui_panel", "base")]
+---@param base? string
+---@return T
+function vgui.RegisterTable(panel, base) end
+
 ---@[call_arg("gmod.vgui_panel", "define_control")]
 ---@param class string
 ---@param description string

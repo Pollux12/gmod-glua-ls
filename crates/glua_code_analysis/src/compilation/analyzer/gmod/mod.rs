@@ -2341,6 +2341,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
     struct VguiRegistrationRegion {
         file_id: FileId,
         decl_id: LuaDeclId,
+        class_decl_id: LuaTypeDeclId,
         panel_name: String,
         region_start: TextSize,
         region_end: TextSize,
@@ -2372,6 +2373,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     vgui_registration_regions.push(VguiRegistrationRegion {
                         file_id,
                         decl_id,
+                        class_decl_id: LuaTypeDeclId::global(panel_name),
                         panel_name: panel_name.clone(),
                         region_start,
                         region_end: register_position,
@@ -2379,6 +2381,27 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                 }
             }
             synthesize_vgui_register(db, file_id, call);
+        }
+
+        for call in &metadata.vgui_register_table_calls {
+            let register_position = call.syntax_id.get_range().start();
+            let table_arg_idx = call.vgui_panel_table_arg_idx(0);
+            if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
+                call.literal_args.get(table_arg_idx)
+                && let Some((decl_id, region_start)) =
+                    resolve_local_registration_region(db, file_id, table_var, register_position)
+            {
+                let class_decl_id = vgui_register_table_type_decl_id(file_id, call);
+                vgui_registration_regions.push(VguiRegistrationRegion {
+                    file_id,
+                    decl_id,
+                    panel_name: class_decl_id.get_simple_name().to_string(),
+                    class_decl_id,
+                    region_start,
+                    region_end: register_position,
+                });
+            }
+            synthesize_vgui_register_table(db, file_id, call);
         }
 
         for call in &metadata.derma_define_control_calls {
@@ -2396,6 +2419,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     vgui_registration_regions.push(VguiRegistrationRegion {
                         file_id,
                         decl_id,
+                        class_decl_id: LuaTypeDeclId::global(panel_name),
                         panel_name: panel_name.clone(),
                         region_start,
                         region_end: register_position,
@@ -2424,7 +2448,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
             registration.region_start,
             registration.region_end,
         );
-        let class_decl_id = LuaTypeDeclId::global(&registration.panel_name);
+        let class_decl_id = registration.class_decl_id.clone();
         for call in &metadata.accessor_func_calls {
             if let Some(Some(GmodClassCallLiteral::NameRef(target_name))) =
                 call.literal_args.first()
@@ -3525,6 +3549,54 @@ fn synthesize_derma_define_control(
     register_global_panel(db, file_id, &control_name, call);
 }
 
+fn synthesize_vgui_register_table(
+    db: &mut DbIndex,
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+) {
+    // vgui.RegisterTable(TABLE, "BasePanel")
+    // args[0] = table variable (name ref)
+    // args[1] = base panel name (string)
+    let table_arg_idx = call.vgui_panel_table_arg_idx(0);
+    let base_arg_idx = call.vgui_panel_base_arg_idx(Some(1)).unwrap_or(1);
+
+    let table_var_name = match call.literal_args.get(table_arg_idx) {
+        Some(Some(GmodClassCallLiteral::NameRef(name))) => Some(name.clone()),
+        _ => None,
+    };
+
+    let base_panel = match call.literal_args.get(base_arg_idx) {
+        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => Some(name.clone()),
+        _ => None,
+    };
+
+    let class_decl_id = vgui_register_table_type_decl_id(file_id, call);
+    let class_name = class_decl_id.get_simple_name().to_string();
+    synthesize_panel_class_with_id(
+        db,
+        file_id,
+        class_decl_id,
+        &class_name,
+        table_var_name.as_deref(),
+        base_panel.as_deref(),
+        GmodScriptedClassCallKind::VguiRegisterTable,
+        call,
+    );
+}
+
+fn vgui_register_table_type_decl_id(
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+) -> LuaTypeDeclId {
+    LuaTypeDeclId::local(
+        file_id,
+        &format!(
+            "__gmod_vgui_register_table_{}",
+            u32::from(call.syntax_id.get_range().start())
+        ),
+    )
+}
+
 /// Register a panel name as a global variable with the panel class type.
 fn register_global_panel(
     db: &mut DbIndex,
@@ -3678,17 +3750,43 @@ fn synthesize_panel_class(
     call: &GmodScriptedClassCallMetadata,
 ) {
     let class_decl_id = LuaTypeDeclId::global(panel_name);
+    synthesize_panel_class_with_id(
+        db,
+        file_id,
+        class_decl_id,
+        panel_name,
+        table_var_name,
+        base_panel,
+        call_kind,
+        call,
+    );
+}
 
+fn synthesize_panel_class_with_id(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: LuaTypeDeclId,
+    panel_name: &str,
+    table_var_name: Option<&str>,
+    base_panel: Option<&str>,
+    call_kind: GmodScriptedClassCallKind,
+    call: &GmodScriptedClassCallMetadata,
+) {
     // Create the class type declaration if it doesn't exist
     if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
+        let type_flag = if call_kind == GmodScriptedClassCallKind::VguiRegisterTable {
+            LuaTypeFlag::AutoGenerated
+        } else {
+            LuaTypeFlag::None
+        };
         db.get_type_index_mut().add_type_decl(
             file_id,
             LuaTypeDecl::new(
                 file_id,
                 call.syntax_id.get_range(),
-                class_decl_id.get_simple_name().to_string(),
+                panel_name.to_string(),
                 LuaDeclTypeKind::Class,
-                LuaTypeFlag::None.into(),
+                type_flag.into(),
                 class_decl_id.clone(),
             ),
         );
@@ -3997,6 +4095,9 @@ fn synthesize_panel_baseclass_member(
         GmodScriptedClassCallKind::VguiRegister => {
             call.vgui_panel_base_arg_idx(Some(2)).unwrap_or(2)
         }
+        GmodScriptedClassCallKind::VguiRegisterTable => {
+            call.vgui_panel_base_arg_idx(Some(1)).unwrap_or(1)
+        }
         GmodScriptedClassCallKind::DermaDefineControl => {
             call.vgui_panel_base_arg_idx(Some(3)).unwrap_or(3)
         }
@@ -4304,6 +4405,10 @@ impl AnnotatedGmodCallRoles {
                 self.vgui_panel_define_roles
                     .push((role.param_idx, priority));
             }
+            ("gmod.vgui_panel", "register_table") => {
+                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::VguiRegisterTable);
+                self.vgui_panel_table_roles.push((role.param_idx, priority));
+            }
             ("gmod.vgui_panel", "table") => {
                 self.vgui_panel_table_roles.push((role.param_idx, priority));
             }
@@ -4351,6 +4456,10 @@ impl AnnotatedGmodCallRoles {
             || !self.inheritance_roles.is_empty()
             || !self.network_var_define_roles.is_empty()
             || !self.vgui_panel_define_roles.is_empty()
+            || matches!(
+                self.vgui_panel_kind,
+                Some(GmodScriptedClassCallKind::VguiRegisterTable)
+            )
             || !self.derma_skin_define_roles.is_empty()
     }
 
@@ -4459,6 +4568,10 @@ impl AnnotatedGmodCallRoles {
             has_scripted_class: !self.inheritance_roles.is_empty()
                 || !self.network_var_define_roles.is_empty()
                 || !self.vgui_panel_define_roles.is_empty()
+                || matches!(
+                    self.vgui_panel_kind,
+                    Some(GmodScriptedClassCallKind::VguiRegisterTable)
+                )
                 || !self.derma_skin_define_roles.is_empty(),
         }
     }
@@ -4510,16 +4623,22 @@ impl AnnotatedGmodCallRoles {
         &self,
         is_colon_call: bool,
     ) -> Option<(GmodScriptedClassCallKind, GmodVguiPanelCallRoles)> {
-        let (define_arg_idx, _) = *self.vgui_panel_define_roles.first()?;
+        let kind = self
+            .vgui_panel_kind
+            .unwrap_or(GmodScriptedClassCallKind::VguiRegister);
+        let define_arg_idx = if let Some((param_idx, _)) = self.vgui_panel_define_roles.first() {
+            param_idx_to_call_arg_idx(*param_idx, is_colon_call, self.is_colon_define)?
+        } else if kind == GmodScriptedClassCallKind::VguiRegisterTable {
+            let (param_idx, _) = *self.vgui_panel_table_roles.first()?;
+            param_idx_to_call_arg_idx(param_idx, is_colon_call, self.is_colon_define)?
+        } else {
+            return None;
+        };
+
         Some((
-            self.vgui_panel_kind
-                .unwrap_or(GmodScriptedClassCallKind::VguiRegister),
+            kind,
             GmodVguiPanelCallRoles {
-                define_arg_idx: param_idx_to_call_arg_idx(
-                    define_arg_idx,
-                    is_colon_call,
-                    self.is_colon_define,
-                )?,
+                define_arg_idx,
                 table_arg_idx: self
                     .vgui_panel_table_roles
                     .first()
