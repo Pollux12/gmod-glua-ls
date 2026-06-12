@@ -110,6 +110,8 @@ fn check_call_expr(
                 format!("{name} may be nil", name = prefix.syntax().text()).to_string(),
                 None,
             );
+        } else if nullable_callable_is_from_non_nullable_receiver(semantic_model, &prefix) {
+            return Some(());
         } else if !should_skip_deferred_nullable_function_call(&call_expr, &prefix) {
             context.add_diagnostic(
                 DiagnosticCode::NeedCheckNil,
@@ -123,6 +125,53 @@ fn check_call_expr(
     }
 
     Some(())
+}
+
+fn nullable_callable_is_from_non_nullable_receiver(
+    semantic_model: &SemanticModel,
+    prefix: &LuaExpr,
+) -> bool {
+    let LuaExpr::IndexExpr(index_expr) = prefix else {
+        return false;
+    };
+    let Some(receiver) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Ok(receiver_type) = semantic_model.infer_expr(receiver) else {
+        return false;
+    };
+
+    if index_expr_has_explicit_nullable_member(semantic_model, index_expr, receiver_type.clone()) {
+        return false;
+    }
+
+    !receiver_type.is_nullable()
+        && !contains_gmod_null_type(semantic_model.get_db(), &receiver_type)
+}
+
+fn index_expr_has_explicit_nullable_member(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+    receiver_type: LuaType,
+) -> bool {
+    let Some(owner) = member_owner_for_type(receiver_type) else {
+        return false;
+    };
+    let Some(key) = literal_member_key(index_expr) else {
+        return false;
+    };
+
+    let db = semantic_model.get_db();
+    let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) else {
+        return false;
+    };
+    member_item
+        .resolve_type_with_realm_at_offset(
+            db,
+            &semantic_model.get_file_id(),
+            index_expr.get_position(),
+        )
+        .is_ok_and(|member_type| member_type.is_nullable())
 }
 
 fn report_unsafe_receiver(

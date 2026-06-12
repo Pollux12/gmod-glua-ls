@@ -80,6 +80,49 @@ mod test {
     }
 
     #[test]
+    fn test_non_nil_union_branch_missing_method_is_not_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            function Entity:DeleteOnRemove(ent) end
+
+            ---@class phys_hinge: Entity
+
+            ---@return phys_hinge|false
+            local function Axis()
+                return false
+            end
+
+            local axis = Axis()
+            axis:DeleteOnRemove({})
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_optional_callable_member_on_non_nil_receiver_still_needs_nil_check() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class CallbackOwner
+            ---@field callback? fun()
+
+            ---@type CallbackOwner
+            local owner = {}
+            owner.callback()
+            "#,
+        );
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
     fn test_cast() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
