@@ -1,6 +1,6 @@
 use glua_code_analysis::{
-    LuaCallArgRole, LuaDeclId, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaTypeOwner,
-    SemanticDeclLevel, SemanticModel, find_call_arg_role_from_type,
+    DbIndex, LuaCallArgRole, LuaDeclId, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaType,
+    LuaTypeOwner, SemanticDeclLevel, SemanticModel, find_call_arg_role_from_type,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaLiteralExpr,
@@ -71,14 +71,15 @@ pub(crate) fn find_string_call_arg_role(
     roles: &[&str],
 ) -> Option<LuaCallArgRole> {
     let prefix_expr = call_expr.get_prefix_expr()?;
-    let adjusted_arg_index = adjusted_arg_index(call_expr, arg_index);
+    let is_colon_call = call_expr.is_colon_call();
     if let Some(semantic_decl) = semantic_model.find_decl(
         prefix_expr.syntax().clone().into(),
         SemanticDeclLevel::NoTrace,
     ) && let Some(role) = find_call_arg_role_from_semantic_decl(
         semantic_model,
         semantic_decl,
-        adjusted_arg_index,
+        arg_index,
+        is_colon_call,
         domain,
         roles,
     ) {
@@ -86,10 +87,16 @@ pub(crate) fn find_string_call_arg_role(
     }
 
     let callable_type = semantic_model.infer_expr(prefix_expr).ok()?;
+    let param_idx = call_arg_to_param_idx_for_type(
+        semantic_model.get_db(),
+        &callable_type,
+        arg_index,
+        is_colon_call,
+    );
     find_call_arg_role_from_type(
         semantic_model.get_db(),
         &callable_type,
-        adjusted_arg_index,
+        param_idx,
         domain,
         roles,
     )
@@ -105,6 +112,7 @@ pub(crate) fn find_call_arg_roles(
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return Vec::new();
     };
+    let is_colon_call = call_expr.is_colon_call();
 
     if let Some(semantic_decl) = semantic_model.find_decl(
         prefix_expr.syntax().clone().into(),
@@ -115,7 +123,8 @@ pub(crate) fn find_call_arg_roles(
                 find_call_arg_role_from_semantic_decl(
                     semantic_model,
                     semantic_decl.clone(),
-                    adjusted_arg_index(call_expr, arg_index),
+                    arg_index,
+                    is_colon_call,
                     domain,
                     roles,
                 )
@@ -133,7 +142,12 @@ pub(crate) fn find_call_arg_roles(
             find_call_arg_role_from_type(
                 semantic_model.get_db(),
                 &callable_type,
-                adjusted_arg_index(call_expr, arg_index),
+                call_arg_to_param_idx_for_type(
+                    semantic_model.get_db(),
+                    &callable_type,
+                    arg_index,
+                    is_colon_call,
+                ),
                 domain,
                 roles,
             )
@@ -152,11 +166,46 @@ pub(crate) fn has_string_call_arg_role(
     find_string_call_arg_role(semantic_model, call_expr, arg_index, domain, roles).is_some()
 }
 
-fn adjusted_arg_index(call_expr: &LuaCallExpr, arg_index: usize) -> usize {
-    if call_expr.is_colon_call() {
+/// Convert a call-argument index into the parameter index it binds to.
+///
+/// A colon call (`obj:method(a)`) passes the receiver as an implicit first
+/// argument, so call arg 0 maps to param 1 — but only when the callee is
+/// *not* itself colon-defined (a colon-defined signature already omits the
+/// `self` parameter, so the indices line up again). This mirrors the
+/// analyzer's `param_idx_to_call_arg_idx` in the opposite direction; keeping
+/// the two rules in sync is what prevents an off-by-one for colon-defined
+/// methods such as `Entity:NetworkVar`.
+fn call_arg_to_param_idx(arg_index: usize, is_colon_call: bool, is_colon_define: bool) -> usize {
+    if is_colon_call && !is_colon_define {
         arg_index + 1
     } else {
         arg_index
+    }
+}
+
+/// Resolve the `call_arg` parameter index for a callable `LuaType`, using the
+/// callee's own `is_colon_define` flag so colon calls are adjusted correctly.
+pub(crate) fn call_arg_to_param_idx_for_type(
+    db: &DbIndex,
+    typ: &LuaType,
+    arg_index: usize,
+    is_colon_call: bool,
+) -> usize {
+    call_arg_to_param_idx(arg_index, is_colon_call, type_is_colon_define(db, typ))
+}
+
+/// Best-effort `is_colon_define` for a callable type. Only `Signature`/
+/// `DocFunction` carry the flag; anything else is treated as a plain function
+/// (`false`), which matches every annotated std-lib definition that is not a
+/// method.
+fn type_is_colon_define(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::DocFunction(func) => func.is_colon_define(),
+        LuaType::Signature(signature_id) => db
+            .get_signature_index()
+            .get(signature_id)
+            .is_some_and(|signature| signature.is_colon_define),
+        _ => false,
     }
 }
 
@@ -214,6 +263,7 @@ fn find_call_arg_role_from_semantic_decl(
     semantic_model: &SemanticModel,
     semantic_decl: LuaSemanticDeclId,
     arg_index: usize,
+    is_colon_call: bool,
     domain: &str,
     roles: &[&str],
 ) -> Option<LuaCallArgRole> {
@@ -222,15 +272,26 @@ fn find_call_arg_role_from_semantic_decl(
             semantic_model,
             signature_id,
             arg_index,
+            is_colon_call,
             domain,
             roles,
         ),
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            find_call_arg_role_from_decl_id(semantic_model, decl_id, arg_index, domain, roles)
-        }
-        LuaSemanticDeclId::Member(member_id) => {
-            find_call_arg_role_from_member_id(semantic_model, member_id, arg_index, domain, roles)
-        }
+        LuaSemanticDeclId::LuaDecl(decl_id) => find_call_arg_role_from_decl_id(
+            semantic_model,
+            decl_id,
+            arg_index,
+            is_colon_call,
+            domain,
+            roles,
+        ),
+        LuaSemanticDeclId::Member(member_id) => find_call_arg_role_from_member_id(
+            semantic_model,
+            member_id,
+            arg_index,
+            is_colon_call,
+            domain,
+            roles,
+        ),
         LuaSemanticDeclId::TypeDecl(_) => None,
     }
 }
@@ -239,6 +300,7 @@ fn find_call_arg_role_from_signature_id(
     semantic_model: &SemanticModel,
     signature_id: LuaSignatureId,
     arg_index: usize,
+    is_colon_call: bool,
     domain: &str,
     roles: &[&str],
 ) -> Option<LuaCallArgRole> {
@@ -246,8 +308,9 @@ fn find_call_arg_role_from_signature_id(
         .get_db()
         .get_signature_index()
         .get(&signature_id)?;
+    let param_idx = call_arg_to_param_idx(arg_index, is_colon_call, signature.is_colon_define);
     let mut best = None;
-    signature.visit_call_arg_roles_for_param(arg_index, &mut |role| {
+    signature.visit_call_arg_roles_for_param(param_idx, &mut |role| {
         if role.domain != domain || !roles.iter().any(|candidate| *candidate == role.role) {
             return;
         }
@@ -265,6 +328,7 @@ fn find_call_arg_role_from_decl_id(
     semantic_model: &SemanticModel,
     decl_id: LuaDeclId,
     arg_index: usize,
+    is_colon_call: bool,
     domain: &str,
     roles: &[&str],
 ) -> Option<LuaCallArgRole> {
@@ -273,6 +337,7 @@ fn find_call_arg_role_from_decl_id(
             semantic_model,
             signature_id,
             arg_index,
+            is_colon_call,
             domain,
             roles,
         )
@@ -281,18 +346,31 @@ fn find_call_arg_role_from_decl_id(
     }
 
     let typ = semantic_model.get_type(decl_id.into());
-    find_call_arg_role_from_type(semantic_model.get_db(), &typ, arg_index, domain, roles)
+    let param_idx = call_arg_to_param_idx_for_type(
+        semantic_model.get_db(),
+        &typ,
+        arg_index,
+        is_colon_call,
+    );
+    find_call_arg_role_from_type(semantic_model.get_db(), &typ, param_idx, domain, roles)
 }
 
 fn find_call_arg_role_from_member_id(
     semantic_model: &SemanticModel,
     member_id: LuaMemberId,
     arg_index: usize,
+    is_colon_call: bool,
     domain: &str,
     roles: &[&str],
 ) -> Option<LuaCallArgRole> {
     let typ = semantic_model.get_type(LuaTypeOwner::Member(member_id));
-    find_call_arg_role_from_type(semantic_model.get_db(), &typ, arg_index, domain, roles)
+    let param_idx = call_arg_to_param_idx_for_type(
+        semantic_model.get_db(),
+        &typ,
+        arg_index,
+        is_colon_call,
+    );
+    find_call_arg_role_from_type(semantic_model.get_db(), &typ, param_idx, domain, roles)
 }
 
 fn signature_id_from_decl_value(
@@ -339,5 +417,42 @@ pub(crate) fn normalize_string_name(name: String) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::call_arg_to_param_idx;
+
+    #[test]
+    fn dot_call_dot_define_is_identity() {
+        // foo.bar("x") on `function foo.bar(name)` — arg 0 is param 0.
+        assert_eq!(call_arg_to_param_idx(0, false, false), 0);
+        assert_eq!(call_arg_to_param_idx(1, false, false), 1);
+    }
+
+    #[test]
+    fn colon_call_dot_define_shifts_by_one() {
+        // obj:bar("x") on `function obj.bar(self, name)` — the receiver is the
+        // implicit first arg, so call arg 0 binds to param 1.
+        assert_eq!(call_arg_to_param_idx(0, true, false), 1);
+        assert_eq!(call_arg_to_param_idx(1, true, false), 2);
+    }
+
+    #[test]
+    fn colon_call_colon_define_is_identity() {
+        // ent:NetworkVar("x") on `function Entity:NetworkVar(type, ...)` — the
+        // colon-defined signature omits `self`, so the indices line up again.
+        // This is the case the previous `adjusted_arg_index` got wrong.
+        assert_eq!(call_arg_to_param_idx(0, true, true), 0);
+        assert_eq!(call_arg_to_param_idx(2, true, true), 2);
+    }
+
+    #[test]
+    fn dot_call_colon_define_is_identity() {
+        // Entity.NetworkVar(ent, "x") spelled with a dot still lines up with a
+        // colon-defined signature (param 0 is `type`, not `self`).
+        assert_eq!(call_arg_to_param_idx(0, false, true), 0);
+        assert_eq!(call_arg_to_param_idx(1, false, true), 1);
     }
 }

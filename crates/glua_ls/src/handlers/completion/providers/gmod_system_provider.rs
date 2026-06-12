@@ -823,10 +823,16 @@ fn call_has_hook_gamemode_table_role(
     let Some(callable_type) = semantic_model.infer_expr(prefix_expr).ok() else {
         return false;
     };
+    let param_idx = crate::handlers::gmod_string_context::call_arg_to_param_idx_for_type(
+        semantic_model.get_db(),
+        &callable_type,
+        1,
+        call_expr.is_colon_call(),
+    );
     find_call_arg_role_from_type(
         semantic_model.get_db(),
         &callable_type,
-        if call_expr.is_colon_call() { 2 } else { 1 },
+        param_idx,
         "gmod.hook",
         &["gamemode_table"],
     )
