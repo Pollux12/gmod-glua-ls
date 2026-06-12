@@ -151,4 +151,51 @@ mod tests {
         ws.analysis.update_config(Arc::new(emmyrc));
         assert!(!ws.check_code_for(DiagnosticCode::RedefinedLocal, code));
     }
+
+    #[test]
+    fn test_gmod_vgui_panel_registration_allows_panel_reuse() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedefinedLocal,
+            r#"
+                local PANEL = {}
+                function PANEL:Init() end
+                derma.DefineControl("FirstPanel", "", PANEL, "Panel")
+
+                local PANEL = {}
+                function PANEL:Init() end
+                derma.DefineControl("SecondPanel", "", PANEL, "Panel")
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_gmod_vgui_panel_registration_initializer_allows_panel_reuse() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedefinedLocal,
+            r#"
+                local PANEL = {}
+                function PANEL:Init() end
+
+                local PANEL = derma.DefineControl("Button", "", PANEL, "DLabel")
+                PANEL = table.Copy(PANEL)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_unregistered_panel_reuse_still_reports_redefined_local() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::RedefinedLocal,
+            r#"
+                local PANEL = {}
+                function PANEL:Init() end
+
+                local PANEL = {}
+                function PANEL:Init() end
+        "#
+        ));
+    }
 }
