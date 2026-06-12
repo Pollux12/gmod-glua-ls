@@ -47,6 +47,8 @@ struct GmodKeywords {
     has_system_call: bool,
     /// Annotated scripted-class wrappers (VGUI, Derma, NetworkVar, inheritance)
     has_scripted_class_call: bool,
+    /// Annotated load wrappers (`include`, `AddCSLuaFile`, `IncludeCS`, `require`)
+    has_load_call: bool,
     /// "GM:" or "GAMEMODE:" — GM/GAMEMODE method sites
     has_gm_func: bool,
     /// "CLIENT", "SERVER", or "MENU_DLL" — branch realm ranges.
@@ -61,6 +63,7 @@ struct AnnotatedGmodCandidatePresence {
     has_net: bool,
     has_hook: bool,
     has_scripted_class: bool,
+    has_load: bool,
 }
 
 impl GmodKeywords {
@@ -99,6 +102,7 @@ fn scan_gmod_keywords(
         || content.contains("gmod.network_var")
         || content.contains("gmod.class_base")
         || content.contains("gmod.gamemode");
+    let has_load_annotation = content.contains("gmod.load");
     let annotated_candidates = annotated_global_call_roles.candidate_call_paths_in_content(content);
     GmodKeywords {
         has_hook: content.contains("hook") || has_hook_annotation || annotated_candidates.has_hook,
@@ -111,6 +115,7 @@ fn scan_gmod_keywords(
             || annotated_candidates.has_system,
         has_scripted_class_call: has_scripted_class_annotation
             || annotated_candidates.has_scripted_class,
+        has_load_call: has_load_annotation || annotated_candidates.has_load,
         has_gm_func,
         has_realm_branch: content.contains("CLIENT")
             || content.contains("SERVER")
@@ -172,7 +177,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build(db);
 
         let t_class = do_profile.then(std::time::Instant::now);
-        collect_annotated_scripted_class_calls_with(
+        collect_annotated_gmod_call_sites_with(
             db,
             context,
             &formatted_hook_prefixes,
@@ -180,7 +185,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         );
         if let Some(t_class) = t_class {
             log::info!(
-                "gmod pre: annotated_scripted_class_calls cost {:?}",
+                "gmod pre: annotated_scripted_class_and_load_calls cost {:?}",
                 t_class.elapsed()
             );
         }
@@ -558,6 +563,88 @@ fn collect_annotated_scripted_class_calls_with(
             );
         }
     }
+}
+
+fn collect_annotated_gmod_call_sites_with(
+    db: &mut DbIndex,
+    context: &AnalyzeContext,
+    formatted_hook_prefixes: &[String],
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) {
+    for in_filed_tree in &context.tree_list {
+        let keywords = db
+            .get_vfs()
+            .get_file_content(&in_filed_tree.file_id)
+            .map(|content| {
+                scan_gmod_keywords(
+                    content,
+                    formatted_hook_prefixes,
+                    annotated_global_call_roles,
+                )
+            })
+            .unwrap_or_default();
+        if !keywords.has_scripted_class_call && !keywords.has_load_call {
+            continue;
+        }
+
+        let annotated_call_roles = AnnotatedGmodCallRoleMap::build(
+            db,
+            in_filed_tree.file_id,
+            &in_filed_tree.value,
+            annotated_global_call_roles,
+        );
+        for call_expr in in_filed_tree
+            .value
+            .syntax()
+            .descendants()
+            .filter_map(LuaCallExpr::cast)
+        {
+            if keywords.has_scripted_class_call {
+                collect_annotated_scripted_class_call_metadata(
+                    db,
+                    in_filed_tree.file_id,
+                    &annotated_call_roles,
+                    call_expr.clone(),
+                );
+            }
+            if keywords.has_load_call {
+                collect_annotated_load_dependency_site(
+                    db,
+                    in_filed_tree.file_id,
+                    &annotated_call_roles,
+                    call_expr,
+                );
+            }
+        }
+    }
+}
+
+fn collect_annotated_load_dependency_site(
+    db: &mut DbIndex,
+    file_id: FileId,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
+    call_expr: LuaCallExpr,
+) -> Option<()> {
+    let call_path = call_expr.get_access_path()?;
+    let (kind, path_arg_idx) = annotated_roles.load_call(db, file_id, &call_expr, &call_path)?;
+    let arg_expr = call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().nth(path_arg_idx))?;
+    let path = static_literal_string(&arg_expr);
+    let target_file_id = path
+        .as_deref()
+        .and_then(|path| resolve_load_dependency_target(db, file_id, kind, path));
+
+    db.get_file_dependencies_index_mut()
+        .add_dependency_site(LuaDependencySite {
+            source_file_id: file_id,
+            target_file_id,
+            kind,
+            path,
+            original_expr: call_expr.syntax().text().to_string(),
+            range: arg_expr.get_range(),
+        });
+    Some(())
 }
 
 struct HelperRegistry {
@@ -4301,6 +4388,7 @@ struct AnnotatedGmodCallRoles {
     system_callback_roles: Vec<(GmodSystemCallKind, AnnotatedGmodCallArgRole)>,
     hook_roles: Vec<(GmodHookKind, AnnotatedGmodCallArgRole)>,
     hook_callback_roles: Vec<AnnotatedGmodCallArgRole>,
+    load_roles: Vec<(LuaDependencyKind, AnnotatedGmodCallArgRole)>,
     inheritance_roles: Vec<(GmodScriptedClassCallKind, AnnotatedGmodCallArgRole)>,
     network_var_kind: Option<GmodScriptedClassCallKind>,
     network_var_type_roles: Vec<AnnotatedGmodCallArgRole>,
@@ -4390,6 +4478,18 @@ impl AnnotatedGmodCallRoles {
             ("gmod.hook", "callback") => {
                 self.hook_callback_roles.push(arg_role);
             }
+            ("gmod.load", "require") => {
+                self.load_roles.push((LuaDependencyKind::Require, arg_role))
+            }
+            ("gmod.load", "include") => {
+                self.load_roles.push((LuaDependencyKind::Include, arg_role))
+            }
+            ("gmod.load", "addcsluafile") | ("gmod.load", "add_cs_lua_file") => self
+                .load_roles
+                .push((LuaDependencyKind::AddCSLuaFile, arg_role)),
+            ("gmod.load", "includecs") | ("gmod.load", "include_cs") => self
+                .load_roles
+                .push((LuaDependencyKind::IncludeCS, arg_role)),
             ("gmod.class_base", "reference") => self
                 .inheritance_roles
                 .push((GmodScriptedClassCallKind::DefineBaseClass, arg_role)),
@@ -4419,6 +4519,10 @@ impl AnnotatedGmodCallRoles {
                 self.vgui_panel_kind = Some(GmodScriptedClassCallKind::DermaDefineControl);
                 self.vgui_panel_define_roles.push(arg_role);
             }
+            ("gmod.vgui_panel", "register_file") => {
+                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::VguiRegisterFile);
+                self.vgui_panel_define_roles.push(arg_role);
+            }
             ("gmod.vgui_panel", "register_table") => {
                 self.vgui_panel_kind = Some(GmodScriptedClassCallKind::VguiRegisterTable);
                 self.vgui_panel_table_roles.push(arg_role);
@@ -4443,6 +4547,7 @@ impl AnnotatedGmodCallRoles {
         self.hook_roles.sort_by_key(|(_, role)| role.sort_key());
         self.hook_callback_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.load_roles.sort_by_key(|(_, role)| role.sort_key());
         self.inheritance_roles
             .sort_by_key(|(_, role)| role.sort_key());
         self.network_var_type_roles
@@ -4464,12 +4569,16 @@ impl AnnotatedGmodCallRoles {
             || !self.system_callback_roles.is_empty()
             || !self.hook_roles.is_empty()
             || !self.hook_callback_roles.is_empty()
+            || !self.load_roles.is_empty()
             || !self.inheritance_roles.is_empty()
             || !self.network_var_define_roles.is_empty()
             || !self.vgui_panel_define_roles.is_empty()
             || matches!(
                 self.vgui_panel_kind,
-                Some(GmodScriptedClassCallKind::VguiRegisterTable)
+                Some(
+                    GmodScriptedClassCallKind::VguiRegisterFile
+                        | GmodScriptedClassCallKind::VguiRegisterTable
+                )
             )
             || !self.derma_skin_define_roles.is_empty()
     }
@@ -4576,12 +4685,16 @@ impl AnnotatedGmodCallRoles {
                 )
             }),
             has_hook: !self.hook_roles.is_empty() || !self.hook_callback_roles.is_empty(),
+            has_load: !self.load_roles.is_empty(),
             has_scripted_class: !self.inheritance_roles.is_empty()
                 || !self.network_var_define_roles.is_empty()
                 || !self.vgui_panel_define_roles.is_empty()
                 || matches!(
                     self.vgui_panel_kind,
-                    Some(GmodScriptedClassCallKind::VguiRegisterTable)
+                    Some(
+                        GmodScriptedClassCallKind::VguiRegisterFile
+                            | GmodScriptedClassCallKind::VguiRegisterTable
+                    )
                 )
                 || !self.derma_skin_define_roles.is_empty(),
         }
@@ -4601,6 +4714,14 @@ impl AnnotatedGmodCallRoles {
                     self.is_colon_define,
                 )?,
             },
+        ))
+    }
+
+    fn load_call(&self, is_colon_call: bool) -> Option<(LuaDependencyKind, usize)> {
+        let (kind, role) = self.load_roles.first()?;
+        Some((
+            *kind,
+            param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)?,
         ))
     }
 
@@ -4829,6 +4950,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
                 && !presence.has_net
                 && !presence.has_hook
                 && !presence.has_scripted_class
+                && !presence.has_load
             {
                 continue;
             }
@@ -4861,11 +4983,13 @@ impl AnnotatedGmodGlobalCallRoleMap {
             presence.has_net |= candidate_presence.has_net;
             presence.has_hook |= candidate_presence.has_hook;
             presence.has_scripted_class |= candidate_presence.has_scripted_class;
+            presence.has_load |= candidate_presence.has_load;
 
             if presence.has_system
                 && presence.has_net
                 && presence.has_hook
                 && presence.has_scripted_class
+                && presence.has_load
             {
                 break;
             }
@@ -5039,6 +5163,17 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
                     }),
                 ))
             })
+    }
+
+    fn load_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(LuaDependencyKind, usize)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.load_call(call_expr.is_colon_call()))
     }
 
     fn vgui_panel_call(

@@ -75,10 +75,13 @@ impl LuaDependencyIndex {
         if let Some(target_file_id) = site.target_file_id {
             self.add_dependency_file(site.source_file_id, target_file_id, site.kind);
         }
-        self.dependency_sites
+        let sites = self
+            .dependency_sites
             .entry(site.source_file_id)
-            .or_default()
-            .push(site);
+            .or_default();
+        if !sites.iter().any(|existing| existing == &site) {
+            sites.push(site);
+        }
     }
 
     pub fn get_required_files(&self, file_id: &FileId) -> Option<&HashSet<FileId>> {

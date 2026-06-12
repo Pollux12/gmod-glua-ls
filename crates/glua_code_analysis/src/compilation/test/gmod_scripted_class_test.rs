@@ -2515,6 +2515,105 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_register_file_uses_loaded_panel_base_field_for_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            local Panel = {}
+
+            function Panel:Remove() end
+        "#,
+        );
+        ws.def_file(
+            "annotations/dpanel.lua",
+            r#"
+            ---@meta
+
+            ---@class DPanel: Panel
+            local DPanel = {}
+
+            ---@return Panel
+            function DPanel:Add(class_name) end
+
+            ---@param width number
+            ---@param height number
+            function DPanel:SetSize(width, height) end
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/menu/mount/vgui/workshop.lua",
+            r#"
+            PANEL.Base = "DPanel"
+            AccessorFunc(PANEL, "m_bDrawProgress", "DrawProgress", FORCE_BOOL)
+
+            function PANEL:Init()
+                self:Add("DLabel")
+                self:SetDrawProgress(false)
+                self:SetSize(500, 80)
+            end
+        "#,
+        );
+        let source_id = ws.def_file(
+            "lua/menu/mount/mount.lua",
+            r#"
+            vgui = vgui or {}
+
+            ---@[call_arg("gmod.load", "include")]
+            ---@[call_arg("gmod.vgui_panel", "register_file")]
+            ---@param file string
+            function vgui.RegisterFile(file) end
+
+            vgui.RegisterFile("vgui/workshop.lua")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let metadata = db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&source_id)
+            .expect("expected RegisterFile caller metadata");
+        assert_eq!(
+            metadata.vgui_register_file_calls.len(),
+            1,
+            "vgui.RegisterFile annotation should be collected as VGUI register-file metadata"
+        );
+
+        let self_type = index_expr_prefix_type(&mut ws, file_id, "self:Add");
+        let expected_base = LuaType::Ref(LuaTypeDeclId::global("DPanel"));
+        assert!(
+            ws.check_type(&self_type, &expected_base),
+            "vgui.RegisterFile should infer loaded PANEL self as DPanel-compatible from PANEL.Base, got {}",
+            ws.humanize_type_detailed(self_type.clone())
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field),
+            "vgui.RegisterFile should infer loaded PANEL self from PANEL.Base, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vgui_create_from_table_ignores_stale_base_after_dynamic_table_overwrite() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

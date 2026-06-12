@@ -14,6 +14,7 @@ pub enum GmodScriptedClassCallKind {
     NetworkVar,
     NetworkVarElement,
     VguiRegister,
+    VguiRegisterFile,
     VguiRegisterTable,
     DermaDefineControl,
     DermaDefineSkin,
@@ -214,6 +215,7 @@ pub struct GmodScriptedClassFileMetadata {
     pub network_var_calls: Vec<GmodScriptedClassCallMetadata>,
     pub network_var_element_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub vgui_register_file_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_table_calls: Vec<GmodScriptedClassCallMetadata>,
     pub derma_define_control_calls: Vec<GmodScriptedClassCallMetadata>,
     pub derma_define_skin_calls: Vec<GmodScriptedClassCallMetadata>,
@@ -242,6 +244,7 @@ impl GmodScriptedClassFileMetadata {
             GmodScriptedClassCallKind::NetworkVar => &mut self.network_var_calls,
             GmodScriptedClassCallKind::NetworkVarElement => &mut self.network_var_element_calls,
             GmodScriptedClassCallKind::VguiRegister => &mut self.vgui_register_calls,
+            GmodScriptedClassCallKind::VguiRegisterFile => &mut self.vgui_register_file_calls,
             GmodScriptedClassCallKind::VguiRegisterTable => &mut self.vgui_register_table_calls,
             GmodScriptedClassCallKind::DermaDefineControl => &mut self.derma_define_control_calls,
             GmodScriptedClassCallKind::DermaDefineSkin => &mut self.derma_define_skin_calls,
@@ -352,7 +355,12 @@ impl GmodClassMetadataIndex {
         kind: GmodScriptedClassCallKind,
         call_metadata: &GmodScriptedClassCallMetadata,
     ) {
-        Self::insert_vgui_panel_from_call(&mut self.vgui_panels, file_id, kind, call_metadata);
+        if matches!(
+            kind,
+            GmodScriptedClassCallKind::VguiRegister | GmodScriptedClassCallKind::DermaDefineControl
+        ) {
+            Self::insert_vgui_panel_from_call(&mut self.vgui_panels, file_id, kind, call_metadata);
+        }
     }
 
     fn insert_derma_skin_from_call(
