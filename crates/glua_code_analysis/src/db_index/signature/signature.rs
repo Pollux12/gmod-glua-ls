@@ -29,6 +29,7 @@ pub struct LuaSignature {
     pub async_state: AsyncState,
     pub nodiscard: Option<LuaNoDiscard>,
     pub is_vararg: bool,
+    require_guard_param: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -65,7 +66,16 @@ impl LuaSignature {
             async_state: AsyncState::None,
             nodiscard: None,
             is_vararg: false,
+            require_guard_param: None,
         }
+    }
+
+    pub fn require_guard_param(&self) -> Option<usize> {
+        self.require_guard_param
+    }
+
+    pub fn set_require_guard_param(&mut self, param_idx: usize) {
+        self.require_guard_param = Some(param_idx);
     }
 
     pub fn is_generic(&self) -> bool {

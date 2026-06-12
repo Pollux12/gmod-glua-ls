@@ -207,6 +207,28 @@ fn collect_short_circuit_guarded_name_expr_ranges(
     }
 }
 
+#[derive(Debug)]
+enum GuardedTarget {
+    ArgName(LuaNameExpr),
+    GlobalName(String),
+}
+
+impl GuardedTarget {
+    fn name(&self) -> Option<String> {
+        match self {
+            Self::ArgName(name_expr) => name_expr.get_name_text().map(|name| name.to_string()),
+            Self::GlobalName(name_text) => Some(name_text.clone()),
+        }
+    }
+
+    fn range(&self) -> Option<TextRange> {
+        match self {
+            Self::ArgName(name_expr) => Some(name_expr.get_range()),
+            Self::GlobalName(_) => None,
+        }
+    }
+}
+
 fn is_return_only_block(block: &LuaBlock) -> bool {
     let mut has_return_stat = false;
     for stat in block.get_stats() {
@@ -420,11 +442,13 @@ fn collect_truthy_guarded_names(
         }
         LuaExpr::CallExpr(call_expr) => {
             let mut names = HashSet::new();
-            if let Some(name_expr) = guarded_call_target_name(semantic_model, call_expr)
-                && let Some(name_text) = name_expr.get_name_text()
+            if let Some(guarded_target) = guarded_call_target_name(semantic_model, call_expr)
+                && let Some(name_text) = guarded_target.name()
             {
-                condition_guard_ranges.insert(name_expr.get_range());
-                names.insert(name_text.to_string());
+                if let Some(guard_range) = guarded_target.range() {
+                    condition_guard_ranges.insert(guard_range);
+                }
+                names.insert(name_text);
             }
             names
         }
@@ -477,8 +501,12 @@ fn is_nil_literal(expr: &LuaExpr) -> bool {
 fn guarded_call_target_name(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
-) -> Option<LuaNameExpr> {
+) -> Option<GuardedTarget> {
     let prefix_expr = call_expr.get_prefix_expr()?;
+
+    if let Some(name) = guarded_call_require_target_name(semantic_model, call_expr, &prefix_expr) {
+        return Some(name);
+    }
 
     match prefix_expr {
         LuaExpr::NameExpr(name_expr) => {
@@ -490,7 +518,7 @@ fn guarded_call_target_name(
             }
 
             let first_arg = call_expr.get_args_list()?.get_args().next()?;
-            unwrap_paren_to_name_expr(&first_arg)
+            unwrap_paren_to_name_expr(&first_arg).map(GuardedTarget::ArgName)
         }
         LuaExpr::IndexExpr(index_expr) => {
             if !call_expr.is_colon_call() {
@@ -505,10 +533,65 @@ fn guarded_call_target_name(
                 return None;
             }
 
-            unwrap_paren_to_name_expr(&index_expr.get_prefix_expr()?)
+            unwrap_paren_to_name_expr(&index_expr.get_prefix_expr()?).map(GuardedTarget::ArgName)
         }
         _ => None,
     }
+}
+
+fn guarded_call_require_target_name(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    prefix_expr: &LuaExpr,
+) -> Option<GuardedTarget> {
+    if call_expr.is_colon_call() {
+        return None;
+    }
+
+    let Ok(LuaType::Signature(signature_id)) = semantic_model.infer_expr(prefix_expr.clone())
+    else {
+        return None;
+    };
+
+    let signature = semantic_model
+        .get_db()
+        .get_signature_index()
+        .get(&signature_id)?;
+
+    let guard_arg_idx = signature.require_guard_param()?;
+
+    let arg_expr = call_expr.get_args_list()?.get_args().nth(guard_arg_idx)?;
+
+    let module_name = literal_string_expr_value(&arg_expr)?;
+
+    if is_lua_identifier(&module_name) {
+        Some(GuardedTarget::GlobalName(module_name))
+    } else {
+        None
+    }
+}
+
+fn literal_string_expr_value(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(string_token) => Some(string_token.get_value()),
+            _ => None,
+        },
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .and_then(|expr| literal_string_expr_value(&expr)),
+        _ => None,
+    }
+}
+
+fn is_lua_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first_char) = chars.next() else {
+        return false;
+    };
+
+    (first_char == '_' || first_char.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn collect_truthy_guarded_names_with_not_chain(
@@ -613,8 +696,10 @@ fn collect_condition_guard_side_effects(
             // `IsValid(x)` / `x:IsValid()` style helper calls already imply
             // their target exists — reuse the existing helper so we stay in
             // sync with the truthy-path detection.
-            if let Some(name_expr) = guarded_call_target_name(semantic_model, call_expr) {
-                condition_guard_ranges.insert(name_expr.get_range());
+            if let Some(guarded_target) = guarded_call_target_name(semantic_model, call_expr)
+                && let Some(range) = guarded_target.range()
+            {
+                condition_guard_ranges.insert(range);
             }
             // Also walk argument expressions — `foo(x.y)` should still guard `x`.
             if let Some(args_list) = call_expr.get_args_list() {
