@@ -2360,13 +2360,13 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
 
         for call in &metadata.vgui_register_calls {
             let register_position = call.syntax_id.get_range().start();
-            let panel_arg_idx = call.vgui_panel_define_arg_idx();
-            let table_arg_idx = call.vgui_panel_table_arg_idx(1);
-            if let Some(Some(GmodClassCallLiteral::String(panel_name))) =
-                call.literal_args.get(panel_arg_idx)
+            let panel_source = call.vgui_panel_define_arg_source();
+            let table_source = call.vgui_panel_table_arg_source(1);
+            if let Some(GmodClassCallLiteral::String(panel_name)) =
+                call.value_for_arg_source(&panel_source)
             {
-                if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
-                    call.literal_args.get(table_arg_idx)
+                if let Some(GmodClassCallLiteral::NameRef(table_var)) =
+                    call.value_for_arg_source(&table_source)
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
@@ -2385,9 +2385,9 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
 
         for call in &metadata.vgui_register_table_calls {
             let register_position = call.syntax_id.get_range().start();
-            let table_arg_idx = call.vgui_panel_table_arg_idx(0);
-            if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
-                call.literal_args.get(table_arg_idx)
+            let table_source = call.vgui_panel_table_arg_source(0);
+            if let Some(GmodClassCallLiteral::NameRef(table_var)) =
+                call.value_for_arg_source(&table_source)
                 && let Some((decl_id, region_start)) =
                     resolve_local_registration_region(db, file_id, table_var, register_position)
             {
@@ -2406,13 +2406,13 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
 
         for call in &metadata.derma_define_control_calls {
             let register_position = call.syntax_id.get_range().start();
-            let panel_arg_idx = call.vgui_panel_define_arg_idx();
-            let table_arg_idx = call.vgui_panel_table_arg_idx(2);
-            if let Some(Some(GmodClassCallLiteral::String(panel_name))) =
-                call.literal_args.get(panel_arg_idx)
+            let panel_source = call.vgui_panel_define_arg_source();
+            let table_source = call.vgui_panel_table_arg_source(2);
+            if let Some(GmodClassCallLiteral::String(panel_name)) =
+                call.value_for_arg_source(&panel_source)
             {
-                if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
-                    call.literal_args.get(table_arg_idx)
+                if let Some(GmodClassCallLiteral::NameRef(table_var)) =
+                    call.value_for_arg_source(&table_source)
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
@@ -3476,22 +3476,25 @@ fn synthesize_vgui_register(
     // args[0] = panel name (string)
     // args[1] = table variable (name ref)
     // args[2] = base panel name (string)
-    let panel_arg_idx = call.vgui_panel_define_arg_idx();
-    let table_arg_idx = call.vgui_panel_table_arg_idx(1);
-    let base_arg_idx = call.vgui_panel_base_arg_idx(Some(2)).unwrap_or(2);
+    let panel_source = call.vgui_panel_define_arg_source();
+    let table_source = call.vgui_panel_table_arg_source(1);
+    let base_source = call.vgui_panel_base_arg_source(Some(2));
 
-    let panel_name = match call.literal_args.get(panel_arg_idx) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name.clone(),
+    let panel_name = match call.value_for_arg_source(&panel_source) {
+        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => name.clone(),
         _ => return,
     };
 
-    let table_var_name = match call.literal_args.get(table_arg_idx) {
-        Some(Some(GmodClassCallLiteral::NameRef(name))) => Some(name.clone()),
+    let table_var_name = match call.value_for_arg_source(&table_source) {
+        Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
         _ => None,
     };
 
-    let base_panel = match call.literal_args.get(base_arg_idx) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => Some(name.clone()),
+    let base_panel = match base_source
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
+        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => Some(name.clone()),
         _ => None,
     };
 
@@ -3516,22 +3519,25 @@ fn synthesize_derma_define_control(
     // args[1] = description (string, ignored)
     // args[2] = table variable (name ref)
     // args[3] = base panel name (string)
-    let panel_arg_idx = call.vgui_panel_define_arg_idx();
-    let table_arg_idx = call.vgui_panel_table_arg_idx(2);
-    let base_arg_idx = call.vgui_panel_base_arg_idx(Some(3)).unwrap_or(3);
+    let panel_source = call.vgui_panel_define_arg_source();
+    let table_source = call.vgui_panel_table_arg_source(2);
+    let base_source = call.vgui_panel_base_arg_source(Some(3));
 
-    let control_name = match call.literal_args.get(panel_arg_idx) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name.clone(),
+    let control_name = match call.value_for_arg_source(&panel_source) {
+        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => name.clone(),
         _ => return,
     };
 
-    let table_var_name = match call.literal_args.get(table_arg_idx) {
-        Some(Some(GmodClassCallLiteral::NameRef(name))) => Some(name.clone()),
+    let table_var_name = match call.value_for_arg_source(&table_source) {
+        Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
         _ => None,
     };
 
-    let base_panel = match call.literal_args.get(base_arg_idx) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => Some(name.clone()),
+    let base_panel = match base_source
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
+        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => Some(name.clone()),
         _ => None,
     };
 
@@ -3557,16 +3563,19 @@ fn synthesize_vgui_register_table(
     // vgui.RegisterTable(TABLE, "BasePanel")
     // args[0] = table variable (name ref)
     // args[1] = base panel name (string)
-    let table_arg_idx = call.vgui_panel_table_arg_idx(0);
-    let base_arg_idx = call.vgui_panel_base_arg_idx(Some(1)).unwrap_or(1);
+    let table_source = call.vgui_panel_table_arg_source(0);
+    let base_source = call.vgui_panel_base_arg_source(Some(1));
 
-    let table_var_name = match call.literal_args.get(table_arg_idx) {
-        Some(Some(GmodClassCallLiteral::NameRef(name))) => Some(name.clone()),
+    let table_var_name = match call.value_for_arg_source(&table_source) {
+        Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
         _ => None,
     };
 
-    let base_panel = match call.literal_args.get(base_arg_idx) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => Some(name.clone()),
+    let base_panel = match base_source
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
+        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => Some(name.clone()),
         _ => None,
     };
 
@@ -4091,23 +4100,25 @@ fn synthesize_panel_baseclass_member(
         return;
     }
 
-    let base_arg_index = match call_kind {
-        GmodScriptedClassCallKind::VguiRegister => {
-            call.vgui_panel_base_arg_idx(Some(2)).unwrap_or(2)
-        }
-        GmodScriptedClassCallKind::VguiRegisterTable => {
-            call.vgui_panel_base_arg_idx(Some(1)).unwrap_or(1)
-        }
-        GmodScriptedClassCallKind::DermaDefineControl => {
-            call.vgui_panel_base_arg_idx(Some(3)).unwrap_or(3)
-        }
+    let base_arg_source = match call_kind {
+        GmodScriptedClassCallKind::VguiRegister => call.vgui_panel_base_arg_source(Some(2)),
+        GmodScriptedClassCallKind::VguiRegisterTable => call.vgui_panel_base_arg_source(Some(1)),
+        GmodScriptedClassCallKind::DermaDefineControl => call.vgui_panel_base_arg_source(Some(3)),
         _ => return,
     };
 
-    let syntax_id = call
-        .args
-        .get(base_arg_index)
-        .map(|arg| arg.syntax_id)
+    let syntax_id = base_arg_source
+        .as_ref()
+        .and_then(|source| {
+            if source.field_path.is_empty() {
+                call.args.get(source.arg_idx).map(|arg| arg.syntax_id)
+            } else {
+                call.field_args
+                    .iter()
+                    .find(|arg| &arg.source == source)
+                    .map(|arg| arg.syntax_id)
+            }
+        })
         .unwrap_or(call.syntax_id);
     let member_id = LuaMemberId::new(syntax_id, file_id);
     let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
@@ -4248,25 +4259,57 @@ struct AnnotatedGmodCallRoleMap<'a> {
 }
 
 #[derive(Clone, Default)]
+struct AnnotatedGmodCallArgRole {
+    param_idx: usize,
+    priority: i64,
+    field_path: Vec<String>,
+}
+
+impl AnnotatedGmodCallArgRole {
+    fn from_role(role: &LuaCallArgRole) -> Self {
+        Self {
+            param_idx: role.param_idx,
+            priority: role.priority.unwrap_or(0),
+            field_path: role.field_path.clone(),
+        }
+    }
+
+    fn sort_key(&self) -> (std::cmp::Reverse<i64>, usize) {
+        (std::cmp::Reverse(self.priority), self.param_idx)
+    }
+
+    fn to_arg_source(
+        &self,
+        is_colon_call: bool,
+        is_colon_define: bool,
+    ) -> Option<crate::GmodClassCallArgSource> {
+        Some(crate::GmodClassCallArgSource {
+            arg_idx: param_idx_to_call_arg_idx(self.param_idx, is_colon_call, is_colon_define)?,
+            field_path: self.field_path.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Default)]
 struct AnnotatedGmodCallRoles {
     is_colon_define: bool,
     params: Vec<Option<LuaType>>,
     optional_params: Vec<bool>,
     is_variadic: bool,
     overloads: Vec<AnnotatedGmodCallRoles>,
-    system_roles: Vec<(GmodSystemCallKind, usize, i64)>,
-    system_callback_roles: Vec<(GmodSystemCallKind, usize, i64)>,
-    hook_roles: Vec<(GmodHookKind, usize, i64)>,
-    hook_callback_roles: Vec<(usize, i64)>,
-    inheritance_roles: Vec<(GmodScriptedClassCallKind, usize, i64)>,
+    system_roles: Vec<(GmodSystemCallKind, AnnotatedGmodCallArgRole)>,
+    system_callback_roles: Vec<(GmodSystemCallKind, AnnotatedGmodCallArgRole)>,
+    hook_roles: Vec<(GmodHookKind, AnnotatedGmodCallArgRole)>,
+    hook_callback_roles: Vec<AnnotatedGmodCallArgRole>,
+    inheritance_roles: Vec<(GmodScriptedClassCallKind, AnnotatedGmodCallArgRole)>,
     network_var_kind: Option<GmodScriptedClassCallKind>,
-    network_var_type_roles: Vec<(usize, i64)>,
-    network_var_define_roles: Vec<(usize, i64)>,
+    network_var_type_roles: Vec<AnnotatedGmodCallArgRole>,
+    network_var_define_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_kind: Option<GmodScriptedClassCallKind>,
-    vgui_panel_define_roles: Vec<(usize, i64)>,
-    vgui_panel_table_roles: Vec<(usize, i64)>,
-    vgui_panel_base_roles: Vec<(usize, i64)>,
-    derma_skin_define_roles: Vec<(usize, i64)>,
+    vgui_panel_define_roles: Vec<AnnotatedGmodCallArgRole>,
+    vgui_panel_table_roles: Vec<AnnotatedGmodCallArgRole>,
+    vgui_panel_base_roles: Vec<AnnotatedGmodCallArgRole>,
+    derma_skin_define_roles: Vec<AnnotatedGmodCallArgRole>,
 }
 
 impl AnnotatedGmodCallRoles {
@@ -4305,147 +4348,115 @@ impl AnnotatedGmodCallRoles {
     }
 
     fn add_call_arg_role(&mut self, role: &LuaCallArgRole) {
-        let priority = role.priority.unwrap_or(0);
+        let arg_role = AnnotatedGmodCallArgRole::from_role(role);
         match (role.domain.as_str(), role.role.as_str()) {
-            ("gmod.net_message", "define") => self.system_roles.push((
-                GmodSystemCallKind::AddNetworkString,
-                role.param_idx,
-                priority,
-            )),
+            ("gmod.net_message", "define") => self
+                .system_roles
+                .push((GmodSystemCallKind::AddNetworkString, arg_role)),
             ("gmod.net_message", "start") => {
                 self.system_roles
-                    .push((GmodSystemCallKind::NetStart, role.param_idx, priority));
+                    .push((GmodSystemCallKind::NetStart, arg_role));
             }
             ("gmod.net_message", "receive") => {
                 self.system_roles
-                    .push((GmodSystemCallKind::NetReceive, role.param_idx, priority));
+                    .push((GmodSystemCallKind::NetReceive, arg_role));
             }
-            ("gmod.net_message", "callback") => self.system_callback_roles.push((
-                GmodSystemCallKind::NetReceive,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.concommand", "define") => self.system_roles.push((
-                GmodSystemCallKind::ConcommandAdd,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.concommand", "callback") => self.system_callback_roles.push((
-                GmodSystemCallKind::ConcommandAdd,
-                role.param_idx,
-                priority,
-            )),
+            ("gmod.net_message", "callback") => self
+                .system_callback_roles
+                .push((GmodSystemCallKind::NetReceive, arg_role)),
+            ("gmod.concommand", "define") => self
+                .system_roles
+                .push((GmodSystemCallKind::ConcommandAdd, arg_role)),
+            ("gmod.concommand", "callback") => self
+                .system_callback_roles
+                .push((GmodSystemCallKind::ConcommandAdd, arg_role)),
             ("gmod.convar", "define") | ("gmod.convar", "define_server") => self
                 .system_roles
-                .push((GmodSystemCallKind::CreateConVar, role.param_idx, priority)),
-            ("gmod.convar", "define_client") => self.system_roles.push((
-                GmodSystemCallKind::CreateClientConVar,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.timer", "define") => {
-                self.system_roles
-                    .push((GmodSystemCallKind::TimerCreate, role.param_idx, priority))
-            }
-            ("gmod.timer", "callback") => self.system_callback_roles.push((
-                GmodSystemCallKind::TimerCreate,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.timer", "simple") => self.system_callback_roles.push((
-                GmodSystemCallKind::TimerSimple,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.hook", "add") => {
-                self.hook_roles
-                    .push((GmodHookKind::Add, role.param_idx, priority))
-            }
-            ("gmod.hook", "emit") => {
-                self.hook_roles
-                    .push((GmodHookKind::Emit, role.param_idx, priority))
-            }
+                .push((GmodSystemCallKind::CreateConVar, arg_role)),
+            ("gmod.convar", "define_client") => self
+                .system_roles
+                .push((GmodSystemCallKind::CreateClientConVar, arg_role)),
+            ("gmod.timer", "define") => self
+                .system_roles
+                .push((GmodSystemCallKind::TimerCreate, arg_role)),
+            ("gmod.timer", "callback") => self
+                .system_callback_roles
+                .push((GmodSystemCallKind::TimerCreate, arg_role)),
+            ("gmod.timer", "simple") => self
+                .system_callback_roles
+                .push((GmodSystemCallKind::TimerSimple, arg_role)),
+            ("gmod.hook", "add") => self.hook_roles.push((GmodHookKind::Add, arg_role)),
+            ("gmod.hook", "emit") => self.hook_roles.push((GmodHookKind::Emit, arg_role)),
             ("gmod.hook", "callback") => {
-                self.hook_callback_roles.push((role.param_idx, priority));
+                self.hook_callback_roles.push(arg_role);
             }
-            ("gmod.class_base", "reference") => self.inheritance_roles.push((
-                GmodScriptedClassCallKind::DefineBaseClass,
-                role.param_idx,
-                priority,
-            )),
-            ("gmod.gamemode", "reference") => self.inheritance_roles.push((
-                GmodScriptedClassCallKind::DeriveGamemode,
-                role.param_idx,
-                priority,
-            )),
+            ("gmod.class_base", "reference") => self
+                .inheritance_roles
+                .push((GmodScriptedClassCallKind::DefineBaseClass, arg_role)),
+            ("gmod.gamemode", "reference") => self
+                .inheritance_roles
+                .push((GmodScriptedClassCallKind::DeriveGamemode, arg_role)),
             ("gmod.network_var", "type") => {
-                self.network_var_type_roles.push((role.param_idx, priority));
+                self.network_var_type_roles.push(arg_role);
             }
             ("gmod.network_var", "define") => {
                 self.network_var_kind = self
                     .network_var_kind
                     .or(Some(GmodScriptedClassCallKind::NetworkVar));
-                self.network_var_define_roles
-                    .push((role.param_idx, priority));
+                self.network_var_define_roles.push(arg_role);
             }
             ("gmod.network_var", "define_element") => {
                 self.network_var_kind = Some(GmodScriptedClassCallKind::NetworkVarElement);
-                self.network_var_define_roles
-                    .push((role.param_idx, priority));
+                self.network_var_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "define") => {
                 self.vgui_panel_kind = self
                     .vgui_panel_kind
                     .or(Some(GmodScriptedClassCallKind::VguiRegister));
-                self.vgui_panel_define_roles
-                    .push((role.param_idx, priority));
+                self.vgui_panel_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "define_control") => {
                 self.vgui_panel_kind = Some(GmodScriptedClassCallKind::DermaDefineControl);
-                self.vgui_panel_define_roles
-                    .push((role.param_idx, priority));
+                self.vgui_panel_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "register_table") => {
                 self.vgui_panel_kind = Some(GmodScriptedClassCallKind::VguiRegisterTable);
-                self.vgui_panel_table_roles.push((role.param_idx, priority));
+                self.vgui_panel_table_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "table") => {
-                self.vgui_panel_table_roles.push((role.param_idx, priority));
+                self.vgui_panel_table_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "base") => {
-                self.vgui_panel_base_roles.push((role.param_idx, priority));
+                self.vgui_panel_base_roles.push(arg_role);
             }
             ("gmod.derma_skin", "define") => {
-                self.derma_skin_define_roles
-                    .push((role.param_idx, priority));
+                self.derma_skin_define_roles.push(arg_role);
             }
             _ => {}
         }
     }
 
     fn sort_roles(&mut self) {
-        self.system_roles
-            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.system_roles.sort_by_key(|(_, role)| role.sort_key());
         self.system_callback_roles
-            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
-        self.hook_roles
-            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+            .sort_by_key(|(_, role)| role.sort_key());
+        self.hook_roles.sort_by_key(|(_, role)| role.sort_key());
         self.hook_callback_roles
-            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.inheritance_roles
-            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+            .sort_by_key(|(_, role)| role.sort_key());
         self.network_var_type_roles
-            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.network_var_define_roles
-            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.vgui_panel_define_roles
-            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.vgui_panel_table_roles
-            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.vgui_panel_base_roles
-            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.derma_skin_define_roles
-            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
     }
 
     fn has_any_roles(&self) -> bool {
@@ -4526,37 +4537,37 @@ impl AnnotatedGmodCallRoles {
     }
 
     fn system_call_site(&self) -> Option<GmodSystemCallSite> {
-        if let Some((kind, name_arg_idx, _)) = self.system_roles.first() {
+        if let Some((kind, role)) = self.system_roles.first() {
             return Some(GmodSystemCallSite {
                 kind: *kind,
-                name_arg_idx: Some(*name_arg_idx),
+                name_arg_idx: Some(role.param_idx),
                 callback_arg_idx: self.callback_arg_idx_for_kind(*kind),
             });
         }
 
-        let (kind, callback_arg_idx, _) = self
+        let (kind, callback_role) = self
             .system_callback_roles
             .iter()
-            .find(|(kind, _, _)| *kind == GmodSystemCallKind::TimerSimple)?;
+            .find(|(kind, _)| *kind == GmodSystemCallKind::TimerSimple)?;
 
         Some(GmodSystemCallSite {
             kind: *kind,
             name_arg_idx: None,
-            callback_arg_idx: Some(*callback_arg_idx),
+            callback_arg_idx: Some(callback_role.param_idx),
         })
     }
 
     fn callback_arg_idx_for_kind(&self, call_kind: GmodSystemCallKind) -> Option<usize> {
         self.system_callback_roles
             .iter()
-            .find(|(kind, _, _)| *kind == call_kind)
-            .map(|(_, param_idx, _)| *param_idx)
+            .find(|(kind, _)| *kind == call_kind)
+            .map(|(_, role)| role.param_idx)
     }
 
     fn candidate_presence(&self) -> AnnotatedGmodCandidatePresence {
         AnnotatedGmodCandidatePresence {
             has_system: !self.system_roles.is_empty() || !self.system_callback_roles.is_empty(),
-            has_net: self.system_roles.iter().any(|(kind, _, _)| {
+            has_net: self.system_roles.iter().any(|(kind, _)| {
                 matches!(
                     kind,
                     GmodSystemCallKind::AddNetworkString
@@ -4580,12 +4591,12 @@ impl AnnotatedGmodCallRoles {
         &self,
         is_colon_call: bool,
     ) -> Option<(GmodScriptedClassCallKind, GmodNamedStringCallRoles)> {
-        let (kind, param_idx, _) = *self.inheritance_roles.first()?;
+        let (kind, role) = self.inheritance_roles.first()?;
         Some((
-            kind,
+            *kind,
             GmodNamedStringCallRoles {
                 name_arg_idx: param_idx_to_call_arg_idx(
-                    param_idx,
+                    role.param_idx,
                     is_colon_call,
                     self.is_colon_define,
                 )?,
@@ -4597,21 +4608,18 @@ impl AnnotatedGmodCallRoles {
         &self,
         is_colon_call: bool,
     ) -> Option<(GmodScriptedClassCallKind, GmodNetworkVarCallRoles)> {
-        let (define_param_idx, _) = *self.network_var_define_roles.first()?;
+        let define_role = self.network_var_define_roles.first()?;
         let kind = self
             .network_var_kind
             .unwrap_or(GmodScriptedClassCallKind::NetworkVar);
         Some((
             kind,
             GmodNetworkVarCallRoles {
-                type_arg_idx: self
-                    .network_var_type_roles
-                    .first()
-                    .and_then(|(param_idx, _)| {
-                        param_idx_to_call_arg_idx(*param_idx, is_colon_call, self.is_colon_define)
-                    }),
+                type_arg_idx: self.network_var_type_roles.first().and_then(|role| {
+                    param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)
+                }),
                 name_arg_idx: param_idx_to_call_arg_idx(
-                    define_param_idx,
+                    define_role.param_idx,
                     is_colon_call,
                     self.is_colon_define,
                 )?,
@@ -4626,11 +4634,12 @@ impl AnnotatedGmodCallRoles {
         let kind = self
             .vgui_panel_kind
             .unwrap_or(GmodScriptedClassCallKind::VguiRegister);
-        let define_arg_idx = if let Some((param_idx, _)) = self.vgui_panel_define_roles.first() {
-            param_idx_to_call_arg_idx(*param_idx, is_colon_call, self.is_colon_define)?
+        let define = if let Some(role) = self.vgui_panel_define_roles.first() {
+            role.to_arg_source(is_colon_call, self.is_colon_define)?
         } else if kind == GmodScriptedClassCallKind::VguiRegisterTable {
-            let (param_idx, _) = *self.vgui_panel_table_roles.first()?;
-            param_idx_to_call_arg_idx(param_idx, is_colon_call, self.is_colon_define)?
+            self.vgui_panel_table_roles
+                .first()?
+                .to_arg_source(is_colon_call, self.is_colon_define)?
         } else {
             return None;
         };
@@ -4638,28 +4647,24 @@ impl AnnotatedGmodCallRoles {
         Some((
             kind,
             GmodVguiPanelCallRoles {
-                define_arg_idx,
-                table_arg_idx: self
+                define,
+                table: self
                     .vgui_panel_table_roles
                     .first()
-                    .and_then(|(param_idx, _)| {
-                        param_idx_to_call_arg_idx(*param_idx, is_colon_call, self.is_colon_define)
-                    }),
-                base_arg_idx: self
+                    .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define)),
+                base: self
                     .vgui_panel_base_roles
                     .first()
-                    .and_then(|(param_idx, _)| {
-                        param_idx_to_call_arg_idx(*param_idx, is_colon_call, self.is_colon_define)
-                    }),
+                    .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define)),
             },
         ))
     }
 
     fn derma_skin_call_roles(&self, is_colon_call: bool) -> Option<GmodDermaSkinCallRoles> {
-        let (define_arg_idx, _) = *self.derma_skin_define_roles.first()?;
+        let define_role = self.derma_skin_define_roles.first()?;
         Some(GmodDermaSkinCallRoles {
             define_arg_idx: param_idx_to_call_arg_idx(
-                define_arg_idx,
+                define_role.param_idx,
                 is_colon_call,
                 self.is_colon_define,
             )?,
@@ -5021,20 +5026,17 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
     ) -> Option<(GmodHookKind, usize, Option<usize>)> {
         self.roles_for_call(db, file_id, call_expr, call_path)
             .and_then(|roles| {
-                let (kind, param_idx, _) = roles.hook_roles.first()?;
+                let (kind, role) = roles.hook_roles.first()?;
                 Some((
                     *kind,
-                    *param_idx,
-                    roles
-                        .hook_callback_roles
-                        .first()
-                        .and_then(|(callback_param_idx, _)| {
-                            param_idx_to_call_arg_idx(
-                                *callback_param_idx,
-                                call_expr.is_colon_call(),
-                                roles.is_colon_define,
-                            )
-                        }),
+                    role.param_idx,
+                    roles.hook_callback_roles.first().and_then(|callback_role| {
+                        param_idx_to_call_arg_idx(
+                            callback_role.param_idx,
+                            call_expr.is_colon_call(),
+                            roles.is_colon_define,
+                        )
+                    }),
                 ))
             })
     }
@@ -5532,7 +5534,8 @@ fn collect_annotated_scripted_class_call_metadata(
     if let Some((kind, inheritance_roles)) =
         annotated_roles.inheritance_call(db, file_id, &call_expr, &call_path)
     {
-        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        let (literal_args, args, field_args) =
+            extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
         db.get_gmod_class_metadata_index_mut().add_call(
             file_id,
             kind,
@@ -5540,6 +5543,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
+                field_args,
                 inheritance_roles: Some(inheritance_roles),
                 network_var_roles: None,
                 vgui_panel_roles: None,
@@ -5552,7 +5556,8 @@ fn collect_annotated_scripted_class_call_metadata(
     if let Some((kind, network_var_roles)) =
         annotated_roles.network_var_call(db, file_id, &call_expr, &call_path)
     {
-        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        let (literal_args, args, field_args) =
+            extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
         db.get_gmod_class_metadata_index_mut().add_call(
             file_id,
             kind,
@@ -5560,6 +5565,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
+                field_args,
                 inheritance_roles: None,
                 network_var_roles: Some(network_var_roles),
                 vgui_panel_roles: None,
@@ -5572,7 +5578,9 @@ fn collect_annotated_scripted_class_call_metadata(
     if let Some((kind, vgui_panel_roles)) =
         annotated_roles.vgui_panel_call(db, file_id, &call_expr, &call_path)
     {
-        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        let field_sources = vgui_panel_field_sources(&vgui_panel_roles);
+        let (literal_args, args, field_args) =
+            extract_gmod_class_call_args(db, file_id, &call_expr, &field_sources);
         db.get_gmod_class_metadata_index_mut().add_call(
             file_id,
             kind,
@@ -5580,6 +5588,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
+                field_args,
                 inheritance_roles: None,
                 network_var_roles: None,
                 vgui_panel_roles: Some(vgui_panel_roles),
@@ -5592,7 +5601,8 @@ fn collect_annotated_scripted_class_call_metadata(
     if let Some(derma_skin_roles) =
         annotated_roles.derma_skin_call(db, file_id, &call_expr, &call_path)
     {
-        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        let (literal_args, args, field_args) =
+            extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
         db.get_gmod_class_metadata_index_mut().add_call(
             file_id,
             GmodScriptedClassCallKind::DermaDefineSkin,
@@ -5600,6 +5610,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
+                field_args,
                 inheritance_roles: None,
                 network_var_roles: None,
                 vgui_panel_roles: None,
@@ -5645,25 +5656,273 @@ fn extract_static_string_arg(
 }
 
 fn extract_gmod_class_call_args(
+    db: &DbIndex,
+    file_id: FileId,
     call_expr: &LuaCallExpr,
+    field_sources: &[crate::GmodClassCallArgSource],
 ) -> (
     Vec<Option<GmodClassCallLiteral>>,
     Vec<crate::GmodClassCallArg>,
+    Vec<crate::GmodClassCallFieldArg>,
 ) {
     let Some(args_list) = call_expr.get_args_list() else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
 
     let mut literal_args = Vec::new();
     let mut args = Vec::new();
-    for arg_expr in args_list.get_args() {
+    let arg_exprs = args_list.get_args().collect::<Vec<_>>();
+    for arg_expr in &arg_exprs {
         let syntax_id = arg_expr.get_syntax_id();
-        let value = extract_gmod_class_literal_or_name(&arg_expr);
+        let value = extract_gmod_class_literal_or_name(arg_expr);
         literal_args.push(value.clone());
         args.push(crate::GmodClassCallArg { syntax_id, value });
     }
 
-    (literal_args, args)
+    let mut field_args = Vec::new();
+    for source in field_sources {
+        if source.field_path.is_empty() {
+            continue;
+        }
+        let Some(arg_expr) = arg_exprs.get(source.arg_idx).cloned() else {
+            continue;
+        };
+        let Some(value_expr) =
+            resolve_static_field_path_expr(db, file_id, call_expr, arg_expr, &source.field_path)
+        else {
+            continue;
+        };
+        field_args.push(crate::GmodClassCallFieldArg {
+            source: source.clone(),
+            syntax_id: value_expr.get_syntax_id(),
+            value: extract_gmod_class_literal_or_name(&value_expr),
+        });
+    }
+
+    (literal_args, args, field_args)
+}
+
+fn vgui_panel_field_sources(roles: &GmodVguiPanelCallRoles) -> Vec<crate::GmodClassCallArgSource> {
+    let mut sources = Vec::new();
+    for source in std::iter::once(&roles.define)
+        .chain(roles.table.as_ref())
+        .chain(roles.base.as_ref())
+    {
+        if !source.field_path.is_empty() && !sources.iter().any(|existing| existing == source) {
+            sources.push(source.clone());
+        }
+    }
+    sources
+}
+
+fn resolve_static_field_path_expr(
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    expr: LuaExpr,
+    field_path: &[String],
+) -> Option<LuaExpr> {
+    if field_path.is_empty() {
+        return Some(expr);
+    }
+
+    match expr {
+        LuaExpr::TableExpr(table_expr) => {
+            resolve_table_field_path_expr(table_expr, field_path, call_expr.get_position())
+        }
+        LuaExpr::ParenExpr(paren_expr) => resolve_static_field_path_expr(
+            db,
+            file_id,
+            call_expr,
+            paren_expr.get_expr()?,
+            field_path,
+        ),
+        LuaExpr::NameExpr(name_expr) => {
+            let root_path = name_expr.get_access_path()?;
+            let root_decl_id = name_expr_local_decl_id(db, file_id, &name_expr);
+            match find_prior_static_field_assignment(
+                db,
+                file_id,
+                call_expr,
+                &root_path,
+                root_decl_id,
+                field_path,
+            ) {
+                StaticFieldLookup::Value(value_expr) => return Some(value_expr),
+                StaticFieldLookup::Blocked => return None,
+                StaticFieldLookup::NoEvidence => {}
+            }
+            if let Some(value_expr) =
+                resolve_name_initializer_field_path_expr(db, file_id, &name_expr, field_path)
+            {
+                return Some(value_expr);
+            }
+            None
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            let root_path = index_expr.get_access_path()?;
+            let root_decl_id = index_expr_root_name(&index_expr)
+                .as_ref()
+                .and_then(|name_expr| name_expr_local_decl_id(db, file_id, name_expr));
+            match find_prior_static_field_assignment(
+                db,
+                file_id,
+                call_expr,
+                &root_path,
+                root_decl_id,
+                field_path,
+            ) {
+                StaticFieldLookup::Value(value_expr) => Some(value_expr),
+                StaticFieldLookup::Blocked | StaticFieldLookup::NoEvidence => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn resolve_name_initializer_field_path_expr(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+    field_path: &[String],
+) -> Option<LuaExpr> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())?;
+    let (_, initializer) = local_decl_initializer_expr(db, decl_id)?;
+    resolve_static_initializer_field_path_expr(initializer, field_path, name_expr.get_position())
+}
+
+fn resolve_static_initializer_field_path_expr(
+    initializer: LuaExpr,
+    field_path: &[String],
+    before: TextSize,
+) -> Option<LuaExpr> {
+    match initializer {
+        LuaExpr::TableExpr(table_expr) => {
+            resolve_table_field_path_expr(table_expr, field_path, before)
+        }
+        LuaExpr::ParenExpr(paren_expr) => {
+            resolve_static_initializer_field_path_expr(paren_expr.get_expr()?, field_path, before)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_table_field_path_expr(
+    table_expr: LuaTableExpr,
+    field_path: &[String],
+    before: TextSize,
+) -> Option<LuaExpr> {
+    if table_expr.get_position() >= before {
+        return None;
+    }
+    let field = find_table_field_by_name(&table_expr, &field_path[0])?;
+    let value_expr = field.get_value_expr()?;
+    if field_path.len() == 1 {
+        return Some(value_expr);
+    }
+    resolve_static_initializer_field_path_expr(value_expr, &field_path[1..], before)
+}
+
+enum StaticFieldLookup {
+    NoEvidence,
+    Value(LuaExpr),
+    Blocked,
+}
+
+fn find_prior_static_field_assignment(
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    root_path: &str,
+    root_decl_id: Option<LuaDeclId>,
+    field_path: &[String],
+) -> StaticFieldLookup {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return StaticFieldLookup::NoEvidence;
+    };
+    let root = tree.get_red_root();
+    let Some(chunk) = LuaChunk::cast(root) else {
+        return StaticFieldLookup::NoEvidence;
+    };
+    let call_block = call_expr.ancestors::<LuaBlock>().next();
+    let call_position = call_expr.get_position();
+    let target_path = format!("{root_path}.{}", field_path.join("."));
+    let mut best = StaticFieldLookup::NoEvidence;
+
+    for assign_stat in chunk.descendants::<LuaAssignStat>() {
+        if assign_stat.get_position() >= call_position {
+            continue;
+        }
+        if let Some(call_block) = &call_block
+            && assign_stat
+                .ancestors::<LuaBlock>()
+                .next()
+                .is_none_or(|assign_block| assign_block.syntax() != call_block.syntax())
+        {
+            continue;
+        }
+
+        let (vars, exprs) = assign_stat.get_var_and_expr_list();
+        for (idx, var_expr) in vars.iter().enumerate() {
+            if !assignment_root_matches_target(db, file_id, var_expr, root_decl_id) {
+                continue;
+            }
+
+            let Some(var_path) = var_expr.get_access_path() else {
+                continue;
+            };
+            if var_path == target_path {
+                best = exprs
+                    .get(idx)
+                    .cloned()
+                    .map(StaticFieldLookup::Value)
+                    .unwrap_or(StaticFieldLookup::Blocked);
+                continue;
+            }
+
+            if var_path == root_path {
+                best = match exprs.get(idx).cloned() {
+                    Some(expr) => {
+                        resolve_static_initializer_field_path_expr(expr, field_path, call_position)
+                            .map(StaticFieldLookup::Value)
+                            .unwrap_or(StaticFieldLookup::Blocked)
+                    }
+                    None => StaticFieldLookup::Blocked,
+                }
+            }
+        }
+    }
+
+    best
+}
+
+fn assignment_root_matches_target(
+    db: &DbIndex,
+    file_id: FileId,
+    var_expr: &LuaVarExpr,
+    target_root_decl_id: Option<LuaDeclId>,
+) -> bool {
+    let Some(root_name) = var_expr_root_name(var_expr) else {
+        return false;
+    };
+    let assignment_root_decl_id = name_expr_local_decl_id(db, file_id, &root_name);
+    assignment_root_decl_id == target_root_decl_id
+}
+
+fn find_table_field_by_name(
+    table_expr: &LuaTableExpr,
+    field_name: &str,
+) -> Option<glua_parser::LuaTableField> {
+    table_expr
+        .get_fields()
+        .filter(|field| match field.get_field_key() {
+            Some(LuaIndexKey::Name(name)) => name.get_name_text() == field_name,
+            Some(LuaIndexKey::String(string)) => string.get_value() == field_name,
+            _ => false,
+        })
+        .last()
 }
 
 fn extract_gmod_class_literal_or_name(expr: &LuaExpr) -> Option<GmodClassCallLiteral> {

@@ -476,10 +476,18 @@ fn overload_call_arg_roles(
     let attributes = find_attach_attribute(LuaAst::LuaDocTagOverload(tag.clone()))?;
     for tag_use in attributes {
         for attribute_use in infer_attribute_uses(analyzer, tag_use)? {
-            if attribute_use.id.get_name() != OVERLOAD_CALL_ARG_ATTRIBUTE {
-                continue;
-            }
-
+            let attribute_name = attribute_use.id.get_name();
+            let field_path = match attribute_name {
+                OVERLOAD_CALL_ARG_ATTRIBUTE => Vec::new(),
+                crate::db_index::OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE => {
+                    let Some(field_path) = attribute_field_path_param(&attribute_use, "field_path")
+                    else {
+                        continue;
+                    };
+                    field_path
+                }
+                _ => continue,
+            };
             let Some(LuaType::DocIntegerConst(param_idx) | LuaType::IntegerConst(param_idx)) =
                 attribute_use.get_param_by_name("param")
             else {
@@ -506,6 +514,7 @@ fn overload_call_arg_roles(
                 param_idx,
                 domain,
                 role,
+                field_path,
                 priority,
             });
         }
@@ -519,6 +528,16 @@ fn attribute_string_param(attribute_use: &LuaAttributeUse, name: &str) -> Option
         LuaType::DocStringConst(value) | LuaType::StringConst(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn attribute_field_path_param(attribute_use: &LuaAttributeUse, name: &str) -> Option<Vec<String>> {
+    let path = attribute_string_param(attribute_use, name)?;
+    let field_path = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (!field_path.is_empty()).then_some(field_path)
 }
 
 pub fn analyze_module(analyzer: &mut DocAnalyzer, tag: LuaDocTagModule) -> Option<()> {

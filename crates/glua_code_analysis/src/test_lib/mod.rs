@@ -38,7 +38,9 @@ pub struct DiagnosticSnapshot {
 pub const GMOD_CALL_ARG_BUILTINS_FIXTURE: &str = r#"
 ---@meta
 ---@attribute call_arg(domain: string, role: string, priority: integer?)
+---@attribute call_arg_field(domain: string, role: string, field_path: string, priority: integer?)
 ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+---@attribute overload_call_arg_field(param: integer, domain: string, role: string, field_path: string, priority: integer?)
 
 util = util or {}
 net = net or {}
@@ -133,6 +135,15 @@ function timer.Simple(delay, func) end
 ---@[call_arg("gmod.vgui_panel", "reference")]
 ---@param className string
 function vgui.Create(className, parent, name) end
+
+---@generic T: table
+---@[call_arg("gmod.vgui_panel", "register_table")]
+---@[call_arg_field("gmod.vgui_panel", "base", "Base")]
+---@param metatable T
+---@param parent? Panel
+---@param name? string
+---@return (instance) Panel?
+function vgui.CreateFromTable(metatable, parent, name) end
 
 ---@[call_arg("gmod.vgui_panel", "define")]
 ---@param name string

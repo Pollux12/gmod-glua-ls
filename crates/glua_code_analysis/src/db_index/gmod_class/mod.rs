@@ -49,11 +49,34 @@ pub struct GmodClassCallArg {
     pub value: Option<GmodClassCallLiteral>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GmodClassCallArgSource {
+    pub arg_idx: usize,
+    pub field_path: Vec<String>,
+}
+
+impl GmodClassCallArgSource {
+    pub fn direct(arg_idx: usize) -> Self {
+        Self {
+            arg_idx,
+            field_path: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GmodClassCallFieldArg {
+    pub source: GmodClassCallArgSource,
+    pub syntax_id: LuaSyntaxId,
+    pub value: Option<GmodClassCallLiteral>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GmodScriptedClassCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub literal_args: Vec<Option<GmodClassCallLiteral>>,
     pub args: Vec<GmodClassCallArg>,
+    pub field_args: Vec<GmodClassCallFieldArg>,
     pub inheritance_roles: Option<GmodNamedStringCallRoles>,
     pub network_var_roles: Option<GmodNetworkVarCallRoles>,
     pub vgui_panel_roles: Option<GmodVguiPanelCallRoles>,
@@ -71,11 +94,11 @@ pub struct GmodNetworkVarCallRoles {
     pub name_arg_idx: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodVguiPanelCallRoles {
-    pub define_arg_idx: usize,
-    pub table_arg_idx: Option<usize>,
-    pub base_arg_idx: Option<usize>,
+    pub define: GmodClassCallArgSource,
+    pub table: Option<GmodClassCallArgSource>,
+    pub base: Option<GmodClassCallArgSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,20 +125,61 @@ impl GmodScriptedClassCallMetadata {
 
     pub fn vgui_panel_define_arg_idx(&self) -> usize {
         self.vgui_panel_roles
-            .map(|roles| roles.define_arg_idx)
+            .as_ref()
+            .map(|roles| roles.define.arg_idx)
             .unwrap_or(0)
     }
 
     pub fn vgui_panel_table_arg_idx(&self, default_arg_idx: usize) -> usize {
         self.vgui_panel_roles
-            .and_then(|roles| roles.table_arg_idx)
+            .as_ref()
+            .and_then(|roles| roles.table.as_ref().map(|source| source.arg_idx))
             .unwrap_or(default_arg_idx)
     }
 
     pub fn vgui_panel_base_arg_idx(&self, default_arg_idx: Option<usize>) -> Option<usize> {
         self.vgui_panel_roles
-            .and_then(|roles| roles.base_arg_idx)
+            .as_ref()
+            .and_then(|roles| roles.base.as_ref().map(|source| source.arg_idx))
             .or(default_arg_idx)
+    }
+
+    pub fn vgui_panel_define_arg_source(&self) -> GmodClassCallArgSource {
+        self.vgui_panel_roles
+            .as_ref()
+            .map(|roles| roles.define.clone())
+            .unwrap_or_else(|| GmodClassCallArgSource::direct(0))
+    }
+
+    pub fn vgui_panel_table_arg_source(&self, default_arg_idx: usize) -> GmodClassCallArgSource {
+        self.vgui_panel_roles
+            .as_ref()
+            .and_then(|roles| roles.table.clone())
+            .unwrap_or_else(|| GmodClassCallArgSource::direct(default_arg_idx))
+    }
+
+    pub fn vgui_panel_base_arg_source(
+        &self,
+        default_arg_idx: Option<usize>,
+    ) -> Option<GmodClassCallArgSource> {
+        self.vgui_panel_roles
+            .as_ref()
+            .and_then(|roles| roles.base.clone())
+            .or_else(|| default_arg_idx.map(GmodClassCallArgSource::direct))
+    }
+
+    pub fn value_for_arg_source(
+        &self,
+        source: &GmodClassCallArgSource,
+    ) -> Option<&GmodClassCallLiteral> {
+        if source.field_path.is_empty() {
+            return self.args.get(source.arg_idx)?.value.as_ref();
+        }
+
+        self.field_args
+            .iter()
+            .find(|arg| &arg.source == source)
+            .and_then(|arg| arg.value.as_ref())
     }
 
     pub fn derma_skin_define_arg_idx(&self) -> usize {
@@ -232,6 +296,15 @@ impl GmodClassMetadataIndex {
             .and_then(Self::extract_non_empty_string_literal)
     }
 
+    fn extract_non_empty_string_arg_source(
+        call_metadata: &GmodScriptedClassCallMetadata,
+        source: &GmodClassCallArgSource,
+    ) -> Option<String> {
+        call_metadata
+            .value_for_arg_source(source)
+            .and_then(Self::extract_non_empty_string_literal)
+    }
+
     fn maybe_extract_vgui_panel(
         kind: GmodScriptedClassCallKind,
         call_metadata: &GmodScriptedClassCallMetadata,
@@ -243,11 +316,12 @@ impl GmodClassMetadataIndex {
         };
 
         let define_arg_index = call_metadata.vgui_panel_define_arg_idx();
-        let base_arg_index = call_metadata.vgui_panel_base_arg_idx(default_base_arg_index);
+        let base_arg_source = call_metadata.vgui_panel_base_arg_source(default_base_arg_index);
 
         let panel_name = Self::extract_non_empty_string_arg(call_metadata, define_arg_index)?;
-        let base_name = base_arg_index
-            .and_then(|arg_index| Self::extract_non_empty_string_arg(call_metadata, arg_index));
+        let base_name = base_arg_source
+            .as_ref()
+            .and_then(|source| Self::extract_non_empty_string_arg_source(call_metadata, source));
         Some((panel_name, base_name))
     }
 
@@ -511,6 +585,7 @@ mod tests {
                     Some(GmodClassCallLiteral::String(base.to_string())),
                 ),
             ],
+            field_args: Vec::new(),
             inheritance_roles: None,
             network_var_roles: None,
             vgui_panel_roles: None,

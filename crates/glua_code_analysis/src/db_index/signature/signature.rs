@@ -14,7 +14,9 @@ use crate::{
 };
 
 pub const CALL_ARG_ATTRIBUTE: &str = "call_arg";
+pub const CALL_ARG_FIELD_ATTRIBUTE: &str = "call_arg_field";
 pub const OVERLOAD_CALL_ARG_ATTRIBUTE: &str = "overload_call_arg";
+pub const OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE: &str = "overload_call_arg_field";
 
 #[derive(Debug)]
 pub struct LuaSignature {
@@ -37,6 +39,7 @@ pub struct LuaCallArgRole {
     pub param_idx: usize,
     pub domain: String,
     pub role: String,
+    pub field_path: Vec<String>,
     pub priority: Option<i64>,
 }
 
@@ -102,6 +105,9 @@ impl LuaSignature {
             param_info
                 .get_attribute_by_name(CALL_ARG_ATTRIBUTE)
                 .is_some()
+                || param_info
+                    .get_attribute_by_name(CALL_ARG_FIELD_ATTRIBUTE)
+                    .is_some()
         }) || self
             .overloads
             .iter()
@@ -296,20 +302,38 @@ fn visit_call_arg_roles_from_param_attribute<F>(
     F: FnMut(&LuaCallArgRole),
 {
     for attribute_use in param_info.iter_attributes_by_name(CALL_ARG_ATTRIBUTE) {
-        let Some(domain) = attribute_string_arg(attribute_use, "domain") else {
+        let Some(role) = call_arg_role_from_attribute(param_idx, attribute_use, Vec::new()) else {
             continue;
         };
-        let Some(role) = attribute_string_arg(attribute_use, "role") else {
-            continue;
-        };
-        let priority = attribute_integer_arg(attribute_use, "priority");
-        visitor(&LuaCallArgRole {
-            param_idx,
-            domain,
-            role,
-            priority,
-        });
+        visitor(&role);
     }
+
+    for attribute_use in param_info.iter_attributes_by_name(CALL_ARG_FIELD_ATTRIBUTE) {
+        let Some(field_path) = attribute_field_path_arg(attribute_use, "field_path") else {
+            continue;
+        };
+        let Some(role) = call_arg_role_from_attribute(param_idx, attribute_use, field_path) else {
+            continue;
+        };
+        visitor(&role);
+    }
+}
+
+fn call_arg_role_from_attribute(
+    param_idx: usize,
+    attribute_use: &LuaAttributeUse,
+    field_path: Vec<String>,
+) -> Option<LuaCallArgRole> {
+    let domain = attribute_string_arg(attribute_use, "domain")?;
+    let role = attribute_string_arg(attribute_use, "role")?;
+    let priority = attribute_integer_arg(attribute_use, "priority");
+    Some(LuaCallArgRole {
+        param_idx,
+        domain,
+        role,
+        field_path,
+        priority,
+    })
 }
 
 fn attribute_string_arg(attribute_use: &LuaAttributeUse, name: &str) -> Option<String> {
@@ -324,6 +348,16 @@ fn attribute_integer_arg(attribute_use: &LuaAttributeUse, name: &str) -> Option<
         LuaType::DocIntegerConst(value) | LuaType::IntegerConst(value) => Some(*value),
         _ => None,
     }
+}
+
+fn attribute_field_path_arg(attribute_use: &LuaAttributeUse, name: &str) -> Option<Vec<String>> {
+    let path = attribute_string_arg(attribute_use, name)?;
+    let field_path = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (!field_path.is_empty()).then_some(field_path)
 }
 
 pub fn visit_call_arg_roles_from_type<F>(
@@ -473,6 +507,26 @@ mod tests {
         )
     }
 
+    fn call_arg_field_attribute(domain: &str, role: &str, field_path: &str) -> LuaAttributeUse {
+        LuaAttributeUse::new(
+            LuaTypeDeclId::global(super::CALL_ARG_FIELD_ATTRIBUTE),
+            vec![
+                (
+                    "domain".to_string(),
+                    Some(LuaType::DocStringConst(SmolStr::new(domain).into())),
+                ),
+                (
+                    "role".to_string(),
+                    Some(LuaType::DocStringConst(SmolStr::new(role).into())),
+                ),
+                (
+                    "field_path".to_string(),
+                    Some(LuaType::DocStringConst(SmolStr::new(field_path).into())),
+                ),
+            ],
+        )
+    }
+
     #[test]
     fn call_arg_roles_for_param_keeps_multiple_attributes() {
         let mut signature = LuaSignature::new();
@@ -498,9 +552,40 @@ mod tests {
         assert_eq!(roles[0].domain, "gmod.vgui_panel");
         assert_eq!(roles[0].role, "define");
         assert_eq!(roles[0].param_idx, 0);
+        assert!(roles[0].field_path.is_empty());
         assert_eq!(roles[1].domain, "gmod.derma_skin");
         assert_eq!(roles[1].role, "reference");
         assert_eq!(roles[1].param_idx, 0);
+        assert!(roles[1].field_path.is_empty());
+    }
+
+    #[test]
+    fn call_arg_roles_for_param_keeps_field_path_attributes() {
+        let mut signature = LuaSignature::new();
+        signature.params.push("panel".to_string());
+        signature.param_docs.insert(
+            0,
+            LuaDocParamInfo {
+                name: "panel".to_string(),
+                type_ref: LuaType::Table,
+                default_value: None,
+                nullable: false,
+                description: None,
+                attributes: Some(vec![call_arg_field_attribute(
+                    "gmod.vgui_panel",
+                    "base",
+                    "Base.Name",
+                )]),
+            },
+        );
+
+        let roles = signature.call_arg_roles_for_param(0);
+
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].domain, "gmod.vgui_panel");
+        assert_eq!(roles[0].role, "base");
+        assert_eq!(roles[0].param_idx, 0);
+        assert_eq!(roles[0].field_path, vec!["Base", "Name"]);
     }
 }
 

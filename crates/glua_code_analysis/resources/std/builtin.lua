@@ -208,6 +208,16 @@
 --- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
 ---@attribute call_arg(domain: string, role: string, priority: integer?)
 
+--- Marks a static field on a function parameter as carrying call-site metadata. This is useful
+--- when APIs read configuration from a table field instead of a separate argument.
+---
+--- Parameters:
+--- - `domain`: Stable namespace for the metadata, such as `gmod.vgui_panel`.
+--- - `role`: Meaning of this field in that domain, such as `base`.
+--- - `field_path`: Dot-separated field path rooted at the annotated parameter.
+--- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
+---@attribute call_arg_field(domain: string, role: string, field_path: string, priority: integer?)
+
 --- Marks a parameter inside the following `@overload` function type as carrying call-site
 --- metadata.
 ---
@@ -217,6 +227,17 @@
 --- - `role`: Meaning of this parameter in that domain, such as `define`.
 --- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
 ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
+--- Marks a static field on a parameter inside the following `@overload` function type as
+--- carrying call-site metadata.
+---
+--- Parameters:
+--- - `param`: Zero-based overload parameter index.
+--- - `domain`: Stable namespace for the metadata, such as `gmod.vgui_panel`.
+--- - `role`: Meaning of this field in that domain, such as `base`.
+--- - `field_path`: Dot-separated field path rooted at the overload parameter.
+--- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
+---@attribute overload_call_arg_field(param: integer, domain: string, role: string, field_path: string, priority: integer?)
 
 ---
 --- Associates `getter` and `setter` methods with a field. Currently provides only definition navigation functionality,

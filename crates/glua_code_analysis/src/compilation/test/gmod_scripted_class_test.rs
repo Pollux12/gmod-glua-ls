@@ -2316,6 +2316,246 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_vgui_create_from_table_uses_panel_base_field_for_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_panel.lua",
+            r#"
+            ---@class Panel
+            ---@field SetTitle fun(self: Panel, title: string)
+            ---@class DFrame: Panel
+
+            vgui = {}
+
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param className string
+            ---@param parent Panel?
+            ---@return Panel
+            function vgui.Create(className, parent) end
+
+            local PANEL = {}
+            PANEL.Base = "DFrame"
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+                self.child = vgui.Create("Panel", self)
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_mismatch = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != param_type_mismatch
+                    && diagnostic.code != undefined_field),
+            "vgui.CreateFromTable should infer PANEL self from PANEL.Base, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_ignores_stale_base_after_dynamic_table_overwrite() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_dynamic_overwrite.lua",
+            r#"
+            ---@class Panel
+            ---@class DFrame: Panel
+            ---@field SetTitle fun(self: DFrame, title: string)
+
+            local function make_panel()
+                return {}
+            end
+
+            local PANEL = { Base = "DFrame" }
+            PANEL = make_panel()
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_field),
+            "vgui.CreateFromTable must not infer stale Base after dynamic table overwrite, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_ignores_stale_base_after_table_overwrite_without_base() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_table_overwrite.lua",
+            r#"
+            ---@class Panel
+            ---@class DFrame: Panel
+            ---@field SetTitle fun(self: DFrame, title: string)
+
+            local PANEL = { Base = "DFrame" }
+            PANEL = {}
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_field),
+            "vgui.CreateFromTable must not infer stale Base after table overwrite without Base, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_ignores_prior_base_assignment_for_shadowed_local() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_shadowed_local.lua",
+            r#"
+            ---@class Panel
+            ---@class DFrame: Panel
+            ---@field SetTitle fun(self: DFrame, title: string)
+
+            local PANEL = {}
+            PANEL.Base = "DFrame"
+
+            local PANEL = {}
+            function PANEL:Init()
+                self:SetTitle("Title")
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_field),
+            "vgui.CreateFromTable must not use Base from a shadowed local PANEL, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_missing_multi_assign_rhs_does_not_reuse_previous_rhs() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_missing_multi_assign_rhs.lua",
+            r#"
+            ---@class Panel
+            ---@class DFrame: Panel
+            ---@field SetTitle fun(self: DFrame, title: string)
+
+            local PANEL = {}
+            local other
+            other, PANEL.Base = "DFrame"
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_field),
+            "vgui.CreateFromTable must not reuse the previous RHS for a missing multi-assign value, got {diagnostics:?}"
+        );
+    }
+
     /// Regression: PANEL reassignment (`PANEL = {}`) should create distinct classes
     /// per region. Today all PANEL references bind to a single class, so the set of
     /// resolved class names contains only one entry instead of three.

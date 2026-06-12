@@ -6,10 +6,11 @@ use std::collections::{HashMap, HashSet};
 
 pub use async_state::AsyncState;
 pub use signature::{
-    CALL_ARG_ATTRIBUTE, LuaCallArgRole, LuaDocDefaultValue, LuaDocParamInfo, LuaDocReturnInfo,
-    LuaGenericParamInfo, LuaNoDiscard, LuaOutParamInfo, LuaSignature, LuaSignatureId,
-    OVERLOAD_CALL_ARG_ATTRIBUTE, ReturnTypeKind, SignatureReturnStatus,
-    find_call_arg_role_from_type, visit_call_arg_roles_from_type,
+    CALL_ARG_ATTRIBUTE, CALL_ARG_FIELD_ATTRIBUTE, LuaCallArgRole, LuaDocDefaultValue,
+    LuaDocParamInfo, LuaDocReturnInfo, LuaGenericParamInfo, LuaNoDiscard, LuaOutParamInfo,
+    LuaSignature, LuaSignatureId, OVERLOAD_CALL_ARG_ATTRIBUTE, OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE,
+    ReturnTypeKind, SignatureReturnStatus, find_call_arg_role_from_type,
+    visit_call_arg_roles_from_type,
 };
 
 use crate::FileId;
