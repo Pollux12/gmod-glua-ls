@@ -2603,6 +2603,18 @@ mod test {
             function DPanel:SetSize(width, height) end
         "#,
         );
+        ws.def_file(
+            "annotations/accessor_func.lua",
+            r#"
+            ---@meta
+            ---@param tab table
+            ---@param varName string
+            ---@param name string
+            ---@accessorfunc 2
+            function AccessorFunc(tab, varName, name, force) end
+            FORCE_BOOL = 1
+        "#,
+        );
 
         let file_id = ws.def_file(
             "lua/menu/mount/vgui/workshop.lua",
@@ -2663,6 +2675,110 @@ mod test {
                 .iter()
                 .all(|diagnostic| diagnostic.code != undefined_field),
             "vgui.RegisterFile should infer loaded PANEL self from PANEL.Base, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_file_annotation_loads_nested_panel_base_for_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            Panel = Panel or {}
+
+            ---@generic T : Panel
+            ---@param className `T`
+            ---@return (instance) T
+            function Panel:Add(class_name) end
+        "#,
+        );
+        ws.def_file(
+            "annotations/derma.lua",
+            r#"
+            ---@meta
+            derma = {}
+
+            ---@[call_arg("gmod.vgui_panel", "define_control")]
+            ---@param name string
+            ---@param description string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param tab table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function derma.DefineControl(name, description, tab, base) end
+        "#,
+        );
+        ws.def_file(
+            "annotations/vgui.lua",
+            r#"
+            ---@meta
+            vgui = {}
+
+            ---@[call_arg("gmod.load", "include")]
+            ---@[call_arg("gmod.vgui_panel", "register_file")]
+            ---@param file string
+            function vgui.RegisterFile(file) end
+        "#,
+        );
+        ws.def_file(
+            "lua/vgui/dpanel.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+            end
+
+            derma.DefineControl("DPanel", "", PANEL, "Panel")
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/menu/mount/vgui/workshop.lua",
+            r#"
+            PANEL.Base = "DPanel"
+
+            function PANEL:Init()
+                self:Add("DLabel")
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/menu/mount/mount.lua",
+            r#"
+            local pnlWorkshop = vgui.RegisterFile("vgui/workshop.lua")
+        "#,
+        );
+
+        let self_type = index_expr_prefix_type(&mut ws, file_id, "self:Add");
+        let expected_base = LuaType::Ref(LuaTypeDeclId::global("DPanel"));
+        assert!(
+            ws.check_type(&self_type, &expected_base),
+            "vgui.RegisterFile should infer nested loaded PANEL self as DPanel-compatible from PANEL.Base, got {}",
+            ws.humanize_type_detailed(self_type.clone())
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field),
+            "vgui.RegisterFile should infer nested loaded PANEL self from PANEL.Base, got {diagnostics:?}"
         );
     }
 
