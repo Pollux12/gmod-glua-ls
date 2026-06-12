@@ -3,8 +3,7 @@ use std::sync::Arc;
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaNameExpr};
 
 use crate::{
-    DbIndex, GmodRealm, LuaDeclId, LuaInferCache, LuaType,
-    semantic::overload_resolve::resolve_signature,
+    DbIndex, LuaDeclId, LuaInferCache, LuaType, semantic::overload_resolve::resolve_signature,
 };
 
 pub fn resolve_global_decl_id(
@@ -227,22 +226,18 @@ fn select_realm_compatible_decl_ids(
     let file_id = cache.get_file_id();
     let call_offset = name_expr.get_position();
     let infer_index = db.get_gmod_infer_index();
-    let call_realm = infer_index.get_realm_at_offset(&file_id, call_offset);
 
     let mut compatible = Vec::new();
     for decl_id in decl_ids {
-        let decl_realm = infer_index.get_realm_at_offset(&decl_id.file_id, decl_id.position);
-        if is_realm_compatible(call_realm, decl_realm) {
+        if infer_index.are_offsets_compatible(
+            &file_id,
+            call_offset,
+            &decl_id.file_id,
+            decl_id.position,
+        ) {
             compatible.push(*decl_id);
         }
     }
 
     compatible
-}
-
-fn is_realm_compatible(call_realm: GmodRealm, decl_realm: GmodRealm) -> bool {
-    !matches!(
-        (call_realm, decl_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
 }

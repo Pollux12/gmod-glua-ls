@@ -275,9 +275,9 @@ pub fn resolve_gmod_hook_callback_doc_function(
         })?;
     let hook_name = hook_site.hook_name.as_ref()?.clone();
     let member_key = LuaMemberKey::Name(hook_name.clone().into());
-    let call_realm = db
-        .get_gmod_infer_index()
-        .get_realm_at_offset(&call_file_id, call_expr.get_range().start());
+    let infer_index = db.get_gmod_infer_index();
+    let call_mask =
+        infer_index.get_state_mask_at_offset(&call_file_id, call_expr.get_range().start());
 
     let mut candidates = Vec::new();
     for owner_name in iter_hook_owner_names(db) {
@@ -295,10 +295,9 @@ pub fn resolve_gmod_hook_callback_doc_function(
             else {
                 continue;
             };
-            let member_realm = db
-                .get_gmod_infer_index()
-                .get_realm_at_offset(&member_id.file_id, member_id.get_position());
-            let is_compatible = is_realm_compatible(call_realm, member_realm);
+            let member_mask =
+                infer_index.get_state_mask_at_offset(&member_id.file_id, member_id.get_position());
+            let is_compatible = call_mask.is_compatible_with(member_mask);
 
             for func in function_types {
                 candidates.push((is_compatible, func));
@@ -377,14 +376,6 @@ pub fn extract_hook_name(call_expr: &LuaCallExpr) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
-}
-
-fn is_realm_compatible(call_realm: crate::GmodRealm, item_realm: crate::GmodRealm) -> bool {
-    !matches!(
-        (call_realm, item_realm),
-        (crate::GmodRealm::Client, crate::GmodRealm::Server)
-            | (crate::GmodRealm::Server, crate::GmodRealm::Client)
-    )
 }
 
 pub fn try_resolve_closure_parent_params(

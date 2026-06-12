@@ -297,8 +297,8 @@ fn filter_candidates_by_caller_realm(
     let caller_file_id = cache.get_file_id();
     let caller_offset = index.get_range().start();
     let gmod_infer = db.get_gmod_infer_index();
-    let caller_realm = gmod_infer.get_realm_at_offset(&caller_file_id, caller_offset);
-    if !matches!(caller_realm, GmodRealm::Client | GmodRealm::Server) {
+    let caller_mask = gmod_infer.get_state_mask_at_offset(&caller_file_id, caller_offset);
+    if caller_mask.is_empty() {
         return candidates;
     }
     let Some(index_key) = index.get_index_key() else {
@@ -329,8 +329,8 @@ fn filter_candidates_by_caller_realm(
                 let decl_file = m.get_file_id();
                 let decl_offset = m.get_range().start();
                 match gmod_infer.get_member_annotation_realm_at_offset(&decl_file, decl_offset) {
-                    None | Some(GmodRealm::Shared | GmodRealm::Unknown) => true,
-                    Some(r) => r == caller_realm,
+                    None | Some(GmodRealm::Unknown) => true,
+                    Some(r) => caller_mask.is_compatible_with(r.state_mask()),
                 }
             })
         })

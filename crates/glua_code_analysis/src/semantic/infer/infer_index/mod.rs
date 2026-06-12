@@ -701,14 +701,12 @@ fn is_dynamic_field_fallback_realm_compatible(
     definition_file_id: FileId,
     definition_position: TextSize,
 ) -> bool {
-    let definition_realm = db
+    let definition_mask = db
         .get_gmod_infer_index()
-        .get_realm_at_offset(&definition_file_id, definition_position);
-    !matches!(
-        (access_realm, definition_realm),
-        (crate::GmodRealm::Client, crate::GmodRealm::Server)
-            | (crate::GmodRealm::Server, crate::GmodRealm::Client)
-    )
+        .get_state_mask_at_offset(&definition_file_id, definition_position);
+    access_realm
+        .state_mask()
+        .is_compatible_with(definition_mask)
 }
 
 fn is_table_const_from_doc_tag(db: &DbIndex, inst: &InFiled<TextRange>) -> bool {

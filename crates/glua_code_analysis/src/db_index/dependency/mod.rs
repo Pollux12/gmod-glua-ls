@@ -3,6 +3,7 @@ mod file_dependency_relation;
 use std::collections::{HashMap, HashSet};
 
 use file_dependency_relation::FileDependencyRelation;
+use rowan::TextRange;
 
 use crate::FileId;
 
@@ -16,10 +17,21 @@ pub enum LuaDependencyKind {
     IncludeCS,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaDependencySite {
+    pub source_file_id: FileId,
+    pub target_file_id: Option<FileId>,
+    pub kind: LuaDependencyKind,
+    pub path: Option<String>,
+    pub original_expr: String,
+    pub range: TextRange,
+}
+
 #[derive(Debug)]
 pub struct LuaDependencyIndex {
     dependencies: HashMap<FileId, HashSet<FileId>>,
     dependency_kinds: HashMap<FileId, HashMap<FileId, HashSet<LuaDependencyKind>>>,
+    dependency_sites: HashMap<FileId, Vec<LuaDependencySite>>,
 }
 
 impl Default for LuaDependencyIndex {
@@ -33,6 +45,7 @@ impl LuaDependencyIndex {
         Self {
             dependencies: HashMap::new(),
             dependency_kinds: HashMap::new(),
+            dependency_sites: HashMap::new(),
         }
     }
 
@@ -58,6 +71,16 @@ impl LuaDependencyIndex {
             .insert(kind);
     }
 
+    pub fn add_dependency_site(&mut self, site: LuaDependencySite) {
+        if let Some(target_file_id) = site.target_file_id {
+            self.add_dependency_file(site.source_file_id, target_file_id, site.kind);
+        }
+        self.dependency_sites
+            .entry(site.source_file_id)
+            .or_default()
+            .push(site);
+    }
+
     pub fn get_required_files(&self, file_id: &FileId) -> Option<&HashSet<FileId>> {
         self.dependencies.get(file_id)
     }
@@ -72,6 +95,16 @@ impl LuaDependencyIndex {
             .and_then(|dependencies| dependencies.get(dependency_id))
     }
 
+    pub fn get_dependency_sites(&self, file_id: &FileId) -> Option<&[LuaDependencySite]> {
+        self.dependency_sites.get(file_id).map(Vec::as_slice)
+    }
+
+    pub fn iter_dependency_sites(&self) -> impl Iterator<Item = (&FileId, &[LuaDependencySite])> {
+        self.dependency_sites
+            .iter()
+            .map(|(file_id, sites)| (file_id, sites.as_slice()))
+    }
+
     pub fn get_file_dependencies<'a>(&'a self) -> FileDependencyRelation<'a> {
         FileDependencyRelation::new(&self.dependencies)
     }
@@ -81,10 +114,12 @@ impl LuaIndex for LuaDependencyIndex {
     fn remove(&mut self, file_id: FileId) {
         self.dependencies.remove(&file_id);
         self.dependency_kinds.remove(&file_id);
+        self.dependency_sites.remove(&file_id);
     }
 
     fn clear(&mut self) {
         self.dependencies.clear();
         self.dependency_kinds.clear();
+        self.dependency_sites.clear();
     }
 }

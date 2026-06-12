@@ -12,11 +12,11 @@ use internment::ArcIntern;
 use rowan::TextSize;
 
 use crate::{
-    DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId,
-    LuaDeclTypeKind, LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey,
-    LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache,
-    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel,
-    SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
+    DbIndex, FileId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
+    LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
+    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
+    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, SemanticDeclLevel,
+    SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         common::{add_member, bind_resolved_type},
         lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
@@ -1111,14 +1111,14 @@ fn select_operator_ids_by_workspace_and_realm(
     }
 
     let infer_index = db.get_gmod_infer_index();
-    let caller_realm = infer_index.get_realm_at_offset(&caller_file_id, caller_position);
+    let caller_mask = infer_index.get_state_mask_at_offset(&caller_file_id, caller_position);
     for (_, tier_operator_ids) in priority_tiers {
         let compatible_operator_ids = tier_operator_ids
             .into_iter()
             .filter(|operator_id| {
-                let operator_realm =
-                    infer_index.get_realm_at_offset(&operator_id.file_id, operator_id.position);
-                is_realm_compatible(caller_realm, operator_realm)
+                let operator_mask = infer_index
+                    .get_state_mask_at_offset(&operator_id.file_id, operator_id.position);
+                caller_mask.is_compatible_with(operator_mask)
             })
             .collect::<Vec<_>>();
         if !compatible_operator_ids.is_empty() {
@@ -1131,13 +1131,6 @@ fn select_operator_ids_by_workspace_and_realm(
 
 fn should_strip_first_operator_param(is_colon_define: bool, owner: &LuaOperatorOwner) -> bool {
     matches!(owner, LuaOperatorOwner::Type(_)) && !is_colon_define
-}
-
-fn is_realm_compatible(caller_realm: GmodRealm, candidate_realm: GmodRealm) -> bool {
-    !matches!(
-        (caller_realm, candidate_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
 }
 
 fn adjust_operator_special_call_param_infos(

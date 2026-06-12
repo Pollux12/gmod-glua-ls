@@ -13,12 +13,14 @@ const SERVER_BADGE_MARKDOWN: &str =
     "![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)";
 const CLIENT_BADGE_MARKDOWN: &str =
     "![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)";
+const MENU_BADGE_MARKDOWN: &str = "`MENU`";
 
 pub(crate) fn badge_markdown(realm: GmodRealm) -> Option<&'static str> {
     match realm {
         GmodRealm::Shared => Some(SHARED_BADGE_MARKDOWN),
         GmodRealm::Server => Some(SERVER_BADGE_MARKDOWN),
         GmodRealm::Client => Some(CLIENT_BADGE_MARKDOWN),
+        GmodRealm::Menu => Some(MENU_BADGE_MARKDOWN),
         GmodRealm::Unknown => None,
     }
 }
@@ -28,11 +30,16 @@ pub(crate) fn badge_label(realm: GmodRealm) -> Option<&'static str> {
         GmodRealm::Shared => Some("SHARED"),
         GmodRealm::Server => Some("SERVER"),
         GmodRealm::Client => Some("CLIENT"),
+        GmodRealm::Menu => Some("MENU"),
         GmodRealm::Unknown => None,
     }
 }
 
 pub(crate) fn badge_header_markdown(realm: GmodRealm) -> Option<String> {
+    if realm == GmodRealm::Menu {
+        return Some(MENU_BADGE_MARKDOWN.to_string());
+    }
+
     Some(format!(
         "{} **{}**",
         badge_markdown(realm)?,
@@ -46,6 +53,6 @@ pub(crate) fn badge_url(realm: GmodRealm) -> Option<&'static str> {
         GmodRealm::Shared => Some(SHARED_BADGE_URL),
         GmodRealm::Server => Some(SERVER_BADGE_URL),
         GmodRealm::Client => Some(CLIENT_BADGE_URL),
-        GmodRealm::Unknown => None,
+        GmodRealm::Menu | GmodRealm::Unknown => None,
     }
 }

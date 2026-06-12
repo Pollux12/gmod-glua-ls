@@ -929,18 +929,12 @@ fn extend_gmod_hook_same_owner_semantic_decls(
     };
 
     let module_index = db.get_module_index();
-    let caller_workspace_id = module_index.get_workspace_id(builder.semantic_model.get_file_id());
-    let caller_realm = trigger_position.map_or_else(
-        || {
-            db.get_gmod_infer_index()
-                .get_realm_file_metadata(&builder.semantic_model.get_file_id())
-                .map(|metadata| metadata.inferred_realm)
-                .unwrap_or(glua_code_analysis::GmodRealm::Unknown)
-        },
-        |trigger_position| {
-            db.get_gmod_infer_index()
-                .get_realm_at_offset(&builder.semantic_model.get_file_id(), trigger_position)
-        },
+    let caller_file_id = builder.semantic_model.get_file_id();
+    let caller_workspace_id = module_index.get_workspace_id(caller_file_id);
+    let infer_index = db.get_gmod_infer_index();
+    let caller_mask = infer_index.get_state_mask_at_offset(
+        &caller_file_id,
+        trigger_position.unwrap_or_else(|| TextSize::new(0)),
     );
     let target_access_path = format!("{}.{}", owner_type_decl_id.get_simple_name(), hook_name);
     let mut same_owner_candidates = Vec::new();
@@ -998,10 +992,9 @@ fn extend_gmod_hook_same_owner_semantic_decls(
             if *candidate_owner != *owner_type_decl_id {
                 continue;
             }
-            let candidate_realm = db
-                .get_gmod_infer_index()
-                .get_realm_at_offset(&member_id.file_id, member_id.get_position());
-            if !super::is_realm_compatible(caller_realm, candidate_realm) {
+            let candidate_mask =
+                infer_index.get_state_mask_at_offset(&member_id.file_id, member_id.get_position());
+            if !caller_mask.is_compatible_with(candidate_mask) {
                 continue;
             }
 

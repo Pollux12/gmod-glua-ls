@@ -6,7 +6,7 @@ use std::{
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
 
-use super::LuaIndex;
+use super::{GmodLoadStatus, GmodStateMask, LuaIndex};
 use crate::FileId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,7 +14,23 @@ pub enum GmodRealm {
     Client,
     Server,
     Shared,
+    Menu,
     Unknown,
+}
+
+impl GmodRealm {
+    pub fn state_mask(self) -> GmodStateMask {
+        GmodStateMask::from_realm(self)
+    }
+
+    pub fn is_compatible_with(self, other: Self) -> bool {
+        self.state_mask().is_compatible_with(other.state_mask())
+    }
+
+    pub fn is_strictly_incompatible_with(self, other: Self) -> bool {
+        self.state_mask()
+            .is_strictly_incompatible_with(other.state_mask())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +172,9 @@ pub struct GmodRealmRange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodRealmFileMetadata {
     pub inferred_realm: GmodRealm,
+    pub load_realm: Option<GmodRealm>,
+    pub load_status: Option<GmodLoadStatus>,
+    pub load_state_mask: GmodStateMask,
     pub filename_hint: Option<GmodRealm>,
     pub dependency_hints: Vec<GmodRealm>,
     /// Realm set explicitly via `---@realm client|server|shared`.
@@ -168,6 +187,9 @@ impl Default for GmodRealmFileMetadata {
     fn default() -> Self {
         Self {
             inferred_realm: GmodRealm::Unknown,
+            load_realm: None,
+            load_status: None,
+            load_state_mask: GmodStateMask::empty(),
             filename_hint: None,
             dependency_hints: Vec::new(),
             annotation_realm: None,
@@ -376,6 +398,51 @@ impl GmodInferIndex {
         metadata.annotation_realm.unwrap_or(GmodRealm::Unknown)
     }
 
+    pub fn get_state_mask_at_offset(
+        &self,
+        file_id: &FileId,
+        offset: rowan::TextSize,
+    ) -> GmodStateMask {
+        let Some(metadata) = self.realm_file_metadata.get(file_id) else {
+            return GmodStateMask::empty();
+        };
+        let file_mask = file_state_mask(metadata);
+
+        for range in &metadata.branch_realm_ranges {
+            if range.range.contains(offset) {
+                let branch_mask = range.realm.state_mask();
+                if file_mask.is_empty() {
+                    return branch_mask;
+                }
+
+                return branch_mask.intersection(file_mask);
+            }
+        }
+
+        file_mask
+    }
+
+    pub fn are_state_masks_compatible(left: GmodStateMask, right: GmodStateMask) -> bool {
+        left.is_compatible_with(right)
+    }
+
+    pub fn are_realms_compatible(left: GmodRealm, right: GmodRealm) -> bool {
+        left.is_compatible_with(right)
+    }
+
+    pub fn are_offsets_compatible(
+        &self,
+        left_file_id: &FileId,
+        left_offset: rowan::TextSize,
+        right_file_id: &FileId,
+        right_offset: rowan::TextSize,
+    ) -> bool {
+        Self::are_state_masks_compatible(
+            self.get_state_mask_at_offset(left_file_id, left_offset),
+            self.get_state_mask_at_offset(right_file_id, right_offset),
+        )
+    }
+
     pub fn set_all_realm_file_metadata(
         &mut self,
         metadata: HashMap<FileId, GmodRealmFileMetadata>,
@@ -480,6 +547,20 @@ impl LuaIndex for GmodInferIndex {
         self.fileparam_index.clear();
         self.scoped_class_info.clear();
     }
+}
+
+fn file_state_mask(metadata: &GmodRealmFileMetadata) -> GmodStateMask {
+    if let Some(annotation_realm) = metadata.annotation_realm {
+        return annotation_realm.state_mask();
+    }
+    if !metadata.load_state_mask.is_empty() {
+        return metadata.load_state_mask;
+    }
+    if metadata.inferred_realm != GmodRealm::Unknown {
+        return metadata.inferred_realm.state_mask();
+    }
+
+    GmodStateMask::empty()
 }
 
 fn normalize_system_name(name: Option<&str>) -> Option<&str> {

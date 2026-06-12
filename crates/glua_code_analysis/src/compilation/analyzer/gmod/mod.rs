@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     sync::Arc,
 };
 
 use aho_corasick::AhoCorasick;
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk,
-    LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr,
+    LuaChunk, LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
     LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaStat,
@@ -23,11 +24,12 @@ use crate::{
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
-        GmodConcommandSiteMetadata, GmodHookKind, GmodHookNameIssue, GmodHookSiteMetadata,
-        GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata, GmodRealm, GmodRealmFileMetadata,
-        GmodRealmRange, GmodScopedClassInfo, GmodTimerKind, GmodTimerSiteMetadata,
-        LuaDependencyKind, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind,
-        NetReceiveFlow, NetSendFlow, NetSendKind,
+        GmodConcommandSiteMetadata, GmodFileLoadInfo, GmodHookKind, GmodHookNameIssue,
+        GmodHookSiteMetadata, GmodLoadConfidence, GmodLoadEdge, GmodLoadEdgeKind, GmodLoadRoot,
+        GmodLoadRootKind, GmodLoadStatus, GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata,
+        GmodRealm, GmodRealmFileMetadata, GmodRealmRange, GmodScopedClassInfo, GmodStateMask,
+        GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind, LuaDependencySite, LuaMemberOwner,
+        NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind, NetReceiveFlow, NetSendFlow, NetSendKind,
     },
     profile::Profile,
 };
@@ -47,7 +49,7 @@ struct GmodKeywords {
     has_scripted_class_call: bool,
     /// "GM:" or "GAMEMODE:" — GM/GAMEMODE method sites
     has_gm_func: bool,
-    /// "CLIENT" or "SERVER" — branch realm ranges (if CLIENT/if SERVER)
+    /// "CLIENT", "SERVER", or "MENU_DLL" — branch realm ranges.
     has_realm_branch: bool,
     /// "@realm" — file-level realm annotation
     has_realm_anno: bool,
@@ -110,7 +112,9 @@ fn scan_gmod_keywords(
         has_scripted_class_call: has_scripted_class_annotation
             || annotated_candidates.has_scripted_class,
         has_gm_func,
-        has_realm_branch: content.contains("CLIENT") || content.contains("SERVER"),
+        has_realm_branch: content.contains("CLIENT")
+            || content.contains("SERVER")
+            || content.contains("MENU_DLL"),
         has_realm_anno: content.contains("@realm"),
     }
 }
@@ -369,6 +373,15 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         synthesize_network_var_wrappers(db, &scripted_scope_files, &tree_map);
         if let Some(t1) = t1 {
             log::info!("gmod pre: network_var_wrappers cost {:?}", t1.elapsed());
+        }
+
+        let t_load = do_profile.then(std::time::Instant::now);
+        rebuild_gmod_load_index(db, &branch_realm_ranges, &file_ids);
+        if let Some(t_load) = t_load {
+            log::info!(
+                "gmod pre: rebuild_gmod_load_index cost {:?}",
+                t_load.elapsed()
+            );
         }
 
         let t2 = do_profile.then(std::time::Instant::now);
@@ -6028,6 +6041,7 @@ fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
         "client" => Some(GmodRealm::Client),
         "server" => Some(GmodRealm::Server),
         "shared" => Some(GmodRealm::Shared),
+        "menu" => Some(GmodRealm::Menu),
         _ => None,
     }
 }
@@ -6231,6 +6245,7 @@ fn realm_from_condition(expr: &LuaExpr) -> Option<GmodRealm> {
         LuaExpr::NameExpr(name_expr) => match name_expr.get_name_text()?.as_str() {
             "CLIENT" => Some(GmodRealm::Client),
             "SERVER" => Some(GmodRealm::Server),
+            "MENU_DLL" => Some(GmodRealm::Menu),
             _ => None,
         },
         LuaExpr::UnaryExpr(unary_expr) => {
@@ -6242,6 +6257,7 @@ fn realm_from_condition(expr: &LuaExpr) -> Option<GmodRealm> {
                 match inner_realm {
                     GmodRealm::Client => Some(GmodRealm::Server),
                     GmodRealm::Server => Some(GmodRealm::Client),
+                    GmodRealm::Menu => None,
                     _ => None,
                 }
             } else {
@@ -6250,6 +6266,751 @@ fn realm_from_condition(expr: &LuaExpr) -> Option<GmodRealm> {
         }
         _ => None,
     }
+}
+
+fn rebuild_gmod_load_index(
+    db: &mut DbIndex,
+    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
+    analyzed_file_ids: &[FileId],
+) {
+    let file_ids = db.get_vfs().get_all_local_file_ids();
+    let analyzed_file_ids: HashSet<FileId> = analyzed_file_ids.iter().copied().collect();
+    let previous_realm_metadata: HashMap<FileId, GmodRealmFileMetadata> = file_ids
+        .iter()
+        .filter_map(|file_id| {
+            db.get_gmod_infer_index()
+                .get_realm_file_metadata(file_id)
+                .cloned()
+                .map(|metadata| (*file_id, metadata))
+        })
+        .collect();
+
+    let resolved_branch_ranges = file_ids
+        .iter()
+        .map(|file_id| {
+            let ranges = if let Some(ranges) = branch_realm_ranges.get(file_id) {
+                ranges.clone()
+            } else if analyzed_file_ids.contains(file_id) {
+                Vec::new()
+            } else {
+                previous_realm_metadata
+                    .get(file_id)
+                    .map(|metadata| metadata.branch_realm_ranges.clone())
+                    .unwrap_or_default()
+            };
+            (*file_id, ranges)
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut file_infos = file_ids
+        .iter()
+        .map(|file_id| (*file_id, GmodFileLoadInfo::fallback_shared()))
+        .collect::<HashMap<_, _>>();
+    let mut fallback_masks = HashMap::new();
+
+    for file_id in &file_ids {
+        if let Some(realm) = infer_realm_from_load_path_hint(db, *file_id) {
+            fallback_masks.insert(*file_id, GmodStateMask::from_realm(realm));
+        }
+
+        if let Some((kind, states)) = engine_load_root_for_file(db, *file_id) {
+            mark_load_root(&mut file_infos, *file_id, kind, states);
+        }
+    }
+
+    let dependency_sites = db
+        .get_file_dependencies_index()
+        .iter_dependency_sites()
+        .flat_map(|(_, sites)| sites.iter().cloned())
+        .map(|site| resolve_load_dependency_site(db, site))
+        .collect::<Vec<_>>();
+    let dynamic_loaders = collect_dynamic_loaders(db, &file_ids);
+
+    let mut unresolved_edges = Vec::new();
+    for _ in 0..file_ids.len().max(1) {
+        let mut changed = false;
+        for site in &dependency_sites {
+            let source_states = source_states_for_load_site(
+                &file_infos,
+                &fallback_masks,
+                &resolved_branch_ranges,
+                site,
+            );
+            changed |= apply_load_site(&mut file_infos, &mut unresolved_edges, site, source_states);
+        }
+        changed |= apply_dynamic_loaders(
+            &mut file_infos,
+            &fallback_masks,
+            &resolved_branch_ranges,
+            &dynamic_loaders,
+        );
+        if !changed {
+            break;
+        }
+    }
+
+    db.get_gmod_load_index_mut()
+        .set_all_file_infos(file_infos, unresolved_edges);
+}
+
+struct DynamicLoadPattern {
+    source_file_id: FileId,
+    glob_base: String,
+    has_prefix_dispatch: bool,
+    has_addcs: bool,
+    has_include: bool,
+    range: TextRange,
+    targets: Vec<(FileId, String)>,
+}
+
+fn collect_dynamic_loaders(db: &DbIndex, file_ids: &[FileId]) -> Vec<DynamicLoadPattern> {
+    let relative_paths = file_ids
+        .iter()
+        .filter_map(|file_id| gmod_relative_path(db, *file_id).map(|path| (*file_id, path)))
+        .collect::<HashMap<_, _>>();
+
+    let mut patterns = Vec::new();
+    for source_file_id in file_ids {
+        let Some(tree) = db.get_vfs().get_syntax_tree(source_file_id) else {
+            continue;
+        };
+        let Some(content) = db.get_vfs().get_file_content(source_file_id) else {
+            continue;
+        };
+        if !content.contains("file.Find") {
+            continue;
+        }
+
+        let root = tree.get_chunk_node();
+        let bindings = collect_static_string_bindings(&root);
+        for call_expr in root.descendants::<LuaCallExpr>() {
+            if call_expr.get_access_path().as_deref() != Some("file.Find") {
+                continue;
+            }
+            let Some(args) = call_expr.get_args_list() else {
+                continue;
+            };
+            let args = args.get_args().collect::<Vec<_>>();
+            let Some(pattern_expr) = args.first() else {
+                continue;
+            };
+            if args.get(1).and_then(static_literal_string).as_deref() != Some("LUA") {
+                continue;
+            }
+            let Some(pattern) = static_string_expr(pattern_expr, &bindings) else {
+                continue;
+            };
+            let Some(glob_base) = lua_file_find_glob_base(&pattern) else {
+                continue;
+            };
+            let targets = relative_paths
+                .iter()
+                .filter(|(_, target_path)| file_find_glob_matches(&glob_base, target_path))
+                .map(|(target_file_id, target_path)| (*target_file_id, target_path.clone()))
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                continue;
+            }
+
+            patterns.push(DynamicLoadPattern {
+                source_file_id: *source_file_id,
+                glob_base,
+                has_prefix_dispatch: content.contains("\"cl_\"")
+                    || content.contains("'cl_'")
+                    || content.contains("\"sv_\"")
+                    || content.contains("'sv_'")
+                    || content.contains("\"sh_\"")
+                    || content.contains("'sh_'"),
+                has_addcs: content.contains("AddCSLuaFile"),
+                has_include: content.contains("include(") || content.contains("IncludeCS"),
+                range: call_expr.get_range(),
+                targets,
+            });
+        }
+    }
+
+    patterns
+}
+
+fn collect_static_string_bindings(root: &LuaChunk) -> HashMap<String, String> {
+    let mut bindings = HashMap::new();
+    for node in root.syntax().descendants() {
+        if let Some(local_stat) = LuaLocalStat::cast(node.clone()) {
+            let names = local_stat.get_local_name_list().collect::<Vec<_>>();
+            let values = local_stat.get_value_exprs().collect::<Vec<_>>();
+            for (idx, local_name) in names.iter().enumerate() {
+                let Some(name_token) = local_name.get_name_token() else {
+                    continue;
+                };
+                let Some(value) = values.get(idx) else {
+                    continue;
+                };
+                if let Some(value) = static_string_expr(value, &bindings) {
+                    bindings.insert(name_token.get_name_text().to_string(), value);
+                }
+            }
+            continue;
+        }
+
+        if let Some(assign_stat) = LuaAssignStat::cast(node) {
+            let (vars, values) = assign_stat.get_var_and_expr_list();
+            for (idx, var) in vars.iter().enumerate() {
+                let LuaVarExpr::NameExpr(name_expr) = var else {
+                    continue;
+                };
+                let Some(name) = name_expr.get_name_text() else {
+                    continue;
+                };
+                let Some(value) = values.get(idx) else {
+                    continue;
+                };
+                if let Some(value) = static_string_expr(value, &bindings) {
+                    bindings.insert(name, value);
+                }
+            }
+        }
+    }
+    bindings
+}
+
+fn static_literal_string(expr: &LuaExpr) -> Option<String> {
+    let LuaExpr::LiteralExpr(literal) = expr else {
+        return None;
+    };
+    let LuaLiteralToken::String(string) = literal.get_literal()? else {
+        return None;
+    };
+    Some(string.get_value())
+}
+
+fn static_string_expr(expr: &LuaExpr, bindings: &HashMap<String, String>) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(_) => static_literal_string(expr),
+        LuaExpr::NameExpr(name_expr) => bindings.get(name_expr.get_name_text()?.as_str()).cloned(),
+        LuaExpr::ParenExpr(paren_expr) => static_string_expr(&paren_expr.get_expr()?, bindings),
+        LuaExpr::BinaryExpr(binary_expr) => {
+            if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpConcat {
+                return None;
+            }
+            let (left, right) = binary_expr.get_exprs()?;
+            let left = static_string_expr(&left, bindings)?;
+            let right = static_string_expr(&right, bindings)?;
+            Some(format!("{left}{right}"))
+        }
+        _ => None,
+    }
+}
+
+fn lua_file_find_glob_base(pattern: &str) -> Option<String> {
+    let pattern = pattern.replace('\\', "/").to_ascii_lowercase();
+    let base = pattern.strip_suffix("/*.lua")?;
+    Some(
+        base.trim_start_matches("lua/")
+            .trim_matches('/')
+            .to_string(),
+    )
+}
+
+fn file_find_glob_matches(glob_base: &str, target_path: &str) -> bool {
+    let Some(rest) = target_path.strip_prefix(glob_base) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('/') else {
+        return false;
+    };
+    !rest.contains('/') && rest.ends_with(".lua")
+}
+
+fn apply_dynamic_loaders(
+    file_infos: &mut HashMap<FileId, GmodFileLoadInfo>,
+    fallback_masks: &HashMap<FileId, GmodStateMask>,
+    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
+    dynamic_loaders: &[DynamicLoadPattern],
+) -> bool {
+    let mut changed = false;
+    for loader in dynamic_loaders {
+        let site = LuaDependencySite {
+            source_file_id: loader.source_file_id,
+            target_file_id: None,
+            kind: LuaDependencyKind::Include,
+            path: Some(format!("{}/*.lua", loader.glob_base)),
+            original_expr: "file.Find".to_string(),
+            range: loader.range,
+        };
+        let source_states =
+            source_states_for_load_site(file_infos, fallback_masks, branch_realm_ranges, &site);
+        if source_states.is_empty() {
+            continue;
+        }
+
+        for (target_file_id, target_path) in &loader.targets {
+            let target_states =
+                dynamic_target_states(target_path, source_states, loader.has_prefix_dispatch);
+            if target_states.is_empty() {
+                continue;
+            }
+
+            let target_info = file_infos
+                .entry(*target_file_id)
+                .or_insert_with(GmodFileLoadInfo::fallback_shared);
+            if loader.has_addcs && target_states.intersects(GmodStateMask::CLIENT) {
+                target_info.client_send_available = true;
+                target_info.add_incoming_edge(GmodLoadEdge {
+                    source_file_id: loader.source_file_id,
+                    target_file_id: Some(*target_file_id),
+                    kind: GmodLoadEdgeKind::DynamicAddCSLuaFile,
+                    states: GmodStateMask::CLIENT,
+                    path: Some(target_path.clone()),
+                    original_expr: Some("file.Find".to_string()),
+                    range: Some(loader.range),
+                });
+            }
+            if loader.has_include || target_states.intersects(GmodStateMask::SERVER) {
+                target_info.add_incoming_edge(GmodLoadEdge {
+                    source_file_id: loader.source_file_id,
+                    target_file_id: Some(*target_file_id),
+                    kind: GmodLoadEdgeKind::DynamicInclude,
+                    states: target_states,
+                    path: Some(target_path.clone()),
+                    original_expr: Some("file.Find".to_string()),
+                    range: Some(loader.range),
+                });
+            }
+            changed |= target_info.mark_states(
+                target_states,
+                GmodLoadStatus::MaybeDynamic,
+                GmodLoadConfidence::Dynamic,
+            );
+        }
+    }
+    changed
+}
+
+fn dynamic_target_states(
+    target_path: &str,
+    source_states: GmodStateMask,
+    has_prefix_dispatch: bool,
+) -> GmodStateMask {
+    if !has_prefix_dispatch {
+        return source_states;
+    }
+    let file_name = target_path.rsplit('/').next().unwrap_or(target_path);
+    if file_name.starts_with("cl_") {
+        GmodStateMask::CLIENT
+    } else if file_name.starts_with("sv_") {
+        GmodStateMask::SERVER
+    } else if file_name.starts_with("sh_") {
+        GmodStateMask::SHARED
+    } else {
+        source_states
+    }
+}
+
+fn resolve_load_dependency_site(db: &DbIndex, mut site: LuaDependencySite) -> LuaDependencySite {
+    if site.target_file_id.is_some() {
+        return site;
+    }
+    let Some(path) = site.path.as_deref() else {
+        return site;
+    };
+    site.target_file_id = resolve_load_dependency_target(db, site.source_file_id, site.kind, path);
+    site
+}
+
+fn resolve_load_dependency_target(
+    db: &DbIndex,
+    source_file_id: FileId,
+    dependency_kind: LuaDependencyKind,
+    dependency_path: &str,
+) -> Option<FileId> {
+    let module_index = db.get_module_index();
+    match dependency_kind {
+        LuaDependencyKind::Require => module_index
+            .find_module_for_file(dependency_path, source_file_id)
+            .map(|module| module.file_id),
+        LuaDependencyKind::Include
+        | LuaDependencyKind::AddCSLuaFile
+        | LuaDependencyKind::IncludeCS => {
+            resolve_load_include_target(db, source_file_id, dependency_path).or_else(|| {
+                module_index
+                    .find_module_for_file(dependency_path, source_file_id)
+                    .map(|module| module.file_id)
+            })
+        }
+    }
+}
+
+fn resolve_load_include_target(
+    db: &DbIndex,
+    source_file_id: FileId,
+    dependency_path: &str,
+) -> Option<FileId> {
+    let normalized_path = dependency_path.replace('\\', "/");
+    let normalized_path = normalized_path.trim_start_matches("./");
+    let normalized_no_ext = normalized_path
+        .strip_suffix(".lua")
+        .unwrap_or(normalized_path);
+
+    let module_index = db.get_module_index();
+    let root_module_path = normalized_no_ext.replace('/', ".");
+    if let Some(module_info) = module_index.find_module_for_file(&root_module_path, source_file_id)
+    {
+        return Some(module_info.file_id);
+    }
+
+    if let Some(path_without_lua_prefix) = normalized_no_ext.strip_prefix("lua/") {
+        let module_path = path_without_lua_prefix.replace('/', ".");
+        if let Some(module_info) = module_index.find_module_for_file(&module_path, source_file_id) {
+            return Some(module_info.file_id);
+        }
+    }
+
+    let current_file_path = db.get_vfs().get_file_path(&source_file_id)?;
+    let parent_dir = current_file_path.parent()?;
+    let include_file_path = parent_dir.join(Path::new(normalized_path));
+    module_index
+        .find_module_by_path_for_file(&include_file_path, source_file_id)
+        .map(|module| module.file_id)
+}
+
+fn mark_load_root(
+    file_infos: &mut HashMap<FileId, GmodFileLoadInfo>,
+    file_id: FileId,
+    kind: GmodLoadRootKind,
+    states: GmodStateMask,
+) {
+    let info = file_infos
+        .entry(file_id)
+        .or_insert_with(GmodFileLoadInfo::fallback_shared);
+    info.mark_states(
+        states,
+        GmodLoadStatus::EngineLoaded,
+        GmodLoadConfidence::Engine,
+    );
+    info.add_root(GmodLoadRoot { kind, states });
+}
+
+fn source_states_for_load_site(
+    file_infos: &HashMap<FileId, GmodFileLoadInfo>,
+    fallback_masks: &HashMap<FileId, GmodStateMask>,
+    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
+    site: &LuaDependencySite,
+) -> GmodStateMask {
+    let source_states = file_infos
+        .get(&site.source_file_id)
+        .map(|info| info.state_mask)
+        .filter(|states| !states.is_empty())
+        .or_else(|| fallback_masks.get(&site.source_file_id).copied())
+        .unwrap_or_else(GmodStateMask::empty);
+
+    let Some(ranges) = branch_realm_ranges.get(&site.source_file_id) else {
+        return source_states;
+    };
+
+    let Some(branch_realm) = ranges
+        .iter()
+        .find(|range| range.range.contains(site.range.start()))
+        .map(|range| range.realm)
+    else {
+        return source_states;
+    };
+
+    let branch_states = GmodStateMask::from_realm(branch_realm);
+    if source_states.is_empty() {
+        branch_states
+    } else {
+        source_states.intersection(branch_states)
+    }
+}
+
+fn apply_load_site(
+    file_infos: &mut HashMap<FileId, GmodFileLoadInfo>,
+    unresolved_edges: &mut Vec<GmodLoadEdge>,
+    site: &LuaDependencySite,
+    source_states: GmodStateMask,
+) -> bool {
+    let edge_kind = GmodLoadEdgeKind::from(site.kind);
+    let edge = GmodLoadEdge {
+        source_file_id: site.source_file_id,
+        target_file_id: site.target_file_id,
+        kind: edge_kind,
+        states: source_states,
+        path: site.path.clone(),
+        original_expr: Some(site.original_expr.clone()),
+        range: Some(site.range),
+    };
+
+    let Some(target_file_id) = site.target_file_id else {
+        if !unresolved_edges.contains(&edge) {
+            unresolved_edges.push(edge);
+        }
+        return false;
+    };
+
+    let mut changed = false;
+    let target_info = file_infos
+        .entry(target_file_id)
+        .or_insert_with(GmodFileLoadInfo::fallback_shared);
+
+    match site.kind {
+        LuaDependencyKind::AddCSLuaFile => {
+            target_info.client_send_available = true;
+            changed |= target_info.mark_states(
+                GmodStateMask::CLIENT,
+                GmodLoadStatus::ReachableByLoadEdge,
+                GmodLoadConfidence::Static,
+            );
+            if target_file_id == site.source_file_id {
+                let self_source_states = if source_states.is_empty() {
+                    GmodStateMask::SERVER
+                } else {
+                    source_states
+                };
+                changed |= target_info.mark_states(
+                    self_source_states,
+                    GmodLoadStatus::ReachableByLoadEdge,
+                    GmodLoadConfidence::Static,
+                );
+            }
+        }
+        LuaDependencyKind::Include => {
+            if !source_states.is_empty() {
+                changed |= target_info.mark_states(
+                    source_states,
+                    GmodLoadStatus::ReachableByLoadEdge,
+                    GmodLoadConfidence::Static,
+                );
+            }
+        }
+        LuaDependencyKind::IncludeCS => {
+            target_info.client_send_available = true;
+            changed |= target_info.mark_states(
+                GmodStateMask::CLIENT,
+                GmodLoadStatus::ReachableByLoadEdge,
+                GmodLoadConfidence::Static,
+            );
+            if !source_states.is_empty() {
+                changed |= target_info.mark_states(
+                    source_states,
+                    GmodLoadStatus::ReachableByLoadEdge,
+                    GmodLoadConfidence::Static,
+                );
+            }
+        }
+        LuaDependencyKind::Require => {
+            changed |= target_info.mark_states(
+                GmodStateMask::SHARED,
+                GmodLoadStatus::ReachableByLoadEdge,
+                GmodLoadConfidence::Static,
+            );
+        }
+    }
+
+    target_info.add_incoming_edge(edge);
+    changed
+}
+
+fn engine_load_root_for_file(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Option<(GmodLoadRootKind, GmodStateMask)> {
+    let rel_path = gmod_relative_path(db, file_id)?;
+    engine_load_root_for_relative_path(&rel_path)
+}
+
+fn engine_load_root_for_relative_path(rel_path: &str) -> Option<(GmodLoadRootKind, GmodStateMask)> {
+    let rel_path = rel_path.trim_start_matches('/');
+    let parts = rel_path.split('/').collect::<Vec<_>>();
+
+    match rel_path {
+        "includes/init.lua" => {
+            return Some((GmodLoadRootKind::IncludesInit, GmodStateMask::SHARED));
+        }
+        "includes/init_menu.lua" => {
+            return Some((GmodLoadRootKind::IncludesInitMenu, GmodStateMask::MENU));
+        }
+        "derma/init.lua" => {
+            return Some((
+                GmodLoadRootKind::DermaInit,
+                GmodStateMask::CLIENT.union(GmodStateMask::MENU),
+            ));
+        }
+        "menu/menu.lua" => return Some((GmodLoadRootKind::MenuMain, GmodStateMask::MENU)),
+        _ => {}
+    }
+
+    if rel_path.starts_with("autorun/client/") {
+        return Some((GmodLoadRootKind::AutorunClient, GmodStateMask::CLIENT));
+    }
+    if rel_path.starts_with("autorun/server/") {
+        return Some((GmodLoadRootKind::AutorunServer, GmodStateMask::SERVER));
+    }
+    if rel_path.starts_with("autorun/") {
+        return Some((GmodLoadRootKind::Autorun, GmodStateMask::SHARED));
+    }
+    if rel_path.starts_with("vgui/") {
+        return Some((
+            GmodLoadRootKind::Vgui,
+            GmodStateMask::CLIENT.union(GmodStateMask::MENU),
+        ));
+    }
+    if rel_path.starts_with("postprocess/") {
+        return Some((GmodLoadRootKind::PostProcess, GmodStateMask::CLIENT));
+    }
+    if rel_path.starts_with("matproxy/") {
+        return Some((GmodLoadRootKind::MatProxy, GmodStateMask::CLIENT));
+    }
+    if rel_path.starts_with("skins/") {
+        return Some((GmodLoadRootKind::Skin, GmodStateMask::CLIENT));
+    }
+    if is_effect_path(&parts) {
+        return Some((GmodLoadRootKind::ScriptedEffect, GmodStateMask::SHARED));
+    }
+    if is_stool_path(&parts) {
+        return Some((GmodLoadRootKind::Stool, GmodStateMask::SHARED));
+    }
+    if let Some(root) = gamemode_root_for_parts(&parts) {
+        return Some(root);
+    }
+    if let Some(root) = scripted_class_root_for_parts(&parts) {
+        return Some(root);
+    }
+
+    None
+}
+
+fn gamemode_root_for_parts(parts: &[&str]) -> Option<(GmodLoadRootKind, GmodStateMask)> {
+    let gamemode_idx = parts.iter().rposition(|part| *part == "gamemode")?;
+    let file_name = *parts.get(gamemode_idx + 1)?;
+    if parts.get(gamemode_idx + 2).is_some() {
+        return None;
+    }
+    match file_name {
+        "init.lua" => Some((GmodLoadRootKind::GamemodeInit, GmodStateMask::SERVER)),
+        "cl_init.lua" => Some((GmodLoadRootKind::GamemodeClientInit, GmodStateMask::CLIENT)),
+        "shared.lua" => Some((GmodLoadRootKind::GamemodeShared, GmodStateMask::SHARED)),
+        _ => None,
+    }
+}
+
+fn scripted_class_root_for_parts(parts: &[&str]) -> Option<(GmodLoadRootKind, GmodStateMask)> {
+    let file_name = *parts.last()?;
+    if let Some(kind) = scripted_folder_kind(parts) {
+        return match file_name {
+            "init.lua" => Some((kind, GmodStateMask::SERVER)),
+            "cl_init.lua" => Some((kind, GmodStateMask::CLIENT)),
+            "shared.lua" => None,
+            _ => None,
+        };
+    }
+
+    if !file_name.ends_with(".lua")
+        || matches!(file_name, "init.lua" | "cl_init.lua" | "shared.lua")
+    {
+        return None;
+    }
+
+    let parent = parts.get(parts.len().saturating_sub(2)).copied();
+    match parent {
+        Some("weapons") => Some((GmodLoadRootKind::ScriptedWeapon, GmodStateMask::SHARED)),
+        Some("entities") => Some((GmodLoadRootKind::ScriptedEntity, GmodStateMask::SHARED)),
+        _ => None,
+    }
+}
+
+fn scripted_folder_kind(parts: &[&str]) -> Option<GmodLoadRootKind> {
+    if parts.len() < 3 {
+        return None;
+    }
+    let class_parent = parts.get(parts.len() - 3).copied()?;
+    match class_parent {
+        "weapons" => Some(GmodLoadRootKind::ScriptedWeapon),
+        "entities" => Some(GmodLoadRootKind::ScriptedEntity),
+        _ => None,
+    }
+}
+
+fn is_effect_path(parts: &[&str]) -> bool {
+    parts
+        .windows(2)
+        .any(|window| window == ["entities", "effects"])
+        || parts.first().copied() == Some("effects")
+}
+
+fn is_stool_path(parts: &[&str]) -> bool {
+    parts.contains(&"stools")
+}
+
+fn infer_realm_from_load_path_hint(db: &DbIndex, file_id: FileId) -> Option<GmodRealm> {
+    let file_path = db.get_vfs().get_file_path(&file_id)?;
+    let file_name = file_path
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if file_name.starts_with("cl_") {
+        return Some(GmodRealm::Client);
+    }
+    if file_name.starts_with("sv_") {
+        return Some(GmodRealm::Server);
+    }
+    if file_name.starts_with("sh_") {
+        return Some(GmodRealm::Shared);
+    }
+
+    let rel_path = gmod_relative_path(db, file_id)?;
+    let parts = rel_path.split('/').collect::<Vec<_>>();
+    if rel_path.contains("/client/") || rel_path.contains("/cl/") {
+        return Some(GmodRealm::Client);
+    }
+    if rel_path.contains("/server/") || rel_path.contains("/sv/") {
+        return Some(GmodRealm::Server);
+    }
+    if rel_path.contains("/shared/") || rel_path.contains("/sh/") {
+        return Some(GmodRealm::Shared);
+    }
+    if let Some((_, states)) = engine_load_root_for_relative_path(&rel_path) {
+        return Some(states.to_realm(GmodRealm::Shared));
+    }
+    if scripted_folder_kind(&parts).is_some() {
+        return match file_name.as_str() {
+            "init.lua" => Some(GmodRealm::Server),
+            "cl_init.lua" => Some(GmodRealm::Client),
+            "shared.lua" => Some(GmodRealm::Shared),
+            _ => None,
+        };
+    }
+    match file_name.as_str() {
+        "cl_init.lua" => Some(GmodRealm::Client),
+        "shared.lua" => Some(GmodRealm::Shared),
+        _ => None,
+    }
+}
+
+fn gmod_relative_path(db: &DbIndex, file_id: FileId) -> Option<String> {
+    let path = db
+        .get_vfs()
+        .get_file_path(&file_id)?
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+
+    if let Some(idx) = path.rfind("/lua/") {
+        return Some(path[idx + "/lua/".len()..].to_string());
+    }
+
+    for anchor in [
+        "/gamemodes/",
+        "/gamemode/",
+        "/entities/",
+        "/weapons/",
+        "/effects/",
+    ] {
+        if let Some(idx) = path.rfind(anchor) {
+            return Some(path[idx + 1..].to_string());
+        }
+    }
+
+    None
 }
 
 fn rebuild_realm_metadata(
@@ -6287,7 +7048,6 @@ fn rebuild_realm_metadata(
         .detect_realm_from_filename
         .unwrap_or(true);
     let detect_calls = db.get_emmyrc().gmod.detect_realm_from_calls.unwrap_or(true);
-
     let analyzed_file_ids: HashSet<FileId> = analyzed_file_ids.iter().copied().collect();
     let previous_realm_metadata: HashMap<FileId, GmodRealmFileMetadata> = file_ids
         .iter()
@@ -6357,142 +7117,6 @@ fn rebuild_realm_metadata(
         return;
     }
 
-    let mut filename_hints: HashMap<FileId, Option<GmodRealm>> = HashMap::new();
-    let mut dependency_hints: HashMap<FileId, HashSet<GmodRealm>> = HashMap::new();
-    let mut include_edges = Vec::new();
-
-    for file_id in &file_ids {
-        let hint = if detect_filename {
-            infer_realm_from_filename(db, *file_id)
-        } else {
-            None
-        };
-        filename_hints.insert(*file_id, hint);
-    }
-
-    if detect_calls {
-        let dependency_index = db.get_file_dependencies_index();
-        for source_file_id in &file_ids {
-            let Some(dependencies) = dependency_index.get_required_files(source_file_id) else {
-                continue;
-            };
-
-            for dependency_file_id in dependencies {
-                let Some(kinds) =
-                    dependency_index.get_dependency_kinds(source_file_id, dependency_file_id)
-                else {
-                    continue;
-                };
-                if kinds.contains(&LuaDependencyKind::AddCSLuaFile)
-                    || kinds.contains(&LuaDependencyKind::IncludeCS)
-                {
-                    if source_file_id == dependency_file_id {
-                        // Self-ref AddCSLuaFile() (no args): file sends itself to client,
-                        // meaning it runs on both server (caller) and client → Shared.
-                        dependency_hints
-                            .entry(*source_file_id)
-                            .or_default()
-                            .insert(GmodRealm::Shared);
-                    } else {
-                        // AddCSLuaFile/IncludeCS marks the TARGET as Client
-                        // (it's being sent to the client for download/execution).
-                        // We do NOT add a Server hint to the source file — although AddCSLuaFile is
-                        // server-only, shared files commonly call it inside `if SERVER then` blocks,
-                        // so hinting the source as Server would cause false positives.
-                        dependency_hints
-                            .entry(*dependency_file_id)
-                            .or_default()
-                            .insert(GmodRealm::Client);
-                    }
-                }
-                if kinds.contains(&LuaDependencyKind::Require) {
-                    dependency_hints
-                        .entry(*dependency_file_id)
-                        .or_default()
-                        .insert(GmodRealm::Shared);
-                }
-                if kinds.contains(&LuaDependencyKind::Include)
-                    || kinds.contains(&LuaDependencyKind::IncludeCS)
-                {
-                    // NOTE: Include edges are file-level, not branch-scoped.
-                    // An include() inside `if CLIENT then` still creates a file-level edge.
-                    // This is a deliberate simplification; branch-scoped tracking would
-                    // require storing call-site offsets in dependency edges (major arch change).
-                    include_edges.push((*source_file_id, *dependency_file_id));
-                }
-            }
-        }
-    }
-
-    let mut inferred_realms: HashMap<FileId, GmodRealm> = file_ids
-        .iter()
-        .map(|file_id| {
-            (
-                *file_id,
-                if meta_file_ids.contains(file_id) {
-                    GmodRealm::Unknown
-                } else {
-                    infer_realm(
-                        filename_hints.get(file_id).copied().flatten(),
-                        dependency_hints.get(file_id),
-                        default_realm,
-                    )
-                },
-            )
-        })
-        .collect();
-
-    if detect_calls && !include_edges.is_empty() {
-        for _ in 0..20 {
-            let mut next_dependency_hints = dependency_hints.clone();
-            for (source_file_id, dependency_file_id) in &include_edges {
-                // Collect evidence for the source file: filename hint + dependency hints
-                let mut source_evidence: HashSet<GmodRealm> = HashSet::new();
-                if let Some(Some(fh)) = filename_hints.get(source_file_id) {
-                    source_evidence.insert(*fh);
-                }
-                if let Some(hints) = next_dependency_hints.get(source_file_id) {
-                    source_evidence.extend(hints.iter().copied());
-                }
-
-                // Forward propagation only: source → dependency.
-                // We do NOT propagate backward (dependency → source) because a server-only
-                // file can legitimately include a shared file without becoming shared itself.
-                for hint in &source_evidence {
-                    next_dependency_hints
-                        .entry(*dependency_file_id)
-                        .or_default()
-                        .insert(*hint);
-                }
-            }
-
-            let next_inferred_realms: HashMap<FileId, GmodRealm> = file_ids
-                .iter()
-                .map(|file_id| {
-                    (
-                        *file_id,
-                        if meta_file_ids.contains(file_id) {
-                            GmodRealm::Unknown
-                        } else {
-                            infer_realm(
-                                filename_hints.get(file_id).copied().flatten(),
-                                next_dependency_hints.get(file_id),
-                                default_realm,
-                            )
-                        },
-                    )
-                })
-                .collect();
-
-            dependency_hints = next_dependency_hints;
-            if next_inferred_realms == inferred_realms {
-                break;
-            }
-
-            inferred_realms = next_inferred_realms;
-        }
-    }
-
     let mut realm_metadata = HashMap::new();
     for file_id in file_ids {
         let ranges = if meta_file_ids.contains(&file_id) {
@@ -6503,15 +7127,38 @@ fn rebuild_realm_metadata(
 
         let annotation_realm = resolve_annotation_realm(&file_id);
         let is_meta_file = meta_file_ids.contains(&file_id);
-        let hints = if is_meta_file {
+        let load_info = db.get_gmod_load_index().get_file_info(&file_id);
+        let load_realm = load_info.map(|info| info.realm);
+        let load_status = load_info.map(|info| info.status);
+        let load_state_mask = load_info
+            .map(|info| info.state_mask)
+            .unwrap_or_else(GmodStateMask::empty);
+        let filename_hint = if !is_meta_file && detect_filename {
+            infer_realm_from_filename(db, file_id)
+        } else {
+            None
+        };
+        let hints = if is_meta_file || !detect_calls {
             Vec::new()
         } else {
-            let mut hints = dependency_hints
-                .remove(&file_id)
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<Vec<_>>();
+            let mut hints = load_info
+                .filter(|info| info.status != GmodLoadStatus::NoKnownLoadPath)
+                .map(|info| {
+                    info.incoming_edges
+                        .iter()
+                        .map(|edge| edge.states.to_realm(info.realm))
+                        .filter(|realm| *realm != GmodRealm::Unknown)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if let Some(info) = load_info
+                && info.status != GmodLoadStatus::NoKnownLoadPath
+                && info.realm != GmodRealm::Unknown
+            {
+                hints.push(info.realm);
+            }
             hints.sort_by_key(|realm| realm_sort_key(*realm));
+            hints.dedup();
             hints
         };
 
@@ -6524,23 +7171,33 @@ fn rebuild_realm_metadata(
             // Library files (annotations) default to Shared since they define cross-realm APIs
             annotation_realm.unwrap_or(GmodRealm::Shared)
         } else {
-            annotation_realm.unwrap_or_else(|| {
-                inferred_realms
-                    .get(&file_id)
-                    .copied()
-                    .unwrap_or(default_realm)
-            })
+            annotation_realm
+                .or_else(|| {
+                    detect_calls
+                        .then_some(())
+                        .and(load_info)
+                        .filter(|info| info.status == GmodLoadStatus::EngineLoaded)
+                        .map(|info| info.realm)
+                })
+                .or(filename_hint)
+                .or_else(|| {
+                    detect_calls
+                        .then_some(())
+                        .and(load_info)
+                        .filter(|info| info.status != GmodLoadStatus::NoKnownLoadPath)
+                        .map(|info| info.realm)
+                })
+                .unwrap_or(default_realm)
         };
 
         realm_metadata.insert(
             file_id,
             GmodRealmFileMetadata {
                 inferred_realm: final_realm,
-                filename_hint: if is_meta_file {
-                    None
-                } else {
-                    filename_hints.get(&file_id).copied().flatten()
-                },
+                load_realm,
+                load_status,
+                load_state_mask,
+                filename_hint,
                 dependency_hints: hints,
                 annotation_realm,
                 branch_realm_ranges: ranges,
@@ -6552,53 +7209,12 @@ fn rebuild_realm_metadata(
         .set_all_realm_file_metadata(realm_metadata);
 }
 
-fn infer_realm(
-    filename_hint: Option<GmodRealm>,
-    dependency_hints: Option<&HashSet<GmodRealm>>,
-    default_realm: GmodRealm,
-) -> GmodRealm {
-    if let Some(filename_hint) = filename_hint
-        && filename_hint != GmodRealm::Unknown
-    {
-        return filename_hint;
-    }
-
-    let mut hints = HashSet::new();
-
-    if let Some(dependency_hints) = dependency_hints {
-        hints.extend(
-            dependency_hints
-                .iter()
-                .copied()
-                .filter(|realm| *realm != GmodRealm::Unknown),
-        );
-    }
-
-    if hints.is_empty() {
-        return default_realm;
-    }
-
-    if hints.len() == 1 {
-        return *hints.iter().next().expect("len checked");
-    }
-
-    // Any combination containing Shared, or both Client+Server, resolves to Shared
-    if hints.contains(&GmodRealm::Shared)
-        || (hints.contains(&GmodRealm::Client) && hints.contains(&GmodRealm::Server))
-    {
-        return GmodRealm::Shared;
-    }
-
-    // Fallback for unexpected combinations
-    default_realm
-}
-
 fn gmod_config_default_realm(db: &DbIndex) -> GmodRealm {
     match db.get_emmyrc().gmod.default_realm {
         EmmyrcGmodRealm::Client => GmodRealm::Client,
         EmmyrcGmodRealm::Server => GmodRealm::Server,
         EmmyrcGmodRealm::Shared => GmodRealm::Shared,
-        EmmyrcGmodRealm::Menu => GmodRealm::Unknown,
+        EmmyrcGmodRealm::Menu => GmodRealm::Menu,
     }
 }
 
@@ -6720,7 +7336,8 @@ fn realm_sort_key(realm: GmodRealm) -> u8 {
         GmodRealm::Client => 0,
         GmodRealm::Server => 1,
         GmodRealm::Shared => 2,
-        GmodRealm::Unknown => 3,
+        GmodRealm::Menu => 3,
+        GmodRealm::Unknown => 4,
     }
 }
 

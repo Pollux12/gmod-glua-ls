@@ -433,13 +433,12 @@ fn is_dynamic_field_realm_compatible(
         return true;
     }
 
-    let definition_realm = db
+    let definition_mask = db
         .get_gmod_infer_index()
-        .get_realm_at_offset(&definition.file_id, definition.value.start());
-    !matches!(
-        (caller_realm, definition_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
+        .get_state_mask_at_offset(&definition.file_id, definition.value.start());
+    caller_realm
+        .state_mask()
+        .is_compatible_with(definition_mask)
 }
 
 fn dynamic_field_member_id(db: &DbIndex, file_id: FileId, range: TextRange) -> Option<LuaMemberId> {

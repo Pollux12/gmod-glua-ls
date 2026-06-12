@@ -10,8 +10,9 @@ use glua_parser::{
 use rowan::{NodeOrToken, TextRange, TextSize};
 
 use crate::{
-    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaType, SemanticDeclLevel, SemanticModel, WorkspaceId,
+    DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, GmodStateMask, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, SemanticDeclLevel, SemanticModel,
+    WorkspaceId,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -77,9 +78,13 @@ impl Checker for GmodRealmMisuseChecker {
             if let Some(profile) = profile.as_mut() {
                 profile.calls_scanned += 1;
             }
-            let call_realm =
-                resolve_realm_at_offset(file_realm_metadata, call_expr.get_range().start());
-            if call_realm.realm == GmodRealm::Shared {
+            let call_realm = resolve_realm_at_position(
+                infer_index,
+                &file_id,
+                file_realm_metadata,
+                call_expr.get_range().start(),
+            );
+            if call_realm.is_universal_runtime_caller() {
                 if let Some(profile) = profile.as_mut() {
                     profile.shared_call_skips += 1;
                 }
@@ -119,10 +124,7 @@ impl Checker for GmodRealmMisuseChecker {
             if has_client && has_server {
                 push_unique_realm(
                     &mut callee_realms,
-                    ResolvedRealm {
-                        realm: GmodRealm::Shared,
-                        evidence: RealmEvidence::InferredDependency,
-                    },
+                    ResolvedRealm::new(GmodRealm::Shared, RealmEvidence::InferredDependency),
                 );
             }
 
@@ -148,14 +150,14 @@ impl Checker for GmodRealmMisuseChecker {
             }
 
             let Some(callee_realm) =
-                pick_best_mismatch_candidate_for_call(call_realm.realm, &callee_realms)
+                pick_best_mismatch_candidate_for_call(call_realm, &callee_realms)
             else {
                 continue;
             };
             let compatible_candidate = callee_realms
                 .iter()
                 .copied()
-                .filter(|callee| !is_cross_realm_misuse(call_realm.realm, callee.realm))
+                .filter(|callee| call_realm.is_compatible_with(*callee))
                 .max_by_key(|realm| evidence_priority(realm.evidence));
 
             if compatible_candidate.is_some_and(|candidate| {
@@ -256,7 +258,44 @@ pub(crate) enum RealmEvidence {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ResolvedRealm {
     pub(crate) realm: GmodRealm,
+    pub(crate) state_mask: GmodStateMask,
     pub(crate) evidence: RealmEvidence,
+}
+
+impl ResolvedRealm {
+    fn new(realm: GmodRealm, evidence: RealmEvidence) -> Self {
+        Self {
+            realm,
+            state_mask: realm.state_mask(),
+            evidence,
+        }
+    }
+
+    fn with_state_mask(
+        realm: GmodRealm,
+        state_mask: GmodStateMask,
+        evidence: RealmEvidence,
+    ) -> Self {
+        Self {
+            realm,
+            state_mask,
+            evidence,
+        }
+    }
+
+    fn is_compatible_with(self, callee: Self) -> bool {
+        self.state_mask.is_compatible_with(callee.state_mask)
+    }
+
+    fn is_strictly_incompatible_with(self, callee: Self) -> bool {
+        self.state_mask
+            .is_strictly_incompatible_with(callee.state_mask)
+    }
+
+    fn is_universal_runtime_caller(self) -> bool {
+        let runtime_mask = self.state_mask.without_menu();
+        runtime_mask.contains(GmodStateMask::SHARED)
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -568,13 +607,18 @@ fn resolve_decl_realm(
         decl_offset,
         decl_annotation_cache,
     ) {
-        return Some(ResolvedRealm {
-            realm: annotation_realm,
-            evidence: RealmEvidence::ExplicitAnnotation,
-        });
+        return Some(ResolvedRealm::new(
+            annotation_realm,
+            RealmEvidence::ExplicitAnnotation,
+        ));
     }
 
-    Some(resolve_realm_at_offset(metadata, decl_offset))
+    Some(resolve_realm_at_position(
+        infer_index,
+        &decl_file_id,
+        metadata,
+        decl_offset,
+    ))
 }
 
 fn resolve_decl_annotation_realm_at_offset(
@@ -976,10 +1020,7 @@ fn collect_annotated_gm_method_realms(
                 .or_insert_with(Vec::new);
             push_unique_realm(
                 entry,
-                ResolvedRealm {
-                    realm: *realm,
-                    evidence: RealmEvidence::ExplicitAnnotation,
-                },
+                ResolvedRealm::new(*realm, RealmEvidence::ExplicitAnnotation),
             );
         }
     }
@@ -1000,20 +1041,20 @@ fn pick_best_mismatch_candidate(realms: &[ResolvedRealm]) -> ResolvedRealm {
     *realms
         .iter()
         .max_by_key(|realm| mismatch_candidate_sort_key(realm))
-        .unwrap_or(&ResolvedRealm {
-            realm: GmodRealm::Unknown,
-            evidence: RealmEvidence::Unknown,
-        })
+        .unwrap_or(&ResolvedRealm::new(
+            GmodRealm::Unknown,
+            RealmEvidence::Unknown,
+        ))
 }
 
 fn pick_best_mismatch_candidate_for_call(
-    call_realm: GmodRealm,
+    call_realm: ResolvedRealm,
     realms: &[ResolvedRealm],
 ) -> Option<ResolvedRealm> {
     realms
         .iter()
         .copied()
-        .filter(|callee| is_cross_realm_misuse(call_realm, callee.realm))
+        .filter(|callee| is_cross_realm_misuse(call_realm, *callee))
         .max_by_key(mismatch_candidate_sort_key)
 }
 
@@ -1041,7 +1082,8 @@ fn realm_ordinal(realm: GmodRealm) -> u8 {
         GmodRealm::Client => 0,
         GmodRealm::Server => 1,
         GmodRealm::Shared => 2,
-        GmodRealm::Unknown => 3,
+        GmodRealm::Menu => 3,
+        GmodRealm::Unknown => 4,
     }
 }
 
@@ -1067,31 +1109,39 @@ fn semantic_decl_position(semantic_decl: &LuaSemanticDeclId) -> Option<(FileId, 
     }
 }
 
-fn resolve_realm_at_offset(metadata: &GmodRealmFileMetadata, offset: TextSize) -> ResolvedRealm {
+fn resolve_realm_at_position(
+    infer_index: &crate::GmodInferIndex,
+    file_id: &FileId,
+    metadata: &GmodRealmFileMetadata,
+    offset: TextSize,
+) -> ResolvedRealm {
     let branch_realm = metadata
         .branch_realm_ranges
         .iter()
         .find(|range| range.range.contains(offset))
         .map(|range| range.realm);
-    let realm = branch_realm.unwrap_or_else(|| {
-        if metadata.inferred_realm != GmodRealm::Unknown {
-            metadata.inferred_realm
-        } else {
-            metadata.annotation_realm.unwrap_or(GmodRealm::Unknown)
-        }
-    });
+    let realm = infer_index.get_realm_at_offset(file_id, offset);
+    let state_mask = infer_index.get_state_mask_at_offset(file_id, offset);
     let evidence = if branch_realm.is_some() {
         RealmEvidence::ExplicitBranch
     } else {
         file_realm_evidence(metadata)
     };
 
-    ResolvedRealm { realm, evidence }
+    ResolvedRealm::with_state_mask(realm, state_mask, evidence)
 }
 
 fn file_realm_evidence(metadata: &GmodRealmFileMetadata) -> RealmEvidence {
     if metadata.annotation_realm.is_some() {
         return RealmEvidence::ExplicitAnnotation;
+    }
+
+    if metadata
+        .load_status
+        .is_some_and(|status| status != crate::GmodLoadStatus::NoKnownLoadPath)
+        && metadata.load_realm.is_some()
+    {
+        return RealmEvidence::InferredDependency;
     }
 
     if metadata.filename_hint.is_some() {
@@ -1160,11 +1210,8 @@ fn is_strict_evidence(evidence: RealmEvidence) -> bool {
     )
 }
 
-fn is_cross_realm_misuse(call_realm: GmodRealm, callee_realm: GmodRealm) -> bool {
-    matches!(
-        (call_realm, callee_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
+fn is_cross_realm_misuse(call_realm: ResolvedRealm, callee_realm: ResolvedRealm) -> bool {
+    call_realm.is_strictly_incompatible_with(callee_realm)
 }
 
 fn mismatch_message(
@@ -1206,6 +1253,7 @@ fn realm_label(realm: GmodRealm) -> &'static str {
         GmodRealm::Client => "client",
         GmodRealm::Server => "server",
         GmodRealm::Shared => "shared",
+        GmodRealm::Menu => "menu",
         GmodRealm::Unknown => "unknown",
     }
 }
@@ -1225,13 +1273,19 @@ fn resolve_precomputed_decl_realm(
         decl_offset,
         decl_annotation_cache,
     ) {
-        return Some(ResolvedRealm {
-            realm: annotation_realm,
-            evidence: RealmEvidence::ExplicitAnnotation,
-        });
+        return Some(ResolvedRealm::new(
+            annotation_realm,
+            RealmEvidence::ExplicitAnnotation,
+        ));
     }
 
-    Some(resolve_realm_at_offset(metadata, decl_offset))
+    let infer_index = db.get_gmod_infer_index();
+    Some(resolve_realm_at_position(
+        infer_index,
+        &decl_file_id,
+        metadata,
+        decl_offset,
+    ))
 }
 
 /// Precompute declaration/member/signature realm facts for workspace diagnostics.
@@ -1340,10 +1394,7 @@ pub fn precompute_gm_method_realms(
                 .or_insert_with(Vec::new);
             push_unique_realm(
                 entry,
-                ResolvedRealm {
-                    realm: *realm,
-                    evidence: RealmEvidence::ExplicitAnnotation,
-                },
+                ResolvedRealm::new(*realm, RealmEvidence::ExplicitAnnotation),
             );
         }
     }
@@ -1363,70 +1414,49 @@ mod tests {
     #[gtest]
     fn pick_best_mismatch_candidate_uses_realm_tiebreaker_for_equal_evidence() {
         let candidates = vec![
-            ResolvedRealm {
-                realm: GmodRealm::Client,
-                evidence: RealmEvidence::ExplicitAnnotation,
-            },
-            ResolvedRealm {
-                realm: GmodRealm::Server,
-                evidence: RealmEvidence::ExplicitAnnotation,
-            },
+            ResolvedRealm::new(GmodRealm::Client, RealmEvidence::ExplicitAnnotation),
+            ResolvedRealm::new(GmodRealm::Server, RealmEvidence::ExplicitAnnotation),
         ];
 
         assert_that!(
             pick_best_mismatch_candidate(&candidates),
-            eq(ResolvedRealm {
-                realm: GmodRealm::Server,
-                evidence: RealmEvidence::ExplicitAnnotation,
-            })
+            eq(ResolvedRealm::new(
+                GmodRealm::Server,
+                RealmEvidence::ExplicitAnnotation
+            ))
         );
     }
 
     #[gtest]
     fn pick_best_mismatch_candidate_keeps_evidence_priority_dominant() {
         let candidates = vec![
-            ResolvedRealm {
-                realm: GmodRealm::Client,
-                evidence: RealmEvidence::ExplicitBranch,
-            },
-            ResolvedRealm {
-                realm: GmodRealm::Server,
-                evidence: RealmEvidence::ExplicitAnnotation,
-            },
+            ResolvedRealm::new(GmodRealm::Client, RealmEvidence::ExplicitBranch),
+            ResolvedRealm::new(GmodRealm::Server, RealmEvidence::ExplicitAnnotation),
         ];
 
         assert_that!(
             pick_best_mismatch_candidate(&candidates),
-            eq(ResolvedRealm {
-                realm: GmodRealm::Client,
-                evidence: RealmEvidence::ExplicitBranch,
-            })
+            eq(ResolvedRealm::new(
+                GmodRealm::Client,
+                RealmEvidence::ExplicitBranch
+            ))
         );
     }
 
     #[gtest]
     fn unknown_realm_candidate_uses_realm_tiebreaker_for_equal_evidence() {
-        let call_realm = ResolvedRealm {
-            realm: GmodRealm::Unknown,
-            evidence: RealmEvidence::Unknown,
-        };
+        let call_realm = ResolvedRealm::new(GmodRealm::Unknown, RealmEvidence::Unknown);
         let callee_realms = vec![
-            ResolvedRealm {
-                realm: GmodRealm::Client,
-                evidence: RealmEvidence::ExplicitAnnotation,
-            },
-            ResolvedRealm {
-                realm: GmodRealm::Server,
-                evidence: RealmEvidence::ExplicitAnnotation,
-            },
+            ResolvedRealm::new(GmodRealm::Client, RealmEvidence::ExplicitAnnotation),
+            ResolvedRealm::new(GmodRealm::Server, RealmEvidence::ExplicitAnnotation),
         ];
 
         assert_that!(
             unknown_realm_candidate(call_realm, &callee_realms),
-            some(eq(ResolvedRealm {
-                realm: GmodRealm::Server,
-                evidence: RealmEvidence::ExplicitAnnotation,
-            }))
+            some(eq(ResolvedRealm::new(
+                GmodRealm::Server,
+                RealmEvidence::ExplicitAnnotation
+            )))
         );
     }
 }

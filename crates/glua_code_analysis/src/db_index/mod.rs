@@ -7,6 +7,7 @@ mod flow;
 mod global;
 mod gmod_class;
 mod gmod_infer;
+mod gmod_load;
 mod gmod_network;
 mod member;
 mod metatable;
@@ -25,13 +26,14 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{Emmyrc, FileId, Vfs};
 pub use accessor_func::*;
 pub use declaration::*;
-pub use dependency::{LuaDependencyIndex, LuaDependencyKind};
+pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
 pub use dynamic_field::{DynamicFieldIndex, DynamicFieldOwner};
 pub use flow::*;
 pub use global::{GlobalId, LuaGlobalIndex};
 pub use gmod_class::*;
 pub use gmod_infer::*;
+pub use gmod_load::*;
 pub use gmod_network::*;
 pub use member::*;
 pub use metatable::LuaMetatableIndex;
@@ -61,6 +63,7 @@ pub struct DbIndex {
     accessor_func_call_index: AccessorFuncCallIndex,
     gmod_class_index: GmodClassMetadataIndex,
     gmod_infer_index: GmodInferIndex,
+    gmod_load_index: GmodLoadIndex,
     gmod_network_index: GmodNetworkIndex,
     dynamic_field_index: DynamicFieldIndex,
     vfs: Vfs,
@@ -95,6 +98,7 @@ impl DbIndex {
             accessor_func_call_index: AccessorFuncCallIndex::new(),
             gmod_class_index: GmodClassMetadataIndex::new(),
             gmod_infer_index: GmodInferIndex::new(),
+            gmod_load_index: GmodLoadIndex::new(),
             gmod_network_index: GmodNetworkIndex::new(),
             dynamic_field_index: DynamicFieldIndex::new(),
             vfs: Vfs::new(),
@@ -241,6 +245,14 @@ impl DbIndex {
         &mut self.gmod_infer_index
     }
 
+    pub fn get_gmod_load_index(&self) -> &GmodLoadIndex {
+        &self.gmod_load_index
+    }
+
+    pub fn get_gmod_load_index_mut(&mut self) -> &mut GmodLoadIndex {
+        &mut self.gmod_load_index
+    }
+
     pub fn get_gmod_network_index(&self) -> &GmodNetworkIndex {
         &self.gmod_network_index
     }
@@ -328,6 +340,7 @@ impl LuaIndex for DbIndex {
         self.accessor_func_call_index.remove(file_id);
         self.gmod_class_index.remove(file_id);
         self.gmod_infer_index.remove(file_id);
+        self.gmod_load_index.remove(file_id);
         self.gmod_network_index.remove(file_id);
         self.dynamic_field_index.remove(file_id);
         self.file_dependencies_index.remove(file_id);
@@ -351,6 +364,7 @@ impl LuaIndex for DbIndex {
         self.accessor_func_call_index.clear();
         self.gmod_class_index.clear();
         self.gmod_infer_index.clear();
+        self.gmod_load_index.clear();
         self.gmod_network_index.clear();
         self.dynamic_field_index.clear();
         self.file_dependencies_index.clear();

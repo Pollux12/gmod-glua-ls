@@ -9,7 +9,7 @@ use rowan::TextSize;
 
 use crate::{
     AccessorFuncCallMetadata, DbIndex, FileId, GlobalId, GmodClassCallArg, GmodClassCallLiteral,
-    GmodRealm, GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, InFiled, InferFailReason,
+    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, InFiled, InferFailReason,
     LuaMemberKey, LuaMemberOwner, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, LuaType,
     LuaTypeDeclId,
     compilation::analyzer::{lua::LuaAnalyzer, unresolve::UnResolveSpecialCall},
@@ -1177,13 +1177,11 @@ fn is_realm_compatible(
     }
 
     let infer_index = db.get_gmod_infer_index();
-    let caller_realm = infer_index.get_realm_at_offset(&caller_file_id, caller_position);
-    let candidate_realm = infer_index.get_realm_at_offset(&candidate_file_id, candidate_position);
+    let caller_mask = infer_index.get_state_mask_at_offset(&caller_file_id, caller_position);
+    let candidate_mask =
+        infer_index.get_state_mask_at_offset(&candidate_file_id, candidate_position);
 
-    !matches!(
-        (caller_realm, candidate_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
+    caller_mask.is_compatible_with(candidate_mask)
 }
 
 fn collect_accessorfunc_annotated_call(

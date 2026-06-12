@@ -10,7 +10,9 @@ use crate::{
     EmmyrcLuaVersion, FileId, InFiled, InferFailReason, LegacyModuleEnv, LuaDeclExtra, LuaDeclId,
     LuaMemberFeature, LuaMemberId, LuaSignatureId,
     compilation::analyzer::unresolve::UnResolveTableField,
-    db_index::{LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey, LuaMemberOwner},
+    db_index::{
+        LuaDecl, LuaDependencyKind, LuaDependencySite, LuaMember, LuaMemberKey, LuaMemberOwner,
+    },
 };
 
 use super::DeclAnalyzer;
@@ -357,17 +359,26 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
 
     let dependency_file_id = if let Some(ref path) = dependency_path {
         resolve_dependency_file_id(analyzer, file_id, dependency_kind, path)
-    } else {
+    } else if dependency_kind == LuaDependencyKind::AddCSLuaFile
+        && dependency_call_has_no_args(&expr)
+    {
         // No-arg AddCSLuaFile() means "send self to client" — self-reference
         Some(file_id)
+    } else {
+        None
     };
 
-    if let Some(dependency_file_id) = dependency_file_id {
-        analyzer
-            .db
-            .get_file_dependencies_index_mut()
-            .add_dependency_file(file_id, dependency_file_id, dependency_kind);
-    }
+    analyzer
+        .db
+        .get_file_dependencies_index_mut()
+        .add_dependency_site(LuaDependencySite {
+            source_file_id: file_id,
+            target_file_id: dependency_file_id,
+            kind: dependency_kind,
+            path: dependency_path,
+            original_expr: expr.syntax().text().to_string(),
+            range: expr.get_range(),
+        });
 
     Some(())
 }
@@ -576,12 +587,15 @@ fn get_dependency_call_info(expr: &LuaCallExpr) -> Option<(LuaDependencyKind, Op
         }
     };
     let dependency_path = get_static_string_arg(expr);
-    // AddCSLuaFile() with no args is valid (sends current file to client).
-    // IncludeCS() requires a filename in GMod's util.lua implementation.
-    if dependency_path.is_none() && dependency_kind != LuaDependencyKind::AddCSLuaFile {
+    if dependency_path.is_none() && dependency_kind == LuaDependencyKind::Require {
         return None;
     }
     Some((dependency_kind, dependency_path))
+}
+
+fn dependency_call_has_no_args(expr: &LuaCallExpr) -> bool {
+    expr.get_args_list()
+        .is_none_or(|args| args.get_args().next().is_none())
 }
 
 fn get_call_name(expr: &LuaCallExpr) -> Option<String> {

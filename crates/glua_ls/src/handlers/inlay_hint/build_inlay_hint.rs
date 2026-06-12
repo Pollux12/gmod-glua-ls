@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glua_code_analysis::{
-    AsyncState, FileId, GmodRealm, InferGuard, LuaFunctionType, LuaMember, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaOperatorId, LuaOperatorMetaMethod, LuaOperatorOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeDecl, SemanticModel, WorkspaceId,
+    AsyncState, FileId, InferGuard, LuaFunctionType, LuaMember, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaOperatorId, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId,
+    LuaType, LuaTypeDecl, SemanticModel, WorkspaceId,
 };
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
@@ -877,14 +877,14 @@ fn get_visible_call_operator_ids(
     }
 
     let infer_index = semantic_model.get_db().get_gmod_infer_index();
-    let caller_realm = infer_index.get_realm_at_offset(&caller_file_id, caller_position);
+    let caller_mask = infer_index.get_state_mask_at_offset(&caller_file_id, caller_position);
     for (_, tier_operator_ids) in priority_tiers {
         let compatible_operator_ids = tier_operator_ids
             .into_iter()
             .filter(|operator_id| {
-                let operator_realm =
-                    infer_index.get_realm_at_offset(&operator_id.file_id, operator_id.position);
-                is_operator_realm_compatible(caller_realm, operator_realm)
+                let operator_mask = infer_index
+                    .get_state_mask_at_offset(&operator_id.file_id, operator_id.position);
+                caller_mask.is_compatible_with(operator_mask)
             })
             .collect::<Vec<_>>();
         if !compatible_operator_ids.is_empty() {
@@ -893,13 +893,6 @@ fn get_visible_call_operator_ids(
     }
 
     Some(fallback_operator_ids)
-}
-
-fn is_operator_realm_compatible(caller_realm: GmodRealm, candidate_realm: GmodRealm) -> bool {
-    !matches!(
-        (caller_realm, candidate_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
 }
 
 fn build_index_expr_hint(

@@ -371,7 +371,9 @@ fn merge_docless_realms(
     }
 
     let merged = match caller_realm {
-        glua_code_analysis::GmodRealm::Server | glua_code_analysis::GmodRealm::Client => {
+        glua_code_analysis::GmodRealm::Server
+        | glua_code_analysis::GmodRealm::Client
+        | glua_code_analysis::GmodRealm::Menu => {
             if incoming_realm == glua_code_analysis::GmodRealm::Shared {
                 glua_code_analysis::GmodRealm::Shared
             } else {

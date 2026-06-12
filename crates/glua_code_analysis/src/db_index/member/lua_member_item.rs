@@ -194,9 +194,7 @@ fn visible_single_member_id_with_realm_at_offset(
         .get_gmod_infer_index()
         .get_realm_at_offset(caller_file_id, caller_position);
     let member_realm = member_effective_realm(db.get_gmod_infer_index(), &member_id);
-    if is_realm_compatible(caller_realm, member_realm)
-        || !matches!(caller_realm, GmodRealm::Client | GmodRealm::Server)
-    {
+    if is_realm_compatible(caller_realm, member_realm) {
         Some(member_id)
     } else {
         None
@@ -937,7 +935,7 @@ fn select_member_ids_by_workspace_and_realm(
         }
     }
 
-    if result.is_empty() && !matches!(caller_realm, GmodRealm::Client | GmodRealm::Server) {
+    if result.is_empty() && caller_realm.state_mask().is_empty() {
         return fallback_member_ids;
     }
 
@@ -1021,10 +1019,10 @@ fn member_effective_realm(
 fn realm_match_rank(caller_realm: GmodRealm, member_realm: GmodRealm) -> u8 {
     if caller_realm == member_realm {
         0
-    } else if member_realm == GmodRealm::Shared {
-        1
     } else if member_realm == GmodRealm::Unknown {
         2
+    } else if caller_realm.is_compatible_with(member_realm) {
+        1
     } else {
         3
     }
@@ -1057,10 +1055,7 @@ fn member_item_from_ids(member_ids: Vec<LuaMemberId>) -> LuaMemberIndexItem {
 }
 
 fn is_realm_compatible(call_realm: GmodRealm, decl_realm: GmodRealm) -> bool {
-    !matches!(
-        (call_realm, decl_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
+    call_realm.is_compatible_with(decl_realm)
 }
 
 fn resolve_type_owner_member_id(

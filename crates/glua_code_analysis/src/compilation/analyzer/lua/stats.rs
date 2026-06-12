@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::{
-    CacheEntry, FileId, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
-    LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
+    CacheEntry, FileId, InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId,
+    LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::{
         analyzer::{
             common::{add_member, bind_type},
@@ -1685,14 +1685,11 @@ fn is_member_realm_compatible(
     }
 
     let infer_index = analyzer.db.get_gmod_infer_index();
-    let current_realm = infer_index
-        .get_realm_at_offset(&current_member_id.file_id, current_member_id.get_position());
-    let related_realm = infer_index
-        .get_realm_at_offset(&related_member_id.file_id, related_member_id.get_position());
-
-    !matches!(
-        (current_realm, related_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
+    infer_index.are_offsets_compatible(
+        &current_member_id.file_id,
+        current_member_id.get_position(),
+        &related_member_id.file_id,
+        related_member_id.get_position(),
     )
 }
 

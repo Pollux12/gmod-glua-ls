@@ -992,6 +992,7 @@ fn realms_can_reach(target: GmodRealm, source: GmodRealm) -> bool {
             source,
             GmodRealm::Client | GmodRealm::Shared | GmodRealm::Unknown
         ),
+        GmodRealm::Menu => matches!(source, GmodRealm::Menu | GmodRealm::Unknown),
     }
 }
 

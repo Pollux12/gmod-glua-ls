@@ -2,7 +2,7 @@
 mod tests {
     use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
     use googletest::prelude::*;
-    use lsp_types::{DiagnosticSeverity, NumberOrString};
+    use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
     fn enable_only_realm_mismatch_diagnostics(ws: &mut VirtualWorkspace) {
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[gtest]
-    fn test_reports_unknown_realm_when_callsite_realm_is_unresolved() {
+    fn test_does_not_report_unknown_realm_when_callsite_has_default_menu_realm() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -315,13 +315,13 @@ mod tests {
         let unknown_code = Some(NumberOrString::String(
             DiagnosticCode::GmodUnknownRealm.get_name().to_string(),
         ));
-        let diagnostic = diagnostics
+        let diagnostic_count = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == unknown_code);
-        assert!(diagnostic.is_some());
+            .filter(|diagnostic| diagnostic.code == unknown_code)
+            .count();
         assert_eq!(
-            diagnostic.and_then(|diagnostic| diagnostic.severity),
-            Some(DiagnosticSeverity::HINT)
+            diagnostic_count, 0,
+            "file-level realm indexing assigns Menu instead of leaving the callsite Unknown"
         );
     }
 

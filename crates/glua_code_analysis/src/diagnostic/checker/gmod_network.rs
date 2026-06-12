@@ -418,7 +418,7 @@ fn opposite_realm(realm: GmodRealm) -> Option<GmodRealm> {
     match realm {
         GmodRealm::Client => Some(GmodRealm::Server),
         GmodRealm::Server => Some(GmodRealm::Client),
-        GmodRealm::Shared | GmodRealm::Unknown => None,
+        GmodRealm::Shared | GmodRealm::Menu | GmodRealm::Unknown => None,
     }
 }
 
@@ -427,6 +427,7 @@ fn realm_label(realm: GmodRealm) -> &'static str {
         GmodRealm::Client => "client",
         GmodRealm::Server => "server",
         GmodRealm::Shared => "shared",
+        GmodRealm::Menu => "menu",
         GmodRealm::Unknown => "unknown",
     }
 }

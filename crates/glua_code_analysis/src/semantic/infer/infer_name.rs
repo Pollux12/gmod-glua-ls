@@ -6,9 +6,9 @@ use rowan::TextSize;
 
 use super::{InferFailReason, InferResult, infer_expr};
 use crate::{
-    CacheEntry, FileId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel,
-    TypeOps,
+    CacheEntry, FileId, GmodStateMask, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache,
+    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
+    SemanticDeclLevel, TypeOps,
     compilation::{analyzer::infer_for_range_iter_expr_func, get_scripted_class_type_decl_id},
     db_index::{DbIndex, LuaDeclOrMemberId},
     infer_node_semantic_decl,
@@ -1118,12 +1118,12 @@ pub fn infer_global_type(
     // A top-priority global can exist before its type cache is resolved while
     // analyzing assignments such as `x = x`. It must not hide lower-priority
     // declarations that describe the value being read.
-    let call_realm = if db.get_emmyrc().gmod.enabled {
+    let call_state_mask = if db.get_emmyrc().gmod.enabled {
         current_file_id
             .zip(call_offset)
             .map(|(file_id, call_offset)| {
                 db.get_gmod_infer_index()
-                    .get_realm_at_offset(&file_id, call_offset)
+                    .get_state_mask_at_offset(&file_id, call_offset)
             })
     } else {
         None
@@ -1133,9 +1133,12 @@ pub fn infer_global_type(
     let mut saw_compatible_tier = false;
     let mut fallback_best_tier = None;
     for (_, decl_ids) in priority_tiers {
-        let decl_ids = if let Some(call_realm) = call_realm {
-            let selected_decl_ids =
-                select_realm_compatible_decl_ids_for_global_infer_tier(db, call_realm, &decl_ids);
+        let decl_ids = if let Some(call_state_mask) = call_state_mask {
+            let selected_decl_ids = select_realm_compatible_decl_ids_for_global_infer_tier(
+                db,
+                call_state_mask,
+                &decl_ids,
+            );
             if selected_decl_ids.is_empty() {
                 if fallback_best_tier.is_none() {
                     fallback_best_tier = Some(decl_ids);
@@ -1388,7 +1391,7 @@ fn has_legacy_module_namespace_for_file(db: &DbIndex, file_id: Option<FileId>, n
 
 fn select_realm_compatible_decl_ids_for_global_infer_tier(
     db: &DbIndex,
-    call_realm: GmodRealm,
+    call_state_mask: GmodStateMask,
     decl_ids: &[LuaDeclId],
 ) -> Vec<LuaDeclId> {
     let infer_index = db.get_gmod_infer_index();
@@ -1396,17 +1399,11 @@ fn select_realm_compatible_decl_ids_for_global_infer_tier(
         .iter()
         .copied()
         .filter(|decl_id| {
-            let decl_realm = infer_index.get_realm_at_offset(&decl_id.file_id, decl_id.position);
-            is_realm_compatible(call_realm, decl_realm)
+            let decl_state_mask =
+                infer_index.get_state_mask_at_offset(&decl_id.file_id, decl_id.position);
+            call_state_mask.is_compatible_with(decl_state_mask)
         })
         .collect()
-}
-
-fn is_realm_compatible(call_realm: GmodRealm, decl_realm: GmodRealm) -> bool {
-    !matches!(
-        (call_realm, decl_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
 }
 
 /// Resolves the full `self` reference identity for a `self` name expression.
