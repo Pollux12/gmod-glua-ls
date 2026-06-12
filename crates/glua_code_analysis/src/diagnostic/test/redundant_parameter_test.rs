@@ -238,6 +238,48 @@ mod test {
         ));
     }
 
+    #[test]
+    fn test_vgui_registered_table_inherits_panel_method_optional_param() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class Panel
+            local Panel = {}
+
+            ---@param layoutNow? boolean
+            function Panel:InvalidateLayout(layoutNow) end
+
+            vgui = {}
+
+            ---@generic T: table
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panel T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base? string
+            ---@return T
+            function vgui.RegisterTable(panel, base) end
+        "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            local panelType = vgui.RegisterTable({
+                Layout = function(self)
+                    self:InvalidateLayout()
+                    self:InvalidateLayout(true)
+                end
+            }, "Panel")
+            "#
+        ));
+    }
+
     // Real-world repro: `Vector(seat.GlideExitPos[1], -seat.GlideExitPos[2], seat.GlideExitPos[3])`
     // where `seat.GlideExitPos` is inferred as `Vector | nil` after an `if cond then ... else nil end`
     // on an unannotated (unknown) parameter. The 3-arg call must NOT be matched against a 1-arg
