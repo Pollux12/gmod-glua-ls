@@ -302,7 +302,7 @@ fn get_constraint_type(
         LuaType::TplRef(tpl_ref) | LuaType::ConstTplRef(tpl_ref) => {
             tpl_ref.get_constraint().cloned()
         }
-        LuaType::StrTplRef(str_tpl_ref) => str_tpl_ref.get_constraint().cloned(),
+        LuaType::StrTplRef(_) => None,
         LuaType::Union(union_type) => {
             if depth > 1 {
                 return None;

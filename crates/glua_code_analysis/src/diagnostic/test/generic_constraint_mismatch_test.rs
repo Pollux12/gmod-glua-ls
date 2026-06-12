@@ -237,6 +237,33 @@ mod test {
     }
 
     #[gtest]
+    fn test_str_tpl_ref_forwarded_generic_class_name_no_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::GenericConstraintMismatch,
+                r#"
+                    ---@class Panel
+
+                    ---@generic T: Panel
+                    ---@param className `T`
+                    ---@return T
+                    function create_x(className) end
+
+                    ---@generic T: Panel
+                    ---@param className `T`
+                    ---@return T
+                    function create(className)
+                        return create_x(className)
+                    end
+                "#
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_str_tpl_ref_missing_type_with_constraint_reports_hint_for_auto_created_type() {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
