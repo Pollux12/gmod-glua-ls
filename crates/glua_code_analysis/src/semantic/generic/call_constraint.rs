@@ -212,11 +212,84 @@ fn infer_call_doc_function(
                 .get_db()
                 .get_signature_index()
                 .get(&signature_id)?;
+            for overload in &signature.overloads {
+                if overload_matches_call(semantic_model, call_expr, overload) {
+                    return Some(overload.clone());
+                }
+            }
             Some(signature.to_doc_func_type())
         }
         LuaType::DocFunction(func) => Some(func),
         _ => None,
     }
+}
+
+fn overload_matches_call(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    overload: &LuaFunctionType,
+) -> bool {
+    let mut params = overload.get_params().to_vec();
+    let Some(mut arg_infos) = get_arg_infos(semantic_model, call_expr) else {
+        return false;
+    };
+
+    match (call_expr.is_colon_call(), overload.is_colon_define()) {
+        (true, true) | (false, false) => {}
+        (false, true) => {
+            params.insert(0, ("self".into(), Some(LuaType::SelfInfer)));
+        }
+        (true, false) => {
+            let Some(source_type) = infer_call_source_type(semantic_model, call_expr) else {
+                return false;
+            };
+            arg_infos.insert(0, source_type);
+        }
+    }
+
+    let variadic_index = params.iter().position(|(name, _)| name == "...");
+    let fixed_param_count = variadic_index.unwrap_or(params.len());
+    let required_param_count = params
+        .iter()
+        .take(fixed_param_count)
+        .enumerate()
+        .filter(|(idx, _)| !overload.is_param_optional(*idx))
+        .count();
+    if arg_infos.len() < required_param_count {
+        return false;
+    }
+    if variadic_index.is_none() && arg_infos.len() > fixed_param_count {
+        return false;
+    }
+
+    for (idx, (_, param_type)) in params.iter().take(fixed_param_count).enumerate() {
+        let Some(arg_type) = arg_infos.get(idx) else {
+            break;
+        };
+        let Some(param_type) = param_type else {
+            continue;
+        };
+        if matches!(
+            (param_type, arg_type),
+            (
+                LuaType::Any | LuaType::Unknown | LuaType::Never | LuaType::SelfInfer,
+                _
+            ) | (
+                _,
+                LuaType::Any | LuaType::Unknown | LuaType::Never | LuaType::SelfInfer
+            )
+        ) {
+            continue;
+        }
+        if semantic_model
+            .type_check_detail(param_type, arg_type)
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 // 获取约束类型

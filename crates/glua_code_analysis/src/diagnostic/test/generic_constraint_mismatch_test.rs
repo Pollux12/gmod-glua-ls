@@ -212,6 +212,31 @@ mod test {
     }
 
     #[gtest]
+    fn test_str_tpl_ref_overload_match_does_not_check_base_generic_signature() {
+        let mut ws = VirtualWorkspace::new();
+
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::GenericConstraintMismatch,
+                r#"
+                    ---@class Panel
+
+                    ---@generic T: Panel
+                    ---@overload fun(self: Panel, panelTable: table): Panel
+                    ---@param className `T`
+                    ---@return T
+                    function Panel:Add(className) end
+
+                    local PANEL = {}
+                    local parent ---@type Panel
+                    parent:Add(PANEL)
+                "#
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_str_tpl_ref_missing_type_with_constraint_reports_hint_for_auto_created_type() {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
