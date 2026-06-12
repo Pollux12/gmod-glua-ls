@@ -1,5 +1,6 @@
 use glua_code_analysis::{
     LuaDeclId, LuaMemberId, LuaMemberOwner, LuaType, LuaTypeDeclId, SemanticModel,
+    resolve_alias_type,
 };
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat,
@@ -248,8 +249,11 @@ fn find_gmod_class_from_type(
     semantic_model: &SemanticModel,
     typ: &LuaType,
 ) -> Option<GmodClassInfo> {
-    match typ {
-        LuaType::Def(type_id) => find_gmod_class_from_type_id(semantic_model, type_id),
+    let resolved = resolve_alias_type(semantic_model.get_db(), typ);
+    match &resolved.typ {
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            find_gmod_class_from_type_id(semantic_model, type_id)
+        }
         _ => None,
     }
 }
@@ -279,7 +283,8 @@ fn find_gmod_class_from_type_id(
         .get_super_types(type_id)?;
 
     for super_type in supers {
-        let super_name = match &super_type {
+        let resolved_super = resolve_alias_type(semantic_model.get_db(), &super_type);
+        let super_name = match &resolved_super.typ {
             LuaType::Def(id) | LuaType::Ref(id) => id.get_simple_name(),
             _ => continue,
         };

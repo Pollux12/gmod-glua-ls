@@ -5,7 +5,7 @@ use std::sync::Arc;
 use glua_code_analysis::{
     AsyncState, FileId, GmodRealm, InferGuard, LuaFunctionType, LuaMember, LuaMemberId,
     LuaMemberKey, LuaMemberOwner, LuaOperatorId, LuaOperatorMetaMethod, LuaOperatorOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeDecl, SemanticModel, WorkspaceId,
+    LuaSemanticDeclId, LuaType, LuaTypeDecl, SemanticModel, WorkspaceId, resolve_alias_type,
 };
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
@@ -529,7 +529,8 @@ fn get_vgui_panel_name(
     semantic_model: &SemanticModel,
     typ: &LuaType,
 ) -> Option<(String, Option<String>)> {
-    match typ {
+    let resolved = resolve_alias_type(semantic_model.get_db(), typ);
+    match &resolved.typ {
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
             let type_name = type_decl_id.get_simple_name();
             let base_name = semantic_model
@@ -1165,6 +1166,12 @@ fn get_scripted_entity_suffix(
     };
 
     // Check VGUI panels first
+    let member_type = LuaType::Ref(type_id.clone());
+    let resolved = resolve_alias_type(semantic_model.get_db(), &member_type);
+    let type_id = match &resolved.typ {
+        LuaType::Ref(id) | LuaType::Def(id) => id,
+        _ => return None,
+    };
     let type_name = type_id.get_simple_name();
     if let Some(base_name) = semantic_model
         .get_db()
@@ -1184,11 +1191,11 @@ fn get_scripted_entity_suffix(
         .get_super_types(type_id)?;
 
     for super_type in supers {
-        let super_id = match &super_type {
-            LuaType::Ref(id) => id,
+        let resolved_super = resolve_alias_type(semantic_model.get_db(), &super_type);
+        let super_name = match &resolved_super.typ {
+            LuaType::Ref(id) | LuaType::Def(id) => id.get_simple_name(),
             _ => continue,
         };
-        let super_name = super_id.get_simple_name();
         match super_name {
             "ENT" | "Entity" | "SWEP" | "Weapon" | "EFFECT" | "TOOL" | "Tool" | "PLUGIN" | "GM" => {
                 return Some(format!(" ({type_name} : {super_name})"));

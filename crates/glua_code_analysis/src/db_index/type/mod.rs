@@ -24,6 +24,55 @@ pub use type_owner::{LuaTypeCache, LuaTypeOwner};
 pub use type_visit_trait::TypeVisitTrait;
 pub use types::*;
 
+#[derive(Debug, Clone)]
+pub struct LuaResolvedAliasType {
+    pub alias_id: Option<LuaTypeDeclId>,
+    pub typ: LuaType,
+}
+
+pub fn resolve_alias_type(db: &DbIndex, typ: &LuaType) -> LuaResolvedAliasType {
+    let mut visited_aliases = HashSet::new();
+    resolve_alias_type_inner(db, typ, None, &mut visited_aliases)
+}
+
+fn resolve_alias_type_inner(
+    db: &DbIndex,
+    typ: &LuaType,
+    alias_id: Option<LuaTypeDeclId>,
+    visited_aliases: &mut HashSet<LuaTypeDeclId>,
+) -> LuaResolvedAliasType {
+    let (LuaType::Ref(type_id) | LuaType::Def(type_id)) = typ else {
+        return LuaResolvedAliasType {
+            alias_id,
+            typ: typ.clone(),
+        };
+    };
+
+    let Some(type_decl) = db.get_type_index().get_type_decl(type_id) else {
+        return LuaResolvedAliasType {
+            alias_id,
+            typ: typ.clone(),
+        };
+    };
+
+    if !type_decl.is_alias() || !visited_aliases.insert(type_id.clone()) {
+        return LuaResolvedAliasType {
+            alias_id,
+            typ: typ.clone(),
+        };
+    }
+
+    let Some(origin) = type_decl.get_alias_origin(db, None) else {
+        return LuaResolvedAliasType {
+            alias_id,
+            typ: typ.clone(),
+        };
+    };
+
+    let alias_id = alias_id.or_else(|| Some(type_id.clone()));
+    resolve_alias_type_inner(db, &origin, alias_id, visited_aliases)
+}
+
 fn replace_table_const_in_type(
     typ: &LuaType,
     table_range: &InFiled<TextRange>,

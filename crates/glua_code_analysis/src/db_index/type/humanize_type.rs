@@ -110,6 +110,12 @@ pub fn humanize_type(db: &DbIndex, ty: &LuaType, level: RenderLevel) -> String {
         LuaType::DocBooleanConst(b) => b.to_string(),
         LuaType::Ref(id) => {
             if let Some(type_decl) = db.get_type_index().get_type_decl(id) {
+                if type_decl.is_alias() {
+                    if let Some(alias_type) = humanize_alias_ref_type(db, ty, level) {
+                        return alias_type;
+                    }
+                }
+
                 let name = type_decl.get_full_name().to_string();
                 humanize_simple_type(db, id, &name, level).unwrap_or(name)
             } else {
@@ -161,6 +167,27 @@ pub fn humanize_type(db: &DbIndex, ty: &LuaType, level: RenderLevel) -> String {
         }
         _ => "unknown".to_string(),
     }
+}
+
+fn humanize_alias_ref_type(db: &DbIndex, ty: &LuaType, level: RenderLevel) -> Option<String> {
+    if !matches!(
+        level,
+        RenderLevel::Documentation | RenderLevel::DetailedCount(_) | RenderLevel::Detailed
+    ) {
+        return None;
+    }
+
+    let resolved = super::resolve_alias_type(db, ty);
+    let alias_id = resolved.alias_id?;
+    if resolved.typ == *ty {
+        return None;
+    }
+
+    Some(format!(
+        "(alias) {} = {}",
+        alias_id.get_simple_name(),
+        humanize_type(db, &resolved.typ, level)
+    ))
 }
 
 fn humanize_def_type(db: &DbIndex, id: &LuaTypeDeclId, level: RenderLevel) -> String {
