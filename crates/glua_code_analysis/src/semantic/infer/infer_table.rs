@@ -251,9 +251,34 @@ fn infer_table_type_by_callee(
     call_arg_list: LuaCallArgList,
     table_expr: LuaTableExpr,
 ) -> InferResult {
+    let call_arg_number = call_arg_list
+        .children::<LuaAst>()
+        .enumerate()
+        .find(|(_, arg)| arg.get_position() == table_expr.get_position())
+        .ok_or(InferFailReason::None)?
+        .0;
     let call_expr = call_arg_list
         .get_parent::<LuaCallExpr>()
         .ok_or(InferFailReason::None)?;
+    let typ = infer_call_arg_should_be(db, cache, call_expr, call_arg_number)?;
+    match &typ {
+        LuaType::TableConst(_) => {}
+        LuaType::Union(union) => {
+            // TODO: 假设存在多个匹配项, 我们需要根据字段的匹配情况来确定最终的类型
+            return Ok(union_remove_non_table_type(db, union));
+        }
+        _ => {}
+    }
+
+    Ok(typ)
+}
+
+fn infer_call_arg_should_be(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: LuaCallExpr,
+    mut call_arg_number: usize,
+) -> InferResult {
     let prefix_expr = call_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
     let prefix_type = infer_expr(db, cache, prefix_expr)?;
     let func_type = infer_call_expr_func(
@@ -264,13 +289,6 @@ fn infer_table_type_by_callee(
         &InferGuard::new(),
         None,
     )?;
-    let param_types = func_type.get_params();
-    let mut call_arg_number = call_arg_list
-        .children::<LuaAst>()
-        .enumerate()
-        .find(|(_, arg)| arg.get_position() == table_expr.get_position())
-        .ok_or(InferFailReason::None)?
-        .0;
     match (func_type.is_colon_define(), call_expr.is_colon_call()) {
         (true, true) | (false, false) => {}
         (false, true) => {
@@ -280,21 +298,13 @@ fn infer_table_type_by_callee(
             call_arg_number = call_arg_number.saturating_sub(1);
         }
     }
-    let typ = param_types
+    let typ = func_type
+        .get_params()
         .get(call_arg_number)
         .ok_or(InferFailReason::None)?
         .1
         .clone()
         .unwrap_or(LuaType::Any);
-    match &typ {
-        LuaType::TableConst(_) => {}
-        LuaType::Union(union) => {
-            // TODO: 假设存在多个匹配项, 我们需要根据字段的匹配情况来确定最终的类型
-            return Ok(union_remove_non_table_type(db, union));
-        }
-        _ => {}
-    }
-
     Ok(typ)
 }
 
@@ -393,10 +403,80 @@ fn infer_table_type_by_local(
     let decl_id = LuaDeclId::new(cache.get_file_id(), local_name.get_position());
     match db.get_type_index().get_type_cache(&decl_id.into()) {
         Some(type_cache) => match type_cache.as_type() {
-            LuaType::TableConst(_) => Err(InferFailReason::None),
+            LuaType::TableConst(_) => {
+                infer_table_type_from_local_call_references(db, cache, decl_id)
+            }
             typ => Ok(typ.clone()),
         },
-        None => Err(InferFailReason::UnResolveDeclType(decl_id)),
+        None => infer_table_type_from_local_call_references(db, cache, decl_id)
+            .map_err(|_| InferFailReason::UnResolveDeclType(decl_id)),
+    }
+}
+
+fn infer_table_type_from_local_call_references(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+) -> InferResult {
+    let file_id = cache.get_file_id();
+    let references = db
+        .get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .ok_or(InferFailReason::None)?;
+    if references
+        .cells
+        .iter()
+        .any(|cell| cell.is_write && cell.range.start() != decl_id.position)
+    {
+        return Err(InferFailReason::None);
+    }
+
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .ok_or(InferFailReason::None)?
+        .get_chunk_node();
+
+    let mut typ = LuaType::Unknown;
+    for cell in &references.cells {
+        if cell.is_write {
+            continue;
+        }
+
+        let Some(reference_expr) = root
+            .descendants::<LuaExpr>()
+            .find(|expr| expr.get_range() == cell.range)
+        else {
+            continue;
+        };
+
+        let Some(call_arg_list) = reference_expr.get_parent::<LuaCallArgList>() else {
+            continue;
+        };
+        let Some(call_expr) = call_arg_list.get_parent::<LuaCallExpr>() else {
+            continue;
+        };
+        let Some(call_arg_number) = call_arg_list
+            .get_args()
+            .position(|arg| arg.get_position() == reference_expr.get_position())
+        else {
+            continue;
+        };
+        let Ok(call_arg_type) = infer_call_arg_should_be(db, cache, call_expr, call_arg_number)
+        else {
+            continue;
+        };
+        if call_arg_type.is_any() || call_arg_type.is_unknown() {
+            continue;
+        }
+
+        typ = TypeOps::Union.apply(db, &typ, &call_arg_type);
+    }
+
+    if typ.is_unknown() {
+        Err(InferFailReason::None)
+    } else {
+        Ok(typ)
     }
 }
 

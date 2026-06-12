@@ -2259,4 +2259,47 @@ mod test {
             eq(true)
         );
     }
+
+    #[gtest]
+    fn test_contextual_table_argument_field_function_param_suppresses_nullable_receiver() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class ModelEntity
+            ---@field GetModel fun(self: ModelEntity): string
+
+
+            ---@class SkeletonConvertor
+            ---@field IsApplicable fun(self: SkeletonConvertor, ent: ModelEntity): boolean
+
+            ---@class listlib
+            list = {}
+
+            ---@overload fun(identifier: "SkeletonConvertor", key: string, item: SkeletonConvertor)
+            ---@param identifier string
+            ---@param key any
+            ---@param item any
+            function list.Set(identifier, key, item) end
+            "#,
+        );
+        let code = r#"
+            local Builder = {
+                IsApplicable = function(self, ent)
+                    local mdl = ent:GetModel()
+                    return mdl:EndsWith(".mdl")
+                end
+            }
+
+            list.Set("SkeletonConvertor", "TF2_engineer", Builder)
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "mdl may be nil"),
+            eq(false)
+        );
+    }
 }

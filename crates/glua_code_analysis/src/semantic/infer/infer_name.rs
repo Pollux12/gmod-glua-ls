@@ -1,10 +1,10 @@
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr,
-    LuaNameExpr, LuaVarExpr,
+    LuaNameExpr, LuaTableField, LuaVarExpr,
 };
 use rowan::TextSize;
 
-use super::{InferFailReason, InferResult, infer_expr};
+use super::{InferFailReason, InferResult, infer_expr, infer_table_field_value_should_be};
 use crate::{
     CacheEntry, FileId, GmodStateMask, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache,
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
@@ -695,6 +695,14 @@ pub fn get_name_expr_var_ref_id(
 }
 
 pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
+    infer_param_inner(db, None, decl)
+}
+
+fn infer_param_inner(
+    db: &DbIndex,
+    cache: Option<&mut LuaInferCache>,
+    decl: &LuaDecl,
+) -> InferResult {
     let (param_idx, signature_id, member_id) = match &decl.extra {
         LuaDeclExtra::Param {
             idx,
@@ -730,6 +738,19 @@ pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
         if let Some(param_type) = param_type {
             return Ok(param_type);
         }
+
+        if let Some(cache) = cache
+            && let Some(param_type) = find_param_type_from_contextual_member(
+                db,
+                cache,
+                current_member_id,
+                param_idx,
+                colon_define,
+                decl.get_name() == "...",
+            )
+        {
+            return Ok(param_type);
+        }
     }
 
     if let Some(file_hint_type) = infer_param_type_from_file_hint(db, decl) {
@@ -758,7 +779,7 @@ pub fn infer_param_with_cache(
     }
 
     cache.param_type_cache.insert(decl_id, CacheEntry::Ready);
-    let result = infer_param(db, decl);
+    let result = infer_param_inner(db, Some(cache), decl);
     match &result {
         Ok(typ) => {
             cache
@@ -776,6 +797,25 @@ pub fn infer_param_with_cache(
     }
 
     result
+}
+
+fn find_param_type_from_contextual_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    member_id: LuaMemberId,
+    param_idx: usize,
+    colon_define: bool,
+    is_dots: bool,
+) -> Option<LuaType> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_chunk_node();
+    let table_field = root
+        .descendants::<LuaTableField>()
+        .find(|field| field.get_syntax_id() == *member_id.get_syntax_id())?;
+    let field_type = infer_table_field_value_should_be(db, cache, table_field).ok()?;
+    find_param_type_from_type(db, field_type, param_idx, colon_define, is_dots)
 }
 
 fn infer_param_type_from_gmod_name_hint(db: &DbIndex, param_name: &str) -> Option<LuaType> {

@@ -549,6 +549,134 @@ mod test {
     }
 
     #[test]
+    fn test_local_table_field_function_param_infers_from_call_argument_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class ModelEntity
+            ---@field GetModel fun(self: ModelEntity): string
+
+            ---@class SkeletonConvertor
+            ---@field IsApplicable fun(self: SkeletonConvertor, ent: ModelEntity): boolean
+
+            ---@param builder SkeletonConvertor
+            function register(builder) end
+
+            local Builder = {
+                IsApplicable = function(self, ent)
+                    A = ent
+                    B = ent:GetModel()
+                    local model = ent:GetModel()
+                    C = model
+                    return true
+                end
+            }
+
+            register(Builder)
+            "#,
+        );
+        let ty = ws.expr_ty("A");
+        let expected = ws.ty("ModelEntity");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("B");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("C");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn test_local_table_field_function_param_infers_from_overload_call_argument_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class ModelEntity
+            ---@field GetModel fun(self: ModelEntity): string
+
+            ---@class SkeletonConvertor
+            ---@field IsApplicable fun(self: SkeletonConvertor, ent: ModelEntity): boolean
+
+            list = {}
+
+            ---@overload fun(identifier: "SkeletonConvertor", key: string, item: SkeletonConvertor)
+            ---@param identifier string
+            ---@param key any
+            ---@param item any
+            function list.Set(identifier, key, item) end
+
+            local Builder = {
+                IsApplicable = function(self, ent)
+                    A = ent
+                    B = ent:GetModel()
+                    local model = ent:GetModel()
+                    C = model
+                    return true
+                end
+            }
+
+            list.Set("SkeletonConvertor", "TF2_engineer", Builder)
+            "#,
+        );
+        let ty = ws.expr_ty("A");
+        let expected = ws.ty("ModelEntity");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("B");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("C");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn test_local_table_field_function_param_infers_from_cross_file_overload_call_argument_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class ModelEntity
+            ---@field GetModel fun(self: ModelEntity): string
+
+            ---@class SkeletonConvertor
+            ---@field IsApplicable fun(self: SkeletonConvertor, ent: ModelEntity): boolean
+
+            list = {}
+
+            ---@overload fun(identifier: "SkeletonConvertor", key: string, item: SkeletonConvertor)
+            ---@param identifier string
+            ---@param key any
+            ---@param item any
+            function list.Set(identifier, key, item) end
+            "#,
+        );
+        ws.def(
+            r#"
+            local Builder = {
+                IsApplicable = function(self, ent)
+                    A = ent
+                    B = ent:GetModel()
+                    local model = ent:GetModel()
+                    C = model
+                    return true
+                end
+            }
+
+            list.Set("SkeletonConvertor", "TF2_engineer", Builder)
+            "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        let expected = ws.ty("ModelEntity");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("B");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("C");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
     fn test_dot_function_param_inherit() {
         // Tests that dot-style function definitions inherit param types from
         // annotated Signatures (e.g. TOOL.BuildCPanel pattern in Garry's Mod)
