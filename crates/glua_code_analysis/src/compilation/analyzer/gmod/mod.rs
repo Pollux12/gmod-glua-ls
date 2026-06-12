@@ -15,7 +15,7 @@ use glua_parser::{
 };
 
 use crate::{
-    EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodDermaSkinCallRoles,
+    EmmyrcGmodRealm, FileId, GmodClassCallArgSource, GmodClassCallLiteral, GmodDermaSkinCallRoles,
     GmodNamedStringCallRoles, GmodNetworkVarCallRoles, GmodScriptedClassCallKind,
     GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, GmodVguiPanelCallRoles, InFiled,
     LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclLocation, LuaDeclTypeKind,
@@ -4024,7 +4024,88 @@ fn synthesize_panel_class_with_id(
             db.get_type_index_mut()
                 .replace_table_const_type(&table_range, &class_type);
         }
+    } else if let Some(table_expr) = find_inline_vgui_panel_table_expr(db, file_id, call_kind, call)
+    {
+        bind_inline_vgui_panel_table(db, file_id, &class_decl_id, table_expr);
     }
+}
+
+fn find_inline_vgui_panel_table_expr(
+    db: &DbIndex,
+    file_id: FileId,
+    call_kind: GmodScriptedClassCallKind,
+    call: &GmodScriptedClassCallMetadata,
+) -> Option<LuaTableExpr> {
+    let table_source = match call_kind {
+        GmodScriptedClassCallKind::VguiRegister => call.vgui_panel_table_arg_source(1),
+        GmodScriptedClassCallKind::VguiRegisterTable => call.vgui_panel_table_arg_source(0),
+        GmodScriptedClassCallKind::DermaDefineControl => call.vgui_panel_table_arg_source(2),
+        _ => return None,
+    };
+
+    find_table_expr_for_arg_source(db, file_id, call, &table_source)
+}
+
+fn find_table_expr_for_arg_source(
+    db: &DbIndex,
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+    table_source: &GmodClassCallArgSource,
+) -> Option<LuaTableExpr> {
+    let arg_range = if table_source.field_path.is_empty() {
+        call.args.get(table_source.arg_idx)?.syntax_id.get_range()
+    } else {
+        call.field_args
+            .iter()
+            .find(|arg| &arg.source == table_source)?
+            .syntax_id
+            .get_range()
+    };
+
+    let tree = db.get_vfs().get_syntax_tree(&file_id)?;
+    let chunk = tree.get_chunk_node();
+    chunk.descendants::<LuaTableExpr>().find(|table_expr| {
+        let table_range = table_expr.get_range();
+        table_range == arg_range
+            || (arg_range.start() <= table_range.start() && table_range.end() <= arg_range.end())
+    })
+}
+
+fn bind_inline_vgui_panel_table(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    table_expr: LuaTableExpr,
+) {
+    let class_type = LuaType::Def(class_decl_id.clone());
+    let table_syntax_owner =
+        LuaTypeOwner::SyntaxId(InFiled::new(file_id, table_expr.get_syntax_id()));
+    let preserve_doc = db
+        .get_type_index()
+        .get_type_cache(&table_syntax_owner)
+        .is_some_and(|cache| cache.is_doc());
+    if !preserve_doc {
+        db.get_type_index_mut().force_bind_type(
+            table_syntax_owner,
+            LuaTypeCache::InferType(class_type.clone()),
+        );
+    }
+
+    let table_range = InFiled::new(file_id, table_expr.get_range());
+    let source_owner = LuaMemberOwner::Element(table_range.clone());
+    let class_member_owner = LuaMemberOwner::Type(class_decl_id.clone());
+    let table_member_ids: Vec<_> = db
+        .get_member_index()
+        .get_members(&source_owner)
+        .map(|members| members.iter().map(|member| member.get_id()).collect())
+        .unwrap_or_default();
+
+    for member_id in table_member_ids {
+        add_member(db, class_member_owner.clone(), member_id);
+    }
+
+    db.get_type_index_mut()
+        .replace_table_const_type(&table_range, &class_type);
 }
 
 /// Collect the candidate `Element` owner ranges that may hold this

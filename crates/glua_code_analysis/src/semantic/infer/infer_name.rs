@@ -1,10 +1,13 @@
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr,
-    LuaNameExpr, LuaTableField, LuaVarExpr,
+    LuaNameExpr, LuaTableExpr, LuaTableField, LuaVarExpr,
 };
 use rowan::TextSize;
 
-use super::{InferFailReason, InferResult, infer_expr, infer_table_field_value_should_be};
+use super::{
+    InferFailReason, InferResult, infer_expr, infer_table_field_value_should_be,
+    infer_table_should_be,
+};
 use crate::{
     CacheEntry, FileId, GmodStateMask, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache,
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
@@ -746,6 +749,7 @@ fn infer_param_inner(
                 current_member_id,
                 param_idx,
                 colon_define,
+                decl.get_name() == "self",
                 decl.get_name() == "...",
             )
         {
@@ -805,6 +809,7 @@ fn find_param_type_from_contextual_member(
     member_id: LuaMemberId,
     param_idx: usize,
     colon_define: bool,
+    is_self_param: bool,
     is_dots: bool,
 ) -> Option<LuaType> {
     let root = db
@@ -814,8 +819,56 @@ fn find_param_type_from_contextual_member(
     let table_field = root
         .descendants::<LuaTableField>()
         .find(|field| field.get_syntax_id() == *member_id.get_syntax_id())?;
-    let field_type = infer_table_field_value_should_be(db, cache, table_field).ok()?;
-    find_param_type_from_type(db, field_type, param_idx, colon_define, is_dots)
+    let field_type = infer_table_field_value_should_be(db, cache, table_field.clone()).ok()?;
+    find_param_type_from_type(db, field_type, param_idx, colon_define, is_dots).or_else(|| {
+        if param_idx != 0 || colon_define || is_dots || !is_self_param {
+            return None;
+        }
+
+        let parent_table = table_field.get_parent::<LuaTableExpr>()?;
+        let parent_type = infer_table_should_be(db, cache, parent_table).ok()?;
+        if is_vgui_panel_context_type(db, &parent_type) {
+            Some(parent_type)
+        } else {
+            None
+        }
+    })
+}
+
+fn is_vgui_panel_context_type(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => type_decl_is_vgui_panel(db, type_id, 0),
+        _ => false,
+    }
+}
+
+fn type_decl_is_vgui_panel(db: &DbIndex, type_id: &LuaTypeDeclId, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+
+    if type_id.get_name() == "Panel" {
+        return true;
+    }
+
+    if db
+        .get_type_index()
+        .get_type_decl(type_id)
+        .is_some_and(|decl| decl.is_auto_generated())
+    {
+        return true;
+    }
+
+    db.get_type_index()
+        .get_super_types_iter(type_id)
+        .is_some_and(|mut super_types| {
+            super_types.any(|super_type| match super_type {
+                LuaType::Def(super_id) | LuaType::Ref(super_id) => {
+                    type_decl_is_vgui_panel(db, super_id, depth + 1)
+                }
+                _ => false,
+            })
+        })
 }
 
 fn infer_param_type_from_gmod_name_hint(db: &DbIndex, param_name: &str) -> Option<LuaType> {

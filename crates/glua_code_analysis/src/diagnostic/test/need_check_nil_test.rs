@@ -2302,4 +2302,104 @@ mod test {
             eq(false)
         );
     }
+
+    #[gtest]
+    fn test_cached_nested_annotated_field_is_not_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@class TestColor
+            ---@field r number
+            ---@field g number
+            ---@field b number
+            ---@field a number
+
+            ---@class TestSkinProperties
+            ---@field Border TestColor
+
+            ---@class TestSkinColours
+            ---@field Properties TestSkinProperties
+
+            ---@class TestSkin
+            ---@field Colours TestSkinColours
+
+            ---@class TestPanel
+            local PANEL = {}
+
+            ---@return TestSkin
+            function PANEL:GetSkin() end
+
+            function PANEL:Paint()
+                local skinColor = self:GetSkin().Colours.Properties.Border
+                draw(skinColor.r, skinColor.g, skinColor.b, skinColor.a)
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "cached non-null annotated field should not require a nil check"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_table_cached_nested_annotated_field_is_not_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class TestColor
+            ---@field r number
+            ---@field g number
+            ---@field b number
+            ---@field a number
+
+            ---@class TestSkinProperties
+            ---@field Border TestColor
+
+            ---@class TestSkinColours
+            ---@field Properties TestSkinProperties
+
+            ---@class TestSkin
+            ---@field Colours TestSkinColours
+
+            ---@class Panel
+
+            ---@return TestSkin
+            function Panel:GetSkin() end
+
+            vgui = {}
+
+            ---@generic T: table
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panel T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base? string
+            ---@return T
+            function vgui.RegisterTable(panel, base) end
+        "#,
+        );
+        let code = r#"
+            local tblRow = vgui.RegisterTable({
+                Paint = function(self)
+                    local skinColor = self:GetSkin().Colours.Properties.Border
+                    draw(skinColor.r, skinColor.g, skinColor.b, skinColor.a)
+                end
+            }, "Panel")
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "VGUI table callback self should preserve non-null annotated skin fields"
+        );
+    }
 }

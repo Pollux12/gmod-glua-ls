@@ -187,6 +187,14 @@ pub fn infer_table_should_be(
     cache: &mut LuaInferCache,
     table: LuaTableExpr,
 ) -> InferResult {
+    let table_syntax_owner = InFiled::new(cache.get_file_id(), table.get_syntax_id());
+    if let Some(bind_type_cache) = db
+        .get_type_index()
+        .get_type_cache(&table_syntax_owner.into())
+    {
+        return Ok(bind_type_cache.as_type().clone());
+    }
+
     match table.get_parent::<LuaAst>().ok_or(InferFailReason::None)? {
         LuaAst::LuaCallArgList(call_arg_list) => {
             infer_table_type_by_callee(db, cache, call_arg_list, table)
