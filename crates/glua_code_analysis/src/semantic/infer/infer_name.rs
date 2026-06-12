@@ -13,7 +13,7 @@ use crate::{
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     SemanticDeclLevel, TypeOps,
     compilation::{analyzer::infer_for_range_iter_expr_func, get_scripted_class_type_decl_id},
-    db_index::{DbIndex, LuaDeclOrMemberId},
+    db_index::{DbIndex, LuaDeclOrMemberId, LuaSignature},
     infer_node_semantic_decl,
     semantic::{
         infer::narrow::{
@@ -725,6 +725,28 @@ fn infer_param_inner(
                 typ = TypeOps::Union.apply(db, &typ, &LuaType::Nil);
             }
 
+            typ = union_signature_overload_param_types(
+                db,
+                signature,
+                typ,
+                param_idx,
+                colon_define,
+                decl.get_name() == "...",
+            );
+
+            if let Some(member_id) = member_id
+                && let Some(sibling_type) = find_param_type_from_sibling_members(
+                    db,
+                    member_id,
+                    param_idx,
+                    colon_define,
+                    decl.get_name() == "...",
+                    Some(&typ),
+                )
+            {
+                typ = TypeOps::Union.apply(db, &typ, &sibling_type);
+            }
+
             return Ok(typ);
         }
     }
@@ -739,6 +761,17 @@ fn infer_param_inner(
             decl.get_name() == "...",
         );
         if let Some(param_type) = param_type {
+            return Ok(param_type);
+        }
+
+        if let Some(param_type) = find_param_type_from_sibling_members(
+            db,
+            current_member_id,
+            param_idx,
+            colon_define,
+            decl.get_name() == "...",
+            None,
+        ) {
             return Ok(param_type);
         }
 
@@ -766,6 +799,100 @@ fn infer_param_inner(
     }
 
     Err(InferFailReason::UnResolveDeclType(decl.get_id()))
+}
+
+fn find_param_type_from_sibling_members(
+    db: &DbIndex,
+    current_member_id: LuaMemberId,
+    param_idx: usize,
+    colon_define: bool,
+    is_dots: bool,
+    current_type: Option<&LuaType>,
+) -> Option<LuaType> {
+    if let Some(current_type) = current_type
+        && !current_type.is_number()
+    {
+        return None;
+    }
+
+    let member_index = db.get_member_index();
+    let owner = member_index.get_current_owner(&current_member_id)?;
+    let key = member_index.get_member(&current_member_id)?.get_key();
+
+    let mut final_type = None;
+    for member in member_index.get_current_owner_members_for_key(owner, key) {
+        if member.get_id() == current_member_id {
+            continue;
+        }
+
+        let member_type = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())?
+            .as_type()
+            .clone();
+        let Some(param_type) =
+            find_overload_param_type_from_type(db, member_type, param_idx, colon_define, is_dots)
+        else {
+            continue;
+        };
+
+        if is_dots && param_type.is_any() {
+            return Some(param_type);
+        }
+
+        final_type = match final_type {
+            Some(existing) => Some(TypeOps::Union.apply(db, &existing, &param_type)),
+            None => Some(param_type),
+        };
+    }
+
+    final_type
+}
+
+fn find_overload_param_type_from_type(
+    db: &DbIndex,
+    source_type: LuaType,
+    param_idx: usize,
+    current_colon_define: bool,
+    is_dots: bool,
+) -> Option<LuaType> {
+    match source_type {
+        LuaType::Signature(signature_id) => {
+            let signature = db.get_signature_index().get(&signature_id)?;
+            find_signature_overload_param_type(
+                db,
+                signature,
+                param_idx,
+                current_colon_define,
+                is_dots,
+            )
+        }
+        LuaType::Union(union_types) => {
+            let mut final_type = None;
+            for ty in union_types.into_vec() {
+                let Some(param_type) = find_overload_param_type_from_type(
+                    db,
+                    ty,
+                    param_idx,
+                    current_colon_define,
+                    is_dots,
+                ) else {
+                    continue;
+                };
+
+                if is_dots && param_type.is_any() {
+                    return Some(param_type);
+                }
+
+                final_type = match final_type {
+                    Some(existing) => Some(TypeOps::Union.apply(db, &existing, &param_type)),
+                    None => Some(param_type),
+                };
+            }
+            final_type
+        }
+        _ => None,
+    }
 }
 
 pub fn infer_param_with_cache(
@@ -975,6 +1102,57 @@ fn check_dots_param_types(
     None
 }
 
+fn union_signature_overload_param_types(
+    db: &DbIndex,
+    signature: &LuaSignature,
+    mut final_type: LuaType,
+    param_idx: usize,
+    current_colon_define: bool,
+    is_dots: bool,
+) -> LuaType {
+    if let Some(overload_type) =
+        find_signature_overload_param_type(db, signature, param_idx, current_colon_define, is_dots)
+    {
+        final_type = TypeOps::Union.apply(db, &final_type, &overload_type);
+    }
+
+    final_type
+}
+
+fn find_signature_overload_param_type(
+    db: &DbIndex,
+    signature: &LuaSignature,
+    param_idx: usize,
+    current_colon_define: bool,
+    is_dots: bool,
+) -> Option<LuaType> {
+    let mut final_type = None;
+    for overload in &signature.overloads {
+        let adjusted_idx =
+            adjust_param_idx(param_idx, current_colon_define, overload.is_colon_define());
+
+        let Some((_, cur_type)) = overload.get_params().get(adjusted_idx) else {
+            continue;
+        };
+
+        if is_dots
+            && let Some(any_type) =
+                check_dots_param_types(overload.get_params(), adjusted_idx, cur_type)
+        {
+            return Some(any_type);
+        }
+
+        if let Some(typ) = cur_type {
+            final_type = match final_type {
+                Some(existing) => Some(TypeOps::Union.apply(db, &existing, typ)),
+                None => Some(typ.clone()),
+            };
+        }
+    }
+
+    final_type
+}
+
 fn find_param_type_from_type(
     db: &DbIndex,
     source_type: LuaType,
@@ -994,7 +1172,14 @@ fn find_param_type_from_type(
                     if param_info.nullable && !typ.is_nullable() {
                         typ = TypeOps::Union.apply(db, &typ, &LuaType::Nil);
                     }
-                    Some(typ)
+                    Some(union_signature_overload_param_types(
+                        db,
+                        signature,
+                        typ,
+                        param_idx,
+                        current_colon_define,
+                        is_dots,
+                    ))
                 }
                 None => {
                     if !signature.param_docs.is_empty() {
@@ -1078,7 +1263,14 @@ fn find_param_type_from_union(
                     if param_info.nullable && !typ.is_nullable() {
                         typ = TypeOps::Union.apply(db, &typ, &LuaType::Nil);
                     }
-                    Some(typ)
+                    Some(union_signature_overload_param_types(
+                        db,
+                        signature,
+                        typ,
+                        param_idx,
+                        origin_colon_define,
+                        is_dots,
+                    ))
                 } else {
                     None
                 };

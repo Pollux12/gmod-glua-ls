@@ -177,6 +177,109 @@ mod test {
     }
 
     #[test]
+    fn metatable_overload_parameter_type_is_visible_inside_function_body_guards() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@meta
+
+            ---@param value any
+            ---@return TypeGuard<table>
+            function _G.istable(value) end
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function _G.FindMetaTable(metaName) end
+            "#,
+        );
+        ws.def_file(
+            "annotations/color.lua",
+            r#"
+            ---@meta
+
+            ---@class Color
+            ---@field r number The red component of the color.
+            ---@field g number The green component of the color.
+            ---@field b number The blue component of the color.
+            ---@field a number The alpha component of the color.
+            local Color = {}
+            "#,
+        );
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+
+            ---@class Panel
+            Panel = Panel or {}
+
+            ---@overload fun(color: Color)
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a number
+            function Panel:SetFGColor(r, g, b, a) end
+
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a number
+            function Panel:SetFGColorEx(r, g, b, a) end
+
+            ---@overload fun(color: Color)
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a number
+            function Panel:SetBGColor(r, g, b, a) end
+
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a number
+            function Panel:SetBGColorEx(r, g, b, a) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/includes/extensions/client/panel.lua",
+            r#"
+            local meta = FindMetaTable("Panel")
+
+            meta.SetFGColorEx = meta.SetFGColor
+            meta.SetBGColorEx = meta.SetBGColor
+
+            function meta:SetFGColor(r, g, b, a)
+                if istable(r) then
+                    return self:SetFGColorEx(r.r, r.g, r.b, r.a)
+                end
+            end
+
+            function meta:SetBGColor(r, g, b, a)
+                if istable(r) then
+                    return self:SetBGColorEx(r.r, r.g, r.b, r.a)
+                end
+            end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn test_1() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(
