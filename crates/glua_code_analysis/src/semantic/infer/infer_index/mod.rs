@@ -1179,6 +1179,35 @@ fn infer_custom_type_member(
         &key,
         Some(index_expr.get_position()),
     ) {
+        if type_decl.is_class()
+            && let Some(super_types) = type_index.get_super_types(&prefix_type_id)
+        {
+            for super_type in super_types {
+                let result = infer_member_by_member_key(
+                    db,
+                    cache,
+                    &super_type,
+                    index_expr.clone(),
+                    infer_guard,
+                );
+
+                match result {
+                    Ok(super_member_type) => {
+                        if dynamic_field.typ.is_function() || super_member_type.is_function() {
+                            return Ok(LuaType::from_vec(vec![
+                                dynamic_field.typ,
+                                super_member_type,
+                            ]));
+                        }
+
+                        return Ok(dynamic_field.typ);
+                    }
+                    Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
         return Ok(dynamic_field.typ);
     }
 

@@ -280,6 +280,99 @@ mod test {
         ));
     }
 
+    #[test]
+    fn test_instance_dynamic_panel_field_does_not_shadow_inherited_panel_method() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class Panel
+            local Panel = {}
+
+            ---@param layoutNow? boolean
+            function Panel:InvalidateLayout(layoutNow) end
+
+            ---@class DPanel: Panel
+            local DPanel = {}
+            "#,
+        );
+
+        ws.def_file(
+            "lua/vgui/dpanel.lua",
+            r#"
+            local PANEL = {}
+
+            vgui.Register("DPanel", PANEL, "Panel")
+            "#,
+        );
+
+        ws.def_file(
+            "lua/vgui/dpanellist.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.pnlCanvas = vgui.Create("DPanel", self)
+                self.pnlCanvas.InvalidateLayout = function()
+                    self:InvalidateLayout()
+                end
+            end
+
+            vgui.Register("DPanelList", PANEL, "Panel")
+            "#,
+        );
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/vgui/dtree_node.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Layout()
+                self:InvalidateLayout(true)
+            end
+
+            vgui.Register("DTreeNode", PANEL, "Panel")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_dynamic_callable_member_preserves_inherited_callable_arity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ---@class BasePanel
+            local BasePanel = {}
+
+            ---@param immediate? boolean
+            function BasePanel:InvalidateLayout(immediate) end
+
+            ---@class ChildPanel: BasePanel
+            local ChildPanel = {}
+
+            ---@type ChildPanel
+            local canvas = {}
+            canvas.InvalidateLayout = function() end
+
+            ---@type ChildPanel
+            local panel = {}
+            panel:InvalidateLayout(true)
+            "#
+        ));
+    }
+
     // Real-world repro: `Vector(seat.GlideExitPos[1], -seat.GlideExitPos[2], seat.GlideExitPos[3])`
     // where `seat.GlideExitPos` is inferred as `Vector | nil` after an `if cond then ... else nil end`
     // on an unannotated (unknown) parameter. The 3-arg call must NOT be matched against a 1-arg
