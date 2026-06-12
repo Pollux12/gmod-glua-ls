@@ -516,7 +516,7 @@ fn get_decl_position_var_ref_type(
 }
 
 fn should_retry_decl_initializer_type(typ: &LuaType) -> bool {
-    typ.is_unknown() || typ.contain_tpl()
+    typ.is_unknown() || matches!(typ, LuaType::String) || typ.contain_tpl()
 }
 
 fn with_flow_query_realm<T>(
@@ -1206,8 +1206,13 @@ fn get_type_at_assign_stat(
         let rhs_is_fresh_table_literal = explicit_var_type.is_none()
             && matches!(expr_type, LuaType::TableConst(_))
             && exprs.get(i).is_some_and(expr_is_table_constructor);
+        let rhs_is_string_literal = explicit_var_type.is_none()
+            && matches!(
+                expr_type,
+                LuaType::StringConst(_) | LuaType::DocStringConst(_)
+            );
 
-        let narrowed = if rhs_is_fresh_table_literal {
+        let narrowed = if rhs_is_fresh_table_literal || rhs_is_string_literal {
             Some(expr_type.clone())
         } else if source_type == LuaType::Nil {
             None

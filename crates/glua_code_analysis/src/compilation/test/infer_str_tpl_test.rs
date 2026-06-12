@@ -5,7 +5,10 @@ mod test {
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, LuaSignatureId, LuaType, LuaTypeDeclId, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, LuaSignatureId, LuaType, LuaTypeDeclId, LuaUnionType, VirtualWorkspace,
+    };
+    use smol_str::SmolStr;
 
     fn nth_name_expr_type_from_end(
         ws: &mut VirtualWorkspace,
@@ -152,6 +155,48 @@ mod test {
         let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
         let expected = ws.ty("glide_wheel");
         assert_eq!(wheel_ty, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_binds_string_const_union() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+                ---@class Entity
+                ---@class widget_axis_arrow: Entity
+                ---@class widget_axis_disc: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class)
+                end
+
+                local EntName = "widget_axis_arrow"
+                if rotate then
+                    EntName = "widget_axis_disc"
+                end
+
+                ent = ents.Create(EntName)
+            "#,
+        );
+
+        let ent_name_ty = nth_name_expr_type_from_end(&mut ws, file_id, "EntName", 0);
+        let expected_ent_name = LuaType::Union(
+            LuaUnionType::from_vec(vec![
+                LuaType::StringConst(SmolStr::new("widget_axis_arrow").into()),
+                LuaType::StringConst(SmolStr::new("widget_axis_disc").into()),
+            ])
+            .into(),
+        );
+        assert_eq!(ent_name_ty, expected_ent_name);
+
+        let ent_ty = ws.expr_ty("ent");
+        let expected = ws.ty("widget_axis_arrow|widget_axis_disc");
+        assert_eq!(ent_ty, expected);
     }
 
     #[gtest]
