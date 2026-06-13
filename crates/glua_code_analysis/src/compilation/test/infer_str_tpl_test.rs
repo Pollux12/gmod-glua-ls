@@ -6,7 +6,8 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, LuaSignatureId, LuaType, LuaTypeDeclId, LuaUnionType, VirtualWorkspace,
+        DiagnosticCode, Emmyrc, LuaSignatureId, LuaType, LuaTypeDeclId, LuaUnionType,
+        VirtualWorkspace,
     };
     use smol_str::SmolStr;
 
@@ -1636,5 +1637,277 @@ mod test {
         let a_ty = ws.expr_ty("a");
         let expected = ws.ty("Panel");
         assert_eq!(a_ty, expected);
+    }
+
+    // ── VGUI panel reference inference tests ──────────────────────────
+
+    /// Unwrap `Instance(...)` wrappers to get the base type.
+    fn unwrap_instance(typ: &LuaType) -> &LuaType {
+        match typ {
+            LuaType::Instance(inst) => unwrap_instance(inst.get_base()),
+            _ => typ,
+        }
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_infers_class_from_enclosing_method() {
+        // `PANEL:GenerateExample(ClassName)` with `vgui.Create(ClassName)` should
+        // infer ClassName as the registered panel class name.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                local PANEL = {}
+
+                function PANEL:GenerateExample(ClassName, PropertySheet, Width, Height)
+                    local ctrl = vgui.Create(ClassName)
+                    a = ctrl
+                end
+
+                derma.DefineControl("DCategoryList", "", PANEL, "DScrollPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        // The return type is Instance-wrapped due to `---@return (instance) T`.
+        // Unwrap to check the base panel class.
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("DCategoryList");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_panel_add_with_literal_infers_specific_class() {
+        // `self:Add("DButton")` with a literal string should preserve the
+        // literal class identity via the StrTplRef generic on Panel:Add.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DButton: Panel
+
+                ---@generic T: Panel
+                ---@[call_arg("gmod.vgui_panel", "reference")]
+                ---@param className `T`
+                ---@return (instance) T
+                function Panel:Add(className) end
+
+                local PANEL = {}
+
+                function PANEL:Init()
+                    local child = self:Add("DButton")
+                    a = child
+                end
+
+                derma.DefineControl("DCategoryList", "", PANEL, "Panel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("DButton");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_panel_add_with_panel_reference_param_infers_owning_class() {
+        // `self:Add(ClassName)` should participate in the same contextual
+        // VGUI reference inference as `vgui.Create(ClassName)` when the
+        // class name flows in from a PANEL method parameter.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+
+                ---@generic T: Panel
+                ---@[call_arg("gmod.vgui_panel", "reference")]
+                ---@param className `T`
+                ---@return (instance) T
+                function Panel:Add(className) end
+
+                local PANEL = {}
+
+                function PANEL:GenerateExample(ClassName)
+                    a = self:Add(ClassName)
+                end
+
+                derma.DefineControl("DCategoryList", "", PANEL, "Panel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("DCategoryList");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_resolves_correct_panel_in_multi_panel_file() {
+        // When a file has multiple `local PANEL = {}` blocks with separate
+        // registrations, the inference must resolve to the correct panel
+        // class for the enclosing method's PANEL — not just the first
+        // registration in the file.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+
+                local PANEL = {}
+                derma.DefineControl("FirstPanel", "", PANEL, "Panel")
+
+                local PANEL = {}
+                function PANEL:GenerateExample(ClassName)
+                    a = vgui.Create(ClassName)
+                end
+                derma.DefineControl("SecondPanel", "", PANEL, "Panel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("SecondPanel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_resolves_correct_panel_in_reassigned_region() {
+        // When a file reuses the same `local PANEL` declaration across multiple
+        // registrations via plain reassignment, inference must pick the
+        // registration region that encloses the method definition — not the
+        // first registration using that declaration.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+
+                local PANEL = {}
+                derma.DefineControl("FirstPanel", "", PANEL, "Panel")
+
+                PANEL = {}
+                function PANEL:GenerateExample(ClassName)
+                    a = vgui.Create(ClassName)
+                end
+                derma.DefineControl("SecondPanel", "", PANEL, "Panel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("SecondPanel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_does_not_infer_for_non_panel_context() {
+        // `---@param name string` with `vgui.Create(name)` in a non-panel
+        // function should NOT infer a concrete panel class — falls back to Panel.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+
+                ---@param name string
+                function someFunction(name)
+                    local ctrl = vgui.Create(name)
+                    a = ctrl
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("Panel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_does_not_infer_for_nested_helper_param() {
+        // A nested helper function parameter inside a PANEL method is not the
+        // PANEL method parameter itself and must not inherit the owner-panel
+        // contextual panel name.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+
+                local PANEL = {}
+
+                function PANEL:Init()
+                    local function make(className)
+                        a = vgui.Create(className)
+                    end
+                end
+
+                derma.DefineControl("DCategoryList", "", PANEL, "Panel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("Panel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_preserves_literal_string_behavior() {
+        // `vgui.Create("DCategoryList")` with a literal string should still
+        // infer the specific panel class (existing behavior).
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DCategoryList: Panel
+
+                local ctrl = vgui.Create("DCategoryList")
+                a = ctrl
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("DCategoryList");
+        assert_eq!(base, expected);
     }
 }
