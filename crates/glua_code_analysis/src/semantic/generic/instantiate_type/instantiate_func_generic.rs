@@ -287,7 +287,13 @@ fn resolve_vgui_panel_ref_from_arg(
 
     // Check that the call parameter has call_arg("gmod.vgui_panel", "reference").
     let prefix_expr = call_expr.get_prefix_expr()?;
-    if !check_vgui_panel_ref_role(db, cache, &prefix_expr, param_idx, call_expr.is_colon_call()) {
+    if !check_vgui_panel_ref_role(
+        db,
+        cache,
+        &prefix_expr,
+        param_idx,
+        call_expr.is_colon_call(),
+    ) {
         return None;
     }
 
