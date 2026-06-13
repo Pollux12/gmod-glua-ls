@@ -3579,6 +3579,175 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_type_guard_class_name_narrows_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@class Dog
+            local Dog = {}
+            function Dog:Bark() end
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param dog Dog
+            local function RequiresDog(dog) end
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) == "Dog" then
+                    x:Bark()
+                    RequiresDog(x)
+                end
+            end
+            "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::ParamTypeMismatch, code));
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_not_equals_early_return_narrows_afterward() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@class Dog
+            local Dog = {}
+            function Dog:Bark() end
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param dog Dog
+            local function RequiresDog(dog) end
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) ~= "Dog" then return end
+                x:Bark()
+                RequiresDog(x)
+            end
+            "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::ParamTypeMismatch, code));
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_parent_does_not_widen_child() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class Animal
+            local Animal = {}
+
+            ---@class Dog: Animal
+            local Dog = {}
+            function Dog:Bark() end
+
+            ---@param x Dog
+            local function test(x)
+                if type(x) == "Animal" then
+                    x:Bark()
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_unknown_class_name_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Dog
+            local Dog = {}
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param dog Dog
+            local function RequiresDog(dog) end
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) == "Dgo" then
+                    RequiresDog(x)
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_preserves_missing_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class Dog
+            local Dog = {}
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) == "Dog" then
+                    x:DefinitelyMissing()
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_does_not_narrow_incompatible_primitive() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class Dog
+            local Dog = {}
+            function Dog:Bark() end
+
+            ---@param s string
+            local function test(s)
+                if type(s) == "Dog" then
+                    s:Bark()
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_alias_name_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Dog
+            local Dog = {}
+            ---@alias DogAlias Dog
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param dog Dog
+            local function RequiresDog(dog) end
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) == "DogAlias" then
+                    RequiresDog(x)
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
     fn test_if_else_both_branches_assign_no_nil() {
         // When both if/else branches assign, the variable should NOT be nil
         let mut ws = VirtualWorkspace::new();

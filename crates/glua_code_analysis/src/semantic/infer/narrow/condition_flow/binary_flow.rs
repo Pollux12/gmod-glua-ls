@@ -441,8 +441,22 @@ fn maybe_type_guard_binary(
         "userdata" => LuaType::Userdata,
         "nil" => LuaType::Nil,
         _ => {
-            // If the type is not recognized, we cannot narrow it
-            return Ok(ResultTypeOrContinue::Continue);
+            let Some(target_type) = resolve_class_name_target_type(db, cache, &literal_string)
+            else {
+                // If the type is not recognized, we cannot narrow it
+                return Ok(ResultTypeOrContinue::Continue);
+            };
+
+            let LuaType::Ref(target_type_id) = &target_type else {
+                return Ok(ResultTypeOrContinue::Continue);
+            };
+
+            if !can_target_class_be_a_more_specific_narrowing(db, &antecedent_type, target_type_id)
+            {
+                return Ok(ResultTypeOrContinue::Continue);
+            }
+
+            target_type
         }
     };
 
