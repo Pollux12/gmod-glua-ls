@@ -99,4 +99,52 @@ mod test {
             eq(false)
         );
     }
+
+    #[gtest]
+    fn dtree_node_get_root_returns_dtree_for_right_click_hook() {
+        let mut ws = VirtualWorkspace::new();
+
+        const DTREE_STUBS: &str = r#"
+            ---@class Panel
+
+            ---@class DTree: Panel
+            DTree = {}
+
+            ---@param node DTree_Node
+            ---@return boolean
+            function DTree:DoRightClick(node) end
+
+            ---@class DTree_Node: Panel
+            DTree_Node = {}
+
+            ---@return DTree
+            function DTree_Node:GetRoot() end
+
+            ---@type DTree_Node
+            local node
+        "#;
+
+        let valid = format!("{DTREE_STUBS}\nnode:GetRoot():DoRightClick(node)");
+
+        expect_that!(
+            ws.check_code_for(DiagnosticCode::RedundantParameter, &valid),
+            eq(true)
+        );
+        expect_that!(
+            ws.check_code_for(DiagnosticCode::UndefinedField, &valid),
+            eq(true)
+        );
+
+        let extra_arg = format!("{DTREE_STUBS}\nnode:GetRoot():DoRightClick(node, true)");
+        expect_that!(
+            ws.check_code_for(DiagnosticCode::RedundantParameter, &extra_arg),
+            eq(false)
+        );
+
+        let typo = format!("{DTREE_STUBS}\nnode:GetRoot():DoRightCick(node)");
+        expect_that!(
+            ws.check_code_for(DiagnosticCode::UndefinedField, &typo),
+            eq(false)
+        );
+    }
 }
