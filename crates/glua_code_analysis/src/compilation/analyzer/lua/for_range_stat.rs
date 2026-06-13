@@ -231,11 +231,11 @@ fn try_infer_pairs_iter_types_from_table_members(
 
         let value_type = match member_infos.as_slice() {
             [] => LuaType::Any,
-            [member] => member.typ.clone(),
+            [member] => remove_pairs_yield_nil(db, &member.typ),
             _ => LuaType::from_vec(
                 member_infos
                     .into_iter()
-                    .map(|member| member.typ)
+                    .map(|member| remove_pairs_yield_nil(db, &member.typ))
                     .collect::<Vec<_>>(),
             ),
         };
@@ -269,7 +269,21 @@ fn compact_pairs_key_type(keys: &[LuaType]) -> LuaType {
 }
 
 fn compact_pairs_value_type(db: &DbIndex, values: Vec<LuaType>) -> LuaType {
+    let values = values
+        .into_iter()
+        .map(|value| remove_pairs_yield_nil(db, &value))
+        .filter(|value| !value.is_unknown() && !value.is_never())
+        .collect::<Vec<_>>();
     try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_vec(values))
+}
+
+fn remove_pairs_yield_nil(db: &DbIndex, value_type: &LuaType) -> LuaType {
+    let non_nil = TypeOps::Remove.apply(db, value_type, &LuaType::Nil);
+    if non_nil.is_never() {
+        LuaType::Unknown
+    } else {
+        non_nil
+    }
 }
 
 fn try_compact_record_values(db: &DbIndex, values: &[LuaType]) -> Option<LuaType> {
@@ -279,7 +293,9 @@ fn try_compact_record_values(db: &DbIndex, values: &[LuaType]) -> Option<LuaType
 
     let mut fields: HashMap<LuaMemberKey, (LuaType, usize)> = HashMap::new();
     for value in values {
-        let member_map = get_member_map(db, value)?;
+        let Some(member_map) = get_member_map(db, value) else {
+            continue;
+        };
         let mut present_keys = HashSet::new();
         for (key, member_infos) in member_map.iter() {
             if matches!(key, LuaMemberKey::None) || member_infos.is_empty() {

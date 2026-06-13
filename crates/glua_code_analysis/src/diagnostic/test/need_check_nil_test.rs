@@ -80,6 +80,211 @@ mod test {
     }
 
     #[test]
+    fn test_notification_pairs_nil_deletion_keeps_panel_fields_non_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Panel
+            local PanelBase = {}
+
+            ---@class NoticePanel: Panel
+            ---@field fx number
+            ---@field fy number
+            ---@field VelX number
+            ---@field VelY number
+            local NoticePanel = {}
+
+            ---@generic T: Panel
+            ---@param className `T`
+            ---@return T
+            function vgui.Create(className) end
+
+            local Notices = {}
+
+            function AddProgress(uid)
+                local Panel = vgui.Create("NoticePanel")
+                Panel.VelX = -5
+                Panel.VelY = 0
+                Panel.fx = 200
+                Panel.fy = 100
+                Notices[uid] = Panel
+            end
+
+            function AddLegacy()
+                local Panel = vgui.Create("NoticePanel")
+                Panel.VelX = -5
+                Panel.VelY = 0
+                Panel.fx = 200
+                Panel.fy = 100
+                table.insert(Notices, Panel)
+            end
+
+            local function UpdateNotice(pnl, total_h)
+                local x = pnl.fx
+                local y = pnl.fy
+                local spd = 15
+                y = y + pnl.VelY * spd
+                x = x + pnl.VelX * spd
+                pnl.fx = x
+                pnl.fy = y
+                return total_h + 1
+            end
+
+            local h = 0
+            for _, pnl in pairs(Notices) do
+                h = UpdateNotice(pnl, h)
+            end
+
+            for k, Panel in pairs(Notices) do
+                if Panel:KillSelf() then
+                    Notices[k] = nil
+                end
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[test]
+    fn test_pairs_heterogeneous_record_missing_field_stays_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class OptionalXRecord
+            ---@field nested { x: number }|nil
+
+            ---@type table<integer, OptionalXRecord>
+            local records = {}
+
+            for _, rec in pairs(records) do
+                local nested = rec.nested
+                local x = nested.x
+                x = x + 1
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[test]
+    fn test_indexed_read_after_nil_assignment_stays_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local records = {}
+            local key = 1
+            records[key] = { x = 1 }
+            records[key] = nil
+
+            local rec = records[key]
+            local x = rec.x
+            x = x + 1
+            "#,
+        );
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[test]
+    fn test_pairs_call_site_param_inference_does_not_cross_shadowed_local_function() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local records = {}
+            records[1] = { x = 1 }
+
+            local function Update(rec)
+                local x = rec.missing
+                x = x + 1
+            end
+
+            for _, rec in pairs(records) do
+                Update(rec)
+            end
+
+            do
+                local function Update(rec)
+                    local x = rec.missing
+                    x = x + 1
+                end
+
+                Update({})
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[test]
+    fn test_non_pairs_generic_loop_does_not_drive_call_site_param_inference() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@return fun(): integer, { x: number }
+            local function iter() end
+
+            local function Update(rec)
+                local x = rec.missing
+                x = x + 1
+            end
+
+            for _, rec in iter() do
+                Update(rec)
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[test]
+    fn test_pairs_yield_strips_only_top_level_nil_not_optional_fields() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class NestedRecord
+            ---@field x? number
+
+            ---@type table<integer, { nested: NestedRecord }|nil>
+            local records = {}
+
+            for _, rec in pairs(records) do
+                local nested = rec.nested
+                local x = nested.x
+                x = x + 1
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[test]
     fn test_non_nil_union_branch_missing_method_is_not_need_check_nil() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(

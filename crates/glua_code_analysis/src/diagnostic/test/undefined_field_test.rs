@@ -118,6 +118,25 @@ mod test {
             .collect()
     }
 
+    fn diagnostics_for_code(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> Vec<lsp_types::Diagnostic> {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .collect()
+    }
+
     fn contains_empty_table_bootstrap(db: &crate::DbIndex, typ: &LuaType) -> bool {
         match typ {
             LuaType::Table => true,
@@ -925,6 +944,194 @@ mod test {
             empty_table_bootstrap_branch_count(ws.analysis.compilation.get_db(), &ty),
             1,
             "expected repeated empty guarded bootstraps to collapse to one table branch, got {display}"
+        );
+    }
+
+    #[test]
+    fn test_guarded_empty_table_bootstrap_keeps_typed_member_access_valid() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/workshopfilebase.FillFileInfo.lua",
+            r#"
+                ---@meta
+                ---@class (partial) WorkshopFileInfoEntry
+                ---@field file string Local addon file path when available.
+                ---@field ownername string
+                ---@field description string
+                local WorkshopFileInfoEntry = {}
+
+                ---@class (partial) WorkshopUserContentEntry
+                ---@field file? string Local addon file path when available.
+                ---@field ownername string
+                ---@field description string
+                local WorkshopUserContentEntry = {}
+
+                ---@class WorkshopFileInfoResults
+                ---@field extraresults table<integer, WorkshopFileInfoEntry|WorkshopUserContentEntry|nil>
+
+                ---@param results WorkshopFileInfoResults
+                ---@param isUGC? boolean
+                function WorkshopFileBase:FillFileInfo(results, isUGC) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/lua/includes/util/workshop_files.lua",
+            r#"
+                function WorkshopFileBase(namespace, requiredtags)
+                    local ret = {}
+                    ret.HTML = nil
+
+                    function ret:FillFileInfo(results, isUGC)
+                        local k = 1
+                        local extra = results.extraresults[k]
+                        if not extra then
+                            extra = {}
+                        end
+                        extra.ownername = "Local"
+                        extra.description = "Non workshop .gma addon. (" .. extra.file .. ")"
+                        local missing = extra.missing
+                    end
+
+                    return ret
+                end
+            "#,
+        );
+
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        let results_types = index_expr_type_displays(&ws, file_id, "results.extraresults[k]");
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("`missing`"),
+            "expected only extra.missing to remain, got {diags:?}"
+        );
+        assert!(
+            results_types
+                .iter()
+                .any(|display| display.contains("WorkshopFileInfoEntry")
+                    && display.contains("WorkshopUserContentEntry")),
+            "expected typed union on results.extraresults[k], got {results_types:?}"
+        );
+    }
+
+    #[test]
+    fn test_fallback_table_union_still_reports_truly_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/workshopfilebase.FillFileInfo.lua",
+            r#"
+                ---@meta
+                ---@class (partial) WorkshopFileInfoEntry
+                ---@field file string Local addon file path when available.
+                ---@field ownername string
+                ---@field description string
+                local WorkshopFileInfoEntry = {}
+
+                ---@class (partial) WorkshopUserContentEntry
+                ---@field file? string Local addon file path when available.
+                ---@field ownername string
+                ---@field description string
+                local WorkshopUserContentEntry = {}
+
+                ---@class WorkshopFileInfoResults
+                ---@field extraresults table<integer, WorkshopFileInfoEntry|WorkshopUserContentEntry|nil>
+
+                ---@param results WorkshopFileInfoResults
+                ---@param isUGC? boolean
+                function WorkshopFileBase:FillFileInfo(results, isUGC) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/lua/includes/util/workshop_files.lua",
+            r#"
+                function WorkshopFileBase(namespace, requiredtags)
+                    local ret = {}
+                    ret.HTML = nil
+
+                    function ret:FillFileInfo(results, isUGC)
+                        local k = 1
+                        local extra = results.extraresults[k]
+                        if not extra then
+                            extra = {}
+                        end
+                        extra.ownername = "Local"
+                        local missing = extra.missing
+                    end
+
+                    return ret
+                end
+            "#,
+        );
+
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn test_missing_member_probe_does_not_nil_poison_later_valid_member_inference() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/workshopfilebase.FillFileInfo.lua",
+            r#"
+                ---@meta
+                ---@class WorkshopFileInfoEntry
+                ---@field file string
+                ---@field ownername string
+                local WorkshopFileInfoEntry = {}
+
+                ---@class WorkshopFileInfoResults
+                ---@field extraresults table<integer, WorkshopFileInfoEntry|nil>
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/lua/includes/util/workshop_files.lua",
+            r#"
+                ---@param results WorkshopFileInfoResults
+                local function FillFileInfo(results)
+                    local k = 1
+                    local extra = results.extraresults[k]
+                    local missing = extra.missing
+                    local path = extra.file
+                    local len = #extra.file
+                    local again = extra.file
+                end
+            "#,
+        );
+
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        let file_types = index_expr_type_displays(&ws, file_id, "extra.file");
+
+        assert_eq!(diags.len(), 1, "expected only extra.missing, got {diags:?}");
+        assert!(
+            diags[0].message.contains("`missing`"),
+            "expected missing-field diagnostic for extra.missing, got {diags:?}"
+        );
+        assert!(
+            file_types.iter().all(|display| display == "string"),
+            "valid member inference should remain stable after missing-member probe"
         );
     }
 

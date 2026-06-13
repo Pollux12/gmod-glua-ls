@@ -378,6 +378,27 @@ impl LuaInferCache {
             .insert((flow_id, query_realm), entry);
     }
 
+    pub fn take_flow_cache_for_var_ref(
+        &mut self,
+        var_ref_id: &VarRefId,
+    ) -> Option<FxHashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>> {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
+        self.flow_node_cache.remove(&cache_key)
+    }
+
+    pub fn restore_flow_cache_for_var_ref(
+        &mut self,
+        var_ref_id: &VarRefId,
+        previous: Option<FxHashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>>,
+    ) {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
+        if let Some(previous) = previous {
+            self.flow_node_cache.insert(cache_key, previous);
+        } else {
+            self.flow_node_cache.remove(&cache_key);
+        }
+    }
+
     pub fn get_index_ref_origin_type_cache(
         &self,
         var_ref_id: &VarRefId,
@@ -393,6 +414,28 @@ impl LuaInferCache {
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         self.index_ref_origin_type_cache.insert(cache_key, entry);
+    }
+
+    pub fn replace_index_ref_origin_type_cache(
+        &mut self,
+        var_ref_id: &VarRefId,
+        entry: CacheEntry<LuaType>,
+    ) -> Option<CacheEntry<LuaType>> {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
+        self.index_ref_origin_type_cache.insert(cache_key, entry)
+    }
+
+    pub fn restore_index_ref_origin_type_cache(
+        &mut self,
+        var_ref_id: &VarRefId,
+        previous: Option<CacheEntry<LuaType>>,
+    ) {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
+        if let Some(previous) = previous {
+            self.index_ref_origin_type_cache.insert(cache_key, previous);
+        } else {
+            self.index_ref_origin_type_cache.remove(&cache_key);
+        }
     }
 
     pub fn flow_cache_entry_count(&self) -> usize {

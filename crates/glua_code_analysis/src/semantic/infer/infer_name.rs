@@ -1,6 +1,7 @@
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr,
-    LuaNameExpr, LuaTableExpr, LuaTableField, LuaVarExpr,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat,
+    LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaReturnStat,
+    LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rowan::TextSize;
 
@@ -13,13 +14,13 @@ use crate::{
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     SemanticDeclLevel, TypeOps,
     compilation::{analyzer::infer_for_range_iter_expr_func, get_scripted_class_type_decl_id},
-    db_index::{DbIndex, LuaDeclOrMemberId, LuaSignature},
+    db_index::{DbIndex, LuaDeclOrMemberId, LuaSignature, LuaSignatureId},
     infer_node_semantic_decl,
     semantic::{
         infer::narrow::{
             SelfRefId, VarRefId, infer_expr_narrow_type, infer_expr_narrow_type_with_self_base,
         },
-        member::merge_open_table_types,
+        member::{find_members_with_key, merge_open_table_types},
         semantic_info::resolve_global_decl_id,
     },
 };
@@ -703,7 +704,7 @@ pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
 
 fn infer_param_inner(
     db: &DbIndex,
-    cache: Option<&mut LuaInferCache>,
+    mut cache: Option<&mut LuaInferCache>,
     decl: &LuaDecl,
 ) -> InferResult {
     let (param_idx, signature_id, member_id) = match &decl.extra {
@@ -775,7 +776,7 @@ fn infer_param_inner(
             return Ok(param_type);
         }
 
-        if let Some(cache) = cache
+        if let Some(cache) = cache.as_mut()
             && let Some(param_type) = find_param_type_from_contextual_member(
                 db,
                 cache,
@@ -788,10 +789,27 @@ fn infer_param_inner(
         {
             return Ok(param_type);
         }
+
+        if let Some(param_type) = find_param_type_from_outer_factory_member(
+            db,
+            current_member_id,
+            param_idx,
+            colon_define,
+            decl.get_name() == "...",
+        ) {
+            return Ok(param_type);
+        }
     }
 
     if let Some(file_hint_type) = infer_param_type_from_file_hint(db, decl) {
         return Ok(file_hint_type);
+    }
+
+    if let Some(cache) = cache.as_mut()
+        && let Some(call_arg_type) =
+            infer_param_type_from_local_call_sites(db, cache, decl, signature_id, param_idx)
+    {
+        return Ok(call_arg_type);
     }
 
     if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name()) {
@@ -799,6 +817,110 @@ fn infer_param_inner(
     }
 
     Err(InferFailReason::UnResolveDeclType(decl.get_id()))
+}
+
+fn infer_param_type_from_local_call_sites(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl: &LuaDecl,
+    signature_id: LuaSignatureId,
+    param_idx: usize,
+) -> Option<LuaType> {
+    if decl.get_file_id() != signature_id.get_file_id() {
+        return None;
+    }
+
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&signature_id.get_file_id())?
+        .get_red_root();
+    let closure = root
+        .descendants()
+        .filter_map(LuaClosureExpr::cast)
+        .find(|closure| closure.get_position() == signature_id.get_position())?;
+    let local_func_name = closure
+        .get_parent::<LuaLocalFuncStat>()
+        .and_then(|local_func| local_func.get_local_name())?;
+    let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
+    let func_name = local_func_name
+        .get_name_token()
+        .map(|token| token.get_name_text().to_string())?;
+    let file_refs = db
+        .get_reference_index()
+        .get_local_reference(&signature_id.get_file_id())?;
+
+    let mut inferred_type = LuaType::Unknown;
+    for call_expr in root.descendants().filter_map(LuaCallExpr::cast) {
+        let Some(LuaExpr::NameExpr(call_name)) = call_expr.get_prefix_expr() else {
+            continue;
+        };
+        if call_name.get_name_text().as_deref() != Some(func_name.as_str()) {
+            continue;
+        }
+        if file_refs.get_decl_id(&call_name.get_range()) != Some(target_decl_id) {
+            continue;
+        }
+
+        let Some(arg) = call_expr
+            .get_args_list()
+            .and_then(|args| args.get_args().nth(param_idx))
+        else {
+            continue;
+        };
+        if !is_global_pairs_for_range_var_arg(db, signature_id.get_file_id(), &arg) {
+            continue;
+        }
+        let Ok(arg_type) = infer_expr(db, cache, arg) else {
+            continue;
+        };
+        if arg_type.is_unknown() || arg_type.is_nil() || arg_type.is_never() {
+            continue;
+        }
+        inferred_type = TypeOps::Union.apply(db, &inferred_type, &arg_type);
+    }
+
+    (!inferred_type.is_unknown()).then_some(inferred_type)
+}
+
+fn is_global_pairs_for_range_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = arg else {
+        return false;
+    };
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
+    else {
+        return false;
+    };
+
+    name_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaForRangeStat::cast)
+        .is_some_and(|for_range| {
+            let is_loop_var = for_range
+                .get_var_name_list()
+                .any(|var_name| var_name.get_position() == decl_id.position);
+            is_loop_var && is_global_pairs_for_range(db, file_id, &for_range)
+        })
+}
+
+fn is_global_pairs_for_range(db: &DbIndex, file_id: FileId, for_range: &LuaForRangeStat) -> bool {
+    let Some(LuaExpr::CallExpr(call_expr)) = for_range.get_expr_list().next() else {
+        return false;
+    };
+    let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    if name_expr.get_name_text().as_deref() != Some("pairs") {
+        return false;
+    }
+
+    db.get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .is_none()
 }
 
 fn find_param_type_from_sibling_members(
@@ -847,6 +969,159 @@ fn find_param_type_from_sibling_members(
     }
 
     final_type
+}
+
+fn find_param_type_from_outer_factory_member(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    param_idx: usize,
+    colon_define: bool,
+    is_dots: bool,
+) -> Option<LuaType> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let current_node = member_id.get_syntax_id().to_node_from_root(&root)?;
+    let outer_func = current_node
+        .ancestors()
+        .filter_map(LuaFuncStat::cast)
+        .nth(1)?;
+    if !outer_factory_returns_current_member_receiver(&current_node, &outer_func) {
+        return None;
+    }
+
+    let outer_func_name = outer_func.get_func_name()?;
+    let outer_name = outer_func_name.get_access_path()?;
+    let member = db.get_member_index().get_member(&member_id)?;
+    let member_key = member.get_key().clone();
+
+    let owner_types = [
+        LuaType::Ref(LuaTypeDeclId::global(&outer_name)),
+        LuaType::Def(LuaTypeDeclId::global(&outer_name)),
+        LuaType::Namespace(smol_str::SmolStr::new(&outer_name).into()),
+    ];
+    for owner_type in owner_types {
+        let Some(member_infos) = find_members_with_key(db, &owner_type, member_key.clone(), true)
+        else {
+            continue;
+        };
+
+        let informative_types: Vec<_> = member_infos
+            .into_iter()
+            .filter(|info| info.feature.is_some_and(|feature| feature.is_meta_decl()))
+            .filter_map(|info| {
+                find_param_type_from_type(db, info.typ, param_idx, colon_define, is_dots)
+            })
+            .filter(|typ| {
+                !is_broad_factory_param_type(typ) && is_structured_factory_param_type(typ)
+            })
+            .collect();
+        if informative_types.is_empty() {
+            continue;
+        }
+
+        return merge_factory_param_candidates(db, informative_types, is_dots);
+    }
+
+    None
+}
+
+fn merge_factory_param_candidates(
+    db: &DbIndex,
+    informative_types: Vec<LuaType>,
+    is_dots: bool,
+) -> Option<LuaType> {
+    let mut final_type = None;
+    for param_type in informative_types {
+        if is_dots && param_type.is_any() {
+            return Some(param_type);
+        }
+
+        final_type = match final_type {
+            Some(existing) => Some(TypeOps::Union.apply(db, &existing, &param_type)),
+            None => Some(param_type),
+        };
+    }
+
+    final_type
+}
+
+fn is_broad_factory_param_type(typ: &LuaType) -> bool {
+    typ.is_any() || typ.is_unknown() || typ.is_nil() || typ.is_table()
+}
+
+fn is_structured_factory_param_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Object(_) | LuaType::TableGeneric(_) => true,
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .any(is_structured_factory_param_type),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .any(is_structured_factory_param_type),
+        LuaType::TableOf(inner) => is_structured_factory_param_type(inner),
+        LuaType::TypeGuard(inner) => is_structured_factory_param_type(inner),
+        _ => false,
+    }
+}
+
+fn outer_factory_returns_current_member_receiver(
+    current_node: &rowan::SyntaxNode<glua_parser::LuaLanguage>,
+    outer_func: &LuaFuncStat,
+) -> bool {
+    let Some(current_func) = current_node.ancestors().find_map(LuaFuncStat::cast) else {
+        return false;
+    };
+    let Some(receiver_name) = member_receiver_name(&current_func) else {
+        return false;
+    };
+    if !outer_factory_declares_direct_local(outer_func, receiver_name.as_str()) {
+        return false;
+    }
+
+    outer_func
+        .descendants::<LuaReturnStat>()
+        .any(|return_stat| {
+            let is_direct_outer_return = return_stat
+                .syntax()
+                .ancestors()
+                .find_map(LuaFuncStat::cast)
+                .is_some_and(|func| func.get_syntax_id() == outer_func.get_syntax_id());
+            is_direct_outer_return
+                && return_stat.get_expr_list().any(|expr| match expr {
+                    LuaExpr::NameExpr(name_expr) => name_expr
+                        .get_name_text()
+                        .is_some_and(|name| name == receiver_name),
+                    _ => false,
+                })
+        })
+}
+
+fn outer_factory_declares_direct_local(outer_func: &LuaFuncStat, receiver_name: &str) -> bool {
+    outer_func.descendants::<LuaLocalStat>().any(|local_stat| {
+        let is_direct_outer_local = local_stat
+            .syntax()
+            .ancestors()
+            .find_map(LuaFuncStat::cast)
+            .is_some_and(|func| func.get_syntax_id() == outer_func.get_syntax_id());
+        is_direct_outer_local
+            && local_stat
+                .get_local_name_list()
+                .any(|local_name| local_name.get_text() == receiver_name)
+    })
+}
+
+fn member_receiver_name(func: &LuaFuncStat) -> Option<smol_str::SmolStr> {
+    let LuaVarExpr::IndexExpr(index_expr) = func.get_func_name()? else {
+        return None;
+    };
+    let LuaExpr::NameExpr(name_expr) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    name_expr.get_name_text().map(Into::into)
 }
 
 fn find_overload_param_type_from_type(

@@ -169,8 +169,19 @@ fn infer_member_type_fallback_pass_flow(
         return Err(InferFailReason::FieldNotFound);
     };
 
-    cache.set_index_ref_origin_type_cache(&var_ref_id, CacheEntry::Cache(LuaType::Nil));
-    match infer_expr_narrow_type(db, cache, LuaExpr::IndexExpr(index_expr), var_ref_id) {
+    let previous_origin =
+        cache.replace_index_ref_origin_type_cache(&var_ref_id, CacheEntry::Cache(LuaType::Nil));
+    let previous_flow_cache = cache.take_flow_cache_for_var_ref(&var_ref_id);
+    let result = infer_expr_narrow_type(
+        db,
+        cache,
+        LuaExpr::IndexExpr(index_expr),
+        var_ref_id.clone(),
+    );
+    cache.restore_flow_cache_for_var_ref(&var_ref_id, previous_flow_cache);
+    cache.restore_index_ref_origin_type_cache(&var_ref_id, previous_origin);
+
+    match result {
         Ok(member_type) if !member_type.is_nil() && !member_type.is_unknown() => Ok(member_type),
         Ok(member_type) if member_type.is_unknown() && unknown_truthy_as_any => Ok(LuaType::Any),
         Ok(_) | Err(InferFailReason::None) => Err(InferFailReason::FieldNotFound),
