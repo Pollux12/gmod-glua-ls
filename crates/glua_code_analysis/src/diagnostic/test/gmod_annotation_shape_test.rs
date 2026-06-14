@@ -147,4 +147,45 @@ mod test {
             eq(false)
         );
     }
+
+    #[gtest]
+    fn load_presets_string_keyed_table_allows_guarded_nested_assignment() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            ---@class GmodPresets: table<string, table>
+
+            ---@return GmodPresets
+            function LoadPresets() end
+
+            local P = LoadPresets()
+            P["a"] = P["a"] or {}
+            P["a"]["b"] = 1
+        "#;
+
+        expect_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+        expect_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn unguarded_table_index_field_access_still_warns() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            ---@type table
+            local T = {}
+            return T.someKey.Joinable
+        "#;
+
+        expect_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(false)
+        );
+    }
 }
