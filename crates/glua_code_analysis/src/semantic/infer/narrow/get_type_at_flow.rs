@@ -21,7 +21,7 @@ use crate::{
             get_single_antecedent,
             get_type_at_cast_flow::get_type_at_cast_flow,
             get_var_ref_type, narrow_down_type,
-            var_ref_id::get_var_expr_var_ref_id,
+            var_ref_id::{get_var_expr_var_ref_id, is_untyped_param_rooted_index},
         },
     },
 };
@@ -1185,6 +1185,13 @@ fn get_type_at_assign_stat(
         if explicit_var_type.is_none()
             && expr_type.is_nil()
             && typed_global_nil_placeholder_type(db, cache, &maybe_ref_id).is_some()
+        {
+            return Ok(ResultTypeOrContinue::Continue);
+        }
+
+        if explicit_var_type.is_none()
+            && expr_type.is_nil()
+            && is_untyped_param_rooted_index(db, &maybe_ref_id)
         {
             return Ok(ResultTypeOrContinue::Continue);
         }

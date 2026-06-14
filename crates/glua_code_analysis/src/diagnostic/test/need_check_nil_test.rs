@@ -2368,6 +2368,244 @@ mod test {
     }
 
     #[gtest]
+    fn test_dynamic_field_alias_receiver_guard_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+            function CSoundPatch:ChangeVolume(volume) end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+
+            local ENT = {}
+
+            function ENT:Initialize()
+                self.sounds = {}
+                self.sounds.turbo = CreateSound(self, "turbo.wav")
+            end
+
+            function ENT:OnUpdateSounds()
+                local sounds = self.sounds
+
+                if sounds.turbo then
+                    sounds.turbo:Stop()
+                    sounds.turbo:ChangeVolume(0.5)
+                end
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_callback_parameter_identity_field_guard_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class DPanel
+            local DPanel = {}
+
+            function DPanel:UpdateValue(value) end
+
+            ---@return DPanel
+            local function makePanel()
+                return {}
+            end
+
+            local row = {}
+            row.field = makePanel()
+            row.Bind = function(s, newData)
+                if s.field then
+                    s.field:UpdateValue(newData)
+                end
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_nested_short_circuit_receiver_guard_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ProblemData
+            ---@field title string|nil
+
+            ---@class ProblemPanel
+            ---@field Problem ProblemData|nil
+
+            ---@param self ProblemPanel
+            local function Paint(self)
+                if not self.Problem then return end
+
+                if self.Problem.title and self.Problem.title:len() > 0 then
+                    local title = self.Problem.title
+                end
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_derma_menu_spacer_assignment_guard_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class Panel
+            local Panel = {}
+
+            function Panel:SetZPos(pos) end
+
+            ---@class DPanel : Panel
+            local DPanel = {}
+
+            ---@class DMenu : Panel
+            local DMenu = {}
+
+            ---@return DPanel
+            function DMenu:AddSpacer() end
+
+            ---@return DMenu
+            function DermaMenu() end
+
+            local function createMenu()
+                local menu = DermaMenu()
+                if not menu.ToggleSpacer then menu.ToggleSpacer = menu:AddSpacer() end
+                menu.ToggleSpacer:SetZPos(500)
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_problem_lua_constructor_table_title_short_circuit_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ProblemData
+            ---@field title string
+            ---@field text string
+
+            ---@return ProblemData
+            local function CreateProblem()
+                return {
+                    title = "Missing addon dependency",
+                    text = "Install the required workshop item before joining."
+                }
+            end
+
+            ---@class ProblemPanel
+            ---@field Problem ProblemData|nil
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.Problem = CreateProblem()
+
+                self.Paint = function()
+                    if not self.Problem then return end
+
+                    if self.Problem.title and self.Problem.title:len() > 0 then
+                        local title = self.Problem.title
+                    end
+                end
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_vgui_callback_row_field_guard_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class Panel
+            local Panel = {}
+
+            function Panel:UpdateVector(value) end
+
+            ---@return Panel
+            local function makePanel()
+                return {}
+            end
+
+            local data = Vector(1, 2, 3)
+            local row = {}
+            row.offsetRow = makePanel()
+            row.Bind = function(s, data)
+                if s.offsetRow then
+                    s.offsetRow:UpdateVector(data)
+                end
+            end
+
+            row:Bind(data)
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_trace_result_hit_pos_method_call_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class Vector
+            local Vector = {}
+
+            ---@param other Vector
+            ---@return number
+            function Vector:DistToSqr(other) end
+
+            ---@class TraceResult
+            ---@field HitPos Vector
+
+            ---@class Player
+            local Player = {}
+
+            ---@return TraceResult
+            function Player:GetEyeTraceNoCursor() end
+
+            ---@return Vector
+            function Player:GetPos() end
+
+
+            ---@param ply Player
+            local function CanUseWeapon(ply)
+                local tr = ply:GetEyeTraceNoCursor()
+                local ok = tr.HitPos:DistToSqr(ply:GetPos()) <= 10000
+                return ok
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
     fn test_isvalid_not_narrows_entity_null_early_return() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

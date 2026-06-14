@@ -6737,6 +6737,355 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_gmod_vehicle_sound_guarded_turbo_call_has_no_unchecked_nil_and_non_any_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let annotations_code = r#"
+            ---@class Entity
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+            function CSoundPatch:ChangeVolume(volume) end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:Initialize()
+                self.BaseClass.Initialize(self)
+                self:CreateLoopingSound("turbo", "turbo.wav", 70, self)
+            end
+
+            function ENT:OnUpdateSounds()
+                local sounds = self.sounds
+
+                if sounds.turbo then
+                    sounds.turbo:Stop()
+                    sounds.turbo:ChangeVolume(0.5)
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", r#"ENT.Type = "anim""#),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                r#"ENT.Type = "anim"
+                ENT.Base = "base_glide""#,
+            ),
+            (car_path, car_code),
+        ]);
+
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let turbo_type = index_expr_type(&mut ws, file_id, "sounds.turbo");
+        let turbo_display = ws.humanize_type_detailed(turbo_type);
+        assert_that!(
+            turbo_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "guarded sounds.turbo access should use inferred dynamic sound patch type"
+        );
+        assert_that!(
+            turbo_display.contains("any"),
+            eq(false),
+            "guarded sounds.turbo access should not widen to any"
+        );
+
+        let unchecked_nil_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_diagnostics,
+            is_empty(),
+            "guarded sounds.turbo calls should not report unchecked-nil-access"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_sound_turbo_parameter_from_self_sounds_has_no_unchecked_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+            function CSoundPatch:SetSoundLevel(level) end
+            function CSoundPatch:PlayEx(volume, pitch) end
+            function CSoundPatch:ChangeVolume(volume) end
+            function CSoundPatch:ChangePitch(pitch) end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    snd:SetSoundLevel(level)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:OnUpdateSounds()
+                local dt = 0
+                self:UpdateTurboSound(self.sounds, dt)
+            end
+
+            function ENT:UpdateTurboSound(sounds, dt)
+                local hasBoost = true
+                local volume = 0.5
+                local pitch = 120
+
+                if sounds.turbo then
+                    sounds.turbo:Stop()
+                    sounds.turbo = nil
+                end
+
+                if hasBoost then
+                    if sounds.turbo then
+                        local guardedTurbo = sounds.turbo
+                        sounds.turbo:ChangeVolume(volume)
+                        sounds.turbo:ChangePitch(pitch)
+                    elseif self.TurboLoopSound ~= "" then
+                        local snd = self:CreateLoopingSound("turbo", "turbo.wav", 80, self)
+                        snd:PlayEx(volume, pitch)
+                    end
+                elseif sounds.turbo then
+                    sounds.turbo:Stop()
+                    sounds.turbo = nil
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", r#"ENT.Type = "anim""#),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                r#"ENT.Type = "anim"
+                ENT.Base = "base_glide"
+                ENT.TurboLoopSound = "turbo.wav""#,
+            ),
+            (car_path, car_code),
+        ]);
+
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let guarded_turbo_type = local_name_type(&mut ws, file_id, "guardedTurbo");
+        let guarded_turbo_display = ws.humanize_type_detailed(guarded_turbo_type);
+        assert_that!(
+            guarded_turbo_display.as_str(),
+            not(eq("nil")),
+            "guarded sounds.turbo should not narrow to only nil"
+        );
+        assert_that!(
+            guarded_turbo_display.contains("nil"),
+            eq(false),
+            "guarded sounds.turbo should be non-nullable inside the if body"
+        );
+
+        let unchecked_nil_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_diagnostics,
+            is_empty(),
+            "guarded sounds.turbo calls in UpdateTurboSound should not report unchecked-nil-access"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_sound_unguarded_turbo_parameter_field_reports_unchecked_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:OnUpdateSounds()
+                self:StopTurboSound(self.sounds)
+            end
+
+            function ENT:StopTurboSound(sounds)
+                sounds.turbo = nil
+                sounds.turbo:Stop()
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", r#"ENT.Type = "anim""#),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                r#"ENT.Type = "anim"
+                ENT.Base = "base_glide""#,
+            ),
+            (car_path, car_code),
+        ]);
+
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let unchecked_nil_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_diagnostics,
+            contains_each![contains_substring("sounds.turbo may be nil")],
+            "unguarded param-rooted sounds.turbo receiver should still report unchecked-nil-access"
+        );
+    }
+
     #[test]
     fn test_guarded_dynamic_field_local_alias_matches_rhs_type() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

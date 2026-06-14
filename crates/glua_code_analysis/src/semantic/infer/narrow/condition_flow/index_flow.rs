@@ -12,7 +12,10 @@ use crate::{
             get_single_antecedent,
             get_type_at_flow::get_type_at_flow,
             narrow_false_or_nil, remove_false_or_nil,
-            var_ref_id::{get_var_expr_var_ref_id, unknown_prefix_should_widen_to_any},
+            var_ref_id::{
+                get_var_expr_var_ref_id, is_untyped_param_rooted_index,
+                unknown_prefix_should_widen_to_any,
+            },
         },
     },
 };
@@ -51,6 +54,13 @@ pub fn get_type_at_index_expr(
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+
+    if matches!(condition_flow, InferConditionFlow::TrueCondition)
+        && antecedent_type.is_nil()
+        && is_untyped_param_rooted_index(db, var_ref_id)
+    {
+        return Ok(ResultTypeOrContinue::Result(LuaType::Any));
+    }
 
     let result_type = match condition_flow {
         InferConditionFlow::FalseCondition => narrow_false_or_nil(db, antecedent_type),

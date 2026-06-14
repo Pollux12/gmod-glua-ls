@@ -34,6 +34,25 @@ pub fn unknown_prefix_should_widen_to_any(db: &DbIndex, var_ref_id: &VarRefId) -
         .is_some_and(|type_cache| type_cache.is_doc())
 }
 
+/// Identifies member refs rooted in unannotated parameters, where nil cleanup
+/// writes are not authoritative typed member facts.
+pub fn is_untyped_param_rooted_index(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+    let VarRefId::IndexRef(root, _) = var_ref_id else {
+        return false;
+    };
+    let Some(decl_id) = root.as_decl_id() else {
+        return false;
+    };
+
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_param())
+        && db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .is_none_or(|type_cache| !type_cache.is_doc())
+}
+
 /// Identity for an implicit `self` reference inside a colon method.
 ///
 /// `self_decl_id` is the method's implicit `self` declaration, which is unique
