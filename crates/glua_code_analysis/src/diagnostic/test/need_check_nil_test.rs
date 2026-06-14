@@ -2497,6 +2497,274 @@ mod test {
     }
 
     #[gtest]
+    fn test_derma_menu_spacer_unannotated_helper_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class Panel
+            local Panel = {}
+
+            function Panel:SetZPos(pos) end
+
+            ---@class DPanel : Panel
+            local DPanel = {}
+
+            ---@class DMenu : Panel
+            local DMenu = {}
+
+            ---@return DPanel
+            function DMenu:AddSpacer() end
+
+            ---@return DMenu
+            function DermaMenu() end
+
+            local function AddToggleOption(data, menu, ent, ply, tr)
+                if not menu.ToggleSpacer then
+                    menu.ToggleSpacer = menu:AddSpacer()
+                    menu.ToggleSpacer:SetZPos(500)
+                end
+            end
+
+            local menu = DermaMenu()
+            AddToggleOption({}, menu)
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_derma_menu_spacer_transitive_unannotated_helpers_have_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class Panel
+            local Panel = {}
+
+            function Panel:SetZPos(pos) end
+
+            ---@class DPanel : Panel
+            local DPanel = {}
+
+            ---@class DMenu : Panel
+            local DMenu = {}
+
+            ---@return DPanel
+            function DMenu:AddSpacer() end
+
+            ---@return DMenu
+            function DermaMenu() end
+
+            local function AddToggleOption(data, menu, ent, ply, tr)
+                if not menu.ToggleSpacer then
+                    menu.ToggleSpacer = menu:AddSpacer()
+                    menu.ToggleSpacer:SetZPos(500)
+                end
+            end
+
+            local function AddOption(data, menu, ent, ply, tr)
+                AddToggleOption(data, menu, ent, ply, tr)
+            end
+
+            local function OpenEntityMenu(ent, ply, tr)
+                local menu = DermaMenu()
+                AddOption({}, menu, ent, ply, tr)
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_local_helper_nullable_call_site_preserves_need_check_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class DMenu
+            ---@field ToggleSpacer DPanel
+            function DMenu:Open() end
+
+            ---@class DPanel
+            function DPanel:SetZPos(pos) end
+
+            ---@return DMenu
+            function DermaMenu() end
+
+            ---@return DMenu?
+            local function MaybeMenu() end
+
+            local function UseMenu(menu)
+                menu.ToggleSpacer:SetZPos(500)
+            end
+
+            local menu = MaybeMenu()
+            UseMenu(DermaMenu())
+            UseMenu(menu)
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_local_helper_direct_zero_arg_call_site_param_inference() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class DPanel
+            function DPanel:SetZPos(pos) end
+
+            ---@class DMenu
+            ---@field ToggleSpacer DPanel
+            local DMenu = {}
+
+            ---@return DMenu
+            function DermaMenu() end
+
+            local function UseMenu(menu)
+                menu.ToggleSpacer:SetZPos(500)
+            end
+
+            UseMenu(DermaMenu())
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_local_helper_call_site_param_inference_does_not_cross_files() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let helper_file = ws.def_file(
+            "lua/autorun/helper.lua",
+            r#"
+            ---@class DMenu
+            function DMenu:Open() end
+
+            local function UseMenu(menu)
+                menu:Open()
+            end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/caller.lua",
+            r#"
+            ---@class DMenu
+            function DMenu:Open() end
+
+            ---@class DPanel
+
+            ---@return DMenu
+            function DermaMenu() end
+
+            UseMenu(DermaMenu())
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(helper_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_local_helper_self_forwarding_call_site_param_inference_is_safe() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class DMenu
+            ---@field ToggleSpacer DPanel
+            function DMenu:Open() end
+
+            ---@class DPanel
+
+            local function f(menu)
+                f(menu)
+                local spacer = menu.ToggleSpacer
+            end
+
+
+            ---@return DMenu
+            function DermaMenu() end
+
+            f(DermaMenu())
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_local_helper_mutual_forwarding_call_site_param_inference_is_safe() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class DMenu
+            ---@field ToggleSpacer DPanel
+
+            ---@class DPanel
+
+            local function f(menu)
+                g(menu)
+                local spacer = menu.ToggleSpacer
+            end
+
+            local function g(menu)
+                f(menu)
+            end
+
+            ---@return DMenu
+            function DermaMenu() end
+
+            f(DermaMenu())
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_local_helper_call_site_param_inference_respects_shadowed_local_function() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class DMenu
+            ---@field ToggleSpacer DPanel
+
+            ---@class DPanel
+            ---@return DMenu
+            function DermaMenu() end
+
+            local function UseMenu(menu)
+                menu:Open()
+            end
+
+            do
+                local function UseMenu(value) end
+                UseMenu(DermaMenu())
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
     fn test_problem_lua_constructor_table_title_short_circuit_has_no_unchecked_nil_access() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

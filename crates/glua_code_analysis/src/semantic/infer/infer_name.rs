@@ -1,7 +1,7 @@
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat,
     LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaReturnStat,
-    LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rowan::TextSize;
 
@@ -702,6 +702,11 @@ pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
     infer_param_inner(db, None, decl)
 }
 
+// Param type cache is keyed by decl id; nested local-call-site inference is intentionally
+// degraded to avoid recursive/cache-order cycles while top-level requests can still use cache.
+const MAX_LOCAL_CALL_SITE_PARAM_INFER_DEPTH: u32 = 1;
+const MAX_LOCAL_CALL_SITE_PARAM_INFER_CALLS: usize = 64;
+
 fn infer_param_inner(
     db: &DbIndex,
     mut cache: Option<&mut LuaInferCache>,
@@ -842,44 +847,268 @@ fn infer_param_type_from_local_call_sites(
         .get_parent::<LuaLocalFuncStat>()
         .and_then(|local_func| local_func.get_local_name())?;
     let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
-    let func_name = local_func_name
-        .get_name_token()
-        .map(|token| token.get_name_text().to_string())?;
-    let file_refs = db
-        .get_reference_index()
-        .get_local_reference(&signature_id.get_file_id())?;
 
-    let mut inferred_type = LuaType::Unknown;
-    for call_expr in root.descendants().filter_map(LuaCallExpr::cast) {
-        let Some(LuaExpr::NameExpr(call_name)) = call_expr.get_prefix_expr() else {
-            continue;
-        };
-        if call_name.get_name_text().as_deref() != Some(func_name.as_str()) {
-            continue;
-        }
-        if file_refs.get_decl_id(&call_name.get_range()) != Some(target_decl_id) {
-            continue;
-        }
+    if cache.local_call_site_param_infer_depth >= MAX_LOCAL_CALL_SITE_PARAM_INFER_DEPTH {
+        return None;
+    }
 
+    cache.local_call_site_param_infer_depth += 1;
+    let inferred_type = infer_param_type_from_local_call_sites_inner(
+        db,
+        cache,
+        signature_id.get_file_id(),
+        &root,
+        target_decl_id,
+        param_idx,
+        true,
+    );
+    cache.local_call_site_param_infer_depth -= 1;
+
+    inferred_type
+}
+
+fn infer_param_type_from_local_call_sites_inner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    root: &LuaSyntaxNode,
+    target_decl_id: LuaDeclId,
+    param_idx: usize,
+    allow_param_args: bool,
+) -> Option<LuaType> {
+    let mut inferred_type: Option<LuaType> = None;
+    for call_expr in local_function_call_sites(db, file_id, root, target_decl_id)
+        .into_iter()
+        .take(MAX_LOCAL_CALL_SITE_PARAM_INFER_CALLS)
+    {
         let Some(arg) = call_expr
             .get_args_list()
             .and_then(|args| args.get_args().nth(param_idx))
         else {
             continue;
         };
-        if !is_global_pairs_for_range_var_arg(db, signature_id.get_file_id(), &arg) {
+        if !can_call_arg_drive_local_param_inference(db, file_id, &arg, param_idx) {
             continue;
         }
-        let Ok(arg_type) = infer_expr(db, cache, arg) else {
+        if !is_local_call_site_arg_shape_supported(&arg) {
             continue;
+        }
+        let arg_type = if is_global_pairs_for_range_var_arg(db, file_id, &arg) {
+            let Ok(arg_type) = infer_expr(db, cache, arg) else {
+                continue;
+            };
+            arg_type
+        } else if let Some(arg_param_decl) = param_arg_decl(db, file_id, &arg) {
+            if !allow_param_args {
+                continue;
+            }
+            let Some(arg_type) = infer_forwarded_param_arg_type(db, cache, arg_param_decl) else {
+                continue;
+            };
+            arg_type
+        } else {
+            let Some(arg_type) = infer_supported_non_param_call_arg_type(db, cache, file_id, arg)
+            else {
+                continue;
+            };
+            arg_type
         };
-        if arg_type.is_unknown() || arg_type.is_nil() || arg_type.is_never() {
+        if arg_type.is_unknown() || arg_type.is_never() {
             continue;
         }
-        inferred_type = TypeOps::Union.apply(db, &inferred_type, &arg_type);
+        inferred_type = Some(match inferred_type {
+            Some(current) => TypeOps::Union.apply(db, &current, &arg_type),
+            None => arg_type,
+        });
     }
 
-    (!inferred_type.is_unknown()).then_some(inferred_type)
+    inferred_type
+}
+
+fn infer_supported_non_param_call_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    arg: LuaExpr,
+) -> Option<LuaType> {
+    match &arg {
+        LuaExpr::LiteralExpr(_) => infer_expr(db, cache, arg).ok(),
+        LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr) => {
+            infer_expr(db, cache, arg).ok()
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let decl_id = db
+                .get_reference_index()
+                .get_local_reference(&file_id)
+                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))?;
+            let decl = db.get_decl_index().get_decl(&decl_id)?;
+            if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
+                return None;
+            }
+            let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
+            let value_node = decl.get_value_syntax_id()?.to_node_from_root(&root)?;
+            let value_expr = LuaExpr::cast(value_node)?;
+            match &value_expr {
+                LuaExpr::LiteralExpr(_) => {}
+                LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr) => {}
+                _ => return None,
+            }
+            infer_expr(db, cache, value_expr).ok()
+        }
+        _ => None,
+    }
+}
+
+fn is_local_call_site_arg_shape_supported(arg: &LuaExpr) -> bool {
+    match arg {
+        LuaExpr::NameExpr(_) | LuaExpr::LiteralExpr(_) => true,
+        LuaExpr::CallExpr(call_expr) => is_zero_arg_call(call_expr),
+        _ => false,
+    }
+}
+
+fn is_zero_arg_call(call_expr: &LuaCallExpr) -> bool {
+    call_expr
+        .get_args_list()
+        .is_none_or(|args| args.get_args().next().is_none())
+}
+
+fn infer_forwarded_param_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl: &LuaDecl,
+) -> Option<LuaType> {
+    let LuaDeclExtra::Param {
+        idx, signature_id, ..
+    } = decl.extra
+    else {
+        return None;
+    };
+    if decl.get_file_id() != signature_id.get_file_id() {
+        return None;
+    }
+
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&signature_id.get_file_id())?
+        .get_red_root();
+    let closure = root
+        .descendants()
+        .filter_map(LuaClosureExpr::cast)
+        .find(|closure| closure.get_position() == signature_id.get_position())?;
+    let local_func_name = closure
+        .get_parent::<LuaLocalFuncStat>()
+        .and_then(|local_func| local_func.get_local_name())?;
+    let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
+
+    infer_param_type_from_local_call_sites_inner(
+        db,
+        cache,
+        signature_id.get_file_id(),
+        &root,
+        target_decl_id,
+        idx,
+        false,
+    )
+}
+
+fn local_function_call_sites(
+    db: &DbIndex,
+    file_id: FileId,
+    root: &LuaSyntaxNode,
+    target_decl_id: LuaDeclId,
+) -> Vec<LuaCallExpr> {
+    let Some(decl_refs) = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_refs| file_refs.get_decl_references(&target_decl_id))
+    else {
+        return Vec::new();
+    };
+
+    let mut cells = decl_refs.cells.clone();
+    cells.sort_by_key(|cell| cell.range.start());
+
+    cells
+        .into_iter()
+        .filter_map(|cell| {
+            root.covering_element(cell.range)
+                .ancestors()
+                .find_map(LuaNameExpr::cast)
+                .filter(|name_expr| name_expr.get_range() == cell.range)
+        })
+        .filter_map(|name_expr| name_expr.get_parent::<LuaCallExpr>())
+        .filter(|call_expr| matches!(call_expr.get_prefix_expr(), Some(LuaExpr::NameExpr(_))))
+        .collect()
+}
+
+fn can_call_arg_drive_local_param_inference(
+    db: &DbIndex,
+    file_id: FileId,
+    arg: &LuaExpr,
+    target_param_idx: usize,
+) -> bool {
+    if is_for_range_var_arg(db, file_id, arg) {
+        return is_global_pairs_for_range_var_arg(db, file_id, arg);
+    }
+
+    if is_mutable_local_name_arg(db, file_id, arg) {
+        return false;
+    }
+
+    param_arg_decl(db, file_id, arg).is_none_or(
+        |decl| matches!(decl.extra, LuaDeclExtra::Param { idx, .. } if idx == target_param_idx),
+    )
+}
+
+fn is_mutable_local_name_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = arg else {
+        return false;
+    };
+    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
+        return false;
+    };
+    let Some(decl_id) = file_refs.get_decl_id(&name_expr.get_range()) else {
+        return false;
+    };
+    file_refs
+        .get_decl_references(&decl_id)
+        .is_some_and(|decl_refs| decl_refs.mutable)
+}
+
+fn param_arg_decl<'a>(db: &'a DbIndex, file_id: FileId, arg: &LuaExpr) -> Option<&'a LuaDecl> {
+    let LuaExpr::NameExpr(name_expr) = arg else {
+        return None;
+    };
+    let decl_id = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    matches!(decl.extra, LuaDeclExtra::Param { .. }).then_some(decl)
+}
+
+fn is_for_range_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = arg else {
+        return false;
+    };
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
+    else {
+        return false;
+    };
+
+    name_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaForRangeStat::cast)
+        .is_some_and(|for_range| {
+            for_range
+                .get_var_name_list()
+                .any(|var_name| var_name.get_position() == decl_id.position)
+        })
 }
 
 fn is_global_pairs_for_range_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
