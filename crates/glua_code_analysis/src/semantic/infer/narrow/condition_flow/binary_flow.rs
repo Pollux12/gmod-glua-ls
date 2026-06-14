@@ -18,7 +18,7 @@ use crate::{
             get_single_antecedent,
             get_type_at_flow::get_type_at_flow,
             get_var_ref_type, narrow_down_type,
-            var_ref_id::get_var_expr_var_ref_id,
+            var_ref_id::{get_var_expr_var_ref_id, unknown_prefix_should_widen_to_any},
         },
     },
     semantic::type_check::is_sub_type_of,
@@ -109,9 +109,9 @@ pub fn get_type_at_binary_expr(
     }
 
     // Fallback: any binary expression that successfully evaluates implies its
-    // index-typed operands have non-nil prefixes. For an undefined-global
-    // prefix (Unknown base), widen to Any so guarded/indexed global patterns
-    // keep existing flow behavior (e.g. `if tmysql.Version < 4.1 then`).
+    // index-typed operands have non-nil prefixes. Authoritative Unknown prefixes
+    // widen to Any so guarded/indexed global and explicit-unknown patterns keep
+    // existing flow behavior (e.g. `if tmysql.Version < 4.1 then`).
     // Comparison/equality ops that already matched a more-specific narrowing
     // return above; we only run this when dispatch produced Continue.
     //
@@ -142,8 +142,9 @@ pub fn get_type_at_binary_expr(
 }
 
 /// If `index_expr`'s leftmost-name prefix matches `var_ref_id` and that var's
-/// antecedent type is `Unknown`, return `Any`. Used as a fallback for binary
-/// expressions where evaluating the index implies the prefix is non-nil.
+/// antecedent type is an authoritative `Unknown`, return `Any`. Used as a
+/// fallback for binary expressions where evaluating the index implies the prefix
+/// is non-nil.
 #[allow(clippy::too_many_arguments)]
 fn try_unknown_prefix_widen(
     db: &DbIndex,
@@ -177,7 +178,7 @@ fn try_unknown_prefix_widen(
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
-    if matches!(left_type, LuaType::Unknown) {
+    if matches!(left_type, LuaType::Unknown) && unknown_prefix_should_widen_to_any(db, var_ref_id) {
         Ok(Some(LuaType::Any))
     } else {
         Ok(None)

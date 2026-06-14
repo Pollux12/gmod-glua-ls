@@ -16,6 +16,24 @@ use crate::{
     },
 };
 
+/// Returns true when a successfully-indexed `Unknown` prefix is authoritative
+/// and may widen to `Any`.
+pub fn unknown_prefix_should_widen_to_any(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+    // Only authoritative unknowns should be promoted after successful indexing:
+    // unresolved globals and locals explicitly documented as `unknown` are truly
+    // opaque to the analyzer. Inferred unknown aliases can still have concrete
+    // dynamic member origins (for example `local sounds = self.sounds`), so
+    // widening those aliases to `any` would erase the guarded member type.
+    if matches!(var_ref_id, VarRefId::GlobalName(_, _)) {
+        return true;
+    }
+
+    var_ref_id
+        .get_decl_id_ref()
+        .and_then(|decl_id| db.get_type_index().get_type_cache(&decl_id.into()))
+        .is_some_and(|type_cache| type_cache.is_doc())
+}
+
 /// Identity for an implicit `self` reference inside a colon method.
 ///
 /// `self_decl_id` is the method's implicit `self` declaration, which is unique

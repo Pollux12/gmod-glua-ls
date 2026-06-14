@@ -7,9 +7,12 @@ use crate::{
         VarRefId,
         infer_index::infer_member_by_member_key,
         narrow::{
-            ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
-            get_type_at_flow::get_type_at_flow, narrow_false_or_nil, remove_false_or_nil,
-            var_ref_id::get_var_expr_var_ref_id,
+            ResultTypeOrContinue,
+            condition_flow::InferConditionFlow,
+            get_single_antecedent,
+            get_type_at_flow::get_type_at_flow,
+            narrow_false_or_nil, remove_false_or_nil,
+            var_ref_id::{get_var_expr_var_ref_id, unknown_prefix_should_widen_to_any},
         },
     },
 };
@@ -116,11 +119,12 @@ fn maybe_field_exist_narrow(
     }
 
     let Some(candidates) = collect_field_exist_narrow_candidates(db, &left_type) else {
-        // Indexing an Unknown base (e.g. an undefined global like `tmysql.Version`)
-        // implies the base is non-nil/non-false at this point — both branches of
-        // an `if tmysql.X then ... else ... end` only execute if `tmysql.X` was
-        // successfully evaluated, which requires `tmysql` to be non-nil.
-        if matches!(left_type, LuaType::Unknown) {
+        // Indexing an authoritative Unknown base implies it is non-nil/non-false.
+        // Inferred unknown aliases may still carry concrete dynamic member types,
+        // so the shared guard decides whether widening to Any is safe.
+        if matches!(left_type, LuaType::Unknown)
+            && unknown_prefix_should_widen_to_any(db, var_ref_id)
+        {
             return Ok(ResultTypeOrContinue::Result(LuaType::Any));
         }
         return Ok(ResultTypeOrContinue::Continue);
@@ -345,9 +349,9 @@ fn filter_candidates_by_caller_realm(
 }
 
 /// Walk up an index chain looking for the leftmost prefix that resolves to the
-/// queried ar_ref_id. If found, and we are in the truthy branch with the
-/// base type still `Unknown`, narrow it to `Any` — successfully indexing
-/// any link in the chain (e.g. `a.b.c.d`) implies every prefix is non-nil.
+/// queried var_ref_id. If found, and we are in the truthy branch with an
+/// authoritative `Unknown` base, narrow it to `Any` — successfully indexing any
+/// link in the chain (e.g. `a.b.c.d`) implies every prefix is non-nil.
 ///
 /// We intentionally only widen `Unknown` here. For known base types, walking
 /// up beyond the immediate prefix would require recomputing field-existence
@@ -388,7 +392,7 @@ fn maybe_transitive_unknown_prefix_narrow(
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
-    if matches!(left_type, LuaType::Unknown) {
+    if matches!(left_type, LuaType::Unknown) && unknown_prefix_should_widen_to_any(db, var_ref_id) {
         return Ok(ResultTypeOrContinue::Result(LuaType::Any));
     }
     Ok(ResultTypeOrContinue::Continue)

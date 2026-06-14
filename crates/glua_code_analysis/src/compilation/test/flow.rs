@@ -5121,6 +5121,111 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_inferred_unknown_alias_direct_index_guard_preserves_dynamic_member_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@class DynamicValue
+            local DynamicValue = {}
+
+            ---@return DynamicValue
+            local function makeValue() end
+
+            ENT = {}
+
+            function ENT:Init()
+                self.values = {}
+                self.values.field = makeValue()
+            end
+
+            function ENT:Use()
+                local alias = self.values
+                if alias.field then
+                    local guarded = alias.field
+                    print(guarded)
+                end
+            end
+        "#,
+        );
+
+        let guarded = nth_name_expr_type_from_end(&mut ws, file_id, "guarded", 0);
+        assert_eq!(ws.humanize_type(guarded), "DynamicValue");
+    }
+
+    #[gtest]
+    fn test_inferred_unknown_alias_deep_index_guard_preserves_dynamic_member_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@class DynamicValue
+            local DynamicValue = {}
+
+            ---@return DynamicValue
+            local function makeValue() end
+
+            ENT = {}
+
+            function ENT:Init()
+                self.values = {}
+                self.values.a = { b = makeValue() }
+            end
+
+            function ENT:Use()
+                local alias = self.values
+                if alias.a.b then
+                    local guarded = alias.a.b
+                    print(guarded)
+                end
+            end
+        "#,
+        );
+
+        let guarded = nth_name_expr_type_from_end(&mut ws, file_id, "guarded", 0);
+        assert_eq!(ws.humanize_type(guarded), "DynamicValue");
+    }
+
+    #[gtest]
+    fn test_inferred_unknown_alias_comparison_guard_preserves_dynamic_member_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ENT = {}
+
+            function ENT:Init()
+                self.values = {}
+                self.values.field = 1
+            end
+
+            function ENT:Use()
+                local alias = self.values
+                if alias.field < 10 then
+                    local guarded = alias.field
+                    print(guarded)
+                end
+            end
+        "#,
+        );
+
+        let guarded = nth_name_expr_type_from_end(&mut ws, file_id, "guarded", 0);
+        assert_eq!(ws.humanize_type(guarded), "1");
+    }
+
+    #[gtest]
     fn test_unknown_local_binary_guard_promoted_to_any_within_scope() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
