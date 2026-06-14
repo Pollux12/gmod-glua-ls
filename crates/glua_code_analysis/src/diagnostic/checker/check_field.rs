@@ -281,6 +281,17 @@ fn check_index_expr(
     }
 
     if matches!(code, DiagnosticCode::UndefinedField)
+        && has_unresolved_metatable_index(
+            db,
+            semantic_model,
+            &prefix_typ,
+            Some(index_expr.get_position()),
+        )
+    {
+        return Some(());
+    }
+
+    if matches!(code, DiagnosticCode::UndefinedField)
         && !is_enum_type(db, &prefix_typ)
         && is_nil_guarded_in_scope(index_expr)
     {
@@ -404,6 +415,47 @@ fn is_tableof_colon_access(prefix_typ: &LuaType, index_expr: &LuaIndexExpr) -> b
     index_expr
         .get_index_token()
         .is_some_and(|token| token.is_colon())
+}
+
+fn has_unresolved_metatable_index(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    prefix_typ: &LuaType,
+    position: Option<rowan::TextSize>,
+) -> bool {
+    match prefix_typ {
+        LuaType::TableConst(table_range) => {
+            let Some(metatable) = db.get_metatable_index().get(table_range) else {
+                return false;
+            };
+
+            let index_member_key = LuaMemberKey::Name("__index".into());
+            let meta_owner = LuaMemberOwner::Element(metatable.clone());
+            let index_type = infer_owner_raw_member_type_with_realm(
+                db,
+                meta_owner,
+                &index_member_key,
+                semantic_model.get_file_id(),
+                position,
+            );
+
+            // A present but unresolved Lua `__index` can provide fields at runtime, so field
+            // absence cannot be proven. Known `__index` types still flow through normal checks.
+            index_type.is_ok_and(|typ| typ.is_unknown())
+        }
+        LuaType::Instance(instance) => {
+            has_unresolved_metatable_index(db, semantic_model, instance.get_base(), position)
+        }
+        LuaType::Union(union) => match union.as_ref() {
+            LuaUnionType::Nullable(typ) => {
+                has_unresolved_metatable_index(db, semantic_model, typ, position)
+            }
+            LuaUnionType::Multi(types) => types.iter().any(|typ| {
+                !typ.is_nil() && has_unresolved_metatable_index(db, semantic_model, typ, position)
+            }),
+        },
+        _ => false,
+    }
 }
 
 pub(super) fn is_valid_member(

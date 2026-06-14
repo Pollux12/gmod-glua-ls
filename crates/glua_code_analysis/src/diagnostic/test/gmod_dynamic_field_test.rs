@@ -2,6 +2,27 @@
 mod test {
     use crate::{DiagnosticCode, VirtualWorkspace};
     use googletest::prelude::*;
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    fn diagnostic_messages_for_file(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> Vec<String> {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
 
     #[gtest]
     fn test_inject_field_suppressed_for_dynamic_field() {
@@ -295,6 +316,210 @@ mod test {
             function DYNTEST_META:ReadOtherScope()
                 return self.otherScopeField
             end
+            "#
+        ));
+    }
+
+    #[gtest]
+    fn test_gmod_drive_registered_method_dispatch_has_no_undefined_fields() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let base_file_id = ws.def_file(
+            "lua/drive/drive_base.lua",
+            r##"
+            AddCSLuaFile()
+
+            drive.Register( "drive_base",
+            {
+                Init = function( self, cmd ) end,
+                SetupControls = function( self, cmd ) end,
+                StartMove = function( self, mv, cmd ) end,
+                Move = function( self, mv ) end,
+                FinishMove = function( self, mv ) end,
+                CalcView = function( self, view ) end,
+            } )
+            "##,
+        );
+
+        let file_id = ws.def_file(
+            "lua/includes/modules/drive.lua",
+            r##"
+            local IsValid = IsValid
+            local setmetatable = setmetatable
+            local SERVER = SERVER
+            local util = util
+            local ErrorNoHalt = ErrorNoHalt
+            local baseclass = baseclass
+            local LocalPlayer = LocalPlayer
+
+            module( "drive" )
+
+            local Type = {}
+
+            function Register( name, table, base )
+                Type[ name ] = table
+
+                if ( base ) then
+                    Type[ base ] = Type[ base ] or baseclass.Get( base )
+                    setmetatable( Type[ name ], { __index = Type[ base ] } )
+                end
+
+                if ( SERVER ) then
+                    util.AddNetworkString( name )
+                end
+
+                baseclass.Set( name, Type[ name ] )
+            end
+
+            function PlayerStartDriving( ply, ent, mode )
+                local method = Type[mode]
+                if ( !method ) then ErrorNoHalt( "Unknown drive type " .. ( mode ) .. "!\n" ) return end
+
+                local id = util.NetworkStringToID( mode )
+
+                ply:SetDrivingEntity( ent, id )
+            end
+
+            function GetMethod(ply)
+                if ( !ply:IsDrivingEntity() ) then return end
+
+                local ent = ply:GetDrivingEntity()
+                local modeid = ply:GetDrivingMode()
+
+                if ( !IsValid( ent ) || modeid == 0 ) then return end
+
+                local method = ply.m_CurrentDriverMethod
+                if ( method && method.Entity == ent && method.ModeID == modeid ) then return method end
+
+                local modename = util.NetworkIDToString( modeid )
+                if ( !modename ) then return end
+
+                local type = Type[ modename ]
+                if ( !type ) then return end
+
+                local method = {}
+                method.Entity = ent
+                method.Player = ply
+                method.ModeID = modeid
+
+                setmetatable( method, { __index = type } )
+
+                ply.m_CurrentDriverMethod = method
+
+                method:Init()
+                return method
+            end
+
+            function CreateMove( cmd )
+                local method = GetMethod( LocalPlayer() )
+                if ( !method ) then return end
+
+                method:SetupControls( cmd )
+                return true
+            end
+
+            function CalcView( ply, view )
+                local method = GetMethod( ply )
+                if ( !method ) then return end
+
+                method:CalcView( view )
+                return true
+            end
+
+            function StartMove( ply, mv, cmd )
+                local method = GetMethod( ply )
+                if ( !method ) then return end
+
+                method:StartMove( mv, cmd )
+                return true
+            end
+
+            function Move( ply, mv )
+                local method = GetMethod( ply )
+                if ( !method ) then return end
+
+                method:Move( mv )
+                return true
+            end
+
+            function FinishMove( ply, mv )
+                local method = GetMethod( ply )
+                if ( !method ) then return end
+
+                method:FinishMove( mv )
+
+                if ( method.StopDriving ) then
+                    PlayerStopDriving( ply )
+                end
+
+                return true
+            end
+            "##,
+        );
+
+        let base_diagnostics =
+            diagnostic_messages_for_file(&mut ws, base_file_id, DiagnosticCode::UndefinedField);
+        let diagnostics =
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField);
+
+        verify_that!(base_diagnostics, is_empty())?;
+        verify_that!(diagnostics, is_empty())
+    }
+
+    #[gtest]
+    fn test_unresolved_metatable_index_suppresses_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local t = {}
+            local unresolved = GetDynamicIndex()
+            setmetatable(t, { __index = unresolved })
+            local value = t.anything
+            "#
+        ));
+    }
+
+    #[gtest]
+    fn test_known_metatable_index_typo_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class DynTestKnownIndex
+            ---@field knownField number
+            local KnownClass = {}
+
+            ---@type DynTestKnownIndex
+            local known = KnownClass
+
+            local t = {}
+            setmetatable(t, { __index = known })
+            local value = t.typoField
+            "#
+        ));
+    }
+
+    #[gtest]
+    fn test_metatable_without_index_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local t = {}
+            setmetatable(t, {})
+            local value = t.foo
+            "#
+        ));
+    }
+
+    #[gtest]
+    fn test_plain_table_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local t = {}
+            local value = t.foo
             "#
         ));
     }
