@@ -14,6 +14,13 @@ use crate::{
 
 pub struct GenericConstraintMismatchChecker;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrTplArgClass {
+    Compatible,
+    Unprovable,
+    Incompatible,
+}
+
 impl Checker for GenericConstraintMismatchChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::GenericConstraintMismatch];
 
@@ -230,81 +237,47 @@ fn validate_str_tpl_ref(
 ) -> Option<()> {
     match arg_type {
         LuaType::StringConst(str) | LuaType::DocStringConst(str) => {
-            let full_type_name = format!(
-                "{}{}{}",
-                str_tpl_ref.get_prefix(),
+            emit_str_tpl_const_diagnostic(
+                context,
+                semantic_model,
+                str_tpl_ref,
                 str,
-                str_tpl_ref.get_suffix()
+                range,
+                extend_type.as_ref(),
             );
-            let founded_type_decl = semantic_model
-                .get_db()
-                .get_type_index()
-                .find_type_decl(semantic_model.get_file_id(), &full_type_name);
-            let is_auto_generated_decl = founded_type_decl
-                .as_ref()
-                .is_some_and(|type_decl| type_decl.is_auto_generated());
-            if is_auto_generated_decl && let Some(extend_type) = extend_type.as_ref() {
-                context.add_diagnostic_with_severity(
-                    DiagnosticCode::GenericConstraintMismatch,
-                    range,
-                    format!(
-                        "Type `{}` is not explicitly defined; auto-created inheriting `{}`",
-                        full_type_name,
-                        humanize_type(semantic_model.get_db(), extend_type, RenderLevel::Simple)
-                    ),
-                    Some(DiagnosticSeverity::HINT),
-                    None,
-                );
-            }
-
-            if founded_type_decl.is_none() {
-                if let Some(extend_type) = extend_type.as_ref() {
-                    context.add_diagnostic_with_severity(
-                        DiagnosticCode::GenericConstraintMismatch,
-                        range,
-                        format!(
-                            "type `{}` is not defined in the codebase, using constraint type `{}`",
-                            full_type_name,
-                            humanize_type(
-                                semantic_model.get_db(),
-                                extend_type,
-                                RenderLevel::Simple
-                            )
-                        ),
-                        Some(DiagnosticSeverity::HINT),
-                        None,
-                    );
-                } else {
+        }
+        LuaType::String | LuaType::Any | LuaType::Unknown | LuaType::StrTplRef(_) => {}
+        LuaType::Union(_) => {
+            // Diagnostics are pushed directly with no deduplication, so union handling emits once.
+            match classify_str_tpl_arg(semantic_model, str_tpl_ref, arg_type, &extend_type) {
+                StrTplArgClass::Compatible => {}
+                StrTplArgClass::Unprovable => {
+                    if let Some(str) = first_unprovable_str_tpl_const(
+                        semantic_model,
+                        str_tpl_ref,
+                        arg_type,
+                        &extend_type,
+                    ) {
+                        emit_str_tpl_const_diagnostic(
+                            context,
+                            semantic_model,
+                            str_tpl_ref,
+                            &str,
+                            range,
+                            extend_type.as_ref(),
+                        );
+                    }
+                }
+                StrTplArgClass::Incompatible => {
                     context.add_diagnostic(
                         DiagnosticCode::GenericConstraintMismatch,
                         range,
-                        "the string template type does not match any type declaration".to_string(),
+                        "the string template type must be a string constant".to_string(),
                         None,
-                    );
-                }
-
-                return Some(());
-            }
-
-            if let Some(extend_type) = extend_type
-                && let Some(type_decl) = founded_type_decl
-            {
-                let type_id = type_decl.get_id();
-                let ref_type = LuaType::Ref(type_id);
-                let result = semantic_model.type_check_detail(&extend_type, &ref_type);
-                if result.is_err() {
-                    add_type_check_diagnostic(
-                        context,
-                        semantic_model,
-                        range,
-                        &extend_type,
-                        &ref_type,
-                        result,
                     );
                 }
             }
         }
-        LuaType::String | LuaType::Any | LuaType::Unknown | LuaType::StrTplRef(_) => {}
         _ => {
             context.add_diagnostic(
                 DiagnosticCode::GenericConstraintMismatch,
@@ -315,6 +288,183 @@ fn validate_str_tpl_ref(
         }
     }
     Some(())
+}
+
+fn classify_str_tpl_arg(
+    semantic_model: &SemanticModel,
+    str_tpl_ref: &LuaStringTplType,
+    arg: &LuaType,
+    extend_type: &Option<LuaType>,
+) -> StrTplArgClass {
+    match arg {
+        LuaType::StringConst(str) | LuaType::DocStringConst(str) => {
+            classify_str_tpl_const_arg(semantic_model, str_tpl_ref, str, extend_type.as_ref())
+        }
+        LuaType::String | LuaType::Any | LuaType::Unknown | LuaType::StrTplRef(_) => {
+            StrTplArgClass::Compatible
+        }
+        LuaType::Union(union) => {
+            let mut best = StrTplArgClass::Incompatible;
+            for member in union.into_vec() {
+                match classify_str_tpl_arg(semantic_model, str_tpl_ref, &member, extend_type) {
+                    StrTplArgClass::Compatible => return StrTplArgClass::Compatible,
+                    StrTplArgClass::Unprovable => best = StrTplArgClass::Unprovable,
+                    StrTplArgClass::Incompatible => {}
+                }
+            }
+            best
+        }
+        _ => StrTplArgClass::Incompatible,
+    }
+}
+
+fn classify_str_tpl_const_arg(
+    semantic_model: &SemanticModel,
+    str_tpl_ref: &LuaStringTplType,
+    str: &str,
+    extend_type: Option<&LuaType>,
+) -> StrTplArgClass {
+    let full_type_name = str_tpl_full_type_name(str_tpl_ref, str);
+    let Some(type_decl) = semantic_model
+        .get_db()
+        .get_type_index()
+        .find_type_decl(semantic_model.get_file_id(), &full_type_name)
+    else {
+        return StrTplArgClass::Unprovable;
+    };
+
+    if type_decl.is_auto_generated() {
+        return StrTplArgClass::Unprovable;
+    }
+
+    if let Some(extend_type) = extend_type {
+        let ref_type = LuaType::Ref(type_decl.get_id());
+        if semantic_model
+            .type_check_detail(extend_type, &ref_type)
+            .is_err()
+        {
+            return StrTplArgClass::Incompatible;
+        }
+    }
+
+    StrTplArgClass::Compatible
+}
+
+fn first_unprovable_str_tpl_const(
+    semantic_model: &SemanticModel,
+    str_tpl_ref: &LuaStringTplType,
+    arg: &LuaType,
+    extend_type: &Option<LuaType>,
+) -> Option<String> {
+    match arg {
+        LuaType::StringConst(str) | LuaType::DocStringConst(str)
+            if classify_str_tpl_const_arg(
+                semantic_model,
+                str_tpl_ref,
+                str,
+                extend_type.as_ref(),
+            ) == StrTplArgClass::Unprovable =>
+        {
+            Some(str.to_string())
+        }
+        LuaType::Union(union) => {
+            for member in union.into_vec() {
+                if let Some(str) = first_unprovable_str_tpl_const(
+                    semantic_model,
+                    str_tpl_ref,
+                    &member,
+                    extend_type,
+                ) {
+                    return Some(str);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn emit_str_tpl_const_diagnostic(
+    context: &mut DiagnosticContext,
+    semantic_model: &SemanticModel,
+    str_tpl_ref: &LuaStringTplType,
+    str: &str,
+    range: TextRange,
+    extend_type: Option<&LuaType>,
+) {
+    let full_type_name = str_tpl_full_type_name(str_tpl_ref, str);
+    let founded_type_decl = semantic_model
+        .get_db()
+        .get_type_index()
+        .find_type_decl(semantic_model.get_file_id(), &full_type_name);
+    let is_auto_generated_decl = founded_type_decl
+        .as_ref()
+        .is_some_and(|type_decl| type_decl.is_auto_generated());
+    if is_auto_generated_decl && let Some(extend_type) = extend_type {
+        context.add_diagnostic_with_severity(
+            DiagnosticCode::GenericConstraintMismatch,
+            range,
+            format!(
+                "Type `{}` is not explicitly defined; auto-created inheriting `{}`",
+                full_type_name,
+                humanize_type(semantic_model.get_db(), extend_type, RenderLevel::Simple)
+            ),
+            Some(DiagnosticSeverity::HINT),
+            None,
+        );
+    }
+
+    if founded_type_decl.is_none() {
+        if let Some(extend_type) = extend_type {
+            context.add_diagnostic_with_severity(
+                DiagnosticCode::GenericConstraintMismatch,
+                range,
+                format!(
+                    "type `{}` is not defined in the codebase, using constraint type `{}`",
+                    full_type_name,
+                    humanize_type(semantic_model.get_db(), extend_type, RenderLevel::Simple)
+                ),
+                Some(DiagnosticSeverity::HINT),
+                None,
+            );
+        } else {
+            context.add_diagnostic(
+                DiagnosticCode::GenericConstraintMismatch,
+                range,
+                "the string template type does not match any type declaration".to_string(),
+                None,
+            );
+        }
+
+        return;
+    }
+
+    if let Some(extend_type) = extend_type
+        && let Some(type_decl) = founded_type_decl
+    {
+        let type_id = type_decl.get_id();
+        let ref_type = LuaType::Ref(type_id);
+        let result = semantic_model.type_check_detail(extend_type, &ref_type);
+        if result.is_err() {
+            add_type_check_diagnostic(
+                context,
+                semantic_model,
+                range,
+                extend_type,
+                &ref_type,
+                result,
+            );
+        }
+    }
+}
+
+fn str_tpl_full_type_name(str_tpl_ref: &LuaStringTplType, str: &str) -> String {
+    format!(
+        "{}{}{}",
+        str_tpl_ref.get_prefix(),
+        str,
+        str_tpl_ref.get_suffix()
+    )
 }
 
 fn validate_tpl_ref(

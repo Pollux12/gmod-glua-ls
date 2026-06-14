@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test {
     use googletest::prelude::*;
-    use lsp_types::{DiagnosticSeverity, NumberOrString};
+    use lsp_types::{DiagnosticSeverity, NumberOrString, Position};
     use tokio_util::sync::CancellationToken;
 
     use crate::{DiagnosticCode, VirtualWorkspace};
@@ -496,6 +496,125 @@ mod test {
         ));
     }
 
+    #[gtest]
+    fn test_str_tpl_union_all_valid_panel_subtypes_no_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::GenericConstraintMismatch,
+                r#"
+                    ---@class Panel
+                    ---@class DPanel: Panel
+                    ---@class DButton: Panel
+
+                    ---@generic T: Panel
+                    ---@param name `T`
+                    ---@return T
+                    function create_panel(name) end
+
+                    ---@type "DPanel"|"DButton"
+                    local panel_type
+
+                    create_panel(panel_type)
+                "#
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_str_tpl_union_mixed_valid_and_missing_emits_no_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+
+        let file_id = ws.def(
+            r#"
+                    ---@class Panel
+                    ---@class DPanel: Panel
+
+                    ---@generic T: Panel
+                    ---@param name `T`
+                    ---@return T
+                    function create_panel(name) end
+
+                    ---@type "MissingPanel"|"DPanel"
+                    local panel_type
+
+                    create_panel(panel_type)
+                "#,
+        );
+
+        let diagnostics = generic_constraint_mismatch_diagnostics(&mut ws, file_id);
+
+        expect_that!(diagnostics.len(), eq(0));
+    }
+
+    #[gtest]
+    fn test_str_tpl_union_all_missing_emits_single_hint_at_call_range() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+
+        let code = r#"
+                    ---@class Panel
+
+                    ---@generic T: Panel
+                    ---@param name `T`
+                    ---@return T
+                    function create_panel(name) end
+
+                    ---@type "MissingPanel"|"OtherMissingPanel"
+                    local panel_type
+
+                    create_panel(panel_type)
+                "#;
+        let file_id = ws.def(code);
+
+        let diagnostics = generic_constraint_mismatch_diagnostics(&mut ws, file_id);
+        let expected_start = position_of(code, "panel_type)");
+        let diagnostic = diagnostics
+            .first()
+            .expect("expected one generic-constraint-mismatch diagnostic");
+
+        expect_that!(diagnostics.len(), eq(1));
+        expect_that!(diagnostic.severity, eq(Some(DiagnosticSeverity::HINT)));
+        expect_that!(diagnostic.range.start, eq(expected_start));
+    }
+
+    #[gtest]
+    fn test_str_tpl_union_all_non_string_emits_single_hard_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+
+        let file_id = ws.def(
+            r#"
+                    ---@class Panel
+
+                    ---@generic T: Panel
+                    ---@param name `T`
+                    ---@return T
+                    function create_panel(name) end
+
+                    ---@type integer|boolean
+                    local panel_type
+
+                    create_panel(panel_type)
+                "#,
+        );
+
+        let diagnostics = generic_constraint_mismatch_diagnostics(&mut ws, file_id);
+
+        expect_that!(diagnostics.len(), eq(1));
+        expect_that!(
+            diagnostics[0].severity,
+            not(eq(Some(DiagnosticSeverity::HINT)))
+        );
+        expect_that!(
+            diagnostics[0].message.as_str(),
+            eq("the string template type must be a string constant")
+        );
+    }
+
     #[test]
     fn test_generic_keyof_param_scope() {
         let mut ws = VirtualWorkspace::new();
@@ -531,5 +650,39 @@ mod test {
             pick(person, "name")
         "#
         ));
+    }
+
+    fn generic_constraint_mismatch_diagnostics(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+    ) -> Vec<lsp_types::Diagnostic> {
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::GenericConstraintMismatch
+                .get_name()
+                .to_string(),
+        ));
+
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diag| diag.code == code)
+            .collect()
+    }
+
+    fn position_of(source: &str, needle: &str) -> Position {
+        let offset = source.find(needle).expect("needle should exist in source");
+        let mut line = 0;
+        let mut character = 0;
+        for ch in source[..offset].chars() {
+            if ch == '\n' {
+                line += 1;
+                character = 0;
+            } else {
+                character += 1;
+            }
+        }
+
+        Position::new(line, character)
     }
 }
