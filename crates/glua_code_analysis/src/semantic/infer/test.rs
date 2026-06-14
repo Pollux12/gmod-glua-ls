@@ -347,6 +347,26 @@ mod test {
     }
 
     #[test]
+    fn test_istable_guard_preserves_unannotated_string_const_initializer() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            local value = "x"
+
+            if istable(value) then
+                print(value)
+            end
+        "#,
+            "value",
+        );
+
+        assert_eq!(ty, LuaType::StringConst(smol_str::SmolStr::new("x").into()));
+    }
+
+    #[test]
     fn test_truthy_guard_with_index_expr_narrows_unknown_to_any() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         // Pattern: if ctp and ctp.Disable then ... end
