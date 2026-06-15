@@ -1,9 +1,11 @@
 use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaExpr, LuaIndexMemberExpr,
-    LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaTableExpr, LuaTableField, LuaVarExpr,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaChunk, LuaExpr,
+    LuaIndexMemberExpr, LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaTableExpr, LuaTableField,
+    LuaVarExpr,
 };
+use rowan::TextRange;
 
 use crate::{
     InFiled, InferGuard, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaTupleStatus,
@@ -451,10 +453,7 @@ fn infer_table_type_from_local_call_references(
             continue;
         }
 
-        let Some(reference_expr) = root
-            .descendants::<LuaExpr>()
-            .find(|expr| expr.get_range() == cell.range)
-        else {
+        let Some(reference_expr) = find_reference_expr_on_range_spine(&root, cell.range) else {
             continue;
         };
 
@@ -486,6 +485,26 @@ fn infer_table_type_from_local_call_references(
     } else {
         Ok(typ)
     }
+}
+
+fn find_reference_expr_on_range_spine(root: &LuaChunk, range: TextRange) -> Option<LuaExpr> {
+    let mut current_node = Some(root.syntax().clone());
+
+    while let Some(node) = current_node {
+        if node.text_range() == range {
+            if let Some(expr) = LuaExpr::cast(node.clone()) {
+                return Some(expr);
+            }
+        }
+
+        let node_or_token = node.child_or_token_at_range(range)?;
+        current_node = match node_or_token {
+            rowan::NodeOrToken::Node(child_node) => Some(child_node),
+            rowan::NodeOrToken::Token(_) => None,
+        };
+    }
+
+    None
 }
 
 fn infer_table_type_by_assign_stat(
