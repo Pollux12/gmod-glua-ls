@@ -15,6 +15,15 @@ use crate::{
     semantic::infer::InferFailReason,
 };
 
+type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+pub enum FlowOrigin {
+    #[default]
+    Real,
+    NilCounterfactual,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VarRefCacheRootKey {
     Decl(LuaDeclId),
@@ -77,7 +86,7 @@ pub struct LuaInferCache {
     pub call_arg_types_cache:
         FxHashMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
     pub flow_node_cache:
-        FxHashMap<VarRefCacheKey, FxHashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>>,
+        FxHashMap<VarRefCacheKey, FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>>,
     pub flow_query_realm: Option<GmodRealm>,
     pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,
     pub index_ref_origin_type_cache: FxHashMap<VarRefCacheKey, CacheEntry<LuaType>>,
@@ -358,10 +367,20 @@ impl LuaInferCache {
         flow_id: FlowId,
         query_realm: GmodRealm,
     ) -> Option<&CacheEntry<LuaType>> {
+        self.get_flow_cache_with_origin(var_ref_id, flow_id, query_realm, FlowOrigin::Real)
+    }
+
+    pub fn get_flow_cache_with_origin(
+        &self,
+        var_ref_id: &VarRefId,
+        flow_id: FlowId,
+        query_realm: GmodRealm,
+        origin: FlowOrigin,
+    ) -> Option<&CacheEntry<LuaType>> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         self.flow_node_cache
             .get(&cache_key)
-            .and_then(|by_flow| by_flow.get(&(flow_id, query_realm)))
+            .and_then(|by_flow| by_flow.get(&(flow_id, query_realm, origin)))
     }
 
     pub fn set_flow_cache(
@@ -371,17 +390,28 @@ impl LuaInferCache {
         query_realm: GmodRealm,
         entry: CacheEntry<LuaType>,
     ) {
+        self.set_flow_cache_with_origin(var_ref_id, flow_id, query_realm, FlowOrigin::Real, entry);
+    }
+
+    pub fn set_flow_cache_with_origin(
+        &mut self,
+        var_ref_id: &VarRefId,
+        flow_id: FlowId,
+        query_realm: GmodRealm,
+        origin: FlowOrigin,
+        entry: CacheEntry<LuaType>,
+    ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         self.flow_node_cache
             .entry(cache_key)
             .or_default()
-            .insert((flow_id, query_realm), entry);
+            .insert((flow_id, query_realm, origin), entry);
     }
 
     pub fn take_flow_cache_for_var_ref(
         &mut self,
         var_ref_id: &VarRefId,
-    ) -> Option<FxHashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>> {
+    ) -> Option<FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         self.flow_node_cache.remove(&cache_key)
     }
@@ -389,7 +419,7 @@ impl LuaInferCache {
     pub fn restore_flow_cache_for_var_ref(
         &mut self,
         var_ref_id: &VarRefId,
-        previous: Option<FxHashMap<(FlowId, GmodRealm), CacheEntry<LuaType>>>,
+        previous: Option<FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         if let Some(previous) = previous {

@@ -1,8 +1,6 @@
 mod infer_array;
 pub(crate) use infer_array::check_iter_var_range;
 
-use std::collections::HashSet;
-
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaForStat, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
     LuaLocalStat, LuaNameExpr, NumberResult, PathTrait,
@@ -10,6 +8,7 @@ use glua_parser::{
 use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
+use std::collections::HashSet;
 
 use crate::{
     CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
@@ -22,10 +21,13 @@ use crate::{
     enum_variable_is_param, get_keyof_members, get_tpl_ref_extend_type,
     semantic::{
         InferGuard,
+        cache::FlowOrigin,
         generic::{TypeSubstitutor, instantiate_type_generic},
         infer::{
-            VarRefId, VarRefRootId, infer_index::infer_array::infer_array_member,
-            infer_name::get_name_expr_var_ref_id, narrow::infer_expr_narrow_type,
+            VarRefId, VarRefRootId,
+            infer_index::infer_array::infer_array_member,
+            infer_name::get_name_expr_var_ref_id,
+            narrow::{infer_expr_narrow_type, infer_expr_narrow_type_with_flow_origin},
         },
         is_doc_tag_table_const,
         member::get_buildin_type_map_type_id,
@@ -59,7 +61,6 @@ pub fn infer_index_expr(
         Err(err) => return Err(err),
     };
     let index_member_expr = LuaIndexMemberExpr::IndexExpr(index_expr.clone());
-
     let reason = match infer_member_by_member_key(
         db,
         cache,
@@ -69,13 +70,7 @@ pub fn infer_index_expr(
     ) {
         Ok(member_type) => {
             if pass_flow {
-                return infer_member_type_pass_flow(
-                    db,
-                    cache,
-                    index_expr,
-                    // &prefix_type,
-                    member_type,
-                );
+                return infer_member_type_pass_flow(db, cache, index_expr, member_type);
             }
             return Ok(member_type);
         }
@@ -92,13 +87,7 @@ pub fn infer_index_expr(
     ) {
         Ok(member_type) => {
             if pass_flow {
-                return infer_member_type_pass_flow(
-                    db,
-                    cache,
-                    index_expr,
-                    // &prefix_type,
-                    member_type,
-                );
+                return infer_member_type_pass_flow(db, cache, index_expr, member_type);
             }
             return Ok(member_type);
         }
@@ -169,18 +158,96 @@ fn infer_member_type_fallback_pass_flow(
         return Err(InferFailReason::FieldNotFound);
     };
 
+    let Some(flow_id) = db
+        .get_flow_index()
+        .get_flow_tree(&cache.get_file_id())
+        .and_then(|flow_tree| flow_tree.get_flow_id(index_expr.get_syntax_id()))
+    else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+    let query_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&cache.get_file_id(), index_expr.get_position());
+
+    if let Some(counterfactual_entry) = cache
+        .get_flow_cache_with_origin(
+            &var_ref_id,
+            flow_id,
+            query_realm,
+            FlowOrigin::NilCounterfactual,
+        )
+        .cloned()
+    {
+        return finalize_fallback_result(
+            cache_entry_to_infer_result(&counterfactual_entry),
+            unknown_truthy_as_any,
+        );
+    }
+
+    let result = run_legacy_fallback_narrow_raw(db, cache, index_expr, &var_ref_id);
+    if let Some(entry) = infer_result_to_cache_entry(cache, &result) {
+        cache.set_flow_cache_with_origin(
+            &var_ref_id,
+            flow_id,
+            query_realm,
+            FlowOrigin::NilCounterfactual,
+            entry,
+        );
+    }
+
+    finalize_fallback_result(result, unknown_truthy_as_any)
+}
+
+fn run_legacy_fallback_narrow_raw(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: LuaIndexExpr,
+    var_ref_id: &VarRefId,
+) -> InferResult {
     let previous_origin =
-        cache.replace_index_ref_origin_type_cache(&var_ref_id, CacheEntry::Cache(LuaType::Nil));
-    let previous_flow_cache = cache.take_flow_cache_for_var_ref(&var_ref_id);
-    let result = infer_expr_narrow_type(
+        cache.replace_index_ref_origin_type_cache(var_ref_id, CacheEntry::Cache(LuaType::Nil));
+    let previous_flow_cache = cache.take_flow_cache_for_var_ref(var_ref_id);
+    let result = infer_expr_narrow_type_with_flow_origin(
         db,
         cache,
         LuaExpr::IndexExpr(index_expr),
         var_ref_id.clone(),
+        FlowOrigin::Real,
     );
-    cache.restore_flow_cache_for_var_ref(&var_ref_id, previous_flow_cache);
-    cache.restore_index_ref_origin_type_cache(&var_ref_id, previous_origin);
+    cache.restore_flow_cache_for_var_ref(var_ref_id, previous_flow_cache);
+    cache.restore_index_ref_origin_type_cache(var_ref_id, previous_origin);
+    result
+}
 
+fn cache_entry_to_infer_result(entry: &CacheEntry<LuaType>) -> InferResult {
+    match entry {
+        CacheEntry::Cache(ty) => Ok(ty.clone()),
+        CacheEntry::Error(reason) => Err(reason.clone()),
+        CacheEntry::Ready => Err(InferFailReason::None),
+    }
+}
+
+fn infer_result_to_cache_entry(
+    cache: &LuaInferCache,
+    result: &InferResult,
+) -> Option<CacheEntry<LuaType>> {
+    match result {
+        Ok(ty) => Some(CacheEntry::Cache(ty.clone())),
+        Err(InferFailReason::RecursiveInfer) => None,
+        Err(reason) => {
+            let should_cache = match reason {
+                InferFailReason::UnResolveDeclType(_) => {
+                    cache.get_config().analysis_phase.is_diagnostics()
+                }
+                _ => true,
+            };
+
+            should_cache.then(|| CacheEntry::Error(reason.clone()))
+        }
+    }
+}
+
+fn finalize_fallback_result(result: InferResult, unknown_truthy_as_any: bool) -> InferResult {
     match result {
         Ok(member_type) if !member_type.is_nil() && !member_type.is_unknown() => Ok(member_type),
         Ok(member_type) if member_type.is_unknown() && unknown_truthy_as_any => Ok(LuaType::Any),

@@ -11,6 +11,7 @@ use crate::{
     GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId,
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeOwner,
     LuaUnionType, TypeOps, infer_expr,
+    semantic::cache::FlowOrigin,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
         infer_name::infer_global_type,
@@ -34,6 +35,18 @@ pub fn get_type_at_flow(
     var_ref_id: &VarRefId,
     flow_id: FlowId,
 ) -> InferResult {
+    get_type_at_flow_with_origin(db, tree, cache, root, var_ref_id, flow_id, FlowOrigin::Real)
+}
+
+pub fn get_type_at_flow_with_origin(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_id: FlowId,
+    flow_origin: FlowOrigin,
+) -> InferResult {
     cache.prof_flow_calls += 1;
     let query_realm = cache.flow_query_realm.unwrap_or_else(|| {
         db.get_gmod_infer_index()
@@ -41,7 +54,7 @@ pub fn get_type_at_flow(
     });
     // Check cache for both success and error results.
     match cache
-        .get_flow_cache(var_ref_id, flow_id, query_realm)
+        .get_flow_cache_with_origin(var_ref_id, flow_id, query_realm, flow_origin)
         .cloned()
     {
         Some(CacheEntry::Cache(narrow_type)) => {
@@ -54,7 +67,6 @@ pub fn get_type_at_flow(
         }
         _ => {}
     }
-
     let mut visited_flow_ids = Vec::new();
     let result = get_type_at_flow_walk(
         db,
@@ -63,6 +75,7 @@ pub fn get_type_at_flow(
         root,
         var_ref_id,
         query_realm,
+        flow_origin,
         flow_id,
         &mut visited_flow_ids,
     );
@@ -79,9 +92,21 @@ pub fn get_type_at_flow(
     match &result {
         Ok(ty) => {
             let entry = CacheEntry::Cache(ty.clone());
-            cache.set_flow_cache(var_ref_id, flow_id, query_realm, entry.clone());
+            cache.set_flow_cache_with_origin(
+                var_ref_id,
+                flow_id,
+                query_realm,
+                flow_origin,
+                entry.clone(),
+            );
             for visited_flow_id in visited_flow_ids {
-                cache.set_flow_cache(var_ref_id, visited_flow_id, query_realm, entry.clone());
+                cache.set_flow_cache_with_origin(
+                    var_ref_id,
+                    visited_flow_id,
+                    query_realm,
+                    flow_origin,
+                    entry.clone(),
+                );
             }
         }
         Err(InferFailReason::RecursiveInfer) => {
@@ -97,9 +122,21 @@ pub fn get_type_at_flow(
 
             if should_cache {
                 let entry = CacheEntry::Error(reason.clone());
-                cache.set_flow_cache(var_ref_id, flow_id, query_realm, entry.clone());
+                cache.set_flow_cache_with_origin(
+                    var_ref_id,
+                    flow_id,
+                    query_realm,
+                    flow_origin,
+                    entry.clone(),
+                );
                 for visited_flow_id in visited_flow_ids {
-                    cache.set_flow_cache(var_ref_id, visited_flow_id, query_realm, entry.clone());
+                    cache.set_flow_cache_with_origin(
+                        var_ref_id,
+                        visited_flow_id,
+                        query_realm,
+                        flow_origin,
+                        entry.clone(),
+                    );
                 }
             }
         }
@@ -116,6 +153,7 @@ fn get_type_at_flow_walk(
     root: &LuaChunk,
     var_ref_id: &VarRefId,
     query_realm: GmodRealm,
+    flow_origin: FlowOrigin,
     initial_flow_id: FlowId,
     visited_flow_ids: &mut Vec<FlowId>,
 ) -> InferResult {
@@ -124,7 +162,12 @@ fn get_type_at_flow_walk(
         // Check cache for intermediate flow nodes (both success and error).
         // This is critical for performance in large files where many walks
         // share overlapping flow chains.
-        match cache.get_flow_cache(var_ref_id, antecedent_flow_id, query_realm) {
+        match cache.get_flow_cache_with_origin(
+            var_ref_id,
+            antecedent_flow_id,
+            query_realm,
+            flow_origin,
+        ) {
             Some(CacheEntry::Cache(cached_type)) => return Ok(cached_type.clone()),
             Some(CacheEntry::Error(reason)) => return Err(reason.clone()),
             _ => {}

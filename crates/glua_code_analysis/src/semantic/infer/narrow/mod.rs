@@ -9,6 +9,7 @@ use crate::{
     LuaInferCache, LuaType, TypeOps,
     db_index::LuaTypeDeclId,
     get_real_type, infer_param_with_cache,
+    semantic::cache::FlowOrigin,
     semantic::infer::{
         InferResult,
         infer_name::{find_decl_member_type, infer_global_type},
@@ -112,6 +113,40 @@ pub fn infer_expr_narrow_type(
     let previous_query_realm = cache.flow_query_realm.replace(query_realm);
     let result =
         get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id);
+    cache.flow_query_realm = previous_query_realm;
+    result
+}
+
+pub fn infer_expr_narrow_type_with_flow_origin(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    var_ref_id: VarRefId,
+    flow_origin: FlowOrigin,
+) -> InferResult {
+    let file_id = cache.get_file_id();
+    let Some(flow_tree) = db.get_flow_index().get_flow_tree(&file_id) else {
+        return get_var_ref_type(db, cache, &var_ref_id);
+    };
+
+    let Some(flow_id) = flow_tree.get_flow_id(expr.get_syntax_id()) else {
+        return get_var_ref_type(db, cache, &var_ref_id);
+    };
+
+    let root = LuaChunk::cast(expr.get_root()).ok_or(InferFailReason::None)?;
+    let query_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&file_id, expr.get_position());
+    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let result = get_type_at_flow::get_type_at_flow_with_origin(
+        db,
+        flow_tree,
+        cache,
+        &root,
+        &var_ref_id,
+        flow_id,
+        flow_origin,
+    );
     cache.flow_query_realm = previous_query_realm;
     result
 }
