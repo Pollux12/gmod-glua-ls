@@ -1,3 +1,4 @@
+mod call_site_params;
 mod common;
 mod decl;
 mod doc;
@@ -76,6 +77,8 @@ pub fn analyze(
         }
 
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
+
+        run_analysis::<call_site_params::CallSiteParamAnalysisPipeline>(db, &mut context);
 
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);

@@ -523,4 +523,111 @@ mod test {
             "#
         ));
     }
+
+    #[gtest]
+    fn test_same_file_global_call_site_overrides_gmod_param_name_hint() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_file_for(
+            DiagnosticCode::ParamTypeMismatch,
+            "lua/postprocess/bloom.lua",
+            r#"
+            ---@class Color
+
+            ---@class ConVar
+            ---@return number
+            function ConVar:GetFloat() end
+            ---@return boolean
+            function ConVar:GetBool() end
+
+            ---@return ConVar
+            function CreateClientConVar(name, default, shouldsave, userinfo, helptext, min, max) end
+
+            hook = hook or {}
+            function hook.Add(eventName, identifier, func) end
+
+            ---@class Material
+            ---@param key string
+            ---@param value number
+            function Material:SetFloat(key, value) end
+
+            ---@type Material
+            local mat_Bloom
+            local pp_bloom = CreateClientConVar("pp_bloom", "1", true, false)
+            local pp_bloom_color = CreateClientConVar("pp_bloom_color", "1", true, false)
+
+            function DrawBloom(darken, multiply, sizex, sizey, passes, color, colr, colg, colb)
+                mat_Bloom:SetFloat("$colormul", color)
+            end
+
+            hook.Add("RenderScreenspaceEffects", "RenderBloom", function()
+                if not pp_bloom:GetBool() then return end
+                DrawBloom(0.65, 1, 9, 9, 1, pp_bloom_color:GetFloat(), 1, 1, 1)
+            end)
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_same_file_member_global_call_site_overrides_gmod_param_name_hint() {
+        let mut ws = VirtualWorkspace::new();
+        let target_file = ws.def_file(
+            "lua/postprocess/workspace_bloom.lua",
+            r#"
+            ---@class Color
+
+            Namespace = Namespace or {}
+
+            ---@param value number
+            local function takes_number(value) end
+
+            function Namespace.AcceptColorName(color)
+                takes_number(color)
+            end
+
+            Namespace.AcceptColorName(123)
+            "#,
+        );
+
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::ParamTypeMismatch),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_reindexing_same_file_refreshes_call_site_param_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        let target_path = "lua/postprocess/workspace_bloom.lua";
+        let target_source = r#"
+            ---@class Color
+
+            Namespace = Namespace or {}
+
+            ---@param value number
+            local function takes_number(value) end
+
+            function Namespace.AcceptColorName(color)
+                takes_number(color)
+            end
+
+            Namespace.AcceptColorName(123)
+            "#;
+        let target_file = ws.def_file(target_path, target_source);
+
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::ParamTypeMismatch),
+            is_empty()
+        );
+
+        let uri = ws.virtual_url_generator.new_uri(target_path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{target_source}\n"));
+        ws.analysis.reindex_files(vec![target_file]);
+
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::ParamTypeMismatch),
+            is_empty(),
+            "same-file reindex should refresh call-site evidence"
+        );
+    }
 }

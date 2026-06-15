@@ -705,7 +705,6 @@ pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
 // Param type cache is keyed by decl id; nested local-call-site inference is intentionally
 // degraded to avoid recursive/cache-order cycles while top-level requests can still use cache.
 const MAX_LOCAL_CALL_SITE_PARAM_INFER_DEPTH: u32 = 1;
-const MAX_LOCAL_CALL_SITE_PARAM_INFER_CALLS: usize = 64;
 
 fn infer_param_inner(
     db: &DbIndex,
@@ -810,9 +809,16 @@ fn infer_param_inner(
         return Ok(file_hint_type);
     }
 
+    if let Some(call_site_type) = db
+        .get_call_site_param_index()
+        .get_inferred_param(&signature_id, param_idx)
+    {
+        return Ok(call_site_type.clone());
+    }
+
     if let Some(cache) = cache.as_mut()
         && let Some(call_arg_type) =
-            infer_param_type_from_local_call_sites(db, cache, decl, signature_id, param_idx)
+            infer_param_type_from_call_sites(db, cache, decl, signature_id, param_idx)
     {
         return Ok(call_arg_type);
     }
@@ -824,7 +830,7 @@ fn infer_param_inner(
     Err(InferFailReason::UnResolveDeclType(decl.get_id()))
 }
 
-fn infer_param_type_from_local_call_sites(
+fn infer_param_type_from_call_sites(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     decl: &LuaDecl,
@@ -843,25 +849,24 @@ fn infer_param_type_from_local_call_sites(
         .descendants()
         .filter_map(LuaClosureExpr::cast)
         .find(|closure| closure.get_position() == signature_id.get_position())?;
-    let local_func_name = closure
+    let call_sites = if let Some(local_func_name) = closure
         .get_parent::<LuaLocalFuncStat>()
-        .and_then(|local_func| local_func.get_local_name())?;
-    let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
+        .and_then(|local_func| local_func.get_local_name())
+    {
+        let target_decl_id =
+            LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
+        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id)
+    } else {
+        return None;
+    };
 
     if cache.local_call_site_param_infer_depth >= MAX_LOCAL_CALL_SITE_PARAM_INFER_DEPTH {
         return None;
     }
 
     cache.local_call_site_param_infer_depth += 1;
-    let inferred_type = infer_param_type_from_local_call_sites_inner(
-        db,
-        cache,
-        signature_id.get_file_id(),
-        &root,
-        target_decl_id,
-        param_idx,
-        true,
-    );
+    let inferred_type =
+        infer_param_type_from_local_call_sites_inner(db, cache, call_sites, param_idx, true);
     cache.local_call_site_param_infer_depth -= 1;
 
     inferred_type
@@ -870,17 +875,12 @@ fn infer_param_type_from_local_call_sites(
 fn infer_param_type_from_local_call_sites_inner(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    file_id: FileId,
-    root: &LuaSyntaxNode,
-    target_decl_id: LuaDeclId,
+    call_sites: Vec<(FileId, LuaCallExpr)>,
     param_idx: usize,
     allow_param_args: bool,
 ) -> Option<LuaType> {
     let mut inferred_type: Option<LuaType> = None;
-    for call_expr in local_function_call_sites(db, file_id, root, target_decl_id)
-        .into_iter()
-        .take(MAX_LOCAL_CALL_SITE_PARAM_INFER_CALLS)
-    {
+    for (file_id, call_expr) in call_sites {
         let Some(arg) = call_expr
             .get_args_list()
             .and_then(|args| args.get_args().nth(param_idx))
@@ -1004,9 +1004,7 @@ fn infer_forwarded_param_arg_type(
     infer_param_type_from_local_call_sites_inner(
         db,
         cache,
-        signature_id.get_file_id(),
-        &root,
-        target_decl_id,
+        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id),
         idx,
         false,
     )
@@ -1017,7 +1015,7 @@ fn local_function_call_sites(
     file_id: FileId,
     root: &LuaSyntaxNode,
     target_decl_id: LuaDeclId,
-) -> Vec<LuaCallExpr> {
+) -> Vec<(FileId, LuaCallExpr)> {
     let Some(decl_refs) = db
         .get_reference_index()
         .get_local_reference(&file_id)
@@ -1039,6 +1037,7 @@ fn local_function_call_sites(
         })
         .filter_map(|name_expr| name_expr.get_parent::<LuaCallExpr>())
         .filter(|call_expr| matches!(call_expr.get_prefix_expr(), Some(LuaExpr::NameExpr(_))))
+        .map(|call_expr| (file_id, call_expr))
         .collect()
 }
 

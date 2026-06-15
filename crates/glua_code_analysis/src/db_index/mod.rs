@@ -1,4 +1,5 @@
 mod accessor_func;
+mod call_site_param;
 mod declaration;
 mod dependency;
 mod diagnostic;
@@ -25,6 +26,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{Emmyrc, FileId, Vfs};
 pub use accessor_func::*;
+pub use call_site_param::CallSiteParamIndex;
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
@@ -61,6 +63,7 @@ pub struct DbIndex {
     flow_index: LuaFlowIndex,
     accessor_func_index: AccessorFuncAnnotationIndex,
     accessor_func_call_index: AccessorFuncCallIndex,
+    call_site_param_index: CallSiteParamIndex,
     gmod_class_index: GmodClassMetadataIndex,
     gmod_infer_index: GmodInferIndex,
     gmod_load_index: GmodLoadIndex,
@@ -96,6 +99,7 @@ impl DbIndex {
             flow_index: LuaFlowIndex::new(),
             accessor_func_index: AccessorFuncAnnotationIndex::new(),
             accessor_func_call_index: AccessorFuncCallIndex::new(),
+            call_site_param_index: CallSiteParamIndex::new(),
             gmod_class_index: GmodClassMetadataIndex::new(),
             gmod_infer_index: GmodInferIndex::new(),
             gmod_load_index: GmodLoadIndex::new(),
@@ -229,6 +233,14 @@ impl DbIndex {
         &mut self.accessor_func_call_index
     }
 
+    pub fn get_call_site_param_index(&self) -> &CallSiteParamIndex {
+        &self.call_site_param_index
+    }
+
+    pub fn get_call_site_param_index_mut(&mut self) -> &mut CallSiteParamIndex {
+        &mut self.call_site_param_index
+    }
+
     pub fn get_gmod_class_metadata_index(&self) -> &GmodClassMetadataIndex {
         &self.gmod_class_index
     }
@@ -338,6 +350,7 @@ impl LuaIndex for DbIndex {
         self.flow_index.remove(file_id);
         self.accessor_func_index.remove(file_id);
         self.accessor_func_call_index.remove(file_id);
+        self.call_site_param_index.remove(file_id);
         self.gmod_class_index.remove(file_id);
         self.gmod_infer_index.remove(file_id);
         self.gmod_load_index.remove(file_id);
@@ -362,6 +375,7 @@ impl LuaIndex for DbIndex {
         self.flow_index.clear();
         self.accessor_func_index.clear();
         self.accessor_func_call_index.clear();
+        self.call_site_param_index.clear();
         self.gmod_class_index.clear();
         self.gmod_infer_index.clear();
         self.gmod_load_index.clear();

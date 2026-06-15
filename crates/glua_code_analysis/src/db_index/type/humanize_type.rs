@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use itertools::Itertools;
 
 use crate::{
-    AsyncState, DbIndex, GenericTpl, LuaAliasCallType, LuaConditionalType, LuaFunctionType,
-    LuaGenericType, LuaInstanceType, LuaIntersectionType, LuaMemberKey, LuaMemberOwner,
-    LuaMergedTableType, LuaObjectType, LuaSignatureId, LuaStringTplType, LuaTupleType, LuaType,
-    LuaTypeDeclId, LuaUnionType, TypeSubstitutor, VariadicType,
+    AsyncState, DbIndex, DynamicFieldOwner, GenericTpl, LuaAliasCallType, LuaConditionalType,
+    LuaFunctionType, LuaGenericType, LuaInstanceType, LuaIntersectionType, LuaMemberKey,
+    LuaMemberOwner, LuaMergedTableType, LuaObjectType, LuaSignatureId, LuaStringTplType,
+    LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, TypeSubstitutor, VariadicType,
     semantic::{LuaMemberInfo, find_members},
 };
 
@@ -625,8 +625,14 @@ fn humanize_table_const_type_detail_and_simple(
     let mut total_length = 0;
     let mut total_line = 0;
     let mut members_string = String::new();
+    let has_dynamic_wildcard = owner_has_dynamic_wildcard(db, &member_owned);
+    let mut has_dynamic_member = false;
+    let mut truncated = false;
     for member in members {
         let key = member.get_key();
+        if matches!(key, LuaMemberKey::ExprType(typ) if typ.is_unknown()) {
+            has_dynamic_member = true;
+        }
         let type_cache = db.get_type_index().get_type_cache(&member.get_id().into());
         let type_cache = match type_cache {
             Some(type_cache) => type_cache,
@@ -660,7 +666,37 @@ fn humanize_table_const_type_detail_and_simple(
                 members_string.push_str(&member_string);
                 if total_length > 54 {
                     members_string.push_str(", ...");
+                    truncated = true;
                     break;
+                }
+            }
+        }
+    }
+
+    if has_dynamic_wildcard && !has_dynamic_member && !truncated {
+        let dynamic_member_string = build_table_member_string(
+            db,
+            &LuaMemberKey::ExprType(LuaType::Unknown),
+            &LuaType::Any,
+            humanize_type(db, &LuaType::Any, level.next_level()),
+            level,
+        );
+        match layout {
+            TableLayout::Detailed => {
+                if total_line < detailed_max {
+                    members_string.push_str(&format!("    {},\n", dynamic_member_string));
+                }
+            }
+            TableLayout::Compact => {
+                let dynamic_member_string_len = dynamic_member_string.chars().count();
+                if total_length != 0 {
+                    members_string.push_str(", ");
+                    total_length += 2;
+                }
+                total_length += dynamic_member_string_len;
+                members_string.push_str(&dynamic_member_string);
+                if total_length > 54 {
+                    members_string.push_str(", ...");
                 }
             }
         }
@@ -670,6 +706,20 @@ fn humanize_table_const_type_detail_and_simple(
         TableLayout::Detailed => format!("{{\n{}}}", members_string),
         TableLayout::Compact => format!("{{ {} }}", members_string),
     })
+}
+
+fn owner_has_dynamic_wildcard(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
+    let dynamic_owner = match owner {
+        LuaMemberOwner::Type(type_id) => DynamicFieldOwner::Type(type_id.clone()),
+        LuaMemberOwner::Element(table_range) => DynamicFieldOwner::Table(table_range.clone()),
+        _ => return false,
+    };
+
+    let index = db.get_dynamic_field_index();
+    index
+        .get_fields(&dynamic_owner)
+        .is_some_and(|fields| !fields.is_empty())
+        && !index.get_wildcard_definitions(&dynamic_owner).is_empty()
 }
 
 fn humanize_table_const_type(

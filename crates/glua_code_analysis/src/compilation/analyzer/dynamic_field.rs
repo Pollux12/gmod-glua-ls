@@ -245,17 +245,22 @@ fn analyze_dynamic_fields(
                 };
 
                 let field_names = get_field_names(db, cache, &index_expr);
+                let should_collect_wildcard = mode.collect_direct_assignments()
+                    && is_dynamic_index_key(&index_expr)
+                    && (field_names.is_empty()
+                        || dynamic_index_key_has_inferred_string_names(db, cache, &index_expr));
+                if should_collect_wildcard {
+                    collect_wildcard_for_type(
+                        &effective_type,
+                        file_id,
+                        definition_range,
+                        &mut collected_wildcards,
+                    );
+                }
+
                 if field_names.is_empty() {
                     if let Some(profile) = profile.as_mut() {
                         profile.no_field_name_skips += 1;
-                    }
-                    if mode.collect_direct_assignments() && is_dynamic_index_key(&index_expr) {
-                        collect_wildcard_for_type(
-                            &effective_type,
-                            file_id,
-                            definition_range,
-                            &mut collected_wildcards,
-                        );
                     }
                     continue;
                 };
@@ -1108,6 +1113,18 @@ fn field_names_from_table_expr_keys(table_expr: &LuaTableExpr) -> Vec<SmolStr> {
 
 fn is_dynamic_index_key(index_expr: &glua_parser::LuaIndexExpr) -> bool {
     matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_)))
+}
+
+fn dynamic_index_key_has_inferred_string_names(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> bool {
+    let Some(LuaIndexKey::Expr(expr)) = index_expr.get_index_key() else {
+        return false;
+    };
+
+    !string_const_names(&infer_expr(db, cache, expr.clone()).ok()).is_empty()
 }
 
 fn string_const_names(typ: &Option<LuaType>) -> Vec<SmolStr> {
