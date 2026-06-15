@@ -1,5 +1,11 @@
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
+
+#[cfg(not(feature = "dhat-heap"))]
 use mimalloc::MiMalloc;
 
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -179,7 +185,11 @@ async fn main() {
 
     // Phase 4: Indexing (update_files_by_path runs parsing + full analysis pipeline)
     let t = Instant::now();
+    #[cfg(feature = "dhat-heap")]
+    let dhat_profiler = dhat::Profiler::new_heap();
     analysis.update_files_by_path(files);
+    #[cfg(feature = "dhat-heap")]
+    drop(dhat_profiler);
     let indexing_duration = t.elapsed();
     results.push(BenchmarkResult {
         phase: "indexing (total)".into(),

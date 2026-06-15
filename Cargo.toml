@@ -68,6 +68,11 @@ rustc-hash = "2"
 [patch.crates-io]
 emmylua_codestyle = { path = "vendor/emmylua_codestyle" }
 
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
+
 # Lint configuration for the entire workspace
 [workspace.lints.clippy]
 # ==== Domain-Specific Allowances ====

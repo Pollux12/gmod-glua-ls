@@ -1,7 +1,7 @@
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat,
-    LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaReturnStat,
-    LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr,
+    LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr,
+    LuaReturnStat, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rowan::TextSize;
 
@@ -1423,6 +1423,17 @@ pub fn infer_param_with_cache(
     result
 }
 
+fn direct_table_field_from_member_id(
+    root: &LuaChunk,
+    member_id: LuaMemberId,
+) -> Option<LuaTableField> {
+    // Reconstruct the exact table field by syntax id instead of scanning every table field.
+    member_id
+        .get_syntax_id()
+        .to_node_from_root(root.syntax())
+        .and_then(LuaTableField::cast)
+}
+
 fn find_param_type_from_contextual_member(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -1436,9 +1447,7 @@ fn find_param_type_from_contextual_member(
         .get_vfs()
         .get_syntax_tree(&member_id.file_id)?
         .get_chunk_node();
-    let table_field = root
-        .descendants::<LuaTableField>()
-        .find(|field| field.get_syntax_id() == *member_id.get_syntax_id())?;
+    let table_field = direct_table_field_from_member_id(&root, member_id)?;
     let field_type = infer_table_field_value_should_be(db, cache, table_field.clone()).ok()?;
     find_param_type_from_type(db, field_type, param_idx, colon_define, is_dots).or_else(|| {
         if param_idx != 0 || colon_define || is_dots || !is_self_param {
@@ -2344,10 +2353,55 @@ pub(crate) fn infer_enclosing_self_type(
 
 #[cfg(test)]
 mod test {
-    use super::infer_name_expr;
-    use crate::{LuaInferCache, VirtualWorkspace};
-    use glua_parser::{LuaAstNode, LuaNameExpr};
+    use super::{
+        direct_table_field_from_member_id, find_param_type_from_contextual_member, infer_name_expr,
+    };
+    use crate::{Emmyrc, LuaInferCache, LuaMemberId, LuaType, VirtualWorkspace};
+    use glua_parser::{
+        LuaAstNode, LuaAstToken, LuaIndexKey, LuaLocalName, LuaNameExpr, LuaParamName,
+        LuaTableExpr, LuaTableField,
+    };
     use googletest::prelude::*;
+
+    fn find_table_field(root: &glua_parser::LuaChunk, field_name: &str) -> LuaTableField {
+        root.descendants::<LuaTableField>()
+            .find(|field| {
+                matches!(
+                    field.get_field_key(),
+                    Some(LuaIndexKey::Name(name)) if name.get_name_text() == field_name
+                )
+            })
+            .expect("expected table field")
+    }
+
+    fn find_param_type_by_name(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model must exist");
+        let param_name = semantic_model
+            .get_root()
+            .descendants::<LuaParamName>()
+            .find(|param_name| {
+                param_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("expected param name");
+        let token = param_name
+            .get_name_token()
+            .expect("expected param name token");
+
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .map(|info| info.typ)
+            .expect("expected semantic info for param")
+    }
 
     #[gtest]
     fn test_infer_self_populates_name_var_ref_cache() -> Result<()> {
@@ -2386,6 +2440,117 @@ mod test {
             cache.expr_var_ref_id_cache.contains_key(&syntax_id),
             eq(true)
         );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_contextual_member_param_type_inference_still_resolves_table_field_context() -> Result<()>
+    {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class HandlerSpec
+            ---@field handle fun(value: string)
+
+            ---@type HandlerSpec
+            local handlers = {
+                handle = function(value) end,
+            }
+            "#,
+        );
+
+        let inferred_type = find_param_type_by_name(&ws, file_id, "value");
+
+        assert_eq!(inferred_type, LuaType::String);
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_direct_table_field_lookup_returns_none_for_non_table_field_member_id() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local value = 1
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model must exist");
+        let root = semantic_model.get_root();
+        let local_name = root
+            .descendants::<LuaLocalName>()
+            .find(|name| {
+                name.get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "value")
+            })
+            .expect("expected local name");
+        let member_id = LuaMemberId::new(local_name.get_syntax_id(), file_id);
+
+        let direct = direct_table_field_from_member_id(&root, member_id);
+        let scan = root
+            .descendants::<LuaTableField>()
+            .find(|field| field.get_syntax_id() == *member_id.get_syntax_id());
+
+        assert!(direct.is_none());
+        assert!(scan.is_none());
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_contextual_member_self_param_uses_same_vgui_parent_table() -> Result<()> {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            local PANEL = {
+                Init = function(self) end,
+            }
+
+            vgui.Register("MyPanel", PANEL, "Panel")
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model must exist");
+        let root = semantic_model.get_root();
+        let table_field = find_table_field(&root, "Init");
+        let member_id = LuaMemberId::new(table_field.get_syntax_id(), file_id);
+        let parent_table = table_field
+            .get_parent::<LuaTableExpr>()
+            .expect("expected parent table");
+
+        let mut parent_cache = LuaInferCache::new(file_id, Default::default());
+        let parent_type = super::infer_table_should_be(db, &mut parent_cache, parent_table)
+            .expect("expected inferred parent table type");
+
+        let mut contextual_cache = LuaInferCache::new(file_id, Default::default());
+        let contextual_self_type = find_param_type_from_contextual_member(
+            db,
+            &mut contextual_cache,
+            member_id,
+            0,
+            false,
+            true,
+            false,
+        )
+        .expect("expected inferred contextual self type");
+
+        assert_eq!(contextual_self_type, parent_type);
 
         Ok(())
     }
