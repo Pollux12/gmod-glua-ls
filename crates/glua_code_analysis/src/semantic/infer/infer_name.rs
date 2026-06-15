@@ -841,25 +841,12 @@ fn infer_param_type_from_call_sites(
         .get_vfs()
         .get_syntax_tree(&signature_id.get_file_id())?
         .get_red_root();
-    let closure = root
-        .descendants()
-        .filter_map(LuaClosureExpr::cast)
-        .find(|closure| closure.get_position() == signature_id.get_position())?;
-    let call_sites = if let Some(local_func_name) = closure
-        .get_parent::<LuaLocalFuncStat>()
-        .and_then(|local_func| local_func.get_local_name())
-    {
-        let target_decl_id =
-            LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
-        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id)
-    } else {
-        return None;
-    };
-
-    let inferred_type =
-        infer_param_type_from_local_call_sites_inner(db, cache, call_sites, param_idx, true);
-
-    inferred_type
+    let target_decl_id = db
+        .get_signature_index()
+        .local_func_decl_for(&signature_id)?;
+    let call_sites =
+        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id);
+    infer_param_type_from_local_call_sites_inner(db, cache, call_sites, param_idx, true)
 }
 
 fn infer_param_type_from_local_call_sites_inner(
@@ -2356,10 +2343,10 @@ mod test {
     use super::{
         direct_table_field_from_member_id, find_param_type_from_contextual_member, infer_name_expr,
     };
-    use crate::{Emmyrc, LuaInferCache, LuaMemberId, LuaType, VirtualWorkspace};
+    use crate::{Emmyrc, LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, VirtualWorkspace};
     use glua_parser::{
-        LuaAstNode, LuaAstToken, LuaIndexKey, LuaLocalName, LuaNameExpr, LuaParamName,
-        LuaTableExpr, LuaTableField,
+        LuaAstNode, LuaAstToken, LuaClosureExpr, LuaIndexKey, LuaLocalName, LuaNameExpr,
+        LuaParamName, LuaTableExpr, LuaTableField,
     };
     use googletest::prelude::*;
 
@@ -2379,28 +2366,54 @@ mod test {
         file_id: crate::FileId,
         name: &str,
     ) -> LuaType {
+        find_param_types_by_name(ws, file_id, name)
+            .into_iter()
+            .next()
+            .expect("expected semantic info for param")
+    }
+
+    fn find_param_types_by_name(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+    ) -> Vec<LuaType> {
         let semantic_model = ws
             .analysis
             .compilation
             .get_semantic_model(file_id)
             .expect("semantic model must exist");
-        let param_name = semantic_model
+        semantic_model
             .get_root()
             .descendants::<LuaParamName>()
-            .find(|param_name| {
+            .filter(|param_name| {
                 param_name
                     .get_name_token()
                     .is_some_and(|token| token.get_name_text() == name)
             })
-            .expect("expected param name");
-        let token = param_name
-            .get_name_token()
-            .expect("expected param name token");
+            .filter_map(|param_name| {
+                let token = param_name.get_name_token()?;
+                semantic_model
+                    .get_semantic_info(token.syntax().clone().into())
+                    .map(|info| info.typ)
+            })
+            .collect()
+    }
 
-        semantic_model
-            .get_semantic_info(token.syntax().clone().into())
-            .map(|info| info.typ)
-            .expect("expected semantic info for param")
+    fn find_first_closure_signature_id(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+    ) -> LuaSignatureId {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model must exist");
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure");
+        LuaSignatureId::from_closure(file_id, &closure)
     }
 
     #[gtest]
@@ -2462,7 +2475,7 @@ mod test {
 
         let inferred_type = find_param_type_by_name(&ws, file_id, "value");
 
-        assert_eq!(inferred_type, LuaType::String);
+        assert!(ws.check_type(&inferred_type, &LuaType::String));
 
         Ok(())
     }
@@ -2551,6 +2564,155 @@ mod test {
         .expect("expected inferred contextual self type");
 
         assert_eq!(contextual_self_type, parent_type);
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_local_function_call_site_param_inference_still_resolves() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local function takes_value(value)
+                return value
+            end
+
+            takes_value("hello")
+            "#,
+        );
+
+        let inferred_type = find_param_type_by_name(&ws, file_id, "value");
+
+        assert!(ws.check_type(&inferred_type, &LuaType::String));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_non_local_closure_signature_does_not_bind_local_function_decl() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local callback = function(value)
+                return value
+            end
+            "#,
+        );
+
+        let signature_id = find_first_closure_signature_id(&ws, file_id);
+        let db = ws.analysis.compilation.get_db();
+
+        assert_eq!(
+            db.get_signature_index().local_func_decl_for(&signature_id),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_local_function_signature_mapping_updates_after_reparse() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let uri = ws.virtual_url_generator.new_uri("reparse.lua");
+        let file_id = ws
+            .analysis
+            .update_file_by_uri(
+                &uri,
+                Some(
+                    r#"
+                    local function first(value)
+                        return value
+                    end
+                    "#
+                    .to_string(),
+                ),
+            )
+            .expect("file id must be present");
+
+        let initial_signature_id = find_first_closure_signature_id(&ws, file_id);
+        let initial_decl_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_signature_index()
+            .local_func_decl_for(&initial_signature_id)
+            .expect("expected initial local function decl mapping");
+
+        ws.analysis.update_file_by_uri(
+            &uri,
+            Some(
+                r#"
+                -- shift signature position to verify stale map cleanup
+                local function replacement(value)
+                    return value
+                end
+                "#
+                .to_string(),
+            ),
+        );
+
+        let updated_signature_id = find_first_closure_signature_id(&ws, file_id);
+        let db = ws.analysis.compilation.get_db();
+        let updated_decl_id = db
+            .get_signature_index()
+            .local_func_decl_for(&updated_signature_id)
+            .expect("expected updated local function decl mapping");
+
+        assert_eq!(
+            db.get_signature_index()
+                .local_func_decl_for(&initial_signature_id),
+            None
+        );
+        assert_ne!(initial_decl_id, updated_decl_id);
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_adjacent_local_functions_keep_distinct_decl_bindings() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local function first(value)
+                return value
+            end
+
+            local function second(value)
+                return value
+            end
+
+            first("text")
+            second(123)
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("expected syntax tree")
+            .get_red_root();
+        let signature_ids = root
+            .descendants()
+            .filter_map(LuaClosureExpr::cast)
+            .map(|closure| LuaSignatureId::from_closure(file_id, &closure))
+            .collect::<Vec<_>>();
+
+        assert_eq!(signature_ids.len(), 2);
+        let first_decl_id = db
+            .get_signature_index()
+            .local_func_decl_for(&signature_ids[0])
+            .expect("expected first local func decl");
+        let second_decl_id = db
+            .get_signature_index()
+            .local_func_decl_for(&signature_ids[1])
+            .expect("expected second local func decl");
+
+        assert_ne!(first_decl_id, second_decl_id);
+        let param_types = find_param_types_by_name(&ws, file_id, "value");
+        assert_eq!(param_types.len(), 2);
+        assert!(ws.check_type(&param_types[0], &LuaType::String));
+        assert!(ws.check_type(&param_types[1], &LuaType::Number));
 
         Ok(())
     }

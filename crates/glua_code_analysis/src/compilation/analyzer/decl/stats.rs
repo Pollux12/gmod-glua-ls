@@ -383,13 +383,17 @@ pub fn analyze_local_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaLocalFuncSt
 
     let decl_id = analyzer.add_decl(decl);
     let closure = stat.get_closure()?;
-    let closure_owner_id =
-        LuaSemanticDeclId::Signature(LuaSignatureId::from_closure(file_id, &closure));
+    let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+    let closure_owner_id = LuaSemanticDeclId::Signature(signature_id);
     let property_decl_id = LuaSemanticDeclId::LuaDecl(decl_id);
     analyzer
         .db
         .get_property_index_mut()
         .add_owner_map(property_decl_id, closure_owner_id, file_id);
+    analyzer
+        .db
+        .get_signature_index_mut()
+        .bind_local_func_decl(signature_id, decl_id);
 
     Some(())
 }

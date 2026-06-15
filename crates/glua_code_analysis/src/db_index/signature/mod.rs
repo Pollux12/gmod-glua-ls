@@ -13,7 +13,7 @@ pub use signature::{
     visit_call_arg_roles_from_type,
 };
 
-use crate::FileId;
+use crate::{FileId, db_index::LuaDeclId};
 
 use super::traits::LuaIndex;
 
@@ -21,6 +21,7 @@ use super::traits::LuaIndex;
 pub struct LuaSignatureIndex {
     signatures: HashMap<LuaSignatureId, LuaSignature>,
     in_file_signatures: HashMap<FileId, HashSet<LuaSignatureId>>,
+    local_func_decls: HashMap<LuaSignatureId, LuaDeclId>,
 }
 
 impl Default for LuaSignatureIndex {
@@ -34,6 +35,7 @@ impl LuaSignatureIndex {
         Self {
             signatures: HashMap::new(),
             in_file_signatures: HashMap::new(),
+            local_func_decls: HashMap::new(),
         }
     }
 
@@ -56,6 +58,14 @@ impl LuaSignatureIndex {
     pub fn iter(&self) -> impl Iterator<Item = (&LuaSignatureId, &LuaSignature)> {
         self.signatures.iter()
     }
+
+    pub fn local_func_decl_for(&self, signature_id: &LuaSignatureId) -> Option<LuaDeclId> {
+        self.local_func_decls.get(signature_id).copied()
+    }
+
+    pub fn bind_local_func_decl(&mut self, signature_id: LuaSignatureId, decl_id: LuaDeclId) {
+        self.local_func_decls.insert(signature_id, decl_id);
+    }
 }
 
 impl LuaIndex for LuaSignatureIndex {
@@ -63,12 +73,19 @@ impl LuaIndex for LuaSignatureIndex {
         if let Some(signature_ids) = self.in_file_signatures.remove(&file_id) {
             for signature_id in signature_ids {
                 self.signatures.remove(&signature_id);
+                self.local_func_decls.remove(&signature_id);
             }
         }
+
+        // Also drop entries whose target decl lived in the removed file, even if
+        // the signature key was not tracked in that file's signature set.
+        self.local_func_decls
+            .retain(|_, decl_id| decl_id.file_id != file_id);
     }
 
     fn clear(&mut self) {
         self.signatures.clear();
         self.in_file_signatures.clear();
+        self.local_func_decls.clear();
     }
 }
