@@ -80,19 +80,27 @@ impl DebouncedAnalysis {
             return;
         }
 
-        let previous = self
-            .in_flight_changes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(count))
-            })
-            .unwrap_or_else(|current| current);
-
-        if previous < count {
-            log::error!(
-                "LS_INFLIGHT_UNDERFLOW attempted to finish {} in-flight changes with only {} pending",
-                count,
-                previous
-            );
+        let mut current = self.in_flight_changes.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(count);
+            match self.in_flight_changes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(previous) => {
+                    if previous < count {
+                        log::error!(
+                            "LS_INFLIGHT_UNDERFLOW attempted to finish {} in-flight changes with only {} pending",
+                            count,
+                            previous
+                        );
+                    }
+                    break;
+                }
+                Err(observed) => current = observed,
+            }
         }
 
         self.refresh_dirty_state().await;
@@ -140,31 +148,12 @@ impl DebouncedAnalysis {
                 return true;
             }
 
-            if !warned_stuck && started_at.elapsed() >= FRESHNESS_STUCK_WARN_AFTER {
-                self.log_freshness_stuck(request_method, started_at).await;
-                warned_stuck = true;
-            }
-
-            let stuck_timer = if warned_stuck {
-                None
-            } else {
-                Some(tokio::time::sleep_until(
-                    tokio::time::Instant::now()
-                        + FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed()),
-                ))
-            };
-            tokio::pin!(stuck_timer);
+            let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
 
             tokio::select! {
                 _ = notified => {} // re-check
                 _ = cancel_token.cancelled() => return false,
-                _ = async {
-                    if let Some(timer) = stuck_timer.as_mut().as_pin_mut() {
-                        timer.await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                }, if !warned_stuck => {
+                _ = tokio::time::sleep(remaining), if !warned_stuck => {
                     self.log_freshness_stuck(request_method, started_at).await;
                     warned_stuck = true;
                 }
