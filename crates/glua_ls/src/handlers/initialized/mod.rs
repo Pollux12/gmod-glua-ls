@@ -190,12 +190,12 @@ pub async fn init_analysis(
     status_bar
         .create_progress_task(ProgressTask::LoadWorkspace)
         .await;
-    status_bar.update_progress_task(
+    watchdog_status.set_phase("Preparing workspace folders");
+    status_bar.update_startup_phase(
         ProgressTask::LoadWorkspace,
         None,
-        Some("Loading folders".to_string()),
+        watchdog_status.describe(),
     );
-    watchdog_status.set_phase("Preparing workspace folders");
     log::info!("preparing workspace folders for initial indexing");
 
     let workspace_roots = workspace_folders
@@ -222,12 +222,12 @@ pub async fn init_analysis(
         }
     }
 
-    status_bar.update_progress_task(
+    watchdog_status.set_phase("Collecting Lua files");
+    status_bar.update_startup_phase(
         ProgressTask::LoadWorkspace,
         None,
-        Some(String::from("Scanning Lua files")),
+        watchdog_status.describe(),
     );
-    watchdog_status.set_phase("Collecting Lua files");
     log::info!("collecting workspace files for initial indexing");
 
     // load files with per-workspace configs
@@ -258,12 +258,12 @@ pub async fn init_analysis(
 
     let file_count = files.len();
     if file_count != 0 {
-        status_bar.update_progress_task(
+        watchdog_status.set_progress("Indexing Lua files", 0, file_count);
+        status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
             None,
-            Some(format!("Indexing {} files", file_count)),
+            watchdog_status.describe(),
         );
-        watchdog_status.set_progress("Indexing Lua files", 0, file_count);
         log::info!("indexing {} Lua files", file_count);
     } else {
         log::info!("no Lua files found during initial indexing");
@@ -271,12 +271,12 @@ pub async fn init_analysis(
 
     // Hold the write lock only for analysis state mutations.
     let mut mut_analysis = analysis.write().await;
-    status_bar.update_progress_task(
+    watchdog_status.set_phase("Applying workspace configuration");
+    status_bar.update_startup_phase(
         ProgressTask::LoadWorkspace,
         None,
-        Some(String::from("Applying config")),
+        watchdog_status.describe(),
     );
-    watchdog_status.set_phase("Applying workspace configuration");
     log::info!("applying workspace configuration to analysis");
 
     // update config
@@ -317,15 +317,20 @@ pub async fn init_analysis(
     }
 
     if file_count != 0 {
-        status_bar.update_progress_task(
+        watchdog_status.set_progress("Analyzing Lua files", 0, file_count);
+        status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
             None,
-            Some(format!("Analyzing {} files", file_count)),
+            watchdog_status.describe(),
         );
-        watchdog_status.set_progress("Analyzing Lua files", 0, file_count);
         log::info!("analyzing {} Lua files", file_count);
         mut_analysis.update_files_by_path(files);
         watchdog_status.set_progress("Analyzing Lua files", file_count, file_count);
+        status_bar.update_startup_phase(
+            ProgressTask::LoadWorkspace,
+            Some(100),
+            watchdog_status.describe(),
+        );
     }
 
     let schema_urls = if mut_analysis.check_schema_update() {
@@ -337,27 +342,32 @@ pub async fn init_analysis(
     file_diagnostic.invalidate_shared_diagnostic_data();
     drop(mut_analysis);
 
-    status_bar.update_progress_task(
+    watchdog_status.set_phase("Workspace index ready");
+    status_bar.update_startup_phase(
         ProgressTask::LoadWorkspace,
         None,
-        Some(String::from("Workspace ready")),
+        watchdog_status.describe(),
     );
-    watchdog_status.set_phase("Workspace index ready");
     log::info!("workspace index ready");
 
     if !schema_urls.is_empty() {
-        status_bar.update_progress_task(
+        watchdog_status.set_progress("Fetching JSON schemas", 0, schema_urls.len());
+        status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
             None,
-            Some(format!("Fetching {} schemas", schema_urls.len())),
+            watchdog_status.describe(),
         );
-        watchdog_status.set_progress("Fetching JSON schemas", 0, schema_urls.len());
         log::info!("fetching {} JSON schemas", schema_urls.len());
         let url_contents = fetch_schema_urls(schema_urls).await;
         let mut mut_analysis = analysis.write().await;
         mut_analysis.apply_fetched_schemas(url_contents);
         file_diagnostic.invalidate_shared_diagnostic_data();
         watchdog_status.set_phase("JSON schema fetch/apply complete");
+        status_bar.update_startup_phase(
+            ProgressTask::LoadWorkspace,
+            None,
+            watchdog_status.describe(),
+        );
         log::info!("JSON schema fetch/apply complete");
     }
 

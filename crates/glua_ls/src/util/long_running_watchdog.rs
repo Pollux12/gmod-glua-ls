@@ -72,7 +72,7 @@ impl LongRunningWatchdogStatus {
         });
     }
 
-    fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         self.snapshot
             .lock()
             .map(|snapshot| snapshot.describe())
