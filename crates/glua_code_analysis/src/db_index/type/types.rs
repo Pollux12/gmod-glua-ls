@@ -688,8 +688,7 @@ pub fn is_table_const_shaped_array(db: &DbIndex, range: &InFiled<TextRange>) -> 
 /// (`IntegerConst` → `DocIntegerConst`, `FloatConst` → `number`, `StringConst` →
 /// `DocStringConst`). Returns `None` when the table has no integer members or
 /// when the provenance check (`is_table_const_shaped_array`) fails, so callers
-/// can fall back to their existing behavior. Bounded by the shaped-literal
-/// member cap, so this stays cheap.
+/// can fall back to their existing behavior.
 pub fn table_const_array_base(db: &DbIndex, range: &InFiled<TextRange>) -> Option<LuaType> {
     if !is_table_const_shaped_array(db, range) {
         return None;

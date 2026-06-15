@@ -307,10 +307,8 @@ fn parse_table_expr(p: &mut LuaParser) -> ParseResult {
         // Try to recover: look for possible closing brace
         let mut found_brace = false;
         let mut brace_count = 1; // 我们已经在表中
-        let mut lookahead_count = 0;
-        const MAX_LOOKAHEAD: usize = 50; // 限制向前查看的token数量
 
-        while p.current_token() != LuaTokenKind::TkEof && lookahead_count < MAX_LOOKAHEAD {
+        while p.current_token() != LuaTokenKind::TkEof {
             match p.current_token() {
                 LuaTokenKind::TkRightBrace => {
                     brace_count -= 1;
@@ -338,7 +336,6 @@ fn parse_table_expr(p: &mut LuaParser) -> ParseResult {
                     p.bump();
                 }
             }
-            lookahead_count += 1;
         }
 
         if !found_brace {

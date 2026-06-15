@@ -104,7 +104,6 @@ pub struct LuaInferCache {
     /// templated tables, each use of the loop value can otherwise re-run the
     /// full iterator inference from the enclosing `for` statement.
     pub for_range_iter_var_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
-    pub local_call_site_param_infer_depth: u32,
     pub local_reassignment_positions_cache: FxHashMap<LuaDeclId, Vec<TextSize>>,
     pub local_reassignments_indexed: bool,
     pub dynamic_field_scope_metatable_cache:
@@ -213,7 +212,6 @@ impl LuaInferCache {
             self_base_seed: None,
             decl_cache: FxHashMap::default(),
             for_range_iter_var_type_cache: FxHashMap::default(),
-            local_call_site_param_infer_depth: 0,
             local_reassignment_positions_cache: FxHashMap::default(),
             local_reassignments_indexed: false,
             dynamic_field_scope_metatable_cache: FxHashMap::default(),

@@ -98,20 +98,17 @@ pub fn find_member_origin_owners(
     find_all: bool,
     usage_position: Option<TextSize>,
 ) -> DeclOriginResult {
-    const MAX_ITERATIONS: usize = 50;
     let mut visited_members = HashSet::new();
 
     let mut current_owner = resolve_member_owner(compilation, semantic_model, &member_id);
     let mut final_owner = current_owner.clone();
-    let mut iteration_count = 0;
 
     while let Some(LuaSemanticDeclId::Member(current_member_id)) = &current_owner {
-        if visited_members.contains(current_member_id) || iteration_count >= MAX_ITERATIONS {
+        if visited_members.contains(current_member_id) {
             break;
         }
 
         visited_members.insert(*current_member_id);
-        iteration_count += 1;
 
         match resolve_member_owner(compilation, semantic_model, current_member_id) {
             Some(next_owner) => {

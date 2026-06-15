@@ -563,20 +563,17 @@ fn find_member_origin_owner_inner(
     member_id: LuaMemberId,
     caller_position: Option<rowan::TextSize>,
 ) -> Option<LuaSemanticDeclId> {
-    const MAX_ITERATIONS: usize = 50;
     let mut visited_members = HashSet::new();
 
     let mut current_owner = resolve_member_owner(db, infer_config, &member_id, caller_position);
     let mut final_owner = current_owner.clone();
-    let mut iteration_count = 0;
 
     while let Some(LuaSemanticDeclId::Member(current_member_id)) = &current_owner {
-        if visited_members.contains(current_member_id) || iteration_count >= MAX_ITERATIONS {
+        if visited_members.contains(current_member_id) {
             break;
         }
 
         visited_members.insert(*current_member_id);
-        iteration_count += 1;
 
         match resolve_member_owner(db, infer_config, current_member_id, caller_position) {
             Some(next_owner) => {

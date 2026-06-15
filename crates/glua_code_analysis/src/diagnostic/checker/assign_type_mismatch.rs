@@ -678,17 +678,11 @@ fn check_table_expr_content(
     table_type: &LuaType,
     table_expr: &LuaTableExpr,
 ) -> Option<bool> {
-    const MAX_CHECK_COUNT: usize = 250;
-    let mut check_count = 0;
     let mut has_diagnostic = false;
 
     let fields = table_expr.get_fields().collect::<Vec<_>>();
 
     for (idx, field) in fields.iter().enumerate() {
-        check_count += 1;
-        if check_count > MAX_CHECK_COUNT {
-            return Some(has_diagnostic);
-        }
         let Some(value_expr) = field.get_value_expr() else {
             continue;
         };

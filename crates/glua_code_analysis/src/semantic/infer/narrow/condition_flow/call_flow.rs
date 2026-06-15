@@ -394,16 +394,11 @@ fn collect_isfunction_narrow_candidates(
     db: &DbIndex,
     antecedent_type: &LuaType,
 ) -> Option<Vec<LuaType>> {
-    const MAX_CANDIDATES: usize = 128;
-
     match antecedent_type {
         LuaType::Union(union_type) => Some(union_type.into_vec().to_vec()),
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
             let mut candidates = vec![LuaType::Ref(type_decl_id.clone())];
             let all_sub_types = db.get_type_index().get_all_sub_types(type_decl_id);
-            if all_sub_types.len() > MAX_CANDIDATES {
-                return None;
-            }
             for sub_type in all_sub_types {
                 candidates.push(LuaType::Ref(sub_type.get_id()));
             }

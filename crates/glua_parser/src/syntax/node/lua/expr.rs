@@ -522,12 +522,6 @@ impl LuaTableExpr {
         self.children()
     }
 
-    /// Maximum number of positional rows a sequential ("array-style") table
-    /// literal may have while still being materialized with per-index members
-    /// and rich shape. Beyond this the literal is summarized as an array
-    /// (`T[]`) to keep inference/hover cheap on very large literals.
-    pub const SHAPED_ARRAY_LITERAL_LIMIT: usize = 50;
-
     /// Whether this is a sequential ("array-style") table literal whose entries
     /// are themselves table literals — e.g.
     /// `{ { offset = .. }, { offset = .. } }`.
@@ -546,7 +540,6 @@ impl LuaTableExpr {
             return false;
         }
 
-        let mut count = 0usize;
         let mut has_table_row = false;
         for field in self.get_fields() {
             // Variadic spreads (`{ f() }` where the last value is `...`) cannot
@@ -558,10 +551,6 @@ impl LuaTableExpr {
                 return false;
             }
             has_table_row = true;
-            count += 1;
-            if count > Self::SHAPED_ARRAY_LITERAL_LIMIT {
-                return false;
-            }
         }
 
         has_table_row

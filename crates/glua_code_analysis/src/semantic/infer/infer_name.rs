@@ -702,10 +702,6 @@ pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
     infer_param_inner(db, None, decl)
 }
 
-// Param type cache is keyed by decl id; nested local-call-site inference is intentionally
-// degraded to avoid recursive/cache-order cycles while top-level requests can still use cache.
-const MAX_LOCAL_CALL_SITE_PARAM_INFER_DEPTH: u32 = 1;
-
 fn infer_param_inner(
     db: &DbIndex,
     mut cache: Option<&mut LuaInferCache>,
@@ -860,14 +856,8 @@ fn infer_param_type_from_call_sites(
         return None;
     };
 
-    if cache.local_call_site_param_infer_depth >= MAX_LOCAL_CALL_SITE_PARAM_INFER_DEPTH {
-        return None;
-    }
-
-    cache.local_call_site_param_infer_depth += 1;
     let inferred_type =
         infer_param_type_from_local_call_sites_inner(db, cache, call_sites, param_idx, true);
-    cache.local_call_site_param_infer_depth -= 1;
 
     inferred_type
 }
