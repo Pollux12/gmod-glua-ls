@@ -3224,6 +3224,8 @@ mod test {
 
     #[test]
     fn test_dynamic_field_setter_helper_call_no_undefined_field() {
+        // Proves a real helper discovered from another file still suppresses
+        // undefined-field after the helper-call fast-path guards.
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = crate::Emmyrc::default();
         emmyrc.gmod.enabled = true;

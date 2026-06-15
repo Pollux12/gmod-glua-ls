@@ -66,6 +66,7 @@ struct FieldSetterHelper {
 
 #[derive(Default)]
 struct FieldSetterHelperCache {
+    complete_helper_registry: bool,
     helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
     non_helpers: FxHashSet<LuaSignatureId>,
     member_names: FxHashSet<SmolStr>,
@@ -81,10 +82,15 @@ impl FieldSetterHelperCache {
             member_names.clear();
         }
         Self {
+            complete_helper_registry: enable_member_name_prefilter,
             helpers,
             non_helpers: FxHashSet::default(),
             member_names,
         }
+    }
+
+    fn definitely_has_no_helpers(&self) -> bool {
+        self.complete_helper_registry && self.helpers.is_empty()
     }
 
     fn patterns_for_signature(
@@ -165,10 +171,8 @@ fn analyze_dynamic_fields(
     let profile_enabled = log::log_enabled!(log::Level::Info);
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
     let mut field_setter_helpers = if mode.collect_direct_assignments() {
-        FieldSetterHelperCache::from_tree_list(
-            &tree_list,
-            context_covers_workspace(&*db, context, &tree_list),
-        )
+        let context_covers_workspace = context_covers_workspace(&*db, context, &tree_list);
+        FieldSetterHelperCache::from_tree_list(&tree_list, context_covers_workspace)
     } else {
         FieldSetterHelperCache::default()
     };
@@ -294,7 +298,6 @@ fn analyze_dynamic_fields(
                 }
             }
         }
-
         if mode.collect_setmetatable_tables() {
             for call_expr in root.descendants::<LuaCallExpr>() {
                 if let Some(profile) = profile.as_mut() {
@@ -335,9 +338,6 @@ fn analyze_dynamic_fields(
                         *file_id,
                         *range,
                     ));
-                    if let Some(profile) = profile.as_mut() {
-                        profile.fields_propagated += 1;
-                    }
                 }
             }
         }
@@ -608,6 +608,19 @@ fn helper_patterns_for_call(
         return helpers.patterns_for_signature(db, signature_id);
     }
 
+    if helpers.definitely_has_no_helpers() {
+        return Vec::new();
+    }
+
+    helper_patterns_for_call_fallback(db, cache, prefix_expr, helpers)
+}
+
+fn helper_patterns_for_call_fallback(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    prefix_expr: &LuaExpr,
+    helpers: &mut FieldSetterHelperCache,
+) -> Vec<FieldSetterHelper> {
     if helpers.definitely_not_member_helper_call(prefix_expr) {
         return Vec::new();
     }
@@ -712,7 +725,6 @@ struct DynamicFieldProfile {
     no_field_name_skips: usize,
     calls_scanned: usize,
     fields_collected: usize,
-    fields_propagated: usize,
     owner_cache_hits: usize,
     owner_cache_misses: usize,
     owner_infer_time: Duration,
