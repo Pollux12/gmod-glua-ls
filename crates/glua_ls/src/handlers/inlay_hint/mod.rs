@@ -34,7 +34,7 @@ pub async fn on_inlay_hint_handler(
     // computed against consistent tree + index data.
     if !context
         .debounced_analysis()
-        .wait_until_fresh(&cancel_token)
+        .wait_until_fresh_for(&cancel_token, "textDocument/inlayHint")
         .await
     {
         return None;

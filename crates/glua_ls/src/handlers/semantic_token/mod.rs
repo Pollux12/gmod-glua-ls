@@ -37,7 +37,7 @@ pub async fn on_semantic_token_handler(
     // new didChange fires cancel_all_requests().
     if !context
         .debounced_analysis()
-        .wait_until_fresh(&cancel_token)
+        .wait_until_fresh_for(&cancel_token, "textDocument/semanticTokens/full")
         .await
     {
         return None;

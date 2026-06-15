@@ -2,8 +2,13 @@ use lsp_types::{DidChangeTextDocumentParams, Uri};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-use super::ServerContextSnapshot;
+use super::{InFlightChangeGuard, ServerContextSnapshot};
 use crate::handlers::on_did_change_text_document;
+
+struct QueuedDidChange {
+    params: DidChangeTextDocumentParams,
+    in_flight: InFlightChangeGuard,
+}
 
 /// Coalesces rapid `textDocument/didChange` notifications.
 ///
@@ -18,7 +23,7 @@ use crate::handlers::on_did_change_text_document;
 pub struct DidChangeCoalescer {
     /// Send a didChange to the worker.  The worker reads all pending
     /// messages before doing any work, so the channel acts as a buffer.
-    tx: mpsc::UnboundedSender<DidChangeTextDocumentParams>,
+    tx: mpsc::UnboundedSender<QueuedDidChange>,
 }
 
 impl DidChangeCoalescer {
@@ -32,15 +37,19 @@ impl DidChangeCoalescer {
     /// Enqueue a didChange notification.
     /// If the worker is busy, the params accumulate in the channel and
     /// the worker drains + deduplicates them in the next batch.
-    pub fn enqueue(&self, params: DidChangeTextDocumentParams) {
-        // If the worker died we silently drop — nothing useful to do.
-        let _ = self.tx.send(params);
+    pub fn enqueue(&self, params: DidChangeTextDocumentParams, in_flight: InFlightChangeGuard) {
+        if let Err(err) = self.tx.send(QueuedDidChange { params, in_flight }) {
+            log::error!(
+                "LS_COALESCER_SEND_FAILED didChange worker channel is closed; settling dropped change"
+            );
+            drop(err);
+        }
     }
 
     /// Worker loop: wait for at least one message, then drain all pending
     /// messages, keep only the latest per URI, and process the batch.
     async fn worker(
-        mut rx: mpsc::UnboundedReceiver<DidChangeTextDocumentParams>,
+        mut rx: mpsc::UnboundedReceiver<QueuedDidChange>,
         context: ServerContextSnapshot,
     ) {
         loop {
@@ -51,24 +60,32 @@ impl DidChangeCoalescer {
             };
 
             // Drain remaining messages without blocking.
-            let mut latest: HashMap<Uri, DidChangeTextDocumentParams> = HashMap::new();
-            latest.insert(first.text_document.uri.clone(), first);
-            let mut drained_count = 1usize;
+            let mut latest: HashMap<Uri, QueuedDidChange> = HashMap::new();
+            latest.insert(first.params.text_document.uri.clone(), first);
 
             while let Ok(params) = rx.try_recv() {
-                drained_count += 1;
-                latest.insert(params.text_document.uri.clone(), params);
+                if let Some(superseded) =
+                    latest.insert(params.params.text_document.uri.clone(), params)
+                {
+                    superseded.in_flight.finish().await;
+                }
             }
 
             // Process only the latest version for each URI.
-            for (_uri, params) in latest {
-                on_did_change_text_document(context.clone(), params).await;
+            for (uri, queued) in latest {
+                let task_context = context.clone();
+                let handle = tokio::spawn(async move {
+                    on_did_change_text_document(task_context, queued.params).await;
+                });
+                if let Err(err) = handle.await {
+                    log::error!(
+                        "LS_COALESCER_ITEM_PANIC uri={:?} didChange handler failed: {}",
+                        uri,
+                        err
+                    );
+                }
+                queued.in_flight.finish().await;
             }
-
-            context
-                .debounced_analysis()
-                .finish_in_flight_changes(drained_count)
-                .await;
         }
     }
 }

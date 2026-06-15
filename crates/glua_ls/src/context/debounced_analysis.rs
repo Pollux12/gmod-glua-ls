@@ -2,20 +2,22 @@ use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use super::{ClientProxy, file_diagnostic::SharedDiagnosticDataCache};
+
+const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 
 /// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
 pub struct DebouncedAnalysis {
     pending_files: Mutex<HashSet<FileId>>,
     reindexing_files: Mutex<HashSet<FileId>>,
     /// True when document changes have arrived but reindex has not yet completed.
-    /// Set synchronously by `mark_dirty()` (called inline in the notification
-    /// handler, before the didChange task is spawned) so that any request handler
-    /// dispatched afterwards sees the flag immediately.
+    /// Set synchronously by `begin_in_flight_change()` (called inline in the
+    /// notification handler, before the didChange task is spawned) so that any
+    /// request handler dispatched afterwards sees the flag immediately.
     has_pending_changes: AtomicBool,
     in_flight_changes: AtomicUsize,
     notify: Notify,
@@ -66,10 +68,11 @@ impl DebouncedAnalysis {
     /// spawning the didChange task) so that request handlers dispatched
     /// immediately afterward see the dirty flag and wait for reindex instead
     /// of computing on stale analysis data.
-    pub fn mark_dirty(&self) {
+    pub fn begin_in_flight_change(self: &Arc<Self>) -> InFlightChangeGuard {
         self.in_flight_changes.fetch_add(1, Ordering::AcqRel);
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
+        InFlightChangeGuard::new(self.clone(), 1)
     }
 
     pub async fn finish_in_flight_changes(&self, count: usize) {
@@ -77,7 +80,21 @@ impl DebouncedAnalysis {
             return;
         }
 
-        self.in_flight_changes.fetch_sub(count, Ordering::AcqRel);
+        let previous = self
+            .in_flight_changes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(count))
+            })
+            .unwrap_or_else(|current| current);
+
+        if previous < count {
+            log::error!(
+                "LS_INFLIGHT_UNDERFLOW attempted to finish {} in-flight changes with only {} pending",
+                count,
+                previous
+            );
+        }
+
         self.refresh_dirty_state().await;
         self.reindex_notify.notify_waiters();
     }
@@ -91,12 +108,24 @@ impl DebouncedAnalysis {
         self.has_pending_changes.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    fn in_flight_change_count(&self) -> usize {
+        self.in_flight_changes.load(Ordering::Acquire)
+    }
+
     /// Wait until all pending document changes have been reindexed.
     ///
     /// Returns `true` when the analysis is fresh, `false` if the cancel token
     /// fired first.  Uses `enable()` so that `notify_waiters()` wakeups are
     /// not lost between creating the `Notified` future and polling it.
-    pub async fn wait_until_fresh(&self, cancel_token: &CancellationToken) -> bool {
+    pub async fn wait_until_fresh_for(
+        &self,
+        cancel_token: &CancellationToken,
+        request_method: &'static str,
+    ) -> bool {
+        let started_at = Instant::now();
+        let mut warned_stuck = false;
+
         loop {
             // Create and enable the Notified future BEFORE checking the
             // condition.  `enable()` ensures that a `notify_waiters()` call
@@ -110,11 +139,51 @@ impl DebouncedAnalysis {
             if !self.has_pending_changes.load(Ordering::Acquire) {
                 return true;
             }
+
+            if !warned_stuck && started_at.elapsed() >= FRESHNESS_STUCK_WARN_AFTER {
+                self.log_freshness_stuck(request_method, started_at).await;
+                warned_stuck = true;
+            }
+
+            let stuck_timer = if warned_stuck {
+                None
+            } else {
+                Some(tokio::time::sleep_until(
+                    tokio::time::Instant::now()
+                        + FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed()),
+                ))
+            };
+            tokio::pin!(stuck_timer);
+
             tokio::select! {
                 _ = notified => {} // re-check
                 _ = cancel_token.cancelled() => return false,
+                _ = async {
+                    if let Some(timer) = stuck_timer.as_mut().as_pin_mut() {
+                        timer.await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if !warned_stuck => {
+                    self.log_freshness_stuck(request_method, started_at).await;
+                    warned_stuck = true;
+                }
             }
         }
+    }
+
+    async fn log_freshness_stuck(&self, request_method: &'static str, started_at: Instant) {
+        let in_flight = self.in_flight_changes.load(Ordering::Acquire);
+        let pending_count = self.pending_files.lock().await.len();
+        let reindexing_count = self.reindexing_files.lock().await.len();
+        log::warn!(
+            "LS_FRESHNESS_STUCK request={} waited_ms={} in_flight={} pending_files={} reindexing_files={}",
+            request_method,
+            started_at.elapsed().as_millis(),
+            in_flight,
+            pending_count,
+            reindexing_count
+        );
     }
 
     /// Wait until the given file is no longer pending reindex.
@@ -171,7 +240,7 @@ impl DebouncedAnalysis {
             // Wait for the first event, unless files were scheduled during
             // the previous reindex (the Notify signal may have been missed
             // because there was no active waiter at that point), or
-            // mark_dirty() was called without a corresponding schedule().
+            // begin_in_flight_change() was called without a corresponding schedule().
             let needs_work = !self.pending_files.lock().await.is_empty()
                 || self.has_pending_changes.load(Ordering::Acquire);
             if !needs_work {
@@ -258,9 +327,53 @@ impl DebouncedAnalysis {
     }
 }
 
+pub struct InFlightChangeGuard {
+    analysis: Option<Arc<DebouncedAnalysis>>,
+    count: usize,
+}
+
+impl InFlightChangeGuard {
+    fn new(analysis: Arc<DebouncedAnalysis>, count: usize) -> Self {
+        Self {
+            analysis: Some(analysis),
+            count,
+        }
+    }
+
+    pub async fn finish(mut self) {
+        if let Some(analysis) = self.analysis.take() {
+            analysis.finish_in_flight_changes(self.count).await;
+        }
+    }
+}
+
+impl Drop for InFlightChangeGuard {
+    fn drop(&mut self) {
+        let Some(analysis) = self.analysis.take() else {
+            return;
+        };
+        let count = self.count;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    analysis.finish_in_flight_changes(count).await;
+                });
+            }
+            Err(err) => {
+                log::error!(
+                    "LS_INFLIGHT_GUARD_DROP_FAILED could not settle {} in-flight changes without a Tokio runtime: {}",
+                    count,
+                    err
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, file_path_to_uri};
     use googletest::prelude::*;
@@ -273,9 +386,85 @@ mod tests {
 
     use super::DebouncedAnalysis;
 
+    fn test_debounced_analysis() -> Arc<DebouncedAnalysis> {
+        let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+        let (connection, _peer) = Connection::memory();
+        let client = Arc::new(ClientProxy::new(connection));
+        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client.clone());
+        Arc::new(DebouncedAnalysis::new(
+            analysis,
+            0,
+            CancellationToken::new(),
+            client,
+            file_diagnostic.shared_diagnostic_data_cache(),
+        ))
+    }
+
     fn has_diagnostic_code(diagnostics: &[Diagnostic], code: DiagnosticCode) -> bool {
         let code = Some(NumberOrString::String(code.get_name().to_string()));
         diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+    }
+
+    #[gtest]
+    fn in_flight_guard_finish_clears_dirty_state() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let guard = debounced_analysis.begin_in_flight_change();
+
+            verify_that!(debounced_analysis.in_flight_change_count(), eq(1))?;
+            verify_that!(debounced_analysis.is_dirty(), eq(true))?;
+
+            guard.finish().await;
+
+            verify_that!(debounced_analysis.in_flight_change_count(), eq(0))?;
+            verify_that!(debounced_analysis.is_dirty(), eq(false))?;
+            Ok(())
+        })
+    }
+
+    #[gtest]
+    fn in_flight_guard_drop_eventually_clears_dirty_state() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let guard = debounced_analysis.begin_in_flight_change();
+
+            verify_that!(debounced_analysis.in_flight_change_count(), eq(1))?;
+            drop(guard);
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if debounced_analysis.in_flight_change_count() == 0
+                        && !debounced_analysis.is_dirty()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("drop guard should settle in-flight change promptly");
+
+            verify_that!(debounced_analysis.in_flight_change_count(), eq(0))?;
+            verify_that!(debounced_analysis.is_dirty(), eq(false))?;
+            Ok(())
+        })
+    }
+
+    #[gtest]
+    fn finish_in_flight_changes_saturates_underflow() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+
+            debounced_analysis.finish_in_flight_changes(1).await;
+
+            verify_that!(debounced_analysis.in_flight_change_count(), eq(0))?;
+            verify_that!(debounced_analysis.is_dirty(), eq(false))?;
+            Ok(())
+        })
     }
 
     #[gtest]

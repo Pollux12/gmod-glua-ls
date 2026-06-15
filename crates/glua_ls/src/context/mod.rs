@@ -10,7 +10,7 @@ mod workspace_manager;
 
 pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
-pub use debounced_analysis::DebouncedAnalysis;
+pub use debounced_analysis::{DebouncedAnalysis, InFlightChangeGuard};
 pub use did_change_coalescer::DidChangeCoalescer;
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
