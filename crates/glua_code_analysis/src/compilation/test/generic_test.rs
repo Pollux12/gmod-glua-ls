@@ -981,4 +981,21 @@ mod test {
         assert_eq!(ws.humanize_type(result_ty.clone()), "Entity");
         assert!(matches!(result_ty, LuaType::Def(_)));
     }
+
+    #[test]
+    fn test_mutually_recursive_generic_aliases_do_not_overflow() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@alias A<T> B<T>
+            ---@alias B<T> A<T>
+
+            ---@type A<string>
+            cyclic = nil
+            "#,
+        );
+
+        let cyclic_ty = ws.expr_ty("cyclic");
+        assert_eq!(ws.humanize_type(cyclic_ty), "A<string>");
+    }
 }

@@ -348,13 +348,23 @@ pub fn instantiate_generic(
         return LuaType::Unknown;
     };
 
-    if !substitutor.check_recursion(&type_decl_id)
-        && let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id)
+    if let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id)
         && type_decl.is_alias()
     {
-        let new_substitutor = TypeSubstitutor::from_alias(new_params.clone(), type_decl_id.clone());
-        if let Some(origin) = type_decl.get_alias_origin(db, Some(&new_substitutor)) {
-            return origin;
+        if substitutor.check_recursion(&type_decl_id) {
+            log::debug!(
+                "LS_ALIAS_CYCLE_GUARD cut alias expansion for {}",
+                type_decl_id.get_name()
+            );
+        } else {
+            let new_substitutor = TypeSubstitutor::from_alias_with_parent(
+                new_params.clone(),
+                type_decl_id.clone(),
+                Some(substitutor),
+            );
+            if let Some(origin) = type_decl.get_alias_origin(db, Some(&new_substitutor)) {
+                return origin;
+            }
         }
     }
 

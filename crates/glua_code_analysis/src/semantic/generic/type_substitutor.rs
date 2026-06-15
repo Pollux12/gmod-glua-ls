@@ -6,7 +6,7 @@ use crate::{GenericTplId, LuaType, LuaTypeDeclId};
 #[derive(Debug, Clone)]
 pub struct TypeSubstitutor {
     tpl_replace_map: HashMap<GenericTplId, SubstitutorValue>,
-    alias_type_id: Option<LuaTypeDeclId>,
+    alias_type_ids: HashSet<LuaTypeDeclId>,
     self_type: Option<LuaType>,
 }
 
@@ -20,7 +20,7 @@ impl TypeSubstitutor {
     pub fn new() -> Self {
         Self {
             tpl_replace_map: HashMap::new(),
-            alias_type_id: None,
+            alias_type_ids: HashSet::new(),
             self_type: None,
         }
     }
@@ -35,12 +35,20 @@ impl TypeSubstitutor {
         }
         Self {
             tpl_replace_map,
-            alias_type_id: None,
+            alias_type_ids: HashSet::new(),
             self_type: None,
         }
     }
 
     pub fn from_alias(type_array: Vec<LuaType>, alias_type_id: LuaTypeDeclId) -> Self {
+        Self::from_alias_with_parent(type_array, alias_type_id, None)
+    }
+
+    pub fn from_alias_with_parent(
+        type_array: Vec<LuaType>,
+        alias_type_id: LuaTypeDeclId,
+        parent: Option<&TypeSubstitutor>,
+    ) -> Self {
         let mut tpl_replace_map = HashMap::new();
         for (i, ty) in type_array.into_iter().enumerate() {
             tpl_replace_map.insert(
@@ -48,9 +56,15 @@ impl TypeSubstitutor {
                 SubstitutorValue::Type(SubstitutorTypeValue::new(ty, true)),
             );
         }
+
+        let mut alias_type_ids = parent
+            .map(|substitutor| substitutor.alias_type_ids.clone())
+            .unwrap_or_default();
+        alias_type_ids.insert(alias_type_id);
+
         Self {
             tpl_replace_map,
-            alias_type_id: Some(alias_type_id),
+            alias_type_ids,
             self_type: None,
         }
     }
@@ -137,13 +151,7 @@ impl TypeSubstitutor {
     }
 
     pub fn check_recursion(&self, type_id: &LuaTypeDeclId) -> bool {
-        if let Some(alias_type_id) = &self.alias_type_id
-            && alias_type_id == type_id
-        {
-            return true;
-        }
-
-        false
+        self.alias_type_ids.contains(type_id)
     }
 
     pub fn add_self_type(&mut self, self_type: LuaType) {
