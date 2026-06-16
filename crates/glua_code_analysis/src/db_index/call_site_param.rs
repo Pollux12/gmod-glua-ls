@@ -14,8 +14,8 @@ struct CallSiteParamContribution {
 pub struct CallSiteParamIndex {
     /// file → source function access paths declared by that file.
     file_source_signatures: HashMap<FileId, Vec<(String, LuaSignatureId)>>,
-    /// access path → current source function signature id.
-    source_signatures_by_path: HashMap<String, LuaSignatureId>,
+    /// access path → current source function signature candidates.
+    source_signatures_by_path: HashMap<String, Vec<LuaSignatureId>>,
     /// file → observed call-site param evidence contributed by calls in that file.
     file_contributions: HashMap<FileId, Vec<CallSiteParamContribution>>,
     /// signature → param index → union of all observed types from current file contributions.
@@ -37,8 +37,17 @@ impl CallSiteParamIndex {
         self.rebuild_source_signatures();
     }
 
-    pub fn get_source_signature(&self, path: &str) -> Option<LuaSignatureId> {
-        self.source_signatures_by_path.get(path).copied()
+    pub fn get_source_signature_for_file(
+        &self,
+        path: &str,
+        file_id: FileId,
+    ) -> Option<LuaSignatureId> {
+        self.source_signatures_by_path
+            .get(path)?
+            .iter()
+            .rev()
+            .copied()
+            .find(|signature_id| signature_id.get_file_id() == file_id)
     }
 
     pub fn set_files_contributions(
@@ -104,7 +113,9 @@ impl CallSiteParamIndex {
             };
             for (path, signature_id) in signatures {
                 self.source_signatures_by_path
-                    .insert(path.clone(), *signature_id);
+                    .entry(path.clone())
+                    .or_default()
+                    .push(*signature_id);
             }
         }
     }

@@ -109,10 +109,7 @@ fn collect_call_site_param_types(
     }
 
     let prefix_expr = call_expr.get_prefix_expr()?;
-    let signature_id = signature_id_from_call_prefix(db, &prefix_expr)?;
-    if signature_id.get_file_id() != file_id {
-        return None;
-    }
+    let signature_id = signature_id_from_call_prefix(db, file_id, &prefix_expr)?;
     if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
         return None;
     }
@@ -220,21 +217,29 @@ fn has_gmod_param_name_hint(db: &DbIndex, param_name: &str) -> bool {
         .is_some_and(|hint| !hint.trim().is_empty())
 }
 
-fn signature_id_from_call_prefix(db: &DbIndex, prefix_expr: &LuaExpr) -> Option<LuaSignatureId> {
+fn signature_id_from_call_prefix(
+    db: &DbIndex,
+    file_id: FileId,
+    prefix_expr: &LuaExpr,
+) -> Option<LuaSignatureId> {
     match prefix_expr {
-        LuaExpr::NameExpr(name_expr) => signature_id_from_name_expr(db, name_expr),
+        LuaExpr::NameExpr(name_expr) => signature_id_from_name_expr(db, file_id, name_expr),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path().and_then(|path| {
             db.get_call_site_param_index()
-                .get_source_signature(path.as_str())
+                .get_source_signature_for_file(path.as_str(), file_id)
         }),
         _ => None,
     }
 }
 
-fn signature_id_from_name_expr(db: &DbIndex, name_expr: &LuaNameExpr) -> Option<LuaSignatureId> {
+fn signature_id_from_name_expr(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaSignatureId> {
     let name = name_expr.get_name_text()?;
     db.get_call_site_param_index()
-        .get_source_signature(name.as_str())
+        .get_source_signature_for_file(name.as_str(), file_id)
 }
 
 fn is_call_site_realm_compatible(

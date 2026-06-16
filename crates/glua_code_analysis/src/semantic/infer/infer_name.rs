@@ -64,18 +64,13 @@ pub fn infer_name_expr(
         }
 
         match get_name_expr_var_ref_id(db, cache, &name_expr) {
-            Some(var_ref_id) => infer_expr_narrow_type(
-                db,
-                cache,
-                LuaExpr::NameExpr(name_expr.clone()),
-                var_ref_id,
-            )
-            .or_else(|_| {
-                infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-            }),
-            None => {
-                infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+            Some(var_ref_id) => {
+                infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id)
+                    .or_else(|_| {
+                        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+                    })
             }
+            None => infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name),
         }
     };
 
@@ -2537,6 +2532,67 @@ mod test {
         let inferred_type = find_param_type_by_name(&ws, file_id, "value");
 
         assert!(ws.check_type(&inferred_type, &LuaType::String));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_call_site_param_inference_uses_same_file_signature_when_names_collide() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .file_param_defaults
+            .insert("veh".to_string(), "DefaultVehicle".to_string());
+        ws.update_emmyrc(emmyrc);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "file_a.lua",
+                r#"
+                function Handle(veh)
+                    local snapshot_a = veh
+                    return snapshot_a
+                end
+
+                Handle("sedan")
+                "#,
+            ),
+            (
+                "file_b.lua",
+                r#"
+                function Handle(veh)
+                    local snapshot_b = veh
+                    return snapshot_b
+                end
+
+                Handle(123)
+                "#,
+            ),
+        ]);
+
+        let file_a_signature = find_first_closure_signature_id(&ws, file_ids[0]);
+        let file_b_signature = find_first_closure_signature_id(&ws, file_ids[1]);
+        let (file_a_param, file_b_param) = {
+            let db = ws.analysis.compilation.get_db();
+            (
+                db.get_call_site_param_index()
+                    .get_inferred_param(&file_a_signature, 0)
+                    .cloned()
+                    .expect("expected call-site evidence for file_a"),
+                db.get_call_site_param_index()
+                    .get_inferred_param(&file_b_signature, 0)
+                    .cloned()
+                    .expect("expected call-site evidence for file_b"),
+            )
+        };
+
+        assert!(ws.check_type(&file_a_param, &LuaType::String));
+        assert!(
+            matches!(file_b_param, LuaType::Integer | LuaType::IntegerConst(_)),
+            "expected integer evidence for file_b, got {file_b_param:?}"
+        );
 
         Ok(())
     }
