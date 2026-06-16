@@ -114,6 +114,20 @@ pub fn infer_expr_narrow_type(
     let result =
         get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id);
     cache.flow_query_realm = previous_query_realm;
+
+    // Measurement only (Info-gated): how often does the flow walk produce a type
+    // identical to the un-narrowed declared type? Quantifies the upper bound of a
+    // "skip walk when never narrowed" optimization.
+    if log::log_enabled!(log::Level::Info) {
+        cache.prof_narrow_total += 1;
+        let plain = get_var_ref_type(db, cache, &var_ref_id);
+        match (&result, &plain) {
+            (Ok(a), Ok(b)) if a == b => cache.prof_narrow_noop += 1,
+            (Err(_), Err(_)) => cache.prof_narrow_noop += 1,
+            _ => {}
+        }
+    }
+
     result
 }
 

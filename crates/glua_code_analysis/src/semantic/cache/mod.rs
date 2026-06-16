@@ -203,6 +203,8 @@ pub struct LuaInferCache {
     pub prof_flow_miss_other_realm_hit: u32,
     pub prof_flow_miss_other_origin_hit: u32,
     pub prof_flow_entry_miss: u32,
+    pub prof_narrow_total: u32,
+    pub prof_narrow_noop: u32,
 }
 
 impl LuaInferCache {
@@ -296,6 +298,8 @@ impl LuaInferCache {
             prof_flow_miss_other_realm_hit: 0,
             prof_flow_miss_other_origin_hit: 0,
             prof_flow_entry_miss: 0,
+            prof_narrow_total: 0,
+            prof_narrow_noop: 0,
         }
     }
 

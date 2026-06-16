@@ -240,6 +240,10 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
             let mut total_flow_entry_miss: u32 = 0;
             let mut total_flow_miss_other_realm: u32 = 0;
             let mut total_flow_miss_other_origin: u32 = 0;
+            let mut total_merge_calls: u32 = 0;
+            let mut total_merge_antecedents: u32 = 0;
+            let mut total_narrow_total: u32 = 0;
+            let mut total_narrow_noop: u32 = 0;
             for fid in &file_ids {
                 let cache = context.infer_manager.get_infer_cache(*fid);
                 total_flow_calls += cache.prof_flow_calls;
@@ -248,6 +252,10 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 total_flow_entry_miss += cache.prof_flow_entry_miss;
                 total_flow_miss_other_realm += cache.prof_flow_miss_other_realm_hit;
                 total_flow_miss_other_origin += cache.prof_flow_miss_other_origin_hit;
+                total_merge_calls += cache.prof_merge_calls;
+                total_merge_antecedents += cache.prof_merge_total_antecedents;
+                total_narrow_total += cache.prof_narrow_total;
+                total_narrow_noop += cache.prof_narrow_noop;
                 total_idx_ns += cache.prof_infer_index_time_ns;
                 total_call_ns += cache.prof_infer_call_time_ns;
                 total_name_ns += cache.prof_infer_name_time_ns;
@@ -308,7 +316,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 .and_then(|h| h.checked_div(total_flow_calls))
                 .unwrap_or(0);
             info!(
-                "lua flow profile: [calls={} hits={} ({}%) nodes_walked={} entry_miss={} miss_other_realm={} miss_other_origin={}]",
+                "lua flow profile: [calls={} hits={} ({}%) nodes_walked={} entry_miss={} miss_other_realm={} miss_other_origin={} merge_calls={} merge_antecedents={}]",
                 total_flow_calls,
                 total_flow_hits,
                 flow_hit_pct,
@@ -316,6 +324,16 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 total_flow_entry_miss,
                 total_flow_miss_other_realm,
                 total_flow_miss_other_origin,
+                total_merge_calls,
+                total_merge_antecedents,
+            );
+            let narrow_noop_pct = total_narrow_noop
+                .checked_mul(100)
+                .and_then(|h| h.checked_div(total_narrow_total))
+                .unwrap_or(0);
+            info!(
+                "lua narrow noop profile: [narrow_total={} noop={} ({}%)]",
+                total_narrow_total, total_narrow_noop, narrow_noop_pct,
             );
             info!(
                 "lua assign profile: [stats={} slots={} special_hits={} skip_nil={}ms get_owner={}ms special={}ms set_owner={}ms infer_rhs={}ms merge={}ms]",
