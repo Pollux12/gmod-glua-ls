@@ -8,7 +8,7 @@ use rustc_hash::FxHashMap;
 pub use super::checker::DiagnosticContext;
 use super::checker::SharedDiagnosticData;
 use super::checker::precompute_await_candidates;
-use super::checker::precompute_callee_realms_for_workspace;
+use super::checker::precompute_callee_realm_data_for_workspace;
 use super::checker::precompute_gm_method_realms;
 use super::checker::precompute_missing_required_fields;
 use super::checker::precompute_nodiscard_candidates;
@@ -116,12 +116,21 @@ impl LuaDiagnostic {
 
         let mut gm_method_realms = HashMap::new();
         let mut callee_realms_by_workspace = HashMap::new();
+        let mut realm_call_candidates_by_workspace = HashMap::new();
         for workspace_id in module_index.get_main_workspace_ids() {
             let realms = Arc::new(precompute_gm_method_realms(db, workspace_id));
-            let callee_realms =
-                precompute_callee_realms_for_workspace(db, workspace_id, &workspace_file_ids);
+            let mut callee_realm_data =
+                precompute_callee_realm_data_for_workspace(db, workspace_id, &workspace_file_ids);
+            callee_realm_data
+                .realm_call_candidates
+                .insert_gm_method_realms(realms.as_ref());
             gm_method_realms.insert(workspace_id, realms);
-            callee_realms_by_workspace.insert(workspace_id, Arc::new(callee_realms));
+            callee_realms_by_workspace
+                .insert(workspace_id, Arc::new(callee_realm_data.callee_realms));
+            realm_call_candidates_by_workspace.insert(
+                workspace_id,
+                Arc::new(callee_realm_data.realm_call_candidates),
+            );
         }
 
         let missing_required_fields = precompute_missing_required_fields(db);
@@ -143,6 +152,7 @@ impl LuaDiagnostic {
             workspace_file_ids: Arc::new(workspace_file_ids),
             gm_method_realms,
             callee_realms_by_workspace,
+            realm_call_candidates_by_workspace,
             missing_required_fields: Arc::new(missing_required_fields),
             subclass_fields: Arc::new(subclass_fields),
             await_candidates: Arc::new(await_candidates),

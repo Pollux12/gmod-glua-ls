@@ -75,8 +75,9 @@ pub use gmod_network::precompute_sorted_send_flows;
 pub use gmod_realm_misuse::AnnotatedRealmRange;
 pub use gmod_realm_misuse::GmMethodRealmMap;
 pub use gmod_realm_misuse::PrecomputedCalleeRealmMap;
+pub use gmod_realm_misuse::PrecomputedRealmCallCandidates;
 pub(crate) use gmod_realm_misuse::collect_decl_annotation_realms_for_file_precompute;
-pub use gmod_realm_misuse::precompute_callee_realms_for_workspace;
+pub use gmod_realm_misuse::precompute_callee_realm_data_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 pub use missing_fields::precompute_missing_required_fields;
 pub use param_type_check::{PrecomputedParamTypeCandidates, precompute_param_type_candidates};
@@ -257,6 +258,9 @@ pub struct SharedDiagnosticData {
     pub gm_method_realms: HashMap<WorkspaceId, Arc<GmMethodRealmMap>>,
     /// Maps workspace_id -> immutable, precomputed callee-declaration realm data.
     pub callee_realms_by_workspace: HashMap<WorkspaceId, Arc<PrecomputedCalleeRealmMap>>,
+    /// Maps workspace_id -> static callee names that may produce realm diagnostics.
+    pub realm_call_candidates_by_workspace:
+        HashMap<WorkspaceId, Arc<PrecomputedRealmCallCandidates>>,
     /// Required non-method fields for each type declaration, including inherited fields.
     pub missing_required_fields: Arc<PrecomputedMissingRequiredFields>,
     /// Named members declared on subclasses, keyed by every base type they can satisfy.
@@ -323,6 +327,10 @@ impl<'a> DiagnosticContext<'a> {
 
     pub fn get_shared_data_arc(&self) -> Option<Arc<SharedDiagnosticData>> {
         self.shared_data.clone()
+    }
+
+    pub fn get_shared_data(&self) -> Option<&SharedDiagnosticData> {
+        self.shared_data.as_deref()
     }
 
     pub fn get_db(&self) -> &DbIndex {
