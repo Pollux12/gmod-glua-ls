@@ -28,19 +28,41 @@ impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
         db.get_call_site_param_index_mut()
             .set_files_source_signatures(source_signature_updates);
 
-        let mut contribution_updates = Vec::new();
-        for tree in trees {
-            let file_id = tree.file_id;
-            let root = tree.value.get_root().clone();
-
-            let mut contributions = Vec::new();
-            let cache = context.infer_manager.get_infer_cache(file_id);
-            for call_expr in root.descendants().filter_map(LuaCallExpr::cast) {
-                collect_call_site_param_types(db, cache, file_id, call_expr, &mut contributions);
-            }
-
-            contribution_updates.push((file_id, contributions));
-        }
+        // The contribution collection reads only immutable state (signature
+        // index, the source-signature map just installed above, decl/reference
+        // indexes from earlier passes) and writes to per-file local buffers, so
+        // it runs concurrently across files. A fresh per-file infer cache is
+        // used (the db is immutable during this pass, so a cold cache yields
+        // identical inference). Results merge sequentially in file-id order.
+        let file_ids: Vec<FileId> = trees.iter().map(|tree| tree.file_id).collect();
+        let contribution_updates =
+            super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
+                let mut contributions = Vec::new();
+                let Some(root) = db
+                    .get_vfs()
+                    .get_syntax_tree(&file_id)
+                    .map(|tree| tree.get_chunk_node())
+                else {
+                    return (file_id, contributions);
+                };
+                let mut cache = LuaInferCache::new(
+                    file_id,
+                    crate::CacheOptions {
+                        analysis_phase: crate::LuaAnalysisPhase::Force,
+                        skip_flow_narrowing: false,
+                    },
+                );
+                for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
+                    collect_call_site_param_types(
+                        db,
+                        &mut cache,
+                        file_id,
+                        call_expr,
+                        &mut contributions,
+                    );
+                }
+                (file_id, contributions)
+            });
         db.get_call_site_param_index_mut()
             .set_files_contributions(contribution_updates);
     }
