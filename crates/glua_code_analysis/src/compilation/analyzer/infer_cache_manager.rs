@@ -26,7 +26,6 @@ impl InferCacheManager {
                 file_id,
                 crate::CacheOptions {
                     analysis_phase: phase,
-                    skip_flow_narrowing: false,
                 },
             )
         })

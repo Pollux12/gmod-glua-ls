@@ -49,7 +49,6 @@ impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
                     file_id,
                     crate::CacheOptions {
                         analysis_phase: crate::LuaAnalysisPhase::Force,
-                        skip_flow_narrowing: false,
                     },
                 );
                 for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
