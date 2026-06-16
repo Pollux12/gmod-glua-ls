@@ -4,7 +4,16 @@ members = ["crates/*",
     "tools/*",
 ]
 
+# Default release profile stays fast to compile for active development and
+# testing (no whole-program optimization). Iteration rebuilds are ~40s.
 [profile.release]
+
+# Optimized profile for CI / shipped binaries only. Whole-program optimization
+# (thin LTO + single codegen unit) trades a much slower build (~3min) for a
+# small runtime win (~0.4s indexing on the CityRP benchmark). Build with
+# `cargo build --profile dist`.
+[profile.dist]
+inherits = "release"
 lto = "thin"
 codegen-units = 1
 

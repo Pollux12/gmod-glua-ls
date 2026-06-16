@@ -176,29 +176,31 @@ jobs:
         run: |
           echo "current ref ${{ github.ref }}"
           cargo run -p edit_version -- ${{ github.ref }}
+      # Shipped binaries use the `dist` profile (thin LTO + codegen-units=1)
+      # for the small runtime win. Regular `--release` stays fast for dev.
       - name: Build - General
         if: ${{ matrix.cross == 'general' }}
         run: |
           rustup target add ${{ matrix.target }}
-          cargo build --release --target ${{ matrix.target }} -p ${{ matrix.crate }}
+          cargo build --profile dist --target ${{ matrix.target }} -p ${{ matrix.crate }}
       - name: Build - zigbuild
         if: ${{ matrix.cross == 'zigbuild' }}
         run: |
           rustup target add ${{ matrix.target }}
           cargo install --locked cargo-zigbuild
           pip3 install ziglang
-          cargo zigbuild --release --target ${{ matrix.target }}.${{ matrix.glibc }} -p ${{ matrix.crate }}
+          cargo zigbuild --profile dist --target ${{ matrix.target }}.${{ matrix.glibc }} -p ${{ matrix.crate }}
       - name: Copy binary (Linux)
         if: ${{ matrix.os != 'windows-latest' }}
         run: |
           mkdir -p ${{ github.workspace }}/artifact/
-          cp ${{ github.workspace }}/target/${{ matrix.target }}/release/${{ matrix.crate }} ${{ github.workspace }}/artifact/${{ matrix.output }}
+          cp ${{ github.workspace }}/target/${{ matrix.target }}/dist/${{ matrix.crate }} ${{ github.workspace }}/artifact/${{ matrix.output }}
       - name: Copy binary (Windows)
         if: ${{ matrix.os == 'windows-latest' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/artifact/"
-          Copy-Item "${{ github.workspace }}/target/${{ matrix.target }}/release/${{ matrix.crate }}.exe" "${{ github.workspace }}/artifact/${{ matrix.output }}.exe"
+          Copy-Item "${{ github.workspace }}/target/${{ matrix.target }}/dist/${{ matrix.crate }}.exe" "${{ github.workspace }}/artifact/${{ matrix.output }}.exe"
       - name: Upload
         if: ${{ matrix.cross != 'zigbuild' }}
         uses: actions/upload-artifact@v7
