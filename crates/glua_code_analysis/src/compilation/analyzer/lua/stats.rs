@@ -698,8 +698,8 @@ fn apply_index_expr_member_owner(
         // `assignment_file_define_scope_for_member`). For other features
         // (e.g. `MetaDefine`) it stores `None`, so set the real scope here.
         if !matches!(decl_feature, LuaMemberFeature::FileDefine) {
-            let function_scope =
-                member_index.enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
+            let function_scope = member_index
+                .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
             member_index.set_member_function_scope_range(member_id, function_scope);
         }
         if guarded_table_assignment {

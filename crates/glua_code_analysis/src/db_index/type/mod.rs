@@ -76,6 +76,55 @@ fn replace_table_const_in_type(
     }
 }
 
+fn replace_table_consts_in_type(
+    typ: &LuaType,
+    replacements: &HashMap<InFiled<TextRange>, LuaType>,
+) -> Option<LuaType> {
+    match typ {
+        LuaType::TableConst(existing_range) => replacements.get(existing_range).cloned(),
+        LuaType::Union(union) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = union
+                .into_vec()
+                .into_iter()
+                .map(|sub_type| {
+                    replace_table_consts_in_type(&sub_type, replacements)
+                        .inspect(|_| changed = true)
+                        .unwrap_or(sub_type)
+                })
+                .collect();
+            changed.then(|| LuaType::from_vec(new_types))
+        }
+        LuaType::Intersection(intersection) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = intersection
+                .get_types()
+                .iter()
+                .map(|sub_type| {
+                    replace_table_consts_in_type(sub_type, replacements)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| sub_type.clone())
+                })
+                .collect();
+            changed.then(|| LuaType::from_vec(new_types))
+        }
+        LuaType::MergedTable(merged) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = merged
+                .get_types()
+                .iter()
+                .map(|sub_type| {
+                    replace_table_consts_in_type(sub_type, replacements)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| sub_type.clone())
+                })
+                .collect();
+            changed.then(|| LuaMergedTableType::new(new_types).into())
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn widen_literal_type_for_assignment(typ: &LuaType) -> LuaType {
     match typ {
         LuaType::IntegerConst(_) => LuaType::Integer,
@@ -575,6 +624,33 @@ impl LuaTypeIndex {
                         (owner.clone(), new_cache)
                     },
                 )
+            })
+            .collect();
+
+        for (owner, new_cache) in updates {
+            self.types.insert(owner, new_cache);
+        }
+    }
+
+    pub fn replace_table_const_types(
+        &mut self,
+        replacements: &HashMap<InFiled<TextRange>, LuaType>,
+    ) {
+        if replacements.is_empty() {
+            return;
+        }
+
+        let updates: Vec<(LuaTypeOwner, LuaTypeCache)> = self
+            .types
+            .iter()
+            .filter_map(|(owner, cache)| {
+                replace_table_consts_in_type(cache.as_type(), replacements).map(|new_type| {
+                    let new_cache = match cache {
+                        LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
+                        LuaTypeCache::InferType(_) => LuaTypeCache::InferType(new_type),
+                    };
+                    (owner.clone(), new_cache)
+                })
             })
             .collect();
 

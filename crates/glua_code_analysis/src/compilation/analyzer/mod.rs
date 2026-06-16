@@ -18,9 +18,8 @@ use std::{
 };
 
 use crate::{
-    AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId,
-    LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache,
-    WorkspaceId,
+    AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaFunctionType,
+    LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, WorkspaceId,
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
 };
@@ -28,10 +27,7 @@ use glua_parser::LuaChunk;
 use infer_cache_manager::InferCacheManager;
 use unresolve::UnResolve;
 
-pub fn analyze(
-    db: &mut DbIndex,
-    need_analyzed_files: Vec<InFiled<LuaChunk>>,
-) -> HashSet<FileId> {
+pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) -> HashSet<FileId> {
     if need_analyzed_files.is_empty() {
         return HashSet::new();
     }

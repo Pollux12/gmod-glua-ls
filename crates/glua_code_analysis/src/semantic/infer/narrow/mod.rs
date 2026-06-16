@@ -97,10 +97,7 @@ fn is_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
 fn var_ref_can_be_narrowed(db: &DbIndex, file_id: &crate::FileId, var_ref_id: &VarRefId) -> bool {
     // Special-call effects can narrow arbitrary var-refs at runtime positions and
     // are populated after flow binding, so any file with them must not skip.
-    if db
-        .get_flow_index()
-        .has_any_special_call_effect(file_id)
-    {
+    if db.get_flow_index().has_any_special_call_effect(file_id) {
         return true;
     }
 

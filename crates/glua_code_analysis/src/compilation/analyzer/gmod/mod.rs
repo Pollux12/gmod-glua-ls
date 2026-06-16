@@ -10,8 +10,8 @@ use glua_parser::{
     LuaChunk, LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
-    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaStat,
-    LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
+    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaStat, LuaSyntaxId,
+    LuaSyntaxNode, LuaTableExpr, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
 };
 
 use crate::{
@@ -209,8 +209,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         // preserve identical behavior. The scoped-class (`is_in_scope`) work
         // mutates the db and stays in the sequential merge loop.
         let s_collect = do_profile.then(std::time::Instant::now);
-        let collect_file_ids: Vec<FileId> =
-            tree_list.iter().map(|tree| tree.file_id).collect();
+        let collect_file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
         let collected = super::parallel::map_files_collect(db, &collect_file_ids, |db, file_id| {
             collect_file_gmod_metadata(
                 db,
@@ -2609,17 +2608,31 @@ fn synthesize_scripted_class_members(
 }
 
 /// Synthesize vgui.Register / derma.DefineControl class types.
+#[derive(Clone, Copy)]
+struct ResolvedVguiRegistrationRegion {
+    decl_id: LuaDeclId,
+    region_start: TextSize,
+}
+
+#[derive(Default)]
+struct VguiSynthesisCache {
+    registered_table_exprs: HashMap<(FileId, u32), Option<LuaTableExpr>>,
+    decl_has_reassignment: HashMap<(FileId, u32), bool>,
+    initializer_table_ranges: HashMap<(FileId, u32), Option<InFiled<TextRange>>>,
+    table_const_replacements: HashMap<InFiled<TextRange>, LuaType>,
+}
+
 fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
     struct VguiRegistrationRegion {
         file_id: FileId,
         decl_id: LuaDeclId,
         class_decl_id: LuaTypeDeclId,
-        panel_name: String,
         region_start: TextSize,
         region_end: TextSize,
     }
 
     let mut vgui_registration_regions: Vec<VguiRegistrationRegion> = Vec::new();
+    let mut synthesis_cache = VguiSynthesisCache::default();
 
     for file_id in file_ids.iter().copied() {
         // Borrow first and skip files with no VGUI-relevant calls before paying
@@ -2650,6 +2663,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
             let register_position = call.syntax_id.get_range().start();
             let panel_source = call.vgui_panel_define_arg_source();
             let table_source = call.vgui_panel_table_arg_source(1);
+            let mut resolved_registration = None;
             if let Some(GmodClassCallLiteral::String(panel_name)) =
                 call.value_for_arg_source(&panel_source)
             {
@@ -2658,44 +2672,64 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
+                    resolved_registration = Some(ResolvedVguiRegistrationRegion {
+                        decl_id,
+                        region_start,
+                    });
                     vgui_registration_regions.push(VguiRegistrationRegion {
                         file_id,
                         decl_id,
                         class_decl_id: LuaTypeDeclId::global(panel_name),
-                        panel_name: panel_name.clone(),
                         region_start,
                         region_end: register_position,
                     });
                 }
             }
-            synthesize_vgui_register(db, file_id, call);
+            synthesize_vgui_register(
+                db,
+                &mut synthesis_cache,
+                file_id,
+                call,
+                resolved_registration,
+            );
         }
 
         for call in &metadata.vgui_register_table_calls {
             let register_position = call.syntax_id.get_range().start();
             let table_source = call.vgui_panel_table_arg_source(0);
+            let mut resolved_registration = None;
             if let Some(GmodClassCallLiteral::NameRef(table_var)) =
                 call.value_for_arg_source(&table_source)
                 && let Some((decl_id, region_start)) =
                     resolve_local_registration_region(db, file_id, table_var, register_position)
             {
+                resolved_registration = Some(ResolvedVguiRegistrationRegion {
+                    decl_id,
+                    region_start,
+                });
                 let class_decl_id = vgui_register_table_type_decl_id(file_id, call);
                 vgui_registration_regions.push(VguiRegistrationRegion {
                     file_id,
                     decl_id,
-                    panel_name: class_decl_id.get_simple_name().to_string(),
                     class_decl_id,
                     region_start,
                     region_end: register_position,
                 });
             }
-            synthesize_vgui_register_table(db, file_id, call);
+            synthesize_vgui_register_table(
+                db,
+                &mut synthesis_cache,
+                file_id,
+                call,
+                resolved_registration,
+            );
         }
 
         for call in &metadata.derma_define_control_calls {
             let register_position = call.syntax_id.get_range().start();
             let panel_source = call.vgui_panel_define_arg_source();
             let table_source = call.vgui_panel_table_arg_source(2);
+            let mut resolved_registration = None;
             if let Some(GmodClassCallLiteral::String(panel_name)) =
                 call.value_for_arg_source(&panel_source)
             {
@@ -2704,17 +2738,26 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
+                    resolved_registration = Some(ResolvedVguiRegistrationRegion {
+                        decl_id,
+                        region_start,
+                    });
                     vgui_registration_regions.push(VguiRegistrationRegion {
                         file_id,
                         decl_id,
                         class_decl_id: LuaTypeDeclId::global(panel_name),
-                        panel_name: panel_name.clone(),
                         region_start,
                         region_end: register_position,
                     });
                 }
             }
-            synthesize_derma_define_control(db, file_id, call);
+            synthesize_derma_define_control(
+                db,
+                &mut synthesis_cache,
+                file_id,
+                call,
+                resolved_registration,
+            );
         }
 
         for call in &metadata.vgui_register_file_calls {
@@ -2722,7 +2765,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                 target_file_id,
                 decl_id,
                 class_decl_id,
-                panel_name,
+                _panel_name,
                 region_start,
                 region_end,
             )) = synthesize_vgui_register_file_target(db, file_id, call)
@@ -2731,7 +2774,6 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     file_id: target_file_id,
                     decl_id,
                     class_decl_id,
-                    panel_name,
                     region_start,
                     region_end,
                 });
@@ -2739,52 +2781,80 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
         }
     }
 
-    // Synthesize AccessorFunc members for VGUI-registered classes
+    flush_vgui_table_const_replacements(db, &mut synthesis_cache);
+
+    // Synthesize AccessorFunc members for VGUI-registered classes. Group by
+    // file so each accessor target is resolved once instead of once per
+    // registration in that file.
+    let mut registrations_by_file: HashMap<FileId, Vec<&VguiRegistrationRegion>> = HashMap::new();
     for registration in &vgui_registration_regions {
+        registrations_by_file
+            .entry(registration.file_id)
+            .or_default()
+            .push(registration);
+    }
+
+    for (file_id, registrations) in registrations_by_file {
         let metadata = match db
             .get_gmod_class_metadata_index()
-            .get_file_metadata(&registration.file_id)
+            .get_file_metadata(&file_id)
         {
-            Some(m) => m.clone(),
-            None => continue,
+            Some(m) if !m.accessor_func_calls.is_empty() => m.clone(),
+            _ => continue,
         };
 
         log::debug!(
-            "VGUI AccessorFunc: file {:?} has {} accessor_func_calls for panel={} region={:?}..{:?}",
-            registration.file_id,
+            "VGUI AccessorFunc: file {:?} has {} accessor_func_calls across {} registrations",
+            file_id,
             metadata.accessor_func_calls.len(),
-            registration.panel_name,
-            registration.region_start,
-            registration.region_end,
+            registrations.len(),
         );
-        let class_decl_id = registration.class_decl_id.clone();
+
         for call in &metadata.accessor_func_calls {
-            if let Some(Some(GmodClassCallLiteral::NameRef(target_name))) =
-                call.literal_args.first()
-                && let Some(target_arg) = call.args.first()
-            {
-                let accessor_position = call.syntax_id.get_range().start();
-                let target_decl_id = resolve_local_decl_id_at_position(
-                    db,
-                    registration.file_id,
-                    target_name,
-                    target_arg.syntax_id.get_range().start(),
-                );
+            let Some(Some(GmodClassCallLiteral::NameRef(target_name))) = call.literal_args.first()
+            else {
+                continue;
+            };
+            let Some(target_arg) = call.args.first() else {
+                continue;
+            };
+
+            let accessor_position = call.syntax_id.get_range().start();
+            let target_decl_id = resolve_local_decl_id_at_position(
+                db,
+                file_id,
+                target_name,
+                target_arg.syntax_id.get_range().start(),
+            );
+
+            for registration in &registrations {
+                if accessor_position < registration.region_start
+                    || accessor_position >= registration.region_end
+                {
+                    continue;
+                }
 
                 let matches_registration_target = target_decl_id == Some(registration.decl_id)
                     || (target_decl_id.is_none()
                         && target_name == "PANEL"
-                        && registration.decl_id.file_id == registration.file_id);
+                        && registration.decl_id.file_id == file_id);
 
-                if matches_registration_target
-                    && accessor_position >= registration.region_start
-                    && accessor_position < registration.region_end
-                {
-                    synthesize_accessor_func(db, registration.file_id, &class_decl_id, call);
+                if matches_registration_target {
+                    synthesize_accessor_func(db, file_id, &registration.class_decl_id, call);
                 }
             }
         }
     }
+}
+
+fn flush_vgui_table_const_replacements(db: &mut DbIndex, cache: &mut VguiSynthesisCache) {
+    if cache.table_const_replacements.is_empty() {
+        return;
+    }
+
+    let replacements = std::mem::take(&mut cache.table_const_replacements);
+    db.get_type_index_mut()
+        .replace_table_const_types(&replacements);
 }
 
 fn synthesize_scripted_ent_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
@@ -3026,6 +3096,45 @@ fn resolve_local_decl_id_at_position(
         .get_decl_tree(&file_id)?
         .find_local_decl(var_name, position)
         .map(|decl| decl.get_id())
+}
+
+fn text_size_key(position: TextSize) -> u32 {
+    u32::from(position)
+}
+
+fn cached_registered_table_expr(
+    cache: &mut VguiSynthesisCache,
+    db: &DbIndex,
+    file_id: FileId,
+    decl_id: LuaDeclId,
+    register_position: TextSize,
+    write_position: TextSize,
+) -> Option<LuaTableExpr> {
+    let key = (file_id, text_size_key(write_position));
+    if let Some(table_expr) = cache.registered_table_exprs.get(&key) {
+        return table_expr.clone();
+    }
+
+    let table_expr = find_registered_table_expr_at_write_position(db, file_id, write_position)
+        .or_else(|| find_registered_table_expr(db, file_id, decl_id, register_position));
+    cache.registered_table_exprs.insert(key, table_expr.clone());
+    table_expr
+}
+
+fn cached_decl_has_reassignment(
+    cache: &mut VguiSynthesisCache,
+    db: &DbIndex,
+    file_id: FileId,
+    decl_id: LuaDeclId,
+) -> bool {
+    let key = (file_id, text_size_key(decl_id.position));
+    if let Some(has_reassignment) = cache.decl_has_reassignment.get(&key) {
+        return *has_reassignment;
+    }
+
+    let has_reassignment = decl_has_reassignment(db, file_id, decl_id);
+    cache.decl_has_reassignment.insert(key, has_reassignment);
+    has_reassignment
 }
 
 fn synthesize_scoped_base_assignments_with(
@@ -4000,8 +4109,10 @@ fn synthesize_network_var_element(
 
 fn synthesize_vgui_register(
     db: &mut DbIndex,
+    cache: &mut VguiSynthesisCache,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
+    resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     // vgui.Register("PanelName", TABLE, "BasePanel")
     // args[0] = panel name (string)
@@ -4031,19 +4142,23 @@ fn synthesize_vgui_register(
 
     synthesize_panel_class(
         db,
+        cache,
         file_id,
         &panel_name,
         table_var_name.as_deref(),
         base_panel.as_deref(),
         GmodScriptedClassCallKind::VguiRegister,
         call,
+        resolved_registration,
     );
 }
 
 fn synthesize_derma_define_control(
     db: &mut DbIndex,
+    cache: &mut VguiSynthesisCache,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
+    resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     // derma.DefineControl("ControlName", "description", TABLE, "BasePanel")
     // args[0] = control name (string)
@@ -4074,12 +4189,14 @@ fn synthesize_derma_define_control(
 
     synthesize_panel_class(
         db,
+        cache,
         file_id,
         &control_name,
         table_var_name.as_deref(),
         base_panel.as_deref(),
         GmodScriptedClassCallKind::DermaDefineControl,
         call,
+        resolved_registration,
     );
 
     // Register the control name as a global variable with the panel type
@@ -4088,8 +4205,10 @@ fn synthesize_derma_define_control(
 
 fn synthesize_vgui_register_table(
     db: &mut DbIndex,
+    cache: &mut VguiSynthesisCache,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
+    resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     // vgui.RegisterTable(TABLE, "BasePanel")
     // args[0] = table variable (name ref)
@@ -4114,6 +4233,7 @@ fn synthesize_vgui_register_table(
     let class_name = class_decl_id.get_simple_name().to_string();
     synthesize_panel_class_with_id(
         db,
+        cache,
         file_id,
         class_decl_id,
         &class_name,
@@ -4121,6 +4241,7 @@ fn synthesize_vgui_register_table(
         base_panel.as_deref(),
         GmodScriptedClassCallKind::VguiRegisterTable,
         call,
+        resolved_registration,
     );
 }
 
@@ -4397,6 +4518,14 @@ fn find_registered_table_expr(
         find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
             .unwrap_or(decl_id.position);
 
+    find_registered_table_expr_at_write_position(db, file_id, write_position)
+}
+
+fn find_registered_table_expr_at_write_position(
+    db: &DbIndex,
+    file_id: FileId,
+    write_position: TextSize,
+) -> Option<LuaTableExpr> {
     let tree = db.get_vfs().get_syntax_tree(&file_id)?;
     let chunk = tree.get_chunk_node();
 
@@ -4464,16 +4593,19 @@ fn find_latest_decl_write_before_position(
 
 fn synthesize_panel_class(
     db: &mut DbIndex,
+    cache: &mut VguiSynthesisCache,
     file_id: FileId,
     panel_name: &str,
     table_var_name: Option<&str>,
     base_panel: Option<&str>,
     call_kind: GmodScriptedClassCallKind,
     call: &GmodScriptedClassCallMetadata,
+    resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     let class_decl_id = LuaTypeDeclId::global(panel_name);
     synthesize_panel_class_with_id(
         db,
+        cache,
         file_id,
         class_decl_id,
         panel_name,
@@ -4481,11 +4613,13 @@ fn synthesize_panel_class(
         base_panel,
         call_kind,
         call,
+        resolved_registration,
     );
 }
 
 fn synthesize_panel_class_with_id(
     db: &mut DbIndex,
+    cache: &mut VguiSynthesisCache,
     file_id: FileId,
     class_decl_id: LuaTypeDeclId,
     panel_name: &str,
@@ -4493,6 +4627,7 @@ fn synthesize_panel_class_with_id(
     base_panel: Option<&str>,
     call_kind: GmodScriptedClassCallKind,
     call: &GmodScriptedClassCallMetadata,
+    resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     // Create the class type declaration if it doesn't exist
     if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
@@ -4542,17 +4677,31 @@ fn synthesize_panel_class_with_id(
     // resolution for hover, diagnostics, completion and CodeLens uniformly.
     if let Some(var_name) = table_var_name {
         let register_position = call.syntax_id.get_range().start();
-        let Some((decl_id, region_start)) =
-            resolve_local_registration_region(db, file_id, var_name, register_position)
-        else {
+        let Some(resolved_registration) = resolved_registration.or_else(|| {
+            resolve_local_registration_region(db, file_id, var_name, register_position).map(
+                |(decl_id, region_start)| ResolvedVguiRegistrationRegion {
+                    decl_id,
+                    region_start,
+                },
+            )
+        }) else {
             return;
         };
+        let decl_id = resolved_registration.decl_id;
+        let region_start = resolved_registration.region_start;
 
         let class_type = LuaType::Def(class_decl_id.clone());
         let latest_write_position = Some(region_start);
 
         // Resolve the concrete `{}` table literal backing this registration.
-        let registered_table = find_registered_table_expr(db, file_id, decl_id, register_position);
+        let registered_table = cached_registered_table_expr(
+            cache,
+            db,
+            file_id,
+            decl_id,
+            register_position,
+            region_start,
+        );
 
         if let Some(table_expr) = &registered_table {
             // Bind the class to this exact table-constructor expression.
@@ -4571,7 +4720,7 @@ fn synthesize_panel_class_with_id(
             }
         }
 
-        if !decl_has_reassignment(db, file_id, decl_id) {
+        if !cached_decl_has_reassignment(cache, db, file_id, decl_id) {
             // For single-panel files the `PANEL` local has one stable identity.
             // Bind the decl slot too so method-self collection during the Lua
             // pass sees the synthesized class before it caches member values.
@@ -4604,7 +4753,7 @@ fn synthesize_panel_class_with_id(
             // This stays correct if a future flow-aware collector starts keying
             // members under the per-region literal instead.
             let member_source_ranges =
-                collect_panel_member_source_ranges(db, file_id, decl_id, &table_range);
+                collect_panel_member_source_ranges(cache, db, file_id, decl_id, &table_range);
 
             let mut table_member_ids = HashSet::new();
             for (source_idx, source_range) in member_source_ranges.iter().enumerate() {
@@ -4646,12 +4795,13 @@ fn synthesize_panel_class_with_id(
             // Backfill persistent type caches that still hold this exact
             // table-const identity (scoped to the current range only — never
             // carried forward across registrations).
-            db.get_type_index_mut()
-                .replace_table_const_type(&table_range, &class_type);
+            cache
+                .table_const_replacements
+                .insert(table_range, class_type.clone());
         }
     } else if let Some(table_expr) = find_inline_vgui_panel_table_expr(db, file_id, call_kind, call)
     {
-        bind_inline_vgui_panel_table(db, file_id, &class_decl_id, table_expr);
+        bind_inline_vgui_panel_table(db, cache, file_id, &class_decl_id, table_expr);
     }
 }
 
@@ -4698,6 +4848,7 @@ fn find_table_expr_for_arg_source(
 
 fn bind_inline_vgui_panel_table(
     db: &mut DbIndex,
+    cache: &mut VguiSynthesisCache,
     file_id: FileId,
     class_decl_id: &LuaTypeDeclId,
     table_expr: LuaTableExpr,
@@ -4729,8 +4880,9 @@ fn bind_inline_vgui_panel_table(
         add_member(db, class_member_owner.clone(), member_id);
     }
 
-    db.get_type_index_mut()
-        .replace_table_const_type(&table_range, &class_type);
+    cache
+        .table_const_replacements
+        .insert(table_range, class_type);
 }
 
 /// Collect the candidate `Element` owner ranges that may hold this
@@ -4748,6 +4900,7 @@ fn bind_inline_vgui_panel_table(
 /// Callers slice the resulting members by source position to attribute them to
 /// the correct region.
 fn collect_panel_member_source_ranges(
+    cache: &mut VguiSynthesisCache,
     db: &DbIndex,
     file_id: FileId,
     decl_id: LuaDeclId,
@@ -4759,17 +4912,35 @@ fn collect_panel_member_source_ranges(
     // The original local decl's initializer table literal (`local PANEL = {}`)
     // is the `Element` owner the lua pass keyed all reused-local members under.
     //
-    // We derive this range from the AST rather than the decl type cache: the
-    // cache is rewritten in-place by `replace_table_const_type` as each region
-    // is synthesized, so by the second registration the original decl's cache
-    // no longer reports its initializer `TableConst`.
-    if let Some(initializer_range) = find_decl_initializer_table_range(db, file_id, decl_id)
+    // We derive this range from the AST rather than the decl type cache: VGUI
+    // synthesis rewrites table-const caches after collecting region members, so
+    // cache state is intentionally not the source of truth here.
+    if let Some(initializer_range) =
+        cached_decl_initializer_table_range(cache, db, file_id, decl_id)
         && !ranges.iter().any(|existing| existing == &initializer_range)
     {
         ranges.push(initializer_range);
     }
 
     ranges
+}
+
+fn cached_decl_initializer_table_range(
+    cache: &mut VguiSynthesisCache,
+    db: &DbIndex,
+    file_id: FileId,
+    decl_id: LuaDeclId,
+) -> Option<InFiled<TextRange>> {
+    let key = (file_id, text_size_key(decl_id.position));
+    if let Some(initializer_range) = cache.initializer_table_ranges.get(&key) {
+        return initializer_range.clone();
+    }
+
+    let initializer_range = find_decl_initializer_table_range(db, file_id, decl_id);
+    cache
+        .initializer_table_ranges
+        .insert(key, initializer_range.clone());
+    initializer_range
 }
 
 /// Find the range of the table literal in a local declaration's initializer
@@ -7567,19 +7738,145 @@ fn rebuild_gmod_load_index(
 
 struct DynamicLoadPattern {
     source_file_id: FileId,
-    glob_base: String,
-    has_prefix_dispatch: bool,
-    has_addcs: bool,
-    has_include: bool,
+    dispatch: DynamicLoadDispatch,
+    operations: Vec<DynamicLoadOperation>,
     range: TextRange,
     targets: Vec<(FileId, String)>,
 }
 
+struct DynamicFileFindPattern {
+    range: TextRange,
+    binding_name: Option<String>,
+    scope: Option<TextRange>,
+    glob: DynamicLoadGlob,
+    targets: Vec<(FileId, String)>,
+}
+
+enum DynamicFileFindLoopSource {
+    Direct(TextRange),
+    Binding {
+        name: String,
+        scope: Option<TextRange>,
+    },
+}
+
+struct DynamicBindingWrite {
+    name: String,
+    scope: Option<TextRange>,
+    range: TextRange,
+}
+
+struct DynamicLoadGlob {
+    base: String,
+    file_prefix: Option<String>,
+}
+
+#[derive(Clone)]
+struct DynamicLoadWrapper {
+    params: Vec<String>,
+    block: LuaBlock,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct DynamicLoadDispatch {
+    prefix: bool,
+    folder: bool,
+    entrypoint: bool,
+}
+
+impl DynamicLoadDispatch {
+    fn merge(&mut self, other: Self) {
+        self.prefix |= other.prefix;
+        self.folder |= other.folder;
+        self.entrypoint |= other.entrypoint;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DynamicLoadOperationKind {
+    Include,
+    AddCSLuaFile,
+}
+
+#[derive(Clone)]
+struct DynamicLoadOperation {
+    kind: DynamicLoadOperationKind,
+    ranges: Vec<TextRange>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct DynamicLoadAlias {
+    dispatch: DynamicLoadDispatch,
+    has_addcs: bool,
+    has_include: bool,
+}
+
+impl DynamicLoadAlias {
+    fn merge(&mut self, other: Self) {
+        self.dispatch.merge(other.dispatch);
+        self.has_addcs |= other.has_addcs;
+        self.has_include |= other.has_include;
+    }
+
+    fn into_usage_at(self, range: TextRange) -> DynamicLoadUsage {
+        let mut usage = DynamicLoadUsage {
+            dispatch: self.dispatch,
+            operations: Vec::new(),
+        };
+        if self.has_addcs {
+            usage.operations.push(DynamicLoadOperation {
+                kind: DynamicLoadOperationKind::AddCSLuaFile,
+                ranges: vec![range],
+            });
+        }
+        if self.has_include {
+            usage.operations.push(DynamicLoadOperation {
+                kind: DynamicLoadOperationKind::Include,
+                ranges: vec![range],
+            });
+        }
+        usage
+    }
+}
+
+#[derive(Clone, Default)]
+struct DynamicLoadUsage {
+    dispatch: DynamicLoadDispatch,
+    operations: Vec<DynamicLoadOperation>,
+}
+
+impl DynamicLoadUsage {
+    fn has_load_call(&self) -> bool {
+        !self.operations.is_empty()
+    }
+
+    fn merge(&mut self, other: DynamicLoadUsage) {
+        self.dispatch.merge(other.dispatch);
+        self.operations.extend(other.operations);
+    }
+
+    fn add_context_range(&mut self, range: TextRange) {
+        for operation in &mut self.operations {
+            operation.ranges.push(range);
+        }
+    }
+}
+
 fn collect_dynamic_loaders(db: &DbIndex, file_ids: &[FileId]) -> Vec<DynamicLoadPattern> {
-    let relative_paths = file_ids
-        .iter()
-        .filter_map(|file_id| gmod_relative_path(db, *file_id).map(|path| (*file_id, path)))
-        .collect::<HashMap<_, _>>();
+    let mut relative_paths_by_parent: HashMap<String, Vec<(FileId, String)>> = HashMap::new();
+    for file_id in file_ids {
+        let Some(path) = gmod_relative_path(db, *file_id) else {
+            continue;
+        };
+        let parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_default();
+        relative_paths_by_parent
+            .entry(parent)
+            .or_default()
+            .push((*file_id, path));
+    }
 
     let mut patterns = Vec::new();
     for source_file_id in file_ids {
@@ -7595,53 +7892,742 @@ fn collect_dynamic_loaders(db: &DbIndex, file_ids: &[FileId]) -> Vec<DynamicLoad
 
         let root = tree.get_chunk_node();
         let bindings = collect_static_string_bindings(&root);
-        for call_expr in root.descendants::<LuaCallExpr>() {
-            if call_expr.get_access_path().as_deref() != Some("file.Find") {
+        let wrappers = collect_dynamic_load_wrappers(&root);
+
+        let file_find_patterns =
+            collect_dynamic_file_find_patterns(&root, &bindings, &relative_paths_by_parent);
+        if file_find_patterns.is_empty() {
+            continue;
+        }
+
+        let usages = collect_dynamic_load_usages(&root, &file_find_patterns, &wrappers);
+        for (file_find_pattern, usage) in file_find_patterns.into_iter().zip(usages) {
+            if !usage.has_load_call() {
                 continue;
             }
-            let Some(args) = call_expr.get_args_list() else {
-                continue;
-            };
-            let args = args.get_args().collect::<Vec<_>>();
-            let Some(pattern_expr) = args.first() else {
-                continue;
-            };
-            if args.get(1).and_then(static_literal_string).as_deref() != Some("LUA") {
-                continue;
-            }
-            let Some(pattern) = static_string_expr(pattern_expr, &bindings) else {
-                continue;
-            };
-            let Some(glob_base) = lua_file_find_glob_base(&pattern) else {
-                continue;
-            };
-            let targets = relative_paths
-                .iter()
-                .filter(|(_, target_path)| file_find_glob_matches(&glob_base, target_path))
-                .map(|(target_file_id, target_path)| (*target_file_id, target_path.clone()))
-                .collect::<Vec<_>>();
-            if targets.is_empty() {
-                continue;
-            }
+            let mut dispatch = usage.dispatch;
+            dispatch.prefix |= file_find_pattern
+                .glob
+                .file_prefix
+                .as_deref()
+                .is_some_and(is_realm_file_prefix);
 
             patterns.push(DynamicLoadPattern {
                 source_file_id: *source_file_id,
-                glob_base,
-                has_prefix_dispatch: content.contains("\"cl_\"")
-                    || content.contains("'cl_'")
-                    || content.contains("\"sv_\"")
-                    || content.contains("'sv_'")
-                    || content.contains("\"sh_\"")
-                    || content.contains("'sh_'"),
-                has_addcs: content.contains("AddCSLuaFile"),
-                has_include: content.contains("include(") || content.contains("IncludeCS"),
-                range: call_expr.get_range(),
-                targets,
+                dispatch,
+                operations: usage.operations,
+                range: file_find_pattern.range,
+                targets: file_find_pattern.targets,
             });
         }
     }
 
     patterns
+}
+
+fn collect_dynamic_file_find_patterns(
+    root: &LuaChunk,
+    bindings: &HashMap<String, String>,
+    relative_paths_by_parent: &HashMap<String, Vec<(FileId, String)>>,
+) -> Vec<DynamicFileFindPattern> {
+    let mut patterns = Vec::new();
+
+    for call_expr in root.descendants::<LuaCallExpr>() {
+        if call_expr.get_access_path().as_deref() != Some("file.Find") {
+            continue;
+        }
+        let Some(args) = call_expr.get_args_list() else {
+            continue;
+        };
+        let args = args.get_args().collect::<Vec<_>>();
+        let Some(pattern_expr) = args.first() else {
+            continue;
+        };
+        if args.get(1).and_then(static_literal_string).as_deref() != Some("LUA") {
+            continue;
+        }
+        let Some(pattern) = static_string_expr(pattern_expr, bindings) else {
+            continue;
+        };
+        let Some(glob) = lua_file_find_glob(&pattern) else {
+            continue;
+        };
+        let targets = relative_paths_by_parent
+            .get(&glob.base)
+            .into_iter()
+            .flat_map(|candidate_paths| candidate_paths.iter())
+            .filter(|(_, target_path)| file_find_glob_matches(&glob, target_path))
+            .map(|(target_file_id, target_path)| (*target_file_id, target_path.clone()))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            continue;
+        }
+
+        patterns.push(DynamicFileFindPattern {
+            range: call_expr.get_range(),
+            binding_name: file_find_result_binding_name(&call_expr),
+            scope: enclosing_closure_range(call_expr.syntax()),
+            glob,
+            targets,
+        });
+    }
+
+    patterns
+}
+
+fn collect_dynamic_load_usages(
+    root: &LuaChunk,
+    file_find_patterns: &[DynamicFileFindPattern],
+    wrappers: &HashMap<String, DynamicLoadWrapper>,
+) -> Vec<DynamicLoadUsage> {
+    let inherited_aliases = collect_top_level_dynamic_load_call_aliases(root);
+    let binding_writes = collect_dynamic_binding_writes(root);
+    let mut usages = vec![DynamicLoadUsage::default(); file_find_patterns.len()];
+
+    for for_range in root.descendants::<LuaForRangeStat>() {
+        let Some(source) = dynamic_file_find_loop_source(&for_range) else {
+            continue;
+        };
+        let Some(pattern_idx) = resolve_dynamic_file_find_loop_source(
+            &source,
+            file_find_patterns,
+            &binding_writes,
+            for_range.syntax().text_range().start(),
+        ) else {
+            continue;
+        };
+        let Some(file_name_var) = for_range_file_name_var(&for_range) else {
+            continue;
+        };
+        let Some(block) = for_range.get_block() else {
+            continue;
+        };
+
+        usages[pattern_idx].merge(collect_dynamic_load_usage_in_block(
+            &block,
+            HashSet::from([file_name_var]),
+            &wrappers,
+            &inherited_aliases,
+            0,
+        ));
+    }
+
+    usages
+}
+
+const DYNAMIC_LOAD_WRAPPER_DEPTH_LIMIT: usize = 4;
+
+fn collect_dynamic_load_usage_in_block(
+    block: &LuaBlock,
+    initial_file_name_vars: HashSet<String>,
+    wrappers: &HashMap<String, DynamicLoadWrapper>,
+    inherited_aliases: &HashMap<String, DynamicLoadAlias>,
+    wrapper_depth: usize,
+) -> DynamicLoadUsage {
+    let mut usage = DynamicLoadUsage {
+        dispatch: DynamicLoadDispatch {
+            prefix: block_has_dynamic_file_prefix_dispatch(block),
+            folder: block_has_dynamic_file_folder_dispatch(block),
+            entrypoint: block_has_dynamic_file_entrypoint_dispatch(block),
+        },
+        ..DynamicLoadUsage::default()
+    };
+    let file_name_vars = collect_dynamic_file_name_vars(block, initial_file_name_vars);
+    let mut load_call_aliases = inherited_aliases.clone();
+    for (alias_path, alias_usage) in collect_dynamic_load_call_aliases(block) {
+        merge_dynamic_load_alias(&mut load_call_aliases, alias_path, alias_usage);
+    }
+
+    for call_expr in block.descendants::<LuaCallExpr>() {
+        let Some(path) = call_expr.get_access_path() else {
+            continue;
+        };
+        if !load_call_references_file_name(&call_expr, &file_name_vars) {
+            continue;
+        }
+
+        if let Some(load_usage) =
+            dynamic_load_usage_for_call_path(&path, &load_call_aliases, call_expr.get_range())
+        {
+            usage.merge(load_usage);
+            continue;
+        }
+
+        if wrapper_depth < DYNAMIC_LOAD_WRAPPER_DEPTH_LIMIT {
+            usage.merge(collect_dynamic_wrapper_call_usage(
+                &call_expr,
+                &file_name_vars,
+                wrappers,
+                inherited_aliases,
+                wrapper_depth + 1,
+            ));
+        }
+    }
+
+    usage
+}
+
+fn collect_dynamic_wrapper_call_usage(
+    call_expr: &LuaCallExpr,
+    file_name_vars: &HashSet<String>,
+    wrappers: &HashMap<String, DynamicLoadWrapper>,
+    inherited_aliases: &HashMap<String, DynamicLoadAlias>,
+    wrapper_depth: usize,
+) -> DynamicLoadUsage {
+    let Some(path) = call_expr.get_access_path() else {
+        return DynamicLoadUsage::default();
+    };
+    let Some(wrapper) = wrappers.get(&path) else {
+        return DynamicLoadUsage::default();
+    };
+    let Some(args_list) = call_expr.get_args_list() else {
+        return DynamicLoadUsage::default();
+    };
+
+    let wrapper_file_vars = args_list
+        .get_args()
+        .enumerate()
+        .filter(|(_, arg)| expr_references_any_name(arg, file_name_vars))
+        .filter_map(|(idx, _)| wrapper.params.get(idx).cloned())
+        .collect::<HashSet<_>>();
+    if wrapper_file_vars.is_empty() {
+        return DynamicLoadUsage::default();
+    }
+
+    let mut usage = collect_dynamic_load_usage_in_block(
+        &wrapper.block,
+        wrapper_file_vars,
+        wrappers,
+        inherited_aliases,
+        wrapper_depth,
+    );
+    usage.add_context_range(call_expr.get_range());
+    usage
+}
+
+fn collect_dynamic_load_wrappers(root: &LuaChunk) -> HashMap<String, DynamicLoadWrapper> {
+    let mut wrappers = HashMap::new();
+
+    for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
+        let Some(name) = local_func_stat
+            .get_local_name()
+            .and_then(|name| name.get_name_token())
+            .map(|token| token.get_name_text().to_string())
+        else {
+            continue;
+        };
+        let Some(wrapper) = local_func_stat
+            .get_closure()
+            .and_then(dynamic_load_wrapper_from_closure)
+        else {
+            continue;
+        };
+        wrappers.insert(name, wrapper);
+    }
+
+    for func_stat in root.descendants::<LuaFuncStat>() {
+        let Some(name) = func_stat
+            .get_func_name()
+            .and_then(|func_name| func_name.get_access_path())
+        else {
+            continue;
+        };
+        let Some(wrapper) = func_stat
+            .get_closure()
+            .and_then(dynamic_load_wrapper_from_closure)
+        else {
+            continue;
+        };
+        wrappers.insert(name, wrapper);
+    }
+
+    wrappers
+}
+
+fn dynamic_load_wrapper_from_closure(closure: LuaClosureExpr) -> Option<DynamicLoadWrapper> {
+    let params = closure
+        .get_params_list()?
+        .get_params()
+        .filter(|param| !param.is_dots())
+        .filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|token| token.get_name_text().to_string())
+        })
+        .collect::<Vec<_>>();
+    let block = closure.get_block()?;
+    Some(DynamicLoadWrapper { params, block })
+}
+
+fn collect_top_level_dynamic_load_call_aliases(
+    root: &LuaChunk,
+) -> HashMap<String, DynamicLoadAlias> {
+    let Some(block) = root.get_block() else {
+        return HashMap::new();
+    };
+
+    let mut aliases = HashMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        for stat in block.get_stats() {
+            match stat {
+                LuaStat::LocalStat(local_stat) => {
+                    changed |=
+                        collect_dynamic_load_aliases_from_local_stat(&mut aliases, &local_stat);
+                }
+                LuaStat::AssignStat(assign_stat) => {
+                    changed |=
+                        collect_dynamic_load_aliases_from_assign_stat(&mut aliases, &assign_stat);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    aliases
+}
+
+fn collect_dynamic_load_call_aliases(block: &LuaBlock) -> HashMap<String, DynamicLoadAlias> {
+    let mut aliases = HashMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        for local_stat in block.descendants::<LuaLocalStat>() {
+            changed |= collect_dynamic_load_aliases_from_local_stat(&mut aliases, &local_stat);
+        }
+
+        for assign_stat in block.descendants::<LuaAssignStat>() {
+            changed |= collect_dynamic_load_aliases_from_assign_stat(&mut aliases, &assign_stat);
+        }
+    }
+    aliases
+}
+
+fn collect_dynamic_load_aliases_from_local_stat(
+    aliases: &mut HashMap<String, DynamicLoadAlias>,
+    local_stat: &LuaLocalStat,
+) -> bool {
+    let mut changed = false;
+    let names = local_stat.get_local_name_list().collect::<Vec<_>>();
+    let values = local_stat.get_value_exprs().collect::<Vec<_>>();
+    for (idx, value) in values.iter().enumerate() {
+        let Some(load_alias) = dynamic_load_alias_for_expr(value, aliases) else {
+            continue;
+        };
+        let Some(name) = names
+            .get(idx)
+            .and_then(|name| name.get_name_token())
+            .map(|token| token.get_name_text().to_string())
+        else {
+            continue;
+        };
+        changed |= merge_dynamic_load_alias(aliases, name, load_alias);
+    }
+    changed
+}
+
+fn collect_dynamic_load_aliases_from_assign_stat(
+    aliases: &mut HashMap<String, DynamicLoadAlias>,
+    assign_stat: &LuaAssignStat,
+) -> bool {
+    let mut changed = false;
+    let (vars_exprs, values) = assign_stat.get_var_and_expr_list();
+    for (idx, value) in values.iter().enumerate() {
+        let Some(load_alias) = dynamic_load_alias_for_expr(value, aliases) else {
+            continue;
+        };
+        let Some(path) = vars_exprs
+            .get(idx)
+            .and_then(|var_expr| var_expr.get_access_path())
+        else {
+            continue;
+        };
+        changed |= merge_dynamic_load_alias(aliases, path, load_alias);
+    }
+    changed
+}
+
+fn merge_dynamic_load_alias(
+    aliases: &mut HashMap<String, DynamicLoadAlias>,
+    name: String,
+    load_alias: DynamicLoadAlias,
+) -> bool {
+    match aliases.get_mut(&name) {
+        Some(existing) => {
+            let before = *existing;
+            existing.merge(load_alias);
+            before.has_addcs != existing.has_addcs
+                || before.has_include != existing.has_include
+                || before.dispatch != existing.dispatch
+        }
+        None => {
+            aliases.insert(name, load_alias);
+            true
+        }
+    }
+}
+
+fn dynamic_load_alias_for_expr(
+    expr: &LuaExpr,
+    aliases: &HashMap<String, DynamicLoadAlias>,
+) -> Option<DynamicLoadAlias> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => {
+            let name = name_expr.get_name_text()?;
+            dynamic_load_alias_for_call_path(name.as_str(), aliases)
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            let path = index_expr.get_access_path()?;
+            dynamic_load_alias_for_call_path(&path, aliases)
+        }
+        LuaExpr::ParenExpr(paren_expr) => {
+            dynamic_load_alias_for_expr(&paren_expr.get_expr()?, aliases)
+        }
+        _ => None,
+    }
+}
+
+fn dynamic_load_usage_for_call_path(
+    path: &str,
+    aliases: &HashMap<String, DynamicLoadAlias>,
+    range: TextRange,
+) -> Option<DynamicLoadUsage> {
+    dynamic_load_alias_for_call_path(path, aliases).map(|alias| alias.into_usage_at(range))
+}
+
+fn dynamic_load_alias_for_call_path(
+    path: &str,
+    aliases: &HashMap<String, DynamicLoadAlias>,
+) -> Option<DynamicLoadAlias> {
+    if let Some(alias_usage) = aliases.get(path) {
+        return Some(*alias_usage);
+    }
+
+    match path {
+        "AddCSLuaFile" => Some(DynamicLoadAlias {
+            has_addcs: true,
+            ..DynamicLoadAlias::default()
+        }),
+        "include" => Some(DynamicLoadAlias {
+            has_include: true,
+            ..DynamicLoadAlias::default()
+        }),
+        "IncludeCS" => Some(DynamicLoadAlias {
+            has_addcs: true,
+            has_include: true,
+            ..DynamicLoadAlias::default()
+        }),
+        _ => None,
+    }
+}
+
+fn file_find_result_binding_name(file_find_call: &LuaCallExpr) -> Option<String> {
+    let call_range = file_find_call.get_range();
+
+    if let Some(local_stat) = file_find_call.ancestors::<LuaLocalStat>().next() {
+        let values = local_stat.get_value_exprs().collect::<Vec<_>>();
+        if let Some(idx) = values
+            .iter()
+            .position(|expr| expr.get_range() == call_range)
+        {
+            return local_stat
+                .get_local_name_list()
+                .nth(idx)
+                .and_then(|name| name.get_name_token())
+                .map(|token| token.get_name_text().to_string());
+        }
+    }
+
+    if let Some(assign_stat) = file_find_call.ancestors::<LuaAssignStat>().next() {
+        let (vars, values) = assign_stat.get_var_and_expr_list();
+        if let Some(idx) = values
+            .iter()
+            .position(|expr| expr.get_range() == call_range)
+            && let Some(LuaVarExpr::NameExpr(name_expr)) = vars.get(idx)
+        {
+            return name_expr
+                .get_name_text()
+                .map(|name| name.as_str().to_string());
+        }
+    }
+
+    None
+}
+
+fn enclosing_closure_range(node: &LuaSyntaxNode) -> Option<TextRange> {
+    node.ancestors()
+        .skip(1)
+        .find_map(LuaClosureExpr::cast)
+        .map(|closure| closure.syntax().text_range())
+}
+
+fn for_range_file_name_var(for_range: &LuaForRangeStat) -> Option<String> {
+    for_range
+        .get_var_name_list()
+        .filter_map(|name| {
+            let name = name.get_name_text().to_string();
+            (name != "_").then_some(name)
+        })
+        .last()
+}
+
+fn dynamic_file_find_loop_source(for_range: &LuaForRangeStat) -> Option<DynamicFileFindLoopSource> {
+    let exprs = for_range.get_expr_list().collect::<Vec<_>>();
+    if let Some(range) = exprs.iter().find_map(file_find_call_range_in_iterator_expr) {
+        return Some(DynamicFileFindLoopSource::Direct(range));
+    }
+
+    exprs
+        .iter()
+        .find_map(file_find_binding_reference_in_iterator_expr)
+        .map(|name| DynamicFileFindLoopSource::Binding {
+            name,
+            scope: enclosing_closure_range(for_range.syntax()),
+        })
+}
+
+fn file_find_call_range_in_iterator_expr(expr: &LuaExpr) -> Option<TextRange> {
+    match expr {
+        LuaExpr::CallExpr(call_expr) => {
+            let path = call_expr.get_access_path()?;
+            if path == "file.Find" {
+                return Some(call_expr.get_range());
+            }
+            if !file_find_result_iterator_path(&path) {
+                return None;
+            }
+            call_expr
+                .get_args_list()?
+                .get_args()
+                .find_map(|arg| file_find_call_range_in_iterator_expr(&arg))
+        }
+        LuaExpr::ParenExpr(paren_expr) => {
+            file_find_call_range_in_iterator_expr(&paren_expr.get_expr()?)
+        }
+        _ => None,
+    }
+}
+
+fn file_find_binding_reference_in_iterator_expr(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => Some(name_expr.get_name_text()?.as_str().to_string()),
+        LuaExpr::CallExpr(call_expr) => {
+            let path = call_expr.get_access_path()?;
+            if !file_find_result_iterator_path(&path) {
+                return None;
+            }
+            call_expr
+                .get_args_list()?
+                .get_args()
+                .find_map(|arg| file_find_binding_reference_in_iterator_expr(&arg))
+        }
+        LuaExpr::ParenExpr(paren_expr) => {
+            file_find_binding_reference_in_iterator_expr(&paren_expr.get_expr()?)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_dynamic_file_find_loop_source(
+    source: &DynamicFileFindLoopSource,
+    file_find_patterns: &[DynamicFileFindPattern],
+    binding_writes: &[DynamicBindingWrite],
+    loop_start: TextSize,
+) -> Option<usize> {
+    match source {
+        DynamicFileFindLoopSource::Direct(range) => file_find_patterns
+            .iter()
+            .position(|pattern| pattern.range == *range),
+        DynamicFileFindLoopSource::Binding { name, scope } => file_find_patterns
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, pattern)| {
+                pattern.binding_name.as_deref() == Some(name.as_str())
+                    && pattern.scope == *scope
+                    && pattern.range.end() < loop_start
+                    && !binding_written_between(
+                        binding_writes,
+                        name,
+                        pattern.range.end(),
+                        loop_start,
+                        *scope,
+                    )
+            })
+            .map(|(idx, _)| idx),
+    }
+}
+
+fn collect_dynamic_binding_writes(root: &LuaChunk) -> Vec<DynamicBindingWrite> {
+    let mut writes = Vec::new();
+
+    for local_stat in root.descendants::<LuaLocalStat>() {
+        let range = local_stat.syntax().text_range();
+        let scope = enclosing_closure_range(local_stat.syntax());
+        for local_name in local_stat.get_local_name_list() {
+            let Some(name_token) = local_name.get_name_token() else {
+                continue;
+            };
+            writes.push(DynamicBindingWrite {
+                name: name_token.get_name_text().to_string(),
+                scope,
+                range,
+            });
+        }
+    }
+
+    for assign_stat in root.descendants::<LuaAssignStat>() {
+        let range = assign_stat.syntax().text_range();
+        let scope = enclosing_closure_range(assign_stat.syntax());
+        let (vars_exprs, _) = assign_stat.get_var_and_expr_list();
+        for var_expr in vars_exprs {
+            let Some(path) = var_expr.get_access_path() else {
+                continue;
+            };
+            writes.push(DynamicBindingWrite {
+                name: path,
+                scope,
+                range,
+            });
+        }
+    }
+
+    writes
+}
+
+fn binding_written_between(
+    writes: &[DynamicBindingWrite],
+    binding_name: &str,
+    start: TextSize,
+    end: TextSize,
+    scope: Option<TextRange>,
+) -> bool {
+    writes.iter().any(|write| {
+        write.name == binding_name
+            && write.scope == scope
+            && write.range.start() > start
+            && write.range.start() < end
+    })
+}
+
+fn block_has_dynamic_file_prefix_dispatch(block: &LuaBlock) -> bool {
+    let text = block.syntax().text().to_string();
+    text.contains("\"cl_\"")
+        || text.contains("'cl_'")
+        || text.contains("\"sv_\"")
+        || text.contains("'sv_'")
+        || text.contains("\"sh_\"")
+        || text.contains("'sh_'")
+}
+
+fn block_has_dynamic_file_folder_dispatch(block: &LuaBlock) -> bool {
+    let text = block.syntax().text().to_string();
+    text.contains("\"client\"")
+        || text.contains("'client'")
+        || text.contains("\"server\"")
+        || text.contains("'server'")
+        || text.contains("\"shared\"")
+        || text.contains("'shared'")
+}
+
+fn block_has_dynamic_file_entrypoint_dispatch(block: &LuaBlock) -> bool {
+    let text = block.syntax().text().to_string();
+    text.contains("\"cl_init.lua\"")
+        || text.contains("'cl_init.lua'")
+        || text.contains("\"init.lua\"")
+        || text.contains("'init.lua'")
+        || text.contains("\"shared.lua\"")
+        || text.contains("'shared.lua'")
+}
+
+fn file_find_result_iterator_path(path: &str) -> bool {
+    matches!(
+        path,
+        "ipairs" | "pairs" | "SortedPairs" | "SortedPairsByMemberValue" | "SortedPairsByValue"
+    )
+}
+
+fn collect_dynamic_file_name_vars(
+    block: &LuaBlock,
+    initial_file_name_vars: HashSet<String>,
+) -> HashSet<String> {
+    let mut vars = initial_file_name_vars;
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        for local_stat in block.descendants::<LuaLocalStat>() {
+            let names = local_stat.get_local_name_list().collect::<Vec<_>>();
+            let values = local_stat.get_value_exprs().collect::<Vec<_>>();
+            for (idx, value) in values.iter().enumerate() {
+                if !expr_references_any_name(value, &vars) {
+                    continue;
+                }
+                let Some(name) = names
+                    .get(idx)
+                    .and_then(|name| name.get_name_token())
+                    .map(|token| token.get_name_text().to_string())
+                else {
+                    continue;
+                };
+                changed |= vars.insert(name);
+            }
+        }
+
+        for assign_stat in block.descendants::<LuaAssignStat>() {
+            let (vars_exprs, values) = assign_stat.get_var_and_expr_list();
+            for (idx, value) in values.iter().enumerate() {
+                if !expr_references_any_name(value, &vars) {
+                    continue;
+                }
+                let Some(LuaVarExpr::NameExpr(name_expr)) = vars_exprs.get(idx) else {
+                    continue;
+                };
+                if let Some(name) = name_expr.get_name_text() {
+                    changed |= vars.insert(name.as_str().to_string());
+                }
+            }
+        }
+    }
+    vars
+}
+
+fn load_call_references_file_name(
+    call_expr: &LuaCallExpr,
+    file_name_vars: &HashSet<String>,
+) -> bool {
+    call_expr.get_args_list().is_some_and(|args| {
+        args.get_args()
+            .any(|arg| expr_references_any_name(&arg, file_name_vars))
+    })
+}
+
+fn expr_references_any_name(expr: &LuaExpr, expected_names: &HashSet<String>) -> bool {
+    expected_names
+        .iter()
+        .any(|expected_name| expr_references_name(expr, expected_name))
+}
+
+fn expr_references_name(expr: &LuaExpr, expected_name: &str) -> bool {
+    if let LuaExpr::NameExpr(name_expr) = expr
+        && name_expr
+            .get_name_text()
+            .is_some_and(|name| name.as_str() == expected_name)
+    {
+        return true;
+    }
+
+    expr.syntax()
+        .descendants()
+        .filter_map(LuaNameExpr::cast)
+        .any(|name_expr| {
+            name_expr
+                .get_name_text()
+                .is_some_and(|name| name.as_str() == expected_name)
+        })
 }
 
 fn collect_static_string_bindings(root: &LuaChunk) -> HashMap<String, String> {
@@ -7713,24 +8699,52 @@ fn static_string_expr(expr: &LuaExpr, bindings: &HashMap<String, String>) -> Opt
     }
 }
 
-fn lua_file_find_glob_base(pattern: &str) -> Option<String> {
-    let pattern = pattern.replace('\\', "/").to_ascii_lowercase();
-    let base = pattern.strip_suffix("/*.lua")?;
-    Some(
-        base.trim_start_matches("lua/")
-            .trim_matches('/')
-            .to_string(),
-    )
+fn lua_file_find_glob(pattern: &str) -> Option<DynamicLoadGlob> {
+    let normalized = normalize_dynamic_lua_path(pattern);
+    let (base, file_pattern) = normalized.rsplit_once('/')?;
+    let file_prefix = if file_pattern == "*.lua" || file_pattern == "*" {
+        None
+    } else {
+        Some(
+            file_pattern
+                .strip_suffix("*.lua")
+                .filter(|prefix| !prefix.is_empty())?
+                .to_string(),
+        )
+    };
+
+    Some(DynamicLoadGlob {
+        base: base.trim_matches('/').to_string(),
+        file_prefix,
+    })
 }
 
-fn file_find_glob_matches(glob_base: &str, target_path: &str) -> bool {
-    let Some(rest) = target_path.strip_prefix(glob_base) else {
-        return false;
+fn normalize_dynamic_lua_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .to_ascii_lowercase()
+        .trim_start_matches("lua/")
+        .trim_matches('/')
+        .to_string()
+}
+
+fn file_find_glob_matches(glob: &DynamicLoadGlob, target_path: &str) -> bool {
+    let rest = if glob.base.is_empty() {
+        target_path
+    } else {
+        let Some(rest) = target_path.strip_prefix(&glob.base) else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix('/') else {
+            return false;
+        };
+        rest
     };
-    let Some(rest) = rest.strip_prefix('/') else {
+    if rest.contains('/') || !rest.ends_with(".lua") {
         return false;
-    };
-    !rest.contains('/') && rest.ends_with(".lua")
+    }
+    glob.file_prefix
+        .as_deref()
+        .is_none_or(|prefix| rest.starts_with(prefix))
 }
 
 fn apply_dynamic_loaders(
@@ -7741,87 +8755,176 @@ fn apply_dynamic_loaders(
 ) -> bool {
     let mut changed = false;
     for loader in dynamic_loaders {
-        let site = LuaDependencySite {
-            source_file_id: loader.source_file_id,
-            target_file_id: None,
-            kind: LuaDependencyKind::Include,
-            path: Some(format!("{}/*.lua", loader.glob_base)),
-            original_expr: "file.Find".to_string(),
-            range: loader.range,
-        };
-        let source_states =
-            source_states_for_load_site(file_infos, fallback_masks, branch_realm_ranges, &site);
-        if source_states.is_empty() {
+        let operation_source_states = loader
+            .operations
+            .iter()
+            .filter_map(|operation| {
+                let source_states = source_states_for_dynamic_operation(
+                    file_infos,
+                    fallback_masks,
+                    branch_realm_ranges,
+                    loader.source_file_id,
+                    &operation.ranges,
+                );
+                (!source_states.is_empty()).then_some((operation, source_states))
+            })
+            .collect::<Vec<_>>();
+        if operation_source_states.is_empty() {
             continue;
         }
 
         for (target_file_id, target_path) in &loader.targets {
-            let target_states =
-                dynamic_target_states(target_path, source_states, loader.has_prefix_dispatch);
-            if target_states.is_empty() {
-                continue;
-            }
+            for (operation, source_states) in &operation_source_states {
+                let target_states =
+                    dynamic_operation_target_states(target_path, *source_states, loader, operation);
+                if target_states.is_empty() {
+                    continue;
+                }
 
-            let target_info = file_infos
-                .entry(*target_file_id)
-                .or_insert_with(GmodFileLoadInfo::fallback_shared);
-            if loader.has_addcs && target_states.intersects(GmodStateMask::CLIENT) {
-                target_info.client_send_available = true;
+                let target_info = file_infos
+                    .entry(*target_file_id)
+                    .or_insert_with(GmodFileLoadInfo::fallback_shared);
+                if operation.kind == DynamicLoadOperationKind::AddCSLuaFile {
+                    target_info.client_send_available = true;
+                }
                 target_info.add_incoming_edge(GmodLoadEdge {
                     source_file_id: loader.source_file_id,
                     target_file_id: Some(*target_file_id),
-                    kind: GmodLoadEdgeKind::DynamicAddCSLuaFile,
-                    states: GmodStateMask::CLIENT,
-                    path: Some(target_path.clone()),
-                    original_expr: Some("file.Find".to_string()),
-                    range: Some(loader.range),
-                });
-            }
-            if loader.has_include || target_states.intersects(GmodStateMask::SERVER) {
-                target_info.add_incoming_edge(GmodLoadEdge {
-                    source_file_id: loader.source_file_id,
-                    target_file_id: Some(*target_file_id),
-                    kind: GmodLoadEdgeKind::DynamicInclude,
+                    kind: dynamic_load_edge_kind(operation.kind),
                     states: target_states,
                     path: Some(target_path.clone()),
                     original_expr: Some("file.Find".to_string()),
-                    range: Some(loader.range),
+                    range: operation.ranges.first().copied().or(Some(loader.range)),
                 });
+                changed |= target_info.mark_states(
+                    target_states,
+                    GmodLoadStatus::MaybeDynamic,
+                    GmodLoadConfidence::Dynamic,
+                );
             }
-            changed |= target_info.mark_states(
-                target_states,
-                GmodLoadStatus::MaybeDynamic,
-                GmodLoadConfidence::Dynamic,
-            );
         }
     }
     changed
 }
 
-fn dynamic_target_states(
+fn source_states_for_dynamic_operation(
+    file_infos: &HashMap<FileId, GmodFileLoadInfo>,
+    fallback_masks: &HashMap<FileId, GmodStateMask>,
+    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
+    source_file_id: FileId,
+    ranges: &[TextRange],
+) -> GmodStateMask {
+    let mut source_states = file_infos
+        .get(&source_file_id)
+        .map(|info| info.state_mask)
+        .filter(|states| !states.is_empty())
+        .or_else(|| fallback_masks.get(&source_file_id).copied())
+        .unwrap_or_else(GmodStateMask::empty);
+
+    let Some(branch_ranges) = branch_realm_ranges.get(&source_file_id) else {
+        return source_states;
+    };
+
+    for range in ranges {
+        let Some(branch_realm) = branch_ranges
+            .iter()
+            .find(|branch_range| branch_range.range.contains(range.start()))
+            .map(|branch_range| branch_range.realm)
+        else {
+            continue;
+        };
+        let branch_states = GmodStateMask::from_realm(branch_realm);
+        source_states = if source_states.is_empty() {
+            branch_states
+        } else {
+            source_states.intersection(branch_states)
+        };
+    }
+
+    source_states
+}
+
+fn dynamic_operation_target_states(
     target_path: &str,
     source_states: GmodStateMask,
-    has_prefix_dispatch: bool,
+    loader: &DynamicLoadPattern,
+    operation: &DynamicLoadOperation,
 ) -> GmodStateMask {
-    if !has_prefix_dispatch {
-        return source_states;
-    }
-    let file_name = target_path.rsplit('/').next().unwrap_or(target_path);
-    if file_name.starts_with("cl_") {
-        GmodStateMask::CLIENT
-    } else if file_name.starts_with("sv_") {
-        GmodStateMask::SERVER
-    } else if file_name.starts_with("sh_") {
-        GmodStateMask::SHARED
-    } else {
-        source_states
+    let Some(dispatch_states) = dynamic_target_dispatch_states(target_path, loader.dispatch) else {
+        return match operation.kind {
+            DynamicLoadOperationKind::Include => source_states,
+            DynamicLoadOperationKind::AddCSLuaFile => GmodStateMask::CLIENT,
+        };
+    };
+
+    match operation.kind {
+        DynamicLoadOperationKind::Include => dispatch_states.intersection(source_states),
+        DynamicLoadOperationKind::AddCSLuaFile => {
+            if dispatch_states.intersects(GmodStateMask::CLIENT) {
+                GmodStateMask::CLIENT
+            } else {
+                GmodStateMask::empty()
+            }
+        }
     }
 }
 
-fn resolve_load_dependency_site(db: &DbIndex, mut site: LuaDependencySite) -> LuaDependencySite {
-    if site.target_file_id.is_some() {
-        return site;
+fn dynamic_load_edge_kind(kind: DynamicLoadOperationKind) -> GmodLoadEdgeKind {
+    match kind {
+        DynamicLoadOperationKind::Include => GmodLoadEdgeKind::DynamicInclude,
+        DynamicLoadOperationKind::AddCSLuaFile => GmodLoadEdgeKind::DynamicAddCSLuaFile,
     }
+}
+
+fn dynamic_target_dispatch_states(
+    target_path: &str,
+    dispatch: DynamicLoadDispatch,
+) -> Option<GmodStateMask> {
+    let file_name = target_path.rsplit('/').next().unwrap_or(target_path);
+
+    if dispatch.prefix {
+        if file_name.starts_with("cl_") {
+            return Some(GmodStateMask::CLIENT);
+        }
+        if file_name.starts_with("sv_") {
+            return Some(GmodStateMask::SERVER);
+        }
+        if file_name.starts_with("sh_") {
+            return Some(GmodStateMask::SHARED);
+        }
+    }
+
+    if dispatch.entrypoint {
+        match file_name {
+            "cl_init.lua" => return Some(GmodStateMask::CLIENT),
+            "init.lua" => return Some(GmodStateMask::SERVER),
+            "shared.lua" => return Some(GmodStateMask::SHARED),
+            _ => {}
+        }
+    }
+
+    dispatch.folder.then(|| {
+        target_path
+            .rsplit('/')
+            .skip(1)
+            .find_map(realm_folder_states)
+    })?
+}
+
+fn realm_folder_states(segment: &str) -> Option<GmodStateMask> {
+    match segment {
+        "client" | "cl" => Some(GmodStateMask::CLIENT),
+        "server" | "sv" => Some(GmodStateMask::SERVER),
+        "shared" | "sh" => Some(GmodStateMask::SHARED),
+        _ => None,
+    }
+}
+
+fn is_realm_file_prefix(prefix: &str) -> bool {
+    matches!(prefix, "cl_" | "sv_" | "sh_")
+}
+
+fn resolve_load_dependency_site(db: &DbIndex, mut site: LuaDependencySite) -> LuaDependencySite {
     let Some(path) = site.path.as_deref() else {
         return site;
     };

@@ -85,7 +85,10 @@ where
         }
     });
 
-    results.into_iter().map(|slot| slot.expect("slot written")).collect()
+    results
+        .into_iter()
+        .map(|slot| slot.expect("slot written"))
+        .collect()
 }
 
 /// Wrapper making a `*mut Option<T>` shareable across the scoped threads. Safe

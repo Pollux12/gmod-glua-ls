@@ -118,6 +118,26 @@ impl LuaIndex for LuaDependencyIndex {
         self.dependencies.remove(&file_id);
         self.dependency_kinds.remove(&file_id);
         self.dependency_sites.remove(&file_id);
+
+        for dependencies in self.dependencies.values_mut() {
+            dependencies.remove(&file_id);
+        }
+        self.dependencies
+            .retain(|_, dependencies| !dependencies.is_empty());
+
+        for dependency_kinds in self.dependency_kinds.values_mut() {
+            dependency_kinds.remove(&file_id);
+        }
+        self.dependency_kinds
+            .retain(|_, dependency_kinds| !dependency_kinds.is_empty());
+
+        for sites in self.dependency_sites.values_mut() {
+            for site in sites {
+                if site.target_file_id == Some(file_id) {
+                    site.target_file_id = None;
+                }
+            }
+        }
     }
 
     fn clear(&mut self) {

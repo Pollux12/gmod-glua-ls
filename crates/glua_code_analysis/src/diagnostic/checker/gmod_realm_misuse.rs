@@ -37,6 +37,11 @@ impl Checker for GmodRealmMisuseChecker {
         let Some(file_realm_metadata) = infer_index.get_realm_file_metadata(&file_id) else {
             return;
         };
+        if file_realm_metadata.branch_realm_ranges.is_empty()
+            && resolve_file_realm(file_realm_metadata).is_universal_runtime_caller()
+        {
+            return;
+        }
 
         // Clone Arc to shared data upfront to avoid borrow conflicts with context
         let shared_data = context.get_shared_data_arc();
@@ -80,12 +85,8 @@ impl Checker for GmodRealmMisuseChecker {
             if let Some(profile) = profile.as_mut() {
                 profile.calls_scanned += 1;
             }
-            let call_realm = resolve_realm_at_position(
-                infer_index,
-                &file_id,
-                file_realm_metadata,
-                call_expr.get_range().start(),
-            );
+            let call_realm =
+                resolve_realm_at_position(file_realm_metadata, call_expr.get_range().start());
             if call_realm.is_universal_runtime_caller() {
                 if let Some(profile) = profile.as_mut() {
                     profile.shared_call_skips += 1;
@@ -413,6 +414,7 @@ fn resolve_callee_realms(
                 decl,
                 decl_annotation_cache,
                 decl_realm_cache,
+                precomputed_callee_realms,
             ) {
                 if context.is_cancelled() {
                     return realms;
@@ -437,6 +439,7 @@ fn resolve_callee_realms(
             owner_key_member_candidate_cache,
             owner_expansion_cache,
             member_realms_cache,
+            precomputed_callee_realms,
             profile,
         ) && !member_realms.is_empty()
         {
@@ -455,6 +458,7 @@ fn resolve_callee_realms(
                 decl,
                 decl_annotation_cache,
                 decl_realm_cache,
+                precomputed_callee_realms,
             ) {
                 push_unique_realm(&mut realms, realm);
             }
@@ -468,6 +472,7 @@ fn resolve_callee_realms(
                     &origin_owner,
                     decl_annotation_cache,
                     decl_realm_cache,
+                    precomputed_callee_realms,
                 ) {
                     push_unique_realm(&mut realms, realm);
                 }
@@ -489,6 +494,7 @@ fn resolve_global_name_candidate_realms(
     semantic_decl: &LuaSemanticDeclId,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
     decl_realm_cache: &mut DeclRealmCache,
+    precomputed_callee_realms: Option<&PrecomputedCalleeRealmMap>,
 ) -> Vec<ResolvedRealm> {
     let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_decl else {
         return Vec::new();
@@ -525,6 +531,7 @@ fn resolve_global_name_candidate_realms(
                 &property_owner_id,
                 decl_annotation_cache,
                 decl_realm_cache,
+                precomputed_callee_realms,
             ) {
                 push_unique_realm(&mut realms, realm);
             }
@@ -545,6 +552,7 @@ fn resolve_member_candidate_realms(
     owner_key_member_candidate_cache: &mut OwnerKeyMemberCandidateCache,
     owner_expansion_cache: &mut OwnerExpansionCache,
     member_realms_cache: &mut MemberRealmsCache,
+    precomputed_callee_realms: Option<&PrecomputedCalleeRealmMap>,
     mut profile: Option<&mut GmodRealmMisuseProfile>,
 ) -> Option<Vec<ResolvedRealm>> {
     // NOTE: GM method fast-path is already handled in resolve_callee_realms before
@@ -621,6 +629,7 @@ fn resolve_member_candidate_realms(
             &property_owner_id,
             decl_annotation_cache,
             decl_realm_cache,
+            precomputed_callee_realms,
         ) {
             push_unique_realm(&mut realms, realm);
         }
@@ -653,12 +662,7 @@ fn resolve_decl_realm(
         ));
     }
 
-    Some(resolve_realm_at_position(
-        infer_index,
-        &decl_file_id,
-        metadata,
-        decl_offset,
-    ))
+    Some(resolve_realm_at_position(metadata, decl_offset))
 }
 
 /// Cached wrapper around `resolve_decl_realm`. The result (including `None`) is memoized
@@ -669,12 +673,26 @@ fn resolve_decl_realm_cached(
     semantic_decl: &LuaSemanticDeclId,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
     decl_realm_cache: &mut DeclRealmCache,
+    precomputed_callee_realms: Option<&PrecomputedCalleeRealmMap>,
 ) -> Option<ResolvedRealm> {
     // Use entry API to avoid double-lookup: if present return the stored value (Some or None).
     if let Some(cached) = decl_realm_cache.get(semantic_decl) {
         return *cached;
     }
-    let result = resolve_decl_realm(context, semantic_model, semantic_decl, decl_annotation_cache);
+    if let Some(resolved) = precomputed_callee_realms
+        .and_then(|map| map.get(semantic_decl))
+        .and_then(|realms| realms.first())
+        .copied()
+    {
+        decl_realm_cache.insert(semantic_decl.clone(), Some(resolved));
+        return Some(resolved);
+    }
+    let result = resolve_decl_realm(
+        context,
+        semantic_model,
+        semantic_decl,
+        decl_annotation_cache,
+    );
     decl_realm_cache.insert(semantic_decl.clone(), result);
     result
 }
@@ -1167,26 +1185,47 @@ fn semantic_decl_position(semantic_decl: &LuaSemanticDeclId) -> Option<(FileId, 
     }
 }
 
-fn resolve_realm_at_position(
-    infer_index: &crate::GmodInferIndex,
-    file_id: &FileId,
-    metadata: &GmodRealmFileMetadata,
-    offset: TextSize,
-) -> ResolvedRealm {
-    let branch_realm = metadata
+fn resolve_realm_at_position(metadata: &GmodRealmFileMetadata, offset: TextSize) -> ResolvedRealm {
+    let file_realm = resolve_file_realm(metadata);
+    if let Some(branch_realm) = metadata
         .branch_realm_ranges
         .iter()
         .find(|range| range.range.contains(offset))
-        .map(|range| range.realm);
-    let realm = infer_index.get_realm_at_offset(file_id, offset);
-    let state_mask = infer_index.get_state_mask_at_offset(file_id, offset);
-    let evidence = if branch_realm.is_some() {
-        RealmEvidence::ExplicitBranch
+        .map(|range| range.realm)
+    {
+        let branch_mask = branch_realm.state_mask();
+        let state_mask = if file_realm.state_mask.is_empty() {
+            branch_mask
+        } else {
+            branch_mask.intersection(file_realm.state_mask)
+        };
+        return ResolvedRealm::with_state_mask(
+            branch_realm,
+            state_mask,
+            RealmEvidence::ExplicitBranch,
+        );
+    }
+
+    file_realm
+}
+
+fn resolve_file_realm(metadata: &GmodRealmFileMetadata) -> ResolvedRealm {
+    let realm = if metadata.inferred_realm != GmodRealm::Unknown {
+        metadata.inferred_realm
     } else {
-        file_realm_evidence(metadata)
+        metadata.annotation_realm.unwrap_or(GmodRealm::Unknown)
+    };
+    let state_mask = if let Some(annotation_realm) = metadata.annotation_realm {
+        annotation_realm.state_mask()
+    } else if !metadata.load_state_mask.is_empty() {
+        metadata.load_state_mask
+    } else if metadata.inferred_realm != GmodRealm::Unknown {
+        metadata.inferred_realm.state_mask()
+    } else {
+        GmodStateMask::empty()
     };
 
-    ResolvedRealm::with_state_mask(realm, state_mask, evidence)
+    ResolvedRealm::with_state_mask(realm, state_mask, file_realm_evidence(metadata))
 }
 
 fn file_realm_evidence(metadata: &GmodRealmFileMetadata) -> RealmEvidence {
@@ -1337,13 +1376,7 @@ fn resolve_precomputed_decl_realm(
         ));
     }
 
-    let infer_index = db.get_gmod_infer_index();
-    Some(resolve_realm_at_position(
-        infer_index,
-        &decl_file_id,
-        metadata,
-        decl_offset,
-    ))
+    Some(resolve_realm_at_position(metadata, decl_offset))
 }
 
 /// Precompute declaration/member/signature realm facts for workspace diagnostics.

@@ -217,12 +217,9 @@ fn collect_dynamic_fields_for_file(
                 prefix_type
             };
 
-            let effective_type = if let Some(metatable_type) = infer_setmetatable_target_type(
-                db,
-                cache,
-                &prefix_expr,
-                index_expr.get_range(),
-            ) {
+            let effective_type = if let Some(metatable_type) =
+                infer_setmetatable_target_type(db, cache, &prefix_expr, index_expr.get_range())
+            {
                 metatable_type
             } else {
                 prefix_type

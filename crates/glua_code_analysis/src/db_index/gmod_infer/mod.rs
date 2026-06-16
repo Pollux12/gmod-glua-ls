@@ -314,11 +314,7 @@ impl GmodInferIndex {
     /// Replace a file's collected system metadata (net/concommand/convar/timer
     /// sites) wholesale. Used by the parallel gmod-pre collection. Invalidates
     /// the system aggregate cache since registration counts may change.
-    pub fn set_system_file_metadata(
-        &mut self,
-        file_id: FileId,
-        metadata: GmodSystemFileMetadata,
-    ) {
+    pub fn set_system_file_metadata(&mut self, file_id: FileId, metadata: GmodSystemFileMetadata) {
         if metadata == GmodSystemFileMetadata::default() {
             if self.system_file_metadata.remove(&file_id).is_some() {
                 self.invalidate_system_aggregate_cache();
