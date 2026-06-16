@@ -200,44 +200,7 @@ impl LuaDiagnostic {
             DiagnosticContext::new(file_id, db, config, cancel_token.clone())
         };
 
-        let check_start = slow_log_enabled.then(Instant::now);
         check_file(&mut context, &semantic_model, &cancel_token);
-        if let Some(check_start) = check_start {
-            let check_elapsed = check_start.elapsed();
-            if check_elapsed.as_millis() > 100 {
-                let cache = semantic_model.get_cache().borrow_mut();
-                info!(
-                    "diagnose_file: check_file cost {:?} for {:?} | infer_expr: {} calls ({} hits, {:.1}% hit rate) | flow: {} calls ({} hits, {:.1}% hit rate) | flow_nodes_walked: {} | expr_cache_size: {} | flow_cache_size: {} | merges: {} (total_antecedents: {}) | cond_errors: {} (none={}, recursive={}, unresolved={}) | multi_ante_from_cond: {}",
-                    check_elapsed,
-                    file_id,
-                    cache.prof_infer_expr_calls,
-                    cache.prof_infer_expr_hits,
-                    if cache.prof_infer_expr_calls > 0 {
-                        cache.prof_infer_expr_hits as f64 / cache.prof_infer_expr_calls as f64
-                            * 100.0
-                    } else {
-                        0.0
-                    },
-                    cache.prof_flow_calls,
-                    cache.prof_flow_hits,
-                    if cache.prof_flow_calls > 0 {
-                        cache.prof_flow_hits as f64 / cache.prof_flow_calls as f64 * 100.0
-                    } else {
-                        0.0
-                    },
-                    cache.prof_flow_nodes_walked,
-                    cache.expr_cache.len(),
-                    cache.flow_cache_entry_count(),
-                    cache.prof_merge_calls,
-                    cache.prof_merge_total_antecedents,
-                    cache.prof_condition_errors_caught,
-                    cache.prof_condition_errors_none,
-                    cache.prof_condition_errors_recursive,
-                    cache.prof_condition_errors_unresolved,
-                    cache.prof_multi_ante_from_condition,
-                );
-            }
-        }
 
         if cancel_token.is_cancelled() {
             return None;

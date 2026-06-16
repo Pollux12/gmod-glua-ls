@@ -135,9 +135,6 @@ pub fn infer_expr_narrow_type(
     // the backward flow walk is guaranteed to produce the declared/origin type.
     // Measured at ~95% of top-level narrow queries on real GMod codebases.
     if !var_ref_can_be_narrowed(db, &file_id, &var_ref_id) {
-        if log::log_enabled!(log::Level::Info) {
-            cache.prof_narrow_skipped += 1;
-        }
         return get_var_ref_type(db, cache, &var_ref_id);
     }
 
@@ -153,9 +150,6 @@ pub fn infer_expr_narrow_type(
     let query_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, expr.get_position());
-    if log::log_enabled!(log::Level::Info) {
-        cache.prof_narrow_total += 1;
-    }
     let previous_query_realm = cache.flow_query_realm.replace(query_realm);
     let result =
         get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id);
@@ -298,21 +292,6 @@ pub fn get_var_ref_type(
             // 不要在此阶段展开泛型别名, 必须让后续的泛型匹配阶段基于声明形态完成推断
             return Ok(result);
         }
-
-        // Collect unique UnResolveDeclType decl names for profiling
-        cache.prof_unresolve_decl_sample_count += 1;
-        if cache.prof_unresolve_decl_names.len() < 30 {
-            let name = decl.get_name().to_string();
-            let key = format!("{}:{}", name, u32::from(decl.get_id().position));
-            if !cache.prof_unresolve_decl_names.contains(&key) {
-                cache.prof_unresolve_decl_names.push(key);
-            }
-        }
-        // Track per-decl-id counts
-        *cache
-            .prof_unresolve_decl_ids
-            .entry(u32::from(decl.get_id().position))
-            .or_insert(0) += 1;
 
         Err(InferFailReason::UnResolveDeclType(decl.get_id()))
     } else if let Some(member_id) = var_ref_id.get_member_id_ref() {

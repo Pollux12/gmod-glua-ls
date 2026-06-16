@@ -754,27 +754,11 @@ fn apply_index_expr_member_owner(
 
 // assign stat is toooooooooo complex
 pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignStat) -> Option<()> {
-    let profile_enabled = log::log_enabled!(log::Level::Info);
-    if profile_enabled {
-        let cache = analyzer
-            .context
-            .infer_manager
-            .get_infer_cache(analyzer.file_id);
-        cache.prof_assign_stat_calls += 1;
-    }
-
     let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
     let expr_count = expr_list.len();
     let var_count = var_list.len();
 
     for i in 0..expr_count {
-        if profile_enabled {
-            let cache = analyzer
-                .context
-                .infer_manager
-                .get_infer_cache(analyzer.file_id);
-            cache.prof_assign_slots += 1;
-        }
         let var = var_list.get(i)?;
         let expr = expr_list.get(i);
         if expr.is_none() {
@@ -782,18 +766,12 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         }
         let expr = expr?;
 
-        let step_start = profile_enabled.then(std::time::Instant::now);
         if should_skip_nil_table_shape_assignment(analyzer, &var, expr) {
-            record_assign_elapsed(analyzer, step_start, AssignProfileStep::SkipNil);
             continue;
         }
-        record_assign_elapsed(analyzer, step_start, AssignProfileStep::SkipNil);
 
-        let step_start = profile_enabled.then(std::time::Instant::now);
         let type_owner = get_var_owner(analyzer, var.clone());
-        record_assign_elapsed(analyzer, step_start, AssignProfileStep::GetOwner);
 
-        let step_start = profile_enabled.then(std::time::Instant::now);
         let assign_stat_range = assign_stat.get_range();
         if special_assign_pattern(
             analyzer,
@@ -804,23 +782,11 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         )
         .is_some()
         {
-            record_assign_elapsed(analyzer, step_start, AssignProfileStep::Special);
-            if profile_enabled {
-                let cache = analyzer
-                    .context
-                    .infer_manager
-                    .get_infer_cache(analyzer.file_id);
-                cache.prof_assign_special_hits += 1;
-            }
             continue;
         }
-        record_assign_elapsed(analyzer, step_start, AssignProfileStep::Special);
 
-        let step_start = profile_enabled.then(std::time::Instant::now);
         set_index_expr_owner(analyzer, var.clone());
-        record_assign_elapsed(analyzer, step_start, AssignProfileStep::SetOwner);
 
-        let step_start = profile_enabled.then(std::time::Instant::now);
         let expr_type = match analyzer.infer_expr(expr) {
             Ok(mut expr_type) => {
                 if let LuaType::Variadic(multi) = expr_type {
@@ -882,7 +848,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 LuaType::Nil
             }
             Err(reason) => {
-                record_assign_elapsed(analyzer, step_start, AssignProfileStep::InferRhs);
                 if matches!(reason, InferFailReason::FieldNotFound)
                     && should_defer_gmod_self_index(analyzer, expr)
                 {
@@ -892,9 +857,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 continue;
             }
         };
-        record_assign_elapsed(analyzer, step_start, AssignProfileStep::InferRhs);
 
-        let step_start = profile_enabled.then(std::time::Instant::now);
         // 如果具有延迟定义属性, 则先绑定最初的定义
         if let LuaVarExpr::NameExpr(name_expr) = var {
             if let Some(decl_id) = get_delayed_definition_decl_id(analyzer, name_expr) {
@@ -908,7 +871,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
 
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
         assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0, false);
-        record_assign_elapsed(analyzer, step_start, AssignProfileStep::Merge);
     }
 
     // The complexity brought by multiple return values is too high
@@ -962,38 +924,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
     }
 
     Some(())
-}
-
-enum AssignProfileStep {
-    SkipNil,
-    GetOwner,
-    Special,
-    SetOwner,
-    InferRhs,
-    Merge,
-}
-
-fn record_assign_elapsed(
-    analyzer: &mut LuaAnalyzer,
-    step_start: Option<std::time::Instant>,
-    step: AssignProfileStep,
-) {
-    let Some(start) = step_start else {
-        return;
-    };
-    let elapsed = start.elapsed().as_nanos() as u64;
-    let cache = analyzer
-        .context
-        .infer_manager
-        .get_infer_cache(analyzer.file_id);
-    match step {
-        AssignProfileStep::SkipNil => cache.prof_assign_skip_nil_ns += elapsed,
-        AssignProfileStep::GetOwner => cache.prof_assign_get_owner_ns += elapsed,
-        AssignProfileStep::Special => cache.prof_assign_special_ns += elapsed,
-        AssignProfileStep::SetOwner => cache.prof_assign_set_owner_ns += elapsed,
-        AssignProfileStep::InferRhs => cache.prof_assign_infer_rhs_ns += elapsed,
-        AssignProfileStep::Merge => cache.prof_assign_merge_ns += elapsed,
-    }
 }
 
 fn should_skip_nil_table_shape_assignment(

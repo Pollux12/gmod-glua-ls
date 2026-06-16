@@ -47,7 +47,6 @@ pub fn get_type_at_flow_with_origin(
     flow_id: FlowId,
     flow_origin: FlowOrigin,
 ) -> InferResult {
-    cache.prof_flow_calls += 1;
     let query_realm = cache.flow_query_realm.unwrap_or_else(|| {
         db.get_gmod_infer_index()
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
@@ -58,17 +57,12 @@ pub fn get_type_at_flow_with_origin(
         .cloned()
     {
         Some(CacheEntry::Cache(narrow_type)) => {
-            cache.prof_flow_hits += 1;
             return Ok(narrow_type);
         }
         Some(CacheEntry::Error(reason)) => {
-            cache.prof_flow_hits += 1;
             return Err(reason);
         }
         _ => {}
-    }
-    if log::log_enabled!(log::Level::Info) {
-        cache.record_flow_entry_miss(var_ref_id, flow_id, query_realm, flow_origin);
     }
     let mut visited_flow_ids = Vec::new();
     let result = get_type_at_flow_walk(
@@ -82,13 +76,6 @@ pub fn get_type_at_flow_with_origin(
         flow_id,
         &mut visited_flow_ids,
     );
-
-    // Track flow walk depth for profiling
-    let walk_depth = visited_flow_ids.len() as u32;
-    cache.prof_flow_walk_depth_sum += walk_depth as u64;
-    if walk_depth > cache.prof_flow_walk_max_depth {
-        cache.prof_flow_walk_max_depth = walk_depth;
-    }
 
     // RecursiveInfer errors are transient (cycle detection) and must NOT be
     // cached — they'd poison future non-recursive queries.
@@ -177,9 +164,6 @@ fn get_type_at_flow_walk(
         }
         visited_flow_ids.push(antecedent_flow_id);
 
-        // Track total flow work for profiling.
-        cache.flow_nodes_visited += 1;
-        cache.prof_flow_nodes_walked += 1;
         let flow_node = tree
             .get_flow_node(antecedent_flow_id)
             .ok_or(InferFailReason::None)?;
@@ -444,20 +428,7 @@ fn get_type_at_flow_walk(
                     InferConditionFlow::TrueCondition,
                 ) {
                     Ok(r) => r,
-                    Err(e) => {
-                        cache.prof_condition_errors_caught += 1;
-                        match &e {
-                            InferFailReason::None => cache.prof_condition_errors_none += 1,
-                            InferFailReason::RecursiveInfer => {
-                                cache.prof_condition_errors_recursive += 1
-                            }
-                            InferFailReason::UnResolveDeclType(_) => {
-                                cache.prof_condition_errors_unresolved += 1
-                            }
-                            _ => {}
-                        }
-                        ResultTypeOrContinue::Continue
-                    }
+                    Err(_) => ResultTypeOrContinue::Continue,
                 };
 
                 if let ResultTypeOrContinue::Result(condition_type) = result_or_continue {
@@ -466,7 +437,6 @@ fn get_type_at_flow_walk(
                     if let Some(merged_type) =
                         try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
                     {
-                        cache.prof_multi_ante_from_condition += 1;
                         return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
@@ -486,20 +456,7 @@ fn get_type_at_flow_walk(
                     InferConditionFlow::FalseCondition,
                 ) {
                     Ok(r) => r,
-                    Err(e) => {
-                        cache.prof_condition_errors_caught += 1;
-                        match &e {
-                            InferFailReason::None => cache.prof_condition_errors_none += 1,
-                            InferFailReason::RecursiveInfer => {
-                                cache.prof_condition_errors_recursive += 1
-                            }
-                            InferFailReason::UnResolveDeclType(_) => {
-                                cache.prof_condition_errors_unresolved += 1
-                            }
-                            _ => {}
-                        }
-                        ResultTypeOrContinue::Continue
-                    }
+                    Err(_) => ResultTypeOrContinue::Continue,
                 };
 
                 if let ResultTypeOrContinue::Result(condition_type) = result_or_continue {
@@ -698,8 +655,6 @@ fn merge_antecedent_types(
             .ok_or(InferFailReason::None)?,
         None => return Err(InferFailReason::None),
     };
-    cache.prof_merge_calls += 1;
-    cache.prof_merge_total_antecedents += antecedents.len() as u32;
     let target_realm = cache.flow_query_realm.unwrap_or_else(|| {
         db.get_gmod_infer_index()
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())

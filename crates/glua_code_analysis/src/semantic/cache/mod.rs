@@ -123,89 +123,6 @@ pub struct LuaInferCache {
     >,
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
-    /// Tracks total flow nodes visited during flow analysis for profiling.
-    pub flow_nodes_visited: u32,
-    // Diagnostic profiling counters (zero-cost when not read)
-    pub prof_infer_expr_calls: u32,
-    pub prof_infer_expr_hits: u32,
-    pub prof_flow_calls: u32,
-    pub prof_flow_hits: u32,
-    pub prof_flow_nodes_walked: u32,
-    // Detailed flow profiling
-    pub prof_merge_calls: u32,
-    pub prof_merge_total_antecedents: u32,
-    pub prof_condition_errors_caught: u32,
-    pub prof_condition_errors_none: u32,
-    pub prof_condition_errors_recursive: u32,
-    pub prof_condition_errors_unresolved: u32,
-    pub prof_multi_ante_from_condition: u32,
-    // Detailed infer_expr sub-type timing (zero-cost when not profiled — only written to
-    // when the caller checks log_enabled; reads are gated behind the same check)
-    pub prof_infer_index_time_ns: u64,
-    pub prof_infer_call_time_ns: u64,
-    pub prof_infer_name_time_ns: u64,
-    pub prof_infer_table_time_ns: u64,
-    pub prof_infer_other_time_ns: u64,
-    pub prof_infer_index_calls: u32,
-    pub prof_infer_call_calls: u32,
-    pub prof_infer_name_calls: u32,
-    pub prof_infer_table_calls: u32,
-    // Name inference sub-path profiling
-    pub prof_name_local_calls: u32,
-    pub prof_name_narrow_calls: u32,
-    pub prof_name_global_calls: u32,
-    pub prof_name_self_calls: u32,
-    pub prof_name_narrow_time_ns: u64,
-    pub prof_local_reassign_calls: u32,
-    pub prof_local_reassign_hits: u32,
-    pub prof_local_reassign_time_ns: u64,
-    pub prof_local_reassign_assign_scans: u64,
-    pub prof_local_reassign_var_checks: u64,
-    pub prof_assign_stat_calls: u32,
-    pub prof_assign_slots: u32,
-    pub prof_assign_special_hits: u32,
-    pub prof_assign_skip_nil_ns: u64,
-    pub prof_assign_get_owner_ns: u64,
-    pub prof_assign_special_ns: u64,
-    pub prof_assign_set_owner_ns: u64,
-    pub prof_assign_infer_rhs_ns: u64,
-    pub prof_assign_merge_ns: u64,
-    // Expr cache profiling
-    pub prof_expr_cache_removals: u32,
-    pub prof_unique_inferred: u32,
-    // Infer_expr recursion depth profiling
-    pub prof_infer_expr_depth: u32,
-    pub prof_infer_expr_recursive_calls: u32,
-    pub prof_infer_expr_max_depth: u32,
-    // Flow walk depth profiling (per get_type_at_flow call)
-    pub prof_flow_walk_depth_sum: u64,
-    pub prof_flow_walk_max_depth: u32,
-    // Re-inference tracking: how many syntax_ids are inferred more than once
-    pub prof_reinferred: u32,
-    // Error type breakdown during analysis
-    pub prof_err_field_not_found: u32,
-    pub prof_err_other: u32,
-    // Detailed error breakdown
-    pub prof_err_unresolve_expr: u32,
-    pub prof_err_unresolve_decl_type: u32,
-    pub prof_err_unresolve_member_type: u32,
-    pub prof_err_unresolve_type_decl: u32,
-    pub prof_err_unresolve_operator: u32,
-    pub prof_err_unresolve_module: u32,
-    pub prof_err_unresolve_sig_return: u32,
-    // UnResolveDeclType sample logging
-    pub prof_unresolve_decl_sample_count: u32,
-    pub prof_unresolve_decl_names: Vec<String>,
-    // Track unique decl_ids causing UnResolveDeclType
-    pub prof_unresolve_decl_ids: FxHashMap<u32, u32>, // position -> count
-    // Flow-cache fragmentation diagnostics: on an entry miss, would a different
-    // realm and/or origin have hit?
-    pub prof_flow_miss_other_realm_hit: u32,
-    pub prof_flow_miss_other_origin_hit: u32,
-    pub prof_flow_entry_miss: u32,
-    pub prof_narrow_total: u32,
-    pub prof_narrow_noop: u32,
-    pub prof_narrow_skipped: u32,
 }
 
 impl LuaInferCache {
@@ -235,110 +152,6 @@ impl LuaInferCache {
             dynamic_field_resolution_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::new(),
-            flow_nodes_visited: 0,
-            prof_infer_expr_calls: 0,
-            prof_infer_expr_hits: 0,
-            prof_flow_calls: 0,
-            prof_flow_hits: 0,
-            prof_flow_nodes_walked: 0,
-            prof_merge_calls: 0,
-            prof_merge_total_antecedents: 0,
-            prof_condition_errors_caught: 0,
-            prof_condition_errors_none: 0,
-            prof_condition_errors_recursive: 0,
-            prof_condition_errors_unresolved: 0,
-            prof_multi_ante_from_condition: 0,
-            prof_infer_index_time_ns: 0,
-            prof_infer_call_time_ns: 0,
-            prof_infer_name_time_ns: 0,
-            prof_infer_table_time_ns: 0,
-            prof_infer_other_time_ns: 0,
-            prof_infer_index_calls: 0,
-            prof_infer_call_calls: 0,
-            prof_infer_name_calls: 0,
-            prof_infer_table_calls: 0,
-            prof_name_local_calls: 0,
-            prof_name_narrow_calls: 0,
-            prof_name_global_calls: 0,
-            prof_name_self_calls: 0,
-            prof_name_narrow_time_ns: 0,
-            prof_local_reassign_calls: 0,
-            prof_local_reassign_hits: 0,
-            prof_local_reassign_time_ns: 0,
-            prof_local_reassign_assign_scans: 0,
-            prof_local_reassign_var_checks: 0,
-            prof_assign_stat_calls: 0,
-            prof_assign_slots: 0,
-            prof_assign_special_hits: 0,
-            prof_assign_skip_nil_ns: 0,
-            prof_assign_get_owner_ns: 0,
-            prof_assign_special_ns: 0,
-            prof_assign_set_owner_ns: 0,
-            prof_assign_infer_rhs_ns: 0,
-            prof_assign_merge_ns: 0,
-            prof_expr_cache_removals: 0,
-            prof_unique_inferred: 0,
-            prof_infer_expr_depth: 0,
-            prof_infer_expr_recursive_calls: 0,
-            prof_infer_expr_max_depth: 0,
-            prof_flow_walk_depth_sum: 0,
-            prof_flow_walk_max_depth: 0,
-            prof_reinferred: 0,
-            prof_err_field_not_found: 0,
-            prof_err_other: 0,
-            prof_err_unresolve_expr: 0,
-            prof_err_unresolve_decl_type: 0,
-            prof_err_unresolve_member_type: 0,
-            prof_err_unresolve_type_decl: 0,
-            prof_err_unresolve_operator: 0,
-            prof_err_unresolve_module: 0,
-            prof_err_unresolve_sig_return: 0,
-            prof_unresolve_decl_sample_count: 0,
-            prof_unresolve_decl_names: Vec::new(),
-            prof_unresolve_decl_ids: FxHashMap::default(),
-            prof_flow_miss_other_realm_hit: 0,
-            prof_flow_miss_other_origin_hit: 0,
-            prof_flow_entry_miss: 0,
-            prof_narrow_total: 0,
-            prof_narrow_noop: 0,
-            prof_narrow_skipped: 0,
-        }
-    }
-
-    /// Diagnostics helper: given an entry-level miss for `(var_ref, flow_id,
-    /// query_realm, origin)`, record whether a cached entry exists for the same
-    /// `(var_ref, flow_id)` under a *different* realm or origin. Used to quantify
-    /// cache-key fragmentation.
-    pub fn record_flow_entry_miss(
-        &mut self,
-        var_ref_id: &VarRefId,
-        flow_id: FlowId,
-        query_realm: GmodRealm,
-        origin: FlowOrigin,
-    ) {
-        self.prof_flow_entry_miss += 1;
-        let cache_key = VarRefCacheKey::from(var_ref_id);
-        let Some(by_flow) = self.flow_node_cache.get(&cache_key) else {
-            return;
-        };
-        let mut other_realm = false;
-        let mut other_origin = false;
-        for (f, r, o) in by_flow.keys() {
-            if *f != flow_id {
-                continue;
-            }
-            if *r != query_realm {
-                other_realm = true;
-            }
-            if *o != origin {
-                other_origin = true;
-            }
-        }
-        if other_realm {
-            self.prof_flow_miss_other_realm_hit += 1;
-        }
-        if other_origin {
-            self.prof_flow_miss_other_origin_hit += 1;
         }
     }
 
@@ -404,7 +217,6 @@ impl LuaInferCache {
         self.dynamic_field_resolution_cache.clear();
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_resolving.clear();
-        self.flow_nodes_visited = 0;
     }
 
     /// Clears all caches. Used before the unresolve phase.

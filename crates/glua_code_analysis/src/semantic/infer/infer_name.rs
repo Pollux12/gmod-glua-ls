@@ -34,7 +34,6 @@ pub fn infer_name_expr(
     let name = name_token.get_name_text();
     match name {
         "self" => {
-            cache.prof_name_self_calls += 1;
             return infer_self(db, cache, name_expr);
         }
         "_G" => return Ok(LuaType::Global),
@@ -48,7 +47,6 @@ pub fn infer_name_expr(
         .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&range));
     let result = if let Some(decl_id) = decl_id {
-        cache.prof_name_local_calls += 1;
         infer_local_decl_name_type(db, cache, &name_expr, decl_id)
     } else {
         if let Some(implicit_module_type) =
@@ -66,27 +64,16 @@ pub fn infer_name_expr(
         }
 
         match get_name_expr_var_ref_id(db, cache, &name_expr) {
-            Some(var_ref_id) => {
-                cache.prof_name_narrow_calls += 1;
-                let narrow_start =
-                    log::log_enabled!(log::Level::Info).then(std::time::Instant::now);
-                let result = infer_expr_narrow_type(
-                    db,
-                    cache,
-                    LuaExpr::NameExpr(name_expr.clone()),
-                    var_ref_id,
-                )
-                .or_else(|_| {
-                    cache.prof_name_global_calls += 1;
-                    infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-                });
-                if let Some(start) = narrow_start {
-                    cache.prof_name_narrow_time_ns += start.elapsed().as_nanos() as u64;
-                }
-                result
-            }
+            Some(var_ref_id) => infer_expr_narrow_type(
+                db,
+                cache,
+                LuaExpr::NameExpr(name_expr.clone()),
+                var_ref_id,
+            )
+            .or_else(|_| {
+                infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+            }),
             None => {
-                cache.prof_name_global_calls += 1;
                 infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
             }
         }
@@ -273,37 +260,22 @@ fn has_local_reassignment_between(
     decl_id: LuaDeclId,
     query_position: TextSize,
 ) -> bool {
-    let profile_start = if log::log_enabled!(log::Level::Info) {
-        cache.prof_local_reassign_calls += 1;
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-
     if query_position <= decl_id.position {
-        finish_local_reassignment_profile(cache, profile_start, false);
         return false;
     }
 
     if !cache.local_reassignments_indexed {
-        collect_local_reassignment_positions(db, cache, profile_start.is_some());
+        collect_local_reassignment_positions(db, cache);
     }
 
-    let result = cache
+    cache
         .local_reassignment_positions_cache
         .get(&decl_id)
         .and_then(|positions| positions.first())
-        .is_some_and(|position| *position < query_position);
-
-    finish_local_reassignment_profile(cache, profile_start, result);
-    result
+        .is_some_and(|position| *position < query_position)
 }
 
-fn collect_local_reassignment_positions(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    profile_enabled: bool,
-) {
+fn collect_local_reassignment_positions(db: &DbIndex, cache: &mut LuaInferCache) {
     cache.local_reassignments_indexed = true;
     let file_id = cache.get_file_id();
     let Some(root) = db
@@ -317,16 +289,10 @@ fn collect_local_reassignment_positions(
     let references = db.get_reference_index().get_local_reference(&file_id);
     let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
     for assign_stat in root.descendants().filter_map(LuaAssignStat::cast) {
-        if profile_enabled {
-            cache.prof_local_reassign_assign_scans += 1;
-        }
         let position = assign_stat.get_position();
 
         let (vars, _) = assign_stat.get_var_and_expr_list();
         for var in vars {
-            if profile_enabled {
-                cache.prof_local_reassign_var_checks += 1;
-            }
             let LuaVarExpr::NameExpr(name_expr) = var else {
                 continue;
             };
@@ -352,19 +318,6 @@ fn collect_local_reassignment_positions(
     for positions in cache.local_reassignment_positions_cache.values_mut() {
         positions.sort_unstable();
         positions.dedup();
-    }
-}
-
-fn finish_local_reassignment_profile(
-    cache: &mut LuaInferCache,
-    profile_start: Option<std::time::Instant>,
-    hit: bool,
-) {
-    if let Some(start) = profile_start {
-        cache.prof_local_reassign_time_ns += start.elapsed().as_nanos() as u64;
-        if hit {
-            cache.prof_local_reassign_hits += 1;
-        }
     }
 }
 
