@@ -7,6 +7,7 @@ mod flow;
 pub(crate) mod gmod;
 mod infer_cache_manager;
 mod lua;
+mod parallel;
 pub(crate) mod unresolve;
 
 pub(crate) use lua::infer_for_range_iter_expr_func;

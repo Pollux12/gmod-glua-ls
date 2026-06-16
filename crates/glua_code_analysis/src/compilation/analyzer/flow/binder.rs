@@ -22,8 +22,13 @@ pub struct ModificationSnapshot {
 
 #[derive(Debug)]
 pub struct FlowBinder<'a> {
-    pub db: &'a mut DbIndex,
+    pub db: &'a DbIndex,
     pub file_id: FileId,
+    /// Errors accumulated during binding. Collected here (rather than written
+    /// straight to the diagnostic index) so flow binding can run with only an
+    /// immutable `&DbIndex`, enabling parallel per-file binding. The pipeline
+    /// drains these into the diagnostic index sequentially afterward.
+    pub errors: Vec<AnalyzeError>,
     pub decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
     pub start: FlowId,
     pub unreachable: FlowId,
@@ -48,10 +53,11 @@ pub struct FlowBinder<'a> {
 }
 
 impl<'a> FlowBinder<'a> {
-    pub fn new(db: &'a mut DbIndex, file_id: FileId) -> Self {
+    pub fn new(db: &'a DbIndex, file_id: FileId) -> Self {
         let mut binder = FlowBinder {
             db,
             file_id,
+            errors: Vec::new(),
             flow_nodes: Vec::new(),
             multiple_antecedents: Vec::new(),
             decl_bind_expr_ref: HashMap::new(),
@@ -263,9 +269,7 @@ impl<'a> FlowBinder<'a> {
     }
 
     pub fn report_error(&mut self, error: AnalyzeError) {
-        self.db
-            .get_diagnostic_index_mut()
-            .add_diagnostic(self.file_id, error);
+        self.errors.push(error);
     }
 
     /// Record a bare name that can be narrowed at some site (assignment target,
@@ -318,8 +322,8 @@ impl<'a> FlowBinder<'a> {
         }
     }
 
-    pub fn finish(self) -> FlowTree {
-        FlowTree::new(
+    pub fn finish(self) -> (FlowTree, Vec<AnalyzeError>) {
+        let flow_tree = FlowTree::new(
             self.decl_bind_expr_ref,
             self.flow_nodes,
             self.multiple_antecedents,
@@ -328,7 +332,8 @@ impl<'a> FlowBinder<'a> {
             self.branch_label_info,
             self.assignment_flow_info,
             self.narrowing_capability,
-        )
+        );
+        (flow_tree, self.errors)
     }
 }
 
