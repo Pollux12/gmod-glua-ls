@@ -64,7 +64,7 @@ struct FieldSetterHelper {
     key_param_index: usize,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct FieldSetterHelperCache {
     complete_helper_registry: bool,
     helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
@@ -157,6 +157,143 @@ impl DynamicFieldAnalysisMode {
     }
 }
 
+/// Per-file dynamic-field collection. Reads only immutable `&DbIndex` state
+/// (lua/unresolve analysis is complete) plus the file's own AST, and writes
+/// nothing to the db — all results are returned for sequential merge. Uses a
+/// fresh per-file infer cache (the db is immutable during this pass, so a cold
+/// cache yields identical inference results) and a local clone of the workspace
+/// field-setter-helper registry (a deterministic memoization cache). This makes
+/// the collection safe to run concurrently across files.
+fn collect_dynamic_fields_for_file(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    root: &glua_parser::LuaChunk,
+    mode: DynamicFieldAnalysisMode,
+    field_setter_helpers: &FieldSetterHelperCache,
+) -> (
+    Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+) {
+    let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
+        Vec::new();
+    let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
+        Vec::new();
+    let mut field_setter_helpers = field_setter_helpers.clone();
+    let mut cache = crate::LuaInferCache::new(
+        file_id,
+        crate::CacheOptions {
+            analysis_phase: crate::LuaAnalysisPhase::Force,
+            skip_flow_narrowing: false,
+        },
+    );
+    let cache = &mut cache;
+    let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> = FxHashMap::default();
+    for assign in root.descendants::<LuaAssignStat>() {
+        let (vars, exprs) = assign.get_var_and_expr_list();
+        for (idx, var) in vars.iter().enumerate() {
+            let LuaVarExpr::IndexExpr(index_expr) = var else {
+                continue;
+            };
+            let value_expr = exprs.get(idx);
+            if mode.collects_only_declared_member_table_fields()
+                && !matches!(value_expr, Some(LuaExpr::TableExpr(_)))
+            {
+                continue;
+            }
+            let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+                continue;
+            };
+            let cache_key = PrefixCacheKey::from_expr(db, cache, &prefix_expr);
+            let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
+                match cached_type {
+                    Some(prefix_type) => prefix_type.clone(),
+                    None => continue,
+                }
+            } else {
+                let inferred = infer_expr(db, cache, prefix_expr.clone()).ok();
+                prefix_type_cache.insert(cache_key, inferred.clone());
+                let Some(prefix_type) = inferred else {
+                    continue;
+                };
+                prefix_type
+            };
+
+            let effective_type = if let Some(metatable_type) = infer_setmetatable_target_type(
+                db,
+                cache,
+                &prefix_expr,
+                index_expr.get_range(),
+            ) {
+                metatable_type
+            } else {
+                prefix_type
+            };
+
+            let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
+            else {
+                continue;
+            };
+
+            let field_names = get_field_names(db, cache, &index_expr);
+            let should_collect_wildcard = mode.collect_direct_assignments()
+                && is_dynamic_index_key(&index_expr)
+                && (field_names.is_empty()
+                    || dynamic_index_key_has_inferred_string_names(db, cache, &index_expr));
+            if should_collect_wildcard {
+                collect_wildcard_for_type(
+                    &effective_type,
+                    file_id,
+                    definition_range,
+                    &mut collected_wildcards,
+                );
+            }
+
+            if field_names.is_empty() {
+                continue;
+            };
+
+            for field_name in field_names {
+                if mode.collect_declared_member_table_fields()
+                    && let Some(value_expr) = value_expr
+                {
+                    collect_assigned_table_fields_for_declared_member(
+                        db,
+                        cache,
+                        &effective_type,
+                        &field_name,
+                        value_expr,
+                        file_id,
+                        &mut collected,
+                    );
+                }
+                if mode.collect_direct_assignments() {
+                    collect_for_type(
+                        &effective_type,
+                        &field_name,
+                        file_id,
+                        definition_range,
+                        &mut collected,
+                    );
+                }
+            }
+        }
+    }
+    if mode.collect_setmetatable_tables() {
+        for call_expr in root.descendants::<LuaCallExpr>() {
+            collect_field_setter_helper_call_fields(
+                db,
+                cache,
+                &call_expr,
+                file_id,
+                &mut field_setter_helpers,
+                &mut collected,
+            );
+            collect_setmetatable_table_fields(db, cache, &call_expr, file_id, &mut collected);
+        }
+    }
+    (collected, collected_wildcards)
+}
+
 fn analyze_dynamic_fields(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
@@ -170,150 +307,30 @@ fn analyze_dynamic_fields(
         Vec::new();
     let profile_enabled = log::log_enabled!(log::Level::Info);
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
-    let mut field_setter_helpers = if mode.collect_direct_assignments() {
+    let field_setter_helpers = if mode.collect_direct_assignments() {
         let context_covers_workspace = context_covers_workspace(&*db, context, &tree_list);
         FieldSetterHelperCache::from_tree_list(&tree_list, context_covers_workspace)
     } else {
         FieldSetterHelperCache::default()
     };
 
-    for in_filed_tree in &tree_list {
-        let root = in_filed_tree.value.clone();
-        let file_id = in_filed_tree.file_id;
-        let cache = context.infer_manager.get_infer_cache(file_id);
-        let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> =
-            FxHashMap::default();
-        for assign in root.descendants::<LuaAssignStat>() {
-            if let Some(profile) = profile.as_mut() {
-                profile.assignments_scanned += 1;
-            }
-            let (vars, exprs) = assign.get_var_and_expr_list();
-            for (idx, var) in vars.iter().enumerate() {
-                if let Some(profile) = profile.as_mut() {
-                    profile.vars_scanned += 1;
-                }
-                let LuaVarExpr::IndexExpr(index_expr) = var else {
-                    continue;
-                };
-                if let Some(profile) = profile.as_mut() {
-                    profile.index_candidates += 1;
-                }
-                let value_expr = exprs.get(idx);
-                if mode.collects_only_declared_member_table_fields()
-                    && !matches!(value_expr, Some(LuaExpr::TableExpr(_)))
-                {
-                    continue;
-                }
-                let Some(prefix_expr) = index_expr.get_prefix_expr() else {
-                    continue;
-                };
-                let cache_key = PrefixCacheKey::from_expr(&*db, cache, &prefix_expr);
-                let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
-                    if let Some(profile) = profile.as_mut() {
-                        profile.owner_cache_hits += 1;
-                    }
-                    match cached_type {
-                        Some(prefix_type) => prefix_type.clone(),
-                        None => continue,
-                    }
-                } else {
-                    if let Some(profile) = profile.as_mut() {
-                        profile.owner_cache_misses += 1;
-                    }
-                    let infer_start = profile_enabled.then(std::time::Instant::now);
-                    let inferred = infer_expr(&*db, cache, prefix_expr.clone()).ok();
-                    if let (Some(profile), Some(infer_start)) = (profile.as_mut(), infer_start) {
-                        profile.owner_infer_time += infer_start.elapsed();
-                    }
-                    prefix_type_cache.insert(cache_key, inferred.clone());
-                    let Some(prefix_type) = inferred else {
-                        continue;
-                    };
-                    prefix_type
-                };
-
-                let effective_type = if let Some(metatable_type) = infer_setmetatable_target_type(
-                    &*db,
-                    cache,
-                    &prefix_expr,
-                    index_expr.get_range(),
-                ) {
-                    metatable_type
-                } else {
-                    prefix_type
-                };
-
-                let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
-                else {
-                    continue;
-                };
-
-                let field_names = get_field_names(db, cache, &index_expr);
-                let should_collect_wildcard = mode.collect_direct_assignments()
-                    && is_dynamic_index_key(&index_expr)
-                    && (field_names.is_empty()
-                        || dynamic_index_key_has_inferred_string_names(db, cache, &index_expr));
-                if should_collect_wildcard {
-                    collect_wildcard_for_type(
-                        &effective_type,
-                        file_id,
-                        definition_range,
-                        &mut collected_wildcards,
-                    );
-                }
-
-                if field_names.is_empty() {
-                    if let Some(profile) = profile.as_mut() {
-                        profile.no_field_name_skips += 1;
-                    }
-                    continue;
-                };
-
-                for field_name in field_names {
-                    if let Some(profile) = profile.as_mut() {
-                        profile.fields_collected += 1;
-                    }
-                    if mode.collect_declared_member_table_fields()
-                        && let Some(value_expr) = value_expr
-                    {
-                        collect_assigned_table_fields_for_declared_member(
-                            &*db,
-                            cache,
-                            &effective_type,
-                            &field_name,
-                            value_expr,
-                            file_id,
-                            &mut collected,
-                        );
-                    }
-                    if mode.collect_direct_assignments() {
-                        collect_for_type(
-                            &effective_type,
-                            &field_name,
-                            file_id,
-                            definition_range,
-                            &mut collected,
-                        );
-                    }
-                }
-            }
-        }
-        if mode.collect_setmetatable_tables() {
-            for call_expr in root.descendants::<LuaCallExpr>() {
-                if let Some(profile) = profile.as_mut() {
-                    profile.calls_scanned += 1;
-                }
-                collect_field_setter_helper_call_fields(
-                    &*db,
-                    cache,
-                    &call_expr,
-                    file_id,
-                    &mut field_setter_helpers,
-                    &mut collected,
-                );
-                collect_setmetatable_table_fields(&*db, cache, &call_expr, file_id, &mut collected);
-            }
-        }
+    // Collection is read-only against an immutable `&DbIndex` and writes only to
+    // per-file local buffers, so it runs concurrently across files. Results are
+    // concatenated in deterministic file order and merged into the db below.
+    let file_ids: Vec<crate::FileId> = tree_list.iter().map(|t| t.file_id).collect();
+    let per_file = super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_chunk_node())
+        else {
+            return (Vec::new(), Vec::new());
+        };
+        collect_dynamic_fields_for_file(db, file_id, &root, mode, &field_setter_helpers)
+    });
+    for (file_collected, file_wildcards) in per_file {
+        collected.extend(file_collected);
+        collected_wildcards.extend(file_wildcards);
     }
 
     let propagate_start = profile_enabled.then(std::time::Instant::now);
