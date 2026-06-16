@@ -691,13 +691,15 @@ fn apply_index_expr_member_owner(
             LuaMemberFeature::FileDefine
         };
         let member = LuaMember::new(member_id, member_key, decl_feature, None);
-        let function_scope = analyzer
-            .db
-            .get_member_index()
-            .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
-        {
-            let member_index = analyzer.db.get_member_index_mut();
-            member_index.add_member(member_owner, member);
+        let member_index = analyzer.db.get_member_index_mut();
+        member_index.add_member(member_owner, member);
+        // `add_member` already records the enclosing function scope for
+        // `FileDefine` index-expr members (via
+        // `assignment_file_define_scope_for_member`). For other features
+        // (e.g. `MetaDefine`) it stores `None`, so set the real scope here.
+        if !matches!(decl_feature, LuaMemberFeature::FileDefine) {
+            let function_scope =
+                member_index.enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
             member_index.set_member_function_scope_range(member_id, function_scope);
         }
         if guarded_table_assignment {
