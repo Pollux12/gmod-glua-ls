@@ -297,6 +297,38 @@ impl GmodInferIndex {
             .push(site);
     }
 
+    /// Bulk-add hook sites collected for a file (preserving order). Used by the
+    /// parallel gmod-pre collection, which gathers a file's sites off-thread and
+    /// merges them sequentially. No-op when `sites` is empty.
+    pub fn add_hook_sites(&mut self, file_id: FileId, sites: Vec<GmodHookSiteMetadata>) {
+        if sites.is_empty() {
+            return;
+        }
+        self.hook_file_metadata
+            .entry(file_id)
+            .or_default()
+            .sites
+            .extend(sites);
+    }
+
+    /// Replace a file's collected system metadata (net/concommand/convar/timer
+    /// sites) wholesale. Used by the parallel gmod-pre collection. Invalidates
+    /// the system aggregate cache since registration counts may change.
+    pub fn set_system_file_metadata(
+        &mut self,
+        file_id: FileId,
+        metadata: GmodSystemFileMetadata,
+    ) {
+        if metadata == GmodSystemFileMetadata::default() {
+            if self.system_file_metadata.remove(&file_id).is_some() {
+                self.invalidate_system_aggregate_cache();
+            }
+            return;
+        }
+        self.invalidate_system_aggregate_cache();
+        self.system_file_metadata.insert(file_id, metadata);
+    }
+
     pub fn get_hook_file_metadata(&self, file_id: &FileId) -> Option<&GmodHookFileMetadata> {
         self.hook_file_metadata.get(file_id)
     }

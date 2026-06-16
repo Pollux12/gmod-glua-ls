@@ -11,7 +11,7 @@ use glua_parser::{
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
     LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaStat,
-    LuaSyntaxNode, LuaTableExpr, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
+    LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
 };
 
 use crate::{
@@ -29,8 +29,9 @@ use crate::{
         GmodHookSiteMetadata, GmodLoadConfidence, GmodLoadEdge, GmodLoadEdgeKind, GmodLoadRoot,
         GmodLoadRootKind, GmodLoadStatus, GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata,
         GmodRealm, GmodRealmFileMetadata, GmodRealmRange, GmodScopedClassInfo, GmodStateMask,
-        GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind, LuaDependencySite, LuaMemberOwner,
-        NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind, NetReceiveFlow, NetSendFlow, NetSendKind,
+        GmodSystemFileMetadata, GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind,
+        LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind,
+        NetReceiveFlow, NetSendFlow, NetSendKind,
     },
     profile::Profile,
 };
@@ -149,10 +150,10 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let t0 = do_profile.then(std::time::Instant::now);
         let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::new();
         let mut annotation_realms: HashMap<FileId, GmodRealm> = HashMap::new();
-        let mut t_hook = std::time::Duration::ZERO;
-        let mut t_netflow = std::time::Duration::ZERO;
+        // Wall-clock for the parallel read-only collection pass (hook/system/net
+        // flow/realm/fileparam metadata) and the sequential scoped-class merge.
+        let mut t_collect = std::time::Duration::ZERO;
         let mut t_scoped = std::time::Duration::ZERO;
-        let mut t_realm = std::time::Duration::ZERO;
         let mut profile = do_profile.then(GmodPreProfile::default);
 
         // Build a workspace-global registry of helper functions so that
@@ -201,83 +202,86 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             );
         }
 
-        for in_filed_tree in &tree_list {
-            let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
+        // Per-file metadata collection is read-only against `&DbIndex` (it only
+        // reads the reference/decl indexes built by earlier passes plus each
+        // file's own AST), so it runs in parallel across files. The collected
+        // results are merged into the db sequentially afterward in file order to
+        // preserve identical behavior. The scoped-class (`is_in_scope`) work
+        // mutates the db and stays in the sequential merge loop.
+        let s_collect = do_profile.then(std::time::Instant::now);
+        let collect_file_ids: Vec<FileId> =
+            tree_list.iter().map(|tree| tree.file_id).collect();
+        let collected = super::parallel::map_files_collect(db, &collect_file_ids, |db, file_id| {
+            collect_file_gmod_metadata(
+                db,
+                file_id,
+                &helper_registry,
+                &formatted_hook_prefixes,
+                &annotated_global_call_roles,
+            )
+        });
+        if let Some(s_collect) = s_collect {
+            t_collect += s_collect.elapsed();
+        }
 
-            // Pre-scan file source for gmod-relevant keywords to skip unnecessary AST walks
-            let keywords = db
-                .get_vfs()
-                .get_file_content(&in_filed_tree.file_id)
-                .map(|c| {
-                    scan_gmod_keywords(c, &formatted_hook_prefixes, &annotated_global_call_roles)
-                })
-                .unwrap_or_default();
+        for (in_filed_tree, result) in tree_list.iter().zip(collected) {
+            let file_id = in_filed_tree.file_id;
+            let is_in_scope = scripted_scope_files.contains(&file_id);
+            let GmodFileMetadataResult {
+                keywords,
+                hook_metadata,
+                receive_flow_count,
+                network_data,
+                member_ranges,
+                branch_ranges,
+                annotation_realm,
+                file_params,
+            } = result;
+
             if let Some(profile) = profile.as_mut() {
                 profile.files_scanned += 1;
                 profile.record_keywords(&keywords, is_in_scope);
             }
 
-            let s = do_profile.then(std::time::Instant::now);
-            let mut local_fns = LocalFnCache::default();
-            let (gm_method_realms, receive_flows) = if keywords.needs_hook_metadata() {
-                collect_hook_metadata(
-                    db,
-                    in_filed_tree.file_id,
-                    in_filed_tree.value.clone(),
-                    &helper_registry,
-                    &annotated_global_call_roles,
-                    &mut local_fns,
-                )
-            } else {
+            if let Some((hook_sites, system_metadata, gm_method_realms)) = hook_metadata {
                 if let Some(profile) = profile.as_mut() {
-                    profile.hook_metadata_skips += 1;
+                    profile.gm_method_realms += gm_method_realms.len();
+                    profile.receive_flows += receive_flow_count;
                 }
-                (Vec::new(), Vec::new())
-            };
-            if let Some(profile) = profile.as_mut() {
-                profile.gm_method_realms += gm_method_realms.len();
-                profile.receive_flows += receive_flows.len();
-            }
-            if let Some(s) = s {
-                t_hook += s.elapsed();
+                db.get_gmod_infer_index_mut()
+                    .add_hook_sites(file_id, hook_sites);
+                db.get_gmod_infer_index_mut()
+                    .set_system_file_metadata(file_id, system_metadata);
+                if !gm_method_realms.is_empty() {
+                    db.get_gmod_infer_index_mut()
+                        .set_gm_method_realm_annotations(file_id, gm_method_realms);
+                }
+            } else if let Some(profile) = profile.as_mut() {
+                profile.hook_metadata_skips += 1;
             }
 
-            let s = do_profile.then(std::time::Instant::now);
-            if keywords.has_net || !receive_flows.is_empty() {
-                collect_network_flow_metadata(
-                    db,
-                    in_filed_tree.file_id,
-                    in_filed_tree.value.clone(),
-                    receive_flows,
-                    &helper_registry,
-                    &mut local_fns,
-                );
+            if let Some(network_data) = network_data {
+                db.get_gmod_network_index_mut()
+                    .add_file_data(file_id, network_data);
             } else if let Some(profile) = profile.as_mut() {
                 profile.netflow_skips += 1;
             }
-            if let Some(s) = s {
-                t_netflow += s.elapsed();
-            }
 
-            if !gm_method_realms.is_empty() {
-                db.get_gmod_infer_index_mut()
-                    .set_gm_method_realm_annotations(in_filed_tree.file_id, gm_method_realms);
-            }
             if is_in_scope {
                 let s = do_profile.then(std::time::Instant::now);
                 // Use cached scoped class info from decl phase, or detect if not cached
                 let scope_match = db
                     .get_gmod_infer_index()
-                    .get_scoped_class_info(&in_filed_tree.file_id)
+                    .get_scoped_class_info(&file_id)
                     .map(|info| GmodScopedClassMatch {
                         class_name: info.class_name.clone(),
                         global_name: info.global_name.clone(),
                         class_name_prefix: info.class_name_prefix.clone(),
                     })
                     .or_else(|| {
-                        let m = detect_scoped_class_from_path(db, in_filed_tree.file_id)?;
+                        let m = detect_scoped_class_from_path(db, file_id)?;
                         db.get_gmod_infer_index_mut().set_scoped_class_info(
-                            in_filed_tree.file_id,
+                            file_id,
                             GmodScopedClassInfo {
                                 class_name: m.class_name.clone(),
                                 global_name: m.global_name.clone(),
@@ -292,20 +296,16 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     }
                     ensure_scoped_class_type_decl(
                         db,
-                        in_filed_tree.file_id,
+                        file_id,
                         &scope_match.class_name,
                         &scope_match.global_name,
                         in_filed_tree.value.syntax().text_range(),
                     );
 
-                    collect_scripted_scope_type_bindings_with(
-                        db,
-                        in_filed_tree.file_id,
-                        &scope_match,
-                    );
+                    collect_scripted_scope_type_bindings_with(db, file_id, &scope_match);
                     synthesize_scoped_base_assignments_with(
                         db,
-                        in_filed_tree.file_id,
+                        file_id,
                         in_filed_tree.value.clone(),
                         &scope_match,
                     );
@@ -314,46 +314,34 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     t_scoped += s.elapsed();
                 }
             }
-            let s = do_profile.then(std::time::Instant::now);
+
             if keywords.has_realm_branch {
-                let ranges = collect_branch_realm_ranges(&in_filed_tree.value);
                 if let Some(profile) = profile.as_mut() {
-                    profile.branch_realm_ranges += ranges.len();
+                    profile.branch_realm_ranges += branch_ranges.len();
                 }
-                if !ranges.is_empty() {
-                    branch_realm_ranges.insert(in_filed_tree.file_id, ranges);
+                if !branch_ranges.is_empty() {
+                    branch_realm_ranges.insert(file_id, branch_ranges);
                 }
             }
             if keywords.has_realm_anno {
-                if let Some(realm) = collect_realm_annotation(&in_filed_tree.value) {
-                    annotation_realms.insert(in_filed_tree.file_id, realm);
+                if let Some(realm) = annotation_realm {
+                    annotation_realms.insert(file_id, realm);
                     if let Some(profile) = profile.as_mut() {
                         profile.annotation_realms += 1;
                     }
                 }
-                let member_ranges = collect_member_realm_ranges(&in_filed_tree.value);
                 if let Some(profile) = profile.as_mut() {
                     profile.member_realm_ranges += member_ranges.len();
                 }
                 db.get_gmod_infer_index_mut()
-                    .set_member_realm_ranges(in_filed_tree.file_id, member_ranges);
-            }
-            if let Some(s) = s {
-                t_realm += s.elapsed();
+                    .set_member_realm_ranges(file_id, member_ranges);
             }
 
-            // Pre-index @fileparam annotations (O(1) lookup during resolve vs O(file_size) AST walk)
-            // @fileparam is extremely rare; only scan if file content contains it
-            if db
-                .get_vfs()
-                .get_file_content(&in_filed_tree.file_id)
-                .is_some_and(|c| c.contains("@fileparam"))
+            if let Some(file_params) = file_params
+                && !file_params.is_empty()
             {
-                let file_params = collect_file_params(&in_filed_tree.value);
-                if !file_params.is_empty() {
-                    db.get_gmod_infer_index_mut()
-                        .set_file_params(in_filed_tree.file_id, file_params);
-                }
+                db.get_gmod_infer_index_mut()
+                    .set_file_params(file_id, file_params);
             }
         }
         if do_profile {
@@ -361,12 +349,10 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 profile.log();
             }
             log::info!(
-                "gmod pre: per-file metadata cost {:?} (hook={:?}, netflow={:?}, scoped={:?}, realm={:?})",
+                "gmod pre: per-file metadata cost {:?} (parallel_collect={:?}, scoped_merge={:?})",
                 t0.map(|t0| t0.elapsed()).unwrap_or_default(),
-                t_hook,
-                t_netflow,
+                t_collect,
                 t_scoped,
-                t_realm
             );
         }
 
@@ -657,14 +643,19 @@ fn collect_annotated_load_dependency_site(
     Some(())
 }
 
+/// Workspace-global registry of helper function definitions, stored as
+/// `(FileId, LuaSyntaxId)` rather than live red-tree nodes so the registry is
+/// `Send + Sync` and can be shared across the parallel per-file collection
+/// workers. Each entry is resolved back to a `(LuaBlock, LuaChunk)` on demand by
+/// rebuilding the owning file's red tree from the (Send) green tree in the VFS.
 struct HelperRegistry {
-    map: HashMap<String, (LuaChunk, LuaBlock)>,
-    methods: HashMap<String, (LuaChunk, LuaBlock)>,
+    map: HashMap<String, (FileId, LuaSyntaxId)>,
+    methods: HashMap<String, (FileId, LuaSyntaxId)>,
 }
 
 fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
-    let mut map: HashMap<String, (LuaChunk, LuaBlock)> = HashMap::new();
-    let mut methods: HashMap<String, (LuaChunk, LuaBlock)> = HashMap::new();
+    let mut map: HashMap<String, (FileId, LuaSyntaxId)> = HashMap::new();
+    let mut methods: HashMap<String, (FileId, LuaSyntaxId)> = HashMap::new();
     let mut duplicate_methods = HashSet::new();
 
     let vfs = db.get_vfs();
@@ -723,11 +714,14 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
                     // Deterministic duplicate winner rule:
                     // the first helper discovered in sorted path order wins.
                     map.entry(key)
-                        .or_insert_with(|| (chunk.clone(), block.clone()));
+                        .or_insert_with(|| (file_id, LuaSyntaxId::from_node(block.syntax())));
                 }
                 if let Some(method_name) = method_name {
                     if methods
-                        .insert(method_name.clone(), (chunk.clone(), block.clone()))
+                        .insert(
+                            method_name.clone(),
+                            (file_id, LuaSyntaxId::from_node(block.syntax())),
+                        )
                         .is_some()
                     {
                         duplicate_methods.insert(method_name);
@@ -759,11 +753,14 @@ fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
                         // Deterministic duplicate winner rule:
                         // the first helper discovered in sorted path order wins.
                         map.entry(key)
-                            .or_insert_with(|| (chunk.clone(), block.clone()));
+                            .or_insert_with(|| (file_id, LuaSyntaxId::from_node(block.syntax())));
                     }
                     if let Some(method_name) = method_name {
                         if methods
-                            .insert(method_name.clone(), (chunk.clone(), block.clone()))
+                            .insert(
+                                method_name.clone(),
+                                (file_id, LuaSyntaxId::from_node(block.syntax())),
+                            )
                             .is_some()
                         {
                             duplicate_methods.insert(method_name);
@@ -936,14 +933,150 @@ fn index_field_name(index_expr: &glua_parser::LuaIndexExpr) -> Option<String> {
     Some(field_token.get_name_text().to_string())
 }
 
+/// All per-file gmod pre-analysis metadata collected off-thread for one file.
+/// Produced by [`collect_file_gmod_metadata`] (read-only against `&DbIndex`) and
+/// merged into the db sequentially by the pipeline in file order.
+struct GmodFileMetadataResult {
+    keywords: GmodKeywords,
+    /// `Some` when hook metadata was collected (file had hook-relevant
+    /// keywords): (hook sites, system metadata, gm-method realm annotations).
+    /// `None` means the hook walk was skipped for this file.
+    hook_metadata: Option<(
+        Vec<GmodHookSiteMetadata>,
+        GmodSystemFileMetadata,
+        Vec<(String, GmodRealm)>,
+    )>,
+    /// Number of net.Receive flows discovered (for profiling parity).
+    receive_flow_count: usize,
+    /// `Some` when network flow metadata was collected for this file.
+    network_data: Option<crate::db_index::FileNetworkData>,
+    /// `---@realm` member ranges (only populated when `keywords.has_realm_anno`).
+    member_ranges: Vec<GmodRealmRange>,
+    /// Branch realm ranges (only populated when `keywords.has_realm_branch`).
+    branch_ranges: Vec<GmodRealmRange>,
+    /// File-level realm annotation (only when `keywords.has_realm_anno`).
+    annotation_realm: Option<GmodRealm>,
+    /// `@fileparam` annotations, when the file content mentions `@fileparam`.
+    file_params: Option<Vec<(String, String)>>,
+}
+
+/// Collect all per-file gmod pre-analysis metadata for `file_id`. Read-only
+/// against `&DbIndex`: reads the file's own AST (rebuilt locally from the Send
+/// green tree) plus pre-existing immutable index state, so this is safe to run
+/// concurrently across files. The returned [`GmodFileMetadataResult`] is merged
+/// into the db sequentially by the caller.
+fn collect_file_gmod_metadata(
+    db: &DbIndex,
+    file_id: FileId,
+    helper_registry: &HelperRegistry,
+    formatted_hook_prefixes: &[String],
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) -> GmodFileMetadataResult {
+    let content = db.get_vfs().get_file_content(&file_id);
+    let keywords = content
+        .map(|c| scan_gmod_keywords(c, formatted_hook_prefixes, annotated_global_call_roles))
+        .unwrap_or_default();
+
+    // Rebuild the red tree locally from the (Send) green tree so no non-Send
+    // rowan node crosses the thread boundary.
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_chunk_node())
+    else {
+        return GmodFileMetadataResult {
+            keywords,
+            hook_metadata: None,
+            receive_flow_count: 0,
+            network_data: None,
+            member_ranges: Vec::new(),
+            branch_ranges: Vec::new(),
+            annotation_realm: None,
+            file_params: None,
+        };
+    };
+
+    let mut local_fns = LocalFnCache::default();
+
+    let (hook_metadata, receive_flows) = if keywords.needs_hook_metadata() {
+        let (hook_sites, system_metadata, gm_method_realms, receive_flows) = collect_hook_metadata(
+            db,
+            file_id,
+            root.clone(),
+            helper_registry,
+            annotated_global_call_roles,
+            &mut local_fns,
+        );
+        (
+            Some((hook_sites, system_metadata, gm_method_realms)),
+            receive_flows,
+        )
+    } else {
+        (None, Vec::new())
+    };
+    let receive_flow_count = receive_flows.len();
+
+    let network_data = if keywords.has_net || !receive_flows.is_empty() {
+        Some(collect_network_flow_metadata(
+            db,
+            root.clone(),
+            receive_flows,
+            helper_registry,
+            &mut local_fns,
+        ))
+    } else {
+        None
+    };
+
+    let branch_ranges = if keywords.has_realm_branch {
+        collect_branch_realm_ranges(&root)
+    } else {
+        Vec::new()
+    };
+
+    let (annotation_realm, member_ranges) = if keywords.has_realm_anno {
+        (
+            collect_realm_annotation(&root),
+            collect_member_realm_ranges(&root),
+        )
+    } else {
+        (None, Vec::new())
+    };
+
+    // @fileparam is extremely rare; only scan if file content contains it.
+    let file_params = if content.is_some_and(|c| c.contains("@fileparam")) {
+        Some(collect_file_params(&root))
+    } else {
+        None
+    };
+
+    GmodFileMetadataResult {
+        keywords,
+        hook_metadata,
+        receive_flow_count,
+        network_data,
+        member_ranges,
+        branch_ranges,
+        annotation_realm,
+        file_params,
+    }
+}
+
 fn collect_hook_metadata(
-    db: &mut DbIndex,
+    db: &DbIndex,
     file_id: FileId,
     root: LuaChunk,
     helper_registry: &HelperRegistry,
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     local_fns: &mut LocalFnCache,
-) -> (Vec<(String, GmodRealm)>, Vec<NetReceiveFlow>) {
+) -> (
+    Vec<GmodHookSiteMetadata>,
+    GmodSystemFileMetadata,
+    Vec<(String, GmodRealm)>,
+    Vec<NetReceiveFlow>,
+) {
+    let mut hook_sites = Vec::new();
+    let mut system_metadata = GmodSystemFileMetadata::default();
     let mut gm_method_realms = Vec::new();
     let mut receive_flows = Vec::new();
     let annotated_call_roles =
@@ -956,22 +1089,28 @@ fn collect_hook_metadata(
             if let Some(site) =
                 collect_hook_call_site(db, file_id, &annotated_call_roles, call_expr.clone())
             {
-                db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
+                hook_sites.push(site);
             }
 
             if let Some(receive_flow) =
-                collect_net_receive_flow(&root, &call_expr, helper_registry, local_fns)
+                collect_net_receive_flow(&root, &call_expr, helper_registry, local_fns, db)
             {
                 receive_flows.push(receive_flow);
             }
 
-            collect_system_call_metadata(db, file_id, &annotated_call_roles, call_expr);
+            collect_system_call_metadata_into(
+                db,
+                file_id,
+                &annotated_call_roles,
+                call_expr,
+                &mut system_metadata,
+            );
             continue;
         }
 
         if let Some(func_stat) = LuaFuncStat::cast(node) {
             if let Some(site) = collect_hook_method_site(db, func_stat.clone()) {
-                db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
+                hook_sites.push(site);
             }
 
             if let Some((method_name, realm)) = collect_gm_method_realm_annotation(&func_stat)
@@ -987,30 +1126,29 @@ fn collect_hook_metadata(
     }
 
     receive_flows.sort_by_key(|flow| flow.receive_range.start());
-    (gm_method_realms, receive_flows)
+    (hook_sites, system_metadata, gm_method_realms, receive_flows)
 }
 
 fn collect_network_flow_metadata(
-    db: &mut DbIndex,
-    file_id: FileId,
+    db: &DbIndex,
     root: LuaChunk,
     receive_flows: Vec<NetReceiveFlow>,
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
-) {
-    let mut send_flows = collect_net_send_flows(&root, helper_registry, local_fns);
+) -> crate::db_index::FileNetworkData {
+    let mut send_flows = collect_net_send_flows(&root, helper_registry, local_fns, db);
     send_flows.extend(collect_wrapped_net_send_flows(
         &root,
         helper_registry,
         local_fns,
+        db,
     ));
     send_flows.sort_by_key(|flow| flow.start_range.start());
 
-    let data = crate::db_index::FileNetworkData {
+    crate::db_index::FileNetworkData {
         send_flows,
         receive_flows,
-    };
-    db.get_gmod_network_index_mut().add_file_data(file_id, data);
+    }
 }
 
 fn collect_gm_method_realm_annotation(func_stat: &LuaFuncStat) -> Option<(String, GmodRealm)> {
@@ -1037,6 +1175,7 @@ fn collect_net_send_flows(
     root: &LuaChunk,
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
+    db: &DbIndex,
 ) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
@@ -1084,6 +1223,7 @@ fn collect_net_send_flows(
                     &mut writes,
                     helper_registry,
                     local_fns,
+                    db,
                 );
             }
 
@@ -1111,6 +1251,7 @@ fn collect_wrapped_net_send_flows(
     root: &LuaChunk,
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
+    db: &DbIndex,
 ) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
@@ -1124,6 +1265,7 @@ fn collect_wrapped_net_send_flows(
             &mut flows,
             helper_registry,
             local_fns,
+            db,
         );
     }
 
@@ -1137,6 +1279,7 @@ fn collect_wrapped_net_send_flows_in_function_block(
     flows: &mut Vec<NetSendFlow>,
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
+    db: &DbIndex,
 ) {
     for block in function_block
         .syntax()
@@ -1192,6 +1335,7 @@ fn collect_wrapped_net_send_flows_in_function_block(
                     &mut writes,
                     helper_registry,
                     local_fns,
+                    db,
                 );
             }
 
@@ -1236,6 +1380,7 @@ fn collect_net_receive_flow(
     call_expr: &LuaCallExpr,
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
+    db: &DbIndex,
 ) -> Option<NetReceiveFlow> {
     let method_name = get_exact_net_method_name(call_expr)?;
     if method_name != "Receive" {
@@ -1257,6 +1402,7 @@ fn collect_net_receive_flow(
                 &mut reads,
                 helper_registry,
                 local_fns,
+                db,
             ),
             None => {
                 // Inline closure that can't yield a block is malformed — but a
@@ -1313,37 +1459,58 @@ fn resolve_callback_block(
 ///
 /// Handles bare-name calls (`helperFn(...)`) and dotted calls
 /// (`Module.fn(...)`). Method calls (`obj:method(...)`) are out of scope.
-fn resolve_call_to_function_block<'a>(
-    root: &'a LuaChunk,
+/// Resolve a `(FileId, LuaSyntaxId)` helper-registry entry back to its
+/// `(LuaBlock, LuaChunk)` by rebuilding the owning file's red tree on demand.
+/// Returns an owned `LuaChunk` (cheap clone of a red node) which becomes the new
+/// `root` for further nested helper resolution within that body.
+fn resolve_registry_entry(
+    db: &DbIndex,
+    file_id: &FileId,
+    syntax_id: &LuaSyntaxId,
+) -> Option<(LuaBlock, LuaChunk)> {
+    let tree = db.get_vfs().get_syntax_tree(file_id)?;
+    let chunk = tree.get_chunk_node();
+    let node = syntax_id.to_node_from_root(chunk.syntax())?;
+    let block = LuaBlock::cast(node)?;
+    Some((block, chunk))
+}
+
+fn resolve_call_to_function_block(
+    root: &LuaChunk,
     call_expr: &LuaCallExpr,
-    helper_registry: &'a HelperRegistry,
+    helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
-) -> Option<(String, LuaBlock, &'a LuaChunk)> {
+    db: &DbIndex,
+) -> Option<(String, LuaBlock, LuaChunk)> {
     let prefix = call_expr.get_prefix_expr()?;
 
     match prefix {
         LuaExpr::NameExpr(name_expr) => {
             let name = name_expr.get_name_text()?;
             if let Some(block) = local_fns.get(root).bare.get(&name).cloned() {
-                return Some((name, block, root));
+                return Some((name, block, root.clone()));
             }
             // Cross-file fallback: a bare-name call may reference a global
             // function defined in another file (less common than dotted
             // helpers, but supported for symmetry).
-            helper_registry
-                .map
-                .get(&name)
-                .map(|(chunk, block)| (name.clone(), block.clone(), chunk))
+            if let Some((file_id, syntax_id)) = helper_registry.map.get(&name)
+                && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
+            {
+                return Some((name.clone(), block, chunk));
+            }
+            None
         }
         LuaExpr::IndexExpr(index_expr) => {
             if call_expr.is_colon_call()
                 && let Some(method_name) = index_field_name(&index_expr)
             {
                 if let Some(block) = local_fns.get(root).methods.get(&method_name).cloned() {
-                    return Some((format!(":{method_name}"), block, root));
+                    return Some((format!(":{method_name}"), block, root.clone()));
                 }
-                if let Some((chunk, block)) = helper_registry.methods.get(&method_name) {
-                    return Some((format!(":{method_name}"), block.clone(), chunk));
+                if let Some((file_id, syntax_id)) = helper_registry.methods.get(&method_name)
+                    && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
+                {
+                    return Some((format!(":{method_name}"), block, chunk));
                 }
             }
             let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
@@ -1356,12 +1523,14 @@ fn resolve_call_to_function_block<'a>(
             let field_text = field_token.get_name_text().to_string();
             let key = format!("{prefix_text}.{field_text}");
             if let Some(block) = local_fns.get(root).dotted.get(&key).cloned() {
-                return Some((key, block, root));
+                return Some((key, block, root.clone()));
             }
-            helper_registry
-                .map
-                .get(&key)
-                .map(|(chunk, block)| (key.clone(), block.clone(), chunk))
+            if let Some((file_id, syntax_id)) = helper_registry.map.get(&key)
+                && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
+            {
+                return Some((key.clone(), block, chunk));
+            }
+            None
         }
         _ => None,
     }
@@ -1373,6 +1542,7 @@ fn collect_net_read_ops_from_block(
     reads: &mut Vec<NetOpEntry>,
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
+    db: &DbIndex,
 ) {
     let mut visited = HashSet::new();
     collect_net_ops_recursive(
@@ -1386,6 +1556,7 @@ fn collect_net_read_ops_from_block(
         helper_registry,
         &[],
         local_fns,
+        db,
     );
 }
 
@@ -1396,6 +1567,7 @@ fn collect_net_write_ops_from_stat(
     writes: &mut Vec<NetOpEntry>,
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
+    db: &DbIndex,
 ) {
     let mut visited = HashSet::new();
     collect_net_ops_recursive(
@@ -1409,6 +1581,7 @@ fn collect_net_write_ops_from_stat(
         helper_registry,
         &[],
         local_fns,
+        db,
     );
 }
 
@@ -1443,6 +1616,7 @@ fn collect_net_ops_recursive(
     helper_registry: &HelperRegistry,
     flow_prefix: &[NetFlowFrame],
     local_fns: &mut LocalFnCache,
+    db: &DbIndex,
 ) {
     for call_expr in subtree.descendants().filter_map(LuaCallExpr::cast) {
         if is_call_expr_in_nested_closure(enclosing_block, &call_expr) {
@@ -1474,7 +1648,7 @@ fn collect_net_ops_recursive(
         }
 
         let Some((helper_key, helper_block, helper_root)) =
-            resolve_call_to_function_block(root, &call_expr, helper_registry, local_fns)
+            resolve_call_to_function_block(root, &call_expr, helper_registry, local_fns, db)
         else {
             continue;
         };
@@ -1493,7 +1667,7 @@ fn collect_net_ops_recursive(
         nested_prefix.extend_from_slice(flow_prefix);
         nested_prefix.extend(local_path);
         collect_net_ops_recursive(
-            helper_root,
+            &helper_root,
             &helper_block,
             helper_block.syntax(),
             out,
@@ -1503,6 +1677,7 @@ fn collect_net_ops_recursive(
             helper_registry,
             &nested_prefix,
             local_fns,
+            db,
         );
         visited.remove(&helper_key);
     }
@@ -6046,11 +6221,12 @@ fn signature_id_from_decl_value(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaS
     Some(LuaSignatureId::from_closure(decl_id.file_id, &closure))
 }
 
-fn collect_system_call_metadata(
-    db: &mut DbIndex,
+fn collect_system_call_metadata_into(
+    db: &DbIndex,
     file_id: FileId,
     annotated_roles: &AnnotatedGmodCallRoleMap,
     call_expr: LuaCallExpr,
+    out: &mut GmodSystemFileMetadata,
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
     let call_site = annotated_roles.system_call(db, file_id, &call_expr, &call_path)?;
@@ -6060,26 +6236,20 @@ fn collect_system_call_metadata(
         GmodSystemCallKind::AddNetworkString => {
             let name_arg_idx = call_site.name_arg_idx?;
             let (name, name_range) = extract_static_string_arg(call_expr.clone(), name_arg_idx);
-            db.get_gmod_infer_index_mut().add_net_message_registration(
-                file_id,
-                GmodNamedSiteMetadata {
-                    syntax_id: call_expr.get_syntax_id(),
-                    name,
-                    name_range,
-                },
-            );
+            out.net_add_string_calls.push(GmodNamedSiteMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                name,
+                name_range,
+            });
         }
         GmodSystemCallKind::NetStart => {
             let name_arg_idx = call_site.name_arg_idx?;
             let (name, name_range) = extract_static_string_arg(call_expr.clone(), name_arg_idx);
-            db.get_gmod_infer_index_mut().add_net_start_site(
-                file_id,
-                GmodNamedSiteMetadata {
-                    syntax_id: call_expr.get_syntax_id(),
-                    name,
-                    name_range,
-                },
-            );
+            out.net_start_calls.push(GmodNamedSiteMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                name,
+                name_range,
+            });
         }
         GmodSystemCallKind::NetReceive => {
             let name_arg_idx = call_site.name_arg_idx?;
@@ -6092,15 +6262,12 @@ fn collect_system_call_metadata(
                 .unwrap_or_else(|| {
                     extract_first_callback_arg_after(call_expr.clone(), name_arg_idx)
                 });
-            db.get_gmod_infer_index_mut().add_net_receive_site(
-                file_id,
-                GmodNetReceiveSiteMetadata {
-                    syntax_id: call_expr.get_syntax_id(),
-                    message_name,
-                    name_range,
-                    callback,
-                },
-            );
+            out.net_receive_calls.push(GmodNetReceiveSiteMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                message_name,
+                name_range,
+                callback,
+            });
         }
         GmodSystemCallKind::ConcommandAdd => {
             let name_arg_idx = call_site.name_arg_idx?;
@@ -6113,33 +6280,27 @@ fn collect_system_call_metadata(
                 .unwrap_or_else(|| {
                     extract_first_callback_arg_after(call_expr.clone(), name_arg_idx)
                 });
-            db.get_gmod_infer_index_mut().add_concommand_site(
-                file_id,
-                GmodConcommandSiteMetadata {
-                    syntax_id: call_expr.get_syntax_id(),
-                    command_name,
-                    name_range,
-                    callback,
-                },
-            );
+            out.concommand_add_calls.push(GmodConcommandSiteMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                command_name,
+                name_range,
+                callback,
+            });
         }
         GmodSystemCallKind::CreateConVar | GmodSystemCallKind::CreateClientConVar => {
             let name_arg_idx = call_site.name_arg_idx?;
             let (convar_name, name_range) =
                 extract_static_string_arg(call_expr.clone(), name_arg_idx);
-            db.get_gmod_infer_index_mut().add_convar_site(
-                file_id,
-                GmodConVarSiteMetadata {
-                    syntax_id: call_expr.get_syntax_id(),
-                    kind: if kind == GmodSystemCallKind::CreateClientConVar {
-                        GmodConVarKind::Client
-                    } else {
-                        GmodConVarKind::Server
-                    },
-                    convar_name,
-                    name_range,
+            out.convar_create_calls.push(GmodConVarSiteMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                kind: if kind == GmodSystemCallKind::CreateClientConVar {
+                    GmodConVarKind::Client
+                } else {
+                    GmodConVarKind::Server
                 },
-            );
+                convar_name,
+                name_range,
+            });
         }
         GmodSystemCallKind::TimerCreate => {
             let name_arg_idx = call_site.name_arg_idx?;
@@ -6150,32 +6311,26 @@ fn collect_system_call_metadata(
                 .and_then(|arg_idx| extract_callback_arg(call_expr.clone(), arg_idx))
                 .or_else(|| extract_first_callback_arg_after_opt(call_expr.clone(), name_arg_idx))
                 .unwrap_or_default();
-            db.get_gmod_infer_index_mut().add_timer_site(
-                file_id,
-                GmodTimerSiteMetadata {
-                    syntax_id: call_expr.get_syntax_id(),
-                    kind: GmodTimerKind::Create,
-                    timer_name,
-                    name_range,
-                    callback,
-                },
-            );
+            out.timer_calls.push(GmodTimerSiteMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                kind: GmodTimerKind::Create,
+                timer_name,
+                name_range,
+                callback,
+            });
         }
         GmodSystemCallKind::TimerSimple => {
             let callback = call_site
                 .callback_arg_idx
                 .and_then(|arg_idx| extract_callback_arg(call_expr.clone(), arg_idx))
                 .unwrap_or_default();
-            db.get_gmod_infer_index_mut().add_timer_site(
-                file_id,
-                GmodTimerSiteMetadata {
-                    syntax_id: call_expr.get_syntax_id(),
-                    kind: GmodTimerKind::Simple,
-                    timer_name: None,
-                    name_range: None,
-                    callback,
-                },
-            );
+            out.timer_calls.push(GmodTimerSiteMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                kind: GmodTimerKind::Simple,
+                timer_name: None,
+                name_range: None,
+                callback,
+            });
         }
     }
 
