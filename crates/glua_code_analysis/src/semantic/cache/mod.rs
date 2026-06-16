@@ -198,6 +198,11 @@ pub struct LuaInferCache {
     pub prof_unresolve_decl_names: Vec<String>,
     // Track unique decl_ids causing UnResolveDeclType
     pub prof_unresolve_decl_ids: FxHashMap<u32, u32>, // position -> count
+    // Flow-cache fragmentation diagnostics: on an entry miss, would a different
+    // realm and/or origin have hit?
+    pub prof_flow_miss_other_realm_hit: u32,
+    pub prof_flow_miss_other_origin_hit: u32,
+    pub prof_flow_entry_miss: u32,
 }
 
 impl LuaInferCache {
@@ -288,6 +293,46 @@ impl LuaInferCache {
             prof_unresolve_decl_sample_count: 0,
             prof_unresolve_decl_names: Vec::new(),
             prof_unresolve_decl_ids: FxHashMap::default(),
+            prof_flow_miss_other_realm_hit: 0,
+            prof_flow_miss_other_origin_hit: 0,
+            prof_flow_entry_miss: 0,
+        }
+    }
+
+    /// Diagnostics helper: given an entry-level miss for `(var_ref, flow_id,
+    /// query_realm, origin)`, record whether a cached entry exists for the same
+    /// `(var_ref, flow_id)` under a *different* realm or origin. Used to quantify
+    /// cache-key fragmentation.
+    pub fn record_flow_entry_miss(
+        &mut self,
+        var_ref_id: &VarRefId,
+        flow_id: FlowId,
+        query_realm: GmodRealm,
+        origin: FlowOrigin,
+    ) {
+        self.prof_flow_entry_miss += 1;
+        let cache_key = VarRefCacheKey::from(var_ref_id);
+        let Some(by_flow) = self.flow_node_cache.get(&cache_key) else {
+            return;
+        };
+        let mut other_realm = false;
+        let mut other_origin = false;
+        for (f, r, o) in by_flow.keys() {
+            if *f != flow_id {
+                continue;
+            }
+            if *r != query_realm {
+                other_realm = true;
+            }
+            if *o != origin {
+                other_origin = true;
+            }
+        }
+        if other_realm {
+            self.prof_flow_miss_other_realm_hit += 1;
+        }
+        if other_origin {
+            self.prof_flow_miss_other_origin_hit += 1;
         }
     }
 

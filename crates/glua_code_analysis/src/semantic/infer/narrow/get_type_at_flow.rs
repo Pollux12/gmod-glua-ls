@@ -67,6 +67,9 @@ pub fn get_type_at_flow_with_origin(
         }
         _ => {}
     }
+    if log::log_enabled!(log::Level::Info) {
+        cache.record_flow_entry_miss(var_ref_id, flow_id, query_realm, flow_origin);
+    }
     let mut visited_flow_ids = Vec::new();
     let result = get_type_at_flow_walk(
         db,

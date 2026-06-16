@@ -4,6 +4,10 @@ members = ["crates/*",
     "tools/*",
 ]
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.package]
 description = "gmod-glua-ls — Garry's Mod Lua Language Server, a fork of EmmyLua Analyzer Rust optimized for GLua development"
 license = "MIT"

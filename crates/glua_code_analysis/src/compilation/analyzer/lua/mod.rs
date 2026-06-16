@@ -234,8 +234,20 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
             let mut total_assign_set_owner_ns: u64 = 0;
             let mut total_assign_infer_rhs_ns: u64 = 0;
             let mut total_assign_merge_ns: u64 = 0;
+            let mut total_flow_calls: u32 = 0;
+            let mut total_flow_hits: u32 = 0;
+            let mut total_flow_nodes_walked: u32 = 0;
+            let mut total_flow_entry_miss: u32 = 0;
+            let mut total_flow_miss_other_realm: u32 = 0;
+            let mut total_flow_miss_other_origin: u32 = 0;
             for fid in &file_ids {
                 let cache = context.infer_manager.get_infer_cache(*fid);
+                total_flow_calls += cache.prof_flow_calls;
+                total_flow_hits += cache.prof_flow_hits;
+                total_flow_nodes_walked += cache.prof_flow_nodes_walked;
+                total_flow_entry_miss += cache.prof_flow_entry_miss;
+                total_flow_miss_other_realm += cache.prof_flow_miss_other_realm_hit;
+                total_flow_miss_other_origin += cache.prof_flow_miss_other_origin_hit;
                 total_idx_ns += cache.prof_infer_index_time_ns;
                 total_call_ns += cache.prof_infer_call_time_ns;
                 total_name_ns += cache.prof_infer_name_time_ns;
@@ -290,6 +302,20 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 total_tbl_calls,
                 total_tbl_ns / 1_000_000,
                 total_other_ns / 1_000_000,
+            );
+            let flow_hit_pct = total_flow_hits
+                .checked_mul(100)
+                .and_then(|h| h.checked_div(total_flow_calls))
+                .unwrap_or(0);
+            info!(
+                "lua flow profile: [calls={} hits={} ({}%) nodes_walked={} entry_miss={} miss_other_realm={} miss_other_origin={}]",
+                total_flow_calls,
+                total_flow_hits,
+                flow_hit_pct,
+                total_flow_nodes_walked,
+                total_flow_entry_miss,
+                total_flow_miss_other_realm,
+                total_flow_miss_other_origin,
             );
             info!(
                 "lua assign profile: [stats={} slots={} special_hits={} skip_nil={}ms get_owner={}ms special={}ms set_owner={}ms infer_rhs={}ms merge={}ms]",

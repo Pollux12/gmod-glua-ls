@@ -14,3 +14,8 @@ dhat-heap.json
 benchmark_*.log
 .bench-*.log
 100
+
+# Perf work artifacts
+*.log
+diag_*.json
+prof.json.gz
