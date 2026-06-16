@@ -2622,13 +2622,29 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
     let mut vgui_registration_regions: Vec<VguiRegistrationRegion> = Vec::new();
 
     for file_id in file_ids.iter().copied() {
-        let metadata = match db
+        // Borrow first and skip files with no VGUI-relevant calls before paying
+        // for the (multi-Vec) metadata clone. The vast majority of files have
+        // class metadata but no VGUI register/derma calls.
+        let has_vgui_work = match db
             .get_gmod_class_metadata_index()
             .get_file_metadata(&file_id)
         {
-            Some(m) => m.clone(),
+            Some(m) => {
+                !m.vgui_register_calls.is_empty()
+                    || !m.vgui_register_table_calls.is_empty()
+                    || !m.derma_define_control_calls.is_empty()
+                    || !m.vgui_register_file_calls.is_empty()
+            }
             None => continue,
         };
+        if !has_vgui_work {
+            continue;
+        }
+        let metadata = db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+            .expect("metadata present (checked above)")
+            .clone();
 
         for call in &metadata.vgui_register_calls {
             let register_position = call.syntax_id.get_range().start();
