@@ -64,6 +64,8 @@ impl Checker for GmodRealmMisuseChecker {
         let mut owner_key_member_candidate_cache: OwnerKeyMemberCandidateCache =
             FxHashMap::default();
         let mut owner_expansion_cache: OwnerExpansionCache = FxHashMap::default();
+        let mut member_realms_cache: MemberRealmsCache = FxHashMap::default();
+        let mut decl_realm_cache: DeclRealmCache = FxHashMap::default();
         let precomputed_callee_realms = shared_data
             .as_ref()
             .and_then(|s| s.callee_realms_by_workspace.get(&workspace_id))
@@ -101,10 +103,12 @@ impl Checker for GmodRealmMisuseChecker {
                 &call_expr,
                 &gm_method_realms,
                 &mut decl_annotation_cache,
+                &mut decl_realm_cache,
                 &mut callee_realm_cache,
                 &mut member_candidate_cache,
                 &mut owner_key_member_candidate_cache,
                 &mut owner_expansion_cache,
+                &mut member_realms_cache,
                 precomputed_callee_realms,
                 profile.as_mut(),
             );
@@ -215,6 +219,7 @@ struct GmodRealmMisuseProfile {
     decl_cache_hits: usize,
     decl_cache_misses: usize,
     precomputed_callee_hits: usize,
+    member_realms_cache_hits: usize,
     member_candidate_cache_hits: usize,
     member_candidate_cache_misses: usize,
     member_candidate_time: Duration,
@@ -225,7 +230,7 @@ struct GmodRealmMisuseProfile {
 impl GmodRealmMisuseProfile {
     fn log(&self, file_id: FileId) {
         log::info!(
-            "gmod realm misuse profile: file={:?} calls_scanned={} calls_checked={} shared_skips={} empty_callee={} diagnostics={} gm_fast_hits={} decl_cache_hits={} decl_cache_misses={} precomputed_hits={} member_cache_hits={} member_cache_misses={} member_time={:?} annotation_files_loaded={} callee_time={:?}",
+            "gmod realm misuse profile: file={:?} calls_scanned={} calls_checked={} shared_skips={} empty_callee={} diagnostics={} gm_fast_hits={} decl_cache_hits={} decl_cache_misses={} precomputed_hits={} member_realms_cache_hits={} member_cache_hits={} member_cache_misses={} member_time={:?} annotation_files_loaded={} callee_time={:?}",
             file_id,
             self.calls_scanned,
             self.calls_checked,
@@ -236,6 +241,7 @@ impl GmodRealmMisuseProfile {
             self.decl_cache_hits,
             self.decl_cache_misses,
             self.precomputed_callee_hits,
+            self.member_realms_cache_hits,
             self.member_candidate_cache_hits,
             self.member_candidate_cache_misses,
             self.member_candidate_time,
@@ -310,6 +316,14 @@ type CalleeRealmCache = FxHashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
 type MemberCandidateCache = FxHashMap<(LuaType, LuaMemberKey), Vec<LuaMemberId>>;
 type OwnerKeyMemberCandidateCache = FxHashMap<(LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>>;
 type OwnerExpansionCache = FxHashMap<LuaType, Vec<LuaMemberOwner>>;
+/// Cache for the final resolved realm set for member calls, keyed by (owner_type, member_key).
+/// Sound because owner_type + member_key fully determines which member candidates are found
+/// and their realms — independent of call-site syntax. Many different call expressions with
+/// the same receiver type (e.g. `Entity`) and member name share a cached result.
+type MemberRealmsCache = FxHashMap<(LuaType, LuaMemberKey), Vec<ResolvedRealm>>;
+/// Cache for per-decl resolved realm, avoiding repeated file metadata + annotation lookups.
+/// `None` stored as `Option::None` sentinel (use `Option<Option<ResolvedRealm>>`).
+type DeclRealmCache = FxHashMap<LuaSemanticDeclId, Option<ResolvedRealm>>;
 
 fn resolve_callee_realms(
     context: &DiagnosticContext,
@@ -317,30 +331,36 @@ fn resolve_callee_realms(
     call_expr: &LuaCallExpr,
     gm_method_realms: &GmMethodRealmMap,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
+    decl_realm_cache: &mut DeclRealmCache,
     callee_realm_cache: &mut CalleeRealmCache,
     member_candidate_cache: &mut MemberCandidateCache,
     owner_key_member_candidate_cache: &mut OwnerKeyMemberCandidateCache,
     owner_expansion_cache: &mut OwnerExpansionCache,
+    member_realms_cache: &mut MemberRealmsCache,
     precomputed_callee_realms: Option<&PrecomputedCalleeRealmMap>,
     mut profile: Option<&mut GmodRealmMisuseProfile>,
 ) -> Vec<ResolvedRealm> {
-    // Fast path: GM method annotations (O(1) HashMap lookup, no inference needed)
-    if let Some(prefix_expr) = call_expr.get_prefix_expr()
-        && let Some(index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
-    {
-        let gm_realms = resolve_annotated_gm_method_realms(&index_expr, gm_method_realms);
-        if !gm_realms.is_empty() {
-            if let Some(profile) = profile.as_mut() {
-                profile.gm_method_fast_hits += 1;
-            }
-            return gm_realms;
-        }
-    }
-
     // Resolve declaration — needed both as cache key and for non-member resolution paths
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return Vec::new();
     };
+
+    let is_bare_name_call = matches!(prefix_expr, LuaExpr::NameExpr(_));
+
+    // Fast path: GM method annotations (O(1) HashMap lookup, no inference needed).
+    // Only applies to member calls (index expressions like GM:Method or GAMEMODE.Method).
+    if !is_bare_name_call {
+        if let Some(index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone()) {
+            let gm_realms = resolve_annotated_gm_method_realms(&index_expr, gm_method_realms);
+            if !gm_realms.is_empty() {
+                if let Some(profile) = profile.as_mut() {
+                    profile.gm_method_fast_hits += 1;
+                }
+                return gm_realms;
+            }
+        }
+    }
+
     let semantic_decl = semantic_model.find_decl(
         NodeOrToken::Node(prefix_expr.syntax().clone()),
         SemanticDeclLevel::default(),
@@ -350,7 +370,6 @@ fn resolve_callee_realms(
     // call-site-sensitive: different owner/key expressions can resolve to the
     // same semantic declaration after assignment collapsing, but still need
     // different realm candidate sets.
-    let is_bare_name_call = matches!(call_expr.get_prefix_expr(), Some(LuaExpr::NameExpr(_)));
     if let Some(ref decl) = semantic_decl {
         if is_bare_name_call && let Some(cached) = callee_realm_cache.get(decl) {
             if let Some(profile) = profile.as_mut() {
@@ -393,6 +412,7 @@ fn resolve_callee_realms(
                 &prefix_expr,
                 decl,
                 decl_annotation_cache,
+                decl_realm_cache,
             ) {
                 if context.is_cancelled() {
                     return realms;
@@ -411,11 +431,12 @@ fn resolve_callee_realms(
             semantic_model,
             call_expr,
             semantic_decl.as_ref(),
-            gm_method_realms,
             decl_annotation_cache,
+            decl_realm_cache,
             member_candidate_cache,
             owner_key_member_candidate_cache,
             owner_expansion_cache,
+            member_realms_cache,
             profile,
         ) && !member_realms.is_empty()
         {
@@ -428,20 +449,25 @@ fn resolve_callee_realms(
     // Final fallback: decl resolution for non-globals
     if realms.is_empty() && !is_bare_name_call {
         if let Some(ref decl) = semantic_decl {
-            if let Some(realm) =
-                resolve_decl_realm(context, semantic_model, decl, decl_annotation_cache)
-            {
+            if let Some(realm) = resolve_decl_realm_cached(
+                context,
+                semantic_model,
+                decl,
+                decl_annotation_cache,
+                decl_realm_cache,
+            ) {
                 push_unique_realm(&mut realms, realm);
             }
 
             if let LuaSemanticDeclId::Member(member_id) = decl.clone()
                 && let Some(origin_owner) = semantic_model.get_member_origin_owner(member_id)
             {
-                if let Some(realm) = resolve_decl_realm(
+                if let Some(realm) = resolve_decl_realm_cached(
                     context,
                     semantic_model,
                     &origin_owner,
                     decl_annotation_cache,
+                    decl_realm_cache,
                 ) {
                     push_unique_realm(&mut realms, realm);
                 }
@@ -462,6 +488,7 @@ fn resolve_global_name_candidate_realms(
     prefix_expr: &LuaExpr,
     semantic_decl: &LuaSemanticDeclId,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
+    decl_realm_cache: &mut DeclRealmCache,
 ) -> Vec<ResolvedRealm> {
     let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_decl else {
         return Vec::new();
@@ -492,11 +519,12 @@ fn resolve_global_name_candidate_realms(
             let Some(property_owner_id) = member_info.property_owner_id else {
                 continue;
             };
-            if let Some(realm) = resolve_decl_realm(
+            if let Some(realm) = resolve_decl_realm_cached(
                 context,
                 semantic_model,
                 &property_owner_id,
                 decl_annotation_cache,
+                decl_realm_cache,
             ) {
                 push_unique_realm(&mut realms, realm);
             }
@@ -511,83 +539,95 @@ fn resolve_member_candidate_realms(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
     semantic_decl: Option<&LuaSemanticDeclId>,
-    gm_method_realms: &GmMethodRealmMap,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
+    decl_realm_cache: &mut DeclRealmCache,
     member_candidate_cache: &mut MemberCandidateCache,
     owner_key_member_candidate_cache: &mut OwnerKeyMemberCandidateCache,
     owner_expansion_cache: &mut OwnerExpansionCache,
+    member_realms_cache: &mut MemberRealmsCache,
     mut profile: Option<&mut GmodRealmMisuseProfile>,
 ) -> Option<Vec<ResolvedRealm>> {
+    // NOTE: GM method fast-path is already handled in resolve_callee_realms before
+    // this function is called, so we don't need to repeat it here.
     let prefix_expr = call_expr.get_prefix_expr()?;
     let index_expr = LuaIndexExpr::cast(prefix_expr.syntax().clone())?;
-    let mut realms = resolve_annotated_gm_method_realms(&index_expr, gm_method_realms);
 
-    // If we already have explicit GM method realm annotations, skip expensive inference.
-    // The precomputed annotations are authoritative for GM.*/GAMEMODE.* calls.
-    if !realms.is_empty() {
+    // Extract the member key cheaply (no type inference yet).
+    let index_key = index_expr.get_index_key()?;
+    let member_key = semantic_model.get_member_key(&index_key)?;
+    let owner_expr = index_expr.get_prefix_expr()?;
+
+    // Infer the owner type — this is memoized by syntax ID in LuaInferCache, so
+    // repeated calls on the same expression node are O(1) after the first.
+    let Ok(owner_type) = semantic_model.infer_expr(owner_expr) else {
+        return Some(Vec::new());
+    };
+
+    // Check member_realms_cache: many call expressions with the same owner type
+    // (e.g. `Entity`) and member key share a single computed realm set.
+    let cache_key = (owner_type.clone(), member_key.clone());
+    if let Some(cached) = member_realms_cache.get(&cache_key) {
         if let Some(profile) = profile.as_mut() {
-            profile.gm_method_fast_hits += 1;
+            profile.member_realms_cache_hits += 1;
         }
-        return Some(realms);
+        return Some(cached.clone());
     }
 
-    if let Some(index_key) = index_expr.get_index_key()
-        && let Some(member_key) = semantic_model.get_member_key(&index_key)
-        && let Some(owner_expr) = index_expr.get_prefix_expr()
-        && let Ok(owner_type) = semantic_model.infer_expr(owner_expr)
+    // For realm diagnostics we need ALL candidate declarations across
+    // every workspace priority tier. The normal member-resolution path
+    // `get_member_info_with_key` returns only realm-compatible members.
+    let member_start = profile.is_some().then(Instant::now);
+    let mut all_member_ids = collect_all_member_ids_for_type_key(
+        semantic_model,
+        &owner_type,
+        &member_key,
+        member_candidate_cache,
+        owner_key_member_candidate_cache,
+        owner_expansion_cache,
+        #[allow(clippy::needless_option_as_deref)]
+        profile.as_deref_mut(),
+    );
+    if let (Some(profile), Some(member_start)) = (profile.as_mut(), member_start) {
+        profile.member_candidate_time += member_start.elapsed();
+    }
+
+    let db = semantic_model.get_db();
+    let member_index = db.get_member_index();
+    if let Some(LuaSemanticDeclId::Member(resolved_member_id)) = semantic_decl
+        && let Some(resolved_member) = member_index.get_member(resolved_member_id)
+        && resolved_member.get_key() == &member_key
+        && let Some(resolved_owner) = member_index.get_current_owner(resolved_member_id)
     {
-        // For realm diagnostics we need ALL candidate declarations across
-        // every workspace priority tier. The normal member-resolution path
-        // `get_member_info_with_key` returns only realm-compatible members.
-        let member_start = profile.is_some().then(Instant::now);
-        let mut all_member_ids = collect_all_member_ids_for_type_key(
-            semantic_model,
-            &owner_type,
+        let mut seen: HashSet<LuaMemberId> = all_member_ids.iter().copied().collect();
+        push_cached_member_ids_for_owner_key(
+            member_index,
+            resolved_owner,
             &member_key,
-            member_candidate_cache,
             owner_key_member_candidate_cache,
-            owner_expansion_cache,
-            #[allow(clippy::needless_option_as_deref)]
-            profile.as_deref_mut(),
+            &mut all_member_ids,
+            &mut seen,
         );
-        if let (Some(profile), Some(member_start)) = (profile.as_mut(), member_start) {
-            profile.member_candidate_time += member_start.elapsed();
-        }
+    }
 
-        let db = semantic_model.get_db();
-        let member_index = db.get_member_index();
-        if let Some(LuaSemanticDeclId::Member(resolved_member_id)) = semantic_decl
-            && let Some(resolved_member) = member_index.get_member(resolved_member_id)
-            && resolved_member.get_key() == &member_key
-            && let Some(resolved_owner) = member_index.get_current_owner(resolved_member_id)
-        {
-            let mut seen: HashSet<LuaMemberId> = all_member_ids.iter().copied().collect();
-            push_cached_member_ids_for_owner_key(
-                member_index,
-                resolved_owner,
-                &member_key,
-                owner_key_member_candidate_cache,
-                &mut all_member_ids,
-                &mut seen,
-            );
+    let mut realms = Vec::new();
+    for member_id in all_member_ids {
+        if context.is_cancelled() {
+            return Some(realms);
         }
-
-        for member_id in all_member_ids {
-            if context.is_cancelled() {
-                return Some(realms);
-            }
-            let property_owner_id = LuaSemanticDeclId::Member(member_id);
-            if let Some(realm) = resolve_decl_realm(
-                context,
-                semantic_model,
-                &property_owner_id,
-                decl_annotation_cache,
-            ) {
-                push_unique_realm(&mut realms, realm);
-            }
+        let property_owner_id = LuaSemanticDeclId::Member(member_id);
+        if let Some(realm) = resolve_decl_realm_cached(
+            context,
+            semantic_model,
+            &property_owner_id,
+            decl_annotation_cache,
+            decl_realm_cache,
+        ) {
+            push_unique_realm(&mut realms, realm);
         }
     }
 
+    // Store result in member_realms_cache before returning
+    member_realms_cache.insert(cache_key, realms.clone());
     Some(realms)
 }
 
@@ -619,6 +659,24 @@ fn resolve_decl_realm(
         metadata,
         decl_offset,
     ))
+}
+
+/// Cached wrapper around `resolve_decl_realm`. The result (including `None`) is memoized
+/// per `LuaSemanticDeclId` so that the same member/decl is never resolved twice in a file pass.
+fn resolve_decl_realm_cached(
+    context: &DiagnosticContext,
+    semantic_model: &SemanticModel,
+    semantic_decl: &LuaSemanticDeclId,
+    decl_annotation_cache: &mut DeclAnnotationRealmCache,
+    decl_realm_cache: &mut DeclRealmCache,
+) -> Option<ResolvedRealm> {
+    // Use entry API to avoid double-lookup: if present return the stored value (Some or None).
+    if let Some(cached) = decl_realm_cache.get(semantic_decl) {
+        return *cached;
+    }
+    let result = resolve_decl_realm(context, semantic_model, semantic_decl, decl_annotation_cache);
+    decl_realm_cache.insert(semantic_decl.clone(), result);
+    result
 }
 
 fn resolve_decl_annotation_realm_at_offset(
