@@ -58,10 +58,9 @@ impl LuaCompilation {
             });
         }
 
-        let mut stabilization_candidates =
-            analyzer::analyze(&mut self.db, need_analyzed_files, self.emmyrc.clone())
-                .into_iter()
-                .collect::<Vec<_>>();
+        let mut stabilization_candidates = analyzer::analyze(&mut self.db, need_analyzed_files)
+            .into_iter()
+            .collect::<Vec<_>>();
         stabilization_candidates.sort_unstable();
         stabilization_candidates
     }
