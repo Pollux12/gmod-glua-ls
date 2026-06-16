@@ -49,8 +49,31 @@ timer = timer or {}
 concommand = concommand or {}
 vgui = vgui or {}
 derma = derma or {}
+file = file or {}
 
 Entity = Entity or {}
+
+---@[call_arg("gmod.file_find", "glob")]
+---@param name string
+---@[call_arg("gmod.file_find", "search_path")]
+---@param path string
+function file.Find(name, path, sorting) end
+
+---@[call_arg("gmod.load", "include")]
+---@param fileName string
+function include(fileName) end
+
+---@[call_arg("gmod.load", "addcsluafile")]
+---@param fileName string
+function AddCSLuaFile(fileName) end
+
+---@[call_arg("gmod.load", "includecs")]
+---@param fileName string
+function IncludeCS(fileName) end
+
+---@[call_arg("gmod.load", "require")]
+---@param moduleName string
+function require(moduleName) end
 
 ---@[call_arg("gmod.net_message", "define")]
 ---@param str string

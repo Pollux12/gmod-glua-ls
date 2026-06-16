@@ -66,6 +66,7 @@ struct AnnotatedGmodCandidatePresence {
     has_hook: bool,
     has_scripted_class: bool,
     has_load: bool,
+    has_file_find: bool,
 }
 
 impl GmodKeywords {
@@ -367,7 +368,12 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         }
 
         let t_load = do_profile.then(std::time::Instant::now);
-        rebuild_gmod_load_index(db, &branch_realm_ranges, &file_ids);
+        rebuild_gmod_load_index(
+            db,
+            &branch_realm_ranges,
+            &file_ids,
+            &annotated_global_call_roles,
+        );
         if let Some(t_load) = t_load {
             log::info!(
                 "gmod pre: rebuild_gmod_load_index cost {:?}",
@@ -5275,6 +5281,8 @@ struct AnnotatedGmodCallRoles {
     hook_roles: Vec<(GmodHookKind, AnnotatedGmodCallArgRole)>,
     hook_callback_roles: Vec<AnnotatedGmodCallArgRole>,
     load_roles: Vec<(LuaDependencyKind, AnnotatedGmodCallArgRole)>,
+    file_find_glob_roles: Vec<AnnotatedGmodCallArgRole>,
+    file_find_search_path_roles: Vec<AnnotatedGmodCallArgRole>,
     inheritance_roles: Vec<(GmodScriptedClassCallKind, AnnotatedGmodCallArgRole)>,
     network_var_kind: Option<GmodScriptedClassCallKind>,
     network_var_type_roles: Vec<AnnotatedGmodCallArgRole>,
@@ -5376,6 +5384,12 @@ impl AnnotatedGmodCallRoles {
             ("gmod.load", "includecs") | ("gmod.load", "include_cs") => self
                 .load_roles
                 .push((LuaDependencyKind::IncludeCS, arg_role)),
+            ("gmod.file_find", "glob") => {
+                self.file_find_glob_roles.push(arg_role);
+            }
+            ("gmod.file_find", "search_path") | ("gmod.file_find", "path") => {
+                self.file_find_search_path_roles.push(arg_role);
+            }
             ("gmod.class_base", "reference") => self
                 .inheritance_roles
                 .push((GmodScriptedClassCallKind::DefineBaseClass, arg_role)),
@@ -5434,6 +5448,10 @@ impl AnnotatedGmodCallRoles {
         self.hook_callback_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.load_roles.sort_by_key(|(_, role)| role.sort_key());
+        self.file_find_glob_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.file_find_search_path_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.inheritance_roles
             .sort_by_key(|(_, role)| role.sort_key());
         self.network_var_type_roles
@@ -5456,6 +5474,8 @@ impl AnnotatedGmodCallRoles {
             || !self.hook_roles.is_empty()
             || !self.hook_callback_roles.is_empty()
             || !self.load_roles.is_empty()
+            || !self.file_find_glob_roles.is_empty()
+            || !self.file_find_search_path_roles.is_empty()
             || !self.inheritance_roles.is_empty()
             || !self.network_var_define_roles.is_empty()
             || !self.vgui_panel_define_roles.is_empty()
@@ -5572,6 +5592,8 @@ impl AnnotatedGmodCallRoles {
             }),
             has_hook: !self.hook_roles.is_empty() || !self.hook_callback_roles.is_empty(),
             has_load: !self.load_roles.is_empty(),
+            has_file_find: !self.file_find_glob_roles.is_empty()
+                || !self.file_find_search_path_roles.is_empty(),
             has_scripted_class: !self.inheritance_roles.is_empty()
                 || !self.network_var_define_roles.is_empty()
                 || !self.vgui_panel_define_roles.is_empty()
@@ -5608,6 +5630,31 @@ impl AnnotatedGmodCallRoles {
         Some((
             *kind,
             param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)?,
+        ))
+    }
+
+    fn load_alias(&self, is_colon_call: bool) -> Option<DynamicLoadAlias> {
+        self.load_call(is_colon_call)
+            .and_then(|(kind, path_arg_idx)| {
+                DynamicLoadAlias::from_dependency_kind(kind, path_arg_idx)
+            })
+            .or_else(|| {
+                self.overloads
+                    .iter()
+                    .find_map(|overload| overload.load_alias(is_colon_call))
+            })
+    }
+
+    fn file_find_call(&self, is_colon_call: bool) -> Option<(usize, usize)> {
+        let glob_role = self.file_find_glob_roles.first()?;
+        let search_path_role = self.file_find_search_path_roles.first()?;
+        Some((
+            param_idx_to_call_arg_idx(glob_role.param_idx, is_colon_call, self.is_colon_define)?,
+            param_idx_to_call_arg_idx(
+                search_path_role.param_idx,
+                is_colon_call,
+                self.is_colon_define,
+            )?,
         ))
     }
 
@@ -5837,6 +5884,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
                 && !presence.has_hook
                 && !presence.has_scripted_class
                 && !presence.has_load
+                && !presence.has_file_find
             {
                 continue;
             }
@@ -5870,12 +5918,14 @@ impl AnnotatedGmodGlobalCallRoleMap {
             presence.has_hook |= candidate_presence.has_hook;
             presence.has_scripted_class |= candidate_presence.has_scripted_class;
             presence.has_load |= candidate_presence.has_load;
+            presence.has_file_find |= candidate_presence.has_file_find;
 
             if presence.has_system
                 && presence.has_net
                 && presence.has_hook
                 && presence.has_scripted_class
                 && presence.has_load
+                && presence.has_file_find
             {
                 break;
             }
@@ -6060,6 +6110,65 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
     ) -> Option<(LuaDependencyKind, usize)> {
         self.roles_for_call(db, file_id, call_expr, call_path)
             .and_then(|roles| roles.load_call(call_expr.is_colon_call()))
+    }
+
+    fn load_alias_for_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<DynamicLoadAlias> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.load_alias(call_expr.is_colon_call()))
+    }
+
+    fn load_alias_for_reference_expr(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        expr: &LuaExpr,
+    ) -> Option<DynamicLoadAlias> {
+        match expr {
+            LuaExpr::NameExpr(name_expr) => {
+                let name = name_expr.get_name_text()?;
+                if let Some(local_roles) =
+                    annotated_roles_from_local_name_expr(self, db, file_id, name_expr)
+                {
+                    return local_roles.and_then(|roles| roles.load_alias(false));
+                }
+                self.global_roles
+                    .get(name.as_str())
+                    .and_then(|roles| roles.load_alias(false))
+            }
+            LuaExpr::IndexExpr(index_expr) => {
+                let path = index_expr.get_access_path()?;
+                let has_shadowing_local_root = index_expr_root_name(index_expr)
+                    .as_ref()
+                    .is_some_and(|root| name_expr_resolves_to_shadowing_local(db, file_id, root));
+                if has_shadowing_local_root {
+                    return None;
+                }
+                self.global_roles
+                    .get(&path)
+                    .and_then(|roles| roles.load_alias(false))
+            }
+            LuaExpr::ParenExpr(paren_expr) => {
+                self.load_alias_for_reference_expr(db, file_id, &paren_expr.get_expr()?)
+            }
+            _ => None,
+        }
+    }
+
+    fn file_find_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(usize, usize)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.file_find_call(call_expr.is_colon_call()))
     }
 
     fn vgui_panel_call(
@@ -7655,6 +7764,7 @@ fn rebuild_gmod_load_index(
     db: &mut DbIndex,
     branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
     analyzed_file_ids: &[FileId],
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
 ) {
     let file_ids = db.get_vfs().get_all_local_file_ids();
     let analyzed_file_ids: HashSet<FileId> = analyzed_file_ids.iter().copied().collect();
@@ -7696,8 +7806,8 @@ fn rebuild_gmod_load_index(
             fallback_masks.insert(*file_id, GmodStateMask::from_realm(realm));
         }
 
-        if let Some((kind, states)) = engine_load_root_for_file(db, *file_id) {
-            mark_load_root(&mut file_infos, *file_id, kind, states);
+        if let Some((kind, states, path_sort_key)) = engine_load_root_for_file(db, *file_id) {
+            mark_load_root(&mut file_infos, *file_id, kind, states, path_sort_key);
         }
     }
 
@@ -7707,7 +7817,7 @@ fn rebuild_gmod_load_index(
         .flat_map(|(_, sites)| sites.iter().cloned())
         .map(|site| resolve_load_dependency_site(db, site))
         .collect::<Vec<_>>();
-    let dynamic_loaders = collect_dynamic_loaders(db, &file_ids);
+    let dynamic_loaders = collect_dynamic_loaders(db, &file_ids, annotated_global_call_roles);
 
     let mut unresolved_edges = Vec::new();
     for _ in 0..file_ids.len().max(1) {
@@ -7738,6 +7848,8 @@ fn rebuild_gmod_load_index(
 
 struct DynamicLoadPattern {
     source_file_id: FileId,
+    result_kind: DynamicFileFindResultKind,
+    glob: DynamicLoadGlob,
     dispatch: DynamicLoadDispatch,
     operations: Vec<DynamicLoadOperation>,
     range: TextRange,
@@ -7746,10 +7858,21 @@ struct DynamicLoadPattern {
 
 struct DynamicFileFindPattern {
     range: TextRange,
-    binding_name: Option<String>,
+    bindings: DynamicFileFindBindings,
     scope: Option<TextRange>,
     glob: DynamicLoadGlob,
-    targets: Vec<(FileId, String)>,
+}
+
+#[derive(Clone, Default)]
+struct DynamicFileFindBindings {
+    files: Option<String>,
+    directories: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DynamicFileFindResultKind {
+    Files,
+    Directories,
 }
 
 enum DynamicFileFindLoopSource {
@@ -7766,6 +7889,7 @@ struct DynamicBindingWrite {
     range: TextRange,
 }
 
+#[derive(Clone)]
 struct DynamicLoadGlob {
     base: String,
     file_prefix: Option<String>,
@@ -7802,6 +7926,12 @@ enum DynamicLoadOperationKind {
 struct DynamicLoadOperation {
     kind: DynamicLoadOperationKind,
     ranges: Vec<TextRange>,
+    path_hints: Vec<DynamicLoadPathHint>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DynamicLoadPathHint {
+    suffix_after_result: String,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -7809,16 +7939,46 @@ struct DynamicLoadAlias {
     dispatch: DynamicLoadDispatch,
     has_addcs: bool,
     has_include: bool,
+    path_arg_idx: Option<usize>,
 }
 
 impl DynamicLoadAlias {
+    fn from_dependency_kind(kind: LuaDependencyKind, path_arg_idx: usize) -> Option<Self> {
+        match kind {
+            LuaDependencyKind::Include => Some(Self {
+                has_include: true,
+                path_arg_idx: Some(path_arg_idx),
+                ..Self::default()
+            }),
+            LuaDependencyKind::AddCSLuaFile => Some(Self {
+                has_addcs: true,
+                path_arg_idx: Some(path_arg_idx),
+                ..Self::default()
+            }),
+            LuaDependencyKind::IncludeCS => Some(Self {
+                has_addcs: true,
+                has_include: true,
+                path_arg_idx: Some(path_arg_idx),
+                ..Self::default()
+            }),
+            LuaDependencyKind::Require => None,
+        }
+    }
+
     fn merge(&mut self, other: Self) {
         self.dispatch.merge(other.dispatch);
         self.has_addcs |= other.has_addcs;
         self.has_include |= other.has_include;
+        if self.path_arg_idx != other.path_arg_idx {
+            self.path_arg_idx = None;
+        }
     }
 
-    fn into_usage_at(self, range: TextRange) -> DynamicLoadUsage {
+    fn into_usage_at(
+        self,
+        range: TextRange,
+        path_hints: Vec<DynamicLoadPathHint>,
+    ) -> DynamicLoadUsage {
         let mut usage = DynamicLoadUsage {
             dispatch: self.dispatch,
             operations: Vec::new(),
@@ -7827,12 +7987,14 @@ impl DynamicLoadAlias {
             usage.operations.push(DynamicLoadOperation {
                 kind: DynamicLoadOperationKind::AddCSLuaFile,
                 ranges: vec![range],
+                path_hints: path_hints.clone(),
             });
         }
         if self.has_include {
             usage.operations.push(DynamicLoadOperation {
                 kind: DynamicLoadOperationKind::Include,
                 ranges: vec![range],
+                path_hints,
             });
         }
         usage
@@ -7862,7 +8024,11 @@ impl DynamicLoadUsage {
     }
 }
 
-fn collect_dynamic_loaders(db: &DbIndex, file_ids: &[FileId]) -> Vec<DynamicLoadPattern> {
+fn collect_dynamic_loaders(
+    db: &DbIndex,
+    file_ids: &[FileId],
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) -> Vec<DynamicLoadPattern> {
     let mut relative_paths_by_parent: HashMap<String, Vec<(FileId, String)>> = HashMap::new();
     for file_id in file_ids {
         let Some(path) = gmod_relative_path(db, *file_id) else {
@@ -7886,39 +8052,72 @@ fn collect_dynamic_loaders(db: &DbIndex, file_ids: &[FileId]) -> Vec<DynamicLoad
         let Some(content) = db.get_vfs().get_file_content(source_file_id) else {
             continue;
         };
-        if !content.contains("file.Find") {
+        let annotated_candidates =
+            annotated_global_call_roles.candidate_call_paths_in_content(content);
+        if !content.contains("gmod.file_find") && !annotated_candidates.has_file_find {
             continue;
         }
 
         let root = tree.get_chunk_node();
+        let annotated_call_roles = AnnotatedGmodCallRoleMap::build(
+            db,
+            *source_file_id,
+            &root,
+            annotated_global_call_roles,
+        );
         let bindings = collect_static_string_bindings(&root);
         let wrappers = collect_dynamic_load_wrappers(&root);
 
-        let file_find_patterns =
-            collect_dynamic_file_find_patterns(&root, &bindings, &relative_paths_by_parent);
+        let file_find_patterns = collect_dynamic_file_find_patterns(
+            db,
+            *source_file_id,
+            &root,
+            &bindings,
+            &annotated_call_roles,
+        );
         if file_find_patterns.is_empty() {
             continue;
         }
 
-        let usages = collect_dynamic_load_usages(&root, &file_find_patterns, &wrappers);
-        for (file_find_pattern, usage) in file_find_patterns.into_iter().zip(usages) {
-            if !usage.has_load_call() {
-                continue;
-            }
-            let mut dispatch = usage.dispatch;
-            dispatch.prefix |= file_find_pattern
-                .glob
-                .file_prefix
-                .as_deref()
-                .is_some_and(is_realm_file_prefix);
+        let usages = collect_dynamic_load_usages(
+            db,
+            *source_file_id,
+            &root,
+            &file_find_patterns,
+            &wrappers,
+            &annotated_call_roles,
+        );
+        for (file_find_pattern, usages) in file_find_patterns.into_iter().zip(usages) {
+            for (result_kind, usage) in usages {
+                if !usage.has_load_call() {
+                    continue;
+                }
+                let targets = dynamic_file_find_targets(
+                    &file_find_pattern.glob,
+                    result_kind,
+                    &usage,
+                    &relative_paths_by_parent,
+                );
+                if targets.is_empty() {
+                    continue;
+                }
+                let mut dispatch = usage.dispatch;
+                dispatch.prefix |= file_find_pattern
+                    .glob
+                    .file_prefix
+                    .as_deref()
+                    .is_some_and(is_realm_file_prefix);
 
-            patterns.push(DynamicLoadPattern {
-                source_file_id: *source_file_id,
-                dispatch,
-                operations: usage.operations,
-                range: file_find_pattern.range,
-                targets: file_find_pattern.targets,
-            });
+                patterns.push(DynamicLoadPattern {
+                    source_file_id: *source_file_id,
+                    result_kind,
+                    glob: file_find_pattern.glob.clone(),
+                    dispatch,
+                    operations: usage.operations,
+                    range: file_find_pattern.range,
+                    targets,
+                });
+            }
         }
     }
 
@@ -7926,24 +8125,36 @@ fn collect_dynamic_loaders(db: &DbIndex, file_ids: &[FileId]) -> Vec<DynamicLoad
 }
 
 fn collect_dynamic_file_find_patterns(
+    db: &DbIndex,
+    file_id: FileId,
     root: &LuaChunk,
     bindings: &HashMap<String, String>,
-    relative_paths_by_parent: &HashMap<String, Vec<(FileId, String)>>,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
 ) -> Vec<DynamicFileFindPattern> {
     let mut patterns = Vec::new();
 
     for call_expr in root.descendants::<LuaCallExpr>() {
-        if call_expr.get_access_path().as_deref() != Some("file.Find") {
+        let Some(call_path) = call_expr.get_access_path() else {
             continue;
-        }
+        };
+        let Some((pattern_arg_idx, search_path_arg_idx)) =
+            annotated_roles.file_find_call(db, file_id, &call_expr, &call_path)
+        else {
+            continue;
+        };
         let Some(args) = call_expr.get_args_list() else {
             continue;
         };
         let args = args.get_args().collect::<Vec<_>>();
-        let Some(pattern_expr) = args.first() else {
+        let Some(pattern_expr) = args.get(pattern_arg_idx) else {
             continue;
         };
-        if args.get(1).and_then(static_literal_string).as_deref() != Some("LUA") {
+        if args
+            .get(search_path_arg_idx)
+            .and_then(static_literal_string)
+            .as_deref()
+            != Some("LUA")
+        {
             continue;
         }
         let Some(pattern) = static_string_expr(pattern_expr, bindings) else {
@@ -7952,23 +8163,12 @@ fn collect_dynamic_file_find_patterns(
         let Some(glob) = lua_file_find_glob(&pattern) else {
             continue;
         };
-        let targets = relative_paths_by_parent
-            .get(&glob.base)
-            .into_iter()
-            .flat_map(|candidate_paths| candidate_paths.iter())
-            .filter(|(_, target_path)| file_find_glob_matches(&glob, target_path))
-            .map(|(target_file_id, target_path)| (*target_file_id, target_path.clone()))
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            continue;
-        }
 
         patterns.push(DynamicFileFindPattern {
             range: call_expr.get_range(),
-            binding_name: file_find_result_binding_name(&call_expr),
+            bindings: file_find_result_bindings(&call_expr),
             scope: enclosing_closure_range(call_expr.syntax()),
             glob,
-            targets,
         });
     }
 
@@ -7976,19 +8176,24 @@ fn collect_dynamic_file_find_patterns(
 }
 
 fn collect_dynamic_load_usages(
+    db: &DbIndex,
+    file_id: FileId,
     root: &LuaChunk,
     file_find_patterns: &[DynamicFileFindPattern],
     wrappers: &HashMap<String, DynamicLoadWrapper>,
-) -> Vec<DynamicLoadUsage> {
-    let inherited_aliases = collect_top_level_dynamic_load_call_aliases(root);
+    annotated_roles: &AnnotatedGmodCallRoleMap,
+) -> Vec<Vec<(DynamicFileFindResultKind, DynamicLoadUsage)>> {
+    let inherited_aliases =
+        collect_top_level_dynamic_load_call_aliases(db, file_id, root, annotated_roles);
     let binding_writes = collect_dynamic_binding_writes(root);
-    let mut usages = vec![DynamicLoadUsage::default(); file_find_patterns.len()];
+    let mut usages = vec![Vec::new(); file_find_patterns.len()];
 
     for for_range in root.descendants::<LuaForRangeStat>() {
-        let Some(source) = dynamic_file_find_loop_source(&for_range) else {
+        let Some(source) = dynamic_file_find_loop_source(db, file_id, &for_range, annotated_roles)
+        else {
             continue;
         };
-        let Some(pattern_idx) = resolve_dynamic_file_find_loop_source(
+        let Some((pattern_idx, result_kind)) = resolve_dynamic_file_find_loop_source(
             &source,
             file_find_patterns,
             &binding_writes,
@@ -8003,16 +8208,38 @@ fn collect_dynamic_load_usages(
             continue;
         };
 
-        usages[pattern_idx].merge(collect_dynamic_load_usage_in_block(
-            &block,
-            HashSet::from([file_name_var]),
-            &wrappers,
-            &inherited_aliases,
-            0,
-        ));
+        merge_dynamic_load_usage(
+            &mut usages[pattern_idx],
+            result_kind,
+            collect_dynamic_load_usage_in_block(
+                &block,
+                HashSet::from([file_name_var]),
+                db,
+                file_id,
+                &wrappers,
+                &inherited_aliases,
+                annotated_roles,
+                0,
+            ),
+        );
     }
 
     usages
+}
+
+fn merge_dynamic_load_usage(
+    usages: &mut Vec<(DynamicFileFindResultKind, DynamicLoadUsage)>,
+    result_kind: DynamicFileFindResultKind,
+    usage: DynamicLoadUsage,
+) {
+    if let Some((_, existing_usage)) = usages
+        .iter_mut()
+        .find(|(existing_kind, _)| *existing_kind == result_kind)
+    {
+        existing_usage.merge(usage);
+    } else {
+        usages.push((result_kind, usage));
+    }
 }
 
 const DYNAMIC_LOAD_WRAPPER_DEPTH_LIMIT: usize = 4;
@@ -8020,8 +8247,11 @@ const DYNAMIC_LOAD_WRAPPER_DEPTH_LIMIT: usize = 4;
 fn collect_dynamic_load_usage_in_block(
     block: &LuaBlock,
     initial_file_name_vars: HashSet<String>,
+    db: &DbIndex,
+    file_id: FileId,
     wrappers: &HashMap<String, DynamicLoadWrapper>,
     inherited_aliases: &HashMap<String, DynamicLoadAlias>,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
     wrapper_depth: usize,
 ) -> DynamicLoadUsage {
     let mut usage = DynamicLoadUsage {
@@ -8034,7 +8264,9 @@ fn collect_dynamic_load_usage_in_block(
     };
     let file_name_vars = collect_dynamic_file_name_vars(block, initial_file_name_vars);
     let mut load_call_aliases = inherited_aliases.clone();
-    for (alias_path, alias_usage) in collect_dynamic_load_call_aliases(block) {
+    for (alias_path, alias_usage) in
+        collect_dynamic_load_call_aliases(db, file_id, block, annotated_roles)
+    {
         merge_dynamic_load_alias(&mut load_call_aliases, alias_path, alias_usage);
     }
 
@@ -8042,13 +8274,16 @@ fn collect_dynamic_load_usage_in_block(
         let Some(path) = call_expr.get_access_path() else {
             continue;
         };
-        if !load_call_references_file_name(&call_expr, &file_name_vars) {
-            continue;
-        }
 
-        if let Some(load_usage) =
-            dynamic_load_usage_for_call_path(&path, &load_call_aliases, call_expr.get_range())
-        {
+        if let Some(load_usage) = dynamic_load_usage_for_call(
+            db,
+            file_id,
+            annotated_roles,
+            &call_expr,
+            &path,
+            &load_call_aliases,
+            &file_name_vars,
+        ) {
             usage.merge(load_usage);
             continue;
         }
@@ -8057,8 +8292,11 @@ fn collect_dynamic_load_usage_in_block(
             usage.merge(collect_dynamic_wrapper_call_usage(
                 &call_expr,
                 &file_name_vars,
+                db,
+                file_id,
                 wrappers,
                 inherited_aliases,
+                annotated_roles,
                 wrapper_depth + 1,
             ));
         }
@@ -8070,8 +8308,11 @@ fn collect_dynamic_load_usage_in_block(
 fn collect_dynamic_wrapper_call_usage(
     call_expr: &LuaCallExpr,
     file_name_vars: &HashSet<String>,
+    db: &DbIndex,
+    file_id: FileId,
     wrappers: &HashMap<String, DynamicLoadWrapper>,
     inherited_aliases: &HashMap<String, DynamicLoadAlias>,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
     wrapper_depth: usize,
 ) -> DynamicLoadUsage {
     let Some(path) = call_expr.get_access_path() else {
@@ -8097,8 +8338,11 @@ fn collect_dynamic_wrapper_call_usage(
     let mut usage = collect_dynamic_load_usage_in_block(
         &wrapper.block,
         wrapper_file_vars,
+        db,
+        file_id,
         wrappers,
         inherited_aliases,
+        annotated_roles,
         wrapper_depth,
     );
     usage.add_context_range(call_expr.get_range());
@@ -8160,7 +8404,10 @@ fn dynamic_load_wrapper_from_closure(closure: LuaClosureExpr) -> Option<DynamicL
 }
 
 fn collect_top_level_dynamic_load_call_aliases(
+    db: &DbIndex,
+    file_id: FileId,
     root: &LuaChunk,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
 ) -> HashMap<String, DynamicLoadAlias> {
     let Some(block) = root.get_block() else {
         return HashMap::new();
@@ -8174,12 +8421,22 @@ fn collect_top_level_dynamic_load_call_aliases(
         for stat in block.get_stats() {
             match stat {
                 LuaStat::LocalStat(local_stat) => {
-                    changed |=
-                        collect_dynamic_load_aliases_from_local_stat(&mut aliases, &local_stat);
+                    changed |= collect_dynamic_load_aliases_from_local_stat(
+                        db,
+                        file_id,
+                        annotated_roles,
+                        &mut aliases,
+                        &local_stat,
+                    );
                 }
                 LuaStat::AssignStat(assign_stat) => {
-                    changed |=
-                        collect_dynamic_load_aliases_from_assign_stat(&mut aliases, &assign_stat);
+                    changed |= collect_dynamic_load_aliases_from_assign_stat(
+                        db,
+                        file_id,
+                        annotated_roles,
+                        &mut aliases,
+                        &assign_stat,
+                    );
                 }
                 _ => {}
             }
@@ -8189,24 +8446,44 @@ fn collect_top_level_dynamic_load_call_aliases(
     aliases
 }
 
-fn collect_dynamic_load_call_aliases(block: &LuaBlock) -> HashMap<String, DynamicLoadAlias> {
+fn collect_dynamic_load_call_aliases(
+    db: &DbIndex,
+    file_id: FileId,
+    block: &LuaBlock,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
+) -> HashMap<String, DynamicLoadAlias> {
     let mut aliases = HashMap::new();
     let mut changed = true;
     while changed {
         changed = false;
 
         for local_stat in block.descendants::<LuaLocalStat>() {
-            changed |= collect_dynamic_load_aliases_from_local_stat(&mut aliases, &local_stat);
+            changed |= collect_dynamic_load_aliases_from_local_stat(
+                db,
+                file_id,
+                annotated_roles,
+                &mut aliases,
+                &local_stat,
+            );
         }
 
         for assign_stat in block.descendants::<LuaAssignStat>() {
-            changed |= collect_dynamic_load_aliases_from_assign_stat(&mut aliases, &assign_stat);
+            changed |= collect_dynamic_load_aliases_from_assign_stat(
+                db,
+                file_id,
+                annotated_roles,
+                &mut aliases,
+                &assign_stat,
+            );
         }
     }
     aliases
 }
 
 fn collect_dynamic_load_aliases_from_local_stat(
+    db: &DbIndex,
+    file_id: FileId,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
     aliases: &mut HashMap<String, DynamicLoadAlias>,
     local_stat: &LuaLocalStat,
 ) -> bool {
@@ -8214,7 +8491,9 @@ fn collect_dynamic_load_aliases_from_local_stat(
     let names = local_stat.get_local_name_list().collect::<Vec<_>>();
     let values = local_stat.get_value_exprs().collect::<Vec<_>>();
     for (idx, value) in values.iter().enumerate() {
-        let Some(load_alias) = dynamic_load_alias_for_expr(value, aliases) else {
+        let Some(load_alias) =
+            dynamic_load_alias_for_expr(db, file_id, annotated_roles, value, aliases)
+        else {
             continue;
         };
         let Some(name) = names
@@ -8230,13 +8509,18 @@ fn collect_dynamic_load_aliases_from_local_stat(
 }
 
 fn collect_dynamic_load_aliases_from_assign_stat(
+    db: &DbIndex,
+    file_id: FileId,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
     aliases: &mut HashMap<String, DynamicLoadAlias>,
     assign_stat: &LuaAssignStat,
 ) -> bool {
     let mut changed = false;
     let (vars_exprs, values) = assign_stat.get_var_and_expr_list();
     for (idx, value) in values.iter().enumerate() {
-        let Some(load_alias) = dynamic_load_alias_for_expr(value, aliases) else {
+        let Some(load_alias) =
+            dynamic_load_alias_for_expr(db, file_id, annotated_roles, value, aliases)
+        else {
             continue;
         };
         let Some(path) = vars_exprs
@@ -8262,6 +8546,7 @@ fn merge_dynamic_load_alias(
             before.has_addcs != existing.has_addcs
                 || before.has_include != existing.has_include
                 || before.dispatch != existing.dispatch
+                || before.path_arg_idx != existing.path_arg_idx
         }
         None => {
             aliases.insert(name, load_alias);
@@ -8271,60 +8556,86 @@ fn merge_dynamic_load_alias(
 }
 
 fn dynamic_load_alias_for_expr(
+    db: &DbIndex,
+    file_id: FileId,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
     expr: &LuaExpr,
     aliases: &HashMap<String, DynamicLoadAlias>,
 ) -> Option<DynamicLoadAlias> {
     match expr {
         LuaExpr::NameExpr(name_expr) => {
             let name = name_expr.get_name_text()?;
-            dynamic_load_alias_for_call_path(name.as_str(), aliases)
+            aliases
+                .get(name.as_str())
+                .copied()
+                .or_else(|| annotated_roles.load_alias_for_reference_expr(db, file_id, expr))
         }
         LuaExpr::IndexExpr(index_expr) => {
             let path = index_expr.get_access_path()?;
-            dynamic_load_alias_for_call_path(&path, aliases)
+            aliases
+                .get(&path)
+                .copied()
+                .or_else(|| annotated_roles.load_alias_for_reference_expr(db, file_id, expr))
         }
-        LuaExpr::ParenExpr(paren_expr) => {
-            dynamic_load_alias_for_expr(&paren_expr.get_expr()?, aliases)
+        LuaExpr::ParenExpr(paren_expr) => dynamic_load_alias_for_expr(
+            db,
+            file_id,
+            annotated_roles,
+            &paren_expr.get_expr()?,
+            aliases,
+        ),
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let op = binary_expr.get_op_token()?.get_op();
+            if !matches!(op, BinaryOperator::OpAnd | BinaryOperator::OpOr) {
+                return None;
+            }
+
+            let (left, right) = binary_expr.get_exprs()?;
+            merge_optional_dynamic_load_alias(
+                dynamic_load_alias_for_expr(db, file_id, annotated_roles, &left, aliases),
+                dynamic_load_alias_for_expr(db, file_id, annotated_roles, &right, aliases),
+            )
         }
         _ => None,
     }
 }
 
-fn dynamic_load_usage_for_call_path(
-    path: &str,
-    aliases: &HashMap<String, DynamicLoadAlias>,
-    range: TextRange,
-) -> Option<DynamicLoadUsage> {
-    dynamic_load_alias_for_call_path(path, aliases).map(|alias| alias.into_usage_at(range))
-}
-
-fn dynamic_load_alias_for_call_path(
-    path: &str,
-    aliases: &HashMap<String, DynamicLoadAlias>,
+fn merge_optional_dynamic_load_alias(
+    left: Option<DynamicLoadAlias>,
+    right: Option<DynamicLoadAlias>,
 ) -> Option<DynamicLoadAlias> {
-    if let Some(alias_usage) = aliases.get(path) {
-        return Some(*alias_usage);
-    }
-
-    match path {
-        "AddCSLuaFile" => Some(DynamicLoadAlias {
-            has_addcs: true,
-            ..DynamicLoadAlias::default()
-        }),
-        "include" => Some(DynamicLoadAlias {
-            has_include: true,
-            ..DynamicLoadAlias::default()
-        }),
-        "IncludeCS" => Some(DynamicLoadAlias {
-            has_addcs: true,
-            has_include: true,
-            ..DynamicLoadAlias::default()
-        }),
-        _ => None,
+    match (left, right) {
+        (Some(mut left), Some(right)) => {
+            left.merge(right);
+            Some(left)
+        }
+        (Some(alias), None) | (None, Some(alias)) => Some(alias),
+        (None, None) => None,
     }
 }
 
-fn file_find_result_binding_name(file_find_call: &LuaCallExpr) -> Option<String> {
+fn dynamic_load_usage_for_call(
+    db: &DbIndex,
+    file_id: FileId,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
+    call_expr: &LuaCallExpr,
+    path: &str,
+    aliases: &HashMap<String, DynamicLoadAlias>,
+    file_name_vars: &HashSet<String>,
+) -> Option<DynamicLoadUsage> {
+    let alias = aliases
+        .get(path)
+        .copied()
+        .or_else(|| annotated_roles.load_alias_for_call(db, file_id, call_expr, path))?;
+    if !load_call_references_file_name(call_expr, file_name_vars, alias.path_arg_idx) {
+        return None;
+    }
+    let path_hints =
+        dynamic_load_path_hints_for_call(call_expr, file_name_vars, alias.path_arg_idx);
+    Some(alias.into_usage_at(call_expr.get_range(), path_hints))
+}
+
+fn file_find_result_bindings(file_find_call: &LuaCallExpr) -> DynamicFileFindBindings {
     let call_range = file_find_call.get_range();
 
     if let Some(local_stat) = file_find_call.ancestors::<LuaLocalStat>().next() {
@@ -8333,11 +8644,17 @@ fn file_find_result_binding_name(file_find_call: &LuaCallExpr) -> Option<String>
             .iter()
             .position(|expr| expr.get_range() == call_range)
         {
-            return local_stat
-                .get_local_name_list()
-                .nth(idx)
-                .and_then(|name| name.get_name_token())
-                .map(|token| token.get_name_text().to_string());
+            let names = local_stat.get_local_name_list().collect::<Vec<_>>();
+            return file_find_bindings_from_names(
+                names
+                    .iter()
+                    .filter_map(|name| name.get_name_token())
+                    .map(|token| token.get_name_text().to_string())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                idx,
+                idx + 1 == values.len(),
+            );
         }
     }
 
@@ -8346,15 +8663,50 @@ fn file_find_result_binding_name(file_find_call: &LuaCallExpr) -> Option<String>
         if let Some(idx) = values
             .iter()
             .position(|expr| expr.get_range() == call_range)
-            && let Some(LuaVarExpr::NameExpr(name_expr)) = vars.get(idx)
         {
-            return name_expr
-                .get_name_text()
-                .map(|name| name.as_str().to_string());
+            let names = vars
+                .iter()
+                .map(|var_expr| match var_expr {
+                    LuaVarExpr::NameExpr(name_expr) => name_expr
+                        .get_name_text()
+                        .map(|name| name.as_str().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            return file_find_bindings_from_optional_names(&names, idx, idx + 1 == values.len());
         }
     }
 
-    None
+    DynamicFileFindBindings::default()
+}
+
+fn file_find_bindings_from_names(
+    names: &[String],
+    value_idx: usize,
+    value_can_return_multiple: bool,
+) -> DynamicFileFindBindings {
+    let optional_names = names
+        .iter()
+        .map(|name| Some(name.clone()))
+        .collect::<Vec<_>>();
+    file_find_bindings_from_optional_names(&optional_names, value_idx, value_can_return_multiple)
+}
+
+fn file_find_bindings_from_optional_names(
+    names: &[Option<String>],
+    value_idx: usize,
+    value_can_return_multiple: bool,
+) -> DynamicFileFindBindings {
+    DynamicFileFindBindings {
+        files: names.get(value_idx).and_then(binding_name),
+        directories: value_can_return_multiple
+            .then(|| names.get(value_idx + 1).and_then(binding_name))
+            .flatten(),
+    }
+}
+
+fn binding_name(name: &Option<String>) -> Option<String> {
+    name.as_ref().filter(|name| name.as_str() != "_").cloned()
 }
 
 fn enclosing_closure_range(node: &LuaSyntaxNode) -> Option<TextRange> {
@@ -8374,9 +8726,17 @@ fn for_range_file_name_var(for_range: &LuaForRangeStat) -> Option<String> {
         .last()
 }
 
-fn dynamic_file_find_loop_source(for_range: &LuaForRangeStat) -> Option<DynamicFileFindLoopSource> {
+fn dynamic_file_find_loop_source(
+    db: &DbIndex,
+    file_id: FileId,
+    for_range: &LuaForRangeStat,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
+) -> Option<DynamicFileFindLoopSource> {
     let exprs = for_range.get_expr_list().collect::<Vec<_>>();
-    if let Some(range) = exprs.iter().find_map(file_find_call_range_in_iterator_expr) {
+    if let Some(range) = exprs
+        .iter()
+        .find_map(|expr| file_find_call_range_in_iterator_expr(db, file_id, annotated_roles, expr))
+    {
         return Some(DynamicFileFindLoopSource::Direct(range));
     }
 
@@ -8389,24 +8749,34 @@ fn dynamic_file_find_loop_source(for_range: &LuaForRangeStat) -> Option<DynamicF
         })
 }
 
-fn file_find_call_range_in_iterator_expr(expr: &LuaExpr) -> Option<TextRange> {
+fn file_find_call_range_in_iterator_expr(
+    db: &DbIndex,
+    file_id: FileId,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
+    expr: &LuaExpr,
+) -> Option<TextRange> {
     match expr {
         LuaExpr::CallExpr(call_expr) => {
             let path = call_expr.get_access_path()?;
-            if path == "file.Find" {
+            if annotated_roles
+                .file_find_call(db, file_id, call_expr, &path)
+                .is_some()
+            {
                 return Some(call_expr.get_range());
             }
             if !file_find_result_iterator_path(&path) {
                 return None;
             }
-            call_expr
-                .get_args_list()?
-                .get_args()
-                .find_map(|arg| file_find_call_range_in_iterator_expr(&arg))
+            call_expr.get_args_list()?.get_args().find_map(|arg| {
+                file_find_call_range_in_iterator_expr(db, file_id, annotated_roles, &arg)
+            })
         }
-        LuaExpr::ParenExpr(paren_expr) => {
-            file_find_call_range_in_iterator_expr(&paren_expr.get_expr()?)
-        }
+        LuaExpr::ParenExpr(paren_expr) => file_find_call_range_in_iterator_expr(
+            db,
+            file_id,
+            annotated_roles,
+            &paren_expr.get_expr()?,
+        ),
         _ => None,
     }
 }
@@ -8436,28 +8806,37 @@ fn resolve_dynamic_file_find_loop_source(
     file_find_patterns: &[DynamicFileFindPattern],
     binding_writes: &[DynamicBindingWrite],
     loop_start: TextSize,
-) -> Option<usize> {
+) -> Option<(usize, DynamicFileFindResultKind)> {
     match source {
         DynamicFileFindLoopSource::Direct(range) => file_find_patterns
             .iter()
-            .position(|pattern| pattern.range == *range),
+            .position(|pattern| pattern.range == *range)
+            .map(|idx| (idx, DynamicFileFindResultKind::Files)),
         DynamicFileFindLoopSource::Binding { name, scope } => file_find_patterns
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, pattern)| {
-                pattern.binding_name.as_deref() == Some(name.as_str())
-                    && pattern.scope == *scope
-                    && pattern.range.end() < loop_start
-                    && !binding_written_between(
+            .find_map(|(idx, pattern)| {
+                if pattern.scope != *scope
+                    || pattern.range.end() >= loop_start
+                    || binding_written_between(
                         binding_writes,
                         name,
                         pattern.range.end(),
                         loop_start,
                         *scope,
                     )
-            })
-            .map(|(idx, _)| idx),
+                {
+                    return None;
+                }
+                if pattern.bindings.files.as_deref() == Some(name.as_str()) {
+                    return Some((idx, DynamicFileFindResultKind::Files));
+                }
+                if pattern.bindings.directories.as_deref() == Some(name.as_str()) {
+                    return Some((idx, DynamicFileFindResultKind::Directories));
+                }
+                None
+            }),
     }
 }
 
@@ -8598,11 +8977,122 @@ fn collect_dynamic_file_name_vars(
 fn load_call_references_file_name(
     call_expr: &LuaCallExpr,
     file_name_vars: &HashSet<String>,
+    path_arg_idx: Option<usize>,
 ) -> bool {
-    call_expr.get_args_list().is_some_and(|args| {
-        args.get_args()
-            .any(|arg| expr_references_any_name(&arg, file_name_vars))
+    dynamic_load_path_arg_exprs(call_expr, path_arg_idx)
+        .iter()
+        .any(|arg| expr_references_any_name(arg, file_name_vars))
+}
+
+fn dynamic_load_path_hints_for_call(
+    call_expr: &LuaCallExpr,
+    file_name_vars: &HashSet<String>,
+    path_arg_idx: Option<usize>,
+) -> Vec<DynamicLoadPathHint> {
+    dynamic_load_path_arg_exprs(call_expr, path_arg_idx)
+        .iter()
+        .filter_map(|arg| dynamic_load_path_hint_for_expr(&arg, file_name_vars))
+        .collect()
+}
+
+fn dynamic_load_path_arg_exprs(
+    call_expr: &LuaCallExpr,
+    path_arg_idx: Option<usize>,
+) -> Vec<LuaExpr> {
+    let Some(args) = call_expr.get_args_list() else {
+        return Vec::new();
+    };
+    let args = args.get_args().collect::<Vec<_>>();
+    if let Some(path_arg_idx) = path_arg_idx {
+        args.get(path_arg_idx).cloned().into_iter().collect()
+    } else {
+        args
+    }
+}
+
+enum DynamicPathPart {
+    Static(String),
+    ResultName,
+    Other,
+}
+
+fn dynamic_load_path_hint_for_expr(
+    expr: &LuaExpr,
+    file_name_vars: &HashSet<String>,
+) -> Option<DynamicLoadPathHint> {
+    if let LuaExpr::NameExpr(name_expr) = expr
+        && name_expr
+            .get_name_text()
+            .is_some_and(|name| file_name_vars.contains(name.as_str()))
+    {
+        return Some(DynamicLoadPathHint {
+            suffix_after_result: String::new(),
+        });
+    }
+
+    let mut parts = Vec::new();
+    flatten_dynamic_path_expr(expr, file_name_vars, &mut parts)?;
+    let result_idx = parts
+        .iter()
+        .position(|part| matches!(part, DynamicPathPart::ResultName))?;
+
+    let mut suffix = String::new();
+    for part in &parts[result_idx + 1..] {
+        match part {
+            DynamicPathPart::Static(value) => suffix.push_str(value),
+            DynamicPathPart::ResultName | DynamicPathPart::Other => return None,
+        }
+    }
+
+    Some(DynamicLoadPathHint {
+        suffix_after_result: normalize_dynamic_path_suffix(&suffix),
     })
+}
+
+fn flatten_dynamic_path_expr(
+    expr: &LuaExpr,
+    file_name_vars: &HashSet<String>,
+    parts: &mut Vec<DynamicPathPart>,
+) -> Option<()> {
+    match expr {
+        LuaExpr::LiteralExpr(_) => {
+            parts.push(DynamicPathPart::Static(static_literal_string(expr)?));
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let Some(name) = name_expr.get_name_text() else {
+                parts.push(DynamicPathPart::Other);
+                return Some(());
+            };
+            if file_name_vars.contains(name.as_str()) {
+                parts.push(DynamicPathPart::ResultName);
+            } else {
+                parts.push(DynamicPathPart::Other);
+            }
+        }
+        LuaExpr::ParenExpr(paren_expr) => {
+            flatten_dynamic_path_expr(&paren_expr.get_expr()?, file_name_vars, parts)?;
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpConcat {
+                parts.push(DynamicPathPart::Other);
+                return Some(());
+            }
+            let (left, right) = binary_expr.get_exprs()?;
+            flatten_dynamic_path_expr(&left, file_name_vars, parts)?;
+            flatten_dynamic_path_expr(&right, file_name_vars, parts)?;
+        }
+        _ => parts.push(DynamicPathPart::Other),
+    }
+    Some(())
+}
+
+fn normalize_dynamic_path_suffix(suffix: &str) -> String {
+    let suffix = suffix.replace('\\', "/").to_ascii_lowercase();
+    if suffix.is_empty() || suffix.starts_with('/') {
+        suffix
+    } else {
+        format!("/{suffix}")
+    }
 }
 
 fn expr_references_any_name(expr: &LuaExpr, expected_names: &HashSet<String>) -> bool {
@@ -8727,7 +9217,43 @@ fn normalize_dynamic_lua_path(path: &str) -> String {
         .to_string()
 }
 
-fn file_find_glob_matches(glob: &DynamicLoadGlob, target_path: &str) -> bool {
+fn dynamic_file_find_targets(
+    glob: &DynamicLoadGlob,
+    result_kind: DynamicFileFindResultKind,
+    usage: &DynamicLoadUsage,
+    relative_paths_by_parent: &HashMap<String, Vec<(FileId, String)>>,
+) -> Vec<(FileId, String)> {
+    match result_kind {
+        DynamicFileFindResultKind::Files => relative_paths_by_parent
+            .get(&glob.base)
+            .into_iter()
+            .flat_map(|candidate_paths| candidate_paths.iter())
+            .filter(|(_, target_path)| file_find_file_glob_matches(glob, target_path))
+            .map(|(target_file_id, target_path)| (*target_file_id, target_path.clone()))
+            .collect(),
+        DynamicFileFindResultKind::Directories => {
+            let suffixes = usage
+                .operations
+                .iter()
+                .flat_map(|operation| operation.path_hints.iter())
+                .map(|hint| hint.suffix_after_result.as_str())
+                .filter(|suffix| !suffix.is_empty())
+                .collect::<HashSet<_>>();
+            if suffixes.is_empty() {
+                return Vec::new();
+            }
+
+            suffixes
+                .into_iter()
+                .flat_map(|suffix| {
+                    file_find_directory_targets(glob, suffix, relative_paths_by_parent)
+                })
+                .collect()
+        }
+    }
+}
+
+fn file_find_file_glob_matches(glob: &DynamicLoadGlob, target_path: &str) -> bool {
     let rest = if glob.base.is_empty() {
         target_path
     } else {
@@ -8745,6 +9271,86 @@ fn file_find_glob_matches(glob: &DynamicLoadGlob, target_path: &str) -> bool {
     glob.file_prefix
         .as_deref()
         .is_none_or(|prefix| rest.starts_with(prefix))
+}
+
+fn file_find_directory_glob_matches(
+    glob: &DynamicLoadGlob,
+    target_path: &str,
+    suffix_after_result: &str,
+) -> bool {
+    let rest = if glob.base.is_empty() {
+        target_path
+    } else {
+        let Some(rest) = target_path.strip_prefix(&glob.base) else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix('/') else {
+            return false;
+        };
+        rest
+    };
+    let Some((directory_name, path_inside_directory)) = rest.split_once('/') else {
+        return false;
+    };
+    if directory_name.is_empty() || path_inside_directory.is_empty() {
+        return false;
+    }
+    glob.file_prefix
+        .as_deref()
+        .is_none_or(|prefix| directory_name.starts_with(prefix))
+        && suffix_after_result.trim_start_matches('/') == path_inside_directory
+}
+
+fn file_find_directory_targets(
+    glob: &DynamicLoadGlob,
+    suffix_after_result: &str,
+    relative_paths_by_parent: &HashMap<String, Vec<(FileId, String)>>,
+) -> Vec<(FileId, String)> {
+    let suffix = suffix_after_result.trim_start_matches('/');
+    let (suffix_parent, suffix_file_name) = suffix.rsplit_once('/').unwrap_or(("", suffix));
+    if suffix_file_name.is_empty() {
+        return Vec::new();
+    }
+
+    relative_paths_by_parent
+        .iter()
+        .filter(|(parent, _)| file_find_directory_parent_matches(glob, parent, suffix_parent))
+        .flat_map(|(_, candidates)| candidates.iter())
+        .filter(|(_, target_path)| {
+            target_path
+                .rsplit_once('/')
+                .map(|(_, file_name)| file_name == suffix_file_name)
+                .unwrap_or(false)
+        })
+        .map(|(target_file_id, target_path)| (*target_file_id, target_path.clone()))
+        .collect()
+}
+
+fn file_find_directory_parent_matches(
+    glob: &DynamicLoadGlob,
+    parent: &str,
+    suffix_parent: &str,
+) -> bool {
+    let rest = if glob.base.is_empty() {
+        parent
+    } else {
+        let Some(rest) = parent.strip_prefix(&glob.base) else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix('/') else {
+            return false;
+        };
+        rest
+    };
+
+    let (directory_name, path_inside_directory) = rest.split_once('/').unwrap_or((rest, ""));
+    if directory_name.is_empty() {
+        return false;
+    }
+    glob.file_prefix
+        .as_deref()
+        .is_none_or(|prefix| directory_name.starts_with(prefix))
+        && path_inside_directory == suffix_parent
 }
 
 fn apply_dynamic_loaders(
@@ -8775,6 +9381,9 @@ fn apply_dynamic_loaders(
 
         for (target_file_id, target_path) in &loader.targets {
             for (operation, source_states) in &operation_source_states {
+                if !dynamic_operation_matches_target(target_path, loader, operation) {
+                    continue;
+                }
                 let target_states =
                     dynamic_operation_target_states(target_path, *source_states, loader, operation);
                 if target_states.is_empty() {
@@ -8793,7 +9402,7 @@ fn apply_dynamic_loaders(
                     kind: dynamic_load_edge_kind(operation.kind),
                     states: target_states,
                     path: Some(target_path.clone()),
-                    original_expr: Some("file.Find".to_string()),
+                    original_expr: Some("gmod.file_find".to_string()),
                     range: operation.ranges.first().copied().or(Some(loader.range)),
                 });
                 changed |= target_info.mark_states(
@@ -8805,6 +9414,24 @@ fn apply_dynamic_loaders(
         }
     }
     changed
+}
+
+fn dynamic_operation_matches_target(
+    target_path: &str,
+    loader: &DynamicLoadPattern,
+    operation: &DynamicLoadOperation,
+) -> bool {
+    match loader.result_kind {
+        DynamicFileFindResultKind::Files => true,
+        DynamicFileFindResultKind::Directories => operation.path_hints.iter().any(|hint| {
+            !hint.suffix_after_result.is_empty()
+                && file_find_directory_glob_matches(
+                    &loader.glob,
+                    target_path,
+                    &hint.suffix_after_result,
+                )
+        }),
+    }
 }
 
 fn source_states_for_dynamic_operation(
@@ -8850,7 +9477,7 @@ fn dynamic_operation_target_states(
     loader: &DynamicLoadPattern,
     operation: &DynamicLoadOperation,
 ) -> GmodStateMask {
-    let Some(dispatch_states) = dynamic_target_dispatch_states(target_path, loader.dispatch) else {
+    let Some(dispatch_states) = dynamic_target_dispatch_states(target_path, loader) else {
         return match operation.kind {
             DynamicLoadOperationKind::Include => source_states,
             DynamicLoadOperationKind::AddCSLuaFile => GmodStateMask::CLIENT,
@@ -8878,8 +9505,9 @@ fn dynamic_load_edge_kind(kind: DynamicLoadOperationKind) -> GmodLoadEdgeKind {
 
 fn dynamic_target_dispatch_states(
     target_path: &str,
-    dispatch: DynamicLoadDispatch,
+    loader: &DynamicLoadPattern,
 ) -> Option<GmodStateMask> {
+    let dispatch = loader.dispatch;
     let file_name = target_path.rsplit('/').next().unwrap_or(target_path);
 
     if dispatch.prefix {
@@ -8894,6 +9522,12 @@ fn dynamic_target_dispatch_states(
         }
     }
 
+    if dispatch.folder {
+        if let Some(states) = dynamic_target_folder_dispatch_states(target_path, loader) {
+            return Some(states);
+        }
+    }
+
     if dispatch.entrypoint {
         match file_name {
             "cl_init.lua" => return Some(GmodStateMask::CLIENT),
@@ -8903,12 +9537,34 @@ fn dynamic_target_dispatch_states(
         }
     }
 
-    dispatch.folder.then(|| {
-        target_path
+    None
+}
+
+fn dynamic_target_folder_dispatch_states(
+    target_path: &str,
+    loader: &DynamicLoadPattern,
+) -> Option<GmodStateMask> {
+    if loader.result_kind == DynamicFileFindResultKind::Files {
+        if let Some(states) = loader
+            .glob
+            .base
             .rsplit('/')
-            .skip(1)
-            .find_map(realm_folder_states)
-    })?
+            .next()
+            .and_then(realm_folder_states)
+        {
+            return Some(states);
+        }
+    }
+
+    let glob = &loader.glob;
+    let rest = if glob.base.is_empty() {
+        target_path
+    } else {
+        let rest = target_path.strip_prefix(&glob.base)?;
+        rest.strip_prefix('/')?
+    };
+
+    realm_folder_states(rest.split('/').next()?)
 }
 
 fn realm_folder_states(segment: &str) -> Option<GmodStateMask> {
@@ -8993,6 +9649,7 @@ fn mark_load_root(
     file_id: FileId,
     kind: GmodLoadRootKind,
     states: GmodStateMask,
+    path_sort_key: String,
 ) {
     let info = file_infos
         .entry(file_id)
@@ -9002,7 +9659,11 @@ fn mark_load_root(
         GmodLoadStatus::EngineLoaded,
         GmodLoadConfidence::Engine,
     );
-    info.add_root(GmodLoadRoot { kind, states });
+    info.add_root(GmodLoadRoot {
+        kind,
+        states,
+        path_sort_key,
+    });
 }
 
 fn source_states_for_load_site(
@@ -9128,9 +9789,9 @@ fn apply_load_site(
 fn engine_load_root_for_file(
     db: &DbIndex,
     file_id: FileId,
-) -> Option<(GmodLoadRootKind, GmodStateMask)> {
+) -> Option<(GmodLoadRootKind, GmodStateMask, String)> {
     let rel_path = gmod_relative_path(db, file_id)?;
-    engine_load_root_for_relative_path(&rel_path)
+    engine_load_root_for_relative_path(&rel_path).map(|(kind, states)| (kind, states, rel_path))
 }
 
 fn engine_load_root_for_relative_path(rel_path: &str) -> Option<(GmodLoadRootKind, GmodStateMask)> {

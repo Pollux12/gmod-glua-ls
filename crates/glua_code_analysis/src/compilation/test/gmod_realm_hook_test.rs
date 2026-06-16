@@ -2,8 +2,8 @@
 mod test {
     use crate::{
         DiagnosticCode, Emmyrc, EmmyrcGmodRealm, FileId, GmodConVarKind, GmodHookKind,
-        GmodHookNameIssue, GmodLoadStatus, GmodRealm, GmodStateMask, GmodTimerKind,
-        VirtualWorkspace,
+        GmodHookNameIssue, GmodLoadRootKind, GmodLoadStatus, GmodRealm, GmodStateMask,
+        GmodTimerKind, VirtualWorkspace,
     };
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
@@ -2689,6 +2689,171 @@ mod test {
     }
 
     #[gtest]
+    fn test_load_index_engine_roots_follow_documented_client_order() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        ws.def_file("lua/includes/init.lua", "return true");
+        ws.def_file("lua/derma/init.lua", "return true");
+        ws.def_file("lua/autorun/sh_boot.lua", "return true");
+        ws.def_file("lua/autorun/client/cl_boot.lua", "return true");
+        ws.def_file("lua/postprocess/bloom.lua", "return true");
+        ws.def_file("lua/vgui/dpanel.lua", "return true");
+        ws.def_file("lua/matproxy/player_color.lua", "return true");
+        ws.def_file("lua/skins/default.lua", "return true");
+        ws.def_file("gamemodes/example/gamemode/cl_init.lua", "return true");
+        ws.def_file("lua/weapons/example_weapon.lua", "return true");
+        ws.def_file(
+            "gamemodes/example/entities/weapons/gmod_tool/stools/rope.lua",
+            "return true",
+        );
+        ws.def_file("lua/entities/example_ent.lua", "return true");
+        ws.def_file("lua/effects/spark.lua", "return true");
+
+        let ordered_kinds = ws
+            .get_db_mut()
+            .get_gmod_load_index()
+            .engine_roots_in_load_order(GmodStateMask::CLIENT)
+            .into_iter()
+            .map(|(_, kind, _)| kind)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered_kinds,
+            vec![
+                GmodLoadRootKind::IncludesInit,
+                GmodLoadRootKind::DermaInit,
+                GmodLoadRootKind::Autorun,
+                GmodLoadRootKind::AutorunClient,
+                GmodLoadRootKind::PostProcess,
+                GmodLoadRootKind::Vgui,
+                GmodLoadRootKind::MatProxy,
+                GmodLoadRootKind::Skin,
+                GmodLoadRootKind::GamemodeClientInit,
+                GmodLoadRootKind::ScriptedWeapon,
+                GmodLoadRootKind::Stool,
+                GmodLoadRootKind::ScriptedEntity,
+                GmodLoadRootKind::ScriptedEffect,
+            ],
+        );
+    }
+
+    #[gtest]
+    fn test_load_index_engine_roots_follow_documented_server_order() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        ws.def_file("lua/includes/init.lua", "return true");
+        ws.def_file("lua/autorun/sh_boot.lua", "return true");
+        ws.def_file("lua/autorun/server/sv_boot.lua", "return true");
+        ws.def_file("gamemodes/example/gamemode/init.lua", "return true");
+        ws.def_file("lua/weapons/example_weapon.lua", "return true");
+        ws.def_file(
+            "gamemodes/example/entities/weapons/gmod_tool/stools/rope.lua",
+            "return true",
+        );
+        ws.def_file("lua/entities/example_ent.lua", "return true");
+        ws.def_file("lua/effects/spark.lua", "return true");
+
+        let ordered_kinds = ws
+            .get_db_mut()
+            .get_gmod_load_index()
+            .engine_roots_in_load_order(GmodStateMask::SERVER)
+            .into_iter()
+            .map(|(_, kind, _)| kind)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered_kinds,
+            vec![
+                GmodLoadRootKind::IncludesInit,
+                GmodLoadRootKind::Autorun,
+                GmodLoadRootKind::AutorunServer,
+                GmodLoadRootKind::GamemodeInit,
+                GmodLoadRootKind::ScriptedWeapon,
+                GmodLoadRootKind::Stool,
+                GmodLoadRootKind::ScriptedEntity,
+                GmodLoadRootKind::ScriptedEffect,
+            ],
+        );
+    }
+
+    #[gtest]
+    fn test_load_index_autorun_roots_are_alphabetical_within_load_phase() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        ws.def_file("lua/autorun/z_last.lua", "return true");
+        ws.def_file("lua/autorun/a_first.lua", "return true");
+        ws.def_file("lua/autorun/m_middle.lua", "return true");
+
+        let ordered_paths = ws
+            .get_db_mut()
+            .get_gmod_load_index()
+            .engine_roots_in_load_order(GmodStateMask::CLIENT)
+            .into_iter()
+            .map(|(_, _, key)| key.path_sort_key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered_paths,
+            vec![
+                "autorun/a_first.lua".to_string(),
+                "autorun/m_middle.lua".to_string(),
+                "autorun/z_last.lua".to_string(),
+            ],
+        );
+    }
+
+    #[gtest]
+    fn test_load_index_engine_roots_place_base_gamemode_before_autorun() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        ws.def_file("lua/includes/init.lua", "return true");
+        ws.def_file("lua/derma/init.lua", "return true");
+        ws.def_file("gamemodes/base/gamemode/init.lua", "return true");
+        ws.def_file("gamemodes/base/gamemode/cl_init.lua", "return true");
+        ws.def_file("lua/autorun/sh_boot.lua", "return true");
+        ws.def_file("gamemodes/example/gamemode/init.lua", "return true");
+        ws.def_file("gamemodes/example/gamemode/cl_init.lua", "return true");
+
+        let db = ws.get_db_mut();
+        let server_paths = db
+            .get_gmod_load_index()
+            .engine_roots_in_load_order(GmodStateMask::SERVER)
+            .into_iter()
+            .map(|(_, _, key)| key.path_sort_key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            server_paths,
+            vec![
+                "includes/init.lua".to_string(),
+                "gamemodes/base/gamemode/init.lua".to_string(),
+                "autorun/sh_boot.lua".to_string(),
+                "gamemodes/example/gamemode/init.lua".to_string(),
+            ],
+        );
+
+        let client_paths = db
+            .get_gmod_load_index()
+            .engine_roots_in_load_order(GmodStateMask::CLIENT)
+            .into_iter()
+            .map(|(_, _, key)| key.path_sort_key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            client_paths,
+            vec![
+                "includes/init.lua".to_string(),
+                "derma/init.lua".to_string(),
+                "gamemodes/base/gamemode/cl_init.lua".to_string(),
+                "autorun/sh_boot.lua".to_string(),
+                "gamemodes/example/gamemode/cl_init.lua".to_string(),
+            ],
+        );
+    }
+
+    #[gtest]
     fn test_load_index_dynamic_file_find_prefix_dispatch_loader() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -2869,6 +3034,41 @@ mod test {
     }
 
     #[gtest]
+    fn test_load_index_dynamic_loader_uses_annotations_not_hardcoded_names() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let target_id = ws.def_file("lua/myaddon/shared_config.lua", "return true");
+        ws.def_file(
+            "lua/autorun/server/sv_loader.lua",
+            r#"
+            ---@[call_arg("gmod.file_find", "glob")]
+            ---@param pattern string
+            ---@[call_arg("gmod.file_find", "search_path")]
+            ---@param search_path string
+            function DiscoverLua(pattern, search_path) end
+
+            ---@[call_arg("gmod.load", "include")]
+            ---@param path string
+            function LoadLua(path) end
+
+            local files = DiscoverLua("myaddon/*.lua", "LUA")
+            for _, file_name in ipairs(files) do
+                LoadLua("myaddon/" .. file_name)
+            end
+            "#,
+        );
+
+        expect_dynamic_load_info(
+            &mut ws,
+            target_id,
+            GmodStateMask::SERVER,
+            false,
+            GmodRealm::Server,
+        );
+    }
+
+    #[gtest]
     fn test_load_index_dynamic_file_find_path_alias_loader() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -2934,6 +3134,55 @@ mod test {
             end
             for _, file_name in ipairs(file.Find("myaddon/shared/*.lua", "LUA")) do
                 load_realm_file("shared", file_name)
+            end
+            "#,
+        );
+
+        expect_dynamic_load_info(
+            &mut ws,
+            client_id,
+            GmodStateMask::CLIENT,
+            true,
+            GmodRealm::Client,
+        );
+        expect_dynamic_load_info(
+            &mut ws,
+            server_id,
+            GmodStateMask::SERVER,
+            false,
+            GmodRealm::Server,
+        );
+        expect_dynamic_load_info(
+            &mut ws,
+            shared_id,
+            GmodStateMask::SHARED,
+            true,
+            GmodRealm::Shared,
+        );
+    }
+
+    #[gtest]
+    fn test_load_index_dynamic_file_find_folder_dispatch_beats_nested_entrypoint_name() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let client_id = ws.def_file("lua/myaddon/modules/client/init.lua", "return true");
+        let server_id = ws.def_file("lua/myaddon/modules/server/shared/init.lua", "return true");
+        let shared_id = ws.def_file("lua/myaddon/modules/shared/init.lua", "return true");
+        ws.def_file(
+            "lua/autorun/server/sv_loader.lua",
+            r#"
+            local root = "myaddon/modules"
+            local _, folders = file.Find(root .. "/*", "LUA")
+            for _, realm in ipairs(folders) do
+                if realm == "client" then
+                    AddCSLuaFile(root .. "/" .. realm .. "/init.lua")
+                elseif realm == "server" then
+                    include(root .. "/" .. realm .. "/shared/init.lua")
+                elseif realm == "shared" then
+                    AddCSLuaFile(root .. "/" .. realm .. "/init.lua")
+                    include(root .. "/" .. realm .. "/init.lua")
+                end
             end
             "#,
         );
@@ -3066,6 +3315,44 @@ mod test {
     }
 
     #[gtest]
+    fn test_load_index_dynamic_file_find_conditional_loader_alias_uses_prefix_dispatch() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let server_id = ws.def_file("lua/myaddon/sv_store.lua", "return true");
+        let client_id = ws.def_file("lua/myaddon/cl_hud.lua", "return true");
+        ws.def_file(
+            "lua/autorun/server/sv_loader.lua",
+            r#"
+            local function load_file(file_name)
+                local path = "myaddon/" .. file_name
+                local load = string.StartWith(file_name, "cl_") and AddCSLuaFile or include
+                load(path)
+            end
+
+            for _, file_name in ipairs(file.Find("myaddon/*.lua", "LUA")) do
+                load_file(file_name)
+            end
+            "#,
+        );
+
+        expect_dynamic_load_info(
+            &mut ws,
+            server_id,
+            GmodStateMask::SERVER,
+            false,
+            GmodRealm::Server,
+        );
+        expect_dynamic_load_info(
+            &mut ws,
+            client_id,
+            GmodStateMask::CLIENT,
+            true,
+            GmodRealm::Client,
+        );
+    }
+
+    #[gtest]
     fn test_load_index_dynamic_file_find_includecs_loader() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -3136,6 +3423,62 @@ mod test {
             true,
             GmodRealm::Shared,
         );
+    }
+
+    #[gtest]
+    fn test_load_index_dynamic_file_find_plugin_folder_entrypoint_loader() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let shared_id = ws.def_file("lua/helix/plugins/chatbox/sh_plugin.lua", "return true");
+        let server_id = ws.def_file("lua/helix/plugins/chatbox/sv_plugin.lua", "return true");
+        let client_id = ws.def_file("lua/helix/plugins/chatbox/cl_plugin.lua", "return true");
+        let extra_id = ws.def_file("lua/helix/plugins/chatbox/sh_commands.lua", "return true");
+        ws.def_file(
+            "lua/autorun/server/sv_plugin_loader.lua",
+            r#"
+            local plugin_root = "helix/plugins"
+            local _, folders = file.Find(plugin_root .. "/*", "LUA")
+            for _, plugin in SortedPairs(folders) do
+                AddCSLuaFile(plugin_root .. "/" .. plugin .. "/sh_plugin.lua")
+                include(plugin_root .. "/" .. plugin .. "/sh_plugin.lua")
+                AddCSLuaFile(plugin_root .. "/" .. plugin .. "/cl_plugin.lua")
+                if SERVER then
+                    include(plugin_root .. "/" .. plugin .. "/sv_plugin.lua")
+                end
+            end
+            "#,
+        );
+
+        expect_dynamic_load_info(
+            &mut ws,
+            shared_id,
+            GmodStateMask::SHARED,
+            true,
+            GmodRealm::Shared,
+        );
+        expect_dynamic_load_info(
+            &mut ws,
+            server_id,
+            GmodStateMask::SERVER,
+            false,
+            GmodRealm::Server,
+        );
+        expect_dynamic_load_info(
+            &mut ws,
+            client_id,
+            GmodStateMask::CLIENT,
+            true,
+            GmodRealm::Client,
+        );
+
+        let db = ws.get_db_mut();
+        let extra_info = db
+            .get_gmod_load_index()
+            .get_file_info(&extra_id)
+            .expect("extra plugin file should still have load info");
+        assert_eq!(extra_info.status, GmodLoadStatus::NoKnownLoadPath);
+        assert_that!(extra_info.state_mask.is_empty(), eq(true));
     }
 
     #[gtest]

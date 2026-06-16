@@ -149,6 +149,12 @@ pub enum GmodLoadRootKind {
     FallbackDefault,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GmodLoadOrderKey {
+    pub phase: u16,
+    pub path_sort_key: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GmodLoadEdgeKind {
     Include,
@@ -177,6 +183,7 @@ impl From<LuaDependencyKind> for GmodLoadEdgeKind {
 pub struct GmodLoadRoot {
     pub kind: GmodLoadRootKind,
     pub states: GmodStateMask,
+    pub path_sort_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +279,46 @@ impl GmodLoadIndex {
         &self.unresolved_edges
     }
 
+    pub fn engine_roots_in_load_order(
+        &self,
+        state: GmodStateMask,
+    ) -> Vec<(FileId, GmodLoadRootKind, GmodLoadOrderKey)> {
+        let mut roots = self
+            .file_infos
+            .iter()
+            .flat_map(|(file_id, info)| {
+                info.roots.iter().filter_map(|root| {
+                    if !root.states.intersects(state) {
+                        return None;
+                    }
+                    let phase = root.kind.load_order_phase(state, &root.path_sort_key)?;
+                    Some((
+                        *file_id,
+                        root.kind,
+                        GmodLoadOrderKey {
+                            phase,
+                            path_sort_key: root.path_sort_key.clone(),
+                        },
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        roots.sort_by(
+            |(left_file_id, left_kind, left_key), (right_file_id, right_kind, right_key)| {
+                left_key
+                    .cmp(right_key)
+                    .then_with(|| {
+                        left_kind
+                            .load_order_tie_breaker()
+                            .cmp(&right_kind.load_order_tie_breaker())
+                    })
+                    .then_with(|| left_file_id.cmp(right_file_id))
+            },
+        );
+        roots
+    }
+
     pub fn set_all_file_infos(
         &mut self,
         file_infos: HashMap<FileId, GmodFileLoadInfo>,
@@ -280,6 +327,98 @@ impl GmodLoadIndex {
         self.file_infos = file_infos;
         self.unresolved_edges = unresolved_edges;
     }
+}
+
+impl GmodLoadRootKind {
+    fn load_order_phase(self, state: GmodStateMask, path_sort_key: &str) -> Option<u16> {
+        if state.contains(GmodStateMask::MENU) && !state.intersects(GmodStateMask::SHARED) {
+            return self.menu_load_order_phase();
+        }
+        if state.contains(GmodStateMask::SERVER) && !state.contains(GmodStateMask::CLIENT) {
+            return self.server_load_order_phase(path_sort_key);
+        }
+        self.client_load_order_phase(path_sort_key)
+    }
+
+    fn client_load_order_phase(self, path_sort_key: &str) -> Option<u16> {
+        match self {
+            Self::IncludesInit => Some(10),
+            Self::DermaInit => Some(20),
+            Self::GamemodeShared if is_base_gamemode_path(path_sort_key) => Some(29),
+            Self::GamemodeClientInit if is_base_gamemode_path(path_sort_key) => Some(30),
+            Self::Autorun => Some(40),
+            Self::AutorunClient => Some(41),
+            Self::PostProcess => Some(50),
+            Self::Vgui => Some(60),
+            Self::MatProxy => Some(70),
+            Self::Skin => Some(80),
+            Self::GamemodeShared => Some(89),
+            Self::GamemodeClientInit => Some(90),
+            Self::ScriptedWeapon => Some(100),
+            Self::Stool => Some(101),
+            Self::ScriptedEntity => Some(110),
+            Self::ScriptedEffect => Some(120),
+            Self::FallbackDefault => Some(1000),
+            _ => None,
+        }
+    }
+
+    fn server_load_order_phase(self, path_sort_key: &str) -> Option<u16> {
+        match self {
+            Self::IncludesInit => Some(10),
+            Self::GamemodeShared if is_base_gamemode_path(path_sort_key) => Some(19),
+            Self::GamemodeInit if is_base_gamemode_path(path_sort_key) => Some(20),
+            Self::Autorun => Some(30),
+            Self::AutorunServer => Some(31),
+            Self::GamemodeShared => Some(49),
+            Self::GamemodeInit => Some(50),
+            Self::ScriptedWeapon => Some(60),
+            Self::Stool => Some(61),
+            Self::ScriptedEntity => Some(70),
+            Self::ScriptedEffect => Some(80),
+            Self::FallbackDefault => Some(1000),
+            _ => None,
+        }
+    }
+
+    fn menu_load_order_phase(self) -> Option<u16> {
+        match self {
+            Self::IncludesInitMenu => Some(10),
+            Self::DermaInit => Some(20),
+            Self::MenuMain => Some(30),
+            Self::Vgui => Some(40),
+            Self::FallbackDefault => Some(1000),
+            _ => None,
+        }
+    }
+
+    fn load_order_tie_breaker(self) -> u16 {
+        match self {
+            Self::IncludesInit => 0,
+            Self::IncludesInitMenu => 1,
+            Self::DermaInit => 2,
+            Self::MenuMain => 3,
+            Self::Autorun => 4,
+            Self::AutorunClient => 5,
+            Self::AutorunServer => 6,
+            Self::GamemodeShared => 7,
+            Self::GamemodeInit => 8,
+            Self::GamemodeClientInit => 9,
+            Self::ScriptedWeapon => 10,
+            Self::Stool => 11,
+            Self::ScriptedEntity => 12,
+            Self::ScriptedEffect => 13,
+            Self::Vgui => 14,
+            Self::PostProcess => 15,
+            Self::MatProxy => 16,
+            Self::Skin => 17,
+            Self::FallbackDefault => 18,
+        }
+    }
+}
+
+fn is_base_gamemode_path(path_sort_key: &str) -> bool {
+    path_sort_key.starts_with("gamemodes/base/gamemode/")
 }
 
 impl LuaIndex for GmodLoadIndex {
