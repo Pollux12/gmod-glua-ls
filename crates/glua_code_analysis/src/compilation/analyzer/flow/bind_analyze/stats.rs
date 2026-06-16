@@ -86,8 +86,29 @@ pub fn bind_assign_stat(
     let mut has_index = false;
     for var in &vars {
         match var {
-            LuaVarExpr::NameExpr(_) => has_name = true,
-            LuaVarExpr::IndexExpr(_) => has_index = true,
+            LuaVarExpr::NameExpr(name_expr) => {
+                has_name = true;
+                // Record the assigned name as narrowable.
+                match name_expr.get_name_text() {
+                    Some(name) => binder.record_narrowable_name(&name),
+                    None => binder.mark_opaque_name_target(),
+                }
+            }
+            LuaVarExpr::IndexExpr(index_expr) => {
+                has_index = true;
+                // Record the assigned index path as narrowable. The full path
+                // set is also captured in AssignmentFlowInfo; recording here keeps
+                // the file-wide capability authoritative. A computed/dynamic key
+                // (e.g. `t[expr]`) cannot be reduced to a stable path key that
+                // matches the query side, so mark the index space opaque to stay
+                // sound.
+                match index_expr.get_access_path() {
+                    Some(path) if !index_key_is_dynamic(index_expr) => {
+                        binder.record_narrowable_index_path(&path)
+                    }
+                    _ => binder.mark_opaque_index_target(),
+                }
+            }
         }
         if let Some(ast) = LuaAst::cast(var.syntax().clone()) {
             bind_node(binder, ast, current);
@@ -106,6 +127,14 @@ pub fn bind_assign_stat(
     binder.add_antecedent(flow_id, current);
 
     flow_id
+}
+
+/// Whether an index expression uses a dynamic/computed key (`t[expr]`) rather
+/// than a static name/integer. Dynamic keys cannot be reduced to a stable path
+/// key that matches the query side, so the narrowing-capability index set must
+/// treat them as opaque.
+pub(crate) fn index_key_is_dynamic(index_expr: &LuaIndexExpr) -> bool {
+    matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_)))
 }
 
 fn collect_assignment_flow_info(vars: &[LuaVarExpr]) -> AssignmentFlowInfo {
@@ -535,9 +564,22 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
 }
 
 pub fn bind_func_stat(binder: &mut FlowBinder, func_stat: LuaFuncStat, current: FlowId) -> FlowId {
-    if func_stat.get_func_name().is_none() {
+    let Some(func_name) = func_stat.get_func_name() else {
         return current;
     };
+
+    // An ImplFunc node narrows the function's name/index reference (the flow walk
+    // resolves it to the closure signature). Record it as narrowable.
+    match &func_name {
+        LuaVarExpr::NameExpr(name_expr) => match name_expr.get_name_text() {
+            Some(name) => binder.record_narrowable_name(&name),
+            None => binder.mark_opaque_name_target(),
+        },
+        LuaVarExpr::IndexExpr(index_expr) => match index_expr.get_access_path() {
+            Some(path) => binder.record_narrowable_index_path(&path),
+            None => binder.mark_opaque_index_target(),
+        },
+    }
 
     bind_each_child(binder, LuaAst::LuaFuncStat(func_stat.clone()), current);
 

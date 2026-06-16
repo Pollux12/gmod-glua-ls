@@ -244,6 +244,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
             let mut total_merge_antecedents: u32 = 0;
             let mut total_narrow_total: u32 = 0;
             let mut total_narrow_noop: u32 = 0;
+            let mut total_narrow_skipped: u32 = 0;
             for fid in &file_ids {
                 let cache = context.infer_manager.get_infer_cache(*fid);
                 total_flow_calls += cache.prof_flow_calls;
@@ -256,6 +257,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 total_merge_antecedents += cache.prof_merge_total_antecedents;
                 total_narrow_total += cache.prof_narrow_total;
                 total_narrow_noop += cache.prof_narrow_noop;
+                total_narrow_skipped += cache.prof_narrow_skipped;
                 total_idx_ns += cache.prof_infer_index_time_ns;
                 total_call_ns += cache.prof_infer_call_time_ns;
                 total_name_ns += cache.prof_infer_name_time_ns;
@@ -332,8 +334,8 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 .and_then(|h| h.checked_div(total_narrow_total))
                 .unwrap_or(0);
             info!(
-                "lua narrow noop profile: [narrow_total={} noop={} ({}%)]",
-                total_narrow_total, total_narrow_noop, narrow_noop_pct,
+                "lua narrow noop profile: [narrow_total={} noop={} ({}%) skipped={}]",
+                total_narrow_total, total_narrow_noop, narrow_noop_pct, total_narrow_skipped,
             );
             info!(
                 "lua assign profile: [stats={} slots={} special_hits={} skip_nil={}ms get_owner={}ms special={}ms set_owner={}ms infer_rhs={}ms merge={}ms]",

@@ -43,6 +43,8 @@ pub struct FlowBinder<'a> {
     index_assign_count: u32,
     cast_or_implfunc_count: u32,
     condition_count: u32,
+    // File-wide narrowing capability (which names/paths can be narrowed).
+    narrowing_capability: crate::FileNarrowingCapability,
 }
 
 impl<'a> FlowBinder<'a> {
@@ -68,6 +70,7 @@ impl<'a> FlowBinder<'a> {
             index_assign_count: 0,
             cast_or_implfunc_count: 0,
             condition_count: 0,
+            narrowing_capability: crate::FileNarrowingCapability::default(),
         };
 
         binder.start = binder.create_start();
@@ -265,6 +268,56 @@ impl<'a> FlowBinder<'a> {
             .add_diagnostic(self.file_id, error);
     }
 
+    /// Record a bare name that can be narrowed at some site (assignment target,
+    /// cast, or condition expression).
+    pub fn record_narrowable_name(&mut self, name: &str) {
+        self.narrowing_capability
+            .referenced_names
+            .insert(internment::ArcIntern::from(smol_str::SmolStr::new(name)));
+    }
+
+    /// Record an index access path that can be narrowed.
+    pub fn record_narrowable_index_path(&mut self, path: &str) {
+        self.narrowing_capability
+            .referenced_index_paths
+            .insert(internment::ArcIntern::from(smol_str::SmolStr::new(path)));
+    }
+
+    pub fn mark_opaque_name_target(&mut self) {
+        self.narrowing_capability.has_opaque_name_target = true;
+    }
+
+    pub fn mark_opaque_index_target(&mut self) {
+        self.narrowing_capability.has_opaque_index_target = true;
+    }
+
+    /// Walk an expression subtree and record every name / index access path it
+    /// references as narrowable. Used for condition and cast expressions, which
+    /// can narrow any variable they mention.
+    pub fn record_narrowable_refs_in_expr(&mut self, expr: &LuaExpr) {
+        use glua_parser::{LuaAstNode, LuaIndexExpr, LuaNameExpr, PathTrait};
+        // Record the expr itself if it is a name or index, then recurse into
+        // descendants to cover nested references (e.g. `a.b and c(d.e)`).
+        for node in expr.syntax().descendants() {
+            if let Some(name_expr) = LuaNameExpr::cast(node.clone()) {
+                if let Some(name) = name_expr.get_name_text() {
+                    self.record_narrowable_name(&name);
+                } else {
+                    self.mark_opaque_name_target();
+                }
+            } else if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+                let dynamic = matches!(
+                    index_expr.get_index_key(),
+                    Some(glua_parser::LuaIndexKey::Expr(_))
+                );
+                match index_expr.get_access_path() {
+                    Some(path) if !dynamic => self.record_narrowable_index_path(&path),
+                    _ => self.mark_opaque_index_target(),
+                }
+            }
+        }
+    }
+
     pub fn finish(self) -> FlowTree {
         FlowTree::new(
             self.decl_bind_expr_ref,
@@ -274,6 +327,7 @@ impl<'a> FlowBinder<'a> {
             self.bindings,
             self.branch_label_info,
             self.assignment_flow_info,
+            self.narrowing_capability,
         )
     }
 }

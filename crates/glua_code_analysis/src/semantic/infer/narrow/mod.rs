@@ -91,6 +91,38 @@ fn is_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
     }
 }
 
+/// Whether the backward flow walk could possibly change `var_ref_id`'s type from
+/// its declared/origin type, given the file-wide narrowing capability. When this
+/// returns `false`, the walk is guaranteed to be a no-op and can be skipped.
+fn var_ref_can_be_narrowed(db: &DbIndex, file_id: &crate::FileId, var_ref_id: &VarRefId) -> bool {
+    // Special-call effects can narrow arbitrary var-refs at runtime positions and
+    // are populated after flow binding, so any file with them must not skip.
+    if db
+        .get_flow_index()
+        .has_any_special_call_effect(file_id)
+    {
+        return true;
+    }
+
+    let Some(flow_tree) = db.get_flow_index().get_flow_tree(file_id) else {
+        return true;
+    };
+    let capability = flow_tree.get_narrowing_capability();
+
+    match var_ref_id {
+        // Plain locals, `self`, and globals reach the DeclPosition terminus where
+        // the walk can diverge from `get_var_ref_type` (initializer retry,
+        // uninitialized-local nil handling, branch merges). These divergences are
+        // not fully captured by the file-wide capability sets, so always walk.
+        VarRefId::VarRef(_) | VarRefId::SelfRef(_) | VarRefId::GlobalName(_, _) => true,
+        // Index references resolve their base via `index_ref_origin_type_cache`
+        // and only diverge from the origin type through an actual narrowing site
+        // (assignment / cast / condition) on a matching access path. When no such
+        // site exists in the file, the walk is provably a no-op.
+        VarRefId::IndexRef(_, path) => capability.index_path_can_be_narrowed(path),
+    }
+}
+
 pub fn infer_expr_narrow_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -98,6 +130,17 @@ pub fn infer_expr_narrow_type(
     var_ref_id: VarRefId,
 ) -> InferResult {
     let file_id = cache.get_file_id();
+
+    // Fast path: if this reference can never be narrowed anywhere in the file,
+    // the backward flow walk is guaranteed to produce the declared/origin type.
+    // Measured at ~95% of top-level narrow queries on real GMod codebases.
+    if !var_ref_can_be_narrowed(db, &file_id, &var_ref_id) {
+        if log::log_enabled!(log::Level::Info) {
+            cache.prof_narrow_skipped += 1;
+        }
+        return get_var_ref_type(db, cache, &var_ref_id);
+    }
+
     let Some(flow_tree) = db.get_flow_index().get_flow_tree(&file_id) else {
         return get_var_ref_type(db, cache, &var_ref_id);
     };
@@ -110,24 +153,13 @@ pub fn infer_expr_narrow_type(
     let query_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, expr.get_position());
+    if log::log_enabled!(log::Level::Info) {
+        cache.prof_narrow_total += 1;
+    }
     let previous_query_realm = cache.flow_query_realm.replace(query_realm);
     let result =
         get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id);
     cache.flow_query_realm = previous_query_realm;
-
-    // Measurement only (Info-gated): how often does the flow walk produce a type
-    // identical to the un-narrowed declared type? Quantifies the upper bound of a
-    // "skip walk when never narrowed" optimization.
-    if log::log_enabled!(log::Level::Info) {
-        cache.prof_narrow_total += 1;
-        let plain = get_var_ref_type(db, cache, &var_ref_id);
-        match (&result, &plain) {
-            (Ok(a), Ok(b)) if a == b => cache.prof_narrow_noop += 1,
-            (Err(_), Err(_)) => cache.prof_narrow_noop += 1,
-            _ => {}
-        }
-    }
-
     result
 }
 

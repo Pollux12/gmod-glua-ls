@@ -15,13 +15,18 @@ pub fn bind_comment(binder: &mut FlowBinder, lua_comment: LuaComment, current: F
     for cast in cast_tags {
         let expr = cast.get_key_expr();
         if let Some(expr) = expr {
+            // A `---@cast x ...` narrows the named/indexed key expr.
+            binder.record_narrowable_refs_in_expr(&expr);
             bind_expr(binder, expr, current);
 
             let flow_id = binder.create_node(FlowNodeKind::TagCast(cast.to_ptr()));
             binder.add_antecedent(flow_id, parent);
             parent = flow_id;
         } else {
-            // inline cast
+            // inline cast — target is the comment owner, which can be any
+            // var-ref kind. Conservatively disable both name and index skipping.
+            binder.mark_opaque_name_target();
+            binder.mark_opaque_index_target();
             let Some(owner) = lua_comment.get_owner() else {
                 continue;
             };

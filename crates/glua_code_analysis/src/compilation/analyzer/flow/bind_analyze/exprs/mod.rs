@@ -24,6 +24,10 @@ pub fn bind_condition_expr(
     let old_true_target = binder.true_target;
     let old_false_target = binder.false_target;
 
+    // Condition expressions can narrow any variable they mention; record all
+    // referenced names / index paths so the flow-walk skip stays sound.
+    binder.record_narrowable_refs_in_expr(&condition_expr);
+
     binder.true_target = true_target;
     binder.false_target = false_target;
     bind_expr(binder, condition_expr.clone(), current);

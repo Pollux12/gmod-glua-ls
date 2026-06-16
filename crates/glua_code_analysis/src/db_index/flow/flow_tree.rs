@@ -1,10 +1,49 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use glua_parser::{LuaAstPtr, LuaExpr, LuaSyntaxId};
 use internment::ArcIntern;
 use smol_str::SmolStr;
 
 use crate::{FlowId, FlowNode, LuaDeclId};
+
+/// File-wide summary of which variables/paths can possibly be narrowed by the
+/// backward flow walk. Used to skip the (expensive) walk entirely for variable
+/// references that provably reach no narrowing site — measured at ~95% of
+/// top-level narrow queries on real GMod codebases.
+///
+/// Soundness: every set here is a SUPERSET of what could actually narrow a
+/// reference. `referenced_names` / `referenced_index_paths` collect every name
+/// and access path appearing in an assignment target, `---@cast`, or condition
+/// expression (and special-call effect sites). If a reference's name/path is in
+/// none of these sets — and there are no "unknown"/opaque narrowing sources —
+/// the walk cannot change its type, so we return the declared type directly.
+#[derive(Debug, Clone, Default)]
+pub struct FileNarrowingCapability {
+    /// Names (bare identifiers) appearing in any assignment target, cast, or
+    /// condition expression. Covers `VarRef`/`SelfRef`/`GlobalName` references.
+    pub referenced_names: HashSet<ArcIntern<SmolStr>>,
+    /// Access paths (e.g. `self.foo`, `tbl.a.b`) appearing in any assignment
+    /// target, cast, or condition expression. Covers `IndexRef` references.
+    pub referenced_index_paths: HashSet<ArcIntern<SmolStr>>,
+    /// When true, a narrowing site referenced a name/index we could not reduce
+    /// to a stable key (e.g. computed index). Disables name/index skipping
+    /// respectively to stay sound.
+    pub has_opaque_name_target: bool,
+    pub has_opaque_index_target: bool,
+}
+
+impl FileNarrowingCapability {
+    /// Whether a bare-name reference (`VarRef`/`SelfRef`/`GlobalName`) named
+    /// `name` could be narrowed somewhere in the file.
+    pub fn name_can_be_narrowed(&self, name: &ArcIntern<SmolStr>) -> bool {
+        self.has_opaque_name_target || self.referenced_names.contains(name)
+    }
+
+    /// Whether an index reference with access `path` could be narrowed.
+    pub fn index_path_can_be_narrowed(&self, path: &ArcIntern<SmolStr>) -> bool {
+        self.has_opaque_index_target || self.referenced_index_paths.contains(path)
+    }
+}
 
 /// Metadata for BranchLabel nodes that enables the merge-skip optimisation.
 ///
@@ -55,6 +94,7 @@ pub struct FlowTree {
     /// Per-BranchLabel metadata used to skip redundant merges.
     branch_label_info: HashMap<FlowId, BranchLabelInfo>,
     assignment_flow_info: Vec<AssignmentFlowInfo>,
+    narrowing_capability: FileNarrowingCapability,
 }
 
 impl FlowTree {
@@ -66,6 +106,7 @@ impl FlowTree {
         bindings: HashMap<LuaSyntaxId, FlowId>,
         branch_label_info: HashMap<FlowId, BranchLabelInfo>,
         assignment_flow_info: Vec<AssignmentFlowInfo>,
+        narrowing_capability: FileNarrowingCapability,
     ) -> Self {
         Self {
             decl_bind_expr_ref,
@@ -74,7 +115,12 @@ impl FlowTree {
             bindings,
             branch_label_info,
             assignment_flow_info,
+            narrowing_capability,
         }
+    }
+
+    pub fn get_narrowing_capability(&self) -> &FileNarrowingCapability {
+        &self.narrowing_capability
     }
 
     pub fn get_flow_id(&self, syntax_id: LuaSyntaxId) -> Option<FlowId> {

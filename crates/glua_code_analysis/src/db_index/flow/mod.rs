@@ -8,7 +8,7 @@ use rowan::TextSize;
 
 use crate::{FileId, LuaSignatureId, LuaType, VarRefId};
 pub use flow_node::*;
-pub use flow_tree::{AssignmentFlowInfo, BranchLabelInfo, FlowTree};
+pub use flow_tree::{AssignmentFlowInfo, BranchLabelInfo, FileNarrowingCapability, FlowTree};
 use glua_parser::{LuaAstPtr, LuaDocOpType};
 pub use signature_cast::LuaSignatureCast;
 
@@ -95,6 +95,15 @@ impl LuaFlowIndex {
             .get(file_id)?
             .get(&position)
             .map(|effects| effects.as_slice())
+    }
+
+    /// Whether the file has ANY special-call effect. Used by the flow-walk skip
+    /// fast-path: special calls can narrow arbitrary var-refs at runtime, so a
+    /// file with any such effect must not skip narrowing walks.
+    pub fn has_any_special_call_effect(&self, file_id: &FileId) -> bool {
+        self.special_call_effects
+            .get(file_id)
+            .is_some_and(|by_pos| !by_pos.is_empty())
     }
 
     pub fn has_special_call_effect_before(
