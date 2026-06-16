@@ -37,7 +37,7 @@ The settings panel uses collapsible sections that match the `.gluarc.json` struc
 
 | Section | What it configures |
 |---|---|
-| **GMod** | Realm detection, scripted classes, network analysis, VGUI hints |
+| **Garry's Mod** | Realm detection, scripted classes, network analysis, VGUI hints |
 | **Diagnostics** | Enable/disable individual diagnostic codes, set severity levels |
 | **Completion** | Autocomplete behavior, call snippets, postfix triggers |
 | **Formatting** | Formatter preset, style overrides |
@@ -88,7 +88,7 @@ The settings panel can also generate a starter configuration. Open **GLua: Open 
 
 ### Recommended starter config
 
-This configuration is suitable for most GMod addon projects:
+This configuration is suitable for most Garry's Mod addon projects:
 
 ```json .gluarc.json
 {
@@ -131,8 +131,8 @@ When a workspace has multiple config files, GLuaLS uses this priority order (hig
 The config file is split into top-level sections. Refer to each section's page for the full option reference, including both VSCode and `.gluarc.json` equivalents:
 
 <CardGroup cols={2}>
-  <Card title="GMod settings" icon="gamepad-2" href="/configuration/gmod">
-    GMod-specific analysis: realms, network, scripted classes, hooks, VGUI
+  <Card title="Garry's Mod settings" icon="gamepad-2" href="/configuration/gmod">
+    Realm analysis, network checks, scripted classes, hooks, and VGUI
   </Card>
   <Card title="Diagnostics" icon="triangle-alert" href="/configuration/diagnostics">
     Enable, disable, and tune severity of all diagnostic codes
@@ -153,7 +153,7 @@ The config file is split into top-level sections. Refer to each section's page f
     Non-standard symbols, strict type checking, special functions
   </Card>
   <Card title="Annotations management" icon="arrows-rotate" href="/configuration/annotations-management">
-    Auto-download GMod wiki annotations, custom annotation paths
+    Auto-download Garry's Mod wiki annotations, custom annotation paths
   </Card>
 </CardGroup>
 
@@ -165,7 +165,7 @@ Some settings are specific to the VSCode extension and are not part of `.gluarc.
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `gluals.gmod.autoLoadAnnotations` | `boolean` | `true` | Auto-download and load GMod wiki annotations (workspace default is `null` to use this setting) |
+| `gluals.gmod.autoLoadAnnotations` | `boolean` | `true` | Auto-download and load Garry's Mod wiki annotations (workspace default is `null` to use this setting) |
 | `gluals.gmod.settingsAutoSave` | `boolean` | `false` | Auto-save settings panel changes to `.gluarc.json` |
 | `gluals.gmod.debugRealm` | `string` | `"server"` | Default realm for debug execution (`server`, `client`, `shared`) |
 | `gluals.gmod.debugger.autoUpdateRdb` | `boolean` | `true` | Prompt to update `gm_rdb` on version mismatch |

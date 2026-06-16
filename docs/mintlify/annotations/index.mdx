@@ -19,7 +19,7 @@ end
 
 Annotations do not affect runtime. Garry's Mod treats them as normal comments.
 
-GLuaLS follows EmmyLua-style annotations and adds support for GMod-specific cases. It keeps compatibility with EmmyLua and LuaLS where possible.
+GLuaLS follows EmmyLua-style annotations and adds Garry's Mod Lua extensions for realms, hooks, wrappers, and editor tooling. It keeps compatibility with EmmyLua and LuaLS where possible.
 
 ---
 
@@ -45,7 +45,7 @@ GLuaLS follows EmmyLua-style annotations and adds support for GMod-specific case
 | [`@async`](/annotations/async) | Mark a function as async/coroutine-based | `---@async` |
 | [`@nodiscard`](/annotations/nodiscard) | Warn if the return value is unused | `---@nodiscard` |
 
-## GMod-specific annotations
+## Garry's Mod Lua annotations
 
 | Annotation | Description | Example |
 |---|---|---|
@@ -54,7 +54,7 @@ GLuaLS follows EmmyLua-style annotations and adds support for GMod-specific case
 | [`@outparam`](/annotations/outparam) | Document a parameter table field modified by a function | `---@outparam cfg.output TraceResult` |
 | [`@fileparam`](/annotations/fileparam) | Set a file-wide parameter type default | `---@fileparam ply Player` |
 | [`@accessorfunc`](/annotations/accessorfunc) | Mark a function as an accessor generator | `---@accessorfunc` |
-| [`@call_arg`](/annotations/call-arg) | Mark wrapper parameters as GMod names or callbacks | `---@[call_arg("gmod.hook", "add")]` |
+| [`@call_arg`](/annotations/call-arg) | Mark wrapper parameters as names, callbacks, files, or metadata | `---@[call_arg("gmod.hook", "add")]` |
 
 ## Control and metadata annotations
 

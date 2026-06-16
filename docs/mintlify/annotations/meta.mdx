@@ -9,7 +9,7 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 `@meta` marks a file as a **type-only declaration file**. GLuaLS reads it for type information. Your addon does not run it.
 
-Use this for meta libraries, including the wiki-generated Garry's Mod annotations ([view them here](https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations)).
+Use this for meta libraries, including the wiki-generated Garry's Mod annotations downloaded by the VS Code extension ([view them here](https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations)).
 
 ---
 
@@ -60,7 +60,7 @@ Add a name after `@meta` to connect the file to a library name for documentation
 
 ## Common uses
 
-- **Bundled GMod annotations**: GLuaLS ships GMod API annotations as meta files
+- **Downloaded Garry's Mod annotations**: the VS Code extension loads wiki-generated API annotations as meta files
 - **Third-party library stubs**: declare types for libraries loaded at runtime
 - **Custom type files**: define extra types used across your workspace
 
@@ -83,4 +83,4 @@ Add meta files or directories to `workspace.library` so GLuaLS analyzes them wit
 
 ## See also
 
-- [Annotations management](/configuration/annotations-management): how the VS Code extension downloads and loads GMod annotations
+- [Annotations management](/configuration/annotations-management): how the VS Code extension downloads and loads Garry's Mod annotations

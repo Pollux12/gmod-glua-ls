@@ -1,13 +1,13 @@
 ---
 title: "@call_arg"
-description: Mark string and callback parameters so GLuaLS can understand custom GMod wrappers.
+description: Mark wrapper parameters so GLuaLS can understand names, callbacks, files, colors, panels, skins, and scripted-class metadata.
 ---
 
 ## Overview
 
-`@call_arg` marks a function parameter that requires special handling. Use it when you write a wrapper around base gmod functions and still want GLuaLS to understand the names, callbacks, colors, panels, skins, or scripted-class metadata passed through that wrapper. This system was implemented to replace previously hardcoded handling of special base gmod functions / methods / classes to instead implement a more generic system that can be used for other advanced use cases.
+`@call_arg` marks a function parameter that requires special handling. Use it when you write a wrapper and still want GLuaLS to understand the names, callbacks, file paths, colors, panels, skins, or scripted-class metadata passed through that wrapper.
 
-Most addons do not need this annotation. The official GMod annotations already apply it to built-in functions like `util.AddNetworkString`, `net.Start`, `hook.Add`, `vgui.Register`, and `derma.DefineSkin`.
+Most addons do not need this annotation. The official annotations already apply it to built-in functions like `include`, `AddCSLuaFile`, `file.Find`, `util.AddNetworkString`, `net.Start`, `hook.Add`, `vgui.Register`, and `derma.DefineSkin`.
 
 It is expected that you know what you are doing if you use this annotation.
 
@@ -61,6 +61,8 @@ The first argument is the zero-based parameter index inside that overload.
 | `gmod.concommand` | `define`, `callback` | Console command registration and callback tracking |
 | `gmod.convar` | `define`, `define_server`, `define_client` | Server and client ConVar registration |
 | `gmod.timer` | `define`, `callback`, `simple` | Timer creation and callback tracking |
+| `gmod.load` | `include`, `addcsluafile`, `add_cs_lua_file`, `includecs`, `include_cs`, `require` | File load graph, dependency edges, and realm inference for load wrappers |
+| `gmod.file_find` | `glob`, `search_path`, `path` | `file.Find` result tracking for dynamic loader loops |
 | `gmod.vgui_panel` | `define`, `define_control`, `table`, `base`, `reference` | VGUI panel registration, inheritance, and panel name lookup |
 | `gmod.derma_skin` | `define`, `reference` | Derma skin registration and skin name lookup |
 | `gmod.network_var` | `type`, `define`, `define_element` | Entity `NetworkVar` and `NetworkVarElement` accessor generation |
@@ -68,7 +70,7 @@ The first argument is the zero-based parameter index inside that overload.
 | `gmod.gamemode` | `reference` | `DeriveGamemode` inheritance metadata |
 | `gmod.color` | `r`, `g`, `b`, `a` | Color previews for custom color constructors |
 
-Unknown domains and roles are stored as metadata but ignored by GMod-specific features until GLuaLS adds a consumer for them. This is intentional to prevent errors for outdated clients.
+Unknown domains and roles are stored as metadata but ignored until GLuaLS adds a consumer for them. This is intentional to prevent errors for outdated clients.
 
 ---
 
@@ -104,6 +106,54 @@ local function RunHook(eventName, ...)
     return hook.Run(eventName, ...)
 end
 ```
+
+---
+
+## Lua loading
+
+Use `gmod.load` for wrappers around Lua file and module loading:
+
+```lua
+---@[call_arg("gmod.load", "include")]
+---@param path string
+local function IncludeShared(path)
+    include(path)
+end
+
+---@[call_arg("gmod.load", "addcsluafile")]
+---@param path string
+local function SendToClient(path)
+    AddCSLuaFile(path)
+end
+
+---@[call_arg("gmod.load", "includecs")]
+---@param path string
+local function IncludeClient(path)
+    IncludeCS(path)
+end
+
+---@[call_arg("gmod.load", "require")]
+---@param module string
+local function LoadModule(module)
+    return require(module)
+end
+```
+
+Calls through these wrappers feed the same dependency and realm inference as direct `include`, `AddCSLuaFile`, `IncludeCS`, and `require` calls. Literal paths add dependency edges; dynamic paths can still participate when GLuaLS can trace them from `file.Find` loops.
+
+Use `gmod.file_find` when wrapping `file.Find` itself:
+
+```lua
+---@[call_arg("gmod.file_find", "glob")]
+---@param pattern string
+---@[call_arg("gmod.file_find", "search_path")]
+---@param searchPath string
+local function FindLuaFiles(pattern, searchPath)
+    return file.Find(pattern, searchPath)
+end
+```
+
+When `FindLuaFiles("myaddon/*.lua", "LUA")` is used in a loop and the loop body calls annotated load wrappers, GLuaLS can infer which matching files are loaded server-side, sent to the client, or shared.
 
 ---
 
@@ -190,12 +240,13 @@ An optional third argument breaks ties when one parameter can inherit multiple r
 ---@param name string
 ```
 
-Higher priority wins. You normally do not need this unless you are annotating a generic wrapper that can behave like several GMod APIs.
+Higher priority wins. You normally do not need this unless you are annotating a generic wrapper that can behave like several APIs.
 
 ---
 
 ## See also
 
+- [Realm awareness](/language/realm-awareness): realm inference from file loading
 - [Network analysis](/language/network-analysis): net message tracking
 - [Hook intelligence](/language/hook-intelligence): hook completion and callback inference
 - [VGUI support](/language/vgui-support): panels and Derma skins

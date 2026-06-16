@@ -1,11 +1,11 @@
 ---
-title: "GMod Settings"
-description: GMod-specific language server settings for realm analysis, scripted classes, networking, and more.
+title: "Garry's Mod Settings"
+description: Language server settings for realm analysis, scripted classes, networking, VGUI, and annotations.
 ---
 
 ## Overview
 
-All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These settings control realm detection, network message analysis, scripted class behavior, VGUI support, and more.
+Garry's Mod Lua settings live under the `gmod` key in `.gluarc.json`. These settings control realm detection, network message analysis, scripted class behavior, VGUI support, annotations, and more.
 
 ---
 
@@ -13,11 +13,11 @@ All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These se
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `gmod.enabled` | `boolean` | `true` | Enable all GMod-specific analysis. Set `false` to use as a generic Lua LS |
+| `gmod.enabled` | `boolean` | `true` | Enable Garry's Mod Lua analysis. Keep this enabled for normal use; set `false` only when isolating compatibility or debugging issues |
 | `gmod.defaultRealm` | `string` | `"shared"` | Realm assumed for files with no realm signal. Use `"client"`, `"server"`, or `"shared"` |
 | `gmod.detectRealmFromFilename` | `boolean \| null` | `null` (resolves to `true`) | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
-| `gmod.detectRealmFromCalls` | `boolean \| null` | `null` (resolves to `true`) | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, and `require` |
-| `gmod.inferDynamicFields` | `boolean` | `true` | Track fields dynamically assigned to GMod objects |
+| `gmod.detectRealmFromCalls` | `boolean \| null` | `null` (resolves to `true`) | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, `require`, and annotated wrappers |
+| `gmod.inferDynamicFields` | `boolean` | `true` | Track fields dynamically assigned to Garry's Mod objects |
 | `gmod.dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files. Set `false` to scope them per-file |
 | `gmod.fileParamDefaults` | `object` | built-in map | Parameter-name → type fallback, applied to params without explicit `@param`. Editable in the Settings UI. Set a value to `""` to remove a built-in default |
 
@@ -27,7 +27,7 @@ All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These se
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `gmod.annotationsPath` | `string \| null` | `null` | Custom path to GMod annotation `.lua` files. When `null`, the VSCode extension's auto-downloaded annotations are used |
+| `gmod.annotationsPath` | `string \| null` | `null` | Custom path to Garry's Mod annotation `.lua` files. When `null`, the VSCode extension's auto-downloaded annotations are used |
 | `gmod.autoLoadAnnotations` | `boolean \| null` | `null` | Override workspace annotation auto-loading. Set `false` to disable even if the extension or CLI provides annotations |
 
 ---
@@ -182,7 +182,7 @@ You can also configure these settings in VS Code settings with the `gluals.*` pr
 
 | VSCode Setting | .gluarc.json Key | Type | Default | Description |
 |---|---|---|---|---|
-| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `boolean` (`boolean \| null` in workspace) | `true` (`null` in workspace) | Auto-download GMod annotations |
+| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `boolean` (`boolean \| null` in workspace) | `true` (`null` in workspace) | Auto-download Garry's Mod annotations |
 | `gluals.gmod.annotationsRepository` | VS Code only | `string` | `Pollux12/annotations-gmod-glua-ls` | GitHub repository for automatic annotation downloads |
 | `gluals.gmod.annotationsBranch` | VS Code only | `string` | `gluals-annotations` | Git branch for automatic annotation downloads |
 | `gluals.gmod.autoDetectGamemodeBase` | `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Auto-detect base gamemodes from the gamemode `.txt` file |

@@ -99,6 +99,10 @@ When call-based detection is on, GLuaLS also looks at file-loading calls:
 
 `AddCSLuaFile` does not mark the caller as server. It only affects the target file.
 
+These rules also apply to wrappers annotated with `@call_arg("gmod.load", "...")`. Use the roles `include`, `addcsluafile`, `includecs`, and `require` to model wrappers around the matching load operation. GLuaLS also understands `file.Find` loops when the discovery function is annotated with `@call_arg("gmod.file_find", "glob")` and `@call_arg("gmod.file_find", "search_path")`; matching files can then inherit the realm of the load calls inside the loop.
+
+See [`@call_arg`](/annotations/call-arg#lua-loading) for wrapper examples.
+
 ---
 
 ## Loading defaults

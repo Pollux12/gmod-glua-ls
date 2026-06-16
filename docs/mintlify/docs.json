@@ -42,7 +42,7 @@
             ]
           },
           {
-            "group": "GMod",
+            "group": "Garry's Mod",
             "pages": [
               "language/realm-awareness",
               "language/network-analysis",
@@ -109,7 +109,7 @@
             ]
           },
           {
-            "group": "GMod-specific",
+            "group": "Garry's Mod Lua",
             "pages": [
               "annotations/realm",
               "annotations/hook",
