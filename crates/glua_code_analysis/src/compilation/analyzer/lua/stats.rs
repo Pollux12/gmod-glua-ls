@@ -58,6 +58,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             break;
         };
         let decl_id = LuaDeclId::new(analyzer.file_id, position);
+        if is_call_or_index_expr(&expr) {
+            analyzer
+                .context
+                .request_uninformative_local_decl_reinfer(decl_id);
+        }
 
         if let Some(reason) = should_defer_guarded_index_alias(analyzer, &expr) {
             analyzer.context.request_stabilization(analyzer.file_id);
@@ -1097,6 +1102,10 @@ fn is_table_shape_cleanup_type(typ: &LuaType) -> bool {
 
 fn should_defer_none_infer_expr(expr: &LuaExpr) -> bool {
     matches!(expr, LuaExpr::CallExpr(_))
+}
+
+fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
+    matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_))
 }
 
 fn should_defer_nil_gmod_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {

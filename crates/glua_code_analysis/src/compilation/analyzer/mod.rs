@@ -22,7 +22,7 @@ use crate::{
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
 };
-use glua_parser::LuaChunk;
+use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
 use infer_cache_manager::InferCacheManager;
 use unresolve::UnResolve;
 
@@ -79,12 +79,82 @@ pub fn analyze(
 
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
+            context.infer_manager.clear();
+            run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
+            resolve_uninformative_local_decl_caches(db, &mut context);
         }
 
         stabilization_candidates.extend(context.stabilization_candidates.iter().copied());
     }
 
     stabilization_candidates
+}
+
+fn resolve_uninformative_local_decl_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    if context.uninformative_local_decl_candidates.is_empty() {
+        return;
+    }
+
+    for decl_id in std::mem::take(&mut context.uninformative_local_decl_candidates) {
+        let type_owner = decl_id.into();
+        let current_cache = db.get_type_index().get_type_cache(&type_owner);
+        if !type_cache_is_uninformative(current_cache) {
+            continue;
+        }
+
+        let Some((ret_idx, expr)) = local_initializer_expr(db, decl_id) else {
+            continue;
+        };
+        if !matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_)) {
+            continue;
+        }
+
+        let cache = context.infer_manager.get_infer_cache(decl_id.file_id);
+        let Ok(mut inferred_type) = crate::infer_expr(db, cache, expr) else {
+            continue;
+        };
+        if let LuaType::Variadic(variadic) = inferred_type {
+            inferred_type = variadic.get_type(ret_idx).cloned().unwrap_or(LuaType::Nil);
+        } else if ret_idx != 0 {
+            inferred_type = LuaType::Nil;
+        }
+        if type_is_uninformative(&inferred_type) {
+            continue;
+        }
+
+        common::bind_resolved_type(db, type_owner, LuaTypeCache::InferType(inferred_type));
+    }
+}
+
+fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)?
+        .get_red_root();
+    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
+}
+
+fn type_cache_is_uninformative(type_cache: Option<&LuaTypeCache>) -> bool {
+    match type_cache {
+        Some(LuaTypeCache::InferType(typ)) => type_is_uninformative(typ),
+        Some(LuaTypeCache::DocType(_)) => false,
+        None => true,
+    }
+}
+
+fn type_is_uninformative(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
+        LuaType::Union(union) => union.into_vec().iter().all(type_is_uninformative),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(typ, _)| type_is_uninformative(typ)),
+        _ => false,
+    }
 }
 
 fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
@@ -252,6 +322,7 @@ pub struct AnalyzeContext {
     scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
+    uninformative_local_decl_candidates: HashSet<LuaDeclId>,
     stabilization_candidates: HashSet<FileId>,
     infer_manager: InferCacheManager,
     pub workspace_id: Option<WorkspaceId>,
@@ -267,6 +338,7 @@ impl AnalyzeContext {
             scripted_scope_infos: None,
             unresolves: Vec::new(),
             pending_unresolve_decl_ids: HashSet::new(),
+            uninformative_local_decl_candidates: HashSet::new(),
             stabilization_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
             workspace_id: None,
@@ -290,6 +362,10 @@ impl AnalyzeContext {
 
     pub fn has_pending_decl_unresolve(&self, decl_id: LuaDeclId) -> bool {
         self.pending_unresolve_decl_ids.contains(&decl_id)
+    }
+
+    pub fn request_uninformative_local_decl_reinfer(&mut self, decl_id: LuaDeclId) {
+        self.uninformative_local_decl_candidates.insert(decl_id);
     }
 
     pub fn request_stabilization(&mut self, file_id: FileId) {

@@ -148,6 +148,14 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             loop_count += 1;
         }
 
+        for (reason, unresolves) in reason_resolve {
+            context.unresolves.extend(
+                unresolves
+                    .into_iter()
+                    .map(|unresolve| (unresolve, reason.clone())),
+            );
+        }
+
         // Resolving deferred items mutates type/member indexes, so any inference
         // cached while resolution was still in progress can be stale.
         if had_unresolves {

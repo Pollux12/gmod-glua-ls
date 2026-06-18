@@ -436,14 +436,8 @@ fn build_local_name_hint(
         return Some(());
     }
 
-    // 目前没时间完善结合 ast 的类型过滤, 所以只允许一些类型显示
-    if vgui_panel_name.is_none() {
-        match typ {
-            LuaType::Ref(_) | LuaType::Generic(_) | LuaType::Instance(_) => {}
-            _ => {
-                return Some(());
-            }
-        }
+    if vgui_panel_name.is_none() && !local_hint_type_is_displayable(&typ) {
+        return Some(());
     }
 
     let document = semantic_model.get_document();
@@ -473,6 +467,27 @@ fn build_local_name_hint(
     result.push(hint);
 
     Some(())
+}
+
+fn local_hint_type_is_displayable(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(_) | LuaType::Generic(_) | LuaType::Instance(_) => true,
+        LuaType::Union(union) => {
+            let members = union.into_vec();
+            members.iter().any(|member| {
+                matches!(
+                    member,
+                    LuaType::Ref(_) | LuaType::Generic(_) | LuaType::Instance(_)
+                )
+            }) && members.iter().all(|member| {
+                matches!(
+                    member,
+                    LuaType::Ref(_) | LuaType::Generic(_) | LuaType::Instance(_) | LuaType::Nil
+                )
+            })
+        }
+        _ => false,
+    }
 }
 
 fn build_assign_stat_hint(

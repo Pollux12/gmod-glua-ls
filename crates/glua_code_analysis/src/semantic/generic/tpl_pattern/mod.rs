@@ -10,8 +10,8 @@ use smol_str::SmolStr;
 
 use crate::{
     InferFailReason, LuaFunctionType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner, LuaObjectType,
-    LuaSemanticDeclId, LuaTupleType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel, VariadicType,
-    check_type_compact,
+    LuaSemanticDeclId, LuaTupleType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel, TypeOps,
+    VariadicType, check_type_compact,
     db_index::{DbIndex, LuaGenericType, LuaType},
     infer_node_semantic_decl,
     semantic::{
@@ -159,6 +159,21 @@ fn get_str_tpl_infer_type(
     }
 }
 
+fn get_str_tpl_infer_type_from_value(
+    context: &mut TplContext,
+    str_tpl: &crate::LuaStringTplType,
+    value: &str,
+) -> LuaType {
+    let type_name = SmolStr::new(format!(
+        "{}{}{}",
+        str_tpl.get_prefix(),
+        value,
+        str_tpl.get_suffix()
+    ));
+    let constraint = str_tpl.get_constraint().cloned();
+    get_str_tpl_infer_type(context, &type_name, constraint.as_ref())
+}
+
 pub fn tpl_pattern_match(
     context: &mut TplContext,
     pattern: &LuaType,
@@ -184,26 +199,39 @@ pub fn tpl_pattern_match(
                     .insert_type(tpl.get_tpl_id(), target, false);
             }
         }
-        LuaType::StrTplRef(str_tpl) => {
-            // Bind from StringConst (existing), DocStringConst (adjacent
-            // soundness), or StringConst carried as an effective default.
-            let string_value = match target {
-                LuaType::StringConst(s) => Some(s),
-                LuaType::DocStringConst(s) => Some(s),
-                _ => None,
-            };
-            if let Some(s) = string_value {
-                let prefix = str_tpl.get_prefix();
-                let suffix = str_tpl.get_suffix();
-                let type_name = SmolStr::new(format!("{}{}{}", prefix, s, suffix));
-                let constraint = str_tpl.get_constraint().cloned();
-                let inferred_type =
-                    get_str_tpl_infer_type(context, &type_name, constraint.as_ref());
+        LuaType::StrTplRef(str_tpl) => match target {
+            LuaType::StringConst(s) | LuaType::DocStringConst(s) => {
+                let inferred_type = get_str_tpl_infer_type_from_value(context, str_tpl, &s);
                 context
                     .substitutor
                     .insert_type(str_tpl.get_tpl_id(), inferred_type, true);
             }
-        }
+            LuaType::Union(union) => {
+                let mut inferred_type: Option<LuaType> = None;
+                for target_type in union.into_vec() {
+                    let next_type = match target_type {
+                        LuaType::StringConst(s) | LuaType::DocStringConst(s) => {
+                            get_str_tpl_infer_type_from_value(context, str_tpl, &s)
+                        }
+                        _ => return Ok(()),
+                    };
+
+                    inferred_type = Some(match inferred_type {
+                        Some(current_type) => {
+                            TypeOps::Union.apply(context.db, &current_type, &next_type)
+                        }
+                        None => next_type,
+                    });
+                }
+
+                if let Some(inferred_type) = inferred_type {
+                    context
+                        .substitutor
+                        .insert_type(str_tpl.get_tpl_id(), inferred_type, true);
+                }
+            }
+            _ => {}
+        },
         LuaType::Array(array_type) => {
             array_tpl_pattern_match(context, array_type.get_base(), &target)?;
         }

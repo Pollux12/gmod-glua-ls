@@ -212,6 +212,41 @@ mod test {
     }
 
     #[gtest]
+    fn test_str_tpl_ref_string_union_field_with_constraint_no_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        expect_that!(
+            ws.check_file_for(
+                DiagnosticCode::GenericConstraintMismatch,
+                "gamemodes/terrortown/entities/entities/ttt_random_weapon.lua",
+                r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class item_ammo_smg1: Entity
+                    ---@class item_ammo_pistol: Entity
+
+                    ents = {}
+
+                    ---@generic T: Entity
+                    ---@param class `T`
+                    ---@return T|NULL
+                    function ents.Create(class)
+                    end
+
+                    ---@class TttRandomWeapon
+                    ---@field AmmoEnt "item_ammo_smg1"|"item_ammo_pistol"
+
+                    ---@type TttRandomWeapon
+                    local ent
+
+                    local ammo = ents.Create(ent.AmmoEnt)
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_str_tpl_ref_missing_type_with_constraint_reports_hint_for_auto_created_type() {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::GenericConstraintMismatch);

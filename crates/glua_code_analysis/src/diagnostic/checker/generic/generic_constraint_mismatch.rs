@@ -304,6 +304,18 @@ fn validate_str_tpl_ref(
                 }
             }
         }
+        LuaType::Union(union) => {
+            for union_member_type in union.into_vec() {
+                validate_str_tpl_ref(
+                    context,
+                    semantic_model,
+                    str_tpl_ref,
+                    &union_member_type,
+                    range,
+                    extend_type.clone(),
+                );
+            }
+        }
         LuaType::String | LuaType::Any | LuaType::Unknown | LuaType::StrTplRef(_) => {}
         _ => {
             context.add_diagnostic(
