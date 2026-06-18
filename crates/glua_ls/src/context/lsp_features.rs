@@ -80,4 +80,26 @@ impl LspFeatures {
         }
         false
     }
+
+    pub fn supports_inlay_hint_refresh(&self) -> bool {
+        if let Some(workspace) = &self.client_capabilities.workspace {
+            if let Some(inlay_hint) = &workspace.inlay_hint {
+                if let Some(supports) = inlay_hint.refresh_support {
+                    return supports;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn supports_code_lens_refresh(&self) -> bool {
+        if let Some(workspace) = &self.client_capabilities.workspace {
+            if let Some(code_lens) = &workspace.code_lens {
+                if let Some(supports) = code_lens.refresh_support {
+                    return supports;
+                }
+            }
+        }
+        false
+    }
 }

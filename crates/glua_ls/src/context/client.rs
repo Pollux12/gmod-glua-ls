@@ -31,6 +31,7 @@ struct RefreshRequestGates {
     workspace_diagnostics: Option<RequestId>,
     semantic_tokens: Option<RequestId>,
     inlay_hints: Option<RequestId>,
+    code_lens: Option<RequestId>,
 }
 
 #[derive(Clone, Copy)]
@@ -38,6 +39,7 @@ enum RefreshRequestKind {
     WorkspaceDiagnostics,
     SemanticTokens,
     InlayHints,
+    CodeLens,
 }
 
 impl RefreshRequestKind {
@@ -46,6 +48,7 @@ impl RefreshRequestKind {
             Self::WorkspaceDiagnostics => "workspace/diagnostic/refresh",
             Self::SemanticTokens => "workspace/semanticTokens/refresh",
             Self::InlayHints => "workspace/inlayHint/refresh",
+            Self::CodeLens => "workspace/codeLens/refresh",
         }
     }
 
@@ -54,6 +57,7 @@ impl RefreshRequestKind {
             Self::WorkspaceDiagnostics => &mut gates.workspace_diagnostics,
             Self::SemanticTokens => &mut gates.semantic_tokens,
             Self::InlayHints => &mut gates.inlay_hints,
+            Self::CodeLens => &mut gates.code_lens,
         }
     }
 }
@@ -230,6 +234,14 @@ impl ClientProxy {
         {
             gates.inlay_hints = None;
         }
+
+        if gates
+            .code_lens
+            .as_ref()
+            .is_some_and(|in_flight| in_flight == request_id)
+        {
+            gates.code_lens = None;
+        }
     }
 
     pub async fn on_response(&self, response: Response) -> Option<()> {
@@ -326,6 +338,10 @@ impl ClientProxy {
 
     pub fn refresh_inlay_hints(&self) {
         self.send_deduped_refresh_request(RefreshRequestKind::InlayHints);
+    }
+
+    pub fn refresh_code_lens(&self) {
+        self.send_deduped_refresh_request(RefreshRequestKind::CodeLens);
     }
 }
 
@@ -446,26 +462,59 @@ mod tests {
     }
 
     #[gtest]
+    fn refresh_code_lens_dedupes_while_request_is_in_flight() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (client, peer) = create_client_proxy();
+
+        client.refresh_code_lens();
+        client.refresh_code_lens();
+
+        let request = recv_request(&peer);
+        verify_that!(request.method.as_str(), eq("workspace/codeLens/refresh"))?;
+        verify_that!(peer.receiver.try_recv().is_err(), eq(true))?;
+
+        runtime.block_on(client.on_response(Response {
+            id: request.id.clone(),
+            result: Some(serde_json::Value::Null),
+            error: None,
+        }));
+
+        client.refresh_code_lens();
+
+        let second_request = recv_request(&peer);
+        verify_that!(
+            second_request.method.as_str(),
+            eq("workspace/codeLens/refresh")
+        )?;
+        assert_ne!(second_request.id, request.id);
+        Ok(())
+    }
+
+    #[gtest]
     fn different_refresh_requests_keep_separate_gates() -> Result<()> {
         let (client, peer) = create_client_proxy();
 
         client.refresh_workspace_diagnostics();
         client.refresh_semantic_tokens();
         client.refresh_inlay_hints();
+        client.refresh_code_lens();
 
         let first_request = recv_request(&peer);
         let second_request = recv_request(&peer);
         let third_request = recv_request(&peer);
+        let fourth_request = recv_request(&peer);
         let mut methods = [
             first_request.method,
             second_request.method,
             third_request.method,
+            fourth_request.method,
         ];
         methods.sort();
 
         assert_eq!(
             methods,
             [
+                "workspace/codeLens/refresh".to_string(),
                 "workspace/diagnostic/refresh".to_string(),
                 "workspace/inlayHint/refresh".to_string(),
                 "workspace/semanticTokens/refresh".to_string()

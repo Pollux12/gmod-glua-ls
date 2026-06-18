@@ -131,6 +131,7 @@ impl WorkspaceManager {
 
             init_analysis(
                 &analysis,
+                &client,
                 &status_bar,
                 &file_diagnostic,
                 &lsp_features,
@@ -141,8 +142,6 @@ impl WorkspaceManager {
                 watchdog_status,
             )
             .await;
-            client.refresh_semantic_tokens();
-            client.refresh_inlay_hints();
             if lsp_features.supports_workspace_diagnostic() {
                 client.refresh_workspace_diagnostics();
             }
@@ -187,6 +186,7 @@ impl WorkspaceManager {
             // Perform reindex with minimal lock holding time
             init_analysis(
                 &analysis,
+                &client,
                 &status_bar,
                 &file_diagnostic,
                 &lsp_features,
@@ -204,8 +204,6 @@ impl WorkspaceManager {
                 .store(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::Release);
 
             // Trigger diagnostics refresh
-            client.refresh_semantic_tokens();
-            client.refresh_inlay_hints();
             if lsp_features.supports_workspace_diagnostic() {
                 client.refresh_workspace_diagnostics();
             } else {
