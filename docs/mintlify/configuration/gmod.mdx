@@ -15,11 +15,11 @@ All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These se
 |---|---|---|---|
 | `gmod.enabled` | `boolean` | `true` | Enable all GMod-specific analysis. Set `false` to use as a generic Lua LS |
 | `gmod.defaultRealm` | `string` | `"shared"` | Realm assumed for files with no realm signal. Use `"client"`, `"server"`, or `"shared"` |
-| `gmod.detectRealmFromFilename` | `boolean \| null` | `null` (resolves to `true`) | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
-| `gmod.detectRealmFromCalls` | `boolean \| null` | `null` (resolves to `true`) | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, and `require` |
+| `gmod.detectRealmFromFilename` | `boolean \| null` | `null` (uses `true`) | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
+| `gmod.detectRealmFromCalls` | `boolean \| null` | `null` (uses `true`) | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, and `require` |
 | `gmod.inferDynamicFields` | `boolean` | `true` | Track fields dynamically assigned to GMod objects |
 | `gmod.dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files. Set `false` to scope them per-file |
-| `gmod.fileParamDefaults` | `object` | built-in map | Parameter-name → type fallback, applied to params without explicit `@param`. Editable in the Settings UI. Set a value to `""` to remove a built-in default |
+| `gmod.fileParamDefaults` | `object` | built-in map | Default types for common parameter names when a parameter has no `@param`. Editable in the Settings UI. Set a value to `""` to remove a built-in default |
 
 ---
 
@@ -28,7 +28,7 @@ All GMod-specific settings live under the `gmod` key in `.gluarc.json`. These se
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `gmod.annotationsPath` | `string \| null` | `null` | Custom path to GMod annotation `.lua` files. When `null`, the VSCode extension's auto-downloaded annotations are used |
-| `gmod.autoLoadAnnotations` | `boolean \| null` | `null` | Override workspace annotation auto-loading. Set `false` to disable even if the extension or CLI provides annotations |
+| `gmod.autoLoadAnnotations` | `boolean \| null` | `null` | Control annotation auto-loading for this workspace. Set `false` to turn it off even if the extension or CLI provides annotations |
 
 ---
 
@@ -62,7 +62,7 @@ Each definition supports:
 
 | Field | Type | Description |
 |---|---|---|
-| `id` | `string` | Stable key for overrides or removal |
+| `id` | `string` | Name used to change or remove this entry |
 | `label` | `string` | Display name in Class Explorer and Settings UI |
 | `classGlobal` | `string` | Global variable the class uses (`ENT`, `SWEP`, etc.) |
 | `path` | `string[]` | Path segments to detect class from file path |
@@ -77,7 +77,7 @@ Each definition supports:
 
 The `gamemodes` group detects files under `gamemodes/<name>/gamemode/**` and types the `GM` global as the class `gamemode_<name>`. This lets `DEFINE_BASECLASS("gamemode_sandbox")` and cross-gamemode field access, such as `self.Sandbox.SetupMove`, resolve in derived gamemodes.
 
-To **override** a built-in definition, add an entry with its `id` and only the fields you want to change. To **disable** a built-in group, set `{ "id": "effects", "disabled": true }`.
+To change a built-in definition, add an entry with its `id` and only the fields you want to change. To turn off a built-in group, set `{ "id": "effects", "disabled": true }`.
 
 ### Example
 
@@ -184,7 +184,9 @@ You can also configure these settings in VS Code settings with the `gluals.*` pr
 |---|---|---|---|---|
 | `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `boolean` (`boolean \| null` in workspace) | `true` (`null` in workspace) | Auto-download GMod annotations |
 | `gluals.gmod.annotationsRepository` | VS Code only | `string` | `Pollux12/annotations-gmod-glua-ls` | GitHub repository for automatic annotation downloads |
-| `gluals.gmod.annotationsBranch` | VS Code only | `string` | `gluals-annotations` | Git branch for automatic annotation downloads |
+| `gluals.gmod.annotationsChannel` | VS Code only | `auto \| stable \| prerelease` | `auto` | Annotation channel. `auto` follows the extension build |
+| `gluals.gmod.annotationsBranch` | VS Code only | `string` | `gluals-annotations` | Advanced setting for downloading from a specific branch |
+| `gluals.gmod.annotationsCommit` | VS Code only | `string` | `""` | Advanced setting for downloading one exact commit hash; stops annotation update checks |
 | `gluals.gmod.autoDetectGamemodeBase` | `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Auto-detect base gamemodes from the gamemode `.txt` file |
 | `gluals.gmod.templatePath` | `gmod.templatePath` | `string` | `null` | Custom scaffolding template path |
 | `gluals.gmod.network.codeLensEnabled` | `gmod.network.codeLensEnabled` | `boolean` | `true` | Network code lens |
