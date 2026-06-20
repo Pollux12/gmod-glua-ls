@@ -21,7 +21,9 @@ pub use get_member_map::{
     get_member_map, get_member_map_in_workspace_for_file,
     get_member_map_in_workspace_for_file_at_offset,
 };
-use glua_parser::{LuaAssignStat, LuaSyntaxKind, LuaTableExpr, LuaTableField};
+use glua_parser::{
+    LuaAssignStat, LuaExpr, LuaFuncStat, LuaSyntaxKind, LuaTableExpr, LuaTableField,
+};
 use glua_parser::{LuaAstNode, LuaIndexExpr};
 pub use infer_raw_member::infer_raw_member_type;
 pub(crate) use infer_raw_member::{
@@ -484,6 +486,34 @@ pub(crate) fn member_key_as_type(key: &LuaMemberKey) -> Option<LuaType> {
         LuaMemberKey::Name(name) => Some(LuaType::StringConst(name.clone().into())),
         LuaMemberKey::ExprType(typ) => Some(typ.clone()),
     }
+}
+
+pub fn get_member_value_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+
+    if let Some(field) = LuaTableField::cast(node.clone()) {
+        return field.get_value_expr();
+    }
+
+    if let Some(index_expr) = LuaIndexExpr::cast(node) {
+        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
+            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+            let value_idx = vars
+                .iter()
+                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
+            return value_exprs.get(value_idx).cloned();
+        }
+
+        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
+            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
+        }
+    }
+
+    None
 }
 
 pub(crate) fn member_key_matches_type(

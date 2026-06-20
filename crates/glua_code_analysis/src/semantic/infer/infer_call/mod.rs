@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaNameExpr,
-    LuaSyntaxKind, LuaTableField,
-};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaNameExpr, LuaSyntaxKind};
 use rowan::TextRange;
 
 use super::{
@@ -20,6 +17,7 @@ use crate::{
     InferGuardRef,
     semantic::{
         generic::{TypeSubstitutor, get_tpl_ref_extend_type, instantiate_doc_function},
+        get_member_value_expr,
         infer::narrow::get_type_at_call_expr_inline_cast,
         infer_expr_semantic_decl,
     },
@@ -357,34 +355,6 @@ fn get_semantic_decl_value_expr(
         crate::LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
         crate::LuaSemanticDeclId::Signature(_) | crate::LuaSemanticDeclId::TypeDecl(_) => None,
     }
-}
-
-fn get_member_value_expr(db: &DbIndex, member_id: crate::LuaMemberId) -> Option<LuaExpr> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
-
-    if let Some(field) = LuaTableField::cast(node.clone()) {
-        return field.get_value_expr();
-    }
-
-    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
-        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
-            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
-            let value_idx = vars
-                .iter()
-                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
-            return value_exprs.get(value_idx).cloned();
-        }
-
-        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
-            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
-        }
-    }
-
-    None
 }
 
 fn infer_tpl_ref_call(
