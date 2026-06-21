@@ -10,6 +10,7 @@ dhat-heap.json
 .grepai/
 .context-engine/
 .slim/deepwork/
+.codex-artifacts/
 
 benchmark_*.log
 .bench-*.log
