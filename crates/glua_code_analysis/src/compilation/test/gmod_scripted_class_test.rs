@@ -1662,37 +1662,44 @@ mod test {
     }
 
     #[gtest]
-    fn test_ent_base_known_gmod_base_preserves_named_super_type() {
-        let mut ws = VirtualWorkspace::new();
-        let mut emmyrc = Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
+    fn test_ent_base_known_gmod_bases_preserve_named_super_type() {
+        for (class_name, base_name) in [
+            ("mapped_anim", "base_anim"),
+            ("mapped_brush", "base_brush"),
+            ("mapped_filter", "base_filter"),
+            ("mapped_gmodentity", "base_gmodentity"),
+            ("mapped_nextbot", "base_nextbot"),
+            ("mapped_point", "base_point"),
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
 
-        ws.def_file(
-            "lua/entities/mapped_ent/shared.lua",
-            r#"
-            ENT.Base = "base_gmodentity"
-        "#,
-        );
+            ws.def_file(
+                &format!("lua/entities/{class_name}/shared.lua"),
+                &format!(r#"ENT.Base = "{base_name}""#),
+            );
 
-        let db = ws.get_db_mut();
-        let class_id = LuaTypeDeclId::global("mapped_ent");
-        let super_types: Vec<_> = db
-            .get_type_index()
-            .get_super_types_iter(&class_id)
-            .map(|iter| iter.cloned().collect())
-            .unwrap_or_default();
+            let db = ws.get_db_mut();
+            let class_id = LuaTypeDeclId::global(class_name);
+            let super_types: Vec<_> = db
+                .get_type_index()
+                .get_super_types_iter(&class_id)
+                .map(|iter| iter.cloned().collect())
+                .unwrap_or_default();
 
-        assert!(
-            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("ENT"))),
-            "expected ENT super type, got {super_types:?}"
-        );
-        assert!(
-            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("base_gmodentity"))),
-            "expected named base_gmodentity super type, got {super_types:?}"
-        );
+            assert!(
+                super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("ENT"))),
+                "expected ENT super type for {class_name}, got {super_types:?}"
+            );
+            assert!(
+                super_types.contains(&LuaType::Ref(LuaTypeDeclId::global(base_name))),
+                "expected named {base_name} super type for {class_name}, got {super_types:?}"
+            );
+        }
     }
 
     #[gtest]

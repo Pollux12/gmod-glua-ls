@@ -2025,16 +2025,6 @@ pub(crate) struct GmodScopedClassMatch {
     pub class_name_prefix: Option<String>,
 }
 
-const GMOD_ENT_BASE_TO_ENT: &[&str] = &[
-    "base_gmodentity",
-    "base_brush",
-    "base_anim",
-    "base_ai",
-    "base_nextbot",
-    "base_point",
-    "base_filter",
-];
-
 fn collect_scripted_scope_type_bindings_with(
     db: &mut DbIndex,
     file_id: FileId,
@@ -3176,8 +3166,7 @@ fn synthesize_scoped_base_assignments_with(
                 continue;
             };
 
-            let mapped_base_name = remap_scoped_base_name(&scope_match, &base_name);
-            let super_type = LuaType::Ref(LuaTypeDeclId::global(&mapped_base_name));
+            let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
             if super_type == LuaType::Ref(class_decl_id.clone()) {
                 continue;
             }
@@ -3214,25 +3203,6 @@ fn extract_scoped_base_name(expr: &LuaExpr) -> Option<String> {
         }
         _ => None,
     }
-}
-
-fn remap_scoped_base_name(scope_match: &GmodScopedClassMatch, base_name: &str) -> String {
-    if ["base_gmodentity", "base_ai"]
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case(base_name))
-    {
-        return base_name.to_string();
-    }
-
-    if scope_match.global_name == "ENT"
-        && GMOD_ENT_BASE_TO_ENT
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(base_name))
-    {
-        return scope_match.global_name.to_string();
-    }
-
-    base_name.to_string()
 }
 
 /// A wrapper function that internally calls NetworkVar or NetworkVarElement.
