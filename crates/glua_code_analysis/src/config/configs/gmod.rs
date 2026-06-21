@@ -648,6 +648,27 @@ fn scripted_scope_include_default() -> Vec<EmmyrcGmodScriptedClassScopeEntry> {
             Some("plugins"),
             None,
         )),
+        // Player classes (player_manager.RegisterClass). These live under a
+        // gamemode's `player_class/` directory and author a local `PLAYER`
+        // table. The `player_class` path segment is deeper than the generic
+        // `gamemodes` scope below, so detect_class_for_path prefers this
+        // definition for those files (matching by deepest path segment).
+        EmmyrcGmodScriptedClassScopeEntry::Definition(default_scripted_class_definition(
+            "player_classes",
+            "Player Classes",
+            &["player_class"],
+            &[
+                "player_class/**",
+                "gamemode/player_class/**",
+                "gamemodes/*/gamemode/player_class/**",
+            ],
+            &[],
+            "PLAYER",
+            None,
+            Some("person"),
+            Some("gamemodes"),
+            None,
+        )),
         EmmyrcGmodScriptedClassScopeEntry::Definition({
             let mut definition = default_scripted_class_definition(
                 "gamemodes",
@@ -1676,7 +1697,7 @@ mod tests {
         let definitions = gmod.scripted_class_scopes.resolved_definitions();
         verify_that!(gmod.enabled, eq(true))?;
         verify_that!(gmod.default_realm, eq(EmmyrcGmodRealm::Shared))?;
-        verify_that!(definitions.len(), eq(6usize))?;
+        verify_that!(definitions.len(), eq(7usize))?;
         verify_that!(definitions[0].id.as_str(), eq("entities"))?;
         verify_that!(definitions[0].class_global.as_str(), eq("ENT"))?;
         verify_that!(
@@ -1685,10 +1706,12 @@ mod tests {
         )?;
         verify_that!(definitions[3].parent_id.as_deref(), eq(Some("weapons")))?;
         verify_that!(definitions[4].scaffold.is_none(), eq(true))?;
-        verify_that!(definitions[5].id.as_str(), eq("gamemodes"))?;
-        verify_that!(definitions[5].class_global.as_str(), eq("GM"))?;
+        verify_that!(definitions[5].id.as_str(), eq("player_classes"))?;
+        verify_that!(definitions[5].class_global.as_str(), eq("PLAYER"))?;
+        verify_that!(definitions[6].id.as_str(), eq("gamemodes"))?;
+        verify_that!(definitions[6].class_global.as_str(), eq("GM"))?;
         verify_that!(
-            definitions[5].class_name_prefix.as_deref(),
+            definitions[6].class_name_prefix.as_deref(),
             eq(Some("gamemode_"))
         )?;
         verify_that!(
@@ -1883,6 +1906,18 @@ mod tests {
                 .map(|entry| entry.class_name),
             Some("TestEntity".to_string())
         );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_detect_player_class_scope_default() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+        let m = scopes.detect_class_for_path(Path::new(
+            "garrysmod/gamemodes/sandbox/gamemode/player_class/player_sandbox.lua",
+        ));
+        let m = m.expect("player_sandbox.lua should match a scope");
+        assert_eq!(m.class_name, "player_sandbox");
+        assert_eq!(m.definition.class_global, "PLAYER");
         Ok(())
     }
 

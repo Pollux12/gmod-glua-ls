@@ -2042,7 +2042,8 @@ fn collect_scripted_scope_type_bindings_with(
             }
 
             let is_scoped_local = decl.is_local()
-                && (decl.is_seeded_class_local() || scope_match.global_name == "PLUGIN");
+                && (decl.is_seeded_class_local()
+                    || scoped_class_authored_as_local(&scope_match.global_name));
             if is_scoped_local || decl.is_global() {
                 decls.push((decl.get_id(), decl.get_range()));
             }
@@ -2158,7 +2159,25 @@ fn scoped_class_uses_global_namespace(global_name: &str) -> bool {
     matches!(global_name, "TOOL" | "EFFECT")
 }
 
+/// Scopes whose authoring table is conventionally declared as a `local`
+/// (e.g. `local PLUGIN = {}`, `local PLAYER = {}`) rather than a bare global.
+/// For these, an explicit local declaration with the scope's global name is
+/// treated as the scoped class table even without the synthetic seed.
+pub(crate) fn scoped_class_authored_as_local(global_name: &str) -> bool {
+    matches!(global_name, "PLUGIN" | "PLAYER")
+}
+
 fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
+    // PLAYER is special: the runtime authoring table is named `PLAYER`, but that
+    // identifier is already a GMod enum alias (`PLAYER_IDLE`, ... in enums.lua),
+    // so the authoring-class annotation cannot use it. The shared player-class
+    // fields live on the `PlayerClass` annotation class instead. The player-class
+    // table is NOT itself a Player entity (methods use `self.Player:...`), so it
+    // inherits only `PlayerClass`.
+    if global_name == "PLAYER" {
+        return vec![LuaType::Ref(LuaTypeDeclId::global("PlayerClass"))];
+    }
+
     let mut super_types = vec![LuaType::Ref(LuaTypeDeclId::global(global_name))];
     match global_name {
         "TOOL" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Tool"))),

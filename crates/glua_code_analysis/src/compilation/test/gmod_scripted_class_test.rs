@@ -426,6 +426,115 @@ mod test {
     }
 
     #[gtest]
+    fn test_player_class_scope_binds_player_decl_to_scoped_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        // Use the DEFAULT scopes (which include the player_classes definition).
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        // The PlayerClass authoring annotation (mirrors custom/class.PlayerClass.lua).
+        // Note the authoring class is named `PlayerClass`, not `PLAYER`, because
+        // `PLAYER` is already a GMod enum alias (PLAYER_IDLE, ...).
+        ws.def_file(
+            "annotations/player.lua",
+            r#"
+            ---@meta
+            ---@class Player
+            local Player = {}
+            function Player:GiveAmmo(amount, name) end
+
+            ---@class PlayerClass
+            ---@field Player Player
+            PlayerClass = {}
+        "#,
+        );
+
+        // The base player class — also authors `local PLAYER` and registers it,
+        // reproducing the real two-file scenario (base + sandbox).
+        ws.def_file(
+            "garrysmod/gamemodes/base/gamemode/player_class/player_default.lua",
+            r#"
+            local PLAYER = {}
+            PLAYER.WalkSpeed = 400
+
+            function PLAYER:SetupDataTables()
+            end
+
+            function PLAYER:Loadout()
+                self.Player:GiveAmmo(1, "Pistol")
+            end
+
+            player_manager.RegisterClass("player_default", PLAYER, nil)
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/gamemodes/sandbox/gamemode/player_class/player_sandbox.lua",
+            r#"
+            DEFINE_BASECLASS("player_default")
+            local PLAYER = {}
+
+            function PLAYER:SetupDataTables()
+                BaseClass.SetupDataTables(self)
+            end
+
+            function PLAYER:Loadout()
+                self.Player:GiveAmmo(1, "Pistol")
+            end
+
+            player_manager.RegisterClass("player_sandbox", PLAYER, "player_default")
+        "#,
+        );
+
+        let player_decl_id = {
+            let db = ws.get_db_mut();
+            let decl_tree = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .expect("expected decl tree");
+            decl_tree
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == "PLAYER" && decl.is_local())
+                .expect("expected local PLAYER declaration")
+                .get_id()
+        };
+
+        let db = ws.get_db_mut();
+        let type_cache = db
+            .get_type_index()
+            .get_type_cache(&player_decl_id.into())
+            .expect("expected PLAYER declaration type cache");
+        assert_eq!(
+            type_cache.as_type(),
+            &LuaType::Def(LuaTypeDeclId::global("player_sandbox"))
+        );
+
+        let player_class_id = LuaTypeDeclId::global("player_sandbox");
+        let super_types = db
+            .get_type_index()
+            .get_super_types(&player_class_id)
+            .expect("expected inferred player class super types");
+        assert!(
+            super_types
+                .iter()
+                .any(|ty| ty == &LuaType::Ref(LuaTypeDeclId::global("PlayerClass"))),
+            "player_sandbox should inherit the PlayerClass authoring class, got {super_types:?}"
+        );
+
+        // `self.Player` inside a PLAYER method must resolve to the Player class
+        // (inherited via the PLAYER authoring class).
+        let self_player_ty = index_expr_type(&mut ws, file_id, "self.Player");
+        assert_eq!(
+            self_player_ty,
+            LuaType::Ref(LuaTypeDeclId::global("Player")),
+            "self.Player should resolve to Player, got {self_player_ty:?}"
+        );
+    }
+
+    #[gtest]
     fn test_plugin_scope_binds_plugin_decl_with_self_reference_initializer() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

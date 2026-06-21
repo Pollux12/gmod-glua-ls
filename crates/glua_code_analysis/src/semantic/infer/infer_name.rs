@@ -577,7 +577,22 @@ fn infer_scoped_seeded_class_self_type(
         .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&prefix_name_expr.get_range()))
         .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))?;
-    if !prefix_decl.is_seeded_class_local() {
+    // Accept the synthetic seed (ENT/SWEP/GM convention) or an explicit
+    // authoring local for scopes that conventionally use `local` (PLUGIN,
+    // PLAYER), where the prefix references the user's `local PLAYER = {}`
+    // rather than the seeded decl. For global-convention scopes (ENT/SWEP/...)
+    // an explicit shadowing local must NOT bind as the scoped class.
+    if !prefix_decl.is_seeded_class_local()
+        && !db
+            .get_gmod_infer_index()
+            .get_scoped_class_info(&file_id)
+            .is_some_and(|info| {
+                info.global_name == prefix_name.as_str()
+                    && crate::compilation::analyzer::gmod::scoped_class_authored_as_local(
+                        &info.global_name,
+                    )
+            })
+    {
         return None;
     }
 
