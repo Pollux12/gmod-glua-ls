@@ -1662,7 +1662,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_ent_base_known_gmod_base_maps_to_ent_super_type() {
+    fn test_ent_base_known_gmod_base_preserves_named_super_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -1690,9 +1690,120 @@ mod test {
             "expected ENT super type, got {super_types:?}"
         );
         assert!(
-            !super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("base_gmodentity"))),
-            "base_gmodentity should map to ENT super type"
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("base_gmodentity"))),
+            "expected named base_gmodentity super type, got {super_types:?}"
         );
+    }
+
+    #[gtest]
+    fn test_ent_base_ai_preserves_named_super_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/entities/mapped_npc/shared.lua",
+            r#"
+            ENT.Base = "base_ai"
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("mapped_npc");
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("ENT"))),
+            "expected ENT super type, got {super_types:?}"
+        );
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("base_ai"))),
+            "expected named base_ai super type, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_named_gmod_entity_bases_provide_base_specific_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "annotations/custom_classes.lua",
+                r#"
+                ---@class Entity
+                ---@class NPC : Entity
+
+                ---@class base_gmodentity : Entity
+                local base_gmodentity = {}
+
+                ---@param ply? Player|NULL
+                function base_gmodentity:SetPlayer(ply) end
+                ---@return Player|NULL
+                function base_gmodentity:GetPlayer() end
+
+                ---@class base_ai : NPC
+                local base_ai = {}
+
+                ---@return number
+                function base_ai:GetNPCClass() end
+                ---@param class number
+                function base_ai:SetNPCClass(class) end
+            "#,
+            ),
+            (
+                "lua/entities/mapped_ent/shared.lua",
+                r#"
+                ENT.Base = "base_gmodentity"
+
+                function ENT:Initialize()
+                    self:SetPlayer(nil)
+                    local ply = self:GetPlayer()
+                end
+            "#,
+            ),
+            (
+                "lua/entities/mapped_npc/shared.lua",
+                r#"
+                ENT.Base = "base_ai"
+
+                function ENT:Initialize()
+                    local class = self:GetNPCClass()
+                    self:SetNPCClass(class)
+                end
+            "#,
+            ),
+        ]);
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        for file_id in file_ids.into_iter().skip(1) {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            let undefined_fields: Vec<_> = diagnostics
+                .into_iter()
+                .filter(|diagnostic| diagnostic.code == undefined_field_code)
+                .collect();
+            assert!(
+                undefined_fields.is_empty(),
+                "unexpected undefined-field diagnostics: {undefined_fields:?}"
+            );
+        }
     }
 
     #[gtest]

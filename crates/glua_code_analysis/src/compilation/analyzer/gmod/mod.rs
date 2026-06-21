@@ -3217,6 +3217,13 @@ fn extract_scoped_base_name(expr: &LuaExpr) -> Option<String> {
 }
 
 fn remap_scoped_base_name(scope_match: &GmodScopedClassMatch, base_name: &str) -> String {
+    if ["base_gmodentity", "base_ai"]
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(base_name))
+    {
+        return base_name.to_string();
+    }
+
     if scope_match.global_name == "ENT"
         && GMOD_ENT_BASE_TO_ENT
             .iter()
