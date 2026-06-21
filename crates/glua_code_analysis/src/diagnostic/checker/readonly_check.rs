@@ -158,7 +158,7 @@ fn check_and_report_semantic_id(
             context.add_diagnostic(
                 DiagnosticCode::ReadOnly,
                 range,
-                t!("The variable is marked as readonly and cannot be assigned to.").to_string(),
+                "The variable is marked as readonly and cannot be assigned to.".to_string(),
                 None,
             );
         }

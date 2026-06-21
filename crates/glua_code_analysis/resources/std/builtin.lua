@@ -198,6 +198,27 @@
 ---@attribute constructor(name: string, root_class: string?, strip_self: boolean?, return_self: boolean?)
 
 ---
+--- Marks a function parameter as carrying call-site metadata. Language server features can use
+--- the `domain` and `role` pair to classify string literals and other arguments without matching
+--- the callable by name.
+---
+--- Parameters:
+--- - `domain`: Stable namespace for the metadata, such as `gmod.net_message`.
+--- - `role`: Meaning of this parameter in that domain, such as `define` or `reference`.
+--- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
+---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+--- Marks a parameter inside the following `@overload` function type as carrying call-site
+--- metadata.
+---
+--- Parameters:
+--- - `param`: Zero-based overload parameter index.
+--- - `domain`: Stable namespace for the metadata, such as `gmod.network_var`.
+--- - `role`: Meaning of this parameter in that domain, such as `define`.
+--- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
+---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
+---
 --- Associates `getter` and `setter` methods with a field. Currently provides only definition navigation functionality,
 --- and the target methods must reside within the same class.
 ---

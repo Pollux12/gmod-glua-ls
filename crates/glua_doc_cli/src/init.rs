@@ -108,7 +108,7 @@ pub fn load_workspace(
     }
 
     analysis.update_config(Arc::new(emmyrc));
-    analysis.init_std_lib(None);
+    analysis.init_std_lib();
 
     let file_infos = collect_workspace_files(
         &workspace_folders,

@@ -1,14 +1,13 @@
 use std::collections::HashSet;
 
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr,
-    LuaFuncStat, LuaGeneralToken, LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaNameExpr,
-    LuaTableField,
+    LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaGeneralToken,
+    LuaIndexKey, LuaLiteralToken, LuaNameExpr,
 };
 
 use crate::{
     DbIndex, DiagnosticCode, LuaSemanticDeclId, LuaSignatureId, LuaType, SemanticDeclLevel,
-    SemanticModel,
+    SemanticModel, get_member_value_expr,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -91,8 +90,8 @@ fn check_closure_expr(
         context.add_diagnostic(
             DiagnosticCode::RedundantParameter,
             param.get_range(),
-            t!(
-                "expected %{num} parameters but found %{found_num}",
+            format!(
+                "expected {num} parameters but found {found_num}",
                 num = source_params_len,
                 found_num = params.len(),
             )
@@ -182,7 +181,8 @@ fn check_call_expr(
                 && !is_nullable(context.db, &typ)
                 && !fake_param_optional.get(i).copied().unwrap_or(false)
             {
-                miss_parameter_info.push(t!("missing parameter: %{name}", name = param_info.0,));
+                miss_parameter_info
+                    .push(format!("missing parameter: {name}", name = param_info.0,));
             }
         }
 
@@ -198,8 +198,8 @@ fn check_call_expr(
             context.add_diagnostic(
                 DiagnosticCode::MissingParameter,
                 right_paren.get_range(),
-                t!(
-                    "expected %{num} parameters but found %{found_num}. %{infos}",
+                format!(
+                    "expected {num} parameters but found {found_num}. {infos}",
                     num = fake_params.len(),
                     found_num = call_args_count,
                     infos = miss_parameter_info.join(" \n ")
@@ -256,8 +256,8 @@ fn check_call_expr(
             context.add_diagnostic(
                 DiagnosticCode::RedundantParameter,
                 arg.get_range(),
-                t!(
-                    "expected %{num} parameters but found %{found_num}",
+                format!(
+                    "expected {num} parameters but found {found_num}",
                     num = fake_params.len(),
                     found_num = min_call_args_count,
                 )
@@ -357,34 +357,6 @@ fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) 
         LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
         LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
     }
-}
-
-fn get_member_value_expr(db: &DbIndex, member_id: crate::LuaMemberId) -> Option<LuaExpr> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
-
-    if let Some(field) = LuaTableField::cast(node.clone()) {
-        return field.get_value_expr();
-    }
-
-    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
-        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
-            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
-            let value_idx = vars
-                .iter()
-                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
-            return value_exprs.get(value_idx).cloned();
-        }
-
-        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
-            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
-        }
-    }
-
-    None
 }
 
 fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {

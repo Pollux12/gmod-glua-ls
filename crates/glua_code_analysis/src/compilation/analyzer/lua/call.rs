@@ -2,8 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
-    LuaIndexKey, LuaLiteralToken, LuaNameExpr, LuaTableExpr, LuaTableField, LuaVarExpr,
-    NumberResult, PathTrait,
+    LuaIndexKey, LuaLiteralToken, LuaNameExpr, LuaTableExpr, LuaVarExpr, NumberResult, PathTrait,
 };
 use rowan::TextSize;
 
@@ -13,6 +12,7 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, LuaType,
     LuaTypeDeclId,
     compilation::analyzer::{lua::LuaAnalyzer, unresolve::UnResolveSpecialCall},
+    get_member_value_expr,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -209,7 +209,6 @@ fn is_local_name_expr(db: &DbIndex, file_id: FileId, name_expr: &LuaNameExpr) ->
 
 pub(super) fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -> Option<()> {
     collect_gmod_scripted_class_call(analyzer, &call_expr);
-    collect_gmod_vgui_call(analyzer, &call_expr);
     collect_accessorfunc_annotated_call(analyzer, &call_expr);
 
     let special_call_reason = get_special_call_followup_reason(analyzer, &call_expr);
@@ -743,34 +742,6 @@ fn append_member_chain_to_access_path(
     }
 
     Some(access_path)
-}
-
-fn get_member_value_expr(db: &DbIndex, member_id: crate::LuaMemberId) -> Option<LuaExpr> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
-
-    if let Some(field) = LuaTableField::cast(node.clone()) {
-        return field.get_value_expr();
-    }
-
-    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
-        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
-            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
-            let value_idx = vars
-                .iter()
-                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
-            return value_exprs.get(value_idx).cloned();
-        }
-
-        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
-            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
-        }
-    }
-
-    None
 }
 
 fn call_expr_matches_direct_special_call(
@@ -1357,63 +1328,10 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
             syntax_id: call_expr.get_syntax_id(),
             literal_args,
             args,
-        },
-    );
-}
-
-fn collect_gmod_vgui_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaCallExpr) {
-    if !analyzer.gmod_enabled {
-        return;
-    }
-
-    // Fast path: vgui.Register / derma.DefineControl are always dotted accesses.
-    // Skip the expensive get_access_path() for the 99.9% of calls that can't match.
-    let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr() else {
-        return;
-    };
-
-    let Some(LuaIndexKey::Name(key_token)) = index_expr.get_index_key() else {
-        return;
-    };
-    let key_name = key_token.get_name_text();
-    if key_name != "Register" && key_name != "DefineControl" {
-        return;
-    }
-
-    // Check the base object: handle both direct (vgui.Register) and nested paths
-    let kind = match index_expr.get_prefix_expr() {
-        Some(LuaExpr::NameExpr(base)) => {
-            let base_name = base.get_name_token().map(|t| t.get_name_text().to_string());
-            match base_name.as_deref() {
-                Some("vgui") if key_name == "Register" => GmodScriptedClassCallKind::VguiRegister,
-                Some("derma") if key_name == "DefineControl" => {
-                    GmodScriptedClassCallKind::DermaDefineControl
-                }
-                _ => return,
-            }
-        }
-        Some(_) => {
-            // Nested path like something.vgui.Register - fall back to full path
-            let Some(call_path) = call_expr.get_access_path() else {
-                return;
-            };
-            let Some(kind) = GmodScriptedClassCallKind::from_call_path(&call_path) else {
-                return;
-            };
-            kind
-        }
-        None => return,
-    };
-
-    let (literal_args, args) = extract_call_args(call_expr);
-
-    analyzer.db.get_gmod_class_metadata_index_mut().add_call(
-        analyzer.file_id,
-        kind,
-        GmodScriptedClassCallMetadata {
-            syntax_id: call_expr.get_syntax_id(),
-            literal_args,
-            args,
+            inheritance_roles: None,
+            network_var_roles: None,
+            vgui_panel_roles: None,
+            derma_skin_roles: None,
         },
     );
 }

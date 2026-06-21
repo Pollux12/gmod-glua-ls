@@ -1,12 +1,12 @@
 use std::{collections::HashSet, ops::Deref, sync::Arc};
 
-use glua_parser::{LuaAstNode, LuaDocTypeList, LuaNameExpr};
-use glua_parser::{LuaCallExpr, LuaExpr};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaDocTypeList, LuaExpr, LuaNameExpr};
 use internment::ArcIntern;
+use smol_str::SmolStr;
 
 use crate::{
-    DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaFunctionType, LuaGenericType,
-    TypeVisitTrait,
+    DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaDocDefaultValue, LuaFunctionType,
+    LuaGenericType, LuaSemanticDeclId, TypeVisitTrait,
     db_index::{DbIndex, LuaType},
     infer_doc_type,
     semantic::{
@@ -19,13 +19,173 @@ use crate::{
                 variadic_tpl_pattern_match,
             },
         },
-        infer::InferFailReason,
+        infer::{
+            InferFailReason,
+            narrow::get_type_at_flow::{
+                explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
+            },
+        },
         infer_enclosing_self_type, infer_expr,
     },
 };
-use crate::{LuaMemberOwner, LuaSemanticDeclId, SemanticDeclLevel, infer_node_semantic_decl};
+use crate::{LuaMemberOwner, SemanticDeclLevel, infer_node_semantic_decl};
 
 use super::TypeSubstitutor;
+
+/// Resolve a flow-valid inferred string default for a call argument expression.
+///
+/// When the arg is a local variable with an inferred string default (from
+/// `x = x or "literal"`), and the self-coalescing assignment is the last
+/// write to that variable that dominates the call site, returns
+/// `Some(LuaType::StringConst(value))`.
+///
+/// Only returns a value when:
+/// - `arg_type` is exactly `LuaType::String`
+/// - `param_type` actually contains a `StrTplRef`
+/// - exactly one candidate default is flow-valid at the use site
+/// - no explicit `---@param` default takes precedence
+fn resolve_str_default_from_arg(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    param_type: &LuaType,
+    arg_expr: &LuaExpr,
+) -> Option<LuaType> {
+    // Quick gate: only when param contains a StrTplRef.
+    if !param_type.contain_tpl() {
+        return None;
+    }
+    let mut has_str_tpl = false;
+    param_type.visit_type(&mut |t| {
+        if matches!(t, LuaType::StrTplRef(_)) {
+            has_str_tpl = true;
+        }
+    });
+    if !has_str_tpl {
+        return None;
+    }
+
+    // Resolve the argument's declaration.
+    let name_expr = LuaNameExpr::cast(arg_expr.syntax().clone())?;
+    let file_id = cache.get_file_id();
+    let range = name_expr.get_range();
+    let local_ref = db.get_reference_index().get_local_reference(&file_id)?;
+    let decl_id = local_ref.get_decl_id(&range)?;
+
+    // Seed the cache with the use-site realm so that flow-reachability
+    // checks evaluate from the call argument's realm context (not the
+    // declaration position fallback).
+    let use_site_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&file_id, range.start());
+    let previous_realm = cache.flow_query_realm.replace(use_site_realm);
+
+    let result = resolve_str_default_from_arg_inner(db, cache, param_type, arg_expr, decl_id);
+
+    cache.flow_query_realm = previous_realm;
+    result
+}
+
+/// Inner helper for `resolve_str_default_from_arg` — separated so the
+/// caller can seed/restore `flow_query_realm` around the call.
+fn resolve_str_default_from_arg_inner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    _param_type: &LuaType,
+    arg_expr: &LuaExpr,
+    decl_id: crate::LuaDeclId,
+) -> Option<LuaType> {
+    let file_id = cache.get_file_id();
+
+    // ── Explicit default precedence ───────────────────────────────────
+    // If the variable is a function parameter with an explicit `---@param`
+    // default (e.g. `---@param x string = "foo"`), prefer that over any
+    // inferred `x = x or "foo"` default — but ONLY when:
+    // 1. the default is a `String` (this resolver is for string-template binding),
+    // 2. the explicit default is still flow-valid at the use site.
+    if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
+        if let crate::LuaDeclExtra::Param {
+            idx: param_idx_in_sig,
+            signature_id,
+            ..
+        } = &decl.extra
+        {
+            if let Some(default_val) = db
+                .get_signature_index()
+                .get(signature_id)
+                .and_then(|sig| sig.get_param_info_by_id(*param_idx_in_sig))
+                .and_then(|info| info.default_value.as_ref())
+            {
+                // Only String defaults participate in string-template binding.
+                if let LuaDocDefaultValue::String(s) = default_val {
+                    // Flow-validity: the explicit default must still reach
+                    // the use site (not killed by a non-coalescing reassignment).
+                    let flow_tree = db.get_flow_index().get_flow_tree(&file_id);
+                    let root = LuaChunk::cast(arg_expr.get_root());
+                    let flow_valid = match (&flow_tree, &root) {
+                        (Some(tree), Some(root)) => tree
+                            .get_flow_id(arg_expr.get_syntax_id())
+                            .is_some_and(|use_flow_id| {
+                                explicit_param_string_default_reaches_flow(
+                                    db,
+                                    tree,
+                                    cache,
+                                    root,
+                                    decl_id,
+                                    use_flow_id,
+                                )
+                            }),
+                        _ => false,
+                    };
+
+                    if flow_valid {
+                        return Some(LuaType::StringConst(SmolStr::new(s.as_str()).into()));
+                    }
+                }
+                // Non-String explicit defaults (Boolean, Number, Nil) are
+                // ignored by this resolver — they don't bind string templates.
+            }
+        }
+    }
+
+    // Get inferred string default candidates from the side-map.
+    let candidates = db
+        .get_property_index()
+        .get_inferred_string_defaults(&decl_id)?;
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Get the flow tree and the flow ID for the argument expression (use site).
+    // Using the arg expression's syntax ID (not the call expression's) is
+    // consistent with how existing narrow-flow querying works in
+    // `semantic/infer/narrow/mod.rs`.
+    let flow_tree = db.get_flow_index().get_flow_tree(&file_id)?;
+    let use_flow_id = flow_tree.get_flow_id(arg_expr.get_syntax_id())?;
+    let root = LuaChunk::cast(arg_expr.get_root())?;
+
+    // Check each candidate for flow-validity.  Exactly one must be valid.
+    let mut valid_value: Option<SmolStr> = None;
+    for candidate in candidates {
+        let reaches = inferred_string_default_reaches_flow(
+            db,
+            flow_tree,
+            cache,
+            &root,
+            decl_id,
+            use_flow_id,
+            candidate.source_range,
+        );
+        if reaches {
+            if valid_value.is_some() {
+                // Multiple valid candidates — ambiguous, don't bind.
+                return None;
+            }
+            valid_value = Some(candidate.value.clone());
+        }
+    }
+
+    valid_value.map(|v| LuaType::StringConst(v.into()))
+}
 
 pub fn instantiate_func_generic(
     db: &DbIndex,
@@ -186,7 +346,18 @@ fn infer_generic_types_from_call(
                 break;
             }
             _ => {
-                tpl_pattern_match(context, func_param_type, &arg_type)?;
+                // Try to bind from a registered string default when the
+                // inferred arg_type is plain `String` and the param has a
+                // StrTplRef.  This covers `x = x or "literal"` patterns where
+                // the canonical type stays `string` but the declaration carries
+                // an auxiliary default-value metadata.
+                let effective_type = if matches!(arg_type, LuaType::String) {
+                    resolve_str_default_from_arg(db, context.cache, func_param_type, call_arg_expr)
+                        .unwrap_or_else(|| arg_type.clone())
+                } else {
+                    arg_type.clone()
+                };
+                tpl_pattern_match(context, func_param_type, &effective_type)?;
             }
         }
     }

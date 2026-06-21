@@ -1260,6 +1260,65 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_hook_definition_from_annotated_call_arg_role() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        check!(ws.check_definition(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                function GM:SomeHook(ply) end
+
+                ---@[call_arg("gmod.hook", "emit")]
+                ---@param eventName string
+                local function emit_hook(eventName) end
+
+                emit_hook("SomeHo<??>ok")
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 7,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_hook_definition_from_hook_remove() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        check!(ws.check_definition(
+            r#"
+                ---@class GM
+                ---@type GM
+                GM = GM or {}
+
+                function GM:SomeHook(ply) end
+
+                hook.Remove("SomeHo<??>ok", "id")
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 5,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_source_file_uri_redirects_before_stub_definition() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
 
@@ -1292,6 +1351,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "panels.lua",
@@ -1315,11 +1375,300 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_vgui_panel_definition_from_annotated_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                local PANEL = {}
+                vgui.Register("MyPanel", PANEL, "DPanel")
+            "#,
+        );
+        ws.def(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.vgui_panel", "reference")]
+                ---@param name string
+                function createPanel(name) end
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                local pnl = createPanel("MyPa<??>nel")
+            "#,
+            vec![Expected {
+                file: "panels.lua".to_string(),
+                line: 2,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_vgui_panel_definition_from_overload_call_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                local PANEL = {}
+                vgui.Register("MyPanel", PANEL, "DPanel")
+            "#,
+        );
+        ws.def(
+            r#"
+                ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
+                ---@[overload_call_arg(0, "gmod.vgui_panel", "reference")]
+                ---@overload fun(className: string): Panel
+                ---@param panel Panel
+                function addPanel(panel) end
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                local pnl = addPanel("MyPa<??>nel")
+            "#,
+            vec![Expected {
+                file: "panels.lua".to_string(),
+                line: 2,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_vgui_panel_definition_from_annotated_define_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.vgui_panel", "define")]
+                ---@param name string
+                local function registerPanel(name) end
+
+                registerPanel("MyPanel")
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                local pnl = vgui.Create("MyPa<??>nel")
+            "#,
+            vec![Expected {
+                file: "panels.lua".to_string(),
+                line: 7,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_vgui_panel_definition_from_non_first_annotated_define_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@param description string
+                ---@[call_arg("gmod.vgui_panel", "define")]
+                ---@param name string
+                local function registerPanel(description, name) end
+
+                registerPanel(
+                    "desc",
+                    "MyPanel"
+                )
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                local pnl = vgui.Create("MyPa<??>nel")
+            "#,
+            vec![Expected {
+                file: "panels.lua".to_string(),
+                line: 10,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_derma_skin_definition_from_string() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "skins.lua",
+            r#"
+                local SKIN = {}
+                derma.DefineSkin("MySkin", "Nice skin", SKIN)
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                derma.GetNamedSkin("MyS<??>kin")
+            "#,
+            vec![Expected {
+                file: "skins.lua".to_string(),
+                line: 2,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_derma_skin_definition_from_annotated_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "skins.lua",
+            r#"
+                local SKIN = {}
+                derma.DefineSkin("MySkin", "Nice skin", SKIN)
+            "#,
+        );
+        ws.def(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.derma_skin", "reference")]
+                ---@param name string
+                function useSkin(name) end
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                useSkin("MyS<??>kin")
+            "#,
+            vec![Expected {
+                file: "skins.lua".to_string(),
+                line: 2,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_derma_skin_definition_from_annotated_define_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "skins.lua",
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.derma_skin", "define")]
+                ---@param name string
+                local function defineSkin(name) end
+
+                defineSkin("MySkin")
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                derma.GetNamedSkin("MyS<??>kin")
+            "#,
+            vec![Expected {
+                file: "skins.lua".to_string(),
+                line: 7,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_derma_skin_definition_from_non_first_annotated_define_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "skins.lua",
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@param description string
+                ---@[call_arg("gmod.derma_skin", "define")]
+                ---@param name string
+                local function defineSkin(description, name) end
+
+                defineSkin(
+                    "desc",
+                    "MySkin"
+                )
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                derma.GetNamedSkin("MyS<??>kin")
+            "#,
+            vec![Expected {
+                file: "skins.lua".to_string(),
+                line: 10,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_net_message_definition_from_start_string() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "receive.lua",
@@ -1342,11 +1691,269 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_net_message_definition_from_annotated_start_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "receive.lua",
+            r#"
+                net.Receive("MyMessage", function() end)
+            "#,
+        );
+        ws.def(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.net_message", "start")]
+                ---@param name string
+                function startNet(name) end
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                startNet("MyMes<??>sage")
+            "#,
+            vec![Expected {
+                file: "receive.lua".to_string(),
+                line: 1,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_net_message_definition_from_annotated_define_arg() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "net_defs.lua",
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.net_message", "define")]
+                ---@param name string
+                local function registerMessage(name) end
+
+                registerMessage("MyMessage")
+            "#,
+        );
+        ws.def(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.net_message", "reference")]
+                ---@param name string
+                function describeMessage(name) end
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                describeMessage("MyMes<??>sage")
+            "#,
+            vec![Expected {
+                file: "net_defs.lua".to_string(),
+                line: 7,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_net_message_definition_from_annotated_define_site() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        check!(ws.check_definition(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.net_message", "define")]
+                ---@param name string
+                local function registerMessage(name) end
+
+                registerMessage("MyMes<??>sage")
+            "#,
+            vec![Expected {
+                file: "".to_string(),
+                line: 7,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_vgui_panel_definition_ignores_wrong_annotated_domain() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@[call_arg("gmod.derma_skin", "define")]
+                ---@param name string
+                local function defineSkin(name) end
+
+                defineSkin("MyPanel")
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                vgui.Create("MyPa<??>nel")
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position);
+        verify_that!(result, none())?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_vgui_panel_definition_does_not_match_lookalike_builtin_path() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                local PANEL = {}
+                vgui.Register("MyPanel", PANEL, "DPanel")
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                mylib = { vgui = {} }
+                function mylib.vgui.Create(name) end
+                mylib.vgui.Create("MyPa<??>nel")
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position);
+        verify_that!(result, none())?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_vgui_panel_definition_accepts_explicit_global_builtin_path() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                local PANEL = {}
+                vgui.Register("MyPanel", PANEL, "DPanel")
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                local pnl = _G.vgui.Create("MyPa<??>nel")
+            "#,
+            vec![Expected {
+                file: "panels.lua".to_string(),
+                line: 2,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_derma_skin_definition_does_not_match_lookalike_builtin_path() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "skins.lua",
+            r#"
+                local SKIN = {}
+                derma.DefineSkin("MySkin", "Nice skin", SKIN)
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                mylib = { derma = {} }
+                function mylib.derma.GetNamedSkin(name) end
+                mylib.derma.GetNamedSkin("MyS<??>kin")
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position);
+        verify_that!(result, none())?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_derma_skin_definition_accepts_explicit_global_builtin_path() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "skins.lua",
+            r#"
+                local SKIN = {}
+                derma.DefineSkin("MySkin", "Nice skin", SKIN)
+            "#,
+        );
+
+        check!(ws.check_definition(
+            r#"
+                _G.derma.GetNamedSkin("MyS<??>kin")
+            "#,
+            vec![Expected {
+                file: "skins.lua".to_string(),
+                line: 2,
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_net_message_definition_from_receive_string() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "send.lua",

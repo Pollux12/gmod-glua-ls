@@ -191,8 +191,8 @@ fn check_generic_type_compact_table(
                         return Err(TypeCheckFailReason::TypeNotMatch);
                     }
                     return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                        t!(
-                            "member %{name} type not match, expect %{expect}, got %{got}",
+                        format!(
+                            "member {name} type not match, expect {expect}, got {got}",
                             name = key.to_path(),
                             expect =
                                 humanize_type(context.db, &source_member_type, RenderLevel::Simple),
@@ -208,7 +208,7 @@ fn check_generic_type_compact_table(
                 }
 
                 return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                    t!("missing member %{name}, in table", name = key.to_path()).to_string(),
+                    format!("missing member {name}, in table", name = key.to_path()).to_string(),
                 ));
             }
             _ => {} // 可选成员未找到，继续检查

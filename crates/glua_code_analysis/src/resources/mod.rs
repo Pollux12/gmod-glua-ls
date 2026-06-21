@@ -1,65 +1,76 @@
-mod best_resource_path;
-
 use std::path::{Path, PathBuf};
 
-pub use best_resource_path::get_best_resources_dir;
 use include_dir::{Dir, DirEntry, include_dir};
 
-use crate::{LuaFileInfo, get_locale_code, load_workspace_files};
+use crate::LuaFileInfo;
 
 static RESOURCE_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/resources");
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub fn load_resource_std(
-    create_resources_dir: Option<String>,
-    is_jit: bool,
-) -> (PathBuf, Vec<LuaFileInfo>) {
-    // 指定了输出的资源目录, 目前只有 lsp 会指定
-    if let Some(create_resources_dir) = create_resources_dir {
-        let resource_path = if create_resources_dir.is_empty() {
-            get_best_resources_dir()
-        } else {
-            PathBuf::from(&create_resources_dir)
-        };
-        // 此时会存在 i18n, 我们需要根据当前语言环境切换到对应语言的 std 目录
-        let std_dir = get_std_dir(&resource_path);
-        let result = load_resource_from_file_system(&resource_path);
-        if let Some(mut files) = result {
-            if !is_jit {
-                remove_jit_resource(&mut files);
-            }
-            return (std_dir, files);
-        }
+/// Stable virtual path used to prefix embedded std-lib file paths for VFS
+/// registration.  The directory does **not** need to exist on disk; it only
+/// needs to be an absolute path so that [`crate::file_path_to_uri`] produces
+/// valid `file://` URIs.
+fn virtual_resources_dir() -> PathBuf {
+    // Match the platform layout the old `get_best_resources_dir()` would
+    // return so downstream VFS registration is unchanged.
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                // `C:` is drive-relative (not absolute); `C:\\` is absolute.
+                // Use current_exe parent as a more robust fallback when the
+                // env var is unset; fall back to an absolute drive root.
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+                    .unwrap_or_else(|| PathBuf::from("C:\\"))
+            })
+            .join("glua_ls")
+            .join("resources")
     }
-    // 没有指定资源目录, 那么直接使用默认的资源目录, 此时不会存在 i18n
-    let resoucres_dir = get_best_resources_dir();
-    let std_dir = resoucres_dir.join("std");
-    let files = load_resource_from_include_dir();
-    let mut files = files
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+            })
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join("glua_ls")
+            .join("resources")
+    }
+}
+
+pub fn load_resource_std(is_jit: bool) -> (PathBuf, Vec<LuaFileInfo>) {
+    let resources_dir = virtual_resources_dir();
+    let std_root = resources_dir.join("std");
+
+    let raw_files = load_resource_from_include_dir();
+    let mut files: Vec<LuaFileInfo> = raw_files
         .into_iter()
-        .filter_map(|file| {
-            if file.path.ends_with(".lua") {
-                let path = resoucres_dir
-                    .join(&file.path)
-                    .to_str()
-                    .expect("UTF-8 paths")
-                    .to_string();
-                Some(LuaFileInfo {
-                    path,
-                    content: file.content,
-                })
-            } else {
-                None
+        .filter(|file| file.path.ends_with(".lua"))
+        .map(|file| {
+            let path = resources_dir
+                .join(&file.path)
+                .to_str()
+                .expect("UTF-8 paths")
+                .to_string();
+            LuaFileInfo {
+                path,
+                content: file.content,
             }
         })
-        .collect::<_>();
+        .collect();
+
     if !is_jit {
         remove_jit_resource(&mut files);
     }
-    (std_dir, files)
+
+    (std_root, files)
 }
 
-fn remove_jit_resource(files: &mut Vec<LuaFileInfo>) {
+pub(crate) fn remove_jit_resource(files: &mut Vec<LuaFileInfo>) {
     const JIT_FILES_TO_REMOVE: &[&str] = &[
         "jit.lua",
         "jit/profile.lua",
@@ -77,82 +88,7 @@ fn remove_jit_resource(files: &mut Vec<LuaFileInfo>) {
     });
 }
 
-fn load_resource_from_file_system(resources_dir: &Path) -> Option<Vec<LuaFileInfo>> {
-    // lsp i18n 的资源在更早之前的 crates\glua_ls\src\handlers\initialized\std_i18n.rs 中写入到文件系统
-    if check_need_dump_to_file_system() {
-        log::info!("Creating resources dir: {:?}", resources_dir);
-        let files = load_resource_from_include_dir();
-        for file in &files {
-            let path = resources_dir.join(&file.path);
-            let parent = path.parent()?;
-            if !parent.exists() {
-                match std::fs::create_dir_all(parent) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::error!("Failed to create dir: {:?}, {:?}", parent, e);
-                        return None;
-                    }
-                }
-            }
-
-            match std::fs::write(&path, &file.content) {
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("Failed to write file: {:?}, {:?}", path, e);
-                    return None;
-                }
-            }
-        }
-
-        let version_path = resources_dir.join("version");
-        let content = VERSION.to_string();
-        match std::fs::write(&version_path, content) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("Failed to write file: {:?}, {:?}", version_path, e);
-                return None;
-            }
-        }
-    }
-
-    let std_dir = get_std_dir(&resources_dir);
-    let match_pattern = vec!["**/*.lua".to_string()];
-    let files = match load_workspace_files(&std_dir, &match_pattern, &Vec::new(), &Vec::new(), None)
-    {
-        Ok(files) => files,
-        Err(e) => {
-            log::error!("Failed to load std lib: {:?}", e);
-            vec![]
-        }
-    };
-
-    Some(files)
-}
-
-fn check_need_dump_to_file_system() -> bool {
-    if cfg!(debug_assertions) {
-        return true;
-    }
-
-    let resoucres_dir = get_best_resources_dir();
-    let version_path = resoucres_dir.join("version");
-
-    if !version_path.exists() {
-        return true;
-    }
-
-    let Ok(content) = std::fs::read_to_string(&version_path) else {
-        return true;
-    };
-    let version = content.trim();
-    if version != VERSION {
-        return true;
-    }
-
-    false
-}
-
-pub fn load_resource_from_include_dir() -> Vec<LuaFileInfo> {
+pub(crate) fn load_resource_from_include_dir() -> Vec<LuaFileInfo> {
     let mut files = Vec::new();
     walk_resource_dir(&RESOURCE_DIR, &mut files);
     files
@@ -177,14 +113,97 @@ fn walk_resource_dir(dir: &Dir, files: &mut Vec<LuaFileInfo>) {
     }
 }
 
-// 优先使用当前语言环境的 std-{locale} 目录, 否则回退到默认的 std 目录
-fn get_std_dir(resources_dir: &Path) -> PathBuf {
-    let locale = get_locale_code(&rust_i18n::locale());
-    if locale != "en" {
-        let locale_dir = resources_dir.join(format!("std-{locale}"));
-        if locale_dir.exists() {
-            return locale_dir;
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+
+    use super::*;
+    use crate::normalize_workspace_root;
+
+    #[gtest]
+    fn embedded_std_contains_call_arg_attribute_defs() {
+        let files = load_resource_from_include_dir();
+        let builtin = files.iter().find(|f| f.path.ends_with("builtin.lua"));
+        expect_that!(builtin, some(anything()));
+        let builtin = builtin.unwrap();
+        expect_that!(builtin.content.contains("---@attribute call_arg"), eq(true));
+        expect_that!(
+            builtin.content.contains("---@attribute overload_call_arg"),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn virtual_resources_dir_is_absolute() {
+        let dir = virtual_resources_dir();
+        expect_that!(dir.is_absolute(), eq(true));
+    }
+
+    #[gtest]
+    fn virtual_resources_dir_std_subdir_is_absolute() {
+        let dir = virtual_resources_dir().join("std");
+        expect_that!(dir.is_absolute(), eq(true));
+    }
+
+    #[gtest]
+    fn load_resource_std_returns_absolute_std_root() {
+        let (std_root, _files) = load_resource_std(true);
+        expect_that!(std_root.is_absolute(), eq(true));
+    }
+
+    #[gtest]
+    fn init_std_lib_classifies_builtin_as_std_workspace() {
+        let mut analysis = crate::EmmyLuaAnalysis::new();
+        analysis.init_std_lib();
+
+        // Find the builtin.lua file in the VFS and verify it's classified as STD.
+        let vfs = analysis.compilation.get_db().get_vfs();
+        let module_index = analysis.compilation.get_db().get_module_index();
+
+        let mut found_builtin = false;
+        for file_id in vfs.get_all_file_ids() {
+            if let Some(path) = vfs.get_file_path(&file_id) {
+                if path.to_string_lossy().ends_with("builtin.lua") {
+                    found_builtin = true;
+                    expect_that!(module_index.is_std(&file_id), eq(true));
+                    break;
+                }
+            }
+        }
+        expect_that!(found_builtin, eq(true));
+    }
+
+    #[gtest]
+    fn normalize_workspace_root_preserves_absolute_paths() {
+        // Use a platform-appropriate absolute path.
+        let root = if cfg!(windows) {
+            PathBuf::from("C:/some/absolute/path")
+        } else {
+            PathBuf::from("/some/absolute/path")
+        };
+        let normalized = normalize_workspace_root(root);
+        expect_that!(normalized.is_absolute(), eq(true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[gtest]
+    fn normalize_workspace_root_uppercases_drive_letter() {
+        let lowercase = PathBuf::from("c:/Users/test/resources");
+        let normalized = normalize_workspace_root(lowercase);
+        let normalized_str = normalized.to_string_lossy();
+        // After URI round-trip, the drive letter should be uppercase.
+        expect_that!(normalized_str.starts_with("C:"), eq(true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[gtest]
+    fn virtual_resources_dir_has_uppercase_drive_on_windows() {
+        let dir = virtual_resources_dir();
+        let dir_str = dir.to_string_lossy();
+        // Absolute Windows paths should have an uppercase drive letter
+        // (e.g. C:\ not c:\).
+        if dir_str.len() >= 2 && dir_str.as_bytes()[1] == b':' {
+            expect_that!(dir_str.as_bytes()[0].is_ascii_uppercase(), eq(true));
         }
     }
-    resources_dir.join("std")
 }

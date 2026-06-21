@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr,
-    LuaVarExpr, PathTrait,
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaVarExpr,
 };
 
 use crate::{
-    DbIndex, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo, LuaDocReturnInfo,
-    LuaFunctionType, LuaInferCache, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaSignature,
-    LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel, ReturnTypeKind, SignatureReturnStatus,
-    TypeOps, get_real_type, humanize_type, infer_call_expr_func, infer_expr, infer_table_should_be,
+    DbIndex, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
+    LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberIndexItem, LuaMemberKey,
+    LuaMemberOwner, LuaSignature, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
+    ReturnTypeKind, SignatureReturnStatus, TypeOps, get_real_type, humanize_type,
+    infer_call_expr_func, infer_expr, infer_table_should_be,
 };
 
 use super::{
@@ -237,17 +237,44 @@ pub fn resolve_gmod_hook_add_callback_doc_function(
     origin_signature_id: Option<LuaSignatureId>,
     call_file_id: crate::FileId,
 ) -> Option<Arc<LuaFunctionType>> {
-    if !db.get_emmyrc().gmod.enabled || param_idx != 2 {
+    resolve_gmod_hook_callback_doc_function(
+        db,
+        call_expr,
+        param_idx,
+        origin_signature_id,
+        call_file_id,
+    )
+    .map(|resolved| resolved.function)
+}
+
+pub struct GmodHookCallbackDocFunction {
+    pub hook_name: String,
+    pub function: Arc<LuaFunctionType>,
+}
+
+pub fn resolve_gmod_hook_callback_doc_function(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    param_idx: usize,
+    origin_signature_id: Option<LuaSignatureId>,
+    call_file_id: crate::FileId,
+) -> Option<GmodHookCallbackDocFunction> {
+    if !db.get_emmyrc().gmod.enabled {
         return None;
     }
 
-    let call_path = call_expr.get_access_path()?;
-    if !matches_call_path(&call_path, "hook.Add") {
-        return None;
-    }
-
-    let hook_name = extract_hook_name(call_expr)?;
-    let member_key = LuaMemberKey::Name(hook_name.into());
+    let hook_site = db
+        .get_gmod_infer_index()
+        .get_hook_file_metadata(&call_file_id)?
+        .sites
+        .iter()
+        .find(|site| {
+            site.syntax_id == call_expr.get_syntax_id()
+                && site.kind == GmodHookKind::Add
+                && site.callback_arg_idx == Some(param_idx)
+        })?;
+    let hook_name = hook_site.hook_name.as_ref()?.clone();
+    let member_key = LuaMemberKey::Name(hook_name.clone().into());
     let call_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&call_file_id, call_expr.get_range().start());
@@ -289,7 +316,14 @@ pub fn resolve_gmod_hook_add_callback_doc_function(
             })
         },
     );
-    candidates.into_iter().map(|(_, func)| func).next()
+    let function = candidates
+        .into_iter()
+        .map(|(_, function)| function)
+        .next()?;
+    Some(GmodHookCallbackDocFunction {
+        hook_name,
+        function,
+    })
 }
 
 fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
@@ -343,14 +377,6 @@ pub fn extract_hook_name(call_expr: &LuaCallExpr) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
-}
-
-fn matches_call_path(path: &str, target: &str) -> bool {
-    // All call sites pass a fully-qualified target (e.g. "hook.Add").
-    // get_access_path() also returns the full qualified path, so an exact equality check
-    // is both necessary and sufficient. A suffix check would produce false positives for
-    // paths like "mylib.hook.Add" when the target is "hook.Add".
-    path == target
 }
 
 fn is_realm_compatible(call_realm: crate::GmodRealm, item_realm: crate::GmodRealm) -> bool {

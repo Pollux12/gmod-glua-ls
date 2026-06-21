@@ -8,12 +8,23 @@ pub use decl_feature::{DeclFeatureFlag, PropertyDeclFeature};
 use glua_parser::{LuaAstNode, LuaDocTagField, LuaDocType, LuaVersionCondition, VisibilityKind};
 pub use property::LuaCommonProperty;
 pub use property::{LuaDeprecated, LuaExport, LuaExportScope, LuaPropertyId};
+use rowan::TextRange;
+use smol_str::SmolStr;
 
 use crate::LuaDocDefaultValue;
 pub use crate::db_index::property::property::LuaAttributeUse;
-use crate::{DbIndex, FileId, LuaMember, LuaSignatureId};
+use crate::{DbIndex, FileId, LuaDeclId, LuaMember, LuaSignatureId};
 
 use super::{LuaSemanticDeclId, traits::LuaIndex};
+
+/// An inferred string default from a self-coalescing `x = x or "literal"` pattern.
+#[derive(Debug, Clone)]
+pub struct LuaInferredStringDefault {
+    /// The string value (e.g. "DScrollPanel").
+    pub value: SmolStr,
+    /// The source range of the assignment statement that produced this default.
+    pub source_range: TextRange,
+}
 
 #[derive(Debug)]
 pub struct LuaPropertyIndex {
@@ -23,6 +34,13 @@ pub struct LuaPropertyIndex {
 
     id_count: u32,
     in_filed_owner: HashMap<FileId, HashSet<LuaSemanticDeclId>>,
+
+    /// Inferred string defaults from `x = x or "literal"` patterns.
+    /// Keyed by `LuaDeclId`; one decl can have multiple candidates (e.g.
+    /// multiple self-coalescing assignments in different scopes of the same
+    /// function).  File ownership is tracked for cleanup on reindex.
+    inferred_string_defaults: HashMap<LuaDeclId, Vec<LuaInferredStringDefault>>,
+    inferred_string_defaults_file_owners: HashMap<FileId, HashSet<LuaDeclId>>,
 }
 
 impl Default for LuaPropertyIndex {
@@ -39,6 +57,8 @@ impl LuaPropertyIndex {
             properties: HashMap::new(),
             property_owners_map: HashMap::new(),
             signature_owner_by_property: HashMap::new(),
+            inferred_string_defaults: HashMap::new(),
+            inferred_string_defaults_file_owners: HashMap::new(),
         }
     }
 
@@ -309,6 +329,38 @@ impl LuaPropertyIndex {
                     .map(|property| (owner_id, property))
             })
     }
+
+    /// Register an inferred string default from `x = x or "literal"`.
+    pub fn add_inferred_string_default(
+        &mut self,
+        file_id: FileId,
+        decl_id: LuaDeclId,
+        value: SmolStr,
+        source_range: TextRange,
+    ) {
+        let entry = LuaInferredStringDefault {
+            value,
+            source_range,
+        };
+        self.inferred_string_defaults
+            .entry(decl_id)
+            .or_default()
+            .push(entry);
+        self.inferred_string_defaults_file_owners
+            .entry(file_id)
+            .or_default()
+            .insert(decl_id);
+    }
+
+    /// Get all inferred string default candidates for a declaration.
+    pub fn get_inferred_string_defaults(
+        &self,
+        decl_id: &LuaDeclId,
+    ) -> Option<&[LuaInferredStringDefault]> {
+        self.inferred_string_defaults
+            .get(decl_id)
+            .map(|v| v.as_slice())
+    }
 }
 
 impl LuaIndex for LuaPropertyIndex {
@@ -321,6 +373,12 @@ impl LuaIndex for LuaPropertyIndex {
                 }
             }
         }
+        // Clean up inferred string defaults owned by this file.
+        if let Some(decl_ids) = self.inferred_string_defaults_file_owners.remove(&file_id) {
+            for decl_id in decl_ids {
+                self.inferred_string_defaults.remove(&decl_id);
+            }
+        }
     }
 
     fn clear(&mut self) {
@@ -328,6 +386,8 @@ impl LuaIndex for LuaPropertyIndex {
         self.property_owners_map.clear();
         self.signature_owner_by_property.clear();
         self.in_filed_owner.clear();
+        self.inferred_string_defaults.clear();
+        self.inferred_string_defaults_file_owners.clear();
         self.id_count = 0;
     }
 }

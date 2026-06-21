@@ -13,6 +13,7 @@ mod realm_badge;
 
 use super::RegisterCapabilities;
 use crate::context::ServerContextSnapshot;
+use crate::handlers::gmod_string_context::is_hook_name_string_context;
 use crate::util::{find_ref_at, resolve_ref_single};
 pub use build_hover::build_hover_content_for_completion;
 use build_hover::{build_assignment_target_hover, build_semantic_info_hover};
@@ -22,11 +23,11 @@ pub use find_origin::{
 };
 use glua_code_analysis::{
     EmmyLuaAnalysis, FileId, GmodRealm, LuaMemberKey, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
-    RenderLevel, WorkspaceId, humanize_type, resolve_gmod_hook_add_callback_doc_function,
+    RenderLevel, WorkspaceId, humanize_type, resolve_gmod_hook_callback_doc_function,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaDocDescription, LuaLiteralExpr,
-    LuaStringToken, LuaTokenKind, PathTrait,
+    LuaStringToken, LuaTokenKind,
 };
 use glua_parser_desc::parse_ref_target;
 pub use hover_builder::HoverBuilder;
@@ -252,7 +253,11 @@ fn hover_gmod_hook_name_string(
     let call_expr = literal_expr
         .get_parent::<LuaCallArgList>()?
         .get_parent::<LuaCallExpr>()?;
-    if !is_hook_name_string_context(&call_expr, literal_expr) {
+    let args_list = call_expr.get_args_list()?;
+    let arg_index = args_list
+        .get_args()
+        .position(|arg| arg.get_position() == literal_expr.get_position())?;
+    if !is_hook_name_string_context(semantic_model, &call_expr, arg_index) {
         return None;
     }
 
@@ -293,11 +298,6 @@ fn hover_gmod_hook_callback_function(
     let call_arg_list = closure_expr.get_parent::<LuaCallArgList>()?;
     let call_expr = call_arg_list.get_parent::<LuaCallExpr>()?;
 
-    let call_path = call_expr.get_access_path()?;
-    if !matches_call_path(&call_path, "hook.Add") {
-        return None;
-    }
-
     // Use text range comparison instead of syntax node identity to robustly
     // locate the closure's position in the argument list across traversal paths.
     let closure_range = closure_expr.syntax().text_range();
@@ -307,14 +307,17 @@ fn hover_gmod_hook_callback_function(
         .find(|(_, arg)| arg.syntax().text_range() == closure_range)
         .map(|(idx, _)| idx);
 
-    if param_idx != Some(2) {
-        return None;
-    }
+    let param_idx = param_idx?;
 
-    let hook_name = glua_code_analysis::extract_hook_name(&call_expr)?;
-    let property_owner =
-        resolve_hook_property_owner(semantic_model, file_id, position_offset, &hook_name)?;
     let db = semantic_model.get_db();
+    let resolved_callback =
+        resolve_gmod_hook_callback_doc_function(db, &call_expr, param_idx, None, file_id)?;
+    let property_owner = resolve_hook_property_owner(
+        semantic_model,
+        file_id,
+        position_offset,
+        &resolved_callback.hook_name,
+    )?;
     let document = semantic_model.get_document();
 
     // Build the base hover from the hook property owner (gives description, realm, param docs)
@@ -328,10 +331,8 @@ fn hover_gmod_hook_callback_function(
     // Now override the primary type description with an anonymous callback signature,
     // e.g. `function(ply: Player, seat: Vehicle) -> boolean`
     // using the resolved callback doc function for this hook.
-    // param_idx == Some(2) is guaranteed by the guard above.
-    if let Some(callback_func) =
-        resolve_gmod_hook_add_callback_doc_function(db, &call_expr, 2, None, file_id)
     {
+        let callback_func = resolved_callback.function;
         let params_str = callback_func
             .get_params()
             .iter()
@@ -420,34 +421,6 @@ pub(crate) fn resolve_hook_property_owner(
     }
 
     fallback
-}
-
-fn is_hook_name_string_context(call_expr: &LuaCallExpr, literal_expr: LuaLiteralExpr) -> bool {
-    let Some(call_path) = call_expr.get_access_path() else {
-        return false;
-    };
-    if !matches_call_path(&call_path, "hook.Add")
-        && !matches_call_path(&call_path, "hook.Run")
-        && !matches_call_path(&call_path, "hook.Call")
-    {
-        return false;
-    }
-
-    let Some(args_list) = call_expr.get_args_list() else {
-        return false;
-    };
-    let arg_idx = args_list
-        .get_args()
-        .position(|arg| arg.get_position() == literal_expr.get_position());
-    arg_idx == Some(0)
-}
-
-fn matches_call_path(path: &str, target: &str) -> bool {
-    // All call sites pass a fully-qualified target (e.g. "hook.Add").
-    // get_access_path() also returns the full qualified path, so an exact equality check
-    // is both necessary and sufficient. A suffix check would produce false positives for
-    // paths like "mylib.hook.Add" when the target is "hook.Add".
-    path == target
 }
 
 fn is_realm_compatible(call_realm: GmodRealm, item_realm: GmodRealm) -> bool {

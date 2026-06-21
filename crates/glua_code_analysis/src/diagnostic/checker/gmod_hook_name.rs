@@ -26,9 +26,9 @@ impl Checker for GmodHookNameChecker {
             };
 
             let message = match name_issue {
-                GmodHookNameIssue::Empty => t!("Hook name should not be empty.").to_string(),
+                GmodHookNameIssue::Empty => "Hook name should not be empty.".to_string(),
                 GmodHookNameIssue::NonStringLiteral => {
-                    t!("Hook name should be a string literal when static.").to_string()
+                    "Hook name should be a string literal when static.".to_string()
                 }
             };
 

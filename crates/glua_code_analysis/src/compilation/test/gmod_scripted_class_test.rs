@@ -203,6 +203,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         let file_id = ws.def_file(
             "lua/entities/entities_test.lua",
             r#"
@@ -254,6 +255,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         let file_name = "lua/entities/scripted.lua";
 
         let file_id = ws.def_file(file_name, r#"DEFINE_BASECLASS("base_anim")"#);
@@ -295,6 +297,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let allowed_file_id = ws.def_file(
             "lua/entities/entities_test.lua",
@@ -339,6 +342,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "addons/mygamemode/gamemode/entities/entities_test/shared.lua",
@@ -360,6 +364,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "plugins/vehicles/sh_plugin.lua",
@@ -427,6 +432,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "plugins/vehicles/sh_plugin.lua",
@@ -487,6 +493,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "plugins/vehicles/sh_plugin.lua",
@@ -527,6 +534,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "plugins/vehicles/entities/entities/vehicles_money/sh_init.lua",
@@ -560,6 +568,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "entities/entities/cityrp_money/sh_init.lua",
@@ -612,6 +621,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "entities/entities/shadowed_ent/init.lua",
@@ -646,6 +656,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "entities/entities/shadowed_method_ent/init.lua",
@@ -685,6 +696,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "entities/entities/cityrp_inventory/init.lua",
@@ -733,6 +745,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "entities/entities/cityrp_inventory/init.lua",
@@ -777,6 +790,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/my_entity/init.lua",
@@ -837,6 +851,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/typed_ent/init.lua",
@@ -872,6 +887,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/nw_entity/init.lua",
@@ -929,6 +945,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/derived_ent/init.lua",
@@ -958,6 +975,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedGlobal);
 
         let file_id = ws.def_file(
@@ -1014,6 +1032,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedGlobal);
 
         let file_id = ws.def_file(
@@ -1080,6 +1099,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "lua/vgui/baseclass_source_anchor.lua",
@@ -1122,12 +1142,424 @@ mod test {
     }
 
     #[gtest]
+    fn test_annotated_vgui_registration_wrapper_creates_panel_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/annotated_wrapper.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            ---@class Panel
+
+            ---@generic T: Panel
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName string
+            ---@return T
+            local function register_panel(name, panelTable, baseName)
+                return panelTable
+            end
+
+            local PANEL = {}
+            function PANEL:Paint() end
+
+            register_panel("AnnotatedPanel", PANEL, "DFrame")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let definitions = db
+            .get_gmod_class_metadata_index()
+            .find_vgui_panel_definitions("AnnotatedPanel");
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            db.get_gmod_class_metadata_index()
+                .get_vgui_panel_base("AnnotatedPanel"),
+            Some(Some("DFrame".to_string()))
+        );
+
+        let paint_member = db.get_member_index().get_member_item(
+            &LuaMemberOwner::Type(LuaTypeDeclId::global("AnnotatedPanel")),
+            &LuaMemberKey::Name("Paint".into()),
+        );
+        assert!(
+            paint_member.is_some(),
+            "expected annotated wrapper to synthesize panel members for file {file_id:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_cross_file_annotated_vgui_registration_wrapper_creates_panel_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/includes/modules/panel_registry.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            PanelRegistry = {}
+
+            ---@generic T: Panel
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName string
+            ---@return T
+            function PanelRegistry.Register(name, panelTable, baseName)
+                return panelTable
+            end
+        "#,
+        );
+
+        ws.def_file(
+            "lua/vgui/cross_file_annotated_wrapper.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Paint() end
+
+            PanelRegistry.Register("CrossFilePanel", PANEL, "DFrame")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let definitions = db
+            .get_gmod_class_metadata_index()
+            .find_vgui_panel_definitions("CrossFilePanel");
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            db.get_gmod_class_metadata_index()
+                .get_vgui_panel_base("CrossFilePanel"),
+            Some(Some("DFrame".to_string()))
+        );
+
+        let paint_member = db.get_member_index().get_member_item(
+            &LuaMemberOwner::Type(LuaTypeDeclId::global("CrossFilePanel")),
+            &LuaMemberKey::Name("Paint".into()),
+        );
+        assert!(
+            paint_member.is_some(),
+            "expected cross-file annotated wrapper to synthesize panel members"
+        );
+    }
+
+    #[gtest]
+    fn test_colon_annotated_vgui_registration_wrapper_maps_self_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/vgui/colon_annotated_wrapper.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            local registry = {}
+
+            ---@generic T: Panel
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName string
+            ---@return T
+            function registry:Register(name, panelTable, baseName)
+                return panelTable
+            end
+
+            local PANEL = {}
+            function PANEL:Paint() end
+
+            registry:Register("ColonPanel", PANEL, "DFrame")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let definitions = db
+            .get_gmod_class_metadata_index()
+            .find_vgui_panel_definitions("ColonPanel");
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            db.get_gmod_class_metadata_index()
+                .get_vgui_panel_base("ColonPanel"),
+            Some(Some("DFrame".to_string()))
+        );
+
+        let paint_member = db.get_member_index().get_member_item(
+            &LuaMemberOwner::Type(LuaTypeDeclId::global("ColonPanel")),
+            &LuaMemberKey::Name("Paint".into()),
+        );
+        assert!(
+            paint_member.is_some(),
+            "expected colon-call annotated wrapper to synthesize panel members"
+        );
+    }
+
+    #[gtest]
+    fn test_annotated_network_var_wrapper_synthesizes_get_set_with_reordered_args() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/entities/annotated_network/shared.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.network_var", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param typeName string
+            local function addNetworkVar(name, typeName)
+            end
+
+            function ENT:SetupDataTables()
+                addNetworkVar("Enabled", "Bool")
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("annotated_network"));
+        let getter = db
+            .get_member_index()
+            .get_member_item(&owner, &LuaMemberKey::Name("GetEnabled".into()));
+        let setter = db
+            .get_member_index()
+            .get_member_item(&owner, &LuaMemberKey::Name("SetEnabled".into()));
+
+        assert!(getter.is_some(), "expected annotated wrapper getter");
+        assert!(setter.is_some(), "expected annotated wrapper setter");
+    }
+
+    #[gtest]
+    fn test_annotated_network_var_overload_roles_synthesize_omitted_slot_form() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/entities/annotated_network_overload/shared.lua",
+            r#"
+            ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
+            ---@[overload_call_arg(0, "gmod.network_var", "type")]
+            ---@[overload_call_arg(1, "gmod.network_var", "define")]
+            ---@overload fun(type: string, name: string, extended?: table)
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param type string
+            ---@param slot number
+            ---@[call_arg("gmod.network_var", "define")]
+            ---@param name string
+            ---@param extended? table
+            local function DefineNetworkVar(type, slot, name, extended)
+            end
+
+            function ENT:SetupDataTables()
+                DefineNetworkVar("Bool", "Active")
+                DefineNetworkVar("Float", 0, "Speed")
+            end
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("annotated_network_overload"));
+        for name in ["GetActive", "SetActive", "GetSpeed", "SetSpeed"] {
+            let member = db
+                .get_member_index()
+                .get_member_item(&owner, &LuaMemberKey::Name(name.into()));
+            assert!(
+                member.is_some(),
+                "expected annotated NetworkVar overload to synthesize {name}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_annotated_network_var_element_wrapper_synthesizes_number_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/entities/annotated_network_element/shared.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.network_var", "define_element")]
+            ---@param name string
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param typeName string
+            local function addNetworkElement(name, typeName)
+            end
+
+            function ENT:SetupDataTables()
+                addNetworkElement("VelocityX", "Vector")
+            end
+
+            local value = ENT:GetVelocityX()
+        "#,
+        );
+
+        let value_type = local_name_type(&mut ws, file_id, "value");
+        assert!(
+            matches!(value_type, LuaType::Number | LuaType::Integer),
+            "NetworkVarElement wrapper should synthesize numeric getter, got {value_type:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_annotated_network_var_element_overload_roles_synthesize_omitted_slot_form() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/entities/annotated_network_element_overload/shared.lua",
+            r#"
+            ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
+            ---@[overload_call_arg(0, "gmod.network_var", "type")]
+            ---@[overload_call_arg(2, "gmod.network_var", "define_element")]
+            ---@overload fun(type: string, element: string, name: string, extended?: table)
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param type string
+            ---@param slot number
+            ---@param element string
+            ---@[call_arg("gmod.network_var", "define_element")]
+            ---@param name string
+            ---@param extended? table
+            local function DefineNetworkVarElement(type, slot, element, name, extended)
+            end
+
+            function ENT:SetupDataTables()
+                DefineNetworkVarElement("Vector", "x", "OffsetX")
+                DefineNetworkVarElement("Vector", 0, "y", "OffsetY")
+            end
+
+            local x = ENT:GetOffsetX()
+            local y = ENT:GetOffsetY()
+        "#,
+        );
+
+        for name in ["x", "y"] {
+            let value_type = local_name_type(&mut ws, file_id, name);
+            assert!(
+                matches!(value_type, LuaType::Number | LuaType::Integer),
+                "NetworkVarElement overload wrapper should synthesize numeric getter for {name}, got {value_type:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_annotated_derma_skin_wrapper_records_skin_definition() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/skins/annotated_skin_wrapper.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            ---@[call_arg("gmod.derma_skin", "define")]
+            ---@param skinName string
+            ---@param description string
+            ---@param skin table
+            local function define_skin(skinName, description, skin) end
+
+            define_skin("AnnotatedSkin", "test skin", {})
+        "#,
+        );
+
+        let definitions = ws
+            .get_db_mut()
+            .get_gmod_class_metadata_index()
+            .find_derma_skin_definitions("AnnotatedSkin");
+
+        assert_eq!(definitions.len(), 1);
+    }
+
+    #[gtest]
+    fn test_scripted_class_detection_does_not_match_lookalike_builtin_paths() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/lookalike_paths.lua",
+            r#"
+            mylib = { vgui = {}, derma = {} }
+            function mylib.vgui.Register(name, panel, base) end
+            function mylib.derma.DefineControl(name, description, panel, base) end
+            function mylib.derma.DefineSkin(name, description, skin) end
+
+            local PANEL = {}
+            mylib.vgui.Register("LookalikePanel", PANEL, "DPanel")
+            mylib.derma.DefineControl("LookalikeControl", "desc", PANEL, "DPanel")
+            mylib.derma.DefineSkin("LookalikeSkin", "desc", {})
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        assert!(
+            db.get_gmod_class_metadata_index()
+                .get_file_metadata(&file_id)
+                .is_none()
+        );
+        assert!(
+            db.get_gmod_class_metadata_index()
+                .find_vgui_panel_definitions("LookalikePanel")
+                .is_empty()
+        );
+        assert!(
+            db.get_gmod_class_metadata_index()
+                .find_vgui_panel_definitions("LookalikeControl")
+                .is_empty()
+        );
+        assert!(
+            db.get_gmod_class_metadata_index()
+                .find_derma_skin_definitions("LookalikeSkin")
+                .is_empty()
+        );
+    }
+
+    #[gtest]
     fn test_ent_base_from_shared_file_sets_folder_class_super_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "entities/entities/cityrp_money/sh_init.lua",
@@ -1183,6 +1615,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/mapped_ent/shared.lua",
@@ -1216,6 +1649,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::TypeNotFound);
 
         ws.def_files(vec![
@@ -1263,6 +1697,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/vgui/my_panel.lua",
@@ -1305,6 +1740,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/vgui/multi_panel.lua",
@@ -1404,6 +1840,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/vgui/reassigned_panel.lua",
@@ -1469,6 +1906,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/vgui/reassigned_panel_accessors.lua",
@@ -1534,6 +1972,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/vgui/reassigned_panel_stress.lua",
@@ -1619,6 +2058,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/vgui/panel_do_scope.lua",
@@ -1691,6 +2131,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/vgui/panel_orphan_scope.lua",
@@ -1735,6 +2176,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "lua/vgui/panel_hover_type.lua",
@@ -1826,6 +2268,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "lua/vgui/reassigned_panel_regions.lua",
@@ -1895,6 +2338,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "lua/vgui/reassigned_panel_decl_type.lua",
@@ -1954,6 +2398,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = false;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         let file_id = ws.def_file(
@@ -1998,6 +2443,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = false;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         let file_id = ws.def_file(
@@ -2037,6 +2483,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         let file_id = ws.def_file(
@@ -2076,6 +2523,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def(
@@ -2134,6 +2582,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def(
@@ -2181,6 +2630,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
         ws.enable_check(DiagnosticCode::NeedCheckNil);
         ws.enable_check(DiagnosticCode::MissingParameter);
@@ -2267,6 +2717,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/two_arg_nw/init.lua",
@@ -2315,6 +2766,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "lua/entities/nve_entity/init.lua",
@@ -2378,6 +2830,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/nve_short/init.lua",
@@ -2417,6 +2870,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_files(vec![
             (
@@ -2483,6 +2937,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/mixed_nw/init.lua",
@@ -2542,6 +2997,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "lua/entities/nve_meta_test.lua",
@@ -2575,6 +3031,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/wrapper_ent/init.lua",
@@ -2628,6 +3085,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/wrapper_fixed/init.lua",
@@ -2681,6 +3139,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/elem_wrap/init.lua",
@@ -2726,6 +3185,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_files(vec![
@@ -2779,6 +3239,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_files(vec![
             (
@@ -2839,6 +3300,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_files(vec![
@@ -2898,6 +3360,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/local_wrap_ent/init.lua",
@@ -2950,6 +3413,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_files(vec![
@@ -3003,6 +3467,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_files(vec![
@@ -3139,6 +3604,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         // First batch: shared.lua analyzed alone
@@ -3188,6 +3654,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_files(vec![
@@ -3548,6 +4015,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_files(vec![
@@ -3712,6 +4180,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_file(
@@ -3831,6 +4300,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/includes/custom_classes.lua",
@@ -3913,6 +4383,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         // class.TOOL.lua - exact real annotation structure
@@ -4061,6 +4532,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         let file_id = ws.def_file(
@@ -4117,6 +4589,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         // Mimics the real pattern: function param with @type re-annotation
@@ -4165,6 +4638,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         // Class defined in file A
@@ -4226,6 +4700,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         let file_id = ws.def_file(
@@ -4302,6 +4777,163 @@ mod test {
     }
 
     #[gtest]
+    fn test_gettable_alias_dynamic_sound_table_named_field_keeps_value_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+
+        let cl_init_path = "cityrp/entities/entities/base_glide/cl_init.lua";
+        let cl_init_code = r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class CSoundPatch
+                ---@field Stop fun(self: CSoundPatch)
+                ---@field SetSoundLevel fun(self: CSoundPatch, level: number)
+
+                ---@return CSoundPatch
+                function CreateSound() end
+
+                local GetTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    self.sounds = {}
+                end
+
+                function ENT:OnEngineStateChange()
+                    local snd = self:CreateLoopingSound("start")
+                    snd:Stop()
+                end
+
+                function ENT:CreateLoopingSound(id)
+                    local snd = self.sounds[id]
+
+                    if not snd then
+                        snd = CreateSound()
+                        snd:SetSoundLevel(70)
+                        self.sounds[id] = snd
+                    end
+
+                    return snd
+                end
+
+                function ENT:InternalDeactivateSounds()
+                    local sounds = self.sounds
+
+                    for k, snd in pairs(sounds) do
+                        snd:Stop()
+                        sounds[k] = nil
+                    end
+                end
+
+                function ENT:InternalUpdateFeatures()
+                    local selfTbl = GetTable(self)
+                    local sounds = selfTbl.sounds
+                    local calmWaterPreview = sounds.calmWater
+
+                    if sounds.start then
+                        local guardedStart = sounds.start
+                        sounds.start:Stop()
+                        sounds.start = nil
+                    end
+
+                    if sounds.calmWater then
+                        local guardedCalmWater = sounds.calmWater
+                        sounds.calmWater:Stop()
+                    end
+                end
+            "#;
+        let file_id = ws.def_file(cl_init_path, cl_init_code);
+
+        ws.def_file(
+            "cityrp/entities/entities/base_glide/cl_water.lua",
+            r#"
+                function ENT:UpdateWaterSounds()
+                    local sounds = self.sounds
+                    local snd = self:CreateLoopingSound("calmWater")
+                    snd:Stop()
+
+                    if sounds.calmWater then
+                        sounds.calmWater:Stop()
+                        sounds.calmWater = nil
+                    end
+                end
+            "#,
+        );
+
+        let sounds_ty = index_expr_type(&mut ws, file_id, "selfTbl.sounds");
+        let sounds_ty_text = ws.humanize_type_detailed(sounds_ty.clone());
+        assert!(
+            sounds_ty_text.contains("[dynamic]: CSoundPatch"),
+            "expected GetTable(self).sounds to preserve dynamic sound table type, got {:?}",
+            sounds_ty
+        );
+
+        let start_ty = local_name_type(&mut ws, file_id, "guardedStart");
+        assert_eq!(
+            ws.humanize_type(start_ty.clone()),
+            "CSoundPatch",
+            "expected sounds.start to use dynamic sound value type, got {:?}",
+            start_ty
+        );
+
+        let calm_water_preview_ty = local_name_type(&mut ws, file_id, "calmWaterPreview");
+        assert_eq!(
+            ws.humanize_type(calm_water_preview_ty.clone()),
+            "CSoundPatch",
+            "expected cross-file sounds.calmWater preview to use dynamic sound value type, got {:?}",
+            calm_water_preview_ty
+        );
+
+        let guarded_calm_water_ty = local_name_type(&mut ws, file_id, "guardedCalmWater");
+        assert_eq!(
+            ws.humanize_type(guarded_calm_water_ty.clone()),
+            "CSoundPatch",
+            "expected cross-file guarded sounds.calmWater to use dynamic sound value type, got {:?}",
+            guarded_calm_water_ty
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = Some(NumberOrString::String(
+            DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == unchecked_nil_access)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect();
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("sounds.start")),
+            "sounds.start should not report unchecked-nil-access when guarded: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("sounds.calmWater")),
+            "sounds.calmWater should not report unchecked-nil-access when guarded: {messages:?}"
+        );
+    }
+
+    #[gtest]
     fn test_gettable_alias_uses_shadowed_self_argument_type_instead_of_receiver() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
@@ -4309,6 +4941,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "cityrp/entities/entities/glide_wheel/init.lua",
@@ -4370,6 +5003,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UncheckedNilAccess);
 
         let file_id = ws.def_file(
@@ -4464,6 +5098,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "cityrp/entities/entities/base_glide/sv_input.lua",
@@ -4527,6 +5162,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_file(
@@ -4588,6 +5224,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
         ws.enable_check(DiagnosticCode::UncheckedNilAccess);
 
@@ -4680,6 +5317,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         emmyrc.strict.array_index = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "annotations/vehicle.lua",
@@ -4913,6 +5551,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         emmyrc.strict.array_index = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let annotations_code = r#"
             ---@class Entity
@@ -5072,6 +5711,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
@@ -5252,6 +5892,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::UncheckedNilAccess);
@@ -5445,6 +6086,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let consumer_path = "lua/weapons/glide_refueler_base.lua";
         let consumer_code = r#"
@@ -5593,6 +6235,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_ids = ws.def_files(vec![
             (
@@ -5791,6 +6434,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "lua/weapons/glide_refueler_base.lua",
@@ -5823,6 +6467,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_ids = ws.def_files(vec![
             (
@@ -5911,6 +6556,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def(
             r#"
@@ -5945,6 +6591,7 @@ mod test {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def(
             r#"
@@ -5970,6 +6617,7 @@ mod test {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def(
             r#"
@@ -5998,6 +6646,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let code = r#"
             ---@return unknown
@@ -6158,6 +6807,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/dual_realm_ent/init.lua",
@@ -6213,6 +6863,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/vgui/test_derma_panel.lua",
@@ -6265,6 +6916,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_files(vec![
             (
@@ -6346,6 +6998,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::ParamTypeMismatch);
 
         let file_id = ws.def_file(
@@ -6410,6 +7063,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let shared_path = "lua/weapons/weapon_mad_deagle/shared.lua";
         let shared_text = r#"
@@ -6481,6 +7135,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "gamemodes/sandbox/gamemode/init.lua",
@@ -6518,6 +7173,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "gamemodes/darkrp/gamemode/entities/entities/my_ent/shared.lua",
@@ -6555,6 +7211,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
@@ -6640,6 +7297,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/entities/base_thing/init.lua",
@@ -6685,6 +7343,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "gamemodes/weirdgame/gamemode/init.lua",
@@ -6718,6 +7377,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "gamemodes/sandbox/gamemode/player.lua",
@@ -6759,6 +7419,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         add_gamemode_gm_library(&mut ws);
 
         ws.def_file(
@@ -6797,6 +7458,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         add_gamemode_gm_library(&mut ws);
 
         ws.def_file(
@@ -6823,11 +7485,78 @@ mod test {
     }
 
     #[gtest]
+    fn test_annotated_define_baseclass_wrapper_synthesizes_parent_alias() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        add_gamemode_gm_library(&mut ws);
+
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/player.lua",
+            r#"function GM:SetupMove(ply, mv, cmd) end"#,
+        );
+
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            ---@[call_arg("gmod.class_base", "reference")]
+            ---@param base string
+            local function setBaseClass(base) end
+
+            setBaseClass("gamemode_sandbox")
+            "#,
+        );
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_darkrp"));
+        let member_item = ws
+            .get_db_mut()
+            .get_member_index()
+            .get_member_item(&owner, &LuaMemberKey::Name("Sandbox".into()));
+
+        assert!(
+            member_item.is_some(),
+            "annotated class_base wrapper should synthesize Sandbox alias"
+        );
+    }
+
+    #[gtest]
+    fn test_annotated_derive_gamemode_wrapper_adds_prefixed_super_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        add_gamemode_gm_library(&mut ws);
+
+        ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            ---@[call_arg("gmod.gamemode", "reference")]
+            ---@param base string
+            local function derive(base) end
+
+            derive("sandbox")
+            "#,
+        );
+
+        let super_types = super_types_of(&mut ws, "gamemode_darkrp");
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("gamemode_sandbox"))),
+            "annotated gamemode wrapper should add gamemode_sandbox super type, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
     fn test_derive_gamemode_and_define_baseclass_together() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         add_gamemode_gm_library(&mut ws);
 
         ws.def_file(
@@ -6859,6 +7588,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "gamemodes/darkrp/gamemode/init.lua",
@@ -6885,6 +7615,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         add_gamemode_gm_library(&mut ws);
 
         ws.def_file(
@@ -6907,6 +7638,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "lua/autorun/test.lua",
@@ -6935,6 +7667,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         add_gamemode_gm_library(&mut ws);
 
         let file_a = ws.def_file(
@@ -6970,6 +7703,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         add_gamemode_gm_library(&mut ws);
 
         let file_id = ws.def_file(
@@ -7028,6 +7762,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         // Simulate the real edit_sky / env_skypaint pattern
         ws.def_files(vec![
@@ -7098,6 +7833,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
 
         ws.def_files(vec![
@@ -7159,6 +7895,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         // Test direct call: scripted_ents.GetMember("class", "method")(self)
         ws.def_files(vec![
@@ -7209,6 +7946,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         // Verify the target entity still has its own NetworkVar members
         ws.def_files(vec![
@@ -7273,6 +8011,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_files(vec![
             (
@@ -7323,6 +8062,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_files(vec![
             (
@@ -7380,6 +8120,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_files(vec![
             (
@@ -7446,6 +8187,7 @@ mod test {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         // Delegation to a nonexistent class should not crash
         ws.def_file(
@@ -7491,6 +8233,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "lua/vgui/self_field_collapse.lua",
@@ -7563,6 +8306,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "lua/vgui/alias_after_reassign.lua",

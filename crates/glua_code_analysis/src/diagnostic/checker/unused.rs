@@ -43,8 +43,8 @@ impl Checker for UnusedChecker {
                         context.add_diagnostic(
                         DiagnosticCode::Unused,
                         range,
-                        t!(
-                            "%{name} is never used, if this is intentional, prefix it with an underscore: _%{name}",
+                        format!(
+                            "{name} is never used, if this is intentional, prefix it with an underscore: _{name}",
                             name = name
                         ).to_string(),
                         None)
@@ -63,9 +63,7 @@ impl Checker for UnusedChecker {
                         context.add_diagnostic(
                             DiagnosticCode::UnusedSelf,
                             range,
-                            t!(
-                                "Implicit self is never used, if this is intentional, please use '.' instead of ':' to define the method",
-                            ).to_string(),
+                            "Implicit self is never used, if this is intentional, please use '.' instead of ':' to define the method".to_string(),
                             None,
                         );
                     }

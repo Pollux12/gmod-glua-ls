@@ -23,9 +23,9 @@ fn parse_sub_expr(p: &mut LuaParser, limit: i32) -> ParseResult {
             Ok(_) => {}
             Err(_) => {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!(
-                        "unary operator '%{op}' is not followed by an expression",
-                        op = op_token
+                    &format!(
+                        "unary operator '{}' is not followed by an expression",
+                        op_token
                     ),
                     op_range,
                 ));
@@ -46,9 +46,9 @@ fn parse_sub_expr(p: &mut LuaParser, limit: i32) -> ParseResult {
             Ok(_) => {}
             Err(err) => {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!(
-                        "binary operator '%{op}' is not followed by an expression",
-                        op = op_token
+                    &format!(
+                        "binary operator '{}' is not followed by an expression",
+                        op_token
                     ),
                     op_range,
                 ));
@@ -85,21 +85,21 @@ fn parse_simple_expr(p: &mut LuaParser) -> ParseResult {
         _ => {
             // Provide more specific error information
             let error_msg = match p.current_token() {
-                LuaTokenKind::TkEof => t!("unexpected end of file, expected expression"),
-                LuaTokenKind::TkRightParen => t!("unexpected ')', expected expression"),
-                LuaTokenKind::TkRightBrace => t!("unexpected '}', expected expression"),
-                LuaTokenKind::TkRightBracket => t!("unexpected ']', expected expression"),
-                LuaTokenKind::TkComma => t!("unexpected ',', expected expression"),
-                LuaTokenKind::TkSemicolon => t!("unexpected ';', expected expression"),
-                LuaTokenKind::TkEnd => t!("unexpected 'end', expected expression"),
-                LuaTokenKind::TkElse => t!("unexpected 'else', expected expression"),
-                LuaTokenKind::TkElseIf => t!("unexpected 'elseif', expected expression"),
-                LuaTokenKind::TkThen => t!("unexpected 'then', expected expression"),
-                LuaTokenKind::TkDo => t!("unexpected 'do', expected expression"),
-                LuaTokenKind::TkUntil => t!("unexpected 'until', expected expression"),
-                _ => t!(
-                    "unexpected token '%{token}', expected expression",
-                    token = p.current_token()
+                LuaTokenKind::TkEof => "unexpected end of file, expected expression".to_string(),
+                LuaTokenKind::TkRightParen => "unexpected ')', expected expression".to_string(),
+                LuaTokenKind::TkRightBrace => "unexpected '}', expected expression".to_string(),
+                LuaTokenKind::TkRightBracket => "unexpected ']', expected expression".to_string(),
+                LuaTokenKind::TkComma => "unexpected ',', expected expression".to_string(),
+                LuaTokenKind::TkSemicolon => "unexpected ';', expected expression".to_string(),
+                LuaTokenKind::TkEnd => "unexpected 'end', expected expression".to_string(),
+                LuaTokenKind::TkElse => "unexpected 'else', expected expression".to_string(),
+                LuaTokenKind::TkElseIf => "unexpected 'elseif', expected expression".to_string(),
+                LuaTokenKind::TkThen => "unexpected 'then', expected expression".to_string(),
+                LuaTokenKind::TkDo => "unexpected 'do', expected expression".to_string(),
+                LuaTokenKind::TkUntil => "unexpected 'until', expected expression".to_string(),
+                _ => format!(
+                    "unexpected token '{}', expected expression",
+                    p.current_token()
                 ),
             };
 
@@ -127,7 +127,7 @@ pub fn parse_closure_expr(p: &mut LuaParser) -> ParseResult {
         p.bump();
     } else {
         p.push_error(LuaParseError::syntax_error_from(
-            &t!("expected 'end' to close function definition"),
+            "expected 'end' to close function definition",
             p.current_token_range(),
         ));
     }
@@ -142,7 +142,7 @@ fn parse_param_list(p: &mut LuaParser) -> ParseResult {
         p.bump();
     } else {
         p.push_error(LuaParseError::syntax_error_from(
-            &t!("expected '(' to start parameter list"),
+            "expected '(' to start parameter list",
             p.current_token_range(),
         ));
     }
@@ -155,7 +155,7 @@ fn parse_param_list(p: &mut LuaParser) -> ParseResult {
                 Ok(_) => {}
                 Err(_) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected parameter name"),
+                        "expected parameter name",
                         p.current_token_range(),
                     ));
                     // Try to recover to next comma or right parenthesis
@@ -177,7 +177,7 @@ fn parse_param_list(p: &mut LuaParser) -> ParseResult {
                 // Check if there is a parameter after comma
                 if p.current_token() == LuaTokenKind::TkRightParen {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected parameter name after ','"),
+                        "expected parameter name after ','",
                         p.current_token_range(),
                     ));
                     break;
@@ -185,7 +185,7 @@ fn parse_param_list(p: &mut LuaParser) -> ParseResult {
 
                 if is_vararg && !reported_trailing_after_vararg {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("vararg '...' must be the last parameter"),
+                        "vararg '...' must be the last parameter",
                         p.current_token_range(),
                     ));
                     reported_trailing_after_vararg = true;
@@ -200,7 +200,7 @@ fn parse_param_list(p: &mut LuaParser) -> ParseResult {
         p.bump();
     } else {
         p.push_error(LuaParseError::syntax_error_from(
-            &t!("expected ')' to close parameter list"),
+            "expected ')' to close parameter list",
             p.current_token_range(),
         ));
     }
@@ -225,7 +225,7 @@ fn parse_param_name(p: &mut LuaParser, is_vararg: &mut bool) -> ParseResult {
         }
         _ => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected parameter name or '...' (vararg)"),
+                "expected parameter name or '...' (vararg)",
                 p.current_token_range(),
             ));
             m.complete(p);
@@ -283,7 +283,7 @@ fn parse_table_expr(p: &mut LuaParser) -> ParseResult {
             }
             Err(_) => {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("invalid table field after '%{sep}'", sep = separator_token),
+                    &format!("invalid table field after '{}'", separator_token),
                     p.current_token_range(),
                 ));
                 // Recover to next field boundary
@@ -300,7 +300,7 @@ fn parse_table_expr(p: &mut LuaParser) -> ParseResult {
         p.bump();
     } else {
         p.push_error(LuaParseError::syntax_error_from(
-            &t!("expected '}' to close table constructor"),
+            "expected '}' to close table constructor",
             p.current_token_range(),
         ));
 
@@ -344,7 +344,7 @@ fn parse_table_expr(p: &mut LuaParser) -> ParseResult {
         if !found_brace {
             // 如果没有找到闭合括号，在当前位置创建一个错误标记
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("table constructor was not properly closed"),
+                "table constructor was not properly closed",
                 p.current_token_range(),
             ));
         }
@@ -366,7 +366,7 @@ fn parse_field_with_recovery(p: &mut LuaParser) -> ParseResult {
                 Ok(_) => {}
                 Err(_) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected expression inside table index brackets"),
+                        "expected expression inside table index brackets",
                         p.current_token_range(),
                     ));
                     // 恢复到边界
@@ -388,7 +388,7 @@ fn parse_field_with_recovery(p: &mut LuaParser) -> ParseResult {
                 p.bump();
             } else {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected ']' to close table index"),
+                    "expected ']' to close table index",
                     p.current_token_range(),
                 ));
             }
@@ -397,7 +397,7 @@ fn parse_field_with_recovery(p: &mut LuaParser) -> ParseResult {
                 p.bump();
             } else {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected '=' after table index"),
+                    "expected '=' after table index",
                     p.current_token_range(),
                 ));
             }
@@ -406,7 +406,7 @@ fn parse_field_with_recovery(p: &mut LuaParser) -> ParseResult {
                 Ok(_) => {}
                 Err(_) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected value expression after '='"),
+                        "expected value expression after '='",
                         p.current_token_range(),
                     ));
                 }
@@ -422,7 +422,7 @@ fn parse_field_with_recovery(p: &mut LuaParser) -> ParseResult {
                     Ok(_) => {}
                     Err(_) => {
                         p.push_error(LuaParseError::syntax_error_from(
-                            &t!("expected value expression after field name"),
+                            "expected value expression after field name",
                             p.current_token_range(),
                         ));
                     }
@@ -433,7 +433,7 @@ fn parse_field_with_recovery(p: &mut LuaParser) -> ParseResult {
                     Ok(_) => {}
                     Err(_) => {
                         p.push_error(LuaParseError::syntax_error_from(
-                            &t!("invalid table field expression"),
+                            "invalid table field expression",
                             p.current_token_range(),
                         ));
                     }
@@ -443,7 +443,7 @@ fn parse_field_with_recovery(p: &mut LuaParser) -> ParseResult {
         // 表示表实际上已经结束的token
         LuaTokenKind::TkEof | LuaTokenKind::TkLocal => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("unexpected end of table field"),
+                "unexpected end of table field",
                 p.current_token_range(),
             ));
         }
@@ -453,7 +453,7 @@ fn parse_field_with_recovery(p: &mut LuaParser) -> ParseResult {
                 Ok(_) => {}
                 Err(_) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("invalid table field, expected expression, field assignment, or table end"),
+                        "invalid table field, expected expression, field assignment, or table end",
                         p.current_token_range(),
                     ));
                 }
@@ -488,7 +488,7 @@ fn parse_suffixed_expr(p: &mut LuaParser) -> ParseResult {
                 Ok(_) => {}
                 Err(err) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected expression inside parentheses"),
+                        "expected expression inside parentheses",
                         paren_range,
                     ));
                     m.complete(p);
@@ -499,7 +499,7 @@ fn parse_suffixed_expr(p: &mut LuaParser) -> ParseResult {
                 p.bump();
             } else {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected ')' to close parentheses"),
+                    "expected ')' to close parentheses",
                     paren_range,
                 ));
             }
@@ -507,7 +507,7 @@ fn parse_suffixed_expr(p: &mut LuaParser) -> ParseResult {
         }
         _ => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expect primary expression (identifier or parenthesized expression)"),
+                "expect primary expression (identifier or parenthesized expression)",
                 p.current_token_range(),
             ));
             return Err(ParseFailReason::UnexpectedToken);
@@ -585,7 +585,7 @@ fn parse_index_struct(p: &mut LuaParser) -> Result<(), ParseFailReason> {
                 Ok(_) => {}
                 Err(err) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected expression inside table index brackets"),
+                        "expected expression inside table index brackets",
                         index_op_range,
                     ));
                     return Err(err);
@@ -595,7 +595,7 @@ fn parse_index_struct(p: &mut LuaParser) -> Result<(), ParseFailReason> {
                 Ok(_) => {}
                 Err(err) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected ']' to close table index"),
+                        "expected ']' to close table index",
                         index_op_range,
                     ));
                     return Err(err);
@@ -608,7 +608,7 @@ fn parse_index_struct(p: &mut LuaParser) -> Result<(), ParseFailReason> {
                 Ok(_) => {}
                 Err(err) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected field name after '.'"),
+                        "expected field name after '.'",
                         index_op_range,
                     ));
                     return Err(err);
@@ -622,7 +622,7 @@ fn parse_index_struct(p: &mut LuaParser) -> Result<(), ParseFailReason> {
                 Ok(_) => {}
                 Err(err) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected method name after ':'"),
+                        "expected method name after ':'",
                         index_op_range,
                     ));
                     return Err(err);
@@ -636,9 +636,7 @@ fn parse_index_struct(p: &mut LuaParser) -> Result<(), ParseFailReason> {
                     | LuaTokenKind::TkLongString
             ) {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!(
-                        "colon accessor must be followed by a function call or table constructor or string literal"
-                    ),
+                    "colon accessor must be followed by a function call or table constructor or string literal",
                     name_token_range,
                 ));
 
@@ -647,7 +645,7 @@ fn parse_index_struct(p: &mut LuaParser) -> Result<(), ParseFailReason> {
         }
         _ => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expect index struct"),
+                "expect index struct",
                 p.current_token_range(),
             ));
 
@@ -669,7 +667,7 @@ fn parse_args(p: &mut LuaParser) -> ParseResult {
                         Ok(_) => {}
                         Err(_) => {
                             p.push_error(LuaParseError::syntax_error_from(
-                                &t!("expected argument expression"),
+                                "expected argument expression",
                                 p.current_token_range(),
                             ));
                             // 跳过到下一个逗号或右括号
@@ -695,7 +693,7 @@ fn parse_args(p: &mut LuaParser) -> ParseResult {
                         p.bump();
                         if p.current_token() == LuaTokenKind::TkRightParen {
                             p.push_error(LuaParseError::syntax_error_from(
-                                &t!("expected expression after ','"),
+                                "expected expression after ','",
                                 p.current_token_range(),
                             ));
                             break;
@@ -710,7 +708,7 @@ fn parse_args(p: &mut LuaParser) -> ParseResult {
                 p.bump();
             } else {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected ')' to close argument list"),
+                    "expected ')' to close argument list",
                     p.current_token_range(),
                 ));
             }
@@ -719,7 +717,7 @@ fn parse_args(p: &mut LuaParser) -> ParseResult {
             Ok(_) => {}
             Err(err) => {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("invalid table constructor in function call"),
+                    "invalid table constructor in function call",
                     p.current_token_range(),
                 ));
                 m.complete(p);
@@ -733,7 +731,7 @@ fn parse_args(p: &mut LuaParser) -> ParseResult {
         }
         _ => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected '(', string, or table constructor for function call"),
+                "expected '(', string, or table constructor for function call",
                 p.current_token_range(),
             ));
 

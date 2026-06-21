@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
 
     #[test]
     fn test_issue_586() {
@@ -952,5 +952,33 @@ mod test {
 
         let result_ty = ws.expr_ty("result");
         assert_eq!(ws.humanize_type(result_ty), "string[]");
+    }
+
+    #[test]
+    fn test_generic_definition_return_uses_class_type_with_gmod_enabled() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@generic T
+            ---@param object T
+            ---@return (definition) T
+            local function get_meta(object) end
+
+            ---@type Entity
+            local ent
+            result = get_meta(ent)
+            "#,
+        );
+
+        let result_ty = ws.expr_ty("result");
+        assert_eq!(ws.humanize_type(result_ty.clone()), "Entity");
+        assert!(matches!(result_ty, LuaType::Def(_)));
     }
 }

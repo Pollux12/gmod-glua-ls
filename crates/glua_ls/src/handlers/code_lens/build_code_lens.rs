@@ -1,5 +1,6 @@
 use glua_code_analysis::{
     LuaDeclId, LuaMemberId, LuaMemberOwner, LuaType, LuaTypeDeclId, SemanticModel,
+    resolve_alias_type,
 };
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat,
@@ -9,6 +10,7 @@ use lsp_types::{CodeLens, Command, Range};
 use rowan::NodeOrToken;
 
 use super::{CodeLensData, CodeLensResolveData};
+use crate::handlers::gmod_string_context::find_call_arg_roles;
 
 fn is_top_level_stat(syntax: &glua_parser::LuaSyntaxNode) -> bool {
     syntax
@@ -247,8 +249,11 @@ fn find_gmod_class_from_type(
     semantic_model: &SemanticModel,
     typ: &LuaType,
 ) -> Option<GmodClassInfo> {
-    match typ {
-        LuaType::Def(type_id) => find_gmod_class_from_type_id(semantic_model, type_id),
+    let resolved = resolve_alias_type(semantic_model.get_db(), typ);
+    match &resolved.typ {
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            find_gmod_class_from_type_id(semantic_model, type_id)
+        }
         _ => None,
     }
 }
@@ -278,7 +283,8 @@ fn find_gmod_class_from_type_id(
         .get_super_types(type_id)?;
 
     for super_type in supers {
-        let super_name = match &super_type {
+        let resolved_super = resolve_alias_type(semantic_model.get_db(), &super_type);
+        let super_name = match &resolved_super.typ {
             LuaType::Def(id) | LuaType::Ref(id) => id.get_simple_name(),
             _ => continue,
         };
@@ -314,39 +320,40 @@ fn push_gmod_class_code_lens(result: &mut Vec<CodeLens>, range: Range, info: &Gm
     });
 }
 
-/// Adds CodeLenses above net.Start / net.Receive / util.AddNetworkString
-/// call sites that mirror the VGUI/entity lens style: a lazy-resolved
-/// "N usage(s)" lens (clicking it opens the references panel for every
-/// indexed send/receive of this message) plus a `Name : Kind` label lens
-/// where `Kind` is `Send`, `Receive`, or `Register` so the role of the
-/// call site is obvious at a glance. Detailed payload information lives
-/// in the hover, not the lens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetCodeLensCallKind {
+    Define,
+    Start,
+    Receive,
+}
+
+/// Adds CodeLenses above net message call sites that mirror the VGUI/entity
+/// lens style: a lazy-resolved "N usage(s)" lens plus a `Name : Kind` label.
+/// The annotated message argument decides whether a call defines, starts, or
+/// receives a net message. Builtins keep their familiar labels through their
+/// annotation metadata; wrappers fall back to the wrapper's call path label.
 fn add_net_call_code_lens(
     semantic_model: &SemanticModel,
     result: &mut Vec<CodeLens>,
     call_expr: LuaCallExpr,
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
-    let kind_label: String = match call_path.as_str() {
-        "net.Start" => resolve_start_kind_label(semantic_model, &call_expr),
-        "net.Receive" => resolve_receive_kind_label(semantic_model, &call_expr),
-        "util.AddNetworkString" => "util.AddNetworkString".to_string(),
-        _ => return Some(()),
-    };
-
-    let args_list = call_expr.get_args_list()?;
-    let first_arg = args_list.get_args().next()?;
-    let LuaExpr::LiteralExpr(literal_expr) = first_arg else {
-        return Some(());
-    };
-    let LuaLiteralToken::String(string_token) = literal_expr.get_literal()? else {
-        return Some(());
-    };
+    let (kind, message_arg_idx) = net_code_lens_call_kind(semantic_model, &call_expr)?;
+    let string_token = string_arg_at(&call_expr, message_arg_idx)?;
     let raw_name = string_token.get_value();
     let message_name = raw_name.trim();
     if message_name.is_empty() {
         return Some(());
     }
+    let kind_label = match kind {
+        NetCodeLensCallKind::Define => call_path.clone(),
+        NetCodeLensCallKind::Start => {
+            resolve_start_kind_label(semantic_model, &call_expr, &call_path, message_arg_idx)
+        }
+        NetCodeLensCallKind::Receive => {
+            resolve_receive_kind_label(semantic_model, &call_expr, &call_path)
+        }
+    };
 
     let document = semantic_model.get_document();
     let range = document.to_lsp_range(call_expr.get_range())?;
@@ -374,26 +381,64 @@ fn add_net_call_code_lens(
     Some(())
 }
 
+fn net_code_lens_call_kind(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+) -> Option<(NetCodeLensCallKind, usize)> {
+    let args_list = call_expr.get_args_list()?;
+    let args: Vec<LuaExpr> = args_list.get_args().collect();
+    if !args
+        .iter()
+        .any(|arg| matches!(arg, LuaExpr::LiteralExpr(literal_expr) if matches!(literal_expr.get_literal(), Some(LuaLiteralToken::String(_)))))
+    {
+        return None;
+    }
+
+    let arg_count = args.len();
+    for (arg_idx, role) in find_call_arg_roles(
+        semantic_model,
+        call_expr,
+        arg_count,
+        "gmod.net_message",
+        &["define", "start", "receive"],
+    ) {
+        let kind = match role.role.as_str() {
+            "define" => NetCodeLensCallKind::Define,
+            "start" => NetCodeLensCallKind::Start,
+            "receive" => NetCodeLensCallKind::Receive,
+            _ => continue,
+        };
+        return Some((kind, arg_idx));
+    }
+    None
+}
+
+fn string_arg_at(call_expr: &LuaCallExpr, arg_idx: usize) -> Option<glua_parser::LuaStringToken> {
+    let args_list = call_expr.get_args_list()?;
+    let arg = args_list.get_args().nth(arg_idx)?;
+    let LuaExpr::LiteralExpr(literal_expr) = arg else {
+        return None;
+    };
+    let LuaLiteralToken::String(string_token) = literal_expr.get_literal()? else {
+        return None;
+    };
+    Some(string_token)
+}
+
 /// Picks the label for a `net.Start` lens. Looks up the indexed send flow
 /// originating at this call site and uses the actual transport call name
 /// (e.g. `net.SendToServer`) so the lens reflects the realm/recipients
 /// instead of the generic `net.Start`. Falls back to `net.Start` when the
 /// flow could not be resolved (wrapped helpers, conservative stubs, message
 /// not yet indexed, etc).
-fn resolve_start_kind_label(semantic_model: &SemanticModel, call_expr: &LuaCallExpr) -> String {
-    let fallback = "net.Start".to_string();
-    let args_list = match call_expr.get_args_list() {
-        Some(args) => args,
-        None => return fallback,
-    };
-    let first_arg = match args_list.get_args().next() {
-        Some(arg) => arg,
-        None => return fallback,
-    };
-    let LuaExpr::LiteralExpr(literal_expr) = first_arg else {
-        return fallback;
-    };
-    let Some(LuaLiteralToken::String(string_token)) = literal_expr.get_literal() else {
+fn resolve_start_kind_label(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    fallback: &str,
+    message_arg_idx: usize,
+) -> String {
+    let fallback = fallback.to_string();
+    let Some(string_token) = string_arg_at(call_expr, message_arg_idx) else {
         return fallback;
     };
     let message_name = string_token.get_value();
@@ -432,9 +477,11 @@ fn resolve_start_kind_label(semantic_model: &SemanticModel, call_expr: &LuaCallE
 /// flows; pattern-based pairing keeps the label faithful to *this* receive's
 /// actual senders. Falls back to `net.Receive` when no candidate matches
 /// (e.g. counterpart not yet indexed, opaque callback, ambiguous realm).
-fn resolve_receive_kind_label(semantic_model: &SemanticModel, call_expr: &LuaCallExpr) -> String {
-    let fallback = "net.Receive".to_string();
-
+fn resolve_receive_kind_label(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    fallback: &str,
+) -> String {
     let file_id = semantic_model.get_file_id();
     let call_range = call_expr.get_range();
     let db = semantic_model.get_db();
@@ -442,14 +489,14 @@ fn resolve_receive_kind_label(semantic_model: &SemanticModel, call_expr: &LuaCal
     let infer_index = db.get_gmod_infer_index();
 
     let Some(file_data) = network_index.get_file_data(file_id) else {
-        return fallback;
+        return fallback.to_string();
     };
     let Some(receive_flow) = file_data
         .receive_flows
         .iter()
         .find(|flow| flow.receive_range == call_range)
     else {
-        return fallback;
+        return fallback.to_string();
     };
 
     let paired = glua_code_analysis::pair_senders_for_receive(
@@ -468,7 +515,7 @@ fn resolve_receive_kind_label(semantic_model: &SemanticModel, call_expr: &LuaCal
     }
 
     if kinds.is_empty() {
-        fallback
+        fallback.to_string()
     } else {
         kinds.join(", ")
     }
@@ -520,6 +567,7 @@ mod tests {
     #[gtest]
     fn vgui_reassigned_panel_code_lens_labels_resolve_per_region() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = glua_code_analysis::Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.vgui.code_lens_enabled = true;
@@ -560,6 +608,7 @@ mod tests {
     #[gtest]
     fn vgui_reassigned_panel_assignment_code_lens_resolves_per_region() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = glua_code_analysis::Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.vgui.code_lens_enabled = true;
@@ -620,5 +669,63 @@ mod tests {
 
         assert_that!(assignment_titles[0].as_str(), eq("ReButton : DButton"));
         assert_that!(assignment_titles[1].as_str(), eq("ReTree : DTree"));
+    }
+
+    #[gtest]
+    fn net_code_lens_uses_annotated_message_argument_roles() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = glua_code_analysis::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.enabled = true;
+        emmyrc.gmod.network.code_lens_enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                ---@param realm string
+                ---@[call_arg("gmod.net_message", "define")]
+                ---@param name string
+                function RegisterScopedNet(realm, name) end
+
+                ---@param realm string
+                ---@[call_arg("gmod.net_message", "start")]
+                ---@param name string
+                function StartScopedNet(realm, name) end
+
+                ---@param realm string
+                ---@[call_arg("gmod.net_message", "receive")]
+                ---@param name string
+                ---@param callback fun()
+                function ReceiveScopedNet(realm, name, callback) end
+
+                RegisterScopedNet("shared", "WrappedMessage")
+                StartScopedNet("shared", "WrappedMessage")
+                ReceiveScopedNet("shared", "WrappedMessage", function() end)
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let lenses = build_code_lens(&semantic_model).expect("expected code lenses");
+
+        let titles: Vec<String> = lenses
+            .iter()
+            .filter_map(|lens| lens.command.as_ref().map(|command| command.title.clone()))
+            .collect();
+        assert_that!(titles, contains(eq("WrappedMessage : RegisterScopedNet")));
+        assert_that!(titles, contains(eq("WrappedMessage : StartScopedNet")));
+        assert_that!(titles, contains(eq("WrappedMessage : ReceiveScopedNet")));
+
+        let net_message_lens_count = lenses
+            .iter()
+            .filter_map(|lens| lens.data.as_ref())
+            .filter_map(|value| serde_json::from_value::<CodeLensResolveData>(value.clone()).ok())
+            .filter(|data| matches!(data.payload, CodeLensData::NetMessage(_)))
+            .count();
+        assert_that!(net_message_lens_count, eq(3usize));
     }
 }

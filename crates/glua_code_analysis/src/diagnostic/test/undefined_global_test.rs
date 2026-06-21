@@ -79,6 +79,35 @@ mod test {
         })
     }
 
+    /// Like [`has_undefined_global_name`] but matches either `UndefinedGlobal` or
+    /// `UndefinedGlobalAssignment` for the same name.
+    fn has_any_undefined_global_name(
+        ws: &mut VirtualWorkspace,
+        file_path: &str,
+        content: &str,
+        name: &str,
+    ) -> bool {
+        let file_id = ws.def_file(file_path, content);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let strict_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedGlobal.get_name().to_string(),
+        ));
+        let assignment_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedGlobalAssignment
+                .get_name()
+                .to_string(),
+        ));
+        let message_needled = format!("undefined global variable: {name}");
+
+        diagnostics.iter().any(|diagnostic| {
+            (diagnostic.code == strict_code || diagnostic.code == assignment_code)
+                && diagnostic.message.contains(&message_needled)
+        })
+    }
+
     #[test]
     fn test_issue_250() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -168,6 +197,27 @@ mod test {
                 print(ms.GetTheaterPlayers)
             end
             "#
+        ));
+    }
+
+    #[test]
+    fn test_guard_clause_not_compound_and_suppresses_following_uses() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_sv/wire.lua",
+            r#"
+            module("sf_wire", package.seeall)
+
+            return function(instance)
+                if not (WireLib and WireLib.CreateInputs) then return end
+
+                instance:AddHook("initialize", function()
+                    WireLib.CreateInputs()
+                end)
+            end
+            "#,
+            "WireLib",
         ));
     }
 
@@ -512,6 +562,47 @@ mod test {
                 print(ctp)
             end
             "#
+        ));
+    }
+
+    #[test]
+    fn test_short_circuit_and_guards_rhs_global_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "lua/entities/starfall_processor/init.lua",
+            r#"
+            function ENT:PreEntityCopy()
+                local info = WireLib and WireLib.BuildDupeInfo(self) or {}
+            end
+            "#,
+            "WireLib",
+        ));
+    }
+
+    #[test]
+    fn test_short_circuit_and_lhs_optional_global_probe_is_silent() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            local enabled = OptionalAddon and true
+            "#,
+            "OptionalAddon",
+        ));
+    }
+
+    #[test]
+    fn test_short_circuit_and_does_not_guard_unrelated_rhs_global() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            local info = WireLib and OtherLib.BuildDupeInfo(self) or {}
+            "#,
+            "OtherLib",
         ));
     }
 
@@ -959,6 +1050,316 @@ mod test {
             end
             "#,
             "tmysql",
+        ));
+    }
+
+    #[test]
+    fn test_sf_require_wrapper_suppresses_xinput_access_across_files() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/starfall/libs_cl/sf_require.lua",
+            r#"
+            SF = {}
+
+            function SF.Require(name)
+              if util.IsBinaryModuleInstalled(name) then
+                local ok, err = pcall(require, name)
+                if ok then
+                  return true
+                else
+                  ErrorNoHalt(err .. "\n")
+                  return false
+                end
+              end
+              return false
+            end
+            "#,
+        );
+
+        assert!(!has_any_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput.lua",
+            r#"
+            if not SF.Require("xinput") then return function() end end
+            xinput.getState()
+            "#,
+            "xinput",
+        ));
+    }
+
+    #[test]
+    fn test_sf_require_dot_index_continuation_guard_allows_late_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/starfall/libs_cl/sf_require.lua",
+            r#"
+            SF = {}
+
+            function SF.Require(name)
+              if util.IsBinaryModuleInstalled(name) then
+                local ok, err = pcall(require, name)
+                if ok then
+                  return true
+                else
+                  ErrorNoHalt(err .. "\n")
+                  return false
+                end
+              end
+              return false
+            end
+            "#,
+        );
+
+        assert!(!has_any_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput_guard.lua",
+            r#"
+            function GetInputState()
+                if not SF.Require("xinput") then
+                    return function() end
+                end
+
+                return xinput.getState()
+            end
+            "#,
+            "xinput",
+        ));
+    }
+
+    #[test]
+    fn test_sf_require_does_not_suppress_use_before_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/starfall/libs_cl/sf_require.lua",
+            r#"
+            SF = {}
+
+            function SF.Require(name)
+              if util.IsBinaryModuleInstalled(name) then
+                local ok, err = pcall(require, name)
+                if ok then
+                  return true
+                else
+                  ErrorNoHalt(err .. "\n")
+                  return false
+                end
+              end
+              return false
+            end
+            "#,
+        );
+
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput.lua",
+            r#"
+            xinput.getState()
+            if not SF.Require("xinput") then return function() end end
+            "#,
+            "xinput",
+        ));
+    }
+
+    #[test]
+    fn test_sf_require_is_binary_module_installed_check_only_does_not_suppress() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/starfall/libs_cl/sf_require.lua",
+            r#"
+            SF = {}
+
+            function SF.Require(name)
+              if util.IsBinaryModuleInstalled(name) then
+                return true
+              end
+              return false
+            end
+            "#,
+        );
+
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput.lua",
+            r#"
+            if not SF.Require("xinput") then return function() end end
+            xinput.getState()
+            "#,
+            "xinput",
+        ));
+    }
+
+    #[test]
+    fn test_sf_require_unconditional_true_after_pcall_does_not_suppress() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/starfall/libs_cl/sf_require.lua",
+            r#"
+            SF = {}
+
+            function SF.Require(name)
+              local ok = pcall(require, name)
+              return true
+            end
+            "#,
+        );
+
+        assert!(has_any_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput.lua",
+            r#"
+            if not SF.Require("xinput") then return function() end end
+            xinput.getState()
+            "#,
+            "xinput",
+        ));
+    }
+
+    #[test]
+    fn test_sf_require_mutated_pcall_ok_does_not_suppress() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/starfall/libs_cl/sf_require.lua",
+            r#"
+            SF = {}
+
+            function SF.Require(name)
+              local ok = pcall(require, name)
+              ok = true
+              if ok then
+                return true
+              end
+              return false
+            end
+            "#,
+        );
+
+        assert!(has_any_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput.lua",
+            r#"
+            if not SF.Require("xinput") then return function() end end
+            xinput.getState()
+            "#,
+            "xinput",
+        ));
+    }
+
+    #[test]
+    fn test_util_binary_module_installed_check_alone_does_not_suppress_xinput() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput.lua",
+            r#"
+            if util.IsBinaryModuleInstalled("xinput") then
+                xinput.getState()
+            end
+            "#,
+            "xinput",
+        ));
+    }
+
+    #[test]
+    fn test_sf_require_non_literal_module_name_is_not_a_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/starfall/libs_cl/sf_require.lua",
+            r#"
+            SF = {}
+
+            function SF.Require(name)
+              if util.IsBinaryModuleInstalled(name) then
+                local ok, err = pcall(require, name)
+                if ok then
+                  return true
+                else
+                  ErrorNoHalt(err .. "\n")
+                  return false
+                end
+              end
+              return false
+            end
+            "#,
+        );
+
+        assert!(has_any_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput.lua",
+            r#"
+            local modname = "xinput"
+            if not SF.Require(modname) then return function() end end
+            xinput.getState()
+            "#,
+            "xinput",
+        ));
+    }
+
+    #[test]
+    fn test_sf_require_truthy_clause_guard_suppresses_xinput() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/starfall/libs_cl/sf_require.lua",
+            r#"
+            SF = {}
+
+            function SF.Require(name)
+              if util.IsBinaryModuleInstalled(name) then
+                local ok, err = pcall(require, name)
+                if ok then
+                  return true
+                else
+                  ErrorNoHalt(err .. "\n")
+                  return false
+                end
+              end
+              return false
+            end
+            "#,
+        );
+
+        assert!(!has_any_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput.lua",
+            r#"
+            if SF.Require("xinput") then
+                xinput.getState()
+            end
+            "#,
+            "xinput",
+        ));
+    }
+
+    #[test]
+    fn test_sf_require_short_circuit_and_does_not_warn_xinput() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/starfall/libs_cl/sf_require.lua",
+            r#"
+            SF = {}
+
+            function SF.Require(name)
+              if util.IsBinaryModuleInstalled(name) then
+                local ok, err = pcall(require, name)
+                if ok then
+                  return true
+                else
+                  ErrorNoHalt(err .. "\n")
+                  return false
+                end
+              end
+              return false
+            end
+            "#,
+        );
+
+        assert!(!has_any_undefined_global_name(
+            &mut ws,
+            "lua/starfall/libs_cl/xinput.lua",
+            r#"
+            SF.Require("xinput") and xinput.getState()
+            "#,
+            "xinput",
         ));
     }
 

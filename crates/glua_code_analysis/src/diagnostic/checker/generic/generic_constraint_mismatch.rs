@@ -278,8 +278,7 @@ fn validate_str_tpl_ref(
                     context.add_diagnostic(
                         DiagnosticCode::GenericConstraintMismatch,
                         range,
-                        t!("the string template type does not match any type declaration")
-                            .to_string(),
+                        "the string template type does not match any type declaration".to_string(),
                         None,
                     );
                 }
@@ -305,12 +304,24 @@ fn validate_str_tpl_ref(
                 }
             }
         }
+        LuaType::Union(union) => {
+            for union_member_type in union.into_vec() {
+                validate_str_tpl_ref(
+                    context,
+                    semantic_model,
+                    str_tpl_ref,
+                    &union_member_type,
+                    range,
+                    extend_type.clone(),
+                );
+            }
+        }
         LuaType::String | LuaType::Any | LuaType::Unknown | LuaType::StrTplRef(_) => {}
         _ => {
             context.add_diagnostic(
                 DiagnosticCode::GenericConstraintMismatch,
                 range,
-                t!("the string template type must be a string constant").to_string(),
+                "the string template type must be a string constant".to_string(),
                 None,
             );
         }
@@ -364,8 +375,8 @@ fn add_type_check_diagnostic(
             context.add_diagnostic(
                 DiagnosticCode::GenericConstraintMismatch,
                 range,
-                t!(
-                    "type `%{found}` does not satisfy the constraint `%{source}`. %{reason}",
+                format!(
+                    "type `{found}` does not satisfy the constraint `{source}`. {reason}",
                     source = humanize_type(db, extend_type, RenderLevel::Simple),
                     found = humanize_type(db, expr_type, RenderLevel::Simple),
                     reason = reason_message

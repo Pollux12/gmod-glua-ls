@@ -1,7 +1,5 @@
 mod client_config;
 mod codestyle;
-mod locale;
-mod std_i18n;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,9 +13,7 @@ use crate::{
         FileDiagnostic, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
         WorkspaceFileMatcher, get_client_id, load_emmy_config,
     },
-    handlers::{
-        initialized::std_i18n::try_generate_translated_std, text_document::register_files_watch,
-    },
+    handlers::text_document::register_files_watch,
     logger::init_logger,
     util::{LongRunningWatchdogStatus, spawn_long_running_watchdog},
 };
@@ -36,8 +32,6 @@ pub async fn initialized_handler(
     cmd_args: CmdArgs,
 ) -> Option<()> {
     log::info!("initialized handler started");
-    // init locale
-    locale::set_ls_locale(&params);
     let workspace_folders = get_workspace_folders(&params);
     let main_root: Option<&str> = match workspace_folders.first() {
         Some(path) => path.root.to_str(),
@@ -140,10 +134,12 @@ pub async fn initialized_handler(
     log::info!("configuration loaded");
 
     // init std lib
-    watchdog_status.set_phase("Loading standard libraries");
-    log::info!("loading standard libraries");
-    init_std_lib(context.analysis(), &cmd_args, emmyrc.clone()).await;
-    log::info!("standard libraries loaded");
+    if cmd_args.load_stdlib.0 {
+        watchdog_status.set_phase("Loading standard libraries");
+        log::info!("loading standard libraries");
+        init_std_lib(context.analysis(), emmyrc.clone()).await;
+        log::info!("standard libraries loaded");
+    }
 
     {
         watchdog_status.set_phase("Preparing workspace manager");
@@ -159,6 +155,7 @@ pub async fn initialized_handler(
 
     init_analysis(
         context.analysis(),
+        context.client(),
         context.status_bar(),
         context.file_diagnostic(),
         context.lsp_features(),
@@ -178,6 +175,7 @@ pub async fn initialized_handler(
 
 pub async fn init_analysis(
     analysis: &RwLock<EmmyLuaAnalysis>,
+    client: &crate::context::ClientProxy,
     status_bar: &StatusBar,
     file_diagnostic: &FileDiagnostic,
     lsp_features: &LspFeatures,
@@ -371,6 +369,16 @@ pub async fn init_analysis(
     );
     file_diagnostic.notify_workspace_loaded();
 
+    if lsp_features.supports_semantic_tokens_refresh() {
+        client.refresh_semantic_tokens();
+    }
+    if lsp_features.supports_inlay_hint_refresh() {
+        client.refresh_inlay_hints();
+    }
+    if lsp_features.supports_code_lens_refresh() {
+        client.refresh_code_lens();
+    }
+
     if !lsp_features.supports_workspace_diagnostic() {
         log::info!("client does not support workspace diagnostics; scheduling push diagnostics");
         file_diagnostic
@@ -395,8 +403,44 @@ fn build_workspace_collection_folders(
         workspaces.push(WorkspaceFolder::new(PathBuf::from(extra_root), false));
     }
 
+    // Canonicalize the main workspace root for self-overlap detection.
+    let main_root_canon = workspaces
+        .first()
+        .and_then(|ws| ws.root.canonicalize().ok());
+
     for lib in &emmyrc.workspace.library {
-        workspaces.push(WorkspaceFolder::new(PathBuf::from(lib.get_path()), true));
+        let configured = lib.get_path();
+        let path = PathBuf::from(configured);
+
+        // Filter invalid library paths: empty, nonexistent, not a directory,
+        // or resolves to the same path as the main workspace root (self-overlap
+        // would cause a redundant full re-scan of the workspace).
+        if configured.trim().is_empty() {
+            log::warn!(
+                "Skipping empty library path from config entry: {:?}",
+                configured
+            );
+            continue;
+        }
+        if !path.exists() {
+            log::warn!("Skipping library path that does not exist: {:?}", path);
+            continue;
+        }
+        if !path.is_dir() {
+            log::warn!("Skipping library path that is not a directory: {:?}", path);
+            continue;
+        }
+        if let (Ok(lib_canon), Some(ws_canon)) = (path.canonicalize(), &main_root_canon)
+            && lib_canon == *ws_canon
+        {
+            log::warn!(
+                "Skipping library path that resolves to the workspace root (self-overlap): {:?}",
+                path
+            );
+            continue;
+        }
+
+        workspaces.push(WorkspaceFolder::new(path, true));
     }
 
     for package_dir in &emmyrc.workspace.package_dirs {
@@ -443,22 +487,103 @@ pub fn get_workspace_folders(params: &InitializeParams) -> Vec<WorkspaceFolder> 
     workspace_folders
 }
 
-pub async fn init_std_lib(
-    analysis: &RwLock<EmmyLuaAnalysis>,
-    cmd_args: &CmdArgs,
-    emmyrc: Arc<Emmyrc>,
-) {
-    log::info!(
-        "initializing std lib with resources path: {:?}",
-        cmd_args.resources_path
-    );
+pub async fn init_std_lib(analysis: &RwLock<EmmyLuaAnalysis>, emmyrc: Arc<Emmyrc>) {
+    log::info!("initializing std lib");
     let mut analysis = analysis.write().await;
-    if cmd_args.load_stdlib.0 {
+    {
         // double update config
         analysis.update_config(emmyrc);
-        try_generate_translated_std();
-        analysis.init_std_lib(cmd_args.resources_path.0.clone());
+        analysis.init_std_lib();
     }
 
     log::info!("initialized std lib complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    use glua_code_analysis::{EmmyLuaAnalysis, Emmyrc};
+    use googletest::prelude::*;
+    use lsp_server::{Connection, Message};
+    use lsp_types::{
+        ClientCapabilities, CodeLensWorkspaceClientCapabilities,
+        InlayHintWorkspaceClientCapabilities, SemanticTokensWorkspaceClientCapabilities,
+        WorkspaceClientCapabilities,
+    };
+    use tokio::sync::RwLock;
+
+    use crate::{
+        context::{ClientProxy, FileDiagnostic, LspFeatures, StatusBar},
+        util::LongRunningWatchdogStatus,
+    };
+
+    use super::init_analysis;
+
+    #[gtest]
+    fn init_analysis_refreshes_open_document_features_when_workspace_becomes_ready() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (proxy_connection, peer_connection) = Connection::memory();
+        let client = Arc::new(ClientProxy::new(proxy_connection));
+        let capabilities = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
+                    refresh_support: Some(true),
+                }),
+                inlay_hint: Some(InlayHintWorkspaceClientCapabilities {
+                    refresh_support: Some(true),
+                }),
+                code_lens: Some(CodeLensWorkspaceClientCapabilities {
+                    refresh_support: Some(true),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lsp_features = LspFeatures::new(capabilities);
+        let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let file_diagnostic = Arc::new(FileDiagnostic::new(
+            analysis.clone(),
+            status_bar.clone(),
+            client.clone(),
+        ));
+
+        runtime.block_on(init_analysis(
+            &analysis,
+            client.as_ref(),
+            &status_bar,
+            &file_diagnostic,
+            &lsp_features,
+            Vec::new(),
+            Arc::new(Emmyrc::default()),
+            HashMap::new(),
+            HashMap::new(),
+            LongRunningWatchdogStatus::new("test"),
+        ));
+
+        let mut methods = Vec::new();
+        while methods.len() < 3 {
+            let message = peer_connection
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("expected refresh request");
+            if let Message::Request(request) = message {
+                if request.method.ends_with("/refresh") {
+                    methods.push(request.method);
+                }
+            }
+        }
+        methods.sort();
+
+        assert_eq!(
+            methods,
+            vec![
+                "workspace/codeLens/refresh".to_string(),
+                "workspace/inlayHint/refresh".to_string(),
+                "workspace/semanticTokens/refresh".to_string(),
+            ]
+        );
+        Ok(())
+    }
 }

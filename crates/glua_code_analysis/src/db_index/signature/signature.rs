@@ -7,11 +7,14 @@ use glua_parser::{LuaAstNode, LuaClosureExpr, LuaDocFuncType};
 use rowan::TextSize;
 
 use crate::db_index::signature::async_state::AsyncState;
+use crate::{DbIndex, LuaAttributeUse, SemanticModel, VariadicType, first_param_may_not_self};
 use crate::{
     FileId,
     db_index::{LuaFunctionType, LuaType},
 };
-use crate::{LuaAttributeUse, SemanticModel, VariadicType, first_param_may_not_self};
+
+pub const CALL_ARG_ATTRIBUTE: &str = "call_arg";
+pub const OVERLOAD_CALL_ARG_ATTRIBUTE: &str = "overload_call_arg";
 
 #[derive(Debug)]
 pub struct LuaSignature {
@@ -26,6 +29,15 @@ pub struct LuaSignature {
     pub async_state: AsyncState,
     pub nodiscard: Option<LuaNoDiscard>,
     pub is_vararg: bool,
+    require_guard_param: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaCallArgRole {
+    pub param_idx: usize,
+    pub domain: String,
+    pub role: String,
+    pub priority: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +66,16 @@ impl LuaSignature {
             async_state: AsyncState::None,
             nodiscard: None,
             is_vararg: false,
+            require_guard_param: None,
         }
+    }
+
+    pub fn require_guard_param(&self) -> Option<usize> {
+        self.require_guard_param
+    }
+
+    pub fn set_require_guard_param(&mut self, param_idx: usize) {
+        self.require_guard_param = Some(param_idx);
     }
 
     pub fn is_generic(&self) -> bool {
@@ -74,6 +95,61 @@ impl LuaSignature {
                 .overloads
                 .iter()
                 .any(|overload| overload_has_special_call_params(overload.as_ref()))
+    }
+
+    pub fn has_call_arg_roles(&self) -> bool {
+        self.param_docs.values().any(|param_info| {
+            param_info
+                .get_attribute_by_name(CALL_ARG_ATTRIBUTE)
+                .is_some()
+        }) || self
+            .overloads
+            .iter()
+            .any(|overload| !overload.get_call_arg_roles().is_empty())
+    }
+
+    pub fn call_arg_roles_for_param(&self, param_idx: usize) -> Vec<LuaCallArgRole> {
+        let mut roles = Vec::new();
+        self.visit_call_arg_roles_for_param(param_idx, &mut |role| roles.push(role.clone()));
+        roles
+    }
+
+    pub fn visit_call_arg_roles_for_param<F>(&self, param_idx: usize, visitor: &mut F)
+    where
+        F: FnMut(&LuaCallArgRole),
+    {
+        if let Some(param_info) = self.get_param_info_by_id(param_idx) {
+            visit_call_arg_roles_from_param_attribute(param_idx, param_info, visitor);
+        }
+        for overload in &self.overloads {
+            for role in overload.get_call_arg_roles() {
+                if role.param_idx == param_idx {
+                    visitor(role);
+                }
+            }
+        }
+    }
+
+    pub fn call_arg_roles(&self) -> Vec<LuaCallArgRole> {
+        let mut roles = Vec::new();
+        for (param_idx, param_info) in &self.param_docs {
+            visit_call_arg_roles_from_param_attribute(*param_idx, param_info, &mut |role| {
+                roles.push(role.clone());
+            });
+        }
+        roles.sort_by_key(|role| {
+            (
+                role.param_idx,
+                std::cmp::Reverse(role.priority.unwrap_or(0)),
+            )
+        });
+        roles
+    }
+
+    pub fn overload_call_arg_roles(&self) -> impl Iterator<Item = &LuaCallArgRole> {
+        self.overloads
+            .iter()
+            .flat_map(|overload| overload.get_call_arg_roles().iter())
     }
 
     pub fn get_type_params(&self) -> Vec<(String, Option<LuaType>)> {
@@ -212,6 +288,114 @@ impl LuaSignature {
     }
 }
 
+fn visit_call_arg_roles_from_param_attribute<F>(
+    param_idx: usize,
+    param_info: &LuaDocParamInfo,
+    visitor: &mut F,
+) where
+    F: FnMut(&LuaCallArgRole),
+{
+    for attribute_use in param_info.iter_attributes_by_name(CALL_ARG_ATTRIBUTE) {
+        let Some(domain) = attribute_string_arg(attribute_use, "domain") else {
+            continue;
+        };
+        let Some(role) = attribute_string_arg(attribute_use, "role") else {
+            continue;
+        };
+        let priority = attribute_integer_arg(attribute_use, "priority");
+        visitor(&LuaCallArgRole {
+            param_idx,
+            domain,
+            role,
+            priority,
+        });
+    }
+}
+
+fn attribute_string_arg(attribute_use: &LuaAttributeUse, name: &str) -> Option<String> {
+    match attribute_use.get_param_by_name(name)? {
+        LuaType::DocStringConst(value) | LuaType::StringConst(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn attribute_integer_arg(attribute_use: &LuaAttributeUse, name: &str) -> Option<i64> {
+    match attribute_use.get_param_by_name(name)? {
+        LuaType::DocIntegerConst(value) | LuaType::IntegerConst(value) => Some(*value),
+        _ => None,
+    }
+}
+
+pub fn visit_call_arg_roles_from_type<F>(
+    db: &DbIndex,
+    typ: &LuaType,
+    arg_idx: usize,
+    visitor: &mut F,
+) where
+    F: FnMut(&LuaCallArgRole),
+{
+    match typ {
+        LuaType::Signature(signature_id) => {
+            if let Some(signature) = db.get_signature_index().get(signature_id) {
+                signature.visit_call_arg_roles_for_param(arg_idx, visitor);
+            }
+        }
+        LuaType::TypeGuard(inner) => {
+            visit_call_arg_roles_from_type(db, inner, arg_idx, visitor);
+        }
+        LuaType::TableOf(inner) => {
+            visit_call_arg_roles_from_type(db, inner, arg_idx, visitor);
+        }
+        LuaType::Instance(instance) => {
+            visit_call_arg_roles_from_type(db, instance.get_base(), arg_idx, visitor);
+        }
+        LuaType::Union(union) => match union.as_ref() {
+            crate::db_index::LuaUnionType::Nullable(inner) => {
+                visit_call_arg_roles_from_type(db, inner, arg_idx, visitor);
+            }
+            crate::db_index::LuaUnionType::Multi(types) => {
+                for typ in types {
+                    visit_call_arg_roles_from_type(db, typ, arg_idx, visitor);
+                }
+            }
+        },
+        LuaType::Intersection(intersection) => {
+            for typ in intersection.get_types() {
+                visit_call_arg_roles_from_type(db, typ, arg_idx, visitor);
+            }
+        }
+        LuaType::MultiLineUnion(union) => {
+            for (typ, _) in union.get_unions() {
+                visit_call_arg_roles_from_type(db, typ, arg_idx, visitor);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn find_call_arg_role_from_type(
+    db: &DbIndex,
+    typ: &LuaType,
+    arg_idx: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    let mut best: Option<LuaCallArgRole> = None;
+    visit_call_arg_roles_from_type(db, typ, arg_idx, &mut |role| {
+        if role.domain != domain || !roles.iter().any(|candidate| *candidate == role.role) {
+            return;
+        }
+
+        if best
+            .as_ref()
+            .is_none_or(|current| role.priority.unwrap_or(0) > current.priority.unwrap_or(0))
+        {
+            best = Some(role.clone());
+        }
+    });
+    best
+}
+
 fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {
     match typ {
         LuaType::StrTplRef(_) => true,
@@ -254,6 +438,69 @@ impl LuaDocParamInfo {
             .iter()
             .flatten()
             .find(|attr| attr.id.get_name() == name)
+    }
+
+    pub fn iter_attributes_by_name<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a LuaAttributeUse> + 'a {
+        self.attributes
+            .iter()
+            .flatten()
+            .filter(move |attr| attr.id.get_name() == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CALL_ARG_ATTRIBUTE, LuaDocParamInfo, LuaSignature};
+    use crate::{LuaAttributeUse, LuaType, LuaTypeDeclId};
+    use smol_str::SmolStr;
+
+    fn call_arg_attribute(domain: &str, role: &str) -> LuaAttributeUse {
+        LuaAttributeUse::new(
+            LuaTypeDeclId::global(CALL_ARG_ATTRIBUTE),
+            vec![
+                (
+                    "domain".to_string(),
+                    Some(LuaType::DocStringConst(SmolStr::new(domain).into())),
+                ),
+                (
+                    "role".to_string(),
+                    Some(LuaType::DocStringConst(SmolStr::new(role).into())),
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn call_arg_roles_for_param_keeps_multiple_attributes() {
+        let mut signature = LuaSignature::new();
+        signature.params.push("name".to_string());
+        signature.param_docs.insert(
+            0,
+            LuaDocParamInfo {
+                name: "name".to_string(),
+                type_ref: LuaType::String,
+                default_value: None,
+                nullable: false,
+                description: None,
+                attributes: Some(vec![
+                    call_arg_attribute("gmod.vgui_panel", "define"),
+                    call_arg_attribute("gmod.derma_skin", "reference"),
+                ]),
+            },
+        );
+
+        let roles = signature.call_arg_roles_for_param(0);
+
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0].domain, "gmod.vgui_panel");
+        assert_eq!(roles[0].role, "define");
+        assert_eq!(roles[0].param_idx, 0);
+        assert_eq!(roles[1].domain, "gmod.derma_skin");
+        assert_eq!(roles[1].role, "reference");
+        assert_eq!(roles[1].param_idx, 0);
     }
 }
 

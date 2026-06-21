@@ -11,7 +11,7 @@ use crate::{context::ClientId, handlers::semantic_token::language_injector::inje
 use glua_code_analysis::{
     DbIndex, Emmyrc, GlobalId, LocalAttribute, LuaDecl, LuaDeclExtra, LuaMemberFeature,
     LuaMemberId, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaTypeOwner,
-    SemanticDeclLevel, SemanticModel, WorkspaceId, parse_require_module_info,
+    SemanticDeclLevel, SemanticModel, WorkspaceId, parse_require_module_info, resolve_alias_type,
 };
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaComment,
@@ -1576,7 +1576,25 @@ fn semantic_token_type_for_type_decl(
     } else if type_decl.is_class() {
         Some(SemanticTokenType::CLASS)
     } else if type_decl.is_alias() {
-        Some(SemanticTokenType::TYPE)
+        match resolve_alias_type(semantic_model.get_db(), &LuaType::Ref(type_id.clone())).typ {
+            LuaType::Ref(origin_id) | LuaType::Def(origin_id) => {
+                let Some(origin_decl) = semantic_model
+                    .get_db()
+                    .get_type_index()
+                    .get_type_decl(&origin_id)
+                else {
+                    return Some(SemanticTokenType::TYPE);
+                };
+                if origin_decl.is_enum() {
+                    Some(SemanticTokenType::ENUM)
+                } else if origin_decl.is_class() {
+                    Some(SemanticTokenType::CLASS)
+                } else {
+                    Some(SemanticTokenType::TYPE)
+                }
+            }
+            _ => Some(SemanticTokenType::TYPE),
+        }
     } else {
         None
     }
@@ -1595,8 +1613,9 @@ fn is_object_like_decl_type(
 }
 
 fn is_object_like_value_type(semantic_model: &SemanticModel, decl_type: &LuaType) -> bool {
-    match decl_type {
-        LuaType::Ref(type_id) => semantic_model
+    let resolved = resolve_alias_type(semantic_model.get_db(), decl_type);
+    match &resolved.typ {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => semantic_model
             .get_db()
             .get_type_index()
             .get_type_decl(type_id)

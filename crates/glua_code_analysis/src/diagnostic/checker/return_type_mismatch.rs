@@ -196,8 +196,8 @@ fn add_type_check_diagnostic(
             context.add_diagnostic(
                 DiagnosticCode::ReturnTypeMismatch,
                 range,
-                t!(
-                    "Annotations specify that return value %{index} has a type of `%{source}`, returning value of type `%{found}` here instead. %{reason}",
+                format!(
+                    "Annotations specify that return value {index} has a type of `{source}`, returning value of type `{found}` here instead. {reason}",
                     index = index + 1,
                     source = humanize_lint_type(db, param_type),
                     found = humanize_lint_type(db, expr_type),

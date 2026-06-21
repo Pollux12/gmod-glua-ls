@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::{DiagnosticCode, VirtualWorkspace};
+    use googletest::prelude::*;
 
     #[test]
     fn test_issue_221() {
@@ -135,5 +136,46 @@ mod test {
             local _ = type(f1) ~= 'function' and f1 or f1()
             "#,
         ));
+    }
+
+    // ── Inferred string default: type must stay string ─────────────────
+
+    #[gtest]
+    fn test_string_or_literal_keeps_string_type_annotated() {
+        // With `---@param panelClass string|nil` then `panelClass = panelClass or "DScrollPanel"`,
+        // the inferred type must be `string` (not the literal, not a union).
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param panelClass string|nil
+            function foo(panelClass)
+                panelClass = panelClass or "DScrollPanel"
+                a = panelClass
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_eq!(desc, "string");
+    }
+
+    #[gtest]
+    fn test_string_or_literal_keeps_string_type_unannotated() {
+        // Without annotation, `panelClass = panelClass or "DScrollPanel"`
+        // must still infer `string`.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            function foo(panelClass)
+                panelClass = panelClass or "DScrollPanel"
+                a = panelClass
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_eq!(desc, "string");
     }
 }

@@ -1,5 +1,0 @@
-version: 1
-line_base: 0
-col_base: 0
-file: jit/profile.lua
-entries: []

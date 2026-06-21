@@ -34,8 +34,8 @@ fn check_doc_param(
                     context.add_diagnostic(
                         DiagnosticCode::UndefinedDocParam,
                         name_token.get_range(),
-                        t!(
-                            "Undefined doc param: `%{name}`",
+                        format!(
+                            "Undefined doc param: `{name}`",
                             name = name_token.get_name_text()
                         )
                         .to_string(),

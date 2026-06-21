@@ -984,6 +984,42 @@ local pnl = create()
     }
 
     #[gtest]
+    fn test_alias_to_class_local_keeps_object_modifier() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"---@class Test2
+
+---@alias TestAlias Test2
+
+---@type TestAlias
+local var
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+
+        verify_that!(
+            has_token(
+                &tokens,
+                5,
+                6,
+                3,
+                SemanticTokenType::VARIABLE,
+                &[
+                    SemanticTokenModifier::DECLARATION,
+                    CustomSemanticTokenModifier::LOCAL,
+                    CustomSemanticTokenModifier::OBJECT,
+                ],
+            ),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_local_class_alias_keeps_class_and_local_signal() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let main = ws.def_file(

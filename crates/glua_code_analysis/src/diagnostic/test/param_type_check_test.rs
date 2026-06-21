@@ -26,6 +26,27 @@ mod test {
     }
 
     #[test]
+    fn test_mutual_alias_type_check_does_not_overflow() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@alias AliasA AliasB
+            ---@alias AliasB AliasA
+
+            ---@param value string
+            local function takesString(value) end
+
+            ---@type AliasA
+            local value
+
+            takesString(value)
+        "#
+        ));
+    }
+
+    #[test]
     fn test_issue_82() {
         let mut ws = VirtualWorkspace::new();
 

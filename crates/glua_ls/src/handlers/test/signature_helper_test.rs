@@ -143,17 +143,10 @@ mod tests {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         check!(ws.check_signature_helper(
             r#"
-                ---@class hook
-                hook = {}
-
-                ---@param eventName string
-                ---@param identifier any
-                ---@param func function
-                function hook.Add(eventName, identifier, func) end
-
                 ---@class GM
                 GM = {}
 

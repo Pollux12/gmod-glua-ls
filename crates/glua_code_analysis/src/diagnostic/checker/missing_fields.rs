@@ -171,8 +171,8 @@ fn check_table_expr(
         context.add_diagnostic(
             DiagnosticCode::MissingFields,
             expr.get_range(),
-            t!(
-                "Missing required fields in type `%{typ}`: %{fields}",
+            format!(
+                "Missing required fields in type `{typ}`: {fields}",
                 typ = humanize_lint_type(db, &table_type),
                 fields = missing_fields
             )

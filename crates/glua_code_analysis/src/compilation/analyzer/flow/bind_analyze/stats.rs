@@ -278,7 +278,7 @@ pub fn bind_break_stat(
         // report a error if we are trying to break outside a loop
         binder.report_error(AnalyzeError::new(
             DiagnosticCode::SyntaxError,
-            &t!("Break outside loop"),
+            "Break outside loop",
             break_stat.get_range(),
         ));
         return current;

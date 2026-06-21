@@ -75,6 +75,239 @@ mod test {
             .expect("expected semantic info for local name")
     }
 
+    fn setup_vehicle_weapon_registry_same_file_fixture() -> (VirtualWorkspace, crate::FileId) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/sh_glide.lua",
+            r#"
+            ---@class Glide
+            Glide = Glide or {}
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/glide/sh_vsweps.lua",
+            r##"
+            Glide.WeaponRegistry = Glide.WeaponRegistry or {}
+
+            local function RunWeaponScript(path, className)
+                VSWEP.ClassName = className
+                VSWEP.Name = "#glide.weapons.mgs"
+                VSWEP.Icon = "glide/icons/bullets.png"
+                VSWEP.Base = "base"
+            end
+
+            function Glide.ReloadWeaponScript(className)
+                local registry = Glide.WeaponRegistry
+
+                if registry[className] then
+                    VSWEP = registry[className]
+                else
+                    VSWEP = {}
+                end
+
+                RunWeaponScript("glide/vsweps/" .. className .. ".lua", className)
+                registry[className] = VSWEP
+                VSWEP = nil
+            end
+
+            Glide.ReloadWeaponScript("base")
+            Glide.ReloadWeaponScript("child")
+            Owner = Glide.WeaponRegistry
+
+            local function RefreshInheritance(className)
+                if className == "base" then return end
+
+                local class = Glide.WeaponRegistry[className]
+                local baseClassName = class.Base
+
+                if type(baseClassName) ~= "string" then
+                    return
+                end
+
+                local baseClass = Glide.WeaponRegistry[baseClassName]
+
+                if baseClass == nil then
+                    return
+                end
+
+                class.BaseClass = baseClass
+                setmetatable(class, { __index = baseClass })
+            end
+            "##,
+        );
+
+        (ws, file_id)
+    }
+
+    fn setup_vehicle_weapon_registry_real_multifile_fixture() -> (VirtualWorkspace, crate::FileId) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/autorun/sh_glide.lua",
+            r#"
+            SERVER = true
+            CLIENT = false
+
+            ---@class Glide
+            Glide = Glide or {}
+
+            file = file or {}
+            concommand = concommand or {}
+            net = net or {}
+
+            function Glide.IncludeDir(path, sv, cl) end
+            function Glide.Print(...) end
+            function Glide.PrintDev(...) end
+            function Glide.StartCommand(...) end
+
+            function file.Exists(path, realm) return true end
+            function file.Find(path, realm) return {"base.lua", "missile_launcher.lua"} end
+
+            function CompileFile(path)
+                return function() end
+            end
+
+            function ProtectedCall(fn, ...)
+                fn(...)
+                return true
+            end
+
+            function ErrorNoHalt(...) end
+
+            function concommand.Add(name, fn, autocomplete, help) end
+            function net.WriteString(value) end
+            function net.Broadcast() end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/glide/vsweps/base.lua",
+            r##"
+            VSWEP.Name = "#glide.weapons.mgs"
+            VSWEP.Icon = "glide/icons/bullets.png"
+            VSWEP.FireDelay = 0.5
+            VSWEP.ReloadDelay = 1
+            VSWEP.EnableLockOn = false
+            "##,
+        );
+
+        ws.def_file(
+            "lua/glide/vsweps/missile_launcher.lua",
+            r##"
+            VSWEP.Base = "base"
+            VSWEP.Name = "#glide.weapons.missiles"
+            VSWEP.Icon = "glide/icons/rocket.png"
+            VSWEP.FireDelay = 1
+            VSWEP.EnableLockOn = false
+            "##,
+        );
+
+        let file_id = ws.def_file(
+            "lua/glide/sh_vsweps.lua",
+            r#"
+            if SERVER then
+                Glide.IncludeDir("glide/vsweps/", false, true)
+            end
+
+            Glide.WeaponRegistry = Glide.WeaponRegistry or {}
+
+            local function ValidateTableKey(tbl, key, expectedType)
+                local value = tbl[key]
+                if value == nil then return end
+
+                local actualType = type(value)
+                assert(actualType == expectedType)
+            end
+
+            local function RunWeaponScript(path, className)
+                local func = CompileFile(path)
+                if not func then
+                    Glide.Print("failed", className)
+                    return
+                end
+                func()
+
+                VSWEP.ClassName = className
+
+                if CLIENT then
+                    ValidateTableKey(VSWEP, "Name", "string")
+                    ValidateTableKey(VSWEP, "Icon", "string")
+                end
+
+                if SERVER then
+                    ValidateTableKey(VSWEP, "FireDelay", "number")
+                    ValidateTableKey(VSWEP, "ReloadDelay", "number")
+                    ValidateTableKey(VSWEP, "EnableLockOn", "boolean")
+                end
+            end
+
+            local function RefreshInheritance(className)
+                if className == "base" then return end
+
+                OwnerInFunction = Glide.WeaponRegistry
+                local class = Glide.WeaponRegistry[className]
+                RawClassExpr = Glide.WeaponRegistry[className]
+                local baseClassName = class.Base
+
+                if type(baseClassName) ~= "string" then
+                    ErrorNoHalt(className .. ": Invalid base class type! (string expected, got " .. type(baseClassName) .. ")\n")
+                    return
+                end
+
+                local baseClass = Glide.WeaponRegistry[baseClassName]
+
+                if baseClass == nil then
+                    ErrorNoHalt(className .. ": Invalid base class: " .. baseClassName .. "\n")
+                    return
+                end
+
+                class.BaseClass = baseClass
+                setmetatable(class, { __index = baseClass })
+            end
+
+            function Glide.ReloadWeaponScript(className)
+                local path = "glide/vsweps/" .. className .. ".lua"
+
+                if not file.Exists(path, "LUA") then
+                    Glide.Print("missing", className)
+                    return
+                end
+
+                local registry = Glide.WeaponRegistry
+                if registry[className] then
+                    VSWEP = registry[className]
+                else
+                    VSWEP = {}
+                end
+
+                local success = ProtectedCall(RunWeaponScript, path, className)
+                if success then
+                    registry[className] = VSWEP
+                end
+
+                VSWEP = nil
+            end
+
+            Glide.ReloadWeaponScript("base")
+            Glide.ReloadWeaponScript("missile_launcher")
+            Owner = Glide.WeaponRegistry
+            RefreshInheritance("missile_launcher")
+            "#,
+        );
+
+        (ws, file_id)
+    }
+
     fn index_expr_type(
         ws: &mut VirtualWorkspace,
         file_id: crate::FileId,
@@ -491,7 +724,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_unknown_dynamic_key_does_not_match_exact_field_lookup() {
+    fn test_unknown_dynamic_key_does_not_apply_to_unresolved_named_field_lookup() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -503,7 +736,9 @@ mod test {
             B = test[key]
         end
 
+        test.meow = nil
         A = test.meow
+        C = test.unobserved
         "#,
         );
 
@@ -514,6 +749,196 @@ mod test {
         assert_that!(
             ws.check_type(&dynamic_lookup_ty, &LuaType::Boolean),
             eq(true)
+        );
+
+        let unobserved_lookup_ty = ws.expr_ty("C");
+        assert_eq!(ws.humanize_type(unobserved_lookup_ty), "nil");
+    }
+
+    #[gtest]
+    fn test_vehicle_weapon_registry_same_file_key_should_not_infer_unknown() {
+        let (mut ws, _) = setup_vehicle_weapon_registry_same_file_fixture();
+
+        let owner_ty = ws.expr_ty("Owner");
+        let owner_detailed = ws.humanize_type_detailed(owner_ty);
+        assert_that!(
+            owner_detailed.as_str(),
+            not(contains_substring("[unknown]")),
+            "registry key inference should not use the invalid `unknown` key type: {}",
+            owner_detailed
+        );
+    }
+
+    #[gtest]
+    fn test_vehicle_weapon_registry_same_file_class_read_should_use_value_shape_and_nil_union() {
+        let (mut ws, file_id) = setup_vehicle_weapon_registry_same_file_fixture();
+
+        let class_ty = local_name_type(&mut ws, file_id, "class");
+        let class_detailed = ws.humanize_type_detailed(class_ty.clone());
+        assert_that!(
+            class_detailed.as_str(),
+            all!(
+                not(eq("any?")),
+                contains_substring("ClassName"),
+                contains_substring("Name"),
+                contains_substring("Icon"),
+                contains_substring("?")
+            ),
+            "`local class = Glide.WeaponRegistry[className]` should use the registry value shape with nil union: {}",
+            class_detailed
+        );
+
+        let base_class_name_ty = local_name_type(&mut ws, file_id, "baseClassName");
+        let string_ty = ws.ty("string");
+        assert_that!(
+            ws.check_type(&base_class_name_ty, &string_ty),
+            eq(true),
+            "`class.Base` should preserve the string key before the second registry read, got: {}",
+            ws.humanize_type_detailed(base_class_name_ty.clone())
+        );
+
+        let base_class_read_ty =
+            index_expr_type(&mut ws, file_id, "Glide.WeaponRegistry[baseClassName]");
+        let base_class_read_display = ws.humanize_type_detailed(base_class_read_ty.clone());
+        assert_that!(
+            base_class_read_display.as_str(),
+            all!(
+                not(eq("any?")),
+                not(eq("nil")),
+                contains_substring("Name"),
+                contains_substring("Icon")
+            ),
+            "`Glide.WeaponRegistry[baseClassName]` should also use the registry value shape instead of degrading: {}",
+            base_class_read_display
+        );
+    }
+
+    #[gtest]
+    fn test_vehicle_weapon_registry_real_multifile_local_binding_does_not_degrade_to_any() {
+        let (mut ws, file_id) = setup_vehicle_weapon_registry_real_multifile_fixture();
+
+        let owner_ty = ws.expr_ty("Owner");
+        let owner_display = ws.humanize_type_detailed(owner_ty);
+        assert_that!(
+            owner_display.as_str(),
+            contains_substring("[dynamic]"),
+            "expected real-style registry fixture to preserve dynamic owner shape: {}",
+            owner_display
+        );
+
+        let raw_expr_ty = index_expr_type(&mut ws, file_id, "Glide.WeaponRegistry[className]");
+        let raw_expr_display = ws.humanize_type_detailed(raw_expr_ty.clone());
+        assert_that!(
+            raw_expr_display.as_str(),
+            all!(
+                not(eq("any?")),
+                contains_substring("Name"),
+                contains_substring("Icon"),
+                contains_substring("?")
+            ),
+            "raw index expr should preserve registry value shape in the real-style fixture: {}",
+            raw_expr_display
+        );
+
+        let class_ty = local_name_type(&mut ws, file_id, "class");
+        let class_display = ws.humanize_type_detailed(class_ty.clone());
+        assert_that!(
+            ws.check_type(&class_ty, &raw_expr_ty),
+            eq(true),
+            "local binding for `class` should be compatible with the paired raw index expr: local={}, raw={}",
+            class_display,
+            raw_expr_display
+        );
+        assert_that!(
+            class_display.as_str(),
+            all!(
+                not(eq("any?")),
+                contains_substring("Name"),
+                contains_substring("Icon")
+            ),
+            "local binding for `class` should not degrade beyond the paired raw index expr: {}",
+            class_display
+        );
+    }
+
+    #[gtest]
+    fn test_guarded_dynamic_key_assignment_preserves_shaped_table_value() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/glide/client/debugging.lua",
+            r#"
+        ---@class Vector
+        local Vector = {}
+        ---@param other Vector
+        function Vector:Add(other)
+        end
+
+        ---@return Vector
+        local function vec()
+        end
+
+        ---@return any
+        local function getVid()
+        end
+
+        local vehicleContacts = {}
+        local vid = getVid()
+        local contactPos = vec()
+        local d = { contactPos = true, contactNormal = true }
+
+        if d.contactPos then
+            vehicleContacts[vid] = vehicleContacts[vid] or {
+                sum = vec(),
+                n = 0,
+                normalSum = vec(),
+                normalN = 0,
+            }
+            vehicleContacts[vid].sum:Add(contactPos)
+            vehicleContacts[vid].n = vehicleContacts[vid].n + 1
+            if d.contactNormal then
+                vehicleContacts[vid].normalSum:Add(vec())
+                vehicleContacts[vid].normalN = vehicleContacts[vid].normalN + 1
+            end
+        end
+
+        local contacts = vehicleContacts
+        local contact = vehicleContacts[vid]
+        "#,
+        );
+
+        let contacts_ty = local_name_type(&mut ws, file_id, "contacts");
+        let contacts_display = ws.humanize_type_detailed(contacts_ty.clone());
+        assert_that!(
+            contacts_display.as_str(),
+            all!(
+                contains_substring("sum"),
+                contains_substring("n"),
+                contains_substring("normalSum"),
+                contains_substring("normalN"),
+                not(contains_substring(": any"))
+            ),
+            "guarded dynamic-key table should preserve the shaped value type on `vehicleContacts`: {}",
+            contacts_display
+        );
+
+        let contact_ty = local_name_type(&mut ws, file_id, "contact");
+        let contact_display = ws.humanize_type_detailed(contact_ty.clone());
+        assert_that!(
+            contact_display.as_str(),
+            all!(
+                contains_substring("sum"),
+                contains_substring("n"),
+                contains_substring("normalSum"),
+                contains_substring("normalN"),
+                not(eq("any?"))
+            ),
+            "guarded dynamic-key read should preserve the shaped contact value: {}",
+            contact_display
         );
     }
 
@@ -722,6 +1147,94 @@ mod test {
 
         let ty = ws.expr_ty("A");
         assert_that!(ws.check_type(&ty, &LuaType::Integer), eq(true));
+    }
+
+    #[gtest]
+    fn test_dynamic_table_unresolved_named_field_stays_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+        ---@class SoundPatch
+        ---@field Stop fun(self: SoundPatch)
+
+        ---@return SoundPatch
+        local function CreateSound()
+        end
+
+        local sounds = {}
+
+        ---@param id string
+        local function CreateLoopingSound(id)
+            sounds[id] = CreateSound()
+        end
+
+        CreateLoopingSound("start")
+
+        sounds.start = nil
+        local start = sounds.start
+        "#,
+        );
+
+        let ty = local_name_type(&mut ws, file_id, "start");
+        assert_eq!(ws.humanize_type(ty), "nil");
+    }
+
+    #[gtest]
+    fn test_tableof_dynamic_table_unresolved_named_field_stays_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+        ---@class SoundPatch
+        ---@field Stop fun(self: SoundPatch)
+
+        ---@return SoundPatch
+        local function CreateSound()
+        end
+
+        ---@class TestEntity
+        local TestEntity = {}
+
+        ---@generic T
+        ---@param ent T
+        ---@return tableof<T>
+        local function GetTable(ent)
+        end
+
+        function TestEntity:Initialize()
+            self.sounds = {}
+        end
+
+        ---@param id string
+        function TestEntity:CreateLoopingSound(id)
+            local snd = self.sounds[id]
+
+            if not snd then
+                snd = CreateSound()
+                self.sounds[id] = snd
+            end
+
+            return snd
+        end
+
+        function TestEntity:InternalDeactivateSounds()
+            for id in pairs(self.sounds) do
+                self.sounds[id] = nil
+            end
+        end
+
+        function TestEntity:Update()
+            local selfTbl = GetTable(self)
+            local sounds = selfTbl.sounds
+            sounds.start = nil
+            local start = sounds.start
+        end
+        "#,
+        );
+
+        let ty = local_name_type(&mut ws, file_id, "start");
+        assert_eq!(ws.humanize_type(ty), "nil");
     }
 
     #[gtest]

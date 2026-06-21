@@ -1,11 +1,11 @@
 use glua_code_analysis::{
-    DbIndex, LuaAliasCallKind, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
-    LuaSemanticDeclId, LuaType, SemanticModel, get_keyof_members,
+    DbIndex, LuaAliasCallKind, LuaMemberInfo, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId,
+    LuaType, SemanticModel, get_keyof_members, get_member_value_expr,
     try_extract_signature_id_from_field,
 };
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaFuncStat, LuaGeneralToken, LuaIndexExpr,
-    LuaParenExpr, LuaTableField, LuaTokenKind,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaFuncStat, LuaGeneralToken, LuaIndexExpr,
+    LuaParenExpr, LuaTokenKind,
 };
 use lsp_types::CompletionItem;
 
@@ -223,7 +223,14 @@ pub fn add_member_completion_with_description_hint(
     }
 
     if can_add_snippet {
-        if apply_staged_call_snippet(builder, &label, status, &mut completion_item).is_none()
+        if apply_staged_call_snippet(
+            builder,
+            &label,
+            status,
+            &remove_nil_type,
+            &mut completion_item,
+        )
+        .is_none()
             && builder.support_snippets(typ)
             && let Some(snippet) = get_function_snippet(builder, &label, typ, call_display)
         {
@@ -300,34 +307,6 @@ fn get_member_completion_literal_info(
     };
 
     (color, constructor_literal_detail)
-}
-
-fn get_member_value_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
-
-    if let Some(field) = LuaTableField::cast(node.clone()) {
-        return field.get_value_expr();
-    }
-
-    if let Some(index_expr) = LuaIndexExpr::cast(node) {
-        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
-            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
-            let value_idx = vars
-                .iter()
-                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
-            return value_exprs.get(value_idx).cloned();
-        }
-
-        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
-            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
-        }
-    }
-
-    None
 }
 
 fn add_signature_overloads(
@@ -588,7 +567,7 @@ fn try_add_alias_completion_item_new(
     ));
 
     // 更新 label_details 添加别名提示
-    let index_hint = t!("completion.index %{label}", label = label).to_string();
+    let index_hint = format!("index {label}");
     let label_details = alias_completion_item
         .label_details
         .get_or_insert_with(Default::default);

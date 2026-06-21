@@ -114,7 +114,8 @@
               "annotations/realm",
               "annotations/hook",
               "annotations/fileparam",
-              "annotations/accessorfunc"
+              "annotations/accessorfunc",
+              "annotations/call-arg"
             ]
           },
           {

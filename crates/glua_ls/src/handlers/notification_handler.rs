@@ -78,10 +78,10 @@ pub async fn on_notification_handler(
                 let workspace = snapshot.workspace_manager().read().await;
                 workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
             }
-            // Keep inlay hint requests alive so they can wait for fresh data
-            // instead of being cancelled and causing visible flicker.
+            // Keep stale-aware UI requests alive so they can wait for fresh
+            // data instead of flickering while typing.
             server_context
-                .cancel_all_requests_except(&["textDocument/inlayHint"])
+                .cancel_all_requests_except(&["textDocument/codeLens", "textDocument/inlayHint"])
                 .await;
             // Mark analysis dirty BEFORE handing the update to the coalescer so
             // follow-up requests see the stale state immediately.

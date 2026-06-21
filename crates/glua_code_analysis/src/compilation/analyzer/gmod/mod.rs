@@ -3,21 +3,23 @@ use std::{
     sync::Arc,
 };
 
+use aho_corasick::AhoCorasick;
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk,
     LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
-    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaRepeatStat, LuaStat, LuaSyntaxNode,
-    LuaTableExpr, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
+    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaStat,
+    LuaSyntaxNode, LuaTableExpr, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
 };
 
 use crate::{
-    EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodScriptedClassCallKind,
-    GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, InFiled, LuaDecl, LuaDeclExtra,
-    LuaDeclId, LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaMember, LuaMemberFeature,
-    LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
-    LuaTypeOwner,
+    EmmyrcGmodRealm, FileId, GmodClassCallLiteral, GmodDermaSkinCallRoles,
+    GmodNamedStringCallRoles, GmodNetworkVarCallRoles, GmodScriptedClassCallKind,
+    GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, GmodVguiPanelCallRoles, InFiled,
+    LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclLocation, LuaDeclTypeKind,
+    LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature,
+    LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -41,12 +43,22 @@ struct GmodKeywords {
     has_net: bool,
     /// timer/concommand/ConVar/AddNetworkString — system call metadata
     has_system_call: bool,
+    /// Annotated scripted-class wrappers (VGUI, Derma, NetworkVar, inheritance)
+    has_scripted_class_call: bool,
     /// "GM:" or "GAMEMODE:" — GM/GAMEMODE method sites
     has_gm_func: bool,
     /// "CLIENT" or "SERVER" — branch realm ranges (if CLIENT/if SERVER)
     has_realm_branch: bool,
     /// "@realm" — file-level realm annotation
     has_realm_anno: bool,
+}
+
+#[derive(Default)]
+struct AnnotatedGmodCandidatePresence {
+    has_system: bool,
+    has_net: bool,
+    has_hook: bool,
+    has_scripted_class: bool,
 }
 
 impl GmodKeywords {
@@ -66,17 +78,37 @@ impl GmodKeywords {
     }
 }
 
-fn scan_gmod_keywords(content: &str, formatted_hook_prefixes: &[String]) -> GmodKeywords {
+fn scan_gmod_keywords(
+    content: &str,
+    formatted_hook_prefixes: &[String],
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) -> GmodKeywords {
     let has_gm_func = content.contains("GM:")
         || content.contains("GAMEMODE:")
         || formatted_hook_prefixes.iter().any(|p| content.contains(p));
+    let has_hook_annotation = content.contains("gmod.hook");
+    let has_net_annotation = content.contains("gmod.net_message");
+    let has_system_annotation = has_net_annotation
+        || content.contains("gmod.concommand")
+        || content.contains("gmod.convar")
+        || content.contains("gmod.timer");
+    let has_scripted_class_annotation = content.contains("gmod.vgui_panel")
+        || content.contains("gmod.derma_skin")
+        || content.contains("gmod.network_var")
+        || content.contains("gmod.class_base")
+        || content.contains("gmod.gamemode");
+    let annotated_candidates = annotated_global_call_roles.candidate_call_paths_in_content(content);
     GmodKeywords {
-        has_hook: content.contains("hook"),
-        has_net: content.contains("net."),
+        has_hook: content.contains("hook") || has_hook_annotation || annotated_candidates.has_hook,
+        has_net: content.contains("net.") || has_net_annotation || annotated_candidates.has_net,
         has_system_call: content.contains("timer.")
             || content.contains("concommand")
             || content.contains("ConVar")
-            || content.contains("AddNetworkString"),
+            || content.contains("AddNetworkString")
+            || has_system_annotation
+            || annotated_candidates.has_system,
+        has_scripted_class_call: has_scripted_class_annotation
+            || annotated_candidates.has_scripted_class,
         has_gm_func,
         has_realm_branch: content.contains("CLIENT") || content.contains("SERVER"),
         has_realm_anno: content.contains("@realm"),
@@ -99,7 +131,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
 
         let _p = Profile::cond_new("gmod pre-analyze", context.tree_list.len() > 1);
         let tree_list = context.tree_list.clone();
-        let file_ids: Vec<FileId> = tree_list.iter().map(|x| x.file_id).collect();
         let do_profile = tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
 
         // Pre-compute scripted class scope for all files (compile globs once)
@@ -134,6 +165,31 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             .iter()
             .map(|p| format!("{p}:"))
             .collect();
+        let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build(db);
+
+        let t_class = do_profile.then(std::time::Instant::now);
+        collect_annotated_scripted_class_calls_with(
+            db,
+            context,
+            &formatted_hook_prefixes,
+            &annotated_global_call_roles,
+        );
+        if let Some(t_class) = t_class {
+            log::info!(
+                "gmod pre: annotated_scripted_class_calls cost {:?}",
+                t_class.elapsed()
+            );
+        }
+
+        let t_vgui = do_profile.then(std::time::Instant::now);
+        let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
+        synthesize_vgui_registrations(db, &file_ids);
+        if let Some(t_vgui) = t_vgui {
+            log::info!(
+                "gmod pre: vgui_registration_bindings cost {:?}",
+                t_vgui.elapsed()
+            );
+        }
 
         for in_filed_tree in &tree_list {
             let is_in_scope = scripted_scope_files.contains(&in_filed_tree.file_id);
@@ -142,7 +198,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             let keywords = db
                 .get_vfs()
                 .get_file_content(&in_filed_tree.file_id)
-                .map(|c| scan_gmod_keywords(c, &formatted_hook_prefixes))
+                .map(|c| {
+                    scan_gmod_keywords(c, &formatted_hook_prefixes, &annotated_global_call_roles)
+                })
                 .unwrap_or_default();
             if let Some(profile) = profile.as_mut() {
                 profile.files_scanned += 1;
@@ -157,6 +215,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     in_filed_tree.file_id,
                     in_filed_tree.value.clone(),
                     &helper_registry,
+                    &annotated_global_call_roles,
                     &mut local_fns,
                 )
             } else {
@@ -403,16 +462,87 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
             );
         }
 
-        let t0 = do_profile.then(std::time::Instant::now);
-        synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
-        if let Some(t0) = t0 {
-            log::info!("gmod post: scripted_class_members cost {:?}", t0.elapsed());
+        let t_class = do_profile.then(std::time::Instant::now);
+        collect_annotated_scripted_class_calls(db, context);
+        if let Some(t_class) = t_class {
+            log::info!(
+                "gmod post: annotated_scripted_class_calls cost {:?}",
+                t_class.elapsed()
+            );
         }
 
         let t1 = do_profile.then(std::time::Instant::now);
         synthesize_vgui_registrations(db, &file_ids);
         if let Some(t1) = t1 {
             log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed());
+        }
+
+        let t0 = do_profile.then(std::time::Instant::now);
+        synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
+        if let Some(t0) = t0 {
+            log::info!("gmod post: scripted_class_members cost {:?}", t0.elapsed());
+        }
+    }
+}
+
+fn collect_annotated_scripted_class_calls(db: &mut DbIndex, context: &AnalyzeContext) {
+    let formatted_hook_prefixes: Vec<String> = db
+        .get_emmyrc()
+        .gmod
+        .hook_mappings
+        .method_prefixes
+        .iter()
+        .map(|p| format!("{p}:"))
+        .collect();
+    let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build(db);
+    collect_annotated_scripted_class_calls_with(
+        db,
+        context,
+        &formatted_hook_prefixes,
+        &annotated_global_call_roles,
+    );
+}
+
+fn collect_annotated_scripted_class_calls_with(
+    db: &mut DbIndex,
+    context: &AnalyzeContext,
+    formatted_hook_prefixes: &[String],
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) {
+    for in_filed_tree in &context.tree_list {
+        let keywords = db
+            .get_vfs()
+            .get_file_content(&in_filed_tree.file_id)
+            .map(|content| {
+                scan_gmod_keywords(
+                    content,
+                    formatted_hook_prefixes,
+                    annotated_global_call_roles,
+                )
+            })
+            .unwrap_or_default();
+        if !keywords.has_scripted_class_call {
+            continue;
+        }
+
+        let annotated_call_roles = AnnotatedGmodCallRoleMap::build(
+            db,
+            in_filed_tree.file_id,
+            &in_filed_tree.value,
+            annotated_global_call_roles,
+        );
+        for call_expr in in_filed_tree
+            .value
+            .syntax()
+            .descendants()
+            .filter_map(LuaCallExpr::cast)
+        {
+            collect_annotated_scripted_class_call_metadata(
+                db,
+                in_filed_tree.file_id,
+                &annotated_call_roles,
+                call_expr,
+            );
         }
     }
 }
@@ -701,16 +831,21 @@ fn collect_hook_metadata(
     file_id: FileId,
     root: LuaChunk,
     helper_registry: &HelperRegistry,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     local_fns: &mut LocalFnCache,
 ) -> (Vec<(String, GmodRealm)>, Vec<NetReceiveFlow>) {
     let mut gm_method_realms = Vec::new();
     let mut receive_flows = Vec::new();
+    let annotated_call_roles =
+        AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
 
     // Single descendants walk dispatching by node kind. Avoids two separate
     // O(N) walks for the LuaCallExpr and LuaFuncStat passes.
     for node in root.syntax().descendants() {
         if let Some(call_expr) = LuaCallExpr::cast(node.clone()) {
-            if let Some(site) = collect_hook_call_site(db, call_expr.clone()) {
+            if let Some(site) =
+                collect_hook_call_site(db, file_id, &annotated_call_roles, call_expr.clone())
+            {
                 db.get_gmod_infer_index_mut().add_hook_site(file_id, site);
             }
 
@@ -720,7 +855,7 @@ fn collect_hook_metadata(
                 receive_flows.push(receive_flow);
             }
 
-            collect_system_call_metadata(db, file_id, call_expr);
+            collect_system_call_metadata(db, file_id, &annotated_call_roles, call_expr);
             continue;
         }
 
@@ -2211,10 +2346,13 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
 
         for call in &metadata.vgui_register_calls {
             let register_position = call.syntax_id.get_range().start();
-            if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first()
+            let panel_arg_idx = call.vgui_panel_define_arg_idx();
+            let table_arg_idx = call.vgui_panel_table_arg_idx(1);
+            if let Some(Some(GmodClassCallLiteral::String(panel_name))) =
+                call.literal_args.get(panel_arg_idx)
             {
                 if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
-                    call.literal_args.get(1)
+                    call.literal_args.get(table_arg_idx)
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
@@ -2232,10 +2370,13 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
 
         for call in &metadata.derma_define_control_calls {
             let register_position = call.syntax_id.get_range().start();
-            if let Some(Some(GmodClassCallLiteral::String(panel_name))) = call.literal_args.first()
+            let panel_arg_idx = call.vgui_panel_define_arg_idx();
+            let table_arg_idx = call.vgui_panel_table_arg_idx(2);
+            if let Some(Some(GmodClassCallLiteral::String(panel_name))) =
+                call.literal_args.get(panel_arg_idx)
             {
                 if let Some(Some(GmodClassCallLiteral::NameRef(table_var))) =
-                    call.literal_args.get(2)
+                    call.literal_args.get(table_arg_idx)
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
@@ -2883,7 +3024,7 @@ fn resolve_effective_inheritance_call(
 
 fn valid_inheritance_literal(call: &GmodScriptedClassCallMetadata) -> bool {
     matches!(
-        call.literal_args.first(),
+        call.literal_args.get(call.inheritance_name_arg_idx()),
         Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty()
     )
 }
@@ -2893,7 +3034,7 @@ fn resolve_effective_inheritance_base(
     class_name_prefix: Option<&str>,
 ) -> Option<(String, bool)> {
     let call = resolve_effective_inheritance_call(metadata)?;
-    let base_name = match call.literal_args.first() {
+    let base_name = match call.literal_args.get(call.inheritance_name_arg_idx()) {
         Some(Some(GmodClassCallLiteral::String(name))) => name.as_str(),
         _ => return None,
     };
@@ -2946,7 +3087,7 @@ fn synthesize_define_baseclass_parent_alias(
         _ => return,
     };
 
-    let base_name = match call.literal_args.first() {
+    let base_name = match call.literal_args.get(call.inheritance_name_arg_idx()) {
         Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name.as_str(),
         _ => return,
     };
@@ -3114,22 +3255,33 @@ fn synthesize_network_var(
     // args[1] = slot (integer) OR name (string, if 2-arg form)
     // args[2] = name (string, if 3-arg form)
 
-    let type_name = match call.literal_args.first() {
+    let type_arg_idx = call.network_var_type_arg_idx().unwrap_or(0);
+    let type_name = match call.literal_args.get(type_arg_idx) {
         Some(Some(GmodClassCallLiteral::String(name))) => name.clone(),
         _ => return,
     };
 
-    // Try index 2 first (3-arg form), then index 1 (2-arg form)
-    let (prop_name, prop_name_arg_idx) = match call.literal_args.get(2) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-            (name.clone(), 2usize)
-        }
-        _ => match call.literal_args.get(1) {
+    let (prop_name, prop_name_arg_idx) = if let Some(name_arg_idx) = call.network_var_name_arg_idx()
+    {
+        match call.literal_args.get(name_arg_idx) {
             Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-                (name.clone(), 1usize)
+                (name.clone(), name_arg_idx)
             }
             _ => return,
-        },
+        }
+    } else {
+        // Try index 2 first (3-arg form), then index 1 (2-arg form)
+        match call.literal_args.get(2) {
+            Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                (name.clone(), 2usize)
+            }
+            _ => match call.literal_args.get(1) {
+                Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                    (name.clone(), 1usize)
+                }
+                _ => return,
+            },
+        }
     };
 
     let value_type = resolve_networkvar_type(&type_name);
@@ -3193,27 +3345,42 @@ fn synthesize_network_var_element(
     // args[2] = element or name
     // args[3] = name (if 4-arg form)
 
-    // Type name must be present (first arg is always the type)
-    if call.literal_args.first().and_then(|a| a.as_ref()).is_none() {
+    let type_arg_idx = call.network_var_type_arg_idx().unwrap_or(0);
+    if call
+        .literal_args
+        .get(type_arg_idx)
+        .and_then(|a| a.as_ref())
+        .is_none()
+    {
         return;
     }
 
-    // Find the property name: try index 3, then 2, then 1
-    let (prop_name, prop_name_arg_idx) = match call.literal_args.get(3) {
-        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-            (name.clone(), 3usize)
-        }
-        _ => match call.literal_args.get(2) {
+    let (prop_name, prop_name_arg_idx) = if let Some(name_arg_idx) = call.network_var_name_arg_idx()
+    {
+        match call.literal_args.get(name_arg_idx) {
             Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-                (name.clone(), 2usize)
+                (name.clone(), name_arg_idx)
             }
-            _ => match call.literal_args.get(1) {
+            _ => return,
+        }
+    } else {
+        // Find the property name: try index 3, then 2, then 1
+        match call.literal_args.get(3) {
+            Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                (name.clone(), 3usize)
+            }
+            _ => match call.literal_args.get(2) {
                 Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-                    (name.clone(), 1usize)
+                    (name.clone(), 2usize)
                 }
-                _ => return,
+                _ => match call.literal_args.get(1) {
+                    Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
+                        (name.clone(), 1usize)
+                    }
+                    _ => return,
+                },
             },
-        },
+        }
     };
 
     // NetworkVarElement always produces number accessors
@@ -3272,17 +3439,21 @@ fn synthesize_vgui_register(
     // args[0] = panel name (string)
     // args[1] = table variable (name ref)
     // args[2] = base panel name (string)
-    let panel_name = match call.literal_args.first() {
+    let panel_arg_idx = call.vgui_panel_define_arg_idx();
+    let table_arg_idx = call.vgui_panel_table_arg_idx(1);
+    let base_arg_idx = call.vgui_panel_base_arg_idx(Some(2)).unwrap_or(2);
+
+    let panel_name = match call.literal_args.get(panel_arg_idx) {
         Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name.clone(),
         _ => return,
     };
 
-    let table_var_name = match call.literal_args.get(1) {
+    let table_var_name = match call.literal_args.get(table_arg_idx) {
         Some(Some(GmodClassCallLiteral::NameRef(name))) => Some(name.clone()),
         _ => None,
     };
 
-    let base_panel = match call.literal_args.get(2) {
+    let base_panel = match call.literal_args.get(base_arg_idx) {
         Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => Some(name.clone()),
         _ => None,
     };
@@ -3308,17 +3479,21 @@ fn synthesize_derma_define_control(
     // args[1] = description (string, ignored)
     // args[2] = table variable (name ref)
     // args[3] = base panel name (string)
-    let control_name = match call.literal_args.first() {
+    let panel_arg_idx = call.vgui_panel_define_arg_idx();
+    let table_arg_idx = call.vgui_panel_table_arg_idx(2);
+    let base_arg_idx = call.vgui_panel_base_arg_idx(Some(3)).unwrap_or(3);
+
+    let control_name = match call.literal_args.get(panel_arg_idx) {
         Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => name.clone(),
         _ => return,
     };
 
-    let table_var_name = match call.literal_args.get(2) {
+    let table_var_name = match call.literal_args.get(table_arg_idx) {
         Some(Some(GmodClassCallLiteral::NameRef(name))) => Some(name.clone()),
         _ => None,
     };
 
-    let base_panel = match call.literal_args.get(3) {
+    let base_panel = match call.literal_args.get(base_arg_idx) {
         Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => Some(name.clone()),
         _ => None,
     };
@@ -3561,12 +3736,14 @@ fn synthesize_panel_class(
                     LuaTypeCache::InferType(class_type.clone()),
                 );
             }
-        } else if !decl_has_reassignment(db, file_id, decl_id) {
-            // Compatibility fallback for single-panel files (one `local PANEL`,
-            // no plain reassignments) where the RHS is not a recoverable table
-            // literal. Binding the decl slot is safe here because the local is
-            // never reused, so there is no region to collapse. Reassigned
-            // locals are deliberately left untouched to avoid collapse.
+        }
+
+        if !decl_has_reassignment(db, file_id, decl_id) {
+            // For single-panel files the `PANEL` local has one stable identity.
+            // Bind the decl slot too so method-self collection during the Lua
+            // pass sees the synthesized class before it caches member values.
+            // Reassigned locals remain table-literal-only to avoid collapsing
+            // distinct registration regions onto one class.
             db.get_type_index_mut()
                 .force_bind_type(decl_id.into(), LuaTypeCache::InferType(class_type.clone()));
         }
@@ -3804,8 +3981,12 @@ fn synthesize_panel_baseclass_member(
     }
 
     let base_arg_index = match call_kind {
-        GmodScriptedClassCallKind::VguiRegister => 2,
-        GmodScriptedClassCallKind::DermaDefineControl => 3,
+        GmodScriptedClassCallKind::VguiRegister => {
+            call.vgui_panel_base_arg_idx(Some(2)).unwrap_or(2)
+        }
+        GmodScriptedClassCallKind::DermaDefineControl => {
+            call.vgui_panel_base_arg_idx(Some(3)).unwrap_or(3)
+        }
         _ => return,
     };
 
@@ -3931,17 +4112,1161 @@ enum GmodSystemCallKind {
     TimerSimple,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GmodSystemCallSite {
+    kind: GmodSystemCallKind,
+    name_arg_idx: Option<usize>,
+    callback_arg_idx: Option<usize>,
+}
+
+#[derive(Default)]
+struct AnnotatedGmodGlobalCallRoleMap {
+    roles_by_path: HashMap<String, AnnotatedGmodCallRoles>,
+    candidate_call_path_matcher: Option<AhoCorasick>,
+    candidate_call_path_kinds: Vec<AnnotatedGmodCandidatePresence>,
+}
+
+struct AnnotatedGmodCallRoleMap<'a> {
+    global_roles: &'a AnnotatedGmodGlobalCallRoleMap,
+    local_roles_by_decl: HashMap<LuaDeclId, AnnotatedGmodCallRoles>,
+    local_roles_by_path: HashMap<(LuaDeclId, String), AnnotatedGmodCallRoles>,
+    local_candidate_names: HashSet<String>,
+}
+
+#[derive(Clone, Default)]
+struct AnnotatedGmodCallRoles {
+    is_colon_define: bool,
+    params: Vec<Option<LuaType>>,
+    optional_params: Vec<bool>,
+    is_variadic: bool,
+    overloads: Vec<AnnotatedGmodCallRoles>,
+    system_roles: Vec<(GmodSystemCallKind, usize, i64)>,
+    system_callback_roles: Vec<(GmodSystemCallKind, usize, i64)>,
+    hook_roles: Vec<(GmodHookKind, usize, i64)>,
+    hook_callback_roles: Vec<(usize, i64)>,
+    inheritance_roles: Vec<(GmodScriptedClassCallKind, usize, i64)>,
+    network_var_kind: Option<GmodScriptedClassCallKind>,
+    network_var_type_roles: Vec<(usize, i64)>,
+    network_var_define_roles: Vec<(usize, i64)>,
+    vgui_panel_kind: Option<GmodScriptedClassCallKind>,
+    vgui_panel_define_roles: Vec<(usize, i64)>,
+    vgui_panel_table_roles: Vec<(usize, i64)>,
+    vgui_panel_base_roles: Vec<(usize, i64)>,
+    derma_skin_define_roles: Vec<(usize, i64)>,
+}
+
+impl AnnotatedGmodCallRoles {
+    fn from_signature_shape(signature: &LuaSignature) -> Self {
+        Self {
+            is_colon_define: signature.is_colon_define,
+            params: signature
+                .params
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| {
+                    signature
+                        .param_docs
+                        .get(&idx)
+                        .map(|param| param.type_ref.clone())
+                })
+                .collect(),
+            optional_params: signature.get_param_optional_flags(),
+            is_variadic: signature.is_vararg,
+            ..Self::default()
+        }
+    }
+
+    fn from_function_shape(func: &LuaFunctionType) -> Self {
+        Self {
+            is_colon_define: func.is_colon_define(),
+            params: func
+                .get_params()
+                .iter()
+                .map(|(_, typ)| typ.clone())
+                .collect(),
+            optional_params: func.get_optional_params().to_vec(),
+            is_variadic: func.is_variadic(),
+            ..Self::default()
+        }
+    }
+
+    fn add_call_arg_role(&mut self, role: &LuaCallArgRole) {
+        let priority = role.priority.unwrap_or(0);
+        match (role.domain.as_str(), role.role.as_str()) {
+            ("gmod.net_message", "define") => self.system_roles.push((
+                GmodSystemCallKind::AddNetworkString,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.net_message", "start") => {
+                self.system_roles
+                    .push((GmodSystemCallKind::NetStart, role.param_idx, priority));
+            }
+            ("gmod.net_message", "receive") => {
+                self.system_roles
+                    .push((GmodSystemCallKind::NetReceive, role.param_idx, priority));
+            }
+            ("gmod.net_message", "callback") => self.system_callback_roles.push((
+                GmodSystemCallKind::NetReceive,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.concommand", "define") => self.system_roles.push((
+                GmodSystemCallKind::ConcommandAdd,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.concommand", "callback") => self.system_callback_roles.push((
+                GmodSystemCallKind::ConcommandAdd,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.convar", "define") | ("gmod.convar", "define_server") => self
+                .system_roles
+                .push((GmodSystemCallKind::CreateConVar, role.param_idx, priority)),
+            ("gmod.convar", "define_client") => self.system_roles.push((
+                GmodSystemCallKind::CreateClientConVar,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.timer", "define") => {
+                self.system_roles
+                    .push((GmodSystemCallKind::TimerCreate, role.param_idx, priority))
+            }
+            ("gmod.timer", "callback") => self.system_callback_roles.push((
+                GmodSystemCallKind::TimerCreate,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.timer", "simple") => self.system_callback_roles.push((
+                GmodSystemCallKind::TimerSimple,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.hook", "add") => {
+                self.hook_roles
+                    .push((GmodHookKind::Add, role.param_idx, priority))
+            }
+            ("gmod.hook", "emit") => {
+                self.hook_roles
+                    .push((GmodHookKind::Emit, role.param_idx, priority))
+            }
+            ("gmod.hook", "callback") => {
+                self.hook_callback_roles.push((role.param_idx, priority));
+            }
+            ("gmod.class_base", "reference") => self.inheritance_roles.push((
+                GmodScriptedClassCallKind::DefineBaseClass,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.gamemode", "reference") => self.inheritance_roles.push((
+                GmodScriptedClassCallKind::DeriveGamemode,
+                role.param_idx,
+                priority,
+            )),
+            ("gmod.network_var", "type") => {
+                self.network_var_type_roles.push((role.param_idx, priority));
+            }
+            ("gmod.network_var", "define") => {
+                self.network_var_kind = self
+                    .network_var_kind
+                    .or(Some(GmodScriptedClassCallKind::NetworkVar));
+                self.network_var_define_roles
+                    .push((role.param_idx, priority));
+            }
+            ("gmod.network_var", "define_element") => {
+                self.network_var_kind = Some(GmodScriptedClassCallKind::NetworkVarElement);
+                self.network_var_define_roles
+                    .push((role.param_idx, priority));
+            }
+            ("gmod.vgui_panel", "define") => {
+                self.vgui_panel_kind = self
+                    .vgui_panel_kind
+                    .or(Some(GmodScriptedClassCallKind::VguiRegister));
+                self.vgui_panel_define_roles
+                    .push((role.param_idx, priority));
+            }
+            ("gmod.vgui_panel", "define_control") => {
+                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::DermaDefineControl);
+                self.vgui_panel_define_roles
+                    .push((role.param_idx, priority));
+            }
+            ("gmod.vgui_panel", "table") => {
+                self.vgui_panel_table_roles.push((role.param_idx, priority));
+            }
+            ("gmod.vgui_panel", "base") => {
+                self.vgui_panel_base_roles.push((role.param_idx, priority));
+            }
+            ("gmod.derma_skin", "define") => {
+                self.derma_skin_define_roles
+                    .push((role.param_idx, priority));
+            }
+            _ => {}
+        }
+    }
+
+    fn sort_roles(&mut self) {
+        self.system_roles
+            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.system_callback_roles
+            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.hook_roles
+            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.hook_callback_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.inheritance_roles
+            .sort_by_key(|(_, param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.network_var_type_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.network_var_define_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.vgui_panel_define_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.vgui_panel_table_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.vgui_panel_base_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+        self.derma_skin_define_roles
+            .sort_by_key(|(param_idx, priority)| (std::cmp::Reverse(*priority), *param_idx));
+    }
+
+    fn has_any_roles(&self) -> bool {
+        !self.system_roles.is_empty()
+            || !self.system_callback_roles.is_empty()
+            || !self.hook_roles.is_empty()
+            || !self.hook_callback_roles.is_empty()
+            || !self.inheritance_roles.is_empty()
+            || !self.network_var_define_roles.is_empty()
+            || !self.vgui_panel_define_roles.is_empty()
+            || !self.derma_skin_define_roles.is_empty()
+    }
+
+    fn select_for_call(&self, call_expr: &LuaCallExpr) -> Option<AnnotatedGmodCallRoles> {
+        let mut best_roles = None;
+        let mut best_score = i32::MIN;
+
+        for roles in std::iter::once(self).chain(self.overloads.iter()) {
+            let Some(score) = roles.match_score(call_expr) else {
+                continue;
+            };
+            if score > best_score {
+                best_score = score;
+                best_roles = Some(roles.clone_without_overloads());
+            }
+        }
+
+        best_roles.or_else(|| Some(self.clone_without_overloads()))
+    }
+
+    fn clone_without_overloads(&self) -> AnnotatedGmodCallRoles {
+        let mut roles = self.clone();
+        roles.overloads.clear();
+        roles
+    }
+
+    fn match_score(&self, call_expr: &LuaCallExpr) -> Option<i32> {
+        if self.params.is_empty() && self.optional_params.is_empty() && !self.is_variadic {
+            return Some(0);
+        }
+
+        let args = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
+        let effective_arg_count =
+            args.len() + usize::from(call_expr.is_colon_call() && !self.is_colon_define);
+        let required_count = self
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !self.optional_params.get(*idx).copied().unwrap_or(false))
+            .count();
+
+        if effective_arg_count < required_count {
+            return None;
+        }
+        if !self.is_variadic && effective_arg_count > self.params.len() {
+            return None;
+        }
+
+        let first_param_offset = usize::from(call_expr.is_colon_call() && !self.is_colon_define);
+        let mut score = 0;
+        for (arg_idx, arg) in args.iter().enumerate() {
+            let param_idx = arg_idx + first_param_offset;
+            let Some(Some(param_type)) = self.params.get(param_idx) else {
+                continue;
+            };
+            match static_arg_matches_type(arg, param_type) {
+                StaticArgTypeMatch::Match => score += 2,
+                StaticArgTypeMatch::Unknown => {}
+                StaticArgTypeMatch::Mismatch => return None,
+            }
+        }
+
+        Some(score)
+    }
+
+    fn system_call_site(&self) -> Option<GmodSystemCallSite> {
+        if let Some((kind, name_arg_idx, _)) = self.system_roles.first() {
+            return Some(GmodSystemCallSite {
+                kind: *kind,
+                name_arg_idx: Some(*name_arg_idx),
+                callback_arg_idx: self.callback_arg_idx_for_kind(*kind),
+            });
+        }
+
+        let (kind, callback_arg_idx, _) = self
+            .system_callback_roles
+            .iter()
+            .find(|(kind, _, _)| *kind == GmodSystemCallKind::TimerSimple)?;
+
+        Some(GmodSystemCallSite {
+            kind: *kind,
+            name_arg_idx: None,
+            callback_arg_idx: Some(*callback_arg_idx),
+        })
+    }
+
+    fn callback_arg_idx_for_kind(&self, call_kind: GmodSystemCallKind) -> Option<usize> {
+        self.system_callback_roles
+            .iter()
+            .find(|(kind, _, _)| *kind == call_kind)
+            .map(|(_, param_idx, _)| *param_idx)
+    }
+
+    fn candidate_presence(&self) -> AnnotatedGmodCandidatePresence {
+        AnnotatedGmodCandidatePresence {
+            has_system: !self.system_roles.is_empty() || !self.system_callback_roles.is_empty(),
+            has_net: self.system_roles.iter().any(|(kind, _, _)| {
+                matches!(
+                    kind,
+                    GmodSystemCallKind::AddNetworkString
+                        | GmodSystemCallKind::NetStart
+                        | GmodSystemCallKind::NetReceive
+                )
+            }),
+            has_hook: !self.hook_roles.is_empty() || !self.hook_callback_roles.is_empty(),
+            has_scripted_class: !self.inheritance_roles.is_empty()
+                || !self.network_var_define_roles.is_empty()
+                || !self.vgui_panel_define_roles.is_empty()
+                || !self.derma_skin_define_roles.is_empty(),
+        }
+    }
+
+    fn inheritance_call(
+        &self,
+        is_colon_call: bool,
+    ) -> Option<(GmodScriptedClassCallKind, GmodNamedStringCallRoles)> {
+        let (kind, param_idx, _) = *self.inheritance_roles.first()?;
+        Some((
+            kind,
+            GmodNamedStringCallRoles {
+                name_arg_idx: param_idx_to_call_arg_idx(
+                    param_idx,
+                    is_colon_call,
+                    self.is_colon_define,
+                )?,
+            },
+        ))
+    }
+
+    fn network_var_call(
+        &self,
+        is_colon_call: bool,
+    ) -> Option<(GmodScriptedClassCallKind, GmodNetworkVarCallRoles)> {
+        let (define_param_idx, _) = *self.network_var_define_roles.first()?;
+        let kind = self
+            .network_var_kind
+            .unwrap_or(GmodScriptedClassCallKind::NetworkVar);
+        Some((
+            kind,
+            GmodNetworkVarCallRoles {
+                type_arg_idx: self
+                    .network_var_type_roles
+                    .first()
+                    .and_then(|(param_idx, _)| {
+                        param_idx_to_call_arg_idx(*param_idx, is_colon_call, self.is_colon_define)
+                    }),
+                name_arg_idx: param_idx_to_call_arg_idx(
+                    define_param_idx,
+                    is_colon_call,
+                    self.is_colon_define,
+                )?,
+            },
+        ))
+    }
+
+    fn vgui_panel_call(
+        &self,
+        is_colon_call: bool,
+    ) -> Option<(GmodScriptedClassCallKind, GmodVguiPanelCallRoles)> {
+        let (define_arg_idx, _) = *self.vgui_panel_define_roles.first()?;
+        Some((
+            self.vgui_panel_kind
+                .unwrap_or(GmodScriptedClassCallKind::VguiRegister),
+            GmodVguiPanelCallRoles {
+                define_arg_idx: param_idx_to_call_arg_idx(
+                    define_arg_idx,
+                    is_colon_call,
+                    self.is_colon_define,
+                )?,
+                table_arg_idx: self
+                    .vgui_panel_table_roles
+                    .first()
+                    .and_then(|(param_idx, _)| {
+                        param_idx_to_call_arg_idx(*param_idx, is_colon_call, self.is_colon_define)
+                    }),
+                base_arg_idx: self
+                    .vgui_panel_base_roles
+                    .first()
+                    .and_then(|(param_idx, _)| {
+                        param_idx_to_call_arg_idx(*param_idx, is_colon_call, self.is_colon_define)
+                    }),
+            },
+        ))
+    }
+
+    fn derma_skin_call_roles(&self, is_colon_call: bool) -> Option<GmodDermaSkinCallRoles> {
+        let (define_arg_idx, _) = *self.derma_skin_define_roles.first()?;
+        Some(GmodDermaSkinCallRoles {
+            define_arg_idx: param_idx_to_call_arg_idx(
+                define_arg_idx,
+                is_colon_call,
+                self.is_colon_define,
+            )?,
+        })
+    }
+}
+
+fn param_idx_to_call_arg_idx(
+    param_idx: usize,
+    is_colon_call: bool,
+    is_colon_define: bool,
+) -> Option<usize> {
+    if is_colon_call && !is_colon_define {
+        param_idx.checked_sub(1)
+    } else {
+        Some(param_idx)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticArgTypeMatch {
+    Match,
+    Mismatch,
+    Unknown,
+}
+
+fn static_arg_matches_type(arg: &LuaExpr, param_type: &LuaType) -> StaticArgTypeMatch {
+    let Some(kind) = static_arg_kind(arg) else {
+        return StaticArgTypeMatch::Unknown;
+    };
+
+    static_arg_kind_matches_type(kind, param_type)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticArgKind {
+    String,
+    Number,
+    Boolean,
+    Table,
+    Function,
+    Nil,
+}
+
+fn static_arg_kind(arg: &LuaExpr) -> Option<StaticArgKind> {
+    match arg {
+        LuaExpr::LiteralExpr(literal) => match literal.get_literal()? {
+            LuaLiteralToken::String(_) => Some(StaticArgKind::String),
+            LuaLiteralToken::Number(_) => Some(StaticArgKind::Number),
+            LuaLiteralToken::Bool(_) => Some(StaticArgKind::Boolean),
+            LuaLiteralToken::Nil(_) => Some(StaticArgKind::Nil),
+            LuaLiteralToken::Dots(_) | LuaLiteralToken::Question(_) => None,
+        },
+        LuaExpr::TableExpr(_) => Some(StaticArgKind::Table),
+        LuaExpr::ClosureExpr(_) => Some(StaticArgKind::Function),
+        _ => None,
+    }
+}
+
+fn static_arg_kind_matches_type(kind: StaticArgKind, param_type: &LuaType) -> StaticArgTypeMatch {
+    match param_type {
+        LuaType::Any | LuaType::Unknown => StaticArgTypeMatch::Unknown,
+        LuaType::String | LuaType::StringConst(_) | LuaType::DocStringConst(_) => {
+            match_bool(kind == StaticArgKind::String)
+        }
+        LuaType::Number
+        | LuaType::Integer
+        | LuaType::IntegerConst(_)
+        | LuaType::DocIntegerConst(_) => match_bool(kind == StaticArgKind::Number),
+        LuaType::Boolean | LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_) => {
+            match_bool(kind == StaticArgKind::Boolean)
+        }
+        LuaType::Table | LuaType::Object(_) | LuaType::TableConst(_) => {
+            match_bool(kind == StaticArgKind::Table)
+        }
+        LuaType::DocFunction(_) | LuaType::Signature(_) | LuaType::Function => {
+            match_bool(kind == StaticArgKind::Function)
+        }
+        LuaType::Nil => match_bool(kind == StaticArgKind::Nil),
+        LuaType::Union(union) => {
+            let mut saw_unknown = false;
+            for typ in union.into_vec() {
+                match static_arg_kind_matches_type(kind, &typ) {
+                    StaticArgTypeMatch::Match => return StaticArgTypeMatch::Match,
+                    StaticArgTypeMatch::Unknown => saw_unknown = true,
+                    StaticArgTypeMatch::Mismatch => {}
+                }
+            }
+            if saw_unknown {
+                StaticArgTypeMatch::Unknown
+            } else {
+                StaticArgTypeMatch::Mismatch
+            }
+        }
+        LuaType::MultiLineUnion(union) => {
+            let mut saw_unknown = false;
+            for (typ, _) in union.get_unions() {
+                match static_arg_kind_matches_type(kind, typ) {
+                    StaticArgTypeMatch::Match => return StaticArgTypeMatch::Match,
+                    StaticArgTypeMatch::Unknown => saw_unknown = true,
+                    StaticArgTypeMatch::Mismatch => {}
+                }
+            }
+            if saw_unknown {
+                StaticArgTypeMatch::Unknown
+            } else {
+                StaticArgTypeMatch::Mismatch
+            }
+        }
+        LuaType::TypeGuard(inner) => static_arg_kind_matches_type(kind, inner),
+        LuaType::TableOf(inner) => static_arg_kind_matches_type(kind, inner),
+        LuaType::Instance(instance) => static_arg_kind_matches_type(kind, instance.get_base()),
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            crate::db_index::VariadicType::Base(inner) => static_arg_kind_matches_type(kind, inner),
+            crate::db_index::VariadicType::Multi(types) => {
+                if types
+                    .iter()
+                    .any(|typ| static_arg_kind_matches_type(kind, typ) == StaticArgTypeMatch::Match)
+                {
+                    StaticArgTypeMatch::Match
+                } else {
+                    StaticArgTypeMatch::Unknown
+                }
+            }
+        },
+        _ => StaticArgTypeMatch::Unknown,
+    }
+}
+
+fn match_bool(matches: bool) -> StaticArgTypeMatch {
+    if matches {
+        StaticArgTypeMatch::Match
+    } else {
+        StaticArgTypeMatch::Mismatch
+    }
+}
+
+impl AnnotatedGmodGlobalCallRoleMap {
+    fn build(db: &DbIndex) -> Self {
+        let mut role_map = Self::default();
+        for (signature_id, signature) in db.get_signature_index().iter() {
+            if !signature.has_call_arg_roles() {
+                continue;
+            }
+            let Some(closure) = closure_from_signature_id(db, *signature_id) else {
+                continue;
+            };
+            role_map.add_signature_closure(db, *signature_id, &closure);
+        }
+        role_map.rebuild_candidate_call_path_set();
+
+        role_map
+    }
+
+    fn rebuild_candidate_call_path_set(&mut self) {
+        let mut call_paths = Vec::new();
+        self.candidate_call_path_kinds.clear();
+
+        for (call_path, roles) in &self.roles_by_path {
+            let presence = roles.candidate_presence();
+            if !presence.has_system
+                && !presence.has_net
+                && !presence.has_hook
+                && !presence.has_scripted_class
+            {
+                continue;
+            }
+
+            call_paths.push(call_path.as_str());
+            self.candidate_call_path_kinds.push(presence);
+        }
+
+        self.candidate_call_path_matcher = if call_paths.is_empty() {
+            None
+        } else {
+            AhoCorasick::new(call_paths).ok()
+        };
+    }
+
+    fn candidate_call_paths_in_content(&self, content: &str) -> AnnotatedGmodCandidatePresence {
+        let mut presence = AnnotatedGmodCandidatePresence::default();
+        let Some(matcher) = &self.candidate_call_path_matcher else {
+            return presence;
+        };
+
+        for mat in matcher.find_iter(content) {
+            let Some(candidate_presence) =
+                self.candidate_call_path_kinds.get(mat.pattern().as_usize())
+            else {
+                continue;
+            };
+
+            presence.has_system |= candidate_presence.has_system;
+            presence.has_net |= candidate_presence.has_net;
+            presence.has_hook |= candidate_presence.has_hook;
+            presence.has_scripted_class |= candidate_presence.has_scripted_class;
+
+            if presence.has_system
+                && presence.has_net
+                && presence.has_hook
+                && presence.has_scripted_class
+            {
+                break;
+            }
+        }
+
+        presence
+    }
+
+    fn add_signature_closure(
+        &mut self,
+        db: &DbIndex,
+        signature_id: LuaSignatureId,
+        closure: &LuaClosureExpr,
+    ) {
+        let Some(call_path) = global_call_path_for_signature_closure(db, signature_id, closure)
+        else {
+            return;
+        };
+        if let Some(roles) = roles_from_signature(db, signature_id) {
+            self.roles_by_path.insert(call_path.clone(), roles.clone());
+            if let Some(global_path) = call_path.strip_prefix("_G.") {
+                self.roles_by_path.insert(global_path.to_string(), roles);
+            }
+        }
+    }
+
+    fn get(&self, call_path: &str) -> Option<AnnotatedGmodCallRoles> {
+        self.roles_by_path
+            .get(call_path)
+            .or_else(|| {
+                call_path
+                    .strip_prefix("_G.")
+                    .and_then(|global_path| self.roles_by_path.get(global_path))
+            })
+            .cloned()
+    }
+
+    fn contains(&self, call_path: &str) -> bool {
+        self.roles_by_path.contains_key(call_path)
+            || call_path
+                .strip_prefix("_G.")
+                .is_some_and(|global_path| self.roles_by_path.contains_key(global_path))
+    }
+}
+
+impl<'a> AnnotatedGmodCallRoleMap<'a> {
+    fn build(
+        db: &DbIndex,
+        file_id: FileId,
+        root: &LuaChunk,
+        global_roles: &'a AnnotatedGmodGlobalCallRoleMap,
+    ) -> Self {
+        let mut role_map = Self {
+            global_roles,
+            local_roles_by_decl: HashMap::new(),
+            local_roles_by_path: HashMap::new(),
+            local_candidate_names: HashSet::new(),
+        };
+
+        for func_stat in root.descendants::<LuaFuncStat>() {
+            let Some(func_name) = func_stat.get_func_name() else {
+                continue;
+            };
+            let Some(root_name_expr) = var_expr_root_name(&func_name) else {
+                continue;
+            };
+            let Some(root_name) = root_name_expr.get_name_text() else {
+                continue;
+            };
+            let Some(root_decl) =
+                db.get_decl_index()
+                    .get_decl_tree(&file_id)
+                    .and_then(|decl_tree| {
+                        decl_tree.find_local_decl(&root_name, root_name_expr.get_position())
+                    })
+            else {
+                continue;
+            };
+            if !root_decl.is_local() {
+                continue;
+            }
+            let root_decl_id = root_decl.get_id();
+            let Some(closure) = func_stat.get_closure() else {
+                continue;
+            };
+            let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+            let Some(roles) = roles_from_signature(db, signature_id) else {
+                continue;
+            };
+            let Some(call_path) = func_name.get_access_path() else {
+                continue;
+            };
+            role_map.add_local_path_roles(root_decl_id, call_path, roles);
+        }
+
+        for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
+            let Some(name_token) = local_func_stat
+                .get_local_name()
+                .and_then(|local_name| local_name.get_name_token())
+            else {
+                continue;
+            };
+            let Some(closure) = local_func_stat.get_closure() else {
+                continue;
+            };
+            let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+            let Some(roles) = roles_from_signature(db, signature_id) else {
+                continue;
+            };
+            role_map.add_local_decl_roles(
+                LuaDeclId::new(file_id, name_token.get_range().start()),
+                name_token.get_name_text().to_string(),
+                roles,
+            );
+        }
+
+        role_map
+    }
+
+    fn add_local_decl_roles(
+        &mut self,
+        decl_id: LuaDeclId,
+        name: String,
+        roles: AnnotatedGmodCallRoles,
+    ) {
+        self.local_roles_by_decl.insert(decl_id, roles);
+        self.local_candidate_names.insert(name);
+    }
+
+    fn add_local_path_roles(
+        &mut self,
+        root_decl_id: LuaDeclId,
+        call_path: String,
+        roles: AnnotatedGmodCallRoles,
+    ) {
+        self.local_candidate_names.insert(call_path.clone());
+        self.local_roles_by_path
+            .insert((root_decl_id, call_path), roles);
+    }
+
+    fn system_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<GmodSystemCallSite> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.system_call_site())
+    }
+
+    fn hook_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(GmodHookKind, usize, Option<usize>)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| {
+                let (kind, param_idx, _) = roles.hook_roles.first()?;
+                Some((
+                    *kind,
+                    *param_idx,
+                    roles
+                        .hook_callback_roles
+                        .first()
+                        .and_then(|(callback_param_idx, _)| {
+                            param_idx_to_call_arg_idx(
+                                *callback_param_idx,
+                                call_expr.is_colon_call(),
+                                roles.is_colon_define,
+                            )
+                        }),
+                ))
+            })
+    }
+
+    fn vgui_panel_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(GmodScriptedClassCallKind, GmodVguiPanelCallRoles)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.vgui_panel_call(call_expr.is_colon_call()))
+    }
+
+    fn inheritance_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(GmodScriptedClassCallKind, GmodNamedStringCallRoles)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.inheritance_call(call_expr.is_colon_call()))
+    }
+
+    fn network_var_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(GmodScriptedClassCallKind, GmodNetworkVarCallRoles)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.network_var_call(call_expr.is_colon_call()))
+    }
+
+    fn derma_skin_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<GmodDermaSkinCallRoles> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.derma_skin_call_roles(call_expr.is_colon_call()))
+    }
+
+    fn roles_for_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<AnnotatedGmodCallRoles> {
+        if let Some(local_path_roles) =
+            annotated_roles_from_local_call_path(self, db, file_id, call_expr, call_path)
+        {
+            return local_path_roles.and_then(|roles| roles.select_for_call(call_expr));
+        }
+
+        if self.global_roles.contains(call_path) {
+            if let Some(local_roles) = annotated_roles_from_local_call_prefix(
+                self,
+                db,
+                file_id,
+                call_expr.get_prefix_expr(),
+            ) {
+                return local_roles.and_then(|roles| roles.select_for_call(call_expr));
+            }
+
+            if call_expr_has_shadowing_local_root(db, file_id, call_expr) {
+                return None;
+            }
+
+            return self
+                .global_roles
+                .get(call_path)
+                .and_then(|roles| roles.select_for_call(call_expr));
+        }
+
+        if !self.local_candidate_names.contains(call_path) {
+            return None;
+        }
+
+        annotated_roles_from_local_call_prefix(self, db, file_id, call_expr.get_prefix_expr())?
+            .and_then(|roles| roles.select_for_call(call_expr))
+    }
+}
+
+fn roles_from_signature(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+) -> Option<AnnotatedGmodCallRoles> {
+    let signature = db.get_signature_index().get(&signature_id)?;
+    if !signature.has_call_arg_roles() {
+        return None;
+    }
+
+    let mut roles = AnnotatedGmodCallRoles::from_signature_shape(signature);
+    for role in signature.call_arg_roles() {
+        roles.add_call_arg_role(&role);
+    }
+
+    for overload in &signature.overloads {
+        if overload.get_call_arg_roles().is_empty() {
+            continue;
+        }
+        let mut overload_roles = AnnotatedGmodCallRoles::from_function_shape(overload);
+        for role in overload.get_call_arg_roles() {
+            overload_roles.add_call_arg_role(role);
+        }
+        overload_roles.sort_roles();
+        if overload_roles.has_any_roles() {
+            roles.overloads.push(overload_roles);
+        }
+    }
+
+    roles.sort_roles();
+
+    (roles.has_any_roles() || !roles.overloads.is_empty()).then_some(roles)
+}
+
+fn closure_from_signature_id(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&signature_id.get_file_id())?
+        .get_red_root();
+    root.descendants()
+        .filter_map(LuaClosureExpr::cast)
+        .find(|closure| closure.get_position() == signature_id.get_position())
+}
+
+fn global_call_path_for_signature_closure(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<String> {
+    let file_id = signature_id.get_file_id();
+    if let Some(func_stat) = closure.get_parent::<LuaFuncStat>() {
+        let func_name = func_stat.get_func_name()?;
+        return var_expr_has_global_root(db, file_id, &func_name)
+            .then(|| func_name.get_access_path())?;
+    }
+
+    let assign_stat = closure.get_parent::<LuaAssignStat>()?;
+    let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+    let value_idx = value_exprs
+        .iter()
+        .position(|expr| expr.get_position() == closure.get_position())?;
+    let var_expr = vars.get(value_idx)?;
+    var_expr_has_global_root(db, file_id, var_expr).then(|| var_expr.get_access_path())?
+}
+
+fn var_expr_has_global_root(db: &DbIndex, file_id: FileId, var_expr: &LuaVarExpr) -> bool {
+    match var_expr {
+        LuaVarExpr::NameExpr(name_expr) => !name_expr_resolves_to_local(db, file_id, name_expr),
+        LuaVarExpr::IndexExpr(index_expr) => index_expr_root_name(index_expr)
+            .as_ref()
+            .is_none_or(|name_expr| !name_expr_resolves_to_local(db, file_id, name_expr)),
+    }
+}
+
+fn call_expr_has_shadowing_local_root(
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    match call_expr.get_prefix_expr() {
+        Some(LuaExpr::NameExpr(name_expr)) => {
+            name_expr_resolves_to_shadowing_local(db, file_id, &name_expr)
+        }
+        Some(LuaExpr::IndexExpr(index_expr)) => index_expr_root_name(&index_expr)
+            .as_ref()
+            .is_some_and(|name_expr| name_expr_resolves_to_shadowing_local(db, file_id, name_expr)),
+        _ => false,
+    }
+}
+
+fn index_expr_root_name(index_expr: &glua_parser::LuaIndexExpr) -> Option<LuaNameExpr> {
+    match index_expr.get_prefix_expr()? {
+        LuaExpr::NameExpr(name_expr) => Some(name_expr),
+        LuaExpr::IndexExpr(prefix_index_expr) => index_expr_root_name(&prefix_index_expr),
+        _ => None,
+    }
+}
+
+fn var_expr_root_name(var_expr: &LuaVarExpr) -> Option<LuaNameExpr> {
+    match var_expr {
+        LuaVarExpr::NameExpr(name_expr) => Some(name_expr.clone()),
+        LuaVarExpr::IndexExpr(index_expr) => index_expr_root_name(index_expr),
+    }
+}
+
+fn name_expr_resolves_to_local(db: &DbIndex, file_id: FileId, name_expr: &LuaNameExpr) -> bool {
+    name_expr_local_decl_id(db, file_id, name_expr).is_some()
+}
+
+fn name_expr_resolves_to_shadowing_local(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    let Some(decl_id) = name_expr_local_decl_id(db, file_id, name_expr) else {
+        return false;
+    };
+    let Some(name) = name_expr.get_name_text() else {
+        return true;
+    };
+    !local_decl_aliases_global_name(db, decl_id, &name)
+}
+
+fn name_expr_local_decl_id(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaDeclId> {
+    db.get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())
+        .filter(|decl_id| {
+            db.get_decl_index()
+                .get_decl(decl_id)
+                .is_some_and(|decl| decl.is_local())
+        })
+}
+
+fn local_decl_aliases_global_name(db: &DbIndex, decl_id: LuaDeclId, global_name: &str) -> bool {
+    let Some((ret_idx, initializer)) = local_decl_initializer_expr(db, decl_id) else {
+        return false;
+    };
+    if ret_idx != 0 {
+        return false;
+    }
+
+    match initializer {
+        LuaExpr::NameExpr(name_expr) => {
+            name_expr.get_name_text().as_deref() == Some(global_name)
+                && !name_expr_resolves_to_local(db, decl_id.file_id, &name_expr)
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            index_expr
+                .get_access_path()
+                .as_deref()
+                .and_then(|path| path.strip_prefix("_G."))
+                == Some(global_name)
+                && index_expr_root_name(&index_expr)
+                    .as_ref()
+                    .is_none_or(|root| !name_expr_resolves_to_local(db, decl_id.file_id, root))
+        }
+        _ => false,
+    }
+}
+
+fn local_decl_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)?
+        .get_red_root();
+    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
+}
+
+fn annotated_roles_from_local_call_prefix(
+    role_map: &AnnotatedGmodCallRoleMap,
+    db: &DbIndex,
+    file_id: FileId,
+    prefix_expr: Option<LuaExpr>,
+) -> Option<Option<AnnotatedGmodCallRoles>> {
+    let LuaExpr::NameExpr(name_expr) = prefix_expr? else {
+        return None;
+    };
+    annotated_roles_from_local_name_expr(role_map, db, file_id, &name_expr)
+}
+
+fn annotated_roles_from_local_call_path(
+    role_map: &AnnotatedGmodCallRoleMap,
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    call_path: &str,
+) -> Option<Option<AnnotatedGmodCallRoles>> {
+    let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let root_name_expr = index_expr_root_name(&index_expr)?;
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, root_name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !decl.is_local() {
+        return None;
+    }
+    if root_name_expr
+        .get_name_text()
+        .is_some_and(|root_name| local_decl_aliases_global_name(db, decl_id, &root_name))
+    {
+        return None;
+    }
+
+    Some(
+        role_map
+            .local_roles_by_path
+            .get(&(decl_id, call_path.to_string()))
+            .cloned(),
+    )
+}
+
+fn annotated_roles_from_local_name_expr(
+    role_map: &AnnotatedGmodCallRoleMap,
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> Option<Option<AnnotatedGmodCallRoles>> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !decl.is_local() {
+        return None;
+    }
+    if name_expr
+        .get_name_text()
+        .is_some_and(|name| local_decl_aliases_global_name(db, decl_id, &name))
+    {
+        return None;
+    }
+    if let Some(roles) = role_map.local_roles_by_decl.get(&decl_id) {
+        return Some(Some(roles.clone()));
+    }
+
+    let Some(signature_id) = signature_id_from_decl_value(db, decl_id) else {
+        return Some(None);
+    };
+    Some(roles_from_signature(db, signature_id))
+}
+
+fn signature_id_from_decl_value(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaSignatureId> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)?
+        .get_red_root();
+    let value_node = value_syntax_id.to_node_from_root(&root)?;
+    let closure = LuaClosureExpr::cast(value_node)?;
+    Some(LuaSignatureId::from_closure(decl_id.file_id, &closure))
+}
+
 fn collect_system_call_metadata(
     db: &mut DbIndex,
     file_id: FileId,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
     call_expr: LuaCallExpr,
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
-    let kind = classify_system_call_path(&call_path)?;
+    let call_site = annotated_roles.system_call(db, file_id, &call_expr, &call_path)?;
+    let kind = call_site.kind;
 
     match kind {
         GmodSystemCallKind::AddNetworkString => {
-            let (name, name_range) = extract_static_string_arg(call_expr.clone(), 0);
+            let name_arg_idx = call_site.name_arg_idx?;
+            let (name, name_range) = extract_static_string_arg(call_expr.clone(), name_arg_idx);
             db.get_gmod_infer_index_mut().add_net_message_registration(
                 file_id,
                 GmodNamedSiteMetadata {
@@ -3952,7 +5277,8 @@ fn collect_system_call_metadata(
             );
         }
         GmodSystemCallKind::NetStart => {
-            let (name, name_range) = extract_static_string_arg(call_expr.clone(), 0);
+            let name_arg_idx = call_site.name_arg_idx?;
+            let (name, name_range) = extract_static_string_arg(call_expr.clone(), name_arg_idx);
             db.get_gmod_infer_index_mut().add_net_start_site(
                 file_id,
                 GmodNamedSiteMetadata {
@@ -3963,8 +5289,16 @@ fn collect_system_call_metadata(
             );
         }
         GmodSystemCallKind::NetReceive => {
-            let (message_name, name_range) = extract_static_string_arg(call_expr.clone(), 0);
-            let callback = extract_callback_arg(call_expr.clone(), 1);
+            let name_arg_idx = call_site.name_arg_idx?;
+            let (message_name, name_range) =
+                extract_static_string_arg(call_expr.clone(), name_arg_idx);
+            let callback = call_site
+                .callback_arg_idx
+                .and_then(|arg_idx| extract_callback_arg(call_expr.clone(), arg_idx))
+                .or_else(|| extract_callback_arg(call_expr.clone(), name_arg_idx + 1))
+                .unwrap_or_else(|| {
+                    extract_first_callback_arg_after(call_expr.clone(), name_arg_idx)
+                });
             db.get_gmod_infer_index_mut().add_net_receive_site(
                 file_id,
                 GmodNetReceiveSiteMetadata {
@@ -3976,8 +5310,16 @@ fn collect_system_call_metadata(
             );
         }
         GmodSystemCallKind::ConcommandAdd => {
-            let (command_name, name_range) = extract_static_string_arg(call_expr.clone(), 0);
-            let callback = extract_callback_arg(call_expr.clone(), 1);
+            let name_arg_idx = call_site.name_arg_idx?;
+            let (command_name, name_range) =
+                extract_static_string_arg(call_expr.clone(), name_arg_idx);
+            let callback = call_site
+                .callback_arg_idx
+                .and_then(|arg_idx| extract_callback_arg(call_expr.clone(), arg_idx))
+                .or_else(|| extract_callback_arg(call_expr.clone(), name_arg_idx + 1))
+                .unwrap_or_else(|| {
+                    extract_first_callback_arg_after(call_expr.clone(), name_arg_idx)
+                });
             db.get_gmod_infer_index_mut().add_concommand_site(
                 file_id,
                 GmodConcommandSiteMetadata {
@@ -3989,7 +5331,9 @@ fn collect_system_call_metadata(
             );
         }
         GmodSystemCallKind::CreateConVar | GmodSystemCallKind::CreateClientConVar => {
-            let (convar_name, name_range) = extract_static_string_arg(call_expr.clone(), 0);
+            let name_arg_idx = call_site.name_arg_idx?;
+            let (convar_name, name_range) =
+                extract_static_string_arg(call_expr.clone(), name_arg_idx);
             db.get_gmod_infer_index_mut().add_convar_site(
                 file_id,
                 GmodConVarSiteMetadata {
@@ -4005,8 +5349,14 @@ fn collect_system_call_metadata(
             );
         }
         GmodSystemCallKind::TimerCreate => {
-            let (timer_name, name_range) = extract_static_string_arg(call_expr.clone(), 0);
-            let callback = extract_callback_arg(call_expr.clone(), 3);
+            let name_arg_idx = call_site.name_arg_idx?;
+            let (timer_name, name_range) =
+                extract_static_string_arg(call_expr.clone(), name_arg_idx);
+            let callback = call_site
+                .callback_arg_idx
+                .and_then(|arg_idx| extract_callback_arg(call_expr.clone(), arg_idx))
+                .or_else(|| extract_first_callback_arg_after_opt(call_expr.clone(), name_arg_idx))
+                .unwrap_or_default();
             db.get_gmod_infer_index_mut().add_timer_site(
                 file_id,
                 GmodTimerSiteMetadata {
@@ -4019,7 +5369,10 @@ fn collect_system_call_metadata(
             );
         }
         GmodSystemCallKind::TimerSimple => {
-            let callback = extract_callback_arg(call_expr.clone(), 1);
+            let callback = call_site
+                .callback_arg_idx
+                .and_then(|arg_idx| extract_callback_arg(call_expr.clone(), arg_idx))
+                .unwrap_or_default();
             db.get_gmod_infer_index_mut().add_timer_site(
                 file_id,
                 GmodTimerSiteMetadata {
@@ -4036,36 +5389,102 @@ fn collect_system_call_metadata(
     Some(())
 }
 
-fn classify_system_call_path(path: &str) -> Option<GmodSystemCallKind> {
-    if matches_call_path(path, "util.AddNetworkString") {
-        return Some(GmodSystemCallKind::AddNetworkString);
+fn collect_annotated_scripted_class_call_metadata(
+    db: &mut DbIndex,
+    file_id: FileId,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
+    call_expr: LuaCallExpr,
+) -> Option<()> {
+    let call_path = call_expr.get_access_path()?;
+
+    if let Some((kind, inheritance_roles)) =
+        annotated_roles.inheritance_call(db, file_id, &call_expr, &call_path)
+    {
+        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        db.get_gmod_class_metadata_index_mut().add_call(
+            file_id,
+            kind,
+            GmodScriptedClassCallMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                literal_args,
+                args,
+                inheritance_roles: Some(inheritance_roles),
+                network_var_roles: None,
+                vgui_panel_roles: None,
+                derma_skin_roles: None,
+            },
+        );
+        return Some(());
     }
-    if matches_call_path(path, "net.Start") {
-        return Some(GmodSystemCallKind::NetStart);
+
+    if let Some((kind, network_var_roles)) =
+        annotated_roles.network_var_call(db, file_id, &call_expr, &call_path)
+    {
+        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        db.get_gmod_class_metadata_index_mut().add_call(
+            file_id,
+            kind,
+            GmodScriptedClassCallMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                literal_args,
+                args,
+                inheritance_roles: None,
+                network_var_roles: Some(network_var_roles),
+                vgui_panel_roles: None,
+                derma_skin_roles: None,
+            },
+        );
+        return Some(());
     }
-    if matches_call_path(path, "net.Receive") {
-        return Some(GmodSystemCallKind::NetReceive);
+
+    if let Some((kind, vgui_panel_roles)) =
+        annotated_roles.vgui_panel_call(db, file_id, &call_expr, &call_path)
+    {
+        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        db.get_gmod_class_metadata_index_mut().add_call(
+            file_id,
+            kind,
+            GmodScriptedClassCallMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                literal_args,
+                args,
+                inheritance_roles: None,
+                network_var_roles: None,
+                vgui_panel_roles: Some(vgui_panel_roles),
+                derma_skin_roles: None,
+            },
+        );
+        return Some(());
     }
-    if matches_call_path(path, "concommand.Add") {
-        return Some(GmodSystemCallKind::ConcommandAdd);
+
+    if let Some(derma_skin_roles) =
+        annotated_roles.derma_skin_call(db, file_id, &call_expr, &call_path)
+    {
+        let (literal_args, args) = extract_gmod_class_call_args(&call_expr);
+        db.get_gmod_class_metadata_index_mut().add_call(
+            file_id,
+            GmodScriptedClassCallKind::DermaDefineSkin,
+            GmodScriptedClassCallMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                literal_args,
+                args,
+                inheritance_roles: None,
+                network_var_roles: None,
+                vgui_panel_roles: None,
+                derma_skin_roles: Some(derma_skin_roles),
+            },
+        );
+        return Some(());
     }
-    if matches_call_path(path, "CreateClientConVar") {
-        return Some(GmodSystemCallKind::CreateClientConVar);
-    }
-    if matches_call_path(path, "CreateConVar") {
-        return Some(GmodSystemCallKind::CreateConVar);
-    }
-    if matches_call_path(path, "timer.Create") {
-        return Some(GmodSystemCallKind::TimerCreate);
-    }
-    if matches_call_path(path, "timer.Simple") {
-        return Some(GmodSystemCallKind::TimerSimple);
-    }
+
     None
 }
 
-fn matches_call_path(path: &str, target: &str) -> bool {
-    path == target || path.ends_with(&format!(".{target}")) || path.ends_with(&format!(":{target}"))
+fn matches_configured_call_path(path: &str, target: &str) -> bool {
+    path == target
+        || path
+            .strip_suffix(target)
+            .is_some_and(|prefix| prefix.ends_with('.') || prefix.ends_with(':'))
 }
 
 fn extract_static_string_arg(
@@ -4093,34 +5512,128 @@ fn extract_static_string_arg(
     }
 }
 
-fn extract_callback_arg(call_expr: LuaCallExpr, arg_idx: usize) -> GmodCallbackSiteMetadata {
-    let Some(callback_expr) = call_expr
-        .get_args_list()
-        .and_then(|args| args.get_args().nth(arg_idx))
-    else {
-        return GmodCallbackSiteMetadata::default();
+fn extract_gmod_class_call_args(
+    call_expr: &LuaCallExpr,
+) -> (
+    Vec<Option<GmodClassCallLiteral>>,
+    Vec<crate::GmodClassCallArg>,
+) {
+    let Some(args_list) = call_expr.get_args_list() else {
+        return (Vec::new(), Vec::new());
     };
 
-    GmodCallbackSiteMetadata {
-        syntax_id: Some(callback_expr.get_syntax_id()),
-        callback_range: Some(callback_expr.get_range()),
+    let mut literal_args = Vec::new();
+    let mut args = Vec::new();
+    for arg_expr in args_list.get_args() {
+        let syntax_id = arg_expr.get_syntax_id();
+        let value = extract_gmod_class_literal_or_name(&arg_expr);
+        literal_args.push(value.clone());
+        args.push(crate::GmodClassCallArg { syntax_id, value });
+    }
+
+    (literal_args, args)
+}
+
+fn extract_gmod_class_literal_or_name(expr: &LuaExpr) -> Option<GmodClassCallLiteral> {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(string_token) => Some(GmodClassCallLiteral::String(
+                string_token.get_value().to_string(),
+            )),
+            LuaLiteralToken::Number(number_token) => match number_token.get_number_value() {
+                NumberResult::Int(value) => Some(GmodClassCallLiteral::Integer(value)),
+                NumberResult::Uint(value) => Some(GmodClassCallLiteral::Unsigned(value)),
+                NumberResult::Float(value) => Some(GmodClassCallLiteral::Float(value)),
+            },
+            LuaLiteralToken::Bool(boolean_token) => {
+                Some(GmodClassCallLiteral::Boolean(boolean_token.is_true()))
+            }
+            LuaLiteralToken::Nil(_) => Some(GmodClassCallLiteral::Nil),
+            _ => None,
+        },
+        LuaExpr::NameExpr(name_expr) => name_expr
+            .get_name_text()
+            .map(|name| GmodClassCallLiteral::NameRef(name.to_string())),
+        LuaExpr::ParenExpr(paren_expr) => {
+            let inner = paren_expr.get_expr()?;
+            extract_gmod_class_literal_or_name(&inner)
+        }
+        _ => None,
     }
 }
 
-fn collect_hook_call_site(db: &DbIndex, call_expr: LuaCallExpr) -> Option<GmodHookSiteMetadata> {
+fn extract_callback_arg(
+    call_expr: LuaCallExpr,
+    arg_idx: usize,
+) -> Option<GmodCallbackSiteMetadata> {
+    let callback_expr = call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().nth(arg_idx))?;
+
+    Some(GmodCallbackSiteMetadata {
+        syntax_id: Some(callback_expr.get_syntax_id()),
+        callback_range: Some(callback_expr.get_range()),
+    })
+}
+
+fn extract_first_callback_arg_after(
+    call_expr: LuaCallExpr,
+    arg_idx: usize,
+) -> GmodCallbackSiteMetadata {
+    extract_first_callback_arg_after_opt(call_expr, arg_idx).unwrap_or_default()
+}
+
+fn extract_first_callback_arg_after_opt(
+    call_expr: LuaCallExpr,
+    arg_idx: usize,
+) -> Option<GmodCallbackSiteMetadata> {
+    let args_list = call_expr.get_args_list()?;
+
+    args_list
+        .get_args()
+        .skip(arg_idx + 1)
+        .find(|arg_expr| matches!(arg_expr, LuaExpr::ClosureExpr(_)))
+        .map(|callback_expr| GmodCallbackSiteMetadata {
+            syntax_id: Some(callback_expr.get_syntax_id()),
+            callback_range: Some(callback_expr.get_range()),
+        })
+}
+
+fn collect_hook_call_site(
+    db: &DbIndex,
+    file_id: FileId,
+    annotated_roles: &AnnotatedGmodCallRoleMap,
+    call_expr: LuaCallExpr,
+) -> Option<GmodHookSiteMetadata> {
     let call_path = call_expr.get_access_path()?;
-    let mapped_hook = mapped_hook_for_emitter_call(db, &call_path, call_expr.clone());
-    let kind = mapped_hook
-        .as_ref()
-        .map(|_| GmodHookKind::Emit)
-        .or_else(|| classify_hook_call_path(&call_path))?;
-    let (hook_name, name_range, name_issue) = mapped_hook.unwrap_or_else(|| {
+    let has_shadowing_local_root = call_expr_has_shadowing_local_root(db, file_id, &call_expr);
+    let annotated_hook = annotated_roles.hook_call(db, file_id, &call_expr, &call_path);
+    let mapped_hook = if has_shadowing_local_root {
+        None
+    } else {
+        mapped_hook_for_emitter_call(db, &call_path, call_expr.clone())
+    };
+    let (kind, name_arg_idx, callback_arg_idx, mapped_hook_data) =
+        if let Some((kind, name_arg_idx, callback_arg_idx)) = annotated_hook {
+            (kind, name_arg_idx, callback_arg_idx, None)
+        } else if let Some(mapped_hook) = mapped_hook {
+            (GmodHookKind::Emit, 0, None, Some(mapped_hook))
+        } else {
+            return None;
+        };
+    let (hook_name, name_range, name_issue) = mapped_hook_data.unwrap_or_else(|| {
         extract_static_hook_name(
             call_expr
                 .get_args_list()
-                .and_then(|args| args.get_args().next()),
+                .and_then(|args| args.get_args().nth(name_arg_idx)),
         )
     });
+
+    let callback_arg_idx = if kind == GmodHookKind::Add {
+        callback_arg_idx.or_else(|| find_first_callback_arg_idx_after(&call_expr, name_arg_idx))
+    } else {
+        callback_arg_idx
+    };
 
     Some(GmodHookSiteMetadata {
         syntax_id: call_expr.get_syntax_id(),
@@ -4128,24 +5641,13 @@ fn collect_hook_call_site(db: &DbIndex, call_expr: LuaCallExpr) -> Option<GmodHo
         hook_name,
         name_range,
         name_issue,
+        callback_arg_idx,
         callback_params: if kind == GmodHookKind::Add {
-            extract_hook_callback_params_from_call(&call_expr)
+            extract_hook_callback_params_from_call(&call_expr, name_arg_idx, callback_arg_idx)
         } else {
             Vec::new()
         },
     })
-}
-
-fn classify_hook_call_path(path: &str) -> Option<GmodHookKind> {
-    if matches_call_path(path, "hook.Add") {
-        return Some(GmodHookKind::Add);
-    }
-
-    if matches_call_path(path, "hook.Run") || matches_call_path(path, "hook.Call") {
-        return Some(GmodHookKind::Emit);
-    }
-
-    None
 }
 
 fn mapped_hook_for_emitter_call(
@@ -4158,7 +5660,7 @@ fn mapped_hook_for_emitter_call(
     Option<GmodHookNameIssue>,
 )> {
     for (emitter_path, mapped_hook) in &db.get_emmyrc().gmod.hook_mappings.emitter_to_hook {
-        if !matches_call_path(call_path, emitter_path) {
+        if !matches_configured_call_path(call_path, emitter_path) {
             continue;
         }
 
@@ -4257,23 +5759,46 @@ fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<Gmod
         hook_name,
         name_range,
         name_issue,
+        callback_arg_idx: None,
         callback_params: extract_hook_callback_params_from_method(&func_stat),
     })
 }
 
-fn extract_hook_callback_params_from_call(call_expr: &LuaCallExpr) -> Vec<String> {
-    let Some(callback_expr) = call_expr
-        .get_args_list()
-        .and_then(|args| args.get_args().nth(2))
-    else {
+fn extract_hook_callback_params_from_call(
+    call_expr: &LuaCallExpr,
+    name_arg_idx: usize,
+    callback_arg_idx: Option<usize>,
+) -> Vec<String> {
+    let Some(args_list) = call_expr.get_args_list() else {
         return Vec::new();
     };
 
+    let callback_expr = if let Some(callback_arg_idx) = callback_arg_idx {
+        args_list.get_args().nth(callback_arg_idx)
+    } else {
+        args_list
+            .get_args()
+            .skip(name_arg_idx + 1)
+            .find(|arg_expr| matches!(arg_expr, LuaExpr::ClosureExpr(_)))
+    };
+    let Some(callback_expr) = callback_expr else {
+        return Vec::new();
+    };
     let LuaExpr::ClosureExpr(closure_expr) = callback_expr else {
         return Vec::new();
     };
 
     extract_param_names_from_closure(closure_expr)
+}
+
+fn find_first_callback_arg_idx_after(call_expr: &LuaCallExpr, arg_idx: usize) -> Option<usize> {
+    call_expr
+        .get_args_list()?
+        .get_args()
+        .enumerate()
+        .skip(arg_idx + 1)
+        .find(|(_, arg_expr)| matches!(arg_expr, LuaExpr::ClosureExpr(_)))
+        .map(|(idx, _)| idx)
 }
 
 fn extract_hook_callback_params_from_method(func_stat: &LuaFuncStat) -> Vec<String> {

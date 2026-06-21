@@ -62,14 +62,14 @@ fn check_duplicate_class(context: &mut DiagnosticContext, class_tag: LuaDocTagCl
             context.add_diagnostic(
                 DiagnosticCode::DuplicateType,
                 range,
-                t!("Duplicate class '%{name}', if this is intentional, please add the 'partial' attribute for every class define", name = name).to_string(),
+                format!("Duplicate class '{name}', if this is intentional, please add the 'partial' attribute for every class define", name = name).to_string(),
                 None,
             );
         } else if type_times > 0 && partial_times > 0 {
             context.add_diagnostic(
                 DiagnosticCode::DuplicateType,
                 range,
-                t!("Duplicate class '%{name}'. The class %{name} is defined as both partial and non-partial.", name = name).to_string(),
+                format!("Duplicate class '{name}'. The class {name} is defined as both partial and non-partial.", name = name).to_string(),
                 None,
             );
         }
@@ -77,8 +77,8 @@ fn check_duplicate_class(context: &mut DiagnosticContext, class_tag: LuaDocTagCl
             context.add_diagnostic(
                 DiagnosticCode::DuplicateType,
                 range,
-                t!(
-                    "Duplicate class constructor '%{name}'. constructor must have only one.",
+                format!(
+                    "Duplicate class constructor '{name}'. constructor must have only one.",
                     name = name
                 )
                 .to_string(),
@@ -119,14 +119,14 @@ fn check_duplicate_enum(context: &mut DiagnosticContext, enum_tag: LuaDocTagEnum
             context.add_diagnostic(
                 DiagnosticCode::DuplicateType,
                 range,
-                t!("Duplicate enum '%{name}', if this is intentional, please add the 'partial' attribute for every enum define", name = name).to_string(),
+                format!("Duplicate enum '{name}', if this is intentional, please add the 'partial' attribute for every enum define", name = name).to_string(),
                 None,
             );
         } else if type_times > 0 && partial_times > 0 {
             context.add_diagnostic(
                 DiagnosticCode::DuplicateType,
                 range,
-                t!("Duplicate enum '%{name}'. The enum %{name} is defined as both partial and non-partial.", name = name).to_string(),
+                format!("Duplicate enum '{name}'. The enum {name} is defined as both partial and non-partial.", name = name).to_string(),
                 None,
             );
         }
@@ -158,7 +158,7 @@ fn check_duplicate_alias(context: &mut DiagnosticContext, alias_tag: LuaDocTagAl
             context.add_diagnostic(
                 DiagnosticCode::DuplicateType,
                 range,
-                t!(
+                format!(
                     "Duplicate alias '{name}'. Alias definitions cannot be partial.",
                     name = name
                 )

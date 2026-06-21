@@ -1286,6 +1286,88 @@ mod tests {
         );
     }
 
+    /// A client-file helper class that stores a method *name* and later calls it
+    /// dynamically via `self.ent[self.onActivate](self.ent)` must not produce a
+    /// realm mismatch: everything involved lives in client files.
+    #[gtest]
+    fn test_no_mismatch_for_dynamic_string_keyed_method_call_in_client_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
+
+        ws.def_file("lua/autorun/sh_defs.lua", r#"---@class Entity"#);
+
+        // An unrelated server-only file that assigns entity members through a
+        // dynamic key. This must not be treated as a server-realm declaration
+        // for *other* dynamic-keyed calls elsewhere in the workspace.
+        ws.def_file(
+            "lua/entities/glide_standalone_turret.lua",
+            r#"
+                if not SERVER then return end
+
+                ---@param ent Entity
+                local function ApplyVars(ent, data)
+                    for k, v in pairs(data) do
+                        ent[k] = v
+                    end
+                end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/glide/client/ranged_feature.lua",
+            r#"
+                local RangedFeature = {}
+                RangedFeature.__index = RangedFeature
+
+                function CreateRangedFeature(ent)
+                    return setmetatable({
+                        ent = ent,
+                        isActive = false
+                    }, RangedFeature)
+                end
+
+                function RangedFeature:SetActivateCallback(callback)
+                    self.onActivate = callback
+                end
+
+                function RangedFeature:Activate()
+                    if self.onActivate then
+                        self.ent[self.onActivate](self.ent)
+                    end
+                end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        let heuristic_code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatchHeuristic
+                .get_name()
+                .to_string(),
+        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == mismatch_code || d.code == heuristic_code),
+            "Expected no realm mismatch for dynamic client-side method dispatch, got: {:?}",
+            diagnostics
+                .iter()
+                .filter(|d| d.code == mismatch_code || d.code == heuristic_code)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[gtest]
     fn test_disabled_when_gmod_off_even_if_diagnostic_enabled() {
         let mut ws = VirtualWorkspace::new();

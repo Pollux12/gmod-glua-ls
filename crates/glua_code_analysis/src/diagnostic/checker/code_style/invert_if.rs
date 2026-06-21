@@ -93,7 +93,7 @@ fn check_early_return_pattern(context: &mut DiagnosticContext, if_statement: &Lu
         context.add_diagnostic(
             DiagnosticCode::InvertIf,
             if_token.get_range(),
-            t!("Consider inverting 'if' statement to reduce nesting").to_string(),
+            "Consider inverting 'if' statement to reduce nesting".to_string(),
             None,
         );
     }

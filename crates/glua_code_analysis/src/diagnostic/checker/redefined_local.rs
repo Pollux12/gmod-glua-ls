@@ -45,7 +45,8 @@ impl Checker for RedefinedLocalChecker {
                 context.add_diagnostic(
                     DiagnosticCode::RedefinedLocal,
                     decl.get_range(),
-                    t!("Redefined local variable `%{name}`", name = decl.get_name()).to_string(),
+                    format!("Redefined local variable `{name}`", name = decl.get_name())
+                        .to_string(),
                     None,
                 );
             }

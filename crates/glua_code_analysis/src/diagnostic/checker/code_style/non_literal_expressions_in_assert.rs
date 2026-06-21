@@ -55,7 +55,7 @@ fn check_assert_rule(
         context.add_diagnostic(
             DiagnosticCode::NonLiteralExpressionsInAssert,
             range,
-            t!("codestyle.NonLiteralExpressionsInAssert").to_string(),
+            "Using an assert call with an expensive (non-literal) message expression may cause serious performance regressions.\nThe assert macro is only allowed if the error message is a fixed string literal.\nPlease refactor your code to separate the condition check and error handling.\n\nInstead of:\n  local a = assert(foo(), expensive_msg_expression)\n\nUse one of the following forms:\n  local a = foo()\n  if not a then\n    error(expensive_msg_expression)\n  end\n".to_string(),
             None,
         );
     }

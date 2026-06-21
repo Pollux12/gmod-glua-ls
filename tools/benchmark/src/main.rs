@@ -13,12 +13,6 @@ use glua_code_analysis::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Default paths — override with env vars
-const DEFAULT_LARGE_CODEBASE: &str =
-    r"A:\Misc\FearlessSRCDS\steamapps\common\GarrysModDS\garrysmod\gamemodes\cityrp";
-const DEFAULT_ANNOTATIONS: &str =
-    r"C:\Users\Pollux\Documents\glualangserver\emmylua-rust\glua-api-snippets\output";
-
 fn setup_logger() {
     let log_file =
         std::env::var("BENCH_LOG").unwrap_or_else(|_| "benchmark_profile.log".to_string());
@@ -76,10 +70,14 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
 async fn main() {
     setup_logger();
 
-    let large_codebase =
-        std::env::var("BENCH_CODEBASE").unwrap_or_else(|_| DEFAULT_LARGE_CODEBASE.to_string());
-    let annotations =
-        std::env::var("BENCH_ANNOTATIONS").unwrap_or_else(|_| DEFAULT_ANNOTATIONS.to_string());
+    let large_codebase = std::env::var("BENCH_CODEBASE").unwrap_or_else(|_| {
+        eprintln!("ERROR: BENCH_CODEBASE env var is required");
+        std::process::exit(1);
+    });
+    let annotations = std::env::var("BENCH_ANNOTATIONS").unwrap_or_else(|_| {
+        eprintln!("ERROR: BENCH_ANNOTATIONS env var is required");
+        std::process::exit(1);
+    });
 
     let large_path = PathBuf::from(&large_codebase);
     let annotations_path = PathBuf::from(&annotations);
@@ -124,7 +122,7 @@ async fn main() {
     let t = Instant::now();
     let mut analysis = EmmyLuaAnalysis::new();
     analysis.update_config(Arc::new(emmyrc.clone()));
-    analysis.init_std_lib(None);
+    analysis.init_std_lib();
 
     // Add annotations as library workspace
     analysis.add_library_workspace(annotations_path.clone());
@@ -197,15 +195,26 @@ async fn main() {
     // Precompute shared diagnostic data once (avoids per-file workspace-wide scans)
     let shared_data = analysis.precompute_diagnostic_shared_data();
 
-    let parallelism = std::env::var("BENCH_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(16)
-        });
+    let parallelism = match std::env::var("BENCH_THREADS") {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                eprintln!(
+                    "ERROR: BENCH_THREADS must be a positive integer, got: {}",
+                    val
+                );
+                std::process::exit(1);
+            }
+            Err(_) => {
+                eprintln!("ERROR: BENCH_THREADS is not a valid integer: {}", val);
+                std::process::exit(1);
+            }
+        },
+        Err(_) => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16),
+    };
     eprintln!(
         "Diagnostics: {} files, {} threads",
         diag_file_count, parallelism

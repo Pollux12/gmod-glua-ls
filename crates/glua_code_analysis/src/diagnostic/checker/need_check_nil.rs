@@ -107,14 +107,14 @@ fn check_call_expr(
             context.add_diagnostic(
                 DiagnosticCode::UncheckedNilAccess,
                 prefix.get_range(),
-                t!("%{name} may be nil", name = prefix.syntax().text()).to_string(),
+                format!("{name} may be nil", name = prefix.syntax().text()).to_string(),
                 None,
             );
         } else if !should_skip_deferred_nullable_function_call(&call_expr, &prefix) {
             context.add_diagnostic(
                 DiagnosticCode::NeedCheckNil,
                 prefix.get_range(),
-                t!("function %{name} may be nil", name = prefix.syntax().text()).to_string(),
+                format!("function {name} may be nil", name = prefix.syntax().text()).to_string(),
                 None,
             );
         }
@@ -158,7 +158,7 @@ fn report_unsafe_receiver(
         context.add_diagnostic(
             diagnostic_code,
             receiver.get_range(),
-            t!("%{name} may be nil", name = receiver.syntax().text()).to_string(),
+            format!("{name} may be nil", name = receiver.syntax().text()).to_string(),
             None,
         );
         return true;
@@ -175,8 +175,8 @@ fn report_unsafe_receiver(
     context.add_diagnostic(
         DiagnosticCode::NeedCheckNil,
         receiver.get_range(),
-        t!(
-            "%{name} may be NULL; check IsValid before calling Entity methods",
+        format!(
+            "{name} may be NULL; check IsValid before calling Entity methods",
             name = receiver.syntax().text()
         )
         .to_string(),
@@ -237,7 +237,7 @@ fn check_index_expr(
         context.add_diagnostic(
             diagnostic_code,
             prefix.get_range(),
-            t!("%{name} may be nil", name = prefix.syntax().text()).to_string(),
+            format!("{name} may be nil", name = prefix.syntax().text()).to_string(),
             None,
         );
     }
@@ -690,8 +690,8 @@ fn check_binary_expr(
             context.add_diagnostic(
                 DiagnosticCode::GmodNullCheck,
                 binary_expr.get_range(),
-                t!(
-                    "%{name} may be NULL; comparing to nil does not prove entity validity, use IsValid(...) instead",
+                format!(
+                    "{name} may be NULL; comparing to nil does not prove entity validity, use IsValid(...) instead",
                     name = non_nil_side.syntax().text()
                 )
                 .to_string(),
@@ -715,7 +715,7 @@ fn check_binary_expr(
             context.add_diagnostic(
                 DiagnosticCode::NeedCheckNil,
                 left.get_range(),
-                t!("%{name} value may be nil", name = left.syntax().text()).to_string(),
+                format!("{name} value may be nil", name = left.syntax().text()).to_string(),
                 None,
             );
         }
@@ -725,7 +725,7 @@ fn check_binary_expr(
             context.add_diagnostic(
                 DiagnosticCode::NeedCheckNil,
                 right.get_range(),
-                t!("%{name} value may be nil", name = right.syntax().text()).to_string(),
+                format!("{name} value may be nil", name = right.syntax().text()).to_string(),
                 None,
             );
         }
@@ -769,8 +769,8 @@ fn check_condition_expr(
                 context.add_diagnostic(
                     DiagnosticCode::GmodNullCheck,
                     expr.get_range(),
-                    t!(
-                        "%{name} may be NULL; NULL is truthy, use IsValid(...) to check entity validity",
+                    format!(
+                        "{name} may be NULL; NULL is truthy, use IsValid(...) to check entity validity",
                         name = expr.syntax().text()
                     )
                     .to_string(),

@@ -1,6 +1,6 @@
 mod condition_flow;
 mod get_type_at_cast_flow;
-mod get_type_at_flow;
+pub mod get_type_at_flow;
 mod narrow_type;
 mod var_ref_id;
 
@@ -15,6 +15,9 @@ use crate::{
     },
 };
 pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
+pub use get_type_at_flow::{
+    explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
+};
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
 pub use narrow_type::{narrow_down_type, narrow_false_or_nil, remove_false_or_nil};
 pub use var_ref_id::{SelfRefId, VarRefId, VarRefRootId, get_var_expr_var_ref_id};

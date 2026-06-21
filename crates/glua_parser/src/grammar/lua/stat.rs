@@ -14,7 +14,7 @@ use super::{
 /// Push expression parsing error with lazy error message generation
 fn push_expr_error_lazy<F>(p: &mut LuaParser, error_msg_fn: F)
 where
-    F: FnOnce() -> std::borrow::Cow<'static, str>,
+    F: FnOnce() -> String,
 {
     let error_msg = error_msg_fn();
     p.push_error(LuaParseError::syntax_error_from(
@@ -30,7 +30,7 @@ fn expect_keyword_with_recovery<F>(
     error_msg_fn: F,
 ) -> bool
 where
-    F: FnOnce() -> std::borrow::Cow<'static, str>,
+    F: FnOnce() -> String,
 {
     if p.current_token() == expected {
         p.bump();
@@ -50,7 +50,7 @@ where
 /// Expect 'end' keyword, report error at start keyword location if missing
 fn expect_end_keyword<F>(p: &mut LuaParser, start_range: crate::text::SourceRange, error_msg_fn: F)
 where
-    F: FnOnce() -> std::borrow::Cow<'static, str>,
+    F: FnOnce() -> String,
 {
     if p.current_token() == LuaTokenKind::TkEnd {
         p.bump();
@@ -148,7 +148,7 @@ fn parse_variable_name_list(p: &mut LuaParser, support_attrib: bool) -> ParseRes
             Ok(_) => {}
             Err(_) => {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected variable name after ','"),
+                    "expected variable name after ','",
                     p.current_token_range(),
                 ));
             }
@@ -231,14 +231,14 @@ fn parse_if(p: &mut LuaParser) -> ParseResult {
 
     // Parse condition expression
     if parse_expr(p).is_err() {
-        push_expr_error_lazy(p, || t!("expected condition expression after 'if'"));
+        push_expr_error_lazy(p, || "expected condition expression after 'if'".to_string());
         // 尝试恢复到 'then' 或语句开始
         recover_to_keywords(p, &[LuaTokenKind::TkThen, LuaTokenKind::TkEnd]);
     }
 
     // Expect 'then'
     if !expect_keyword_with_recovery(p, LuaTokenKind::TkThen, || {
-        t!("expected 'then' after if condition")
+        "expected 'then' after if condition".to_string()
     }) {
         // 如果没有找到 'then'，尝试恢复
         recover_to_keywords(
@@ -269,7 +269,7 @@ fn parse_if(p: &mut LuaParser) -> ParseResult {
 
     // Use new end expectation function to associate error with 'if' keyword
     expect_end_keyword(p, if_start_range, || {
-        t!("expected 'end' to close if statement")
+        "expected 'end' to close if statement".to_string()
     });
 
     if_token_bump(p, LuaTokenKind::TkSemicolon);
@@ -281,11 +281,13 @@ fn parse_elseif_clause(p: &mut LuaParser) -> ParseResult {
     p.bump();
 
     if parse_expr(p).is_err() {
-        push_expr_error_lazy(p, || t!("expected condition expression after 'elseif'"));
+        push_expr_error_lazy(p, || {
+            "expected condition expression after 'elseif'".to_string()
+        });
     }
 
     expect_keyword_with_recovery(p, LuaTokenKind::TkThen, || {
-        t!("expected 'then' after 'elseif' condition")
+        "expected 'then' after 'elseif' condition".to_string()
     });
 
     parse_block(p)?;
@@ -308,13 +310,15 @@ fn parse_while(p: &mut LuaParser) -> ParseResult {
 
     // Parse condition expression
     if parse_expr(p).is_err() {
-        push_expr_error_lazy(p, || t!("expected condition expression after 'while'"));
+        push_expr_error_lazy(p, || {
+            "expected condition expression after 'while'".to_string()
+        });
         recover_to_keywords(p, &[LuaTokenKind::TkDo, LuaTokenKind::TkEnd]);
     }
 
     // Expect 'do'
     if !expect_keyword_with_recovery(p, LuaTokenKind::TkDo, || {
-        t!("expected 'do' after while condition")
+        "expected 'do' after while condition".to_string()
     }) {
         recover_to_keywords(p, &[LuaTokenKind::TkEnd]);
     }
@@ -326,7 +330,7 @@ fn parse_while(p: &mut LuaParser) -> ParseResult {
 
     // Use new end expectation function to associate error with 'while' keyword
     expect_end_keyword(p, while_start_range, || {
-        t!("expected 'end' to close while statement")
+        "expected 'end' to close while statement".to_string()
     });
 
     if_token_bump(p, LuaTokenKind::TkSemicolon);
@@ -340,7 +344,9 @@ fn parse_do(p: &mut LuaParser) -> ParseResult {
 
     parse_block(p)?;
 
-    expect_end_keyword(p, do_start_range, || t!("expected 'end' after 'do' block"));
+    expect_end_keyword(p, do_start_range, || {
+        "expected 'end' after 'do' block".to_string()
+    });
 
     if_token_bump(p, LuaTokenKind::TkSemicolon);
     Ok(m.complete(p))
@@ -356,7 +362,7 @@ fn parse_for(p: &mut LuaParser) -> ParseResult {
         p.bump();
     } else {
         p.push_error(LuaParseError::syntax_error_from(
-            &t!("expected variable name after 'for'"),
+            "expected variable name after 'for'",
             p.current_token_range(),
         ));
         // Try to recover: skip to '=' or 'in'
@@ -379,7 +385,7 @@ fn parse_for(p: &mut LuaParser) -> ParseResult {
             // Start value
             if parse_expr(p).is_err() {
                 push_expr_error_lazy(p, || {
-                    t!("expected start value expression in numeric for loop")
+                    "expected start value expression in numeric for loop".to_string()
                 });
             }
 
@@ -387,7 +393,7 @@ fn parse_for(p: &mut LuaParser) -> ParseResult {
                 p.bump();
             } else {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected ',' after start value in numeric for loop"),
+                    "expected ',' after start value in numeric for loop",
                     p.current_token_range(),
                 ));
             }
@@ -395,7 +401,7 @@ fn parse_for(p: &mut LuaParser) -> ParseResult {
             // End value
             if parse_expr(p).is_err() {
                 push_expr_error_lazy(p, || {
-                    t!("expected end value expression in numeric for loop")
+                    "expected end value expression in numeric for loop".to_string()
                 });
             }
 
@@ -404,7 +410,7 @@ fn parse_for(p: &mut LuaParser) -> ParseResult {
                 p.bump();
                 if parse_expr(p).is_err() {
                     push_expr_error_lazy(p, || {
-                        t!("expected step value expression in numeric for loop")
+                        "expected step value expression in numeric for loop".to_string()
                     });
                 }
             }
@@ -418,7 +424,7 @@ fn parse_for(p: &mut LuaParser) -> ParseResult {
                     p.bump();
                 } else {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected variable name after ','"),
+                        "expected variable name after ','",
                         p.current_token_range(),
                     ));
                 }
@@ -428,19 +434,19 @@ fn parse_for(p: &mut LuaParser) -> ParseResult {
                 p.bump();
             } else {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected 'in' after variable list in generic for loop"),
+                    "expected 'in' after variable list in generic for loop",
                     p.current_token_range(),
                 ));
             }
 
             // Iterator expression list
             if parse_expr_list_impl(p).is_err() {
-                push_expr_error_lazy(p, || t!("expected iterator expression after 'in'"));
+                push_expr_error_lazy(p, || "expected iterator expression after 'in'".to_string());
             }
         }
         _ => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected '=' for numeric for loop or ',' or 'in' for generic for loop"),
+                "expected '=' for numeric for loop or ',' or 'in' for generic for loop",
                 p.current_token_range(),
             ));
         }
@@ -448,7 +454,7 @@ fn parse_for(p: &mut LuaParser) -> ParseResult {
 
     // Expect 'do'
     if !expect_keyword_with_recovery(p, LuaTokenKind::TkDo, || {
-        t!("expected 'do' in for statement")
+        "expected 'do' in for statement".to_string()
     }) {
         recover_to_keywords(p, &[LuaTokenKind::TkEnd]);
     }
@@ -459,7 +465,7 @@ fn parse_for(p: &mut LuaParser) -> ParseResult {
     }
 
     expect_end_keyword(p, for_start_range, || {
-        t!("expected 'end' to close for statement")
+        "expected 'end' to close for statement".to_string()
     });
 
     if_token_bump(p, LuaTokenKind::TkSemicolon);
@@ -481,7 +487,7 @@ fn parse_func_name(p: &mut LuaParser) -> ParseResult {
         Ok(_) => {}
         Err(_) => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected function name after 'function'"),
+                "expected function name after 'function'",
                 p.current_token_range(),
             ));
             return Err(ParseFailReason::UnexpectedToken);
@@ -498,7 +504,7 @@ fn parse_func_name(p: &mut LuaParser) -> ParseResult {
                     Ok(_) => {}
                     Err(_) => {
                         p.push_error(LuaParseError::syntax_error_from(
-                            &t!("expected name after '.'"),
+                            "expected name after '.'",
                             p.current_token_range(),
                         ));
                     }
@@ -513,7 +519,7 @@ fn parse_func_name(p: &mut LuaParser) -> ParseResult {
                     Ok(_) => {}
                     Err(_) => {
                         p.push_error(LuaParseError::syntax_error_from(
-                            &t!("expected name after ':'"),
+                            "expected name after ':'",
                             p.current_token_range(),
                         ));
                     }
@@ -542,7 +548,7 @@ fn parse_local(p: &mut LuaParser) -> ParseResult {
                 Ok(_) => {}
                 Err(_) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("expected function name after 'local function'"),
+                        "expected function name after 'local function'",
                         p.current_token_range(),
                     ));
                 }
@@ -552,7 +558,7 @@ fn parse_local(p: &mut LuaParser) -> ParseResult {
                 Ok(_) => {}
                 Err(_) => {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!("invalid function definition"),
+                        "invalid function definition",
                         p.current_token_range(),
                     ));
                 }
@@ -565,13 +571,15 @@ fn parse_local(p: &mut LuaParser) -> ParseResult {
             if p.current_token().is_assign_op() {
                 p.bump();
                 if parse_expr_list_impl(p).is_err() {
-                    push_expr_error_lazy(p, || t!("expected initialization expression after '='"));
+                    push_expr_error_lazy(p, || {
+                        "expected initialization expression after '='".to_string()
+                    });
                 }
             }
         }
         _ => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected 'function' or variable name after 'local'"),
+                "expected 'function' or variable name after 'local'",
                 p.current_token_range(),
             ));
 
@@ -589,7 +597,7 @@ fn parse_local_name(p: &mut LuaParser, support_attrib: bool) -> ParseResult {
         Ok(_) => {}
         Err(_) => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected variable name after 'local'"),
+                "expected variable name after 'local'",
                 p.current_token_range(),
             ));
         }
@@ -609,7 +617,7 @@ fn parse_attrib(p: &mut LuaParser) -> ParseResult {
         Ok(_) => {}
         Err(_) => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected attribute name after '<'"),
+                "expected attribute name after '<'",
                 p.current_token_range(),
             ));
         }
@@ -618,16 +626,16 @@ fn parse_attrib(p: &mut LuaParser) -> ParseResult {
         Ok(_) => {}
         Err(_) => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected '>' after attribute name"),
+                "expected '>' after attribute name",
                 p.current_token_range(),
             ));
         }
     }
     if !p.parse_config.support_local_attrib() {
         p.errors.push(LuaParseError::syntax_error_from(
-            &t!(
-                "local attribute is not supported for current version: %{level}",
-                level = p.parse_config.level
+            &format!(
+                "local attribute is not supported for current version: {}",
+                p.parse_config.level
             ),
             range,
         ));
@@ -643,7 +651,7 @@ fn parse_return(p: &mut LuaParser) -> ParseResult {
         && p.current_token() != LuaTokenKind::TkSemicolon
         && parse_expr_list_impl(p).is_err()
     {
-        push_expr_error_lazy(p, || t!("expected expression in return statement"));
+        push_expr_error_lazy(p, || "expected expression in return statement".to_string());
     }
 
     if_token_bump(p, LuaTokenKind::TkSemicolon);
@@ -665,13 +673,15 @@ fn parse_repeat(p: &mut LuaParser) -> ParseResult {
         Ok(_) => {}
         Err(_) => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected 'until' after repeat block"),
+                "expected 'until' after repeat block",
                 p.current_token_range(),
             ));
         }
     }
     if parse_expr(p).is_err() {
-        push_expr_error_lazy(p, || t!("expected condition expression after 'until'"));
+        push_expr_error_lazy(p, || {
+            "expected condition expression after 'until'".to_string()
+        });
     }
     if_token_bump(p, LuaTokenKind::TkSemicolon);
     Ok(m.complete(p))
@@ -684,7 +694,7 @@ fn parse_goto(p: &mut LuaParser) -> ParseResult {
         Ok(_) => {}
         Err(_) => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected label name after 'goto'"),
+                "expected label name after 'goto'",
                 p.current_token_range(),
             ));
         }
@@ -708,7 +718,7 @@ fn parse_assign_or_expr_or_global_stat(p: &mut LuaParser) -> ParseResult {
         Ok(cm) => cm,
         Err(err) => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected expression in assignment or statement"),
+                "expected expression in assignment or statement",
                 range,
             ));
             return Err(err);
@@ -733,7 +743,7 @@ fn parse_assign_or_expr_or_global_stat(p: &mut LuaParser) -> ParseResult {
     // 验证左值
     if !matches!(cm.kind, LuaSyntaxKind::NameExpr | LuaSyntaxKind::IndexExpr) {
         p.push_error(LuaParseError::syntax_error_from(
-            &t!("invalid left-hand side in assignment (expected variable or table index)"),
+            "invalid left-hand side in assignment (expected variable or table index)",
             range,
         ));
 
@@ -750,9 +760,7 @@ fn parse_assign_or_expr_or_global_stat(p: &mut LuaParser) -> ParseResult {
                     LuaSyntaxKind::NameExpr | LuaSyntaxKind::IndexExpr
                 ) {
                     p.push_error(LuaParseError::syntax_error_from(
-                        &t!(
-                            "invalid left-hand side in assignment (expected variable or table index)"
-                        ),
+                        "invalid left-hand side in assignment (expected variable or table index)",
                         p.current_token_range(),
                     ));
                     return Err(ParseFailReason::UnexpectedToken);
@@ -760,7 +768,7 @@ fn parse_assign_or_expr_or_global_stat(p: &mut LuaParser) -> ParseResult {
             }
             Err(_) => {
                 p.push_error(LuaParseError::syntax_error_from(
-                    &t!("expected variable after ',' in assignment"),
+                    "expected variable after ',' in assignment",
                     p.current_token_range(),
                 ));
             }
@@ -773,11 +781,13 @@ fn parse_assign_or_expr_or_global_stat(p: &mut LuaParser) -> ParseResult {
 
         // 解析右值表达式列表
         if parse_expr_list_impl(p).is_err() {
-            push_expr_error_lazy(p, || t!("expected expression after '=' in assignment"));
+            push_expr_error_lazy(p, || {
+                "expected expression after '=' in assignment".to_string()
+            });
         }
     } else {
         p.push_error(LuaParseError::syntax_error_from(
-            &t!("expected '=' for assignment or this is an incomplete statement"),
+            "expected '=' for assignment or this is an incomplete statement",
             p.previous_token_range(),
         ));
 
@@ -795,7 +805,7 @@ fn parse_label_stat(p: &mut LuaParser) -> ParseResult {
         Ok(_) => {}
         Err(_) => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected label name after 'goto'"),
+                "expected label name after 'goto'",
                 p.current_token_range(),
             ));
         }
@@ -804,7 +814,7 @@ fn parse_label_stat(p: &mut LuaParser) -> ParseResult {
         Ok(_) => {}
         Err(_) => {
             p.push_error(LuaParseError::syntax_error_from(
-                &t!("expected '::' after label name"),
+                "expected '::' after label name",
                 p.current_token_range(),
             ));
         }

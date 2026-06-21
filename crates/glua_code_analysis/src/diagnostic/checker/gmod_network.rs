@@ -133,8 +133,8 @@ fn check_read_write_mismatch(
                     (
                         DiagnosticCode::GmodNetReadWriteOrderMismatch,
                         receive_flow.receive_range,
-                        t!(
-                            "Read/write structure mismatch for `%{name}`: writer and receiver flows cannot be aligned.",
+                        format!(
+                            "Read/write structure mismatch for `{name}`: writer and receiver flows cannot be aligned.",
                             name = receive_flow.message_name,
                         )
                         .to_string(),
@@ -283,8 +283,8 @@ fn check_missing_send_counterpart(
         context.add_diagnostic(
             DiagnosticCode::GmodNetMissingNetworkCounterpart,
             send_flow.start_range,
-            t!(
-                "No `net.Receive` counterpart found for `%{name}` in %{realm} realm.",
+            format!(
+                "No `net.Receive` counterpart found for `{name}` in {realm} realm.",
                 name = send_flow.message_name,
                 realm = realm_label(expected_realm),
             )
@@ -324,8 +324,8 @@ fn check_missing_receive_counterpart(
         context.add_diagnostic(
             DiagnosticCode::GmodNetMissingNetworkCounterpart,
             receive_flow.receive_range,
-            t!(
-                "No sending counterpart found for `%{name}` from %{realm} realm.",
+            format!(
+                "No sending counterpart found for `{name}` from {realm} realm.",
                 name = receive_flow.message_name,
                 realm = realm_label(expected_sender_realm),
             )
@@ -351,8 +351,8 @@ fn first_mismatch_diagnostic(
         return Some((
             DiagnosticCode::GmodNetReadWriteOrderMismatch,
             receive_flow.receive_range,
-            t!(
-                "Read/write count mismatch for `%{name}`: writer has %{write_count} values, receiver reads %{read_count} values.",
+            format!(
+                "Read/write count mismatch for `{name}`: writer has {write_count} values, receiver reads {read_count} values.",
                 name = receive_flow.message_name,
                 write_count = send_flow.writes.len(),
                 read_count = receive_flow.reads.len(),
@@ -376,8 +376,8 @@ fn first_mismatch_diagnostic(
             return Some((
                 DiagnosticCode::GmodNetReadWriteOrderMismatch,
                 receive_flow.receive_range,
-                t!(
-                    "Read/write order mismatch for `%{name}` at position %{position}: expected `%{expected}`, got `%{actual}`.",
+                format!(
+                    "Read/write order mismatch for `{name}` at position {position}: expected `{expected}`, got `{actual}`.",
                     name = receive_flow.message_name,
                     position = index + 1,
                     expected = expected_read_kind.to_fn_name(),
@@ -390,8 +390,8 @@ fn first_mismatch_diagnostic(
         return Some((
             DiagnosticCode::GmodNetReadWriteTypeMismatch,
             receive_flow.receive_range,
-            t!(
-                "Read/write type mismatch for `%{name}` at position %{position}: expected `%{expected}`, got `%{actual}`.",
+            format!(
+                "Read/write type mismatch for `{name}` at position {position}: expected `{expected}`, got `{actual}`.",
                 name = receive_flow.message_name,
                 position = index + 1,
                 expected = expected_read_kind.to_fn_name(),
@@ -525,8 +525,8 @@ fn check_bits_mismatch(
                 context.add_diagnostic(
                     DiagnosticCode::GmodNetReadWriteBitsMismatch,
                     receive_flow.receive_range,
-                    t!(
-                        "Bit-width mismatch for `%{name}` at position %{position}: writer uses `%{op}(%{expected})`, reader uses `%{rop}(%{actual})`.",
+                    format!(
+                        "Bit-width mismatch for `{name}` at position {position}: writer uses `{op}({expected})`, reader uses `{rop}({actual})`.",
                         name = receive_flow.message_name,
                         position = index + 1,
                         op = write.kind.to_fn_name(),

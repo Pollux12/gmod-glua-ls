@@ -27,7 +27,7 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
                 analyzer.file_id,
                 AnalyzeError {
                     kind: DiagnosticCode::AnnotationUsageError,
-                    message: t!("`@field` must be used under a `@class`").to_string(),
+                    message: "`@field` must be used under a `@class`".to_string(),
                     range: tag.get_range(),
                 },
             );

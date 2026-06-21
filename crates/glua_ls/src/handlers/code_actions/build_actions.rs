@@ -92,11 +92,10 @@ fn add_disable_code_action(
     }
 
     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-        title: t!(
-            "Disable current line diagnostic (%{name})",
+        title: format!(
+            "Disable current line diagnostic ({name})",
             name = diagnostic_code.get_name()
-        )
-        .to_string(),
+        ),
         kind: Some(CodeActionKind::QUICKFIX),
         edit: Some(WorkspaceEdit {
             changes: build_disable_next_line_changes(semantic_model, range.start, diagnostic_code),
@@ -106,11 +105,10 @@ fn add_disable_code_action(
     }));
 
     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-        title: t!(
-            "Disable all diagnostics in current file (%{name})",
+        title: format!(
+            "Disable all diagnostics in current file ({name})",
             name = diagnostic_code.get_name()
-        )
-        .to_string(),
+        ),
         kind: Some(CodeActionKind::QUICKFIX),
         edit: Some(WorkspaceEdit {
             changes: build_disable_file_changes(semantic_model, diagnostic_code),
@@ -120,15 +118,14 @@ fn add_disable_code_action(
     }));
 
     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-        title: t!(
-            "Disable all diagnostics in current project (%{name})",
+        title: format!(
+            "Disable all diagnostics in current project ({name})",
             name = diagnostic_code.get_name()
-        )
-        .to_string(),
+        ),
         kind: Some(CodeActionKind::QUICKFIX),
         command: Some(make_disable_code_command(
-            t!(
-                "Disable all diagnostics in current project (%{name})",
+            format!(
+                "Disable all diagnostics in current project ({name})",
                 name = diagnostic_code.get_name()
             )
             .as_ref(),

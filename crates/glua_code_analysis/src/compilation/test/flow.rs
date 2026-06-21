@@ -3956,6 +3956,239 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_elseif_type_guard_narrows_after_previous_type_guard_false_branch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
+        ws.def(
+            r#"
+            ---@param value table
+            local function RequiresTable(value) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param sfmeshdata string|table
+            local function test(sfmeshdata)
+                if isstring(sfmeshdata) then
+                    return
+                elseif istable(sfmeshdata) then
+                    RequiresTable(sfmeshdata)
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_starfall_mesh_convexes_do_not_keep_string_after_elseif_istable_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_gmod_type_predicates();
+
+        let file_id = ws.def_file(
+            "lua/entities/starfall_prop/init.lua",
+            r#"
+            SF = {}
+
+            function SF.Throw(msg, level, uncatchable, userdata)
+                local level = 1 + (level or 1)
+                error(msg, level)
+            end
+
+            util = {}
+
+            ---@param str string
+            ---@return string
+            function util.Compress(str) end
+
+            ---@param compressedString string
+            ---@param maxSize? number
+            ---@return string|nil
+            function util.Decompress(compressedString, maxSize) end
+
+            ---@class Vector
+
+            ---@return Vector
+            function Vector(x, y, z) end
+
+            local function streamToMesh(meshdata)
+                local meshConvexes = {}
+
+                meshdata = SF.StringStream(util.Decompress(meshdata, 65536))
+                local nConvexes = meshdata:readInt32()
+                if nConvexes > maxConvexesPerProp then SF.Throw("Exceeded", 2) end
+                for iConvex = 1, nConvexes do
+                    local nVertices = meshdata:readInt32()
+                    if nVertices > maxVerticesPerConvex then SF.Throw("Exceeded", 2) end
+                    local convex = {}
+                    for iVertex = 1, nVertices do
+                        convex[iVertex] = Vector(meshdata:readFloat(), meshdata:readFloat(), meshdata:readFloat())
+                    end
+                    meshConvexes[iConvex] = convex
+                end
+
+                return meshConvexes
+            end
+
+            local function meshToStream(meshConvexes)
+                local meshdata = SF.StringStream()
+                meshdata:writeInt32(#meshConvexes)
+                for _, convex in ipairs(meshConvexes) do
+                    meshdata:writeInt32(#convex)
+                    for _, vertex in ipairs(convex) do
+                        meshdata:writeFloat(vertex[1]) meshdata:writeFloat(vertex[2]) meshdata:writeFloat(vertex[3])
+                    end
+                end
+                return util.Compress(meshdata:getString())
+            end
+
+            local function checkMesh(ply, meshConvexes)
+                if #meshConvexes > maxConvexesPerProp then SF.Throw("Exceeded", 2) end
+                if #meshConvexes <= 0 then SF.Throw("Invalid", 2) end
+
+                local totalVertices = 0
+                for _, convex in ipairs(meshConvexes) do
+                    if #convex > maxVerticesPerConvex then SF.Throw("Exceeded", 2) end
+                    if #convex < 4 then SF.Throw("Invalid", 2) end
+
+                    totalVertices = totalVertices + #convex
+                    customPropVertexLimit:checkuse(ply, totalVertices)
+
+                    for k, vertex in ipairs(convex) do
+                        for i = 1, k - 1 do
+                            if convex[i]:DistToSqr(vertex) < mindist then
+                                SF.Throw("No two vertices can have a distance less", 2)
+                            end
+                        end
+                    end
+                end
+            end
+
+            local function createCustomProp(ply, pos, ang, sfmeshdata)
+                local meshConvexes
+                if isstring(sfmeshdata) then
+                    meshConvexes = streamToMesh(sfmeshdata)
+                elseif istable(sfmeshdata) then
+                    meshConvexes = sfmeshdata
+                    sfmeshdata = meshToStream(meshConvexes)
+                else
+                    SF.Throw("Invalid sfmeshdata", 2)
+                end
+                if #sfmeshdata > 65536 then
+                    SF.Throw("sfmeshdata is too long!", 2)
+                end
+
+                checkMesh(ply, meshConvexes)
+                SF.NetBurst:use(ply, #sfmeshdata * 8)
+
+                local propent = ents.Create("starfall_prop")
+                propent.sf_physmesh = meshConvexes
+
+                propent.sfmeshdata = sfmeshdata
+                propent:Spawn()
+
+                local totalVertices = 0
+                for k, v in ipairs(meshConvexes) do
+                    totalVertices = totalVertices + #v
+                end
+
+                return propent
+            end
+            "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::ParamTypeMismatch,
+        ));
+
+        let mesh_convexes_ty = nth_name_expr_type_from_end(&mut ws, file_id, "meshConvexes", 0);
+        assert_that!(ws.humanize_type(mesh_convexes_ty), eq("table"));
+    }
+
+    #[gtest]
+    fn test_never_returning_call_branch_does_not_leave_uninitialized_local_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return never
+            local function Throw() end
+
+            local value
+            if condition then
+                value = "ok"
+            else
+                Throw()
+            end
+
+            local result = value
+            "#,
+        );
+
+        let value_ty = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        assert_that!(ws.humanize_type(value_ty), eq("\"ok\""));
+    }
+
+    #[gtest]
+    fn test_error_wrapper_call_branch_does_not_leave_uninitialized_local_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local function Throw(message)
+                error(message, 2)
+            end
+
+            local value
+            if condition then
+                value = "ok"
+            else
+                Throw("invalid")
+            end
+
+            local result = value
+            "#,
+        );
+
+        let value_ty = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        assert_that!(ws.humanize_type(value_ty), eq("\"ok\""));
+    }
+
+    #[gtest]
+    fn test_shadowed_global_never_member_call_does_not_mark_branch_unreachable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            GlobalApi = {}
+
+            ---@return never
+            function GlobalApi.Throw() end
+            "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            local GlobalApi = {}
+            function GlobalApi.Throw() end
+
+            local value
+            if condition then
+                value = "ok"
+            else
+                GlobalApi.Throw()
+            end
+
+            local result = value
+            "#,
+        );
+
+        let value_ty = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        assert_that!(ws.humanize_type(value_ty), eq("\"ok\"?"));
+    }
+
+    #[gtest]
     fn test_realistic_registry_lookup_keeps_value_type_for_followup_field_access() {
         let mut ws = VirtualWorkspace::new();
 
@@ -4380,6 +4613,96 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_field_narrow_keeps_nullable_table_generic_on_constant_key() {
+        // `if t.x then` on `table<string, integer>?` must not narrow `t` to
+        // `nil`: the `nil` union arm infers the member as `Never`, which can
+        // never be truthy, so it must not survive as field-exists evidence
+        // while the table arm (which has no indexed member for `x`) drops out.
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@type table<string, integer>?
+            local t
+            if t.x then
+                a = t
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "a", 0);
+        let desc = ws.humanize_type(narrowed);
+        assert_that!(
+            desc.contains("table"),
+            eq(true),
+            "field-exists narrowing must keep the table arm, not collapse to nil: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_field_narrow_with_dynamic_key_ignores_unrelated_dynamic_member_realm() {
+        // Dynamic index keys produce `ExprType` member keys, which alias every
+        // other dynamic access with the same inferred key type. Field-existence
+        // narrowing must not collapse `ent` to whichever subtype happens to
+        // contain an unrelated dynamic write (`EFFECT[k] = v`), and the
+        // realm-aware filter must not drop candidates based on that unrelated
+        // write's `---@realm` annotation.
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@realm server
+
+            ---@class Entity
+
+            ---@class EFFECT : Entity
+            EFFECT = {}
+
+            ---@realm client
+            ---@param k string
+            function EFFECT.StoreField(k, v)
+                EFFECT[k] = v
+            end
+
+            ---@class ENT : Entity
+            ENT = {}
+
+            ---@realm server
+            ---@param k string
+            function ENT.StoreField(k, v)
+                ENT[k] = v
+            end
+
+            ---@param ent Entity?
+            ---@param key string
+            local function test(ent, key)
+                if ent and ent[key] then
+                    b = ent
+                end
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "b", 0);
+        let desc = ws.humanize_type(narrowed);
+        assert_that!(
+            desc.contains("Entity"),
+            eq(true),
+            "dynamic-key narrowing must keep the declared base type: {}",
+            desc
+        );
+        assert_that!(
+            desc.contains("EFFECT") || desc.contains("ENT"),
+            eq(false),
+            "dynamic-key narrowing must not collapse to a subtype that merely \
+             contains an unrelated dynamic write: {}",
+            desc
+        );
+    }
+
+    #[gtest]
     fn test_field_narrow_does_not_pick_subclass_when_base_directly_defines_field() {
         // `if x.EndTouch then` on `Entity` must not collapse to `EFFECT`
         // override — the base already defines the field.
@@ -4677,5 +5000,169 @@ _2 = a[1]
 
         let not_narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "y", 0);
         assert_eq!(not_narrowed, LuaType::Unknown);
+    }
+
+    // ── Table-guard / self-coalescing regression guards ────────────────────
+
+    #[gtest]
+    fn test_self_coalescing_table_or_keeps_table_behavior() {
+        // `opts = opts or {}` then `opts.foo = "x"` must keep table behavior;
+        // opts must NOT collapse to string after the second assignment.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param opts table|nil
+            function foo(opts)
+                opts = opts or {}
+                opts.foo = "x"
+                a = opts
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        let desc = ws.humanize_type(a);
+        assert_that!(
+            desc,
+            not(contains_substring("string")),
+            "table-guard self-coalescing must not leak string into opts: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_self_coalescing_registry_table_of_over_bare_table_unchanged() {
+        // `Glide = Glide or {}` and `Glide.Registry = Glide.Registry or {}`
+        // must keep the table-of-over-bare-table preference unchanged.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            Glide = Glide or {}
+            Glide.Registry = Glide.Registry or {}
+            a = Glide
+            b = Glide.Registry
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let a_desc = ws.humanize_type(a_ty);
+        assert_that!(
+            a_desc,
+            not(contains_substring("string")),
+            "Glide self-coalescing must keep table type: {}",
+            a_desc
+        );
+
+        let b_ty = ws.expr_ty("b");
+        let b_desc = ws.humanize_type(b_ty);
+        assert_that!(
+            b_desc,
+            not(contains_substring("string")),
+            "Glide.Registry self-coalescing must keep table type: {}",
+            b_desc
+        );
+    }
+
+    /// Regression: a wrong-realm assignment (e.g. inside `if SERVER`) must NOT
+    /// kill an inferred default for a client-side use site when used as a
+    /// generic string template argument.
+    #[gtest]
+    fn test_inferred_default_survives_wrong_realm_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            ---@class ServerPanel: Panel
+
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@return T
+            function create_panel(classname)
+            end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/autorun/client/test.lua",
+            r#"
+            ---@param panelClass string|nil
+            local function create(panelClass)
+                panelClass = panelClass or "DPanel"
+                if SERVER then
+                    panelClass = "ServerPanel"
+                end
+                result = create_panel(panelClass)
+            end
+            "#,
+        );
+
+        // At the client use site, panelClass's inferred default "DPanel"
+        // should survive because the SERVER-only reassignment must be
+        // filtered out by realm-aware reachability.
+        let ty = nth_name_expr_type_from_end(&mut ws, file_id, "result", 0);
+        let desc = ws.humanize_type(ty);
+        assert_that!(
+            desc,
+            contains_substring("DPanel"),
+            "inferred default must survive wrong-realm assignment for generic binding, got: {}",
+            desc
+        );
+    }
+
+    /// Regression: a wrong-realm assignment must NOT kill an explicit param
+    /// default for a client-side use site when used as a generic string
+    /// template argument.
+    #[gtest]
+    fn test_explicit_default_survives_wrong_realm_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            ---@class ServerPanel: Panel
+
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@return T
+            function create_panel(classname)
+            end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/autorun/client/test.lua",
+            r#"
+            ---@param panelClass string="DPanel"
+            local function create(panelClass)
+                if SERVER then
+                    panelClass = "ServerPanel"
+                end
+                result = create_panel(panelClass)
+            end
+            "#,
+        );
+
+        // Inside the function body, at the client use site, panelClass's
+        // explicit default "DPanel" should survive because the SERVER-only
+        // reassignment must be filtered out.
+        let ty = nth_name_expr_type_from_end(&mut ws, file_id, "result", 0);
+        let desc = ws.humanize_type(ty);
+        assert_that!(
+            desc,
+            contains_substring("DPanel"),
+            "explicit default must survive wrong-realm assignment for generic binding, got: {}",
+            desc
+        );
     }
 }

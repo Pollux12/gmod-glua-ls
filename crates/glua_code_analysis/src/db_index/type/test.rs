@@ -5,10 +5,46 @@ mod test {
     use crate::db_index::traits::LuaIndex;
     use crate::db_index::r#type::LuaTypeIndex;
     use crate::db_index::{LuaDeclTypeKind, LuaTypeFlag};
-    use crate::{FileId, LuaTypeDecl, LuaTypeDeclId};
+    use crate::{DbIndex, FileId, LuaType, LuaTypeDecl, LuaTypeDeclId, resolve_alias_type};
 
     fn create_type_index() -> LuaTypeIndex {
         LuaTypeIndex::new()
+    }
+
+    #[test]
+    fn test_resolve_alias_type_handles_def_alias() {
+        let mut db = DbIndex::default();
+        let file_id = FileId { id: 1 };
+        let origin_id = LuaTypeDeclId::global("Test2");
+        let alias_id = LuaTypeDeclId::global("TestAlias");
+
+        db.get_type_index_mut().add_type_decl(
+            file_id,
+            LuaTypeDecl::new(
+                file_id,
+                TextRange::new(0.into(), 0.into()),
+                "Test2".to_string(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::None.into(),
+                origin_id.clone(),
+            ),
+        );
+
+        let mut alias = LuaTypeDecl::new(
+            file_id,
+            TextRange::new(0.into(), 0.into()),
+            "TestAlias".to_string(),
+            LuaDeclTypeKind::Alias,
+            LuaTypeFlag::None.into(),
+            alias_id.clone(),
+        );
+        alias.add_alias_origin(LuaType::Ref(origin_id.clone()));
+        db.get_type_index_mut().add_type_decl(file_id, alias);
+
+        let resolved = resolve_alias_type(&db, &LuaType::Def(alias_id.clone()));
+
+        assert_eq!(resolved.alias_id, Some(alias_id));
+        assert_eq!(resolved.typ, LuaType::Ref(origin_id));
     }
 
     #[test]

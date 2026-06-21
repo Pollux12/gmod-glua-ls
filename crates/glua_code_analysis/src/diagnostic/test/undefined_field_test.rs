@@ -94,6 +94,30 @@ mod test {
             .expect("expected inferred index expression type")
     }
 
+    fn index_expr_type_displays(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> Vec<String> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .filter(|index_expr| index_expr.syntax().text() == expr_text)
+            .map(|index_expr| {
+                let typ = semantic_model
+                    .infer_expr(LuaExpr::IndexExpr(index_expr))
+                    .expect("expected inferred index expression type");
+                ws.humanize_type(typ)
+            })
+            .collect()
+    }
+
     fn contains_empty_table_bootstrap(db: &crate::DbIndex, typ: &LuaType) -> bool {
         match typ {
             LuaType::Table => true,
@@ -254,6 +278,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
@@ -364,6 +389,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
@@ -428,6 +454,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
@@ -768,6 +795,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "gamemodes/helix/gamemode/shared.lua",
@@ -3686,6 +3714,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
@@ -3696,12 +3725,15 @@ mod test {
                 ix = ix or { gui = {} }
             "#,
         );
-        ws.def_file(
-            "gamemodes/helix-hl2rp/schema/derma/cl_combinedisplay.lua",
+        ws.def(
             r#"
             ---@class DPanel
             ---@field Remove fun(self: DPanel)
-
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix-hl2rp/schema/derma/cl_combinedisplay.lua",
+            r#"
             local PANEL = {}
 
             function PANEL:Init()
@@ -3722,6 +3754,8 @@ mod test {
                 end
             "#,
         );
+        let gui_displays = index_expr_type_displays(&ws, hooks_file, "ix.gui");
+        let combine_displays = index_expr_type_displays(&ws, hooks_file, "ix.gui.combine");
 
         let diagnostics = ws
             .analysis
@@ -3739,7 +3773,7 @@ mod test {
 
         assert!(
             undefined_fields.is_empty(),
-            "unexpected UndefinedField diagnostics for panel self-assignment: {undefined_fields:#?}"
+            "unexpected UndefinedField diagnostics for panel self-assignment on gui={gui_displays:?} combine={combine_displays:?}: {undefined_fields:#?}"
         );
     }
 
@@ -3749,6 +3783,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "gamemodes/helix/gamemode/cl_init.lua",
@@ -3786,6 +3821,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
             "gamemodes/helix/gamemode/cl_init.lua",

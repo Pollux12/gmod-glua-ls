@@ -1,6 +1,6 @@
 use glua_code_analysis::{
     LuaDeclId, LuaType, LuaUnionType, RenderLevel, SemanticModel, format_union_type, humanize_type,
-    infer_param_with_cache,
+    infer_param_with_cache, resolve_alias_type,
 };
 use glua_parser::{LuaAstNode, LuaAstToken, LuaClosureExpr, LuaParamName};
 use itertools::Itertools;
@@ -193,7 +193,20 @@ fn get_base_type_location(semantic_model: &SemanticModel, name: &str) -> Option<
 
 fn hint_humanize_type(semantic_model: &SemanticModel, typ: &LuaType, level: RenderLevel) -> String {
     match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => id.get_simple_name().to_string(),
+        LuaType::Ref(id) | LuaType::Def(id) => {
+            let resolved = resolve_alias_type(semantic_model.get_db(), typ);
+            if let Some(alias_id) = resolved.alias_id
+                && resolved.typ != *typ
+            {
+                return format!(
+                    "{} = {}",
+                    alias_id.get_simple_name(),
+                    hint_humanize_type(semantic_model, &resolved.typ, level)
+                );
+            }
+
+            id.get_simple_name().to_string()
+        }
         LuaType::Generic(generic) => {
             let base_type_id = generic.get_base_type_id();
             let base_type_name =

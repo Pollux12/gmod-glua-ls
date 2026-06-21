@@ -132,7 +132,10 @@ fn keep_stale_editor_data_on_cancel(method: &str) -> bool {
     // causes brief visual flickering as the client clears its display.
     matches!(
         method,
-        "textDocument/inlayHint" | "textDocument/semanticTokens/full" | "gluals/annotator"
+        "textDocument/codeLens"
+            | "textDocument/inlayHint"
+            | "textDocument/semanticTokens/full"
+            | "gluals/annotator"
     )
 }
 
@@ -145,10 +148,10 @@ fn should_send_stale_response_on_cancel(method: &str, response: &Response) -> bo
         return false;
     }
 
-    if method == "textDocument/inlayHint" {
-        // Returning stale-but-empty inlay hints clears currently rendered hints
-        // while the user is typing. Let RequestCanceled keep the previous hints
-        // visible until we have a fresh, complete inlay result.
+    if matches!(method, "textDocument/codeLens" | "textDocument/inlayHint") {
+        // Returning stale-but-empty results for inlay hints/code lens can clear
+        // currently rendered UI while typing. Let RequestCanceled keep the
+        // previous output visible until fresh results are ready.
         return result.as_array().is_some_and(|hints| !hints.is_empty());
     }
 
@@ -361,7 +364,7 @@ mod tests {
     use std::time::Duration;
 
     #[gtest]
-    fn stale_inlay_hint_response_requires_non_empty_array() -> Result<()> {
+    fn stale_inlay_and_code_lens_response_requires_non_empty_array() -> Result<()> {
         let empty = Response::new_ok(1.into(), json!([]));
         let non_empty = Response::new_ok(2.into(), json!([{"label": ": number"}]));
 
@@ -371,6 +374,14 @@ mod tests {
         )?;
         verify_that!(
             should_send_stale_response_on_cancel("textDocument/inlayHint", &non_empty),
+            eq(true)
+        )?;
+        verify_that!(
+            should_send_stale_response_on_cancel("textDocument/codeLens", &empty),
+            eq(false)
+        )?;
+        verify_that!(
+            should_send_stale_response_on_cancel("textDocument/codeLens", &non_empty),
             eq(true)
         )?;
         Ok(())
@@ -399,7 +410,7 @@ mod tests {
     }
 
     #[gtest]
-    fn cancel_all_requests_except_preserves_inlay_requests() -> Result<()> {
+    fn cancel_all_requests_except_preserves_inlay_and_code_lens_requests() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let (conn, _peer) = lsp_server::Connection::memory();
@@ -429,11 +440,28 @@ mod tests {
                 )
                 .await;
 
-            let (inlay_token, hover_token) = {
+            let code_lens_id: RequestId = 3.into();
+            context
+                .task(
+                    code_lens_id.clone(),
+                    RequestTaskMetadata::new("textDocument/codeLens", None),
+                    |_cancel_token| async move {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        Some(Response::new_ok(code_lens_id, json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "command": {"title": "test", "command": "test"}}])))
+                    },
+                )
+                .await;
+
+            let (inlay_token, code_lens_token, hover_token) = {
                 let requests = context.requests.lock().await;
                 let inlay = requests
                     .get(&RequestId::from(1))
                     .expect("inlay request should exist")
+                    .cancel_token
+                    .clone();
+                let code_lens = requests
+                    .get(&RequestId::from(3))
+                    .expect("code lens request should exist")
                     .cancel_token
                     .clone();
                 let hover = requests
@@ -441,14 +469,15 @@ mod tests {
                     .expect("hover request should exist")
                     .cancel_token
                     .clone();
-                (inlay, hover)
+                (inlay, code_lens, hover)
             };
 
             context
-                .cancel_all_requests_except(&["textDocument/inlayHint"])
+                .cancel_all_requests_except(&["textDocument/inlayHint", "textDocument/codeLens"])
                 .await;
 
             verify_that!(inlay_token.is_cancelled(), eq(false))?;
+            verify_that!(code_lens_token.is_cancelled(), eq(false))?;
             verify_that!(hover_token.is_cancelled(), eq(true))?;
             Ok(())
         })

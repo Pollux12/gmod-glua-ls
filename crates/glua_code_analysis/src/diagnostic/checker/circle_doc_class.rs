@@ -68,7 +68,7 @@ fn check_doc_tag_class(
                         context.add_diagnostic(
                             DiagnosticCode::CircleDocClass,
                             get_lint_range(tag).unwrap_or(tag.get_range()),
-                            t!("Circularly inherited classes.").to_string(),
+                            "Circularly inherited classes.".to_string(),
                             None,
                         );
                         return Some(());

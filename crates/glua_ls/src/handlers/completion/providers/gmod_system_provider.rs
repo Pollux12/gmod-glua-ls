@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use glua_code_analysis::{
-    FileId, GmodHookSiteMetadata, GmodRealm, NetSendFlow, NetSendKind, SemanticModel,
+    FileId, GmodHookSiteMetadata, GmodRealm, LuaType, NetSendFlow, NetSendKind, SemanticModel,
+    find_call_arg_role_from_type,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaComment, LuaCommentOwner, LuaDocTag,
     LuaDocTagRealm, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLiteralExpr,
-    LuaLocalFuncStat, LuaStringToken, PathTrait,
+    LuaLocalFuncStat, LuaStringToken,
 };
 use lsp_types::{
     Command, CompletionItem, CompletionTextEdit, InsertTextFormat, InsertTextMode, TextEdit,
@@ -16,6 +17,10 @@ use rowan::TextSize;
 use crate::handlers::completion::add_completions::CompletionTriggerStatus;
 use crate::handlers::completion::completion_builder::CompletionBuilder;
 use crate::handlers::completion::completion_data::CompletionData;
+use crate::handlers::gmod_string_context::{
+    find_call_arg_roles, find_string_call_arg_role, is_hook_name_string_context,
+    is_net_message_string_context,
+};
 use crate::handlers::hover::resolve_hook_property_owner;
 
 use super::get_text_edit_range_in_string;
@@ -28,6 +33,13 @@ struct HookStats {
     method_count: usize,
     emit_count: usize,
     callback_params: Option<(u8, Vec<String>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedStringCallKind {
+    NetReceive,
+    HookAdd,
+    HookEmit { include_gamemode_arg: bool },
 }
 
 pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
@@ -55,33 +67,40 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         && let Some(call_expr) = literal_expr
             .get_parent::<LuaCallArgList>()
             .and_then(|args| args.get_parent::<LuaCallExpr>())
-        && let Some(call_path) = call_expr.get_access_path()
+        && let Some(arg_index) = literal_arg_index(&call_expr, &literal_expr)
         && let Some(text_edit_range) = get_text_edit_range_in_string(builder, string_token)
     {
-        let string_added = if is_net_message_string_context(&call_expr, literal_expr.clone()) {
-            if staged_call_snippets_enabled(builder) && matches_call_path(&call_path, "net.Receive")
-            {
-                add_staged_net_receive_completion_items(builder, &call_expr)
+        let string_added =
+            if is_net_message_string_context(&builder.semantic_model, &call_expr, arg_index) {
+                match staged_string_call_kind(&builder.semantic_model, &call_expr, arg_index) {
+                    Some(StagedStringCallKind::NetReceive)
+                        if staged_call_snippets_enabled(builder) =>
+                    {
+                        add_staged_net_receive_completion_items(builder, &call_expr)
+                    }
+                    _ => add_net_message_completion_items(builder, Some(text_edit_range)),
+                }
+            } else if is_hook_name_string_context(&builder.semantic_model, &call_expr, arg_index) {
+                match staged_string_call_kind(&builder.semantic_model, &call_expr, arg_index) {
+                    Some(StagedStringCallKind::HookAdd)
+                        if staged_call_snippets_enabled(builder) =>
+                    {
+                        add_staged_hook_add_completion_items(builder, &call_expr)
+                    }
+                    Some(StagedStringCallKind::HookEmit {
+                        include_gamemode_arg,
+                    }) if staged_call_snippets_enabled(builder) => {
+                        add_staged_hook_emit_completion_items(
+                            builder,
+                            &call_expr,
+                            include_gamemode_arg,
+                        )
+                    }
+                    _ => add_hook_completion_items(builder, Some(text_edit_range)),
+                }
             } else {
-                add_net_message_completion_items(builder, Some(text_edit_range))
-            }
-        } else if is_hook_name_string_context(builder, &call_expr, literal_expr) {
-            if staged_call_snippets_enabled(builder) && matches_call_path(&call_path, "hook.Add") {
-                add_staged_hook_add_completion_items(builder, &call_expr)
-            } else if staged_call_snippets_enabled(builder)
-                && matches_call_path(&call_path, "hook.Run")
-            {
-                add_staged_hook_emit_completion_items(builder, &call_expr, false)
-            } else if staged_call_snippets_enabled(builder)
-                && matches_call_path(&call_path, "hook.Call")
-            {
-                add_staged_hook_emit_completion_items(builder, &call_expr, true)
-            } else {
-                add_hook_completion_items(builder, Some(text_edit_range))
-            }
-        } else {
-            false
-        };
+                false
+            };
         if string_added {
             builder.stop_here();
         }
@@ -96,30 +115,20 @@ pub fn apply_staged_call_snippet(
     builder: &CompletionBuilder,
     label: &str,
     status: CompletionTriggerStatus,
+    typ: &LuaType,
     completion_item: &mut CompletionItem,
 ) -> Option<()> {
     if status != CompletionTriggerStatus::Dot || !staged_call_snippets_enabled(builder) {
         return None;
     }
 
-    let index_expr = builder
-        .trigger_token
-        .parent_ancestors()
-        .find_map(LuaIndexExpr::cast)?;
-    let prefix_path = expr_access_path(&index_expr.get_prefix_expr()?)?;
-    let call_path = format!("{prefix_path}.{label}");
-    if !matches_call_path(&call_path, "hook.Add")
-        && !matches_call_path(&call_path, "hook.Run")
-        && !matches_call_path(&call_path, "hook.Call")
-        && !matches_call_path(&call_path, "net.Receive")
-    {
-        return None;
-    }
+    let kind = staged_string_call_kind_from_type(builder.semantic_model.get_db(), typ)?;
 
-    completion_item.insert_text = Some(if matches_call_path(&call_path, "hook.Call") {
-        format!(r#"{}("${{1}}", ${{2:GAMEMODE}})"#, label)
-    } else {
-        format!(r#"{}("${{1}}")"#, label)
+    completion_item.insert_text = Some(match kind {
+        StagedStringCallKind::HookEmit {
+            include_gamemode_arg: true,
+        } => format!(r#"{}("${{1}}", ${{2:GAMEMODE}})"#, label),
+        _ => format!(r#"{}("${{1}}")"#, label),
     });
     completion_item.insert_text_format = Some(InsertTextFormat::SNIPPET);
     completion_item.sort_text = Some(format!("000_gmod_staged_call_{}", label.to_lowercase()));
@@ -723,72 +732,111 @@ fn collect_hook_completion_entries(
         .collect()
 }
 
-fn is_net_message_string_context(call_expr: &LuaCallExpr, literal_expr: LuaLiteralExpr) -> bool {
-    let Some(call_path) = call_expr.get_access_path() else {
-        return false;
-    };
-    if !matches_call_path(&call_path, "util.AddNetworkString")
-        && !matches_call_path(&call_path, "net.Start")
-        && !matches_call_path(&call_path, "net.Receive")
-    {
-        return false;
-    }
-
-    let Some(args_list) = call_expr.get_args_list() else {
-        return false;
-    };
-    let arg_idx = args_list
+fn literal_arg_index(call_expr: &LuaCallExpr, literal_expr: &LuaLiteralExpr) -> Option<usize> {
+    let args_list = call_expr.get_args_list()?;
+    args_list
         .get_args()
-        .position(|arg| arg.get_position() == literal_expr.get_position());
-
-    arg_idx == Some(0)
+        .position(|arg| arg.get_position() == literal_expr.get_position())
 }
 
-fn is_hook_name_string_context(
-    builder: &CompletionBuilder,
+fn staged_string_call_kind(
+    semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
-    literal_expr: LuaLiteralExpr,
-) -> bool {
-    let Some(call_path) = call_expr.get_access_path() else {
-        return false;
-    };
-    let is_builtin = matches_call_path(&call_path, "hook.Add")
-        || matches_call_path(&call_path, "hook.Run")
-        || matches_call_path(&call_path, "hook.Call");
-    let is_custom_emitter = builder
-        .semantic_model
-        .get_emmyrc()
-        .gmod
-        .hook_mappings
-        .emitter_to_hook
-        .iter()
-        .any(|(emitter_path, mapped_hook)| {
-            mapped_hook == "*" && matches_call_path(&call_path, emitter_path)
-        });
-    if !is_builtin && !is_custom_emitter {
-        return false;
+    arg_index: usize,
+) -> Option<StagedStringCallKind> {
+    if find_string_call_arg_role(
+        semantic_model,
+        call_expr,
+        arg_index,
+        "gmod.net_message",
+        &["receive"],
+    )
+    .is_some()
+    {
+        return Some(StagedStringCallKind::NetReceive);
     }
 
-    let Some(args_list) = call_expr.get_args_list() else {
-        return false;
-    };
-    let arg_idx = args_list
-        .get_args()
-        .position(|arg| arg.get_position() == literal_expr.get_position());
-    arg_idx == Some(0)
-}
-
-fn matches_call_path(path: &str, target: &str) -> bool {
-    path == target || path.ends_with(&format!(".{target}")) || path.ends_with(&format!(":{target}"))
-}
-
-fn expr_access_path(expr: &LuaExpr) -> Option<String> {
-    match expr {
-        LuaExpr::NameExpr(name_expr) => Some(name_expr.get_name_text()?.to_string()),
-        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
-        LuaExpr::CallExpr(call_expr) => call_expr.get_access_path(),
+    let hook_role = find_string_call_arg_role(
+        semantic_model,
+        call_expr,
+        arg_index,
+        "gmod.hook",
+        &["add", "emit"],
+    )?;
+    match hook_role.role.as_str() {
+        "add" => Some(StagedStringCallKind::HookAdd),
+        "emit" => Some(StagedStringCallKind::HookEmit {
+            include_gamemode_arg: call_has_hook_gamemode_table_role(semantic_model, call_expr),
+        }),
         _ => None,
     }
+}
+
+fn staged_string_call_kind_from_type(
+    db: &glua_code_analysis::DbIndex,
+    typ: &LuaType,
+) -> Option<StagedStringCallKind> {
+    if find_call_arg_role_from_type(db, typ, 0, "gmod.net_message", &["receive"]).is_some() {
+        return Some(StagedStringCallKind::NetReceive);
+    }
+
+    let hook_role = find_call_arg_role_from_type(db, typ, 0, "gmod.hook", &["add", "emit"])?;
+    match hook_role.role.as_str() {
+        "add" => Some(StagedStringCallKind::HookAdd),
+        "emit" => Some(StagedStringCallKind::HookEmit {
+            include_gamemode_arg: find_call_arg_role_from_type(
+                db,
+                typ,
+                1,
+                "gmod.hook",
+                &["gamemode_table"],
+            )
+            .is_some(),
+        }),
+        _ => None,
+    }
+}
+
+fn call_has_hook_gamemode_table_role(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    if let Some(args_list) = call_expr.get_args_list() {
+        let arg_count = args_list.get_args().count();
+        if find_call_arg_roles(
+            semantic_model,
+            call_expr,
+            arg_count,
+            "gmod.hook",
+            &["gamemode_table"],
+        )
+        .into_iter()
+        .any(|(_, role)| role.role == "gamemode_table")
+        {
+            return true;
+        }
+    }
+
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(callable_type) = semantic_model.infer_expr(prefix_expr).ok() else {
+        return false;
+    };
+    let param_idx = crate::handlers::gmod_string_context::call_arg_to_param_idx_for_type(
+        semantic_model.get_db(),
+        &callable_type,
+        1,
+        call_expr.is_colon_call(),
+    );
+    find_call_arg_role_from_type(
+        semantic_model.get_db(),
+        &callable_type,
+        param_idx,
+        "gmod.hook",
+        &["gamemode_table"],
+    )
+    .is_some()
 }
 
 fn completion_string_token(builder: &CompletionBuilder) -> Option<LuaStringToken> {

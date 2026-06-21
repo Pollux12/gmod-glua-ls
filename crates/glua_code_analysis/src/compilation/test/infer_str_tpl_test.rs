@@ -1,11 +1,13 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAstNode, LuaFuncStat, LuaIndexKey, LuaNameExpr, LuaVarExpr};
+    use glua_parser::{
+        LuaAstNode, LuaAstToken, LuaFuncStat, LuaIndexKey, LuaLocalName, LuaNameExpr, LuaVarExpr,
+    };
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, LuaSignatureId, LuaType, LuaTypeDeclId, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaSignatureId, LuaType, LuaTypeDeclId, VirtualWorkspace};
 
     fn nth_name_expr_type_from_end(
         ws: &mut VirtualWorkspace,
@@ -33,6 +35,69 @@ mod test {
             .get_semantic_info(name_expr.syntax().clone().into())
             .expect("expected semantic info for name expression")
             .typ
+    }
+
+    fn nth_local_name_type_from_end(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth_from_end: usize,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let local_names = root
+            .clone()
+            .descendants::<LuaLocalName>()
+            .filter(|local_name| local_name.get_text() == name)
+            .collect::<Vec<_>>();
+        let local_name = local_names
+            .into_iter()
+            .rev()
+            .nth(nth_from_end)
+            .expect("expected matching local name");
+        let token = local_name
+            .get_name_token()
+            .expect("expected local name token");
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("expected semantic info for local name")
+            .typ
+    }
+
+    fn nth_local_name_cached_type_from_end(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth_from_end: usize,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let local_names = root
+            .clone()
+            .descendants::<LuaLocalName>()
+            .filter(|local_name| local_name.get_text() == name)
+            .collect::<Vec<_>>();
+        let local_name = local_names
+            .into_iter()
+            .rev()
+            .nth(nth_from_end)
+            .expect("expected matching local name");
+        let decl_id = crate::LuaDeclId::new(file_id, local_name.get_position());
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .map(|type_cache| type_cache.as_type().clone())
+            .unwrap_or(LuaType::Unknown)
     }
 
     fn signature_return_type_for_function(
@@ -121,6 +186,254 @@ mod test {
         let result_ty = ws.expr_ty("ents.Create('sent_npc')");
         let expected = ws.ty("sent_npc");
         assert_eq!(result_ty, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_accepts_string_union_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/entities/entities/ttt_random_weapon.lua",
+            r#"
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class item_ammo_smg1: Entity
+                ---@class item_ammo_pistol: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function ents.Create(class)
+                end
+
+                ---@class TttRandomWeapon
+                ---@field AmmoEnt "item_ammo_smg1"|"item_ammo_pistol"
+
+                ---@type TttRandomWeapon
+                local ent
+
+                function CreateAmmo()
+                    local ammo = ents.Create(ent.AmmoEnt)
+                    return ammo
+                end
+            "#,
+        );
+
+        let expected = ws.ty("item_ammo_smg1|item_ammo_pistol|NULL");
+        let return_ammo_ty = nth_name_expr_type_from_end(&mut ws, file_id, "ammo", 0);
+        assert_eq!(return_ammo_ty, expected);
+
+        let signature_return = signature_return_type_for_function(&mut ws, file_id, "CreateAmmo");
+        assert_eq!(signature_return, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_initial_indexing_materializes_string_union_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/entities/entities/ttt_random_weapon.lua",
+            r#"
+                ---@class Entity
+                ---@class NULL: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function ents.Create(class)
+                end
+
+                ---@class TttRandomWeapon
+                ---@field AmmoEnt "item_ammo_smg1"|"item_ammo_pistol"
+
+                ---@type TttRandomWeapon
+                local ent
+
+                function CreateAmmo()
+                    local ammo = ents.Create(ent.AmmoEnt)
+                    return ammo
+                end
+            "#,
+        );
+
+        let expected = ws.ty("item_ammo_smg1|item_ammo_pistol|NULL");
+        let return_ammo_ty = nth_name_expr_type_from_end(&mut ws, file_id, "ammo", 0);
+        assert_eq!(return_ammo_ty, expected);
+
+        let signature_return = signature_return_type_for_function(&mut ws, file_id, "CreateAmmo");
+        assert_eq!(signature_return, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_initial_indexing_reproduces_ttt_random_weapon_chain() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/ttt_test_annotations.lua",
+                r#"
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class Weapon: Entity
+
+                ents = { TTT = {} }
+                WEPS = {}
+                weapons = {}
+                math = {}
+                table = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function ents.Create(class)
+                end
+
+                ---@return (weapon_zm_pistol|weapon_zm_shotgun)[]
+                function weapons.GetList()
+                end
+
+                ---@param t table
+                ---@param value any
+                function table.insert(t, value)
+                end
+
+                ---@param n integer
+                ---@return integer
+                function math.random(n)
+                end
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function IsValid(value)
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/entities/weapons/weapon_zm_pistol.lua",
+                r#"
+                SWEP.ClassName = "weapon_zm_pistol"
+                SWEP.AutoSpawnable = true
+                SWEP.AmmoEnt = "item_ammo_pistol_ttt"
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/entities/weapons/weapon_zm_shotgun.lua",
+                r#"
+                SWEP.ClassName = "weapon_zm_shotgun"
+                SWEP.AutoSpawnable = true
+                SWEP.AmmoEnt = "item_box_buckshot_ttt"
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/weaponry_shd.lua",
+                r#"
+                function WEPS.IsEquipment(wep)
+                    return false
+                end
+
+                function WEPS.GetClass(wep)
+                    if istable(wep) then
+                        return wep.ClassName or wep.Classname
+                    elseif IsValid(wep) then
+                        return wep:GetClass()
+                    end
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/ent_replace.lua",
+                r#"
+                local SpawnableSWEPs = nil
+                function ents.TTT.GetSpawnableSWEPs()
+                    if not SpawnableSWEPs then
+                        local tbl = {}
+                        for k, v in pairs(weapons.GetList()) do
+                            if v and v.AutoSpawnable and (not WEPS.IsEquipment(v)) then
+                                table.insert(tbl, v)
+                            end
+                        end
+
+                        SpawnableSWEPs = tbl
+                    end
+
+                    return SpawnableSWEPs
+                end
+
+                function ents.TTT.GetFilteredSpawnableSWEPs(filter)
+                    return ents.TTT.GetSpawnableSWEPs()
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/entities/entities/ttt_random_weapon.lua",
+                r#"
+                ENT.Type = "point"
+                ENT.Base = "base_point"
+                ENT.AutoAmmo = 0
+
+                function ENT:Initialize()
+                    local spawnflags = self:GetSpawnFlags()
+
+                    local weps
+                    if spawnflags != 0 then
+                        weps = ents.TTT.GetFilteredSpawnableSWEPs(spawnflags)
+                    else
+                        weps = ents.TTT.GetSpawnableSWEPs()
+                    end
+
+                    if not weps then return end
+
+                    local w = weps[math.random(#weps)]
+                    local ent = ents.Create(WEPS.GetClass(w))
+                    if IsValid(ent) then
+                        local pos = self:GetPos()
+                        if ent.AmmoEnt and self.AutoAmmo > 0 then
+                            for i=1, self.AutoAmmo do
+                                local ammo = ents.Create(ent.AmmoEnt)
+                                print(ammo)
+                                if IsValid(ammo) then
+                                    ammo:SetPos(pos)
+                                end
+                            end
+                        end
+                    end
+                end
+                "#,
+            ),
+        ]);
+        let file_id = *file_ids
+            .iter()
+            .find(|file_id| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_path(file_id)
+                    .is_some_and(|path| path.ends_with("ttt_random_weapon.lua"))
+            })
+            .expect("expected random weapon file id");
+
+        let expected = LuaType::from_vec(vec![
+            LuaType::Ref(LuaTypeDeclId::global("item_ammo_pistol_ttt")),
+            LuaType::Ref(LuaTypeDeclId::global("item_box_buckshot_ttt")),
+            LuaType::Ref(LuaTypeDeclId::global("NULL")),
+        ]);
+
+        let later_ammo_ty = nth_name_expr_type_from_end(&mut ws, file_id, "ammo", 1);
+        assert_eq!(later_ammo_ty, expected);
+
+        let local_ammo_ty = nth_local_name_type_from_end(&mut ws, file_id, "ammo", 0);
+        assert_eq!(local_ammo_ty, expected);
+
+        let cached_ammo_ty = nth_local_name_cached_type_from_end(&ws, file_id, "ammo", 0);
+        assert_eq!(cached_ammo_ty, expected);
     }
 
     #[gtest]
@@ -1168,5 +1481,428 @@ mod test {
 
         let ply_field_type = ws.expr_ty("scenario_ply_test_var");
         assert!(ws.check_type(&ply_field_type, &bool_type));
+    }
+
+    // ── Inferred string default binding tests ───────────────────────────
+
+    #[gtest]
+    fn test_inferred_str_default_binds_str_tpl_generic() {
+        // `panelClass = panelClass or "DScrollPanel"` then
+        // `local p = fn(panelClass)` ⇒ p is DScrollPanel.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                function foo(panelClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_no_or_default_does_not_bind_str_tpl() {
+        // `---@param panelClass string` with NO or-default ⇒
+        // `fn(panelClass)` ⇒ Panel (no binding).
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string
+                function foo(panelClass)
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_non_self_or_does_not_bind_from_default_metadata() {
+        // `local y = panelClass or "DScrollPanel"; fn(y)` ⇒
+        // y is a different decl with no registered default ⇒ Panel.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                function foo(panelClass)
+                    local y = panelClass or "DScrollPanel"
+                    local p = create_panel(y)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_inferred_str_default_binds_unannotated_variable() {
+        // Without any annotation, `panelClass = panelClass or "DScrollPanel"`
+        // still carries the inferred default and binds.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                function foo(panelClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(a_ty, expected);
+    }
+
+    // ── Flow-sensitive inferred default tests ──────────────────────────
+
+    #[gtest]
+    fn test_inferred_str_default_is_killed_by_later_reassignment() {
+        // After `panelClass = panelClass or "DScrollPanel"` followed by
+        // `panelClass = otherClass`, the default is dead at the use site.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                ---@param otherClass string
+                function AddTab(panelClass, otherClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    panelClass = otherClass
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_inferred_str_default_inside_conditional_does_not_bind() {
+        // The default is inside a conditional — it does not dominate the use,
+        // so it must NOT bind.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                ---@param cond boolean
+                function AddTab(panelClass, cond)
+                    if cond then
+                        panelClass = panelClass or "DScrollPanel"
+                    end
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_inferred_str_default_before_branch_still_binds() {
+        // The default is before the branch and no reassignment happens,
+        // so it MUST still bind.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                ---@param cond boolean
+                function AddTab(panelClass, cond)
+                    panelClass = panelClass or "DScrollPanel"
+                    if cond then
+                        local x = 1
+                    end
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_inferred_str_default_branch_reassignment_kills_binding() {
+        // Default before branch, but branch reassigns → default is dead.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                ---@param cond boolean
+                ---@param otherClass string
+                function AddTab(panelClass, cond, otherClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    if cond then
+                        panelClass = otherClass
+                    end
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_self_coalescing_assignment_kills_explicit_default() {
+        // When a function has `---@param panelClass string = "DPanel"` AND
+        // then `panelClass = panelClass or "DScrollPanel"`,
+        // the self-coalescing assignment kills the explicit default.
+        // The inferred default "DScrollPanel" should bind downstream.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DScrollPanel: Panel
+                ---@class DPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string|nil
+                function foo(panelClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    ---@cast panelClass string
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+
+                ---@param panelClass string = "DPanel"
+                function bar(panelClass)
+                    panelClass = panelClass or "DScrollPanel"
+                    local p = create_panel(panelClass)
+                    b = p
+                end
+            "#,
+        );
+
+        // foo: no explicit default → inferred "DScrollPanel" binds
+        let a_ty = ws.expr_ty("a");
+        let expected_inferred = ws.ty("DScrollPanel");
+        assert_eq!(a_ty, expected_inferred);
+
+        // bar: self-coalescing assignment kills explicit default,
+        // inferred "DScrollPanel" binds
+        let b_ty = ws.expr_ty("b");
+        let expected_inferred = ws.ty("DScrollPanel");
+        assert_eq!(b_ty, expected_inferred);
+    }
+
+    // ── Explicit param default flow-validity tests ─────────────────────
+
+    #[gtest]
+    fn test_explicit_param_default_is_killed_by_reassignment() {
+        // When a function parameter has `---@param panelClass string = "DPanel"`
+        // but `panelClass = otherClass` reassigns it before the use site,
+        // the explicit default must be killed. Expected: `p` is `Panel`.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string = "DPanel"
+                ---@param otherClass string
+                function AddTab(panelClass, otherClass)
+                    panelClass = otherClass
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
+    }
+
+    #[gtest]
+    fn test_non_string_explicit_param_default_does_not_bind_str_tpl() {
+        // When a function parameter has a non-string explicit default (e.g. boolean),
+        // the string-template default resolver must NOT bind from it.
+        // Expected: `p` is `Panel` (no binding from boolean default).
+        // No reassignment — isolates the non-string-default behavior.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DPanel: Panel
+
+                ---@generic T: Panel
+                ---@param classname `T`
+                ---@return T
+                function create_panel(classname)
+                end
+            "#,
+        );
+
+        ws.def(
+            r#"
+                ---@param panelClass string = true
+                function AddTab(panelClass)
+                    local p = create_panel(panelClass)
+                    a = p
+                end
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let expected = ws.ty("Panel");
+        assert_eq!(a_ty, expected);
     }
 }

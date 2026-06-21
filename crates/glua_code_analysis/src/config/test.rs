@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::config::Emmyrc;
+    use std::path::PathBuf;
 
     #[test]
     fn test_default_ignore_dir_defaults_resolve_to_4_globs() {
@@ -198,5 +199,75 @@ mod test {
 
         let emmyrc: Emmyrc = serde_json::from_str(json).unwrap();
         assert_eq!(emmyrc.gmod.auto_load_annotations, None);
+    }
+
+    #[test]
+    fn test_pre_process_empty_library_path_stays_empty() {
+        use crate::config::configs::EmmyLibraryItem;
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc
+            .workspace
+            .library
+            .push(EmmyLibraryItem::Path(String::new()));
+
+        let workspace = PathBuf::from("/some/workspace");
+        emmyrc.pre_process_emmyrc(&workspace);
+
+        // An empty library path must NOT resolve to the workspace root.
+        // It should remain empty so downstream ingestion can drop it.
+        assert_eq!(
+            emmyrc.workspace.library.len(),
+            1,
+            "expected 1 library entry"
+        );
+        let processed = emmyrc.workspace.library[0].get_path();
+        assert!(
+            processed.is_empty(),
+            "empty library path should stay empty after preprocessing, got: {:?}",
+            processed
+        );
+    }
+
+    #[test]
+    fn test_pre_process_whitespace_library_path_stays_empty() {
+        use crate::config::configs::EmmyLibraryItem;
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc
+            .workspace
+            .library
+            .push(EmmyLibraryItem::Path("   ".to_string()));
+
+        let workspace = PathBuf::from("/some/workspace");
+        emmyrc.pre_process_emmyrc(&workspace);
+
+        let processed = emmyrc.workspace.library[0].get_path();
+        assert!(
+            processed.trim().is_empty(),
+            "whitespace-only library path should stay empty after preprocessing, got: {:?}",
+            processed
+        );
+    }
+
+    #[test]
+    fn test_pre_process_unset_env_var_library_path_stays_empty() {
+        use crate::config::configs::EmmyLibraryItem;
+
+        // Use an env var name that is extremely unlikely to be set.
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.library.push(EmmyLibraryItem::Path(
+            "$__GLUA_LS_TEST_UNSET_VAR_12345__".to_string(),
+        ));
+
+        let workspace = PathBuf::from("/some/workspace");
+        emmyrc.pre_process_emmyrc(&workspace);
+
+        let processed = emmyrc.workspace.library[0].get_path();
+        assert!(
+            processed.trim().is_empty(),
+            "unset env var library path should expand to empty and stay empty, got: {:?}",
+            processed
+        );
     }
 }

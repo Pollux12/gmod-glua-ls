@@ -68,7 +68,7 @@ pub fn check_ref_type_compact(
         // unreachable!
         .ok_or(if context.detail {
             TypeCheckFailReason::TypeNotMatchWithReason(
-                t!("type `%{name}` not found.", name = source_id.get_name()).to_string(),
+                format!("type `{name}` not found.", name = source_id.get_name()).to_string(),
             )
         } else {
             TypeCheckFailReason::TypeNotMatch
@@ -389,8 +389,8 @@ fn check_ref_type_compact_table(
                     }
 
                     return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                        t!(
-                            "member %{name} type not match, expect %{expect}, got %{got}",
+                        format!(
+                            "member {name} type not match, expect {expect}, got {got}",
                             name = key.to_path(),
                             expect =
                                 humanize_type(context.db, source_member_type, RenderLevel::Simple),
@@ -406,7 +406,7 @@ fn check_ref_type_compact_table(
                 }
 
                 return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                    t!("missing member %{name}, in table", name = key.to_path()).to_string(),
+                    format!("missing member {name}, in table", name = key.to_path()).to_string(),
                 ));
             }
             _ => {} // Optional member not found, continue
@@ -477,8 +477,8 @@ fn check_ref_type_compact_object(
                     }
 
                     return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                        t!(
-                            "member %{name} type not match, expect %{expect}, got %{got}",
+                        format!(
+                            "member {name} type not match, expect {expect}, got {got}",
                             name = key.to_path(),
                             expect =
                                 humanize_type(context.db, &source_member_type, RenderLevel::Simple),
@@ -493,7 +493,7 @@ fn check_ref_type_compact_object(
                     return Err(TypeCheckFailReason::TypeNotMatch);
                 }
                 return Err(TypeCheckFailReason::TypeNotMatchWithReason(
-                    t!("missing member %{name}, in table", name = key.to_path()).to_string(),
+                    format!("missing member {name}, in table", name = key.to_path()).to_string(),
                 ));
             }
             _ => {} // Optional member not found, continue

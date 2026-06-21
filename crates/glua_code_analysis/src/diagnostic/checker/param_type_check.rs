@@ -12,6 +12,7 @@ use crate::{
     LuaType, LuaTypeOwner, LuaUnionType, RenderLevel, SemanticDeclLevel, SemanticModel,
     TypeCheckFailReason, TypeCheckResult, TypeVisitTrait, VariadicType,
     diagnostic::checker::assign_type_mismatch::check_table_expr, humanize_type, infer_index_expr,
+    resolve_alias_type,
 };
 
 use super::{Checker, DiagnosticContext, should_suppress_inferred_value_mismatch};
@@ -248,14 +249,15 @@ fn type_is_callable_with_actionable_params(
             LuaType::DocFunction(func) => {
                 is_candidate = function_has_actionable_params(func);
             }
-            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
-                is_candidate = db
-                    .get_type_index()
-                    .get_type_decl(type_id)
-                    .and_then(|type_decl| type_decl.get_alias_ref())
-                    .is_some_and(|origin| {
-                        type_is_callable_with_actionable_params(db, origin, visited_signatures)
-                    });
+            LuaType::Ref(_) | LuaType::Def(_) => {
+                let resolved = resolve_alias_type(db, inner_type);
+                if resolved.typ != *inner_type {
+                    is_candidate = type_is_callable_with_actionable_params(
+                        db,
+                        &resolved.typ,
+                        visited_signatures,
+                    );
+                }
             }
             LuaType::Signature(signature_id) => {
                 is_candidate =
@@ -757,8 +759,8 @@ fn add_type_check_diagnostic(
             context.add_diagnostic(
                 DiagnosticCode::ParamTypeMismatch,
                 range,
-                t!(
-                    "expected `%{source}` but found `%{found}`. %{reason}",
+                format!(
+                    "expected `{source}` but found `{found}`. {reason}",
                     source = humanize_type(db, param_type, RenderLevel::Simple),
                     found = humanize_type(db, expr_type, RenderLevel::Simple),
                     reason = reason_message

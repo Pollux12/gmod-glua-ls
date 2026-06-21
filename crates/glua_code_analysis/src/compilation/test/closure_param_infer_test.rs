@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{LuaType, VirtualWorkspace};
+    use crate::{GmodHookKind, LuaType, VirtualWorkspace};
 
     #[test]
     fn test_closure_param_infer() {
@@ -589,8 +589,9 @@ mod test {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
-        ws.def(
+        let file_id = ws.def(
             r#"
             ---@class Entity
             local Entity = {}
@@ -607,12 +608,6 @@ mod test {
             ---@return boolean
             function GM:AcceptInput(ent, input, activator, caller, value) end
 
-            hook = {}
-            ---@param eventName string
-            ---@param identifier any
-            ---@param func function
-            function hook.Add(eventName, identifier, func) end
-
             hook.Add("AcceptInput", "Test", function(ent, input, activator, caller, value)
                 gmod_hook_ent = ent
                 gmod_hook_input = input
@@ -622,6 +617,23 @@ mod test {
             end)
             "#,
         );
+
+        {
+            let metadata = ws
+                .get_db_mut()
+                .get_gmod_infer_index()
+                .get_hook_file_metadata(&file_id)
+                .expect("expected hook metadata for annotated hook.Add");
+            let site = metadata
+                .sites
+                .iter()
+                .find(|site| {
+                    site.kind == GmodHookKind::Add
+                        && site.hook_name.as_deref() == Some("AcceptInput")
+                })
+                .expect("expected AcceptInput hook metadata");
+            assert_eq!(site.callback_arg_idx, Some(2));
+        }
 
         let hook_ent = ws.expr_ty("gmod_hook_ent");
         let hook_input = ws.expr_ty("gmod_hook_input");
@@ -643,5 +655,42 @@ mod test {
         );
         assert_eq!(ws.humanize_type(hook_caller), ws.humanize_type(entity_type));
         assert_eq!(ws.humanize_type(hook_value), ws.humanize_type(any_type));
+    }
+
+    #[test]
+    fn test_gmod_hook_callback_params_infer_from_annotated_wrapper() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class Player
+            local Player = {}
+
+            ---@class GM
+            GM = {}
+
+            ---@param ply Player
+            ---@return boolean
+            function GM:PlayerSpawn(ply) end
+
+            ---@[call_arg("gmod.hook", "add")]
+            ---@param eventName string
+            ---@[call_arg("gmod.hook", "callback")]
+            ---@param callback function
+            local function add_hook(eventName, callback, identifier) end
+
+            add_hook("PlayerSpawn", function(ply)
+                gmod_wrapper_hook_ply = ply
+            end, "Test")
+            "#,
+        );
+
+        let hook_ply = ws.expr_ty("gmod_wrapper_hook_ply");
+        let player_type = ws.ty("Player");
+        assert_eq!(ws.humanize_type(hook_ply), ws.humanize_type(player_type));
     }
 }

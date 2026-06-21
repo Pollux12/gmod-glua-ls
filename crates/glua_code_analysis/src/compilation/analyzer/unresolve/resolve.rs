@@ -5,8 +5,8 @@ use std::{
 };
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat,
-    LuaIndexExpr, LuaLocalStat, LuaTableExpr, LuaTableField, PathTrait,
+    BinaryOperator, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaLocalStat,
+    LuaTableExpr, LuaTableField, PathTrait,
 };
 use internment::ArcIntern;
 use rowan::TextSize;
@@ -23,7 +23,7 @@ use crate::{
         unresolve::UnResolveSpecialCall,
     },
     db_index::{LuaFunctionType, LuaMemberOwner, LuaSignature, LuaSignatureId},
-    find_members_with_key, humanize_type,
+    find_members_with_key, get_member_value_expr, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
         get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, infer_expr_semantic_decl,
@@ -678,34 +678,6 @@ fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) 
         LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
         LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
     }
-}
-
-fn get_member_value_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
-
-    if let Some(field) = LuaTableField::cast(node.clone()) {
-        return field.get_value_expr();
-    }
-
-    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
-        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
-            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
-            let value_idx = vars
-                .iter()
-                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
-            return value_exprs.get(value_idx).cloned();
-        }
-
-        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
-            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
-        }
-    }
-
-    None
 }
 
 pub(crate) fn get_setmetatable_call_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {

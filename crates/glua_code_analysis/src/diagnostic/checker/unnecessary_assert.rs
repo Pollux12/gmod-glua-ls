@@ -37,15 +37,14 @@ fn check_assert_rule(
             context.add_diagnostic(
                 DiagnosticCode::UnnecessaryAssert,
                 call_expr.get_range(),
-                t!("Unnecessary assert: this expression is always truthy").to_string(),
+                "Unnecessary assert: this expression is always truthy".to_string(),
                 None,
             );
         } else if first_type.is_always_falsy() {
             context.add_diagnostic(
                 DiagnosticCode::UnnecessaryAssert,
                 call_expr.get_range(),
-                t!("Impossible assert: this expression is always falsy; prefer `error()`")
-                    .to_string(),
+                "Impossible assert: this expression is always falsy; prefer `error()`".to_string(),
                 None,
             );
         }

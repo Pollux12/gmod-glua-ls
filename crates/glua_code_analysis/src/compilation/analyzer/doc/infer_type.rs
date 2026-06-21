@@ -191,7 +191,7 @@ fn infer_buildin_or_ref_type(
                     analyzer.file_id,
                     AnalyzeError::new(
                         DiagnosticCode::TypeNotFound,
-                        &t!("Type '%{name}' not found", name = name),
+                        &format!("Type '{name}' not found", name = name),
                         range,
                     ),
                 );
@@ -242,7 +242,7 @@ fn infer_generic_type(analyzer: &mut DocAnalyzer, generic_type: &LuaDocGenericTy
                 analyzer.file_id,
                 AnalyzeError::new(
                     DiagnosticCode::TypeNotFound,
-                    &t!("Type '%{name}' not found", name = name),
+                    &format!("Type '{name}' not found", name = name),
                     generic_type.get_range(),
                 ),
             );
@@ -502,6 +502,7 @@ fn infer_func_type(analyzer: &mut DocAnalyzer, func: &LuaDocFuncType) -> LuaType
     }
 
     let mut params_result = Vec::new();
+    let mut optional_params = Vec::new();
     let mut is_variadic = false;
     for param in func.get_params() {
         let name = if let Some(param) = param.get_name_token() {
@@ -525,6 +526,7 @@ fn infer_func_type(analyzer: &mut DocAnalyzer, func: &LuaDocFuncType) -> LuaType
             None
         };
 
+        optional_params.push(nullable && name != "...");
         params_result.push((name, type_ref));
     }
 
@@ -581,6 +583,7 @@ fn infer_func_type(analyzer: &mut DocAnalyzer, func: &LuaDocFuncType) -> LuaType
             params_result,
             return_type,
         )
+        .with_optional_params(optional_params)
         .into(),
     )
 }

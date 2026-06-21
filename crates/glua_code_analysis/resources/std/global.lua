@@ -98,6 +98,7 @@ function dofile(filename) end
 --- addition of error position information to the message.
 ---@param message any
 ---@param level? integer
+---@return never
 function error(message, level) end
 
 ---

@@ -13,7 +13,6 @@ mod config;
 mod db_index;
 mod diagnostic;
 mod gamemode_base;
-mod locale;
 mod profile;
 mod resources;
 mod semantic;
@@ -27,11 +26,8 @@ pub use diagnostic::*;
 pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
 use glua_parser::{LineIndex, LuaParser, LuaSyntaxTree};
-pub use locale::get_locale_code;
 use lsp_types::Uri;
 pub use profile::Profile;
-pub use resources::get_best_resources_dir;
-pub use resources::load_resource_from_include_dir;
 use resources::load_resource_std;
 use schema_to_glua::SchemaConverter;
 pub use semantic::*;
@@ -39,19 +35,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
-pub use test_lib::VirtualWorkspace;
+pub use test_lib::{GMOD_CALL_ARG_BUILTINS_FIXTURE, VirtualWorkspace};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 pub use vfs::*;
-
-#[macro_use]
-extern crate rust_i18n;
-
-rust_i18n::i18n!("./locales", fallback = "en");
-
-pub fn set_locale(locale: &str) {
-    rust_i18n::set_locale(locale);
-}
 
 pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
     let mut url_contents = HashMap::new();
@@ -112,9 +99,20 @@ impl EmmyLuaAnalysis {
         }
     }
 
-    pub fn init_std_lib(&mut self, create_resources_dir: Option<String>) {
+    pub fn init_std_lib(&mut self) {
         let is_jit = matches!(self.emmyrc.runtime.version, EmmyrcLuaVersion::LuaJIT);
-        let (std_root, files) = load_resource_std(create_resources_dir, is_jit);
+        let (std_root, files) = load_resource_std(is_jit);
+        // Normalize so the root's drive-letter casing matches VFS file paths
+        // (the URI round-trip uppercases the Windows drive letter). Without
+        // this, `extract_module_path` prefix matching would fail when the
+        // env-derived root has a lowercase drive letter.
+        let std_root = normalize_workspace_root(std_root);
+        self.init_std_lib_from_files(std_root, files);
+    }
+
+    /// Register a pre-built set of embedded std files directly into the analysis
+    /// workspace without going through the resource-loading pipeline.
+    pub(crate) fn init_std_lib_from_files(&mut self, std_root: PathBuf, files: Vec<LuaFileInfo>) {
         self.compilation
             .get_db_mut()
             .get_module_index_mut()

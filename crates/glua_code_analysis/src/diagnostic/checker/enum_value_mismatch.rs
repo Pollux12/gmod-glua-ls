@@ -92,8 +92,8 @@ fn check_enum_value_pair(
         context.add_diagnostic(
             DiagnosticCode::EnumValueMismatch,
             value_expr.get_range(),
-            t!(
-                "Value '%{value}' does not match any enum value. Expected one of: %{enum_values}",
+            format!(
+                "Value '{value}' does not match any enum value. Expected one of: {enum_values}",
                 value = constant_value_str,
                 enum_values = enum_values_str.join(", ")
             )

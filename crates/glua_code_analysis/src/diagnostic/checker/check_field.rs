@@ -260,8 +260,8 @@ fn check_index_expr(
             context.add_diagnostic(
                 DiagnosticCode::UndefinedField,
                 index_key.get_range()?,
-                t!(
-                    "Cannot call methods via `:` on a table returned by GetTable(). Use dot-access `.%{field}` instead. ",
+                format!(
+                    "Cannot call methods via `:` on a table returned by GetTable(). Use dot-access `.{field}` instead. ",
                     field = index_key.get_path_part(),
                 )
                 .to_string(),
@@ -329,8 +329,8 @@ fn check_index_expr(
             context.add_diagnostic(
                 DiagnosticCode::InjectField,
                 index_key.get_range()?,
-                t!(
-                    "Fields cannot be injected into the reference of `%{class}` for `%{field}`. ",
+                format!(
+                    "Fields cannot be injected into the reference of `{class}` for `{field}`. ",
                     class = humanize_lint_type(db, &prefix_typ),
                     field = field_name,
                 )
@@ -345,7 +345,7 @@ fn check_index_expr(
             context.add_diagnostic(
                 DiagnosticCode::UndefinedField,
                 index_key.get_range()?,
-                t!("Undefined field `%{field}`. ", field = field_name,).to_string(),
+                format!("Undefined field `{field}`. ", field = field_name,).to_string(),
                 None,
             );
         }

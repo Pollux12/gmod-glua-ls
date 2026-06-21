@@ -1,4 +1,7 @@
-use glua_code_analysis::{EmmyLuaAnalysis, Emmyrc, FileId, RenderLevel, VirtualUrlGenerator};
+use glua_code_analysis::{
+    EmmyLuaAnalysis, Emmyrc, FileId, GMOD_CALL_ARG_BUILTINS_FIXTURE, RenderLevel,
+    VirtualUrlGenerator,
+};
 use googletest::prelude::*;
 use itertools::Itertools;
 use lsp_types::{
@@ -125,7 +128,7 @@ impl ProviderVirtualWorkspace {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = false;
         analysis.update_config(Arc::new(emmyrc));
-        analysis.init_std_lib(None);
+        analysis.init_std_lib();
         let base = &generator.base;
         analysis.add_main_workspace(base.clone());
         ProviderVirtualWorkspace {
@@ -147,6 +150,13 @@ impl ProviderVirtualWorkspace {
         self.analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
             .unwrap()
+    }
+
+    pub fn def_gmod_call_arg_builtins(&mut self) -> FileId {
+        self.def_file(
+            "lua/includes/glua_ls_gmod_call_arg_builtins.lua",
+            GMOD_CALL_ARG_BUILTINS_FIXTURE,
+        )
     }
 
     pub fn def_files(&mut self, files: Vec<(&str, &str)>) -> Vec<FileId> {

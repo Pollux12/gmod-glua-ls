@@ -81,6 +81,43 @@ After `vgui.Register(name, PANEL, base)`, GLuaLS recognizes `"MyPanel"` in later
 
 ---
 
+## Derma controls and skins
+
+GLuaLS also understands `derma.DefineControl`, `derma.DefineSkin`, `derma.GetNamedSkin`, `derma.GetSkinTable()`, and panel skin setters:
+
+```lua
+local SKIN = {}
+
+function SKIN:PaintFrame(panel, w, h)
+    draw.RoundedBox(0, 0, 0, w, h, color_black)
+end
+
+derma.DefineSkin("MySkin", "Dark UI skin", SKIN)
+
+local frame = vgui.Create("DFrame")
+frame:SetSkin("MySkin") -- navigates to the skin definition
+```
+
+Skin names support completion, hover, references, and go-to-definition in the same way as panel names.
+
+---
+
+## Custom wrappers
+
+If your framework wraps VGUI or Derma APIs, annotate the wrapper parameters with [`@call_arg`](/annotations/call-arg). This lets GLuaLS recognize the wrapped calls without matching the wrapper by name.
+
+```lua
+---@[call_arg("gmod.derma_skin", "define")]
+---@param name string
+---@param description string
+---@param skin table
+function MyUI.DefineSkin(name, description, skin)
+    derma.DefineSkin(name, description, skin)
+end
+```
+
+---
+
 ## Scripted Entity Explorer
 
 The Scripted Class Explorer lists VGUI panels for navigation. Click a panel class in the explorer to open its definition.

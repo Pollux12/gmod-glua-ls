@@ -9,6 +9,7 @@ use crate::{
     semantic::infer::{
         VarRefId,
         infer_index::infer_member_by_member_key,
+        infer_param_with_cache,
         narrow::{
             ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
             get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow, narrow_down_type,
@@ -494,7 +495,7 @@ fn get_type_at_call_expr_by_type_guard(
 
     match condition_flow {
         InferConditionFlow::TrueCondition => Ok(ResultTypeOrContinue::Result(
-            narrow_type_guard_true_branch(db, antecedent_type, guard_type),
+            narrow_type_guard_true_branch(db, cache, var_ref_id, antecedent_type, guard_type),
         )),
         InferConditionFlow::FalseCondition => Ok(ResultTypeOrContinue::Result(
             TypeOps::Remove.apply(db, &antecedent_type, &guard_type),
@@ -504,6 +505,8 @@ fn get_type_at_call_expr_by_type_guard(
 
 fn narrow_type_guard_true_branch(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
+    var_ref_id: &VarRefId,
     antecedent_type: LuaType,
     guard_type: LuaType,
 ) -> LuaType {
@@ -521,7 +524,42 @@ fn narrow_type_guard_true_branch(
         return guard_type;
     }
 
+    // The inferred type cache for mutable unannotated parameters is flow-insensitive:
+    // later writes can poison the origin type used by earlier guards (for example,
+    // Starfall's `sfmeshdata = meshToStream(...)` made `elseif istable(sfmeshdata)`
+    // start from `string`). In that case the runtime TypeGuard is the better authority.
+    if is_inferred_mutable_param_without_declared_type(db, cache, var_ref_id) {
+        return guard_type;
+    }
+
     remove_false_or_nil(antecedent_type)
+}
+
+fn is_inferred_mutable_param_without_declared_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    var_ref_id: &VarRefId,
+) -> bool {
+    let Some(decl_id) = var_ref_id.get_decl_id_ref() else {
+        return false;
+    };
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return false;
+    };
+    if !decl.is_param() || infer_param_with_cache(db, cache, decl).is_ok() {
+        return false;
+    }
+    if !db
+        .get_type_index()
+        .get_type_cache(&decl_id.into())
+        .is_some_and(|type_cache| type_cache.is_infer())
+    {
+        return false;
+    }
+
+    db.get_reference_index()
+        .get_decl_references(&decl_id.file_id, &decl_id)
+        .is_some_and(|decl_refs| decl_refs.mutable)
 }
 
 #[allow(clippy::too_many_arguments)]

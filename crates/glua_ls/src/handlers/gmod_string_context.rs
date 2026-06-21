@@ -1,5 +1,10 @@
+use glua_code_analysis::{
+    DbIndex, LuaCallArgRole, LuaDeclId, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaType,
+    LuaTypeOwner, SemanticDeclLevel, SemanticModel, find_call_arg_role_from_type,
+};
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken, PathTrait,
+    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaLiteralExpr,
+    LuaStringToken, PathTrait,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,7 +15,6 @@ pub(crate) enum NetMessageCallKind {
 
 #[derive(Clone, Debug)]
 pub(crate) struct StringCallContext {
-    pub(crate) call_path: String,
     pub(crate) arg_index: usize,
     pub(crate) name: String,
 }
@@ -23,50 +27,380 @@ pub(crate) fn extract_string_call_context(
     let arg_index = call_arg_list
         .get_args()
         .position(|arg| arg.get_position() == literal_expr.get_position())?;
-    let call_expr = call_arg_list.get_parent::<LuaCallExpr>()?;
+    call_arg_list.get_parent::<LuaCallExpr>()?;
 
     Some(StringCallContext {
-        call_path: call_expr.get_access_path()?,
         arg_index,
         name: normalize_string_name(string_token.get_value())?,
     })
 }
 
-pub(crate) fn is_vgui_panel_string_context(call_path: &str, arg_index: usize) -> bool {
-    if matches_call_path(call_path, "vgui.Create") {
-        return arg_index == 0;
-    }
-
-    if matches_call_path(call_path, "vgui.Register") {
-        return arg_index == 0 || arg_index == 2;
-    }
-
-    if matches_call_path(call_path, "derma.DefineControl") {
-        return arg_index == 0 || arg_index == 3;
-    }
-
-    // `:Add` is broadly matched by method name only (no receiver type check).
-    // False positives are mitigated by the subsequent VGUI index lookup finding no match.
-    matches_call_path(call_path, "Add") && arg_index == 0
+pub(crate) fn is_annotated_vgui_panel_string_context(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    arg_index: usize,
+) -> bool {
+    has_string_call_arg_role(
+        semantic_model,
+        call_expr,
+        arg_index,
+        "gmod.vgui_panel",
+        &["define", "define_control", "base", "reference"],
+    )
 }
 
-pub(crate) fn net_message_call_kind(
-    call_path: &str,
+pub(crate) fn is_annotated_derma_skin_string_context(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    arg_index: usize,
+) -> bool {
+    has_string_call_arg_role(
+        semantic_model,
+        call_expr,
+        arg_index,
+        "gmod.derma_skin",
+        &["define", "reference"],
+    )
+}
+
+pub(crate) fn find_string_call_arg_role(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    arg_index: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    let is_colon_call = call_expr.is_colon_call();
+    if let Some(semantic_decl) = semantic_model.find_decl(
+        prefix_expr.syntax().clone().into(),
+        SemanticDeclLevel::NoTrace,
+    ) && let Some(role) = find_call_arg_role_from_semantic_decl(
+        semantic_model,
+        semantic_decl,
+        arg_index,
+        is_colon_call,
+        domain,
+        roles,
+    ) {
+        return Some(role);
+    }
+
+    let callable_type = semantic_model.infer_expr(prefix_expr).ok()?;
+    let param_idx = call_arg_to_param_idx_for_type(
+        semantic_model.get_db(),
+        &callable_type,
+        arg_index,
+        is_colon_call,
+    );
+    find_call_arg_role_from_type(
+        semantic_model.get_db(),
+        &callable_type,
+        param_idx,
+        domain,
+        roles,
+    )
+}
+
+pub(crate) fn find_call_arg_roles(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    arg_count: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Vec<(usize, LuaCallArgRole)> {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return Vec::new();
+    };
+    let is_colon_call = call_expr.is_colon_call();
+
+    if let Some(semantic_decl) = semantic_model.find_decl(
+        prefix_expr.syntax().clone().into(),
+        SemanticDeclLevel::NoTrace,
+    ) {
+        return (0..arg_count)
+            .filter_map(|arg_index| {
+                find_call_arg_role_from_semantic_decl(
+                    semantic_model,
+                    semantic_decl.clone(),
+                    arg_index,
+                    is_colon_call,
+                    domain,
+                    roles,
+                )
+                .map(|role| (arg_index, role))
+            })
+            .collect();
+    }
+
+    let Some(callable_type) = semantic_model.infer_expr(prefix_expr).ok() else {
+        return Vec::new();
+    };
+
+    (0..arg_count)
+        .filter_map(|arg_index| {
+            find_call_arg_role_from_type(
+                semantic_model.get_db(),
+                &callable_type,
+                call_arg_to_param_idx_for_type(
+                    semantic_model.get_db(),
+                    &callable_type,
+                    arg_index,
+                    is_colon_call,
+                ),
+                domain,
+                roles,
+            )
+            .map(|role| (arg_index, role))
+        })
+        .collect()
+}
+
+pub(crate) fn has_string_call_arg_role(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    arg_index: usize,
+    domain: &str,
+    roles: &[&str],
+) -> bool {
+    find_string_call_arg_role(semantic_model, call_expr, arg_index, domain, roles).is_some()
+}
+
+/// Convert a call-argument index into the parameter index it binds to.
+///
+/// A colon call (`obj:method(a)`) passes the receiver as an implicit first
+/// argument, so call arg 0 maps to param 1 — but only when the callee is
+/// *not* itself colon-defined (a colon-defined signature already omits the
+/// `self` parameter, so the indices line up again). This mirrors the
+/// analyzer's `param_idx_to_call_arg_idx` in the opposite direction; keeping
+/// the two rules in sync is what prevents an off-by-one for colon-defined
+/// methods such as `Entity:NetworkVar`.
+fn call_arg_to_param_idx(arg_index: usize, is_colon_call: bool, is_colon_define: bool) -> usize {
+    if is_colon_call && !is_colon_define {
+        arg_index + 1
+    } else {
+        arg_index
+    }
+}
+
+/// Resolve the `call_arg` parameter index for a callable `LuaType`, using the
+/// callee's own `is_colon_define` flag so colon calls are adjusted correctly.
+pub(crate) fn call_arg_to_param_idx_for_type(
+    db: &DbIndex,
+    typ: &LuaType,
+    arg_index: usize,
+    is_colon_call: bool,
+) -> usize {
+    call_arg_to_param_idx(arg_index, is_colon_call, type_is_colon_define(db, typ))
+}
+
+/// Best-effort `is_colon_define` for a callable type. Only `Signature`/
+/// `DocFunction` carry the flag; anything else is treated as a plain function
+/// (`false`), which matches every annotated std-lib definition that is not a
+/// method.
+fn type_is_colon_define(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::DocFunction(func) => func.is_colon_define(),
+        LuaType::Signature(signature_id) => db
+            .get_signature_index()
+            .get(signature_id)
+            .is_some_and(|signature| signature.is_colon_define),
+        _ => false,
+    }
+}
+
+pub(crate) fn annotated_net_message_flow_call_kind(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
     arg_index: usize,
 ) -> Option<NetMessageCallKind> {
-    if arg_index != 0 {
-        return None;
+    annotated_net_message_call_kind(semantic_model, call_expr, arg_index)
+}
+
+pub(crate) fn is_net_message_string_context(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    arg_index: usize,
+) -> bool {
+    has_string_call_arg_role(
+        semantic_model,
+        call_expr,
+        arg_index,
+        "gmod.net_message",
+        &["define", "start", "receive", "reference"],
+    )
+}
+
+pub(crate) fn is_hook_name_string_context(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    arg_index: usize,
+) -> bool {
+    if has_string_call_arg_role(
+        semantic_model,
+        call_expr,
+        arg_index,
+        "gmod.hook",
+        &["add", "emit", "remove", "reference"],
+    ) {
+        return true;
     }
 
-    if matches_call_path(call_path, "net.Start") {
-        return Some(NetMessageCallKind::Start);
+    let Some(call_path) = call_expr.get_access_path() else {
+        return false;
+    };
+    arg_index == 0
+        && semantic_model
+            .get_emmyrc()
+            .gmod
+            .hook_mappings
+            .emitter_to_hook
+            .iter()
+            .any(|(emitter_path, mapped_hook)| mapped_hook == "*" && call_path == *emitter_path)
+}
+
+fn find_call_arg_role_from_semantic_decl(
+    semantic_model: &SemanticModel,
+    semantic_decl: LuaSemanticDeclId,
+    arg_index: usize,
+    is_colon_call: bool,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    match semantic_decl {
+        LuaSemanticDeclId::Signature(signature_id) => find_call_arg_role_from_signature_id(
+            semantic_model,
+            signature_id,
+            arg_index,
+            is_colon_call,
+            domain,
+            roles,
+        ),
+        LuaSemanticDeclId::LuaDecl(decl_id) => find_call_arg_role_from_decl_id(
+            semantic_model,
+            decl_id,
+            arg_index,
+            is_colon_call,
+            domain,
+            roles,
+        ),
+        LuaSemanticDeclId::Member(member_id) => find_call_arg_role_from_member_id(
+            semantic_model,
+            member_id,
+            arg_index,
+            is_colon_call,
+            domain,
+            roles,
+        ),
+        LuaSemanticDeclId::TypeDecl(_) => None,
+    }
+}
+
+fn find_call_arg_role_from_signature_id(
+    semantic_model: &SemanticModel,
+    signature_id: LuaSignatureId,
+    arg_index: usize,
+    is_colon_call: bool,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    let signature = semantic_model
+        .get_db()
+        .get_signature_index()
+        .get(&signature_id)?;
+    let param_idx = call_arg_to_param_idx(arg_index, is_colon_call, signature.is_colon_define);
+    let mut best = None;
+    signature.visit_call_arg_roles_for_param(param_idx, &mut |role| {
+        if role.domain != domain || !roles.iter().any(|candidate| *candidate == role.role) {
+            return;
+        }
+
+        if best.as_ref().is_none_or(|current: &LuaCallArgRole| {
+            role.priority.unwrap_or(0) > current.priority.unwrap_or(0)
+        }) {
+            best = Some(role.clone());
+        }
+    });
+    best
+}
+
+fn find_call_arg_role_from_decl_id(
+    semantic_model: &SemanticModel,
+    decl_id: LuaDeclId,
+    arg_index: usize,
+    is_colon_call: bool,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    if let Some(signature_id) = signature_id_from_decl_value(semantic_model, decl_id)
+        && let Some(role) = find_call_arg_role_from_signature_id(
+            semantic_model,
+            signature_id,
+            arg_index,
+            is_colon_call,
+            domain,
+            roles,
+        )
+    {
+        return Some(role);
     }
 
-    if matches_call_path(call_path, "net.Receive") {
-        return Some(NetMessageCallKind::Receive);
-    }
+    let typ = semantic_model.get_type(decl_id.into());
+    let param_idx =
+        call_arg_to_param_idx_for_type(semantic_model.get_db(), &typ, arg_index, is_colon_call);
+    find_call_arg_role_from_type(semantic_model.get_db(), &typ, param_idx, domain, roles)
+}
 
-    None
+fn find_call_arg_role_from_member_id(
+    semantic_model: &SemanticModel,
+    member_id: LuaMemberId,
+    arg_index: usize,
+    is_colon_call: bool,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    let typ = semantic_model.get_type(LuaTypeOwner::Member(member_id));
+    let param_idx =
+        call_arg_to_param_idx_for_type(semantic_model.get_db(), &typ, arg_index, is_colon_call);
+    find_call_arg_role_from_type(semantic_model.get_db(), &typ, param_idx, domain, roles)
+}
+
+fn signature_id_from_decl_value(
+    semantic_model: &SemanticModel,
+    decl_id: LuaDeclId,
+) -> Option<LuaSignatureId> {
+    let decl = semantic_model
+        .get_db()
+        .get_decl_index()
+        .get_decl(&decl_id)?;
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    let root = semantic_model
+        .get_db()
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)?
+        .get_red_root();
+    let value_node = value_syntax_id.to_node_from_root(&root)?;
+    let closure = LuaClosureExpr::cast(value_node)?;
+    Some(LuaSignatureId::from_closure(decl_id.file_id, &closure))
+}
+
+pub(crate) fn annotated_net_message_call_kind(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    arg_index: usize,
+) -> Option<NetMessageCallKind> {
+    let role = find_string_call_arg_role(
+        semantic_model,
+        call_expr,
+        arg_index,
+        "gmod.net_message",
+        &["start", "receive"],
+    )?;
+    match role.role.as_str() {
+        "start" => Some(NetMessageCallKind::Start),
+        "receive" => Some(NetMessageCallKind::Receive),
+        _ => None,
+    }
 }
 
 pub(crate) fn normalize_string_name(name: String) -> Option<String> {
@@ -78,16 +412,39 @@ pub(crate) fn normalize_string_name(name: String) -> Option<String> {
     }
 }
 
-pub(crate) fn matches_call_path(path: &str, target: &str) -> bool {
-    if path == target {
-        return true;
+#[cfg(test)]
+mod tests {
+    use super::call_arg_to_param_idx;
+
+    #[test]
+    fn dot_call_dot_define_is_identity() {
+        // foo.bar("x") on `function foo.bar(name)` — arg 0 is param 0.
+        assert_eq!(call_arg_to_param_idx(0, false, false), 0);
+        assert_eq!(call_arg_to_param_idx(1, false, false), 1);
     }
-    if path.len() > target.len() {
-        let sep_idx = path.len() - target.len() - 1;
-        let sep = path.as_bytes()[sep_idx];
-        if (sep == b'.' || sep == b':') && path[sep_idx + 1..] == *target {
-            return true;
-        }
+
+    #[test]
+    fn colon_call_dot_define_shifts_by_one() {
+        // obj:bar("x") on `function obj.bar(self, name)` — the receiver is the
+        // implicit first arg, so call arg 0 binds to param 1.
+        assert_eq!(call_arg_to_param_idx(0, true, false), 1);
+        assert_eq!(call_arg_to_param_idx(1, true, false), 2);
     }
-    false
+
+    #[test]
+    fn colon_call_colon_define_is_identity() {
+        // ent:NetworkVar("x") on `function Entity:NetworkVar(type, ...)` — the
+        // colon-defined signature omits `self`, so the indices line up again.
+        // This is the case the previous `adjusted_arg_index` got wrong.
+        assert_eq!(call_arg_to_param_idx(0, true, true), 0);
+        assert_eq!(call_arg_to_param_idx(2, true, true), 2);
+    }
+
+    #[test]
+    fn dot_call_colon_define_is_identity() {
+        // Entity.NetworkVar(ent, "x") spelled with a dot still lines up with a
+        // colon-defined signature (param 0 is `type`, not `self`).
+        assert_eq!(call_arg_to_param_idx(0, false, true), 0);
+        assert_eq!(call_arg_to_param_idx(1, false, true), 1);
+    }
 }

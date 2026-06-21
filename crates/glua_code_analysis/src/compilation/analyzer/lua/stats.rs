@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     CacheEntry, FileId, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
-    LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
+    LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::{
         analyzer::{
             common::{add_member, bind_type},
@@ -58,6 +58,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             break;
         };
         let decl_id = LuaDeclId::new(analyzer.file_id, position);
+        if is_call_or_index_expr(&expr) {
+            analyzer
+                .context
+                .request_uninformative_local_decl_reinfer(decl_id);
+        }
 
         if let Some(reason) = should_defer_guarded_index_alias(analyzer, &expr) {
             analyzer.context.request_stabilization(analyzer.file_id);
@@ -112,7 +117,9 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
                     continue;
                 }
-                if should_defer_nil_gmod_index_alias(analyzer, &expr, &expr_type) {
+                if should_defer_nil_gmod_index_alias(analyzer, &expr, &expr_type)
+                    || should_defer_weak_gmod_dynamic_index_alias(analyzer, &expr, &expr_type)
+                {
                     analyzer.context.request_stabilization(analyzer.file_id);
                     clear_index_expr_type_cache(analyzer, &expr);
                     let unresolve = UnResolveDecl {
@@ -324,6 +331,28 @@ fn should_defer_nil_gmod_index_alias(
         && matches!(expr, LuaExpr::IndexExpr(_))
 }
 
+fn should_defer_weak_gmod_dynamic_index_alias(
+    analyzer: &LuaAnalyzer,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    analyzer.gmod_enabled
+        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        && matches!(expr, LuaExpr::IndexExpr(index_expr) if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))))
+        && is_weak_dynamic_index_alias_type(expr_type)
+}
+
+fn is_weak_dynamic_index_alias_type(expr_type: &LuaType) -> bool {
+    match expr_type {
+        LuaType::Any | LuaType::Unknown => true,
+        LuaType::Union(union) => match union.as_ref() {
+            LuaUnionType::Nullable(inner) => inner.is_any() || inner.is_unknown(),
+            LuaUnionType::Multi(_) => false,
+        },
+        _ => false,
+    }
+}
+
 fn should_defer_gmod_self_index(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
     if !analyzer.gmod_enabled || !analyzer.db.get_emmyrc().gmod.infer_dynamic_fields {
         return false;
@@ -378,7 +407,7 @@ fn clear_index_expr_type_cache(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) {
     let mut current_expr = expr.clone();
     while let LuaExpr::IndexExpr(index_expr) = current_expr {
         let syntax_id = index_expr.get_syntax_id();
-        if matches!(cache.expr_cache.get(&syntax_id), Some(CacheEntry::Cache(typ)) if typ.is_nil())
+        if matches!(cache.expr_cache.get(&syntax_id), Some(CacheEntry::Cache(typ)) if typ.is_nil() || is_weak_dynamic_index_alias_type(typ))
         {
             cache.expr_cache.remove(&syntax_id);
             cache.expr_var_ref_id_cache.remove(&syntax_id);
@@ -768,7 +797,15 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         record_assign_elapsed(analyzer, step_start, AssignProfileStep::GetOwner);
 
         let step_start = profile_enabled.then(std::time::Instant::now);
-        if special_assign_pattern(analyzer, type_owner.clone(), var.clone(), expr.clone()).is_some()
+        let assign_stat_range = assign_stat.get_range();
+        if special_assign_pattern(
+            analyzer,
+            type_owner.clone(),
+            var.clone(),
+            expr.clone(),
+            assign_stat_range,
+        )
+        .is_some()
         {
             record_assign_elapsed(analyzer, step_start, AssignProfileStep::Special);
             if profile_enabled {
@@ -1065,6 +1102,10 @@ fn is_table_shape_cleanup_type(typ: &LuaType) -> bool {
 
 fn should_defer_none_infer_expr(expr: &LuaExpr) -> bool {
     matches!(expr, LuaExpr::CallExpr(_))
+}
+
+fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
+    matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_))
 }
 
 fn should_defer_nil_gmod_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
@@ -2194,11 +2235,23 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
     Some(())
 }
 
+/// Extract a string literal value from an expression, if it is a literal string.
+fn extract_string_literal_from_expr(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(string_token) => Some(string_token.get_value().to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn special_assign_pattern(
     analyzer: &mut LuaAnalyzer,
     type_owner: LuaTypeOwner,
     var: LuaVarExpr,
     expr: LuaExpr,
+    assign_stat_range: rowan::TextRange,
 ) -> Option<()> {
     let access_path = var.get_access_path()?;
     let binary_expr = if let LuaExpr::BinaryExpr(binary_expr) = expr {
@@ -2236,6 +2289,28 @@ fn special_assign_pattern(
             if guarded_table_expr {
                 set_index_expr_owner(analyzer, var);
             }
+
+            // Register inferred string default for `x = x or "literal"`.
+            // This is a SIBLING branch to the table-guard path: only fires
+            // when the RHS is NOT a TableExpr and IS a string literal,
+            // and the type_owner is a plain Decl. Completely disjoint from
+            // the table-guard path.
+            if !guarded_table_expr {
+                if let LuaTypeOwner::Decl(decl_id) = &type_owner {
+                    if let Some(string_value) = extract_string_literal_from_expr(&right) {
+                        analyzer
+                            .db
+                            .get_property_index_mut()
+                            .add_inferred_string_default(
+                                analyzer.file_id,
+                                *decl_id,
+                                smol_str::SmolStr::new(string_value),
+                                assign_stat_range,
+                            );
+                    }
+                }
+            }
+
             assign_merge_type_owner_and_expr_type(
                 analyzer,
                 type_owner,
@@ -2267,11 +2342,25 @@ fn infer_guarded_table_assignment_type(
     if left_type.is_nil() || left_type.is_unknown() || left_type.is_never() {
         return Ok(right_type);
     }
+    if should_prefer_guarded_dynamic_index_rhs(analyzer, left, &left_type) {
+        return Ok(right_type);
+    }
     if !(left_type.is_any() || left_type.is_table()) {
         return analyzer.infer_expr(binary_expr);
     }
 
     Ok(TypeOps::Union.apply(analyzer.db, &left_type, &right_type))
+}
+
+fn should_prefer_guarded_dynamic_index_rhs(
+    analyzer: &LuaAnalyzer,
+    left: &LuaExpr,
+    left_type: &LuaType,
+) -> bool {
+    analyzer.gmod_enabled
+        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        && left_type.is_any()
+        && matches!(left, LuaExpr::IndexExpr(index_expr) if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))))
 }
 
 fn has_delayed_definition_attribute(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bool {

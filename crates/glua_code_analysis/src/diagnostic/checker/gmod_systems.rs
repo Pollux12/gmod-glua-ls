@@ -35,8 +35,8 @@ impl Checker for GmodSystemsChecker {
             context.add_diagnostic(
                 DiagnosticCode::GmodUnknownNetMessage,
                 name_range,
-                t!(
-                    "Unknown net message `%{name}` used by net.Start.",
+                format!(
+                    "Unknown net message `{name}` used by net.Start.",
                     name = name
                 )
                 .to_string(),
@@ -61,8 +61,8 @@ impl Checker for GmodSystemsChecker {
             context.add_diagnostic(
                 DiagnosticCode::GmodDuplicateSystemRegistration,
                 name_range,
-                t!(
-                    "Duplicate %{kind} name `%{name}` is registered multiple times.",
+                format!(
+                    "Duplicate {kind} name `{name}` is registered multiple times.",
                     kind = "network string",
                     name = name
                 )
@@ -88,8 +88,8 @@ impl Checker for GmodSystemsChecker {
             context.add_diagnostic(
                 DiagnosticCode::GmodDuplicateSystemRegistration,
                 name_range,
-                t!(
-                    "Duplicate %{kind} name `%{name}` is registered multiple times.",
+                format!(
+                    "Duplicate {kind} name `{name}` is registered multiple times.",
                     kind = "concommand",
                     name = name
                 )
@@ -115,8 +115,8 @@ impl Checker for GmodSystemsChecker {
             context.add_diagnostic(
                 DiagnosticCode::GmodDuplicateSystemRegistration,
                 name_range,
-                t!(
-                    "Duplicate %{kind} name `%{name}` is registered multiple times.",
+                format!(
+                    "Duplicate {kind} name `{name}` is registered multiple times.",
                     kind = "convar",
                     name = name
                 )

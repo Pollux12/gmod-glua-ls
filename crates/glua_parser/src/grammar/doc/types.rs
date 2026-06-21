@@ -66,7 +66,7 @@ fn parse_sub_type(p: &mut LuaDocParser, limit: i32) -> DocParseResult {
             Ok(_) => {}
             Err(err) => {
                 p.push_error(LuaParseError::doc_error_from(
-                    &t!("unary operator not followed by type"),
+                    "unary operator not followed by type",
                     range,
                 ));
                 return Err(err);
@@ -114,7 +114,7 @@ pub fn parse_binary_operator(
                 Ok(_) => {}
                 Err(err) => {
                     p.push_error(LuaParseError::doc_error_from(
-                        &t!("binary operator not followed by type"),
+                        "binary operator not followed by type",
                         range,
                     ));
 
@@ -170,7 +170,7 @@ fn parse_primary_type(p: &mut LuaDocParser) -> DocParseResult {
         LuaTokenKind::TkDots => parse_vararg_type(p),
         LuaTokenKind::TkDocNew => parse_constructor_type(p),
         _ => Err(LuaParseError::doc_error_from(
-            &t!("expect type"),
+            "expect type",
             p.current_token_range(),
         )),
     }
@@ -192,7 +192,7 @@ fn parse_mapped_type(p: &mut LuaDocParser, m: Marker) -> DocParseResult {
         LuaTokenKind::TkLeftBracket => {}
         _ => {
             return Err(LuaParseError::doc_error_from(
-                &t!("expect mapped field"),
+                "expect mapped field",
                 p.current_token_range(),
             ));
         }
@@ -320,7 +320,7 @@ fn parse_typed_field(p: &mut LuaDocParser) -> DocParseResult {
         }
         _ => {
             return Err(LuaParseError::doc_error_from(
-                &t!("expect name or [<number>] or [<string>]"),
+                "expect name or [<number>] or [<string>]",
                 p.current_token_range(),
             ));
         }
@@ -384,7 +384,7 @@ pub fn parse_fun_type(p: &mut LuaDocParser) -> DocParseResult {
 
     if p.current_token_text() != "fun" {
         return Err(LuaParseError::doc_error_from(
-            &t!("expect fun"),
+            "expect fun",
             p.current_token_range(),
         ));
     }
@@ -468,7 +468,7 @@ pub fn parse_typed_param(p: &mut LuaDocParser) -> DocParseResult {
         }
         _ => {
             return Err(LuaParseError::doc_error_from(
-                &t!("expect name or ..."),
+                "expect name or ...",
                 p.current_token_range(),
             ));
         }
@@ -608,7 +608,7 @@ fn parse_constructor_type(p: &mut LuaDocParser) -> DocParseResult {
         Ok(cm) => {
             if cm.kind != LuaSyntaxKind::TypeFun {
                 let err = LuaParseError::doc_error_from(
-                    &t!("new keyword must be followed by function type"),
+                    "new keyword must be followed by function type",
                     new_range,
                 );
                 p.push_error(err.clone());

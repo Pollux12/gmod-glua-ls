@@ -18,7 +18,7 @@ fn long_string_value(token: &LuaSyntaxToken) -> Result<String, LuaParseError> {
     if text.len() < 4 {
         return Err(LuaParseError::new(
             LuaParseErrorKind::SyntaxError,
-            &t!("String too short"),
+            "String too short",
             range,
         ));
     }
@@ -32,9 +32,9 @@ fn long_string_value(token: &LuaSyntaxToken) -> Result<String, LuaParseError> {
         if first_char != '[' {
             return Err(LuaParseError::new(
                 LuaParseErrorKind::SyntaxError,
-                &t!(
-                    "Invalid long string start, expected '[', found '%{char}'",
-                    char = first_char
+                &format!(
+                    "Invalid long string start, expected '[', found '{}'",
+                    first_char
                 ),
                 range,
             ));
@@ -42,7 +42,7 @@ fn long_string_value(token: &LuaSyntaxToken) -> Result<String, LuaParseError> {
     } else {
         return Err(LuaParseError::new(
             LuaParseErrorKind::SyntaxError,
-            &t!("Invalid long string start, expected '[', found end of input"),
+            "Invalid long string start, expected '[', found end of input",
             range,
         ));
     }
@@ -57,7 +57,7 @@ fn long_string_value(token: &LuaSyntaxToken) -> Result<String, LuaParseError> {
         } else {
             return Err(LuaParseError::new(
                 LuaParseErrorKind::SyntaxError,
-                &t!("Invalid long string start"),
+                "Invalid long string start",
                 range,
             ));
         }
@@ -67,9 +67,9 @@ fn long_string_value(token: &LuaSyntaxToken) -> Result<String, LuaParseError> {
     if text.len() < i + equal_num + 2 {
         return Err(LuaParseError::new(
             LuaParseErrorKind::SyntaxError,
-            &t!(
-                "Invalid long string end, expected '%{eq}]'",
-                eq = "=".repeat(equal_num)
+            &format!(
+                "Invalid long string end, expected '{}]'",
+                "=".repeat(equal_num)
             ),
             range,
         ));
@@ -127,7 +127,7 @@ fn normal_string_value(token: &LuaSyntaxToken) -> Result<String, LuaParseError> 
                             } else {
                                 return Err(LuaParseError::new(
                                     LuaParseErrorKind::SyntaxError,
-                                    &t!("Invalid hex escape sequence '\\x%{hex}'", hex = hex),
+                                    &format!("Invalid hex escape sequence '\\x{}'", hex),
                                     token.text_range(),
                                 ));
                             }
@@ -143,9 +143,9 @@ fn normal_string_value(token: &LuaSyntaxToken) -> Result<String, LuaParseError> 
                                     } else {
                                         return Err(LuaParseError::new(
                                             LuaParseErrorKind::SyntaxError,
-                                            &t!(
-                                                "Invalid unicode escape sequence '\\u{{%{unicode_hex}}}'",
-                                                unicode_hex = unicode_hex
+                                            &format!(
+                                                "Invalid unicode escape sequence '\\u{{{{{}}}}}'",
+                                                unicode_hex
                                             ),
                                             token.text_range(),
                                         ));
@@ -187,7 +187,7 @@ fn normal_string_value(token: &LuaSyntaxToken) -> Result<String, LuaParseError> 
                         _ => {
                             return Err(LuaParseError::new(
                                 LuaParseErrorKind::SyntaxError,
-                                &t!("Invalid escape sequence '\\%{char}'", char = next_char),
+                                &format!("Invalid escape sequence '\\{}'", next_char),
                                 token.text_range(),
                             ));
                         }

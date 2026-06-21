@@ -100,8 +100,8 @@ fn check_export_index_expr(
                 context.add_diagnostic(
                     DiagnosticCode::InjectField,
                     index_key.get_range()?,
-                    t!(
-                        "Fields cannot be injected into the reference of `%{class}` for `%{field}`. ",
+                    format!(
+                        "Fields cannot be injected into the reference of `{class}` for `{field}`. ",
                         class = humanize_lint_type(db, export_typ),
                         field = index_name,
                     )
@@ -113,7 +113,7 @@ fn check_export_index_expr(
                 context.add_diagnostic(
                     DiagnosticCode::UndefinedField,
                     index_key.get_range()?,
-                    t!("Undefined field `%{field}`. ", field = index_name,).to_string(),
+                    format!("Undefined field `{field}`. ", field = index_name,).to_string(),
                     None,
                 );
             }
@@ -177,7 +177,7 @@ fn check_export_index_expr(
     context.add_diagnostic(
         DiagnosticCode::UndefinedField,
         index_key.get_range()?,
-        t!("Undefined field `%{field}`. ", field = index_name,).to_string(),
+        format!("Undefined field `{field}`. ", field = index_name,).to_string(),
         None,
     );
 
