@@ -34,6 +34,7 @@ pub use member::find_index_operations;
 use member::find_member_origin_owner;
 pub(crate) use member::find_members;
 pub use member::get_member_map;
+pub use member::get_member_value_expr;
 pub(crate) use member::infer_owner_raw_member_type_with_realm;
 pub(crate) use member::member_key_matches_type;
 pub(crate) use member::merge_open_table_types;

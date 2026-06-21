@@ -4,7 +4,8 @@ use glua_code_analysis::{
     DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaInferCache, LuaMemberId,
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
     RenderLevel, SemanticDeclLevel, SemanticInfo, SemanticModel,
-    explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
+    explicit_param_string_default_reaches_flow, get_member_value_expr,
+    inferred_string_default_reaches_flow,
 };
 use glua_code_analysis::{humanize_member_key_name, humanize_type};
 use glua_parser::{
@@ -726,34 +727,6 @@ fn add_member_color_preview(
 
 fn can_hover_value_expr_be_color(kind: LuaSyntaxKind) -> bool {
     matches!(kind, LuaSyntaxKind::CallExpr | LuaSyntaxKind::LiteralExpr)
-}
-
-fn get_member_value_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
-
-    if let Some(field) = LuaTableField::cast(node.clone()) {
-        return field.get_value_expr();
-    }
-
-    if let Some(index_expr) = LuaIndexExpr::cast(node) {
-        if let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() {
-            let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
-            let value_idx = vars
-                .iter()
-                .position(|var| var.get_syntax_id() == index_expr.get_syntax_id())?;
-            return value_exprs.get(value_idx).cloned();
-        }
-
-        if let Some(func_stat) = index_expr.get_parent::<LuaFuncStat>() {
-            return func_stat.get_closure().map(LuaExpr::ClosureExpr);
-        }
-    }
-
-    None
 }
 
 fn get_gmod_class_description(db: &DbIndex, typ: &LuaType) -> Option<String> {

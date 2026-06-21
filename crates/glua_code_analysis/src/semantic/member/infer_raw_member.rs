@@ -210,7 +210,7 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
     Ok(result_type)
 }
 
-fn resolve_member_item_with_realm(
+pub(crate) fn resolve_member_item_with_realm(
     db: &DbIndex,
     member_item: &LuaMemberIndexItem,
     caller_file_id: FileId,

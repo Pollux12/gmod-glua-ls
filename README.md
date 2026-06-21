@@ -17,7 +17,7 @@
     <img src="https://img.shields.io/github/v/release/Pollux12/gmod-glua-ls?style=flat-square&label=gLuaLS" alt="Language server version">
   </a>
   <a href="https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations">
-    <img src="https://img.shields.io/github/last-commit/Pollux12/annotations-gmod-glua-ls/gluals-annotations?style=flat-square&label=Annotations%20Updated" alt="Annotations updated">
+    <img src="https://img.shields.io/github/last-commit/Pollux12/annotations-gmod-glua-ls/gluals-annotations?style=flat-square&label=Stable%20Annotations" alt="Stable annotations updated">
   </a>
 </p>
 
@@ -51,7 +51,7 @@ https://marketplace.visualstudio.com/items?itemName=Pollux.gmod-glua-ls
 * **Class Resolution:** Automatic mapping for classes such as `ENT`, `SWEP`, `TOOL`, `PLUGIN` and others. NetworkVars, AccessorFuncs and VGUI panels are all registered as well.
 * **Realm Awareness:** Analyses file prefixes (`sv_`, `cl_`, `sh_`) and `include()` chains. Generates real-time diagnostics for cross-realm function calls (e.g. calling a clientside method on the server). Delivers realm-aware suggestions by filtering autocomplete based on realm.
 * **Network Validation:** Parses and validates `net.Start`, `net.Receive` and other net library usages, catching mismatched payloads, read/write order errors, and delivering enhanced autocomplete.
-* **Smart Hook Integration:** Intelligent autocomplete and signature resolution for all hooks, `GM:` overrides, and custom `---@hook` annotations. Automatically detects and registers new custom hooks in addition to those parsed from the wiki.
+* **Smart Hook Integration:** Intelligent autocomplete and signatures for all hooks, `GM:` functions, and custom `---@hook` annotations. Automatically detects and registers new custom hooks in addition to those parsed from the wiki.
 * **Class Explorer & Templates:** Dedicated side-panel to easily reference key classes (Entities, Weapons, VGUI, Plugins) and workspace resources (Materials, Sounds) alongside a configurable template system for easy creation.
 
 For a full list of features, see the VSCode extension page here: https://github.com/Pollux12/vscode-gmod-glua-ls

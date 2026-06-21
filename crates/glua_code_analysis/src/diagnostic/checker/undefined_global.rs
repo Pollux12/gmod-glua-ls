@@ -874,7 +874,7 @@ fn check_name_expr(
         context.add_diagnostic(
             undefined_global_diagnostic_code(name_range, silent_use_ranges),
             name_range,
-            format!("undefined global variable: {name}", name = name_text).to_string(),
+            format!("undefined global variable: {name_text}"),
             None,
         );
         return Some(());

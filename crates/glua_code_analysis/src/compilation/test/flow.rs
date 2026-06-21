@@ -4842,6 +4842,96 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_field_narrow_keeps_nullable_table_generic_on_constant_key() {
+        // `if t.x then` on `table<string, integer>?` must not narrow `t` to
+        // `nil`: the `nil` union arm infers the member as `Never`, which can
+        // never be truthy, so it must not survive as field-exists evidence
+        // while the table arm (which has no indexed member for `x`) drops out.
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@type table<string, integer>?
+            local t
+            if t.x then
+                a = t
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "a", 0);
+        let desc = ws.humanize_type(narrowed);
+        assert_that!(
+            desc.contains("table"),
+            eq(true),
+            "field-exists narrowing must keep the table arm, not collapse to nil: {}",
+            desc
+        );
+    }
+
+    #[gtest]
+    fn test_field_narrow_with_dynamic_key_ignores_unrelated_dynamic_member_realm() {
+        // Dynamic index keys produce `ExprType` member keys, which alias every
+        // other dynamic access with the same inferred key type. Field-existence
+        // narrowing must not collapse `ent` to whichever subtype happens to
+        // contain an unrelated dynamic write (`EFFECT[k] = v`), and the
+        // realm-aware filter must not drop candidates based on that unrelated
+        // write's `---@realm` annotation.
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@realm server
+
+            ---@class Entity
+
+            ---@class EFFECT : Entity
+            EFFECT = {}
+
+            ---@realm client
+            ---@param k string
+            function EFFECT.StoreField(k, v)
+                EFFECT[k] = v
+            end
+
+            ---@class ENT : Entity
+            ENT = {}
+
+            ---@realm server
+            ---@param k string
+            function ENT.StoreField(k, v)
+                ENT[k] = v
+            end
+
+            ---@param ent Entity?
+            ---@param key string
+            local function test(ent, key)
+                if ent and ent[key] then
+                    b = ent
+                end
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "b", 0);
+        let desc = ws.humanize_type(narrowed);
+        assert_that!(
+            desc.contains("Entity"),
+            eq(true),
+            "dynamic-key narrowing must keep the declared base type: {}",
+            desc
+        );
+        assert_that!(
+            desc.contains("EFFECT") || desc.contains("ENT"),
+            eq(false),
+            "dynamic-key narrowing must not collapse to a subtype that merely \
+             contains an unrelated dynamic write: {}",
+            desc
+        );
+    }
+
+    #[gtest]
     fn test_field_narrow_does_not_pick_subclass_when_base_directly_defines_field() {
         // `if x.EndTouch then` on `Entity` must not collapse to `EFFECT`
         // override — the base already defines the field.

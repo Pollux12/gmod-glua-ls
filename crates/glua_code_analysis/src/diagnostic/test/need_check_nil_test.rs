@@ -475,6 +475,97 @@ mod test {
     }
 
     #[gtest]
+    fn test_dynamic_table_guarded_member_call_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::UncheckedNilAccess,
+                r#"
+                ---@class SoundPatch
+                ---@field Stop fun(self: SoundPatch)
+
+                ---@return SoundPatch
+                local function CreateSound()
+                end
+
+                local sounds = {}
+
+                ---@param id string
+                local function CreateLoopingSound(id)
+                    sounds[id] = CreateSound()
+                end
+
+                CreateLoopingSound("start")
+
+                if sounds.start then
+                    sounds.start:Stop()
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_tableof_dynamic_table_guarded_member_call_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::UncheckedNilAccess,
+                r#"
+                ---@class SoundPatch
+                ---@field Stop fun(self: SoundPatch)
+
+                ---@return SoundPatch
+                local function CreateSound()
+                end
+
+                ---@class TestEntity
+                local TestEntity = {}
+
+                ---@generic T
+                ---@param ent T
+                ---@return tableof<T>
+                local function GetTable(ent)
+                end
+
+                function TestEntity:Initialize()
+                    self.sounds = {}
+                end
+
+                ---@param id string
+                function TestEntity:CreateLoopingSound(id)
+                    local snd = self.sounds[id]
+
+                    if not snd then
+                        snd = CreateSound()
+                        self.sounds[id] = snd
+                    end
+
+                    return snd
+                end
+
+                function TestEntity:InternalDeactivateSounds()
+                    for id in pairs(self.sounds) do
+                        self.sounds[id] = nil
+                    end
+                end
+
+                function TestEntity:Update()
+                    local selfTbl = GetTable(self)
+                    local sounds = selfTbl.sounds
+
+                    if sounds.start then
+                        sounds.start:Stop()
+                    end
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_direct_opaque_table_member_read_has_no_unchecked_nil_access() {
         let mut ws = VirtualWorkspace::new();
         assert_that!(

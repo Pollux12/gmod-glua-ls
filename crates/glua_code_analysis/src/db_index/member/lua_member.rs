@@ -149,6 +149,24 @@ impl LuaMemberKey {
         }
     }
 
+    /// Whether an index key is truly dynamic: a key expression that does not
+    /// constant-fold to a `Name`/`Integer` member key and would therefore
+    /// produce an `ExprType` key. `ExprType` keys alias *every* other dynamic
+    /// access whose key infers to the same type — never a specific member —
+    /// so member-identity-sensitive consumers (realm checks, subtype
+    /// narrowing) must not draw evidence through them.
+    pub fn index_key_is_dynamic(
+        db: &DbIndex,
+        cache: &mut LuaInferCache,
+        key: &LuaIndexKey,
+    ) -> bool {
+        key.is_expr()
+            && !matches!(
+                Self::from_index_key(db, cache, key),
+                Ok(LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))
+            )
+    }
+
     pub fn is_none(&self) -> bool {
         matches!(self, LuaMemberKey::None)
     }

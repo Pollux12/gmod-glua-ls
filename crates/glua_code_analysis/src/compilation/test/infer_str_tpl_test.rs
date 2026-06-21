@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAstNode, LuaFuncStat, LuaIndexKey, LuaNameExpr, LuaVarExpr};
+    use glua_parser::{
+        LuaAstNode, LuaAstToken, LuaFuncStat, LuaIndexKey, LuaLocalName, LuaNameExpr, LuaVarExpr,
+    };
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
@@ -37,6 +39,69 @@ mod test {
             .get_semantic_info(name_expr.syntax().clone().into())
             .expect("expected semantic info for name expression")
             .typ
+    }
+
+    fn nth_local_name_type_from_end(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth_from_end: usize,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let local_names = root
+            .clone()
+            .descendants::<LuaLocalName>()
+            .filter(|local_name| local_name.get_text() == name)
+            .collect::<Vec<_>>();
+        let local_name = local_names
+            .into_iter()
+            .rev()
+            .nth(nth_from_end)
+            .expect("expected matching local name");
+        let token = local_name
+            .get_name_token()
+            .expect("expected local name token");
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("expected semantic info for local name")
+            .typ
+    }
+
+    fn nth_local_name_cached_type_from_end(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth_from_end: usize,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let local_names = root
+            .clone()
+            .descendants::<LuaLocalName>()
+            .filter(|local_name| local_name.get_text() == name)
+            .collect::<Vec<_>>();
+        let local_name = local_names
+            .into_iter()
+            .rev()
+            .nth(nth_from_end)
+            .expect("expected matching local name");
+        let decl_id = crate::LuaDeclId::new(file_id, local_name.get_position());
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .map(|type_cache| type_cache.as_type().clone())
+            .unwrap_or(LuaType::Unknown)
     }
 
     fn signature_return_type_for_function(
@@ -125,6 +190,254 @@ mod test {
         let result_ty = ws.expr_ty("ents.Create('sent_npc')");
         let expected = ws.ty("sent_npc");
         assert_eq!(result_ty, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_accepts_string_union_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/entities/entities/ttt_random_weapon.lua",
+            r#"
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class item_ammo_smg1: Entity
+                ---@class item_ammo_pistol: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function ents.Create(class)
+                end
+
+                ---@class TttRandomWeapon
+                ---@field AmmoEnt "item_ammo_smg1"|"item_ammo_pistol"
+
+                ---@type TttRandomWeapon
+                local ent
+
+                function CreateAmmo()
+                    local ammo = ents.Create(ent.AmmoEnt)
+                    return ammo
+                end
+            "#,
+        );
+
+        let expected = ws.ty("item_ammo_smg1|item_ammo_pistol|NULL");
+        let return_ammo_ty = nth_name_expr_type_from_end(&mut ws, file_id, "ammo", 0);
+        assert_eq!(return_ammo_ty, expected);
+
+        let signature_return = signature_return_type_for_function(&mut ws, file_id, "CreateAmmo");
+        assert_eq!(signature_return, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_initial_indexing_materializes_string_union_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/entities/entities/ttt_random_weapon.lua",
+            r#"
+                ---@class Entity
+                ---@class NULL: Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function ents.Create(class)
+                end
+
+                ---@class TttRandomWeapon
+                ---@field AmmoEnt "item_ammo_smg1"|"item_ammo_pistol"
+
+                ---@type TttRandomWeapon
+                local ent
+
+                function CreateAmmo()
+                    local ammo = ents.Create(ent.AmmoEnt)
+                    return ammo
+                end
+            "#,
+        );
+
+        let expected = ws.ty("item_ammo_smg1|item_ammo_pistol|NULL");
+        let return_ammo_ty = nth_name_expr_type_from_end(&mut ws, file_id, "ammo", 0);
+        assert_eq!(return_ammo_ty, expected);
+
+        let signature_return = signature_return_type_for_function(&mut ws, file_id, "CreateAmmo");
+        assert_eq!(signature_return, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_generic_initial_indexing_reproduces_ttt_random_weapon_chain() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/ttt_test_annotations.lua",
+                r#"
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class Weapon: Entity
+
+                ents = { TTT = {} }
+                WEPS = {}
+                weapons = {}
+                math = {}
+                table = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T|NULL
+                function ents.Create(class)
+                end
+
+                ---@return (weapon_zm_pistol|weapon_zm_shotgun)[]
+                function weapons.GetList()
+                end
+
+                ---@param t table
+                ---@param value any
+                function table.insert(t, value)
+                end
+
+                ---@param n integer
+                ---@return integer
+                function math.random(n)
+                end
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function IsValid(value)
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/entities/weapons/weapon_zm_pistol.lua",
+                r#"
+                SWEP.ClassName = "weapon_zm_pistol"
+                SWEP.AutoSpawnable = true
+                SWEP.AmmoEnt = "item_ammo_pistol_ttt"
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/entities/weapons/weapon_zm_shotgun.lua",
+                r#"
+                SWEP.ClassName = "weapon_zm_shotgun"
+                SWEP.AutoSpawnable = true
+                SWEP.AmmoEnt = "item_box_buckshot_ttt"
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/weaponry_shd.lua",
+                r#"
+                function WEPS.IsEquipment(wep)
+                    return false
+                end
+
+                function WEPS.GetClass(wep)
+                    if istable(wep) then
+                        return wep.ClassName or wep.Classname
+                    elseif IsValid(wep) then
+                        return wep:GetClass()
+                    end
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/ent_replace.lua",
+                r#"
+                local SpawnableSWEPs = nil
+                function ents.TTT.GetSpawnableSWEPs()
+                    if not SpawnableSWEPs then
+                        local tbl = {}
+                        for k, v in pairs(weapons.GetList()) do
+                            if v and v.AutoSpawnable and (not WEPS.IsEquipment(v)) then
+                                table.insert(tbl, v)
+                            end
+                        end
+
+                        SpawnableSWEPs = tbl
+                    end
+
+                    return SpawnableSWEPs
+                end
+
+                function ents.TTT.GetFilteredSpawnableSWEPs(filter)
+                    return ents.TTT.GetSpawnableSWEPs()
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/entities/entities/ttt_random_weapon.lua",
+                r#"
+                ENT.Type = "point"
+                ENT.Base = "base_point"
+                ENT.AutoAmmo = 0
+
+                function ENT:Initialize()
+                    local spawnflags = self:GetSpawnFlags()
+
+                    local weps
+                    if spawnflags != 0 then
+                        weps = ents.TTT.GetFilteredSpawnableSWEPs(spawnflags)
+                    else
+                        weps = ents.TTT.GetSpawnableSWEPs()
+                    end
+
+                    if not weps then return end
+
+                    local w = weps[math.random(#weps)]
+                    local ent = ents.Create(WEPS.GetClass(w))
+                    if IsValid(ent) then
+                        local pos = self:GetPos()
+                        if ent.AmmoEnt and self.AutoAmmo > 0 then
+                            for i=1, self.AutoAmmo do
+                                local ammo = ents.Create(ent.AmmoEnt)
+                                print(ammo)
+                                if IsValid(ammo) then
+                                    ammo:SetPos(pos)
+                                end
+                            end
+                        end
+                    end
+                end
+                "#,
+            ),
+        ]);
+        let file_id = *file_ids
+            .iter()
+            .find(|file_id| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_path(file_id)
+                    .is_some_and(|path| path.ends_with("ttt_random_weapon.lua"))
+            })
+            .expect("expected random weapon file id");
+
+        let expected = LuaType::from_vec(vec![
+            LuaType::Ref(LuaTypeDeclId::global("item_ammo_pistol_ttt")),
+            LuaType::Ref(LuaTypeDeclId::global("item_box_buckshot_ttt")),
+            LuaType::Ref(LuaTypeDeclId::global("NULL")),
+        ]);
+
+        let later_ammo_ty = nth_name_expr_type_from_end(&mut ws, file_id, "ammo", 1);
+        assert_eq!(later_ammo_ty, expected);
+
+        let local_ammo_ty = nth_local_name_type_from_end(&mut ws, file_id, "ammo", 0);
+        assert_eq!(local_ammo_ty, expected);
+
+        let cached_ammo_ty = nth_local_name_cached_type_from_end(&ws, file_id, "ammo", 0);
+        assert_eq!(cached_ammo_ty, expected);
     }
 
     #[gtest]

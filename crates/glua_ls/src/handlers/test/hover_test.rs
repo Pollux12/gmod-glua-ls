@@ -718,6 +718,26 @@ mod tests {
     }
 
     #[gtest]
+    fn test_alias_to_class_value_hover_shows_alias_expansion() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class Test2
+                ---@field testField Entity
+
+                ---@alias TestAlias Test2
+
+                ---@type TestAlias
+                local va<??>r
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal var: (alias) TestAlias = Test2 {\n    testField: Entity,\n}\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_type_desc() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(

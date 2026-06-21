@@ -155,6 +155,7 @@ pub async fn initialized_handler(
 
     init_analysis(
         context.analysis(),
+        context.client(),
         context.status_bar(),
         context.file_diagnostic(),
         context.lsp_features(),
@@ -174,6 +175,7 @@ pub async fn initialized_handler(
 
 pub async fn init_analysis(
     analysis: &RwLock<EmmyLuaAnalysis>,
+    client: &crate::context::ClientProxy,
     status_bar: &StatusBar,
     file_diagnostic: &FileDiagnostic,
     lsp_features: &LspFeatures,
@@ -377,6 +379,16 @@ pub async fn init_analysis(
     );
     file_diagnostic.notify_workspace_loaded();
 
+    if lsp_features.supports_semantic_tokens_refresh() {
+        client.refresh_semantic_tokens();
+    }
+    if lsp_features.supports_inlay_hint_refresh() {
+        client.refresh_inlay_hints();
+    }
+    if lsp_features.supports_code_lens_refresh() {
+        client.refresh_code_lens();
+    }
+
     if !lsp_features.supports_workspace_diagnostic() {
         log::info!("client does not support workspace diagnostics; scheduling push diagnostics");
         file_diagnostic
@@ -495,4 +507,93 @@ pub async fn init_std_lib(analysis: &RwLock<EmmyLuaAnalysis>, emmyrc: Arc<Emmyrc
     }
 
     log::info!("initialized std lib complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    use glua_code_analysis::{EmmyLuaAnalysis, Emmyrc};
+    use googletest::prelude::*;
+    use lsp_server::{Connection, Message};
+    use lsp_types::{
+        ClientCapabilities, CodeLensWorkspaceClientCapabilities,
+        InlayHintWorkspaceClientCapabilities, SemanticTokensWorkspaceClientCapabilities,
+        WorkspaceClientCapabilities,
+    };
+    use tokio::sync::RwLock;
+
+    use crate::{
+        context::{ClientProxy, FileDiagnostic, LspFeatures, StatusBar},
+        util::LongRunningWatchdogStatus,
+    };
+
+    use super::init_analysis;
+
+    #[gtest]
+    fn init_analysis_refreshes_open_document_features_when_workspace_becomes_ready() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (proxy_connection, peer_connection) = Connection::memory();
+        let client = Arc::new(ClientProxy::new(proxy_connection));
+        let capabilities = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
+                    refresh_support: Some(true),
+                }),
+                inlay_hint: Some(InlayHintWorkspaceClientCapabilities {
+                    refresh_support: Some(true),
+                }),
+                code_lens: Some(CodeLensWorkspaceClientCapabilities {
+                    refresh_support: Some(true),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lsp_features = LspFeatures::new(capabilities);
+        let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let file_diagnostic = Arc::new(FileDiagnostic::new(
+            analysis.clone(),
+            status_bar.clone(),
+            client.clone(),
+        ));
+
+        runtime.block_on(init_analysis(
+            &analysis,
+            client.as_ref(),
+            &status_bar,
+            &file_diagnostic,
+            &lsp_features,
+            Vec::new(),
+            Arc::new(Emmyrc::default()),
+            HashMap::new(),
+            HashMap::new(),
+            LongRunningWatchdogStatus::new("test"),
+        ));
+
+        let mut methods = Vec::new();
+        while methods.len() < 3 {
+            let message = peer_connection
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("expected refresh request");
+            if let Message::Request(request) = message {
+                if request.method.ends_with("/refresh") {
+                    methods.push(request.method);
+                }
+            }
+        }
+        methods.sort();
+
+        assert_eq!(
+            methods,
+            vec![
+                "workspace/codeLens/refresh".to_string(),
+                "workspace/inlayHint/refresh".to_string(),
+                "workspace/semanticTokens/refresh".to_string(),
+            ]
+        );
+        Ok(())
+    }
 }

@@ -141,6 +141,19 @@ fn maybe_field_exist_narrow(
     };
 
     let index = LuaIndexMemberExpr::IndexExpr(index_expr);
+
+    // Dynamic index keys (`t[expr]` where `expr` is not a compile-time
+    // constant) produce `ExprType` member keys, which alias every other
+    // dynamic access with the same inferred key type. Field-existence
+    // narrowing would then collapse to whichever subtype happens to contain
+    // an unrelated dynamic write — and a dynamic key's truthiness can't
+    // identify a subtype anyway — so skip candidate narrowing entirely.
+    if let Some(index_key) = index.get_index_key()
+        && LuaMemberKey::index_key_is_dynamic(db, cache, &index_key)
+    {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
+
     let mut result = vec![];
     for sub_type in &candidates {
         let member_type = match infer_member_by_member_key(
@@ -154,7 +167,10 @@ fn maybe_field_exist_narrow(
             Err(_) => continue, // If we cannot infer the member type, skip this type
         };
         // donot use always true
-        if !member_type.is_always_falsy() {
+        // `Never` means the member cannot exist on this candidate (e.g. the
+        // `nil` arm of a union) — indexing it can never be truthy, so it must
+        // not survive as field-exists evidence.
+        if !member_type.is_always_falsy() && !member_type.is_never() {
             result.push(sub_type.clone());
         }
     }

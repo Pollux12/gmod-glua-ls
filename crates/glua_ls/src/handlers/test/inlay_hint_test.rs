@@ -84,6 +84,29 @@ mod tests {
     }
 
     #[gtest]
+    fn test_alias_to_class_local_hint_shows_target_class() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_inlay_hint(
+            r#"
+                ---@class Test2
+                ---@field testField Entity
+
+                ---@alias TestAlias Test2
+
+                ---@type TestAlias
+                local var
+            "#,
+            vec![VirtualInlayHint {
+                label: ": TestAlias = Test2".to_string(),
+                line: 7,
+                pos: 25,
+                ref_file: Some("".to_string()),
+            }]
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_local_hint_1() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_inlay_hint(

@@ -5592,6 +5592,163 @@ mod test {
     }
 
     #[gtest]
+    fn test_gettable_alias_dynamic_sound_table_named_field_keeps_value_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+
+        let cl_init_path = "cityrp/entities/entities/base_glide/cl_init.lua";
+        let cl_init_code = r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                ---@generic T : table
+                ---@param metaName `T`
+                ---@return T
+                function FindMetaTable(metaName) end
+
+                ---@class CSoundPatch
+                ---@field Stop fun(self: CSoundPatch)
+                ---@field SetSoundLevel fun(self: CSoundPatch, level: number)
+
+                ---@return CSoundPatch
+                function CreateSound() end
+
+                local GetTable = FindMetaTable("Entity").GetTable
+
+                function ENT:Initialize()
+                    self.sounds = {}
+                end
+
+                function ENT:OnEngineStateChange()
+                    local snd = self:CreateLoopingSound("start")
+                    snd:Stop()
+                end
+
+                function ENT:CreateLoopingSound(id)
+                    local snd = self.sounds[id]
+
+                    if not snd then
+                        snd = CreateSound()
+                        snd:SetSoundLevel(70)
+                        self.sounds[id] = snd
+                    end
+
+                    return snd
+                end
+
+                function ENT:InternalDeactivateSounds()
+                    local sounds = self.sounds
+
+                    for k, snd in pairs(sounds) do
+                        snd:Stop()
+                        sounds[k] = nil
+                    end
+                end
+
+                function ENT:InternalUpdateFeatures()
+                    local selfTbl = GetTable(self)
+                    local sounds = selfTbl.sounds
+                    local calmWaterPreview = sounds.calmWater
+
+                    if sounds.start then
+                        local guardedStart = sounds.start
+                        sounds.start:Stop()
+                        sounds.start = nil
+                    end
+
+                    if sounds.calmWater then
+                        local guardedCalmWater = sounds.calmWater
+                        sounds.calmWater:Stop()
+                    end
+                end
+            "#;
+        let file_id = ws.def_file(cl_init_path, cl_init_code);
+
+        ws.def_file(
+            "cityrp/entities/entities/base_glide/cl_water.lua",
+            r#"
+                function ENT:UpdateWaterSounds()
+                    local sounds = self.sounds
+                    local snd = self:CreateLoopingSound("calmWater")
+                    snd:Stop()
+
+                    if sounds.calmWater then
+                        sounds.calmWater:Stop()
+                        sounds.calmWater = nil
+                    end
+                end
+            "#,
+        );
+
+        let sounds_ty = index_expr_type(&mut ws, file_id, "selfTbl.sounds");
+        let sounds_ty_text = ws.humanize_type_detailed(sounds_ty.clone());
+        assert!(
+            sounds_ty_text.contains("[dynamic]: CSoundPatch"),
+            "expected GetTable(self).sounds to preserve dynamic sound table type, got {:?}",
+            sounds_ty
+        );
+
+        let start_ty = local_name_type(&mut ws, file_id, "guardedStart");
+        assert_eq!(
+            ws.humanize_type(start_ty.clone()),
+            "CSoundPatch",
+            "expected sounds.start to use dynamic sound value type, got {:?}",
+            start_ty
+        );
+
+        let calm_water_preview_ty = local_name_type(&mut ws, file_id, "calmWaterPreview");
+        assert_eq!(
+            ws.humanize_type(calm_water_preview_ty.clone()),
+            "CSoundPatch",
+            "expected cross-file sounds.calmWater preview to use dynamic sound value type, got {:?}",
+            calm_water_preview_ty
+        );
+
+        let guarded_calm_water_ty = local_name_type(&mut ws, file_id, "guardedCalmWater");
+        assert_eq!(
+            ws.humanize_type(guarded_calm_water_ty.clone()),
+            "CSoundPatch",
+            "expected cross-file guarded sounds.calmWater to use dynamic sound value type, got {:?}",
+            guarded_calm_water_ty
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = Some(NumberOrString::String(
+            DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == unchecked_nil_access)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect();
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("sounds.start")),
+            "sounds.start should not report unchecked-nil-access when guarded: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("sounds.calmWater")),
+            "sounds.calmWater should not report unchecked-nil-access when guarded: {messages:?}"
+        );
+    }
+
+    #[gtest]
     fn test_gettable_alias_uses_shadowed_self_argument_type_instead_of_receiver() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();

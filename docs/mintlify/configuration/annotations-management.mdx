@@ -14,9 +14,10 @@ GLuaLS ships without bundled Garry's Mod API definitions. The VS Code extension 
 
 On first launch and on later checks, the extension:
 
-1. Checks the remote metadata for the [gluals-annotations](https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations) branch
-2. If the annotations are outdated or missing, downloads and extracts the latest ZIP
-3. Points the language server at the annotations path
+1. Chooses which annotation branch to use
+2. Checks if that branch has a newer version
+3. Downloads annotations when they are missing or out of date
+4. Gives the annotation folder to the language server
 
 VS Code stores annotations in global extension storage, separate from your project. All workspaces share them.
 
@@ -24,19 +25,25 @@ VS Code stores annotations in global extension storage, separate from your proje
 
 ## Annotation source
 
-By default, the extension downloads annotations from `Pollux12/annotations-gmod-glua-ls` on the `gluals-annotations` branch. You can point downloads at another compatible GitHub repository or branch from VS Code settings:
+By default, the extension downloads annotations from `Pollux12/annotations-gmod-glua-ls`. Keep `annotationsChannel` set to `auto` for normal use. Stable extension builds use `gluals-annotations`. Pre-release extension builds use `gluals-annotations-prerelease`.
+
+You can change the repository, channel, branch, or commit hash in VS Code settings:
 
 | VSCode Setting | Default | Description |
 |---|---|---|
 | `gluals.gmod.annotationsRepository` | `Pollux12/annotations-gmod-glua-ls` | GitHub repository in `owner/repository` format, or a GitHub repository URL |
-| `gluals.gmod.annotationsBranch` | `gluals-annotations` | Branch containing generated annotations and `__metadata.json`; plugin artifact branches are not supported |
+| `gluals.gmod.annotationsChannel` | `auto` | `auto` follows the extension build. `stable` uses `gluals-annotations`. `prerelease` uses `gluals-annotations-prerelease` |
+| `gluals.gmod.annotationsBranch` | `gluals-annotations` | Advanced setting. Download from this branch instead of the selected channel. Plugin branches are not supported |
+| `gluals.gmod.annotationsCommit` | `""` | Advanced setting. Download this exact commit hash. Automatic annotation update checks stop until you remove it |
 
 ```json VS Code settings
 {
   "gluals.gmod.annotationsRepository": "Pollux12/annotations-gmod-glua-ls",
-  "gluals.gmod.annotationsBranch": "gluals-annotations"
+  "gluals.gmod.annotationsChannel": "auto"
 }
 ```
+
+If more than one setting is set, GLuaLS uses the first one in this list: custom local path, commit hash, branch, channel, extension build.
 
 ---
 
@@ -97,7 +104,7 @@ Point GLuaLS at your own annotations folder instead of the auto-downloaded ones:
 The path can be absolute or relative to the workspace root. When you set `annotationsPath`, GLuaLS does not use the downloaded annotations for that workspace.
 
 <Note>
-`gmod.annotationsPath` takes precedence over the extension's auto-download setting for that workspace. Set `gmod.autoLoadAnnotations: false` in `.gluarc.json` to disable auto-loading for that workspace, including extension settings and CLI-provided annotation paths.
+If `gmod.annotationsPath` is set, GLuaLS uses that folder for the workspace. Set `gmod.autoLoadAnnotations: false` in `.gluarc.json` to turn annotation auto-loading off for that workspace.
 </Note>
 
 ---

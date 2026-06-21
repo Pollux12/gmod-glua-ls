@@ -399,6 +399,70 @@ impl GmodClassMetadataIndex {
         }
     }
 
+    /// Incrementally refresh the panel/skin caches for a single re-added call
+    /// site. Both the old and new metadata share the same syntax range (they
+    /// describe the same call), so the previous contribution is located by
+    /// `(file_id, range_start)` and removed before the new one is inserted.
+    fn replace_cached_call(
+        &mut self,
+        file_id: FileId,
+        kind: GmodScriptedClassCallKind,
+        old_metadata: &GmodScriptedClassCallMetadata,
+        new_metadata: &GmodScriptedClassCallMetadata,
+    ) {
+        let range_start = old_metadata.syntax_id.get_range().start();
+        match kind {
+            GmodScriptedClassCallKind::VguiRegister
+            | GmodScriptedClassCallKind::DermaDefineControl => {
+                if let Some((panel_name, _)) = Self::maybe_extract_vgui_panel(kind, old_metadata) {
+                    Self::remove_cached_entry(
+                        &mut self.vgui_panels,
+                        &panel_name,
+                        file_id,
+                        range_start,
+                        |definition| (definition.file_id, definition.range_start),
+                    );
+                }
+                self.update_vgui_panels_from_call(file_id, kind, new_metadata);
+            }
+            GmodScriptedClassCallKind::DermaDefineSkin => {
+                if let Some(skin_name) = Self::extract_non_empty_string_arg(
+                    old_metadata,
+                    old_metadata.derma_skin_define_arg_idx(),
+                ) {
+                    Self::remove_cached_entry(
+                        &mut self.derma_skins,
+                        &skin_name,
+                        file_id,
+                        range_start,
+                        |definition| (definition.file_id, definition.range_start),
+                    );
+                }
+                self.update_derma_skins_from_call(file_id, kind, new_metadata);
+            }
+            _ => {}
+        }
+    }
+
+    /// Remove the cache entry for a single call site from its name bucket,
+    /// matching on `(file_id, range_start)`. Touches only the one bucket, so
+    /// the cost is bounded by the number of definitions sharing the name
+    /// rather than the whole cache.
+    fn remove_cached_entry<T>(
+        cache: &mut HashMap<String, Vec<T>>,
+        name: &str,
+        file_id: FileId,
+        range_start: TextSize,
+        key: impl Fn(&T) -> (FileId, TextSize),
+    ) {
+        if let Some(definitions) = cache.get_mut(name) {
+            definitions.retain(|definition| key(definition) != (file_id, range_start));
+            if definitions.is_empty() {
+                cache.remove(name);
+            }
+        }
+    }
+
     fn recompute_vgui_panels(&mut self) {
         let mut vgui_panels = HashMap::new();
         let mut derma_skins = HashMap::new();
@@ -445,8 +509,13 @@ impl GmodClassMetadataIndex {
                 .iter_mut()
                 .find(|existing| existing.syntax_id == call_metadata.syntax_id)
             {
-                *existing = call_metadata;
-                self.recompute_vgui_panels();
+                // Re-adding the same call site (the pre- and post-analysis
+                // passes both visit every file). Overwrite the stored metadata
+                // in place and refresh only this call's cache contribution
+                // instead of rebuilding every file's panels/skins, which would
+                // make a full analysis O(calls * total_calls).
+                let old_metadata = std::mem::replace(existing, call_metadata.clone());
+                self.replace_cached_call(file_id, kind, &old_metadata, &call_metadata);
                 return;
             }
         }
@@ -625,6 +694,58 @@ mod tests {
         assert_eq!(
             index.get_vgui_panel_base("DeterministicPanel"),
             Some(Some("DFrame".to_string()))
+        );
+    }
+
+    #[test]
+    fn re_adding_same_call_site_keeps_panel_cache_stable() {
+        // The pre- and post-analysis passes both add every call, so the second
+        // add of the same syntax range must update in place rather than
+        // accumulate a duplicate cache entry.
+        let mut index = GmodClassMetadataIndex::new();
+        let file = FileId::new(1);
+
+        index.add_call(
+            file,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("Panel", "DFrame", 10),
+        );
+        index.add_call(
+            file,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("Panel", "DFrame", 10),
+        );
+
+        assert_eq!(
+            index.get_vgui_panel_base("Panel"),
+            Some(Some("DFrame".to_string()))
+        );
+        assert_eq!(index.find_vgui_panel_definitions("Panel").len(), 1);
+    }
+
+    #[test]
+    fn re_adding_call_site_with_changed_name_moves_cache_bucket() {
+        // If the post pass resolves a different panel name for the same call
+        // site, the stale bucket must be vacated so lookups for the old name
+        // no longer match.
+        let mut index = GmodClassMetadataIndex::new();
+        let file = FileId::new(1);
+
+        index.add_call(
+            file,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("OldPanel", "DFrame", 10),
+        );
+        index.add_call(
+            file,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("NewPanel", "EditablePanel", 10),
+        );
+
+        assert_eq!(index.get_vgui_panel_base("OldPanel"), None);
+        assert_eq!(
+            index.get_vgui_panel_base("NewPanel"),
+            Some(Some("EditablePanel".to_string()))
         );
     }
 }
