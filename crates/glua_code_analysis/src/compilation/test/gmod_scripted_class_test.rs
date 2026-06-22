@@ -2672,6 +2672,101 @@ mod test {
         );
     }
 
+    /// Regression test for `vgui.CreateFromTable` using the `register_table`
+    /// call_arg kind, which caused the analyzer to synthesize a SECOND panel
+    /// class at every `CreateFromTable(panelVar, ...)` call site. This second
+    /// synthesis overwrote the original `RegisterTable` binding, producing
+    /// false-positive `undefined-field` / `unchecked-nil-access` on the original
+    /// panel's `self.Field` accesses.
+    ///
+    /// The pattern that triggered this (from `cl_scoreboard.lua`):
+    ///
+    /// ```text
+    /// local PANEL_A = { Init = function(self) self.Btn = self:Add("DButton") end }
+    /// PANEL_A = vgui.RegisterTable(PANEL_A, "DPanel")
+    ///
+    /// local PANEL_B = {
+    ///     Think = function(self)
+    ///         vgui.CreateFromTable(PANEL_A, ...)  -- triggered re-registration
+    ///     end,
+    /// }
+    /// ```
+    #[gtest]
+    fn test_vgui_create_from_table_does_not_re_register_panel_table() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/vgui/create_from_table_no_reregister.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            ---@generic T : table
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param metatable T
+            ---@param parent? Panel
+            ---@return Panel
+            function vgui.CreateFromTable(metatable, parent) end
+
+            local PANEL_A = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            PANEL_A = vgui.RegisterTable(PANEL_A, "DPanel")
+
+            local PANEL_B = {
+                Think = function(self)
+                    local inst = vgui.CreateFromTable(PANEL_A)
+                    inst:Dock(1)
+                end,
+            }
+
+            PANEL_B = vgui.RegisterTable(PANEL_B, "DPanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = Some(NumberOrString::String(
+            DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+        ));
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != unchecked_nil_access
+                    && diagnostic.code != undefined_field),
+            "vgui.CreateFromTable should not re-register PANEL_A; got false-positive diagnostics: {diagnostics:?}"
+        );
+    }
+
     #[gtest]
     fn test_vgui_create_from_table_uses_panel_base_field_for_members() {
         let mut ws = VirtualWorkspace::new();

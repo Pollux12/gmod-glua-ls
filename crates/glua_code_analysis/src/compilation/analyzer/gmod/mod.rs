@@ -2648,6 +2648,10 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
 
     let mut vgui_registration_regions: Vec<VguiRegistrationRegion> = Vec::new();
     let mut synthesis_cache = VguiSynthesisCache::default();
+    // Tracks decl_ids that have already been registered via `vgui.RegisterTable`
+    // so that subsequent `vgui.CreateFromTable` calls referencing the same table
+    // do not trigger a second (overwriting) class synthesis.
+    let mut registered_table_decl_ids: HashSet<LuaDeclId> = HashSet::new();
 
     for file_id in file_ids.iter().copied() {
         // Borrow first and skip files with no VGUI-relevant calls before paying
@@ -2718,6 +2722,18 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                 && let Some((decl_id, region_start)) =
                     resolve_local_registration_region(db, file_id, table_var, register_position)
             {
+                // Skip synthesis when this table is already registered via a
+                // prior `vgui.RegisterTable` call. `vgui.CreateFromTable` uses
+                // the same `register_table` call_arg kind, which means it also
+                // lands in `vgui_register_table_calls`. Without this guard, the
+                // `CreateFromTable` call synthesizes a SECOND class at its own
+                // position, overwriting the first registration's binding and
+                // producing false-positive `undefined-field` /
+                // `unchecked-nil-access` on the original panel's `self.Field`
+                // accesses.
+                if registered_table_decl_ids.contains(&decl_id) {
+                    continue;
+                }
                 resolved_registration = Some(ResolvedVguiRegistrationRegion {
                     decl_id,
                     region_start,
@@ -2730,6 +2746,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     region_start,
                     region_end: register_position,
                 });
+                registered_table_decl_ids.insert(decl_id);
             }
             synthesize_vgui_register_table(
                 db,
