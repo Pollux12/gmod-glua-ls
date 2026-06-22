@@ -4520,7 +4520,16 @@ fn find_registered_table_expr(
         find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
             .unwrap_or(decl_id.position);
 
-    find_registered_table_expr_at_write_position(db, file_id, write_position)
+    find_registered_table_expr_at_write_position(db, file_id, write_position).or_else(|| {
+        // When the latest write is a reassignment whose RHS is not a table
+        // literal (e.g. `PANEL = vgui.RegisterTable(PANEL, "DPanel")`),
+        // the table constructor still lives at the original `local PANEL =
+        // {...}` declaration. Try the decl's own position before giving up.
+        if write_position == decl_id.position {
+            return None;
+        }
+        find_registered_table_expr_at_write_position(db, file_id, decl_id.position)
+    })
 }
 
 fn find_registered_table_expr_at_write_position(

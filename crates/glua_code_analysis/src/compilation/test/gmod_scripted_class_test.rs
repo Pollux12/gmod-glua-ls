@@ -2596,6 +2596,82 @@ mod test {
         );
     }
 
+    /// Regression test for the **reassigned local** registration form:
+    ///
+    /// ```text
+    /// local PANEL = { Init = function(self) ... end }
+    /// PANEL = vgui.RegisterTable(PANEL, "DPanel")
+    /// ```
+    ///
+    /// Before the fix, `find_latest_decl_write_before_position` returned the
+    /// reassignment position (the second `PANEL =`), whose RHS is a `CallExpr`
+    /// (`vgui.RegisterTable(...)`). `value_expr_as_table` could not unwrap a
+    /// `CallExpr`, so the table literal at the original `local PANEL = {...}`
+    /// declaration was never bound to the synthesized panel class. `self` then
+    /// resolved to `Unknown`, `self.Field` to `FieldNotFound`, and the nil
+    /// checker mapped that to `Nil` → false-positive `unchecked-nil-access`.
+    ///
+    /// This pattern is used by the shipped `cl_scoreboard.lua` and many addons.
+    #[gtest]
+    fn test_vgui_register_table_reassigned_local_binds_table_literal() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        let file_id = ws.def_file(
+            "lua/vgui/register_table_reassigned.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            local PANEL = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            PANEL = vgui.RegisterTable(PANEL, "DPanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = Some(NumberOrString::String(
+            DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+        ));
+        let need_check_nil = Some(NumberOrString::String(
+            DiagnosticCode::NeedCheckNil.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != unchecked_nil_access
+                    && diagnostic.code != need_check_nil),
+            "reassigned-local RegisterTable should bind the table literal so self resolves to the synthesized panel class; got false-positive nil diagnostics: {diagnostics:?}"
+        );
+    }
+
     #[gtest]
     fn test_vgui_create_from_table_uses_panel_base_field_for_members() {
         let mut ws = VirtualWorkspace::new();
