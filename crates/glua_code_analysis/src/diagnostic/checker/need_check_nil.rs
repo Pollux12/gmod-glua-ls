@@ -190,7 +190,15 @@ fn report_unsafe_receiver(
         Err(_) => return false,
     };
     if receiver_type.is_nullable() {
-        if is_expr_guarded_by_prior_nil_early_return(semantic_model, receiver) {
+        // If the type contains GMod NULL, use IsValid-only matching —
+        // NULL is truthy, so `not expr` does not prove validity.
+        let has_gmod_null = contains_gmod_null_type(semantic_model.get_db(), &receiver_type);
+        let guarded = if has_gmod_null {
+            is_expr_guarded_by_prior_isvalid_early_return(semantic_model, receiver)
+        } else {
+            is_expr_guarded_by_prior_nil_early_return(semantic_model, receiver)
+        };
+        if guarded {
             return false;
         }
 
@@ -275,7 +283,15 @@ fn check_index_expr(
             return Some(());
         }
 
-        if is_expr_guarded_by_prior_nil_early_return(semantic_model, &prefix) {
+        // If the type contains GMod NULL, use IsValid-only matching —
+        // NULL is truthy, so `not expr` does not prove validity.
+        let has_gmod_null = contains_gmod_null_type(semantic_model.get_db(), &prefix_type);
+        let guarded = if has_gmod_null {
+            is_expr_guarded_by_prior_isvalid_early_return(semantic_model, &prefix)
+        } else {
+            is_expr_guarded_by_prior_nil_early_return(semantic_model, &prefix)
+        };
+        if guarded {
             return Some(());
         }
 
@@ -520,6 +536,13 @@ fn assigned_expr_invalidates_guarded_expr(
         return true;
     }
 
+    // Text-based fallback for dynamic-key index expressions where structural
+    // matching fails. If the assigned expression text-matches the guarded
+    // expression (or any of its prefixes), the guard is invalidated.
+    if expr_text_matches(assigned_expr, guarded_expr) {
+        return true;
+    }
+
     let mut current = guarded_expr.clone();
     while let LuaExpr::IndexExpr(index_expr) = current {
         let Some(prefix) = index_expr.get_prefix_expr() else {
@@ -528,10 +551,36 @@ fn assigned_expr_invalidates_guarded_expr(
         if exprs_reference_same_var(semantic_model, assigned_expr, &prefix) {
             return true;
         }
+        if expr_text_matches(assigned_expr, &prefix) {
+            return true;
+        }
+        // If the index key variable is reassigned, the guard is invalidated:
+        // `if not t[i] then return end; i = i + 1; t[i].field` — the new key
+        // was not checked by the guard.
+        if index_expr_key_reassigned(semantic_model, assigned_expr, &index_expr) {
+            return true;
+        }
         current = prefix;
     }
 
     false
+}
+
+/// Check if the assigned expression is the same variable as the index key.
+/// For `t[i]`, if `i` is reassigned, the guard on `t[i]` is invalidated.
+fn index_expr_key_reassigned(
+    semantic_model: &SemanticModel,
+    assigned_expr: &LuaExpr,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let Some(key) = index_expr.get_index_key() else {
+        return false;
+    };
+    let LuaIndexKey::Expr(key_expr) = key else {
+        // Literal keys (Name/String/Integer) can't be invalidated by reassignment
+        return false;
+    };
+    exprs_reference_same_var(semantic_model, assigned_expr, &key_expr)
 }
 
 fn if_body_has_return(if_stat: &LuaIfStat) -> bool {

@@ -3947,4 +3947,155 @@ mod test {
              Diagnostics: {post_guard_warnings:#?}"
         );
     }
+
+    #[test]
+    fn test_negation_guard_reverse_prefix_does_not_suppress_deeper_access() {
+        // `not self.Objects` should NOT suppress nil diagnostics on
+        // `self.Ent` — they are different fields, so guarding one doesn't
+        // suppress the other.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+            "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            ---@class Container3
+            ---@field Objects Entity?
+            ---@field Ent Entity?
+            local Container3 = {}
+
+            function Container3:GetEnt()
+                if not self.Objects then return end
+                self.Ent:GetPos()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        // `self.Ent:GetPos()` — `self.Ent` is nullable (`Entity?`).
+        // The guard `not self.Objects` is on a DIFFERENT field (`Objects`),
+        // so it should NOT suppress the diagnostic on `self.Ent`.
+        let post_guard_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("may be nil"))
+            .collect();
+
+        assert_that!(
+            post_guard_warnings,
+            not(is_empty()),
+            "`not self.Objects` should NOT suppress nil diagnostic on `self.Ent` — \
+             they are different fields. \
+             Diagnostics: {post_guard_warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn test_negation_guard_invalidated_by_reassignment() {
+        // If the guarded expression is reassigned between the guard and the
+        // access, the guard is invalidated and should NOT suppress.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+            "#,
+        );
+
+        ws.def(
+            r#"
+            ---@class Container4
+            ---@field Objects Entity?
+            local Container4 = {}
+
+            function Container4:GetEnt()
+                if not self.Objects then return end
+                self.Objects = nil
+                self.Objects:GetPos()
+            end
+            "#,
+        );
+
+        // After `self.Objects = nil`, the guard is invalidated.
+        // The subsequent `self.Objects:GetPos()` should produce an
+        // unchecked-nil-access diagnostic since the type narrows to nil.
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::UncheckedNilAccess,
+                r#"
+                function Container4:GetEnt()
+                    if not self.Objects then return end
+                    self.Objects = nil
+                    self.Objects:GetPos()
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[test]
+    fn test_negation_guard_invalidated_by_key_mutation() {
+        // If the index key variable is reassigned between the guard and the
+        // access, the guard is invalidated (it proved the old key, not the new one).
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+            "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            ---@class Container5
+            ---@field Objects table<integer, Entity>?
+            local Container5 = {}
+
+            ---@param i integer
+            function Container5:GetEnt(i)
+                if not self.Objects[i] then return end
+                i = i + 1
+                self.Objects[i]:GetPos()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        // After `i = i + 1`, the guard on `self.Objects[i]` (old i) is invalidated.
+        // The subsequent `self.Objects[i]:GetPos()` (new i) should produce a
+        // diagnostic on `self.Objects` (nullable table prefix).
+        let post_mutation_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("may be nil"))
+            .collect();
+
+        assert_that!(
+            post_mutation_warnings,
+            not(is_empty()),
+            "Reassigning `i = i + 1` should invalidate the guard on `self.Objects[i]` — \
+             the guard proved the old key, not the new one. \
+             Diagnostics: {post_mutation_warnings:#?}"
+        );
+    }
 }
