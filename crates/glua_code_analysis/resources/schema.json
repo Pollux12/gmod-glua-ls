@@ -1681,6 +1681,21 @@
                 "rootDir": "plugins"
               },
               {
+                "classGlobal": "PLAYER",
+                "icon": "person",
+                "id": "player_classes",
+                "include": [
+                  "player_class/**",
+                  "gamemode/player_class/**",
+                  "gamemodes/*/gamemode/player_class/**"
+                ],
+                "label": "Player Classes",
+                "path": [
+                  "player_class"
+                ],
+                "rootDir": "gamemodes"
+              },
+              {
                 "classGlobal": "GM",
                 "classNamePrefix": "gamemode_",
                 "icon": "folder-library",
@@ -2054,6 +2069,21 @@
                 "plugins"
               ],
               "rootDir": "plugins"
+            },
+            {
+              "classGlobal": "PLAYER",
+              "icon": "person",
+              "id": "player_classes",
+              "include": [
+                "player_class/**",
+                "gamemode/player_class/**",
+                "gamemodes/*/gamemode/player_class/**"
+              ],
+              "label": "Player Classes",
+              "path": [
+                "player_class"
+              ],
+              "rootDir": "gamemodes"
             },
             {
               "classGlobal": "GM",
@@ -2861,6 +2891,21 @@
                 "plugins"
               ],
               "rootDir": "plugins"
+            },
+            {
+              "classGlobal": "PLAYER",
+              "icon": "person",
+              "id": "player_classes",
+              "include": [
+                "player_class/**",
+                "gamemode/player_class/**",
+                "gamemodes/*/gamemode/player_class/**"
+              ],
+              "label": "Player Classes",
+              "path": [
+                "player_class"
+              ],
+              "rootDir": "gamemodes"
             },
             {
               "classGlobal": "GM",

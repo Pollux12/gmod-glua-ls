@@ -1886,6 +1886,39 @@ mod test {
         );
     }
 
+    /// Verifies that `SWEP.Type = "nextbot"` does NOT inject `NextBot` as a
+    /// super-type. The `Type` field on non-entity scripted classes has
+    /// different semantics and should not trigger entity framework injection.
+    #[gtest]
+    fn test_sweapon_type_nextbot_does_not_inject_nextbot_super_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("weapons/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/weapons/my_sweapon/shared.lua",
+            r#"
+            SWEP.Type = "nextbot"
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("my_sweapon");
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert!(
+            !super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("NextBot"))),
+            "NextBot should NOT be a super-type for SWEP.Type='nextbot', got {super_types:?}"
+        );
+    }
+
     #[gtest]
     fn test_ent_base_ai_preserves_named_super_type() {
         let mut ws = VirtualWorkspace::new();
@@ -2747,6 +2780,113 @@ mod test {
         );
     }
 
+    /// Verifies that `find_registered_table_expr` does NOT fall back to the
+    /// original local initializer when the latest write is an unrelated
+    /// reassignment (not the registration call). This is a regression guard
+    /// for the narrowed fallback in `find_registered_table_expr`: only when
+    /// the registration call IS the reassignment RHS (e.g.
+    /// `PANEL = vgui.RegisterTable(PANEL, ...)`) should the original local
+    /// initializer be used. An unrelated `PANEL = MakePanel()` should NOT
+    /// trigger the fallback.
+    #[gtest]
+    fn test_vgui_register_table_unrelated_reassignment_does_not_bind_stale_initializer() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        // Case 1: Valid self-assignment registration — PANEL = vgui.RegisterTable(PANEL, ...)
+        // This SHOULD bind the table literal and NOT produce nil diagnostics.
+        let valid_file_id = ws.def_file(
+            "lua/vgui/register_table_self_assign.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            local PANEL = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            PANEL = vgui.RegisterTable(PANEL, "DPanel")
+            "#,
+        );
+
+        let valid_diagnostics = ws
+            .analysis
+            .diagnose_file(valid_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let nil_codes = [
+            Some(NumberOrString::String(
+                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+            )),
+            Some(NumberOrString::String(
+                DiagnosticCode::NeedCheckNil.get_name().to_string(),
+            )),
+        ];
+        assert!(
+            valid_diagnostics
+                .iter()
+                .all(|d| !nil_codes.contains(&d.code)),
+            "self-assignment RegisterTable should bind the table literal; got nil diagnostics: {valid_diagnostics:?}"
+        );
+
+        // Case 2: Unrelated reassignment — PANEL = MakePanel(), then separate vgui.RegisterTable(PANEL, ...)
+        // The stale initializer should NOT be used, so the `Init` function's
+        // `self.Btn` access should produce diagnostics (since self resolves to
+        // Unknown instead of the synthesized panel class).
+        let _unrelated_file_id = ws.def_file(
+            "lua/vgui/register_table_unrelated_reassign.lua",
+            r#"
+            local function MakePanel() return {} end
+
+            local PANEL2 = {
+                Init = function(self)
+                    self.Btn2 = self:Add("DButton")
+                    self.Btn2:Dock(1)
+                end,
+            }
+
+            PANEL2 = MakePanel()
+
+            vgui.RegisterTable(PANEL2, "DPanel")
+            "#,
+        );
+
+        let unrelated_diagnostics = ws
+            .analysis
+            .diagnose_file(_unrelated_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        // With the narrowed fallback, the stale initializer is NOT bound, so
+        // `self.Btn2` should produce `unchecked-nil-access` because `self`
+        // resolves to Unknown (no table expr found).
+        let has_nil_diag = unrelated_diagnostics
+            .iter()
+            .any(|d| nil_codes.contains(&d.code));
+        assert!(
+            has_nil_diag,
+            "unrelated reassignment should NOT bind the stale initializer; expected nil diagnostics on self.Btn2, got: {unrelated_diagnostics:?}"
+        );
+    }
+
     /// Regression test for `vgui.CreateFromTable` using the `register_table`
     /// call_arg kind, which caused the analyzer to synthesize a SECOND panel
     /// class at every `CreateFromTable(panelVar, ...)` call site. This second
@@ -2796,7 +2936,7 @@ mod test {
             function vgui.RegisterTable(panelTable, baseName) end
 
             ---@generic T : table
-            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
             ---@param metatable T
             ---@param parent? Panel
             ---@return Panel

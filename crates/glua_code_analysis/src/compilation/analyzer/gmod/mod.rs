@@ -3037,7 +3037,7 @@ fn synthesize_scripted_ent_registration(
     // entity produces false-positive `undefined-field` diagnostics because
     // the synthesized `base_nextbot` class doesn't inherit from `NextBot`.
     if let Some(type_name) = resolve_registered_scripted_ent_type(&table_expr)
-        && let Some(super_name) = super_type_for_ent_type(&type_name)
+        && let Some(super_name) = super_type_for_entity_type(&type_name)
     {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(&super_name));
         if super_type != class_type {
@@ -3097,7 +3097,7 @@ fn resolve_registered_scripted_ent_type(table_expr: &LuaTableExpr) -> Option<Str
 /// Maps `ENT.Type` values to the annotation class that provides the
 /// engine-side framework methods. C++ metatable injection makes these
 /// methods available at runtime; we model them via super-types.
-fn super_type_for_ent_type(type_name: &str) -> Option<&'static str> {
+fn super_type_for_entity_type(type_name: &str) -> Option<&'static str> {
     match type_name {
         "nextbot" => Some("NextBot"),
         _ => None,
@@ -3220,7 +3220,15 @@ fn synthesize_scoped_base_assignments_with(
         root.syntax().text_range(),
     );
     let expected_base_path = format!("{}.Base", scope_match.global_name);
-    let expected_type_path = format!("{}.Type", scope_match.global_name);
+
+    // ENT.Type selects the engine-side entity framework (e.g. "nextbot"
+    // provides NextBot methods). Only entities use this field — SWEP, TOOL,
+    // PLAYER, etc. have their own Type field with different semantics.
+    let expected_type_path = if scope_match.global_name == "ENT" {
+        Some(format!("{}.Type", scope_match.global_name))
+    } else {
+        None
+    };
 
     for assign_stat in root.descendants::<LuaAssignStat>() {
         let (vars, exprs) = assign_stat.get_var_and_expr_list();
@@ -3237,54 +3245,45 @@ fn synthesize_scoped_base_assignments_with(
                 let Some(base_name) = extract_scoped_base_name(value_expr) else {
                     continue;
                 };
-
-                let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
-                if super_type == LuaType::Ref(class_decl_id.clone()) {
-                    continue;
-                }
-
-                let has_super = db
-                    .get_type_index()
-                    .get_super_types_iter(&class_decl_id)
-                    .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-                    .unwrap_or(false);
-                if !has_super {
-                    db.get_type_index_mut().add_super_type(
-                        class_decl_id.clone(),
-                        file_id,
-                        super_type,
-                    );
-                }
-            } else if access_path.eq_ignore_ascii_case(&expected_type_path) {
+                add_scoped_super_type_if_missing(db, &class_decl_id, file_id, &base_name);
+            } else if let Some(ref type_path) = expected_type_path
+                && access_path.eq_ignore_ascii_case(type_path)
+            {
                 // ENT.Type = "nextbot" → inject NextBot as a super-type so
                 // engine-side framework methods (StartActivity, loco, etc.)
                 // are visible on the synthesized class.
                 let Some(type_name) = extract_scoped_base_name(value_expr) else {
                     continue;
                 };
-                let Some(super_name) = super_type_for_ent_type(&type_name) else {
+                let Some(super_name) = super_type_for_entity_type(&type_name) else {
                     continue;
                 };
-
-                let super_type = LuaType::Ref(LuaTypeDeclId::global(super_name));
-                if super_type == LuaType::Ref(class_decl_id.clone()) {
-                    continue;
-                }
-
-                let has_super = db
-                    .get_type_index()
-                    .get_super_types_iter(&class_decl_id)
-                    .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-                    .unwrap_or(false);
-                if !has_super {
-                    db.get_type_index_mut().add_super_type(
-                        class_decl_id.clone(),
-                        file_id,
-                        super_type,
-                    );
-                }
+                add_scoped_super_type_if_missing(db, &class_decl_id, file_id, super_name);
             }
         }
+    }
+}
+
+/// Adds `super_name` as a global super-type of `class_decl_id` if it is not
+/// already present and is not the class itself.
+fn add_scoped_super_type_if_missing(
+    db: &mut DbIndex,
+    class_decl_id: &LuaTypeDeclId,
+    file_id: FileId,
+    super_name: &str,
+) {
+    let super_type = LuaType::Ref(LuaTypeDeclId::global(super_name));
+    if super_type == LuaType::Ref(class_decl_id.clone()) {
+        return;
+    }
+    let has_super = db
+        .get_type_index()
+        .get_super_types_iter(class_decl_id)
+        .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
+        .unwrap_or(false);
+    if !has_super {
+        db.get_type_index_mut()
+            .add_super_type(class_decl_id.clone(), file_id, super_type);
     }
 }
 
@@ -4609,12 +4608,48 @@ fn find_registered_table_expr(
         // When the latest write is a reassignment whose RHS is not a table
         // literal (e.g. `PANEL = vgui.RegisterTable(PANEL, "DPanel")`),
         // the table constructor still lives at the original `local PANEL =
-        // {...}` declaration. Try the decl's own position before giving up.
+        // {...}` declaration.
+        //
+        // Only fall back when the registration call is the reassignment RHS
+        // itself — i.e. `register_position` is within the write statement's
+        // range. This avoids mis-modeling unrelated reassignments such as
+        // `PANEL = MakePanel()` followed by a separate `vgui.RegisterTable`
+        // call, where the stale initializer should NOT be used.
         if write_position == decl_id.position {
+            return None;
+        }
+        if !write_position_contains_register(db, file_id, write_position, register_position) {
             return None;
         }
         find_registered_table_expr_at_write_position(db, file_id, decl_id.position)
     })
+}
+
+/// Checks whether `register_position` falls within the RHS of the assignment
+/// statement at `write_position`. This identifies the self-assignment
+/// registration pattern `PANEL = vgui.RegisterTable(PANEL, ...)`.
+fn write_position_contains_register(
+    db: &DbIndex,
+    file_id: FileId,
+    write_position: TextSize,
+    register_position: TextSize,
+) -> bool {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return false;
+    };
+    let chunk = tree.get_chunk_node();
+    let Some(name_token) = chunk
+        .syntax()
+        .token_at_offset(write_position)
+        .right_biased()
+    else {
+        return false;
+    };
+    let Some(assign_stat) = name_token.parent_ancestors().find_map(LuaAssignStat::cast) else {
+        return false;
+    };
+    let assign_range = assign_stat.syntax().text_range();
+    assign_range.start() <= register_position && register_position < assign_range.end()
 }
 
 fn find_registered_table_expr_at_write_position(
