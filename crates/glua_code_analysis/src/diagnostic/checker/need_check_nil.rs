@@ -649,9 +649,13 @@ fn index_expr_key_reassigned(
 /// Check if the variable referenced by `assigned_expr` appears anywhere inside `expr`.
 /// This catches cases like `i = i + 1` invalidating `t[i + 1]` where the
 /// key expression `i + 1` contains a reference to `i`.
-/// Also catches indexed variable reassignment such as `self.Key = self.Key + 1`
-/// invalidating `self.Objects[self.Key + 1]`, where the key expression contains
-/// `self.Key` (an IndexExpr, not just a NameExpr).
+///
+/// Also walks `IndexExpr` descendants (not just `NameExpr`) as defensive
+/// hardening of the semantic path: when the assigned expression resolves to
+/// a stable ref id, indexed references like `keys[1]` inside a compound key
+/// are compared semantically. Dynamic-field keys like `self.Key` go through
+/// the text fallback and were already handled by the `NameExpr`-only walk.
+///
 /// Uses semantic var/ref identity for the comparison, with text fallback only
 /// when the assigned expression doesn't resolve to a var ref.
 fn assigned_var_referenced_in_expr(
