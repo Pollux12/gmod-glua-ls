@@ -1,7 +1,7 @@
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr,
-    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaNameExpr, LuaRepeatStat,
-    LuaSyntaxKind, LuaSyntaxNode, LuaWhileStat, UnaryOperator,
+    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaNameExpr,
+    LuaRepeatStat, LuaSyntaxKind, LuaSyntaxNode, LuaWhileStat, UnaryOperator,
 };
 use rowan::TextRange;
 
@@ -504,16 +504,72 @@ fn guarded_expr_reassigned_between(
             return true;
         }
 
+        // Local declarations shadow the guarded name and invalidate the guard.
+        // `local x = nil` after `if not x then return end` means the guard
+        // proved the old binding, not the new local.
+        if let Some(local_stat) = LuaLocalStat::cast(sibling.clone())
+            && local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr)
+        {
+            return true;
+        }
+
         if sibling.descendants().any(|node| {
-            LuaAssignStat::cast(node).is_some_and(|assign_stat| {
-                assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
-            })
+            if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
+                return assign_stat_reassigns_guarded_expr(
+                    semantic_model,
+                    &assign_stat,
+                    guarded_expr,
+                );
+            }
+            if let Some(local_stat) = LuaLocalStat::cast(node) {
+                return local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr);
+            }
+            false
         }) {
             return true;
         }
     }
 
     false
+}
+
+/// Check if a `local` declaration shadows the guarded expression's root name.
+/// This invalidates the guard because the guard proved the old binding.
+fn local_stat_shadows_guarded_expr(
+    _semantic_model: &SemanticModel,
+    local_stat: &LuaLocalStat,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    // Extract the root name from the guarded expression.
+    // For `x`, root is `x`. For `t.field`, root is `t`. For `self.x`, root is `self`.
+    let Some(root_text) = root_name_text(guarded_expr) else {
+        return false;
+    };
+
+    // Check if any local name in the declaration matches the root.
+    local_stat.get_local_name_list().any(|local_name| {
+        local_name
+            .get_name_token()
+            .is_some_and(|token| token.get_name_text() == root_text)
+    })
+}
+
+/// Extract the root name text from an expression.
+/// For `x` → `x`, for `t.field` → `t`, for `self.x` → `self`,
+/// for `t[i]` → `t`.
+fn root_name_text(expr: &LuaExpr) -> Option<String> {
+    let mut current = expr.clone();
+    loop {
+        match &current {
+            LuaExpr::NameExpr(name_expr) => {
+                return Some(name_expr.get_name_token()?.get_name_text().to_string());
+            }
+            LuaExpr::IndexExpr(index_expr) => {
+                current = index_expr.get_prefix_expr()?;
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn assign_stat_reassigns_guarded_expr(
@@ -566,8 +622,10 @@ fn assigned_expr_invalidates_guarded_expr(
     false
 }
 
-/// Check if the assigned expression is the same variable as the index key.
+/// Check if the assigned expression is referenced inside the index key.
 /// For `t[i]`, if `i` is reassigned, the guard on `t[i]` is invalidated.
+/// For `t[i + 1]`, reassigning `i` also invalidates because `i` is
+/// referenced inside the compound key expression.
 fn index_expr_key_reassigned(
     semantic_model: &SemanticModel,
     assigned_expr: &LuaExpr,
@@ -580,7 +638,38 @@ fn index_expr_key_reassigned(
         // Literal keys (Name/String/Integer) can't be invalidated by reassignment
         return false;
     };
-    exprs_reference_same_var(semantic_model, assigned_expr, &key_expr)
+    // First check exact match (fast path).
+    if exprs_reference_same_var(semantic_model, assigned_expr, &key_expr) {
+        return true;
+    }
+    // Then check if the assigned variable is referenced anywhere inside the
+    // key expression (e.g. `i + 1` references `i`).
+    assigned_var_referenced_in_expr(semantic_model, assigned_expr, &key_expr)
+}
+
+/// Check if the variable referenced by `assigned_expr` appears anywhere inside `expr`.
+/// This catches cases like `i = i + 1` invalidating `t[i + 1]` where the
+/// key expression `i + 1` contains a reference to `i`.
+fn assigned_var_referenced_in_expr(
+    _semantic_model: &SemanticModel,
+    assigned_expr: &LuaExpr,
+    expr: &LuaExpr,
+) -> bool {
+    // Get the root name of the assigned expression (e.g. `i` from `i`).
+    let Some(assigned_name) = root_name_text(assigned_expr) else {
+        return false;
+    };
+
+    // Walk all NameExpr descendants of the key expression and check if any
+    // references the same variable as the assigned expression.
+    expr.syntax()
+        .descendants()
+        .filter_map(LuaNameExpr::cast)
+        .any(|name_expr| {
+            name_expr
+                .get_name_token()
+                .is_some_and(|token| token.get_name_text() == assigned_name)
+        })
 }
 
 fn if_body_has_return(if_stat: &LuaIfStat) -> bool {

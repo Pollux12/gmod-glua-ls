@@ -3950,28 +3950,31 @@ mod test {
 
     #[test]
     fn test_negation_guard_reverse_prefix_does_not_suppress_deeper_access() {
-        // `not self.Objects` should NOT suppress nil diagnostics on
-        // `self.Ent` — they are different fields, so guarding one doesn't
-        // suppress the other.
+        // The reverse prefix match (condition shorter than guarded) is
+        // intentionally NOT supported: `not self.Objects` should NOT suppress
+        // diagnostics on `self.Objects.Ent`, because proving the outer object
+        // exists does not prove a specific nested field is non-nil.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
         ws.def(
             r#"
             ---@class Entity
             ---@field GetPos fun(self: Entity): any
+
+            ---@class Inner
+            ---@field Ent Entity?
             "#,
         );
 
         let file_id = ws.def(
             r#"
             ---@class Container3
-            ---@field Objects Entity?
-            ---@field Ent Entity?
+            ---@field Objects Inner?
             local Container3 = {}
 
             function Container3:GetEnt()
                 if not self.Objects then return end
-                self.Ent:GetPos()
+                self.Objects.Ent:GetPos()
             end
             "#,
         );
@@ -3984,19 +3987,24 @@ mod test {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
 
-        // `self.Ent:GetPos()` — `self.Ent` is nullable (`Entity?`).
-        // The guard `not self.Objects` is on a DIFFERENT field (`Objects`),
-        // so it should NOT suppress the diagnostic on `self.Ent`.
+        // `self.Objects.Ent:GetPos()` — the guarded expression (`self.Objects.Ent`)
+        // extends the condition (`self.Objects`). The prefix match is one-directional:
+        // the condition must be the guarded expression OR a longer chained version.
+        // A shorter condition must NOT suppress the deeper access, so this must
+        // produce a nil diagnostic on the nullable `Ent` field.
         let post_guard_warnings: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("may be nil"))
+            // The guarded access is on line 7 (function body line 2); guard line 6
+            // starts after line 0 class/field defs.
+            .filter(|d| d.range.start.line == 7)
             .collect();
 
         assert_that!(
             post_guard_warnings,
             not(is_empty()),
-            "`not self.Objects` should NOT suppress nil diagnostic on `self.Ent` — \
-             they are different fields. \
+            "`not self.Objects` should NOT suppress nil diagnostic on `self.Objects.Ent` — \
+             the condition is shorter than the guarded expression. \
              Diagnostics: {post_guard_warnings:#?}"
         );
     }
@@ -4050,6 +4058,8 @@ mod test {
     fn test_negation_guard_invalidated_by_key_mutation() {
         // If the index key variable is reassigned between the guard and the
         // access, the guard is invalidated (it proved the old key, not the new one).
+        // We use `table<integer, Entity?>` so indexed access returns `Entity?`
+        // (nullable), which triggers need-check-nil unless guarded.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
         ws.def(
@@ -4062,7 +4072,7 @@ mod test {
         let file_id = ws.def(
             r#"
             ---@class Container5
-            ---@field Objects table<integer, Entity>?
+            ---@field Objects table<integer, Entity?>?
             local Container5 = {}
 
             ---@param i integer
@@ -4084,18 +4094,89 @@ mod test {
 
         // After `i = i + 1`, the guard on `self.Objects[i]` (old i) is invalidated.
         // The subsequent `self.Objects[i]:GetPos()` (new i) should produce a
-        // diagnostic on `self.Objects` (nullable table prefix).
+        // diagnostic on `self.Objects[i]` (nullable since Entity? value type).
+        //
+        // We filter for diagnostics on the post-mutation line specifically,
+        // not the guard condition line, to prove the guard was invalidated.
+        // The access `self.Objects[i]:GetPos()` is on the last line of the function.
+        let all_lines: Vec<_> = diagnostics.iter().map(|d| d.range.start.line).collect();
         let post_mutation_warnings: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("may be nil"))
+            // Filter for the post-mutation access line (after `i = i + 1`).
+            // The function body starts around line 7-8, the access is 2 lines
+            // after the guard.
+            .filter(|d| {
+                // Find the max diagnostic line — the post-mutation access should
+                // be on a later line than the guard condition.
+                let max_line = all_lines.iter().copied().max().unwrap_or(0);
+                d.range.start.line == max_line
+            })
             .collect();
 
         assert_that!(
             post_mutation_warnings,
             not(is_empty()),
-            "Reassigning `i = i + 1` should invalidate the guard on `self.Objects[i]` — \
-             the guard proved the old key, not the new one. \
-             Diagnostics: {post_mutation_warnings:#?}"
+            "After `i = i + 1`, `self.Objects[i]:GetPos()` should produce a nil diagnostic \
+             on the post-mutation line. All diagnostic lines: {all_lines:?}. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_negation_guard_does_not_suppress_mixed_nil_null() {
+        // NULL is truthy in GLua, so `not ent` only proves non-nil, not validity.
+        // When the type is `Entity|NULL|nil`, the guard must NOT suppress the
+        // NULL diagnostic, because `not ent` doesn't prove IsValid.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+
+            ---@type NULL
+            NULL = nil
+            "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            ---@param ent Entity|NULL|nil
+            local function useEntity(ent)
+                if not ent then return end
+                ent:GetPos()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        // `ent:GetPos()` should still produce a NULL diagnostic because
+        // `not ent` only proves non-nil, not validity. The type contains
+        // NULL, so the general negation guard must NOT suppress it.
+        let null_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("NULL"))
+            .collect();
+
+        assert_that!(
+            null_warnings.is_empty(),
+            is_false(),
+            "`not ent` on type `Entity|NULL|nil` should NOT suppress NULL diagnostics — \
+             NULL is truthy in GLua, so IsValid is still required. \
+             Diagnostics: {null_warnings:#?}"
         );
     }
 }
