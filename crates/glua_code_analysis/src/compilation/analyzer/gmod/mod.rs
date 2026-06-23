@@ -3030,6 +3030,25 @@ fn synthesize_scripted_ent_registration(
         }
     }
 
+    // Inject extra super-types based on `ENT.Type`. The `Type` field selects
+    // the engine-side entity framework (e.g. `"nextbot"` provides `NextBot`
+    // methods like `StartActivity`, `loco`, `MoveToPos` via C++ metatable
+    // injection). Without this, `self:StartActivity()` on a `base_nextbot`
+    // entity produces false-positive `undefined-field` diagnostics because
+    // the synthesized `base_nextbot` class doesn't inherit from `NextBot`.
+    if let Some(type_name) = resolve_registered_scripted_ent_type(&table_expr)
+        && let Some(super_name) = super_type_for_ent_type(&type_name)
+    {
+        let super_type = LuaType::Ref(LuaTypeDeclId::global(&super_name));
+        if super_type != class_type {
+            db.get_type_index_mut().add_super_type_if_missing(
+                class_decl_id.clone(),
+                file_id,
+                super_type,
+            );
+        }
+    }
+
     synthesize_registered_scripted_ent_region_members(
         db,
         file_id,
@@ -3065,6 +3084,24 @@ fn resolve_registered_scripted_ent_base(
                 _ => None,
             },
         )
+}
+
+/// Reads the `Type` field from a scripted-entity table literal (e.g.
+/// `ENT.Type = "nextbot"`).
+fn resolve_registered_scripted_ent_type(table_expr: &LuaTableExpr) -> Option<String> {
+    let field = find_table_field_by_name(table_expr, "Type")?;
+    let value_expr = field.get_value_expr()?;
+    extract_scoped_base_name(&value_expr)
+}
+
+/// Maps `ENT.Type` values to the annotation class that provides the
+/// engine-side framework methods. C++ metatable injection makes these
+/// methods available at runtime; we model them via super-types.
+fn super_type_for_ent_type(type_name: &str) -> Option<&'static str> {
+    match type_name {
+        "nextbot" => Some("NextBot"),
+        _ => None,
+    }
 }
 
 fn synthesize_registered_scripted_ent_region_members(
@@ -3183,6 +3220,7 @@ fn synthesize_scoped_base_assignments_with(
         root.syntax().text_range(),
     );
     let expected_base_path = format!("{}.Base", scope_match.global_name);
+    let expected_type_path = format!("{}.Type", scope_match.global_name);
 
     for assign_stat in root.descendants::<LuaAssignStat>() {
         let (vars, exprs) = assign_stat.get_var_and_expr_list();
@@ -3194,27 +3232,57 @@ fn synthesize_scoped_base_assignments_with(
             let Some(access_path) = var.get_access_path() else {
                 continue;
             };
-            if !access_path.eq_ignore_ascii_case(&expected_base_path) {
-                continue;
-            }
 
-            let Some(base_name) = extract_scoped_base_name(value_expr) else {
-                continue;
-            };
+            if access_path.eq_ignore_ascii_case(&expected_base_path) {
+                let Some(base_name) = extract_scoped_base_name(value_expr) else {
+                    continue;
+                };
 
-            let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
-            if super_type == LuaType::Ref(class_decl_id.clone()) {
-                continue;
-            }
+                let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
+                if super_type == LuaType::Ref(class_decl_id.clone()) {
+                    continue;
+                }
 
-            let has_super = db
-                .get_type_index()
-                .get_super_types_iter(&class_decl_id)
-                .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-                .unwrap_or(false);
-            if !has_super {
-                db.get_type_index_mut()
-                    .add_super_type(class_decl_id.clone(), file_id, super_type);
+                let has_super = db
+                    .get_type_index()
+                    .get_super_types_iter(&class_decl_id)
+                    .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
+                    .unwrap_or(false);
+                if !has_super {
+                    db.get_type_index_mut().add_super_type(
+                        class_decl_id.clone(),
+                        file_id,
+                        super_type,
+                    );
+                }
+            } else if access_path.eq_ignore_ascii_case(&expected_type_path) {
+                // ENT.Type = "nextbot" → inject NextBot as a super-type so
+                // engine-side framework methods (StartActivity, loco, etc.)
+                // are visible on the synthesized class.
+                let Some(type_name) = extract_scoped_base_name(value_expr) else {
+                    continue;
+                };
+                let Some(super_name) = super_type_for_ent_type(&type_name) else {
+                    continue;
+                };
+
+                let super_type = LuaType::Ref(LuaTypeDeclId::global(super_name));
+                if super_type == LuaType::Ref(class_decl_id.clone()) {
+                    continue;
+                }
+
+                let has_super = db
+                    .get_type_index()
+                    .get_super_types_iter(&class_decl_id)
+                    .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
+                    .unwrap_or(false);
+                if !has_super {
+                    db.get_type_index_mut().add_super_type(
+                        class_decl_id.clone(),
+                        file_id,
+                        super_type,
+                    );
+                }
             }
         }
     }

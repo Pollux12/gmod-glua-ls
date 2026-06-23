@@ -1811,6 +1811,81 @@ mod test {
         }
     }
 
+    /// Verifies that `ENT.Type = "nextbot"` injects `NextBot` as a super-type
+    /// on the synthesized entity class. This mirrors C++ metatable injection
+    /// where `NextBot` methods (StartActivity, loco, etc.) become available on
+    /// entities with `Type = "nextbot"`.
+    #[gtest]
+    fn test_ent_type_nextbot_injects_nextbot_super_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        // Legacy assignment form (ENT.Type = "nextbot")
+        ws.def_file(
+            "lua/entities/base_nextbot/shared.lua",
+            r#"
+            ENT.Base = "base_entity"
+            ENT.Type = "nextbot"
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("base_nextbot");
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("NextBot"))),
+            "expected NextBot super type for base_nextbot (legacy ENT.Type assignment), got {super_types:?}"
+        );
+    }
+
+    /// Verifies that `ENT.Type = "nextbot"` in a `scripted_ents.Register` table
+    /// literal also injects `NextBot` as a super-type. Uses a non-scoped path so
+    /// the `scripted_ents.Register` synthesis path runs (scoped `ENT` tables
+    /// are handled by `synthesize_scoped_base_assignments_with`).
+    #[gtest]
+    fn test_ent_type_nextbot_in_register_table_injects_nextbot_super_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/my_nextbot_init.lua",
+            r#"
+            local ENT = {
+                Base = "base_entity",
+                Type = "nextbot",
+            }
+
+            scripted_ents.Register(ENT, "my_nextbot")
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("my_nextbot");
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("NextBot"))),
+            "expected NextBot super type for my_nextbot (scripted_ents.Register table), got {super_types:?}"
+        );
+    }
+
     #[gtest]
     fn test_ent_base_ai_preserves_named_super_type() {
         let mut ws = VirtualWorkspace::new();
