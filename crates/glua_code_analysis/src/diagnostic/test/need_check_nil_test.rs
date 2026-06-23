@@ -3771,4 +3771,66 @@ mod test {
              Diagnostics: {diagnostics:#?}"
         );
     }
+
+    #[test]
+    fn test_negated_index_expr_guard_suppresses_need_check_nil() {
+        // When an index expression like `t[k]` is guarded by a prior
+        // `if (!t[k]) then return end` (or `if not t[k] then return end`),
+        // the subsequent access `t[k].field` should NOT emit need-check-nil
+        // because the nil case already returned early.
+        //
+        // This is the pattern from gmod_tool/object.lua:
+        //   if ( !self.Objects[i] ) then return NULL end
+        //   return self.Objects[i].Ent
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+            ---@class Container
+            ---@field Objects table<integer, {Ent: Entity}>?
+            local Container = {}
+
+            ---@param i integer
+            ---@return Entity
+            function Container:GetEnt(i)
+                if not self.Objects[i] then return nil end
+                return self.Objects[i].Ent
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        let nil_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("may be nil"))
+            .collect();
+
+        // The `if not self.Objects[i]` condition itself accesses `self.Objects`,
+        // which IS nullable — that diagnostic is correct and expected.
+        // But the subsequent `self.Objects[i].Ent` on the next line should be
+        // guarded by the early return and NOT produce a diagnostic.
+        //
+        // We verify by checking that no diagnostic appears on the `return` line.
+        // The Lua code (after def() adds one prefix line) has:
+        //   line 8: `if not self.Objects[i] then return nil end`
+        //   line 9: `return self.Objects[i].Ent`
+        let post_guard_warnings: Vec<_> = nil_warnings
+            .iter()
+            .filter(|d| d.range.start.line >= 9)
+            .collect();
+
+        assert_that!(
+            post_guard_warnings.is_empty(),
+            is_true(),
+            "self.Objects[i] should be narrowed to non-nil after `if not self.Objects[i] then return end`. \
+             Diagnostics after guard: {post_guard_warnings:#?}"
+        );
+    }
 }

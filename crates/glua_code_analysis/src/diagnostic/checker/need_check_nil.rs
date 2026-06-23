@@ -190,7 +190,7 @@ fn report_unsafe_receiver(
         Err(_) => return false,
     };
     if receiver_type.is_nullable() {
-        if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, receiver) {
+        if is_expr_guarded_by_prior_nil_early_return(semantic_model, receiver) {
             return false;
         }
 
@@ -217,7 +217,7 @@ fn report_unsafe_receiver(
         return false;
     }
 
-    if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, receiver) {
+    if is_expr_guarded_by_prior_nil_early_return(semantic_model, receiver) {
         return false;
     }
 
@@ -273,7 +273,7 @@ fn check_index_expr(
             return Some(());
         }
 
-        if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, &prefix) {
+        if is_expr_guarded_by_prior_nil_early_return(semantic_model, &prefix) {
             return Some(());
         }
 
@@ -347,6 +347,40 @@ fn is_expr_guarded_by_prior_isvalid_early_return(
     semantic_model: &SemanticModel,
     expr: &LuaExpr,
 ) -> bool {
+    is_expr_guarded_by_prior_early_return(semantic_model, expr, |condition, guarded| {
+        condition_is_negative_isvalid_guard(semantic_model, condition, guarded)
+    })
+}
+
+/// Combined guard: checks both IsValid-specific and general negation guards.
+/// The IsValid guard uses structural var_ref_id matching (precise but limited);
+/// the general negation guard uses text-based matching (handles dynamic-key
+/// index expressions like `self.Objects[i]` that var_ref_id can't track).
+fn is_expr_guarded_by_prior_nil_early_return(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> bool {
+    // Try IsValid guard first (structural, more precise)
+    if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, expr) {
+        return true;
+    }
+    // Fall back to general negation guard (text-based, handles dynamic keys)
+    is_expr_guarded_by_prior_early_return(semantic_model, expr, |condition, guarded| {
+        condition_is_negative_expr_guard(condition, guarded)
+    })
+}
+
+/// Walks prior sibling `if` statements to find an early-return guard for `expr`.
+/// The `condition_matches` closure determines whether the if-condition matches
+/// the guarded expression (e.g. via `IsValid` or a general negation check).
+fn is_expr_guarded_by_prior_early_return<F>(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+    condition_matches: F,
+) -> bool
+where
+    F: Fn(&LuaExpr, &LuaExpr) -> bool,
+{
     let Some(containing_stat) = expr.syntax().ancestors().find(|node| {
         let kind: LuaSyntaxKind = node.kind().into();
         matches!(
@@ -385,7 +419,7 @@ fn is_expr_guarded_by_prior_isvalid_early_return(
         let Some(condition) = if_stat.get_condition_expr() else {
             continue;
         };
-        if condition_is_negative_isvalid_guard(semantic_model, &condition, expr)
+        if condition_matches(&condition, expr)
             && !guard_continuing_clauses_reassign_guarded_expr(semantic_model, expr, &if_stat)
             && !guarded_expr_reassigned_between(
                 semantic_model,
@@ -551,6 +585,82 @@ fn condition_is_negative_isvalid_guard(
         }),
         _ => false,
     }
+}
+
+/// Check if `condition` is a negated expression (`not <expr>`) where `<expr>`
+/// textually matches `guarded_expr`. This is the general form of the IsValid
+/// guard: `if not self.Objects[i] then return end` should suppress nil
+/// diagnostics on the subsequent `self.Objects[i]` access.
+///
+/// Text-based matching is used instead of var_ref_id because dynamic-key
+/// index expressions like `t[k]` (where `k` is not a compile-time constant)
+/// do not produce stable var_ref_ids, so the structural matching path in
+/// `exprs_reference_same_var` fails for them.
+fn condition_is_negative_expr_guard(condition: &LuaExpr, guarded_expr: &LuaExpr) -> bool {
+    match condition {
+        LuaExpr::UnaryExpr(unary_expr) => {
+            if !unary_expr
+                .get_op_token()
+                .is_some_and(|token| token.get_op() == UnaryOperator::OpNot)
+            {
+                return false;
+            }
+            let Some(inner_expr) = unary_expr.get_expr() else {
+                return false;
+            };
+            match &inner_expr {
+                LuaExpr::ParenExpr(paren_expr) => paren_expr
+                    .get_expr()
+                    .is_some_and(|expr| condition_is_negative_expr_guard(&expr, guarded_expr)),
+                _ => expr_text_matches(&inner_expr, guarded_expr),
+            }
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let Some(op) = binary_expr.get_op_token().map(|token| token.get_op()) else {
+                return false;
+            };
+            if op != BinaryOperator::OpOr {
+                return false;
+            }
+            let Some((left, right)) = binary_expr.get_exprs() else {
+                return false;
+            };
+            condition_is_negative_expr_guard(&left, guarded_expr)
+                || condition_is_negative_expr_guard(&right, guarded_expr)
+        }
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|expr| condition_is_negative_expr_guard(&expr, guarded_expr)),
+        _ => false,
+    }
+}
+
+/// Text-based comparison of two expressions, ignoring leading/trailing
+/// whitespace and normalizing `:` to `.` for method-vs-field equivalence.
+/// Also matches when the guarded expression is a prefix of the condition
+/// expression: `not self.Objects[i]` guards `self.Objects` because if the
+/// table were nil, the index access would error before the guard runs.
+fn expr_text_matches(a: &LuaExpr, b: &LuaExpr) -> bool {
+    let a_text = a.syntax().text().to_string().replacen(':', ".", 1);
+    let b_text = b.syntax().text().to_string().replacen(':', ".", 1);
+    if a_text == b_text {
+        return true;
+    }
+    // Prefix match: `self.Objects` is guarded by `not self.Objects[i]`
+    // because accessing `self.Objects[i]` would error if `self.Objects` were nil.
+    // The condition expression must be longer and start with the guarded text
+    // followed by an index delimiter (`[` or `.`).
+    if a_text.len() > b_text.len() {
+        return a_text.starts_with(&b_text)
+            && (a_text[b_text.len()..].starts_with('[')
+                || a_text[b_text.len()..].starts_with('.'));
+    }
+    if b_text.len() > a_text.len() {
+        return b_text.starts_with(&a_text)
+            && (b_text[a_text.len()..].starts_with('[')
+                || b_text[a_text.len()..].starts_with('.'));
+    }
+    false
 }
 
 fn is_initialized_assignment_lhs_prefix(
