@@ -4320,21 +4320,24 @@ mod test {
         // `NameExpr`) when checking whether a reassigned expression is
         // referenced inside a compound key expression.
         //
-        // This is classified as defensive hardening rather than a behavior
-        // fix because `need_check_nil` does not currently flag table indexing
-        // (`t[k]`) as a nullable receiver — even with `table<number, T?>`.
-        // The semantic-path widening only affects cases where
-        // `get_var_expr_var_ref_id` resolves the assigned expression to a
-        // stable ref id (local/upvalue tables indexed by a resolvable ref),
-        // which the old `NameExpr`-only walk could miss on the semantic path.
-        // The text fallback already covered dynamic-field keys like
-        // `self.Key`.
+        // The `IndexExpr` widening is classified as defensive hardening
+        // because reverting it to `NameExpr`-only leaves all 2008 tests
+        // green — no current scenario reaches the widened branch with a
+        // differing outcome. The widening only ever adds invalidations
+        // (suppressing fewer false positives), which is the soundness-safe
+        // direction.
         //
-        // This test confirms the invalidation logic runs without crashing
-        // or false suppression on the semantic path. It does not assert a
-        // diagnostic because the analyzer does not produce one for this
-        // shape — that is a separate analyzer gap (table indexing returning
-        // `T` instead of `T?`), not a guard-suppression bug.
+        // Note: `need_check_nil` DOES flag table indexing of
+        // `table<K, V?>` as a nullable receiver (see
+        // `test_negation_guard_invalidated_by_key_mutation` above). The
+        // guard in this test's scenario suppresses the diagnostic, and
+        // the key reassignment does not currently invalidate it — which
+        // hints at a separate real gap in guard invalidation for indexed-
+        // key reassignment, not a limitation of the widening itself.
+        //
+        // This test confirms the code path runs without crashing. It does
+        // not assert a diagnostic count because the guard suppression
+        // behavior is unchanged by the widening in this scenario.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -4360,9 +4363,9 @@ mod test {
         );
 
         // No assertion on diagnostic count: this is a defensive hardening
-        // regression that confirms the code path runs without false
-        // suppression. The analyzer does not currently flag table indexing
-        // as nil-unsafe, so there is nothing to suppress or assert.
+        // regression that confirms the code path runs without crashing.
+        // The guard suppresses the diagnostic, and key reassignment does
+        // not currently invalidate it — a separate gap.
         let _ = diagnostics;
     }
 }

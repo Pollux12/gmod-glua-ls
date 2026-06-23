@@ -650,11 +650,14 @@ fn index_expr_key_reassigned(
 /// This catches cases like `i = i + 1` invalidating `t[i + 1]` where the
 /// key expression `i + 1` contains a reference to `i`.
 ///
-/// Also walks `IndexExpr` descendants (not just `NameExpr`) as defensive
-/// hardening of the semantic path: when the assigned expression resolves to
-/// a stable ref id, indexed references like `keys[1]` inside a compound key
-/// are compared semantically. Dynamic-field keys like `self.Key` go through
-/// the text fallback and were already handled by the `NameExpr`-only walk.
+/// The descendant walk includes both `NameExpr` and `IndexExpr` nodes.
+/// The `IndexExpr` branch is defensive hardening of the semantic path:
+/// when the assigned expression resolves to a stable ref id (e.g. an
+/// `IndexRef` for `self.Key`), indexed references inside the key expression
+/// are compared semantically. No current test scenario reaches this branch
+/// with a differing outcome (reverting to `NameExpr`-only leaves the full
+/// suite green), but the widening only ever *adds* invalidations, which is
+/// the soundness-safe direction.
 ///
 /// Uses semantic var/ref identity for the comparison, with text fallback only
 /// when the assigned expression doesn't resolve to a var ref.
